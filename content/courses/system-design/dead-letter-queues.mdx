@@ -1,0 +1,95 @@
+---
+title: Dead letter queues
+kind: lesson
+---
+
+Com entrega pelo menos uma vez, uma mensagem que falha volta para a fila e é tentada de novo. Isso é ótimo para falhas temporárias, como um banco momentaneamente indisponível. Mas e se a mensagem nunca vai dar certo? Um JSON malformado, um campo obrigatório ausente, um ID que não existe. Ela volta, falha, volta, falha, consumindo workers indefinidamente e, em filas ordenadas, **bloqueando todas as mensagens atrás dela**. Essa é a **mensagem venenosa** (poison message). A **dead letter queue (DLQ)** é a fila para onde essas mensagens vão depois de um número máximo de tentativas, saindo do caminho sem serem perdidas.
+
+## Como funciona
+
+```text
+                     falha (tentativa 1, 2, 3...)
+               +--------------------------------+
+               v                                |
+[Produtor] -> [ fila principal ] -> [Consumidor] -+
+                     |
+                     | tentativas acima do limite
+                     v
+               [ DLQ ] -> alerta, inspeção, correção, reenvio
+```
+
+O broker conta quantas vezes cada mensagem foi entregue. Ao ultrapassar o limite (por exemplo, 5 tentativas), ela é movida para a DLQ junto com metadados úteis.
+
+Como cada sistema implementa:
+
+| Sistema | Mecanismo |
+| --- | --- |
+| Amazon SQS | Redrive policy com `maxReceiveCount` apontando para outra fila |
+| RabbitMQ | Dead letter exchange configurada na fila; mensagens rejeitadas sem requeue, expiradas ou de fila cheia vão para ela |
+| Kafka | Não tem DLQ nativa no broker; o consumidor (ou o framework, como Kafka Connect e Spring) publica num tópico de DLQ |
+| Google Pub/Sub | Dead letter topic com número máximo de tentativas na subscription |
+
+## Falha temporária vs permanente
+
+Nem toda falha deve consumir tentativas da mesma forma:
+
+- **Transitória** (timeout, 503, deadlock): retentar com **backoff exponencial**. Vale a pena esperar.
+- **Permanente** (validação, schema inválido, 404 de entidade apagada): retentar é desperdício. Envie direto para a DLQ.
+
+```python
+def consumir(msg):
+    try:
+        processar(msg)
+        fila.ack(msg)
+    except DadosInvalidos as e:                 # permanente
+        dlq.publicar(msg, motivo=str(e), origem="pedidos")
+        fila.ack(msg)                           # tira da fila principal
+    except ServicoIndisponivel:                 # transitória
+        tentativas = msg.atributos.get("tentativas", 0) + 1
+        if tentativas >= 5:
+            dlq.publicar(msg, motivo="excedeu tentativas", origem="pedidos")
+            fila.ack(msg)
+        else:
+            fila.reagendar(msg, atraso_seg=2 ** tentativas, tentativas=tentativas)
+```
+
+No Kafka, onde não se pode "pular" uma mensagem sem avançar o offset, é comum usar **tópicos de retentativa** em camadas (`pedidos.retry.1m`, `pedidos.retry.10m`) antes da DLQ, para que a mensagem problemática não bloqueie a partição.
+
+## O que guardar junto
+
+Uma DLQ só é útil se dá para entender por que a mensagem está ali:
+
+- Mensagem original, sem alterações.
+- Motivo do erro e stack trace resumido.
+- Fila ou tópico de origem, partição e offset.
+- Número de tentativas e horários da primeira e da última falha.
+- Versão do consumidor que falhou.
+
+## Operando a DLQ
+
+A DLQ não é uma lixeira. Mensagens ali representam pedidos não processados, pagamentos não confirmados ou e-mails não enviados.
+
+- **Alerta:** qualquer mensagem na DLQ (ou acima de um limiar) dispara alerta. Uma DLQ crescendo em silêncio é dívida invisível.
+- **Diagnóstico:** agrupe por motivo de erro; normalmente poucas causas explicam quase tudo.
+- **Correção e redrive:** corrija o bug ou o dado e reenvie as mensagens à fila original. Isso exige consumidores **idempotentes**, porque algumas podem ter sido parcialmente processadas.
+- **Retenção:** configure retenção maior na DLQ que na fila principal, para dar tempo de investigar.
+- **Descarte consciente:** mensagens que não fazem mais sentido podem ser descartadas, mas como decisão registrada, não por expiração esquecida.
+
+<Callout type="warning" title="DLQ e ordem">
+Mover uma mensagem para a DLQ quebra a ordem: as seguintes são processadas antes dela. Se o pedido 9001 tem os eventos criado, pago e cancelado, e o pago vai para a DLQ, reprocessá-lo depois do cancelado pode corromper o estado. Use versões nos eventos ou bloqueie a chave inteira até a resolução.
+</Callout>
+
+## Armadilhas
+
+- **Limite de tentativas baixo demais:** uma instabilidade de dois minutos manda milhares de mensagens saudáveis para a DLQ.
+- **Retentativa imediata sem backoff:** amplifica a sobrecarga do serviço que já está com problema.
+- **Redrive em massa sem corrigir a causa:** as mensagens voltam para a DLQ, às vezes com efeitos colaterais duplicados no caminho.
+
+## Na entrevista
+
+Ao propor uma fila, complete o desenho: retentativas com backoff para erros transitórios, limite de tentativas, DLQ com metadados, alerta e ferramenta de redrive. Diferencie erros transitórios de permanentes. Follow-ups comuns: como fazer DLQ no Kafka, como reprocessar com segurança, o que acontece com a ordem e quantas tentativas configurar.
+
+<QuizSet>
+<Quiz question="Uma mensagem com JSON malformado falha toda vez que é processada. Qual é o tratamento mais adequado?" options={["Retentar indefinidamente com backoff", "Enviá-la para a DLQ sem gastar retentativas, já que é uma falha permanente", "Descartá-la silenciosamente", "Reiniciar o consumidor"]} answer={1} explanation="Erros de validação não melhoram com o tempo. Enviar direto para a DLQ libera a fila e preserva a mensagem para diagnóstico." />
+<Quiz question="Antes de fazer redrive de mensagens da DLQ para a fila principal, o que é essencial?" options={["Aumentar o número de partições", "Corrigir a causa da falha e garantir que o consumidor seja idempotente", "Apagar a fila principal", "Desligar os alertas"]} answer={1} explanation="Sem corrigir a causa, as mensagens voltam a falhar; sem idempotência, mensagens parcialmente processadas podem gerar efeitos duplicados." />
+</QuizSet>

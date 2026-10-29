@@ -38,7 +38,16 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
             <Link href="/practice" className="rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg">
               Prática
             </Link>
-            <Link href="/dashboard" className="rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg">
+            <Link href="/interview" className="rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg">
+              Entrevista
+            </Link>
+            <Link href="/animations" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg md:inline">
+              Animações
+            </Link>
+            <Link href="/roadmaps" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg md:inline">
+              Roadmaps
+            </Link>
+            <Link href="/dashboard" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg sm:inline">
               Painel
             </Link>
             <Link href="/notebook/dsa" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg sm:inline">

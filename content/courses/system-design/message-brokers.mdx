@@ -1,0 +1,97 @@
+---
+title: Message brokers
+kind: lesson
+---
+
+Filas e pub/sub são padrões; o **message broker** é o software que os implementa. Ele recebe mensagens de produtores, guarda, roteia e entrega a consumidores, cuidando de persistência, confirmações, retentativas e escala. Escolher o broker certo muda bastante o que seu sistema consegue fazer: reprocessar eventos de uma semana atrás, rotear mensagens por regras complexas ou entregar milhões de mensagens por segundo exigem arquiteturas diferentes.
+
+## Dois modelos internos
+
+### Broker de filas (fila tradicional)
+
+O broker mantém filas; cada mensagem é entregue, confirmada e **removida**. O broker controla o estado de cada mensagem (pendente, entregue, confirmada). Exemplos: **RabbitMQ**, **ActiveMQ**, **Amazon SQS**.
+
+- Roteamento flexível, prioridades, atraso por mensagem, TTL.
+- Ótimo para distribuir tarefas entre workers.
+- Depois de consumida, a mensagem some: não há replay.
+
+### Log distribuído (streaming)
+
+O broker é um **log append-only** particionado. Mensagens não são removidas ao serem lidas; ficam até expirar a **retenção** (dias, semanas, ou para sempre). Cada consumidor guarda apenas seu **offset**, a posição em que parou. Exemplos: **Apache Kafka**, **Amazon Kinesis**, **Apache Pulsar** (que mistura os dois modelos), **Redpanda**.
+
+```text
+Tópico "pedidos", partição 0:
+offset:  0    1    2    3    4    5    6
+        [m0] [m1] [m2] [m3] [m4] [m5] [m6]
+                    ^              ^
+          grupo "analytics"   grupo "notas"
+            (offset 2)         (offset 5)
+```
+
+- Vários grupos leem o mesmo log, cada um no seu ritmo.
+- **Replay:** um consumidor novo pode começar do offset 0 e reconstruir estado.
+- Throughput altíssimo graças a escrita sequencial em disco e leitura em lote.
+- Ordem garantida **dentro de cada partição**. Mensagens com a mesma chave (por exemplo, `pedido_id`) vão para a mesma partição e mantêm ordem entre si.
+- O paralelismo de um grupo é limitado pelo número de partições: com 6 partições, o sétimo consumidor do grupo fica ocioso.
+
+## Roteamento no RabbitMQ
+
+O RabbitMQ (protocolo AMQP 0-9-1) separa **exchanges** de **filas**. Produtores publicam numa exchange, que roteia para filas conforme **bindings**:
+
+| Exchange | Regra de roteamento |
+| --- | --- |
+| direct | Chave de roteamento igual à do binding |
+| topic | Padrões com curingas (`pedido.*.sul`) |
+| fanout | Copia para todas as filas ligadas |
+| headers | Atributos do cabeçalho da mensagem |
+
+## Comparação
+
+| Aspecto | RabbitMQ | Kafka | SQS / SNS |
+| --- | --- | --- | --- |
+| Modelo | Filas com roteamento | Log particionado | Fila gerenciada / pub-sub gerenciado |
+| Retenção após consumo | Não | Sim, por tempo ou tamanho | Não |
+| Replay | Não (exceto streams) | Sim | Não |
+| Ordem | Por fila, com um consumidor | Por partição | FIFO opcional por grupo |
+| Throughput | Alto | Muito alto | Alto, escala automática |
+| Operação | Você opera | Você opera ou usa serviço gerenciado | Totalmente gerenciado |
+| Ideal para | Tarefas, roteamento complexo, RPC assíncrono | Streams de eventos, CDC, analytics, event sourcing | Desacoplar serviços na AWS sem operar nada |
+
+## Durabilidade e confirmações
+
+Um broker só é tão confiável quanto sua configuração:
+
+- **Confirmação do produtor:** o produtor só considera a mensagem enviada quando o broker confirma (publisher confirms no RabbitMQ; `acks=all` no Kafka, que espera as réplicas sincronizadas).
+- **Replicação:** filas quorum no RabbitMQ; fator de replicação 3 e `min.insync.replicas=2` no Kafka.
+- **Persistência:** mensagens marcadas como persistentes e gravadas em disco.
+- **Confirmação do consumidor:** ack só depois de processar, nunca antes.
+
+```text
+# Produtor Kafka durável (configuração)
+acks=all
+enable.idempotence=true
+retries=2147483647
+max.in.flight.requests.per.connection=5
+```
+
+O produtor idempotente do Kafka numera mensagens por partição para que retentativas não gravem duplicatas no log.
+
+<Callout type="tip" title="Como decidir rápido">
+Precisa reprocessar eventos, alimentar vários sistemas a partir do mesmo fluxo ou lidar com volume enorme? Log distribuído (Kafka). Precisa distribuir tarefas entre workers, com roteamento, prioridade e atraso por mensagem? Broker de filas (RabbitMQ, SQS).
+</Callout>
+
+## Armadilhas
+
+- **Broker como banco de dados:** Kafka com retenção infinita pode ser fonte de verdade em event sourcing, mas consultas por chave continuam sendo trabalho de um banco.
+- **Partições demais ou de menos:** poucas limitam o paralelismo; muitas aumentam overhead e tempo de recuperação. Aumentar depois muda o mapeamento chave para partição e quebra a ordem por chave.
+- **Partição quente:** uma chave muito popular concentra tráfego numa partição só.
+- **Ignorar o lag:** a diferença entre o último offset e o offset do consumidor é a principal métrica de saúde.
+
+## Na entrevista
+
+Diga qual broker e por quê. "Kafka para o fluxo de eventos de pedidos, particionado por `pedido_id` para manter ordem por pedido, com retenção de 7 dias para replay" é uma resposta muito mais forte que "uso uma fila". Follow-ups comuns: o que acontece se um broker cair (replicação e eleição de líder da partição), como escalar consumidores (partições), como evitar duplicatas e como monitorar (lag).
+
+<QuizSet>
+<Quiz question="Um novo serviço de analytics precisa processar todos os pedidos dos últimos 5 dias, além dos novos. Qual tipo de broker torna isso trivial?" options={["Uma fila RabbitMQ clássica", "Um log distribuído como Kafka, com retenção maior que 5 dias", "Redis Pub/Sub", "Webhooks"]} answer={1} explanation="No log distribuído as mensagens permanecem após o consumo. O novo consumer group começa num offset antigo e faz o replay." />
+<Quiz question="Um tópico Kafka tem 8 partições e o consumer group tem 12 consumidores. O que acontece?" options={["Os 12 dividem as mensagens igualmente", "8 consumidores recebem partições e 4 ficam ociosos", "O Kafka cria 4 partições novas automaticamente", "Cada mensagem é entregue a todos os 12"]} answer={1} explanation="Dentro de um grupo, cada partição é atribuída a no máximo um consumidor. O paralelismo máximo é o número de partições." />
+</QuizSet>

@@ -400,7 +400,13 @@ export const ANIMATIONS: AnimationDef[] = [
         ],
       });
       const before = ring(base);
-      const withD = [...base, { label: "D", angle: hash("server-D") }];
+      // D entra no meio do arco do servidor mais carregado, para a demonstração sempre mover chaves.
+      const sortedBase = [...base].sort((x, y) => x.angle - y.angle);
+      const load = (s: string) => k.filter((key) => owner(hash(key), base) === s).length;
+      const busiest = sortedBase.reduce((m, s) => (load(s.label) > load(m.label) ? s : m), sortedBase[0]);
+      const prev = sortedBase[(sortedBase.indexOf(busiest) - 1 + sortedBase.length) % sortedBase.length];
+      const arc = (busiest.angle - prev.angle + 360) % 360 || 360;
+      const withD = [...base, { label: "D", angle: Math.round(prev.angle + arc / 2) % 360 }];
       const after = ring(withD);
       // Os servidores vêm antes das chaves; compara cada chave com ela mesma antes de adicionar D.
       const keyOwner = (nodes: NonNullable<Frame["ring"]>["nodes"]) =>

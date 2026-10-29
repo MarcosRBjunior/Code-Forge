@@ -1,0 +1,86 @@
+---
+title: Semânticas de entrega
+kind: lesson
+---
+
+Entre produtor, broker e consumidor existem várias redes e processos que podem falhar a qualquer momento. A pergunta "essa mensagem foi processada?" não tem resposta trivial: o consumidor pode ter processado e morrido antes de confirmar, ou o broker pode ter gravado e a confirmação ao produtor ter se perdido. A **semântica de entrega** é a garantia que o sistema oferece diante dessas falhas: **no máximo uma vez**, **pelo menos uma vez** ou **exatamente uma vez**.
+
+## Onde as coisas falham
+
+```text
+Produtor --(1) envio--> Broker --(2) entrega--> Consumidor --(3) efeito--> Banco
+         <--(a) ack----        <--(b) ack-------
+```
+
+- Se o ack (a) se perde, o produtor não sabe se o broker gravou. Reenviar pode duplicar; não reenviar pode perder.
+- Se o consumidor faz o efeito (3) e cai antes do ack (b), o broker reentrega. Se o consumidor faz o ack antes do efeito e cai, a mensagem se perde.
+
+A semântica é decidida pelas escolhas em cada um desses pontos.
+
+## No máximo uma vez (at-most-once)
+
+A mensagem é entregue zero ou uma vez. Implementação: o produtor não retenta, e o consumidor confirma **antes** de processar.
+
+```python
+msg = fila.receber()
+fila.ack(msg)          # confirma primeiro
+processar(msg)         # se cair aqui, a mensagem está perdida
+```
+
+Nunca duplica, mas pode perder. Serve para dados em que perder um pouco não importa: métricas de alta frequência, telemetria, posição de um objeto que será atualizada no próximo segundo.
+
+## Pelo menos uma vez (at-least-once)
+
+A mensagem é entregue uma ou mais vezes. O produtor retenta até receber confirmação, e o consumidor confirma **depois** de processar.
+
+```python
+msg = fila.receber()
+processar(msg)         # se cair aqui, a mensagem será reentregue
+fila.ack(msg)
+```
+
+Nunca perde (dentro dos limites de durabilidade do broker), mas pode duplicar. É o **padrão da maioria dos sistemas** (SQS, RabbitMQ com acks manuais, Kafka com commit após processar, webhooks) e exige **consumidores idempotentes**.
+
+## Exatamente uma vez (exactly-once)
+
+Cada mensagem produz seu efeito exatamente uma vez. Em termos de **entrega** pela rede, isso é impossível de garantir em geral: não dá para distinguir "a mensagem se perdeu" de "a confirmação se perdeu". O que sistemas reais oferecem é **processamento efetivamente uma vez**: entrega pelo menos uma vez **mais** deduplicação ou atomicidade, de modo que duplicatas não tenham efeito visível.
+
+As técnicas:
+
+- **Consumidor idempotente com registro de IDs:** gravar o efeito e o ID da mensagem processada na **mesma transação**. Uma reentrega encontra o ID e é ignorada.
+- **Operações naturalmente idempotentes:** `UPSERT`, `SET status = 'pago'` em vez de incrementos.
+- **Transações do broker:** o Kafka oferece produtor idempotente mais transações que gravam mensagens de saída e o offset do consumidor atomicamente. Isso garante exactly-once em fluxos **ler do Kafka, processar, escrever no Kafka**. Efeitos externos (um e-mail, uma chamada a outra API) continuam fora dessa garantia.
+
+```sql
+BEGIN;
+INSERT INTO mensagens_processadas (msg_id) VALUES ('evt_7f3a');  -- falha se já existir
+UPDATE contas SET saldo = saldo - 300 WHERE id = 42;
+COMMIT;
+```
+
+Se o `INSERT` violar a chave única, a transação inteira é revertida e o débito não acontece duas vezes.
+
+## Comparação
+
+| Semântica | Perde? | Duplica? | Custo | Uso típico |
+| --- | --- | --- | --- | --- |
+| No máximo uma vez | Pode | Não | Mínimo | Métricas, logs de baixa importância |
+| Pelo menos uma vez | Não | Pode | Moderado | Padrão para eventos de negócio |
+| Efetivamente uma vez | Não | Sem efeito visível | Alto: dedupe, transações | Pagamentos, saldos, contagens exatas |
+
+<Callout type="warning" title="Cuidado com a promessa">
+Quando um produto anuncia exactly-once, pergunte em que escopo. Quase sempre vale só dentro do próprio sistema. No momento em que seu consumidor chama um serviço externo, você volta a precisar de idempotência ponta a ponta, com chaves de idempotência repassadas adiante.
+</Callout>
+
+## Ordem é outra garantia
+
+Semântica de entrega não diz nada sobre **ordem**. Retentativas podem reordenar mensagens, e consumidores paralelos processam fora de ordem. Ordem costuma ser garantida só por partição ou grupo de mensagens; quando importa, use uma chave de particionamento e um único consumidor por partição, ou números de versão para descartar atualizações antigas.
+
+## Na entrevista
+
+Diga explicitamente: "o broker entrega pelo menos uma vez, então o consumidor é idempotente: gravo o ID do evento na mesma transação do efeito". Isso mostra maturidade. Se alguém pedir exactly-once, explique que é at-least-once mais deduplicação e delimite o escopo. Follow-ups comuns: por que exactly-once de entrega é impossível, como o Kafka implementa transações, por quanto tempo guardar IDs processados e como lidar com efeitos externos.
+
+<QuizSet>
+<Quiz question="Um consumidor confirma a mensagem e só depois grava no banco. Se ele cair entre os dois passos, qual semântica ele está implementando?" options={["Pelo menos uma vez", "No máximo uma vez", "Exatamente uma vez", "Nenhuma das anteriores"]} answer={1} explanation="Com ack antes do processamento, a falha faz a mensagem ser perdida, mas nunca duplicada: semântica at-most-once." />
+<Quiz question="Como obter processamento efetivamente uma vez com um broker que entrega pelo menos uma vez?" options={["Desligar as retentativas do produtor", "Gravar o ID da mensagem e o efeito na mesma transação, ignorando IDs já vistos", "Usar mais partições", "Confirmar antes de processar"]} answer={1} explanation="A entrega continua podendo duplicar, mas a deduplicação atômica garante que a duplicata não tenha efeito." />
+</QuizSet>
