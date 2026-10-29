@@ -24,7 +24,8 @@ interface PoolItem {
   difficulty: Difficulty;
 }
 interface Loaded extends PoolItem {
-  statement: string;
+  statementHtml: string;
+  statementHtmlNoHints: string;
   problem: ProblemSpec;
 }
 
@@ -34,11 +35,6 @@ function fmt(s: number) {
   const m = Math.floor(Math.abs(s) / 60);
   const r = Math.abs(s) % 60;
   return `${s < 0 ? "-" : ""}${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
-}
-
-/** Remove a seção "Dica" do enunciado no modo rigoroso/padrão. */
-function statementFor(md: string, showHints: boolean) {
-  return showHints ? md : md.replace(/\n## Dica[\s\S]*?(?=\n## |$)/, "\n");
 }
 
 function Room({ pool }: { pool: PoolItem[] }) {
@@ -67,7 +63,12 @@ function Room({ pool }: { pool: PoolItem[] }) {
       picked.map((p) =>
         fetch(`/api/problems/${p.course}/${p.slug}`)
           .then((r) => r.json())
-          .then((d) => ({ ...p, statement: d.statement as string, problem: d.problem as ProblemSpec })),
+          .then((d) => ({
+            ...p,
+            statementHtml: d.statementHtml as string,
+            statementHtmlNoHints: d.statementHtmlNoHints as string,
+            problem: d.problem as ProblemSpec,
+          })),
       ),
     ).then(setProblems);
   }, [config, pool]);
@@ -215,9 +216,11 @@ function Room({ pool }: { pool: PoolItem[] }) {
         <section aria-label="Enunciado" className="rounded-xl border border-line bg-surface-1 p-5">
           <h1 className="text-xl font-semibold">{current.title}</h1>
           <p className="mt-1 text-xs text-fg-subtle">{DIFF_LABEL[current.difficulty]} · {MINUTES[current.difficulty]} min sugeridos</p>
-          <pre className="mt-4 whitespace-pre-wrap font-prose text-[0.95rem] leading-relaxed text-fg-prose">
-            {statementFor(current.statement, config.style === "coaching").trim()}
-          </pre>
+          {/* HTML gerado no servidor a partir do Markdown do próprio repositório */}
+          <div
+            className="cf-prose mt-4 text-[0.95rem]"
+            dangerouslySetInnerHTML={{ __html: config.style === "coaching" ? current.statementHtml : current.statementHtmlNoHints }}
+          />
           {config.style !== "coaching" && <p className="mt-4 text-xs text-fg-subtle">Dicas ocultas neste modo de entrevistador.</p>}
         </section>
         <div key={key(current)}>

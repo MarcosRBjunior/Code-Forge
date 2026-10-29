@@ -1,0 +1,87 @@
+---
+title: Service discovery
+kind: lesson
+---
+
+Num monólito, chamar outro módulo é uma chamada de função. Em microsserviços, o serviço de pedidos precisa chamar o serviço de pagamentos pela rede, e para isso precisa saber **onde** ele está. Em ambientes com autoscaling, containers e deploys contínuos, instâncias nascem e morrem o tempo todo, com IPs que mudam a cada reinício. Escrever endereços fixos em arquivo de configuração simplesmente não funciona. **Service discovery** é o mecanismo que responde, em tempo real, à pergunta "quais instâncias saudáveis do serviço X existem agora e em que endereço?".
+
+## As peças
+
+- **Service registry:** um banco de dados de alta disponibilidade com o mapa `nome do serviço → lista de instâncias (IP, porta, metadados)`. Exemplos: Consul, etcd, ZooKeeper, Eureka, ou o próprio plano de controle do Kubernetes.
+- **Registro:** cada instância precisa entrar no registry ao subir e sair ao desligar.
+- **Health check:** o registry precisa remover instâncias que morreram sem avisar, seja por heartbeats (a instância renova um lease periodicamente) ou por sondagens ativas (o registry chama `/health`).
+- **Consulta:** quem quer chamar o serviço pergunta ao registry e escolhe uma instância.
+
+## Self-registration vs registro por terceiros
+
+Na **auto-registração**, a própria aplicação, ao iniciar, chama o registry e depois mantém um heartbeat. É simples, mas acopla todo serviço a uma biblioteca do registry, em cada linguagem que você usa.
+
+No **registro por terceiros**, um componente da plataforma observa o ciclo de vida das instâncias e registra por elas. É o que o Kubernetes faz: quando um pod fica pronto (readiness probe passou), o controlador de endpoints o adiciona ao Service; quando falha, ele sai. A aplicação nem sabe que o registry existe.
+
+## Descoberta no cliente vs no servidor
+
+```text
+Client-side discovery                  Server-side discovery
+
+[pedidos] --1. quem é pagamentos?-->   [pedidos] ---> [load balancer / proxy]
+    |       [registry]                                      |  consulta o registry
+    |<-- 2. 10.0.1.4, 10.0.1.7                              v
+    |--3. chama 10.0.1.7 direto          [pagamentos 1] [pagamentos 2]
+```
+
+| Aspecto | Client-side | Server-side |
+| --- | --- | --- |
+| Quem escolhe a instância | biblioteca no cliente | load balancer ou proxy |
+| Saltos de rede | um a menos | um a mais |
+| Balanceamento | inteligente, por cliente (latência, zona) | centralizado |
+| Acoplamento | cliente precisa de lib por linguagem | cliente só conhece um nome |
+| Exemplos | Eureka + Ribbon, gRPC com resolver xDS | Kubernetes Service, AWS ALB |
+
+Uma terceira via muito comum hoje é o **sidecar**: um proxy local (Envoy, por exemplo) faz a descoberta e o balanceamento pela aplicação. A aplicação chama `localhost`, e o sidecar recebe do plano de controle a lista atualizada de endpoints. Esse é o modelo do service mesh.
+
+## Descoberta via DNS
+
+O jeito mais simples de descoberta é o DNS: `pagamentos.prod.svc.cluster.local` resolve para os IPs das instâncias, ou para um IP virtual estável. Funciona com qualquer linguagem, mas tem limitações: cache de DNS no cliente com TTL ignorado, ausência de metadados (peso, zona, versão) e propagação lenta quando uma instância cai. Registros SRV ajudam a carregar porta e prioridade.
+
+## Exemplo: registro com lease
+
+```python
+import time
+
+class Registry:
+    def __init__(self, ttl=10):
+        self.ttl = ttl
+        self.instancias = {}   # (servico, endereco) -> expira_em
+
+    def registrar(self, servico, endereco):
+        self.instancias[(servico, endereco)] = time.time() + self.ttl
+
+    heartbeat = registrar   # renovar o lease é registrar de novo
+
+    def descobrir(self, servico):
+        agora = time.time()
+        return [end for (s, end), exp in self.instancias.items()
+                if s == servico and exp > agora]
+```
+
+Se a instância trava sem chamar `deregister`, o lease expira e ela some da lista sozinha. Esse é o princípio usado por etcd (leases) e Consul (TTL checks).
+
+## Armadilhas
+
+- **Registry como ponto único de falha:** ele precisa ser replicado (normalmente com consenso, como Raft). Clientes devem guardar em cache a última lista conhecida, para continuar funcionando se o registry ficar indisponível por alguns instantes.
+- **Lista desatualizada:** sempre existe uma janela entre a instância morrer e sair do registry. Combine discovery com timeouts, retentativas e circuit breaker.
+- **Readiness vs liveness:** registre a instância só quando ela estiver pronta para receber tráfego, não apenas quando o processo subiu.
+- **Desligamento gracioso:** ao receber SIGTERM, saia do registry, espere o tráfego drenar e só então encerre.
+
+<Callout type="tip" title="AP ou CP?">
+O Eureka (Netflix) escolheu ser AP: prefere devolver uma lista possivelmente velha a não devolver nada. Já Consul e etcd são CP. Para descoberta, uma lista um pouco desatualizada costuma ser melhor que nenhuma, desde que o cliente tolere instâncias mortas.
+</Callout>
+
+## Na entrevista
+
+Ao desenhar microsserviços, mencione que os serviços se encontram por um registry (ou pelo Kubernetes) com health checks, e não por IP fixo. Follow-ups comuns: "o que acontece se o registry cair?" (cache local, réplicas), "como evitar mandar tráfego para uma instância que acabou de morrer?" (TTL curto, health check ativo, retentativa em outra instância), "client-side ou server-side, e por quê?".
+
+<QuizSet>
+<Quiz question="Uma instância trava sem avisar o registry. Qual mecanismo garante que ela saia da lista?" options={["O DNS remove automaticamente", "Expiração do lease ou falha no health check", "O cliente apaga a entrada no registry", "Nenhum, é preciso remoção manual"]} answer={1} explanation="Com leases ou health checks, a ausência de renovação faz a instância expirar sozinha, sem depender de um desligamento limpo." />
+<Quiz question="Qual a principal vantagem da descoberta server-side em relação à client-side?" options={["Menos saltos de rede", "Clientes não precisam de biblioteca específica do registry", "Balanceamento por cliente mais inteligente", "Elimina a necessidade de health checks"]} answer={1} explanation="O cliente só chama um nome ou endereço estável; o load balancer ou proxy consulta o registry. O custo é um salto de rede a mais." />
+</QuizSet>

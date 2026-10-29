@@ -1,0 +1,134 @@
+---
+title: Projetar indicador de presença
+kind: lesson
+---
+
+A bolinha verde ao lado do nome de um contato parece um detalhe de interface, mas é um dos sistemas mais barulhentos de um produto de mensagens. Cada usuário muda de estado várias vezes por hora, e cada mudança interessa a dezenas ou centenas de outras pessoas. A questão testa se você sabe lidar com dados efêmeros, fan-out e tolerância a imprecisão.
+
+## Requisitos
+
+### Funcionais
+
+- Mostrar se um contato está **online**, **offline** ou "visto por último às 14h32".
+- Atualizar o indicador quase em tempo real para quem está com a conversa ou a lista de contatos aberta.
+- Suportar vários aparelhos: o usuário está online se qualquer um deles estiver.
+- Opcional: estados como "ausente" e configuração de privacidade (esconder o "visto por último").
+
+### Não funcionais
+
+- Latência de propagação de poucos segundos; não precisa ser instantânea.
+- **Imprecisão é tolerável**: mostrar alguém online por 20 segundos a mais não causa dano.
+- Disponibilidade alta, mas se o serviço cair o chat continua funcionando, apenas sem bolinhas.
+- Escala de centenas de milhões de usuários conectados.
+
+Deixe claro logo no início: presença é um dado de baixo valor individual e altíssimo volume. Isso libera você para escolher consistência eventual e armazenamento em memória.
+
+## Estimativas
+
+- 300 milhões de usuários online no pico.
+- Cada aparelho envia um heartbeat a cada 30 segundos: 300 M / 30 = **10 milhões de heartbeats por segundo**. Esse é o número que assusta.
+- Mudanças reais de estado (entrar, sair) são bem menos frequentes: digamos 20 transições por usuário por dia para 800 M de usuários diários = 16 bilhões por dia ≈ **185 mil por segundo**.
+- Se cada transição interessa em média a 50 observadores conectados, o fan-out potencial é 185 mil × 50 ≈ **9 milhões de notificações por segundo**.
+- Memória: por usuário, guardamos estado, último acesso e aparelhos, uns 100 bytes. Para 800 M de usuários, **80 GB**. Cabe num cluster Redis pequeno.
+
+A conta mostra dois problemas distintos: absorver heartbeats e conter o fan-out.
+
+## API
+
+O cliente já mantém um WebSocket para o chat. Presença reaproveita a conexão:
+
+```json
+{ "tipo": "heartbeat", "aparelho": "ios-1" }
+
+{ "tipo": "assinar_presenca", "usuarios": ["u_12", "u_98", "u_301"] }
+
+{ "tipo": "presenca", "usuario": "u_12", "estado": "online" }
+{ "tipo": "presenca", "usuario": "u_98", "estado": "offline",
+  "vistoEm": "2026-10-29T14:32:00Z" }
+```
+
+Também há `GET /presenca?ids=u_12,u_98` para consultas pontuais, por exemplo ao abrir o app.
+
+## Modelo de dados
+
+```text
+presenca:{usuario_id}   (hash no Redis, com TTL de 60 s)
+  estado      = online | ausente
+  aparelhos   = ios-1, web-3
+  atualizado  = 1730212320
+
+visto_por_ultimo  (banco durável, gravado só na transição para offline)
+  usuario_id | visto_em
+```
+
+A ausência da chave significa offline. É esse o truque central: em vez de alguém precisar declarar "fulano saiu", a chave simplesmente expira.
+
+## Arquitetura de alto nível
+
+```text
+ apps (WebSocket)
+     |
++----v-------------+       heartbeats       +-------------------+
+| Servidores de    | ---------------------> | Serviço de        |
+| conexão          |                        | presença          |
++----^-------------+                        +----+---------+----+
+     |                                           |         |
+     |  eventos de presença                 +----v---+  +--v-------------+
+     |  (só para assinantes)                | Redis  |  | Banco de       |
+     |                                      | TTL    |  | visto_por_     |
++----+-------------+    pub/sub por usuário +----+---+  | ultimo         |
+| Barramento de    | <---------------------------+      +----------------+
+| eventos          |      transições (online/offline)
++------------------+
+```
+
+## Aprofundamentos
+
+### 1. Heartbeat e detecção de saída
+
+Existem dois sinais de que alguém saiu: o WebSocket fecha de forma limpa, ou ele simplesmente para de responder (o celular entrou num túnel). O primeiro é fácil; o segundo exige heartbeat com timeout.
+
+Para não transformar 10 milhões de heartbeats por segundo em 10 milhões de escritas no Redis, o servidor de conexão **agrega localmente**. Ele já sabe quais sockets estão vivos; a cada 30 segundos, renova em lote o TTL de todos os seus usuários com um pipeline. Ou melhor: o servidor de conexão só fala com o serviço de presença quando há **transição**. Enquanto o socket está aberto, o próprio servidor de conexão é a fonte da verdade, e o TTL no Redis é renovado em lotes grandes.
+
+Para evitar oscilação (o usuário com sinal ruim alterna online e offline a cada poucos segundos), aplique um atraso na transição para offline: só publique "saiu" se ele continuar ausente por 10 a 20 segundos. Isso elimina a maior parte do ruído.
+
+### 2. Contendo o fan-out
+
+Notificar todos os 300 contatos de alguém a cada transição seria desperdício: a maioria nem está olhando. A saída é **assinatura sob demanda**. O cliente só assina a presença dos usuários visíveis na tela: a conversa aberta e os primeiros itens da lista. Quando a tela muda, cancela as assinaturas antigas.
+
+No servidor, cada servidor de conexão mantém o mapa `usuario_observado -> sockets locais interessados` e se inscreve num canal pub/sub por usuário observado. Uma transição de `u_12` é publicada uma vez no canal `presenca:u_12` e só chega aos servidores que têm alguém olhando. Isso derruba o fan-out de milhões para dezenas de milhares por segundo.
+
+Para listas grandes (grupo de 1.000 pessoas), nem tente tempo real: mostre a contagem "123 online", recalculada a cada poucos segundos.
+
+### 3. Vários aparelhos
+
+O usuário está online se o conjunto `aparelhos` não estiver vazio. Cada aparelho entra e sai do conjunto; a transição de usuário só é publicada quando o conjunto passa de vazio para não vazio ou o contrário. O "visto por último" é gravado no banco durável apenas quando o último aparelho sai.
+
+<Callout type="tip" title="Diga em voz alta o que não importa">
+Ao afirmar que presença pode ficar alguns segundos errada, você justifica Redis sem replicação síncrona, perda de dados num failover e eventos sem garantia de entrega. Entrevistadores gostam de ver que você relaxa requisitos onde o produto permite.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Decisão | Ganho | Custo |
+| --- | --- | --- |
+| Intervalo de heartbeat maior | Menos tráfego e bateria | Detecção de saída mais lenta |
+| Atraso antes de publicar offline | Menos oscilação e eventos | Indicador fica "online" por mais tempo |
+| Assinatura por tela | Fan-out muito menor | Lógica extra no cliente |
+| Redis sem persistência | Simples e rápido | Num failover, todos aparecem offline por um ciclo de heartbeat |
+
+Um failover do Redis faz todo mundo parecer offline até o próximo lote de renovação. Como o servidor de conexão é a fonte real, ele pode reescrever o estado completo de seus usuários ao detectar o novo primário.
+
+Usuários celebridade com milhões de observadores são outro gargalo: o canal pub/sub dele vira hot key. Para esses casos, não ofereça presença em tempo real a desconhecidos, ou amostre as atualizações.
+
+## Perguntas de follow-up comuns
+
+- **Como respeitar privacidade?** Antes de entregar o evento, verifique a configuração do observado. Faça a checagem na assinatura, não a cada evento, e invalide quando a configuração mudar.
+- **Como mostrar "digitando..."?** Mesmo mecanismo de canal efêmero, com TTL de poucos segundos e sem persistência.
+- **E com várias regiões?** Cada região mantém presença dos seus conectados; consultas cruzadas vão para a região de origem do usuário, ou um resumo é replicado de forma assíncrona.
+- **Como testar a escala?** Simule tempestades de reconexão: um servidor de conexão reiniciando gera milhares de transições simultâneas, e o atraso de offline ajuda a absorvê-las.
+
+<QuizSet>
+<Quiz question="Por que usar TTL na chave de presença em vez de apagar a chave quando o usuário sai?" options={["Porque TTL é mais barato que DELETE", "Porque nem sempre há um evento de saída: o aparelho pode simplesmente sumir da rede", "Porque Redis não suporta DELETE em hash", "Porque TTL garante consistência forte"]} answer={1} explanation="Conexões morrem sem aviso. A expiração automática transforma ausência de heartbeat em offline sem depender de um evento explícito." />
+<Quiz question="Qual técnica reduz mais o fan-out de eventos de presença?" options={["Aumentar o número de nós Redis", "Enviar presença por e-mail", "Assinar apenas a presença dos usuários visíveis na tela", "Gravar cada heartbeat no banco durável"]} answer={2} explanation="A maioria dos contatos não está sendo observada em um dado momento; assinatura sob demanda entrega eventos só a quem está olhando." />
+</QuizSet>

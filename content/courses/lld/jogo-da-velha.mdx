@@ -1,0 +1,228 @@
+---
+title: Projetar um jogo da velha
+kind: lesson
+---
+
+O jogo da velha parece trivial demais para uma entrevista, e é justamente por isso que ele aparece: com regras que todo mundo conhece, sobra tempo para o entrevistador olhar a **qualidade do design**. Ele quer ver se você separa tabuleiro, jogadores e regras de vitória, se a detecção de vencedor é eficiente e se o código aguenta uma pergunta como "e se o tabuleiro fosse 5x5 com 4 em linha?".
+
+## Requisitos
+
+Antes de desenhar qualquer classe, faça perguntas. Elas mostram maturidade e reduzem o escopo para algo que cabe em 45 minutos.
+
+- **Tamanho do tabuleiro é fixo em 3x3?** Vale assumir N x N configurável. Custa quase nada e responde ao follow-up mais comum.
+- **Quantos jogadores?** Dois, alternando, cada um com um símbolo.
+- **Os jogadores são humanos ou bots?** Desenhe uma abstração de jogador que permita os dois.
+- **O que acontece numa jogada inválida?** Casa ocupada ou fora do tabuleiro gera erro e o turno não passa.
+- **Precisa de desfazer jogada, placar entre partidas ou interface gráfica?** Normalmente não. Deixe como extensão.
+
+Escopo combinado: tabuleiro N x N, vitória com N símbolos iguais em linha, coluna ou diagonal, empate quando o tabuleiro enche, jogadores plugáveis e estado da partida consultável.
+
+## Entidades e responsabilidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Simbolo` | Enum com X e O. Evita strings soltas espalhadas pelo código. |
+| `Tabuleiro` | Guarda as casas, valida e aplica jogadas. Não sabe quem está jogando. |
+| `Jogador` | Interface com `escolher_jogada(tabuleiro)`. Humano lê da entrada, bot calcula. |
+| `DetectorDeVitoria` | Responde "essa última jogada venceu?" em tempo constante. |
+| `Partida` | Orquestra turnos, consulta o detector e mantém o status (em andamento, vitória, empate). |
+
+A divisão mais importante é entre `Tabuleiro` e `Partida`. O tabuleiro é uma estrutura de dados com regras locais (casa livre, limites). A partida conhece o fluxo: de quem é a vez, quando acabou. Misturar as duas deixa o tabuleiro impossível de reutilizar num bot que simula jogadas.
+
+## Diagrama de classes
+
+```text
++-----------------+        +----------------------+
+|  Partida        |------->|  Tabuleiro           |
+|-----------------|        |----------------------|
+| - jogadores[2]  |        | - n: int             |
+| - vez: int      |        | - casas: [[Simbolo]] |
+| - status        |        | + jogar(l, c, s)     |
+| + proxima()     |        | + livre(l, c)        |
++-----------------+        | + cheio()            |
+   |          |            +----------------------+
+   |          v
+   |   +---------------------+
+   |   |  DetectorDeVitoria  |  contadores por linha,
+   |   | + registrar(l,c,s)  |  coluna e diagonais
+   |   +---------------------+
+   v
++------------------+
+| Jogador (iface)  |
+| + escolher(tab)  |
++------------------+
+     ^         ^
+JogadorRoteiro  BotPrimeiraLivre
+```
+
+## Padrões usados e por quê
+
+- **Strategy** no `Jogador`: a partida chama `escolher_jogada` sem saber se do outro lado há uma pessoa, um bot aleatório ou um minimax. Trocar a dificuldade do bot é trocar o objeto.
+- **Enum** para símbolo e status: valores fechados, comparação segura e nomes legíveis nos logs.
+- **Separação de responsabilidades** no detector: a regra de vitória vira um componente testável isoladamente. Se o entrevistador pedir "vitória com K em linha", você mexe só nele.
+
+O truque do detector é clássico: em vez de varrer o tabuleiro inteiro a cada jogada, mantenha contadores. Cada linha, coluna e as duas diagonais têm um contador; X soma +1 e O soma -1. Quando algum contador chega a `n` ou `-n`, alguém venceu. Cada jogada custa O(1) em vez de O(n²).
+
+## Implementação
+
+```python
+from enum import Enum
+from typing import List, Optional, Tuple
+
+
+class Simbolo(Enum):
+    X = "X"
+    O = "O"
+
+
+class Status(Enum):
+    EM_ANDAMENTO = "em andamento"
+    VITORIA = "vitória"
+    EMPATE = "empate"
+
+
+class JogadaInvalida(Exception):
+    pass
+
+
+class Tabuleiro:
+    def __init__(self, n: int = 3):
+        self.n = n
+        self.casas: List[List[Optional[Simbolo]]] = [[None] * n for _ in range(n)]
+        self.ocupadas = 0
+
+    def livre(self, l: int, c: int) -> bool:
+        return 0 <= l < self.n and 0 <= c < self.n and self.casas[l][c] is None
+
+    def jogar(self, l: int, c: int, s: Simbolo) -> None:
+        if not self.livre(l, c):
+            raise JogadaInvalida(f"casa ({l},{c}) indisponível")
+        self.casas[l][c] = s
+        self.ocupadas += 1
+
+    def cheio(self) -> bool:
+        return self.ocupadas == self.n * self.n
+
+    def desenhar(self) -> str:
+        return "\n".join(" ".join(s.value if s else "." for s in linha) for linha in self.casas)
+
+
+class DetectorDeVitoria:
+    def __init__(self, n: int):
+        self.n = n
+        self.linhas = [0] * n
+        self.colunas = [0] * n
+        self.diag = 0
+        self.anti = 0
+
+    def registrar(self, l: int, c: int, s: Simbolo) -> bool:
+        d = 1 if s is Simbolo.X else -1
+        self.linhas[l] += d
+        self.colunas[c] += d
+        if l == c:
+            self.diag += d
+        if l + c == self.n - 1:
+            self.anti += d
+        alvo = self.n * d
+        return alvo in (self.linhas[l], self.colunas[c], self.diag, self.anti)
+
+
+class Jogador:
+    def __init__(self, nome: str, simbolo: Simbolo):
+        self.nome = nome
+        self.simbolo = simbolo
+
+    def escolher_jogada(self, tab: Tabuleiro) -> Tuple[int, int]:
+        raise NotImplementedError
+
+
+class JogadorRoteiro(Jogador):
+    """Simula um humano com uma lista de jogadas pré-definidas."""
+    def __init__(self, nome, simbolo, jogadas):
+        super().__init__(nome, simbolo)
+        self.jogadas = list(jogadas)
+
+    def escolher_jogada(self, tab):
+        return self.jogadas.pop(0)
+
+
+class BotPrimeiraLivre(Jogador):
+    def escolher_jogada(self, tab):
+        for l in range(tab.n):
+            for c in range(tab.n):
+                if tab.livre(l, c):
+                    return l, c
+        raise JogadaInvalida("sem casas livres")
+
+
+class Partida:
+    def __init__(self, j1: Jogador, j2: Jogador, n: int = 3):
+        self.tabuleiro = Tabuleiro(n)
+        self.detector = DetectorDeVitoria(n)
+        self.jogadores = [j1, j2]
+        self.vez = 0
+        self.status = Status.EM_ANDAMENTO
+        self.vencedor: Optional[Jogador] = None
+
+    def proxima(self) -> Status:
+        if self.status is not Status.EM_ANDAMENTO:
+            raise JogadaInvalida("partida encerrada")
+        jogador = self.jogadores[self.vez]
+        l, c = jogador.escolher_jogada(self.tabuleiro)
+        self.tabuleiro.jogar(l, c, jogador.simbolo)  # se falhar, a vez não passa
+        if self.detector.registrar(l, c, jogador.simbolo):
+            self.status, self.vencedor = Status.VITORIA, jogador
+        elif self.tabuleiro.cheio():
+            self.status = Status.EMPATE
+        else:
+            self.vez = 1 - self.vez
+        return self.status
+
+    def jogar_ate_o_fim(self) -> Status:
+        while self.status is Status.EM_ANDAMENTO:
+            self.proxima()
+        return self.status
+
+
+ana = JogadorRoteiro("Ana", Simbolo.X, [(0, 0), (1, 1), (2, 2)])
+bot = BotPrimeiraLivre("Bot", Simbolo.O)
+p = Partida(ana, bot)
+print(p.jogar_ate_o_fim().value, "->", p.vencedor.nome)
+print(p.tabuleiro.desenhar())
+
+t = Tabuleiro()
+t.jogar(0, 0, Simbolo.X)
+try:
+    t.jogar(0, 0, Simbolo.O)
+except JogadaInvalida as e:
+    print("erro:", e)
+```
+
+Repare que a partida só troca a vez **depois** que o tabuleiro aceita a jogada. Se `jogar` lançar exceção, o mesmo jogador tenta de novo, e o detector nunca recebe uma jogada inválida.
+
+## Concorrência e extensões
+
+Num jogo local não há concorrência real. Ela aparece quando a partida vira um serviço online: dois clientes podem enviar jogadas quase ao mesmo tempo. A solução é tratar a partida como um agregado com um lock (ou uma fila de comandos por partida) e validar que quem jogou é o dono da vez. Uma versão do estado, incrementada a cada jogada, permite rejeitar uma jogada feita sobre um tabuleiro desatualizado.
+
+Extensões que o design já acomoda:
+
+- **Bot inteligente**: nova subclasse de `Jogador` com minimax. Como o `Tabuleiro` é independente da `Partida`, o bot pode copiá-lo e simular jogadas.
+- **K em linha num tabuleiro maior**: os contadores deixam de bastar. Troque o detector por um que, a partir da última casa, conte símbolos iguais nas quatro direções. Custa O(K) por jogada.
+- **Desfazer**: guarde um histórico de jogadas (Command) e reverta tabuleiro e contadores.
+- **Mais de dois jogadores**: troque `1 - self.vez` por `(self.vez + 1) % len(jogadores)` e o detector por contagem direcional.
+
+<Callout type="tip" title="Mostre a complexidade">
+Diga em voz alta que a detecção de vitória é O(1) por jogada graças aos contadores. É o detalhe que separa uma resposta mediana de uma boa neste problema.
+</Callout>
+
+## Follow-ups comuns
+
+- **"Como você testaria?"** Teste o detector isolado com sequências de jogadas e a partida com jogadores de roteiro, como no exemplo. Nada depende de entrada do teclado.
+- **"Por que não guardar o status como string?"** Enum impede valores impossíveis e facilita o `match` em quem consome.
+- **"Onde ficaria a interface?"** Fora do domínio. Uma camada de apresentação lê `tabuleiro.desenhar()` ou observa eventos da partida (Observer) e nunca altera o estado diretamente.
+- **"E se a jogada vier de uma API REST?"** O controlador traduz o pedido em `(l, c)` e chama a partida. O `JogadorRoteiro` mostra que a origem da jogada é irrelevante para o domínio.
+
+<QuizSet>
+<Quiz question="Por que usar contadores por linha, coluna e diagonal na detecção de vitória?" options={["Para economizar memória", "Para verificar vitória em tempo constante após cada jogada", "Porque o tabuleiro não guarda os símbolos", "Para suportar mais de dois jogadores"]} answer={1} explanation="Cada jogada atualiza no máximo quatro contadores, e basta checar se algum chegou a n ou -n." />
+<Quiz question="Qual padrão permite trocar um jogador humano por um bot sem mudar a Partida?" options={["Singleton", "Strategy", "Composite", "Memento"]} answer={1} explanation="A Partida depende da abstração Jogador; cada implementação é uma estratégia diferente de escolher jogadas." />
+</QuizSet>

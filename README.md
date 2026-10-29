@@ -1,6 +1,18 @@
 # CodeForge (versão pessoal)
 
-Plataforma de estudo para entrevistas de engenharia, para um único usuário. Tem leitor com destaques e notas, áudio sincronizado, editor com testes, quizzes e caderno. Tudo roda em serviços gratuitos.
+Plataforma de estudo para entrevistas de engenharia, para um único usuário, inspirada na estrutura do AlgoMaster.io. Todo o texto é original. Tudo roda em serviços gratuitos.
+
+## O que tem
+
+| Área | Recursos |
+|---|---|
+| Cursos | DSA, System Design, Entrevistas de System Design, Low Level Design e Comportamental. Capítulos ainda não escritos aparecem como "em breve" |
+| Leitor | Destaques em 5 cores, notas, caderno com busca e exportação `.md`, áudio com destaque palavra a palavra, modo livro (tecla B), progresso de leitura, sumário com seção ativa, tema claro/escuro e ajustes de fonte e largura |
+| Prática | Editor Monaco com Python e JavaScript rodando no navegador, testes por caso, rascunhos salvos, suporte a listas ligadas, árvores e classes de design; catálogo agrupado por padrão, filtros e problema aleatório |
+| Entrevista | Mock interview cronometrada (estilo, nível, modo sem executar, mistura de dificuldades), avaliação nas 6 áreas da rubrica com nota de 0 a 100 e histórico |
+| Recursos | Animações passo a passo com entrada editável, roadmaps de estudo, painel com sequência de dias e mapa de atividade, busca global (Ctrl+K) |
+
+Para validar conteúdo: `node scripts/check-content.mjs`. Para validar um problema com soluções de referência: `node scripts/check-problem.mjs <problema.mdx> <sol.py> <sol.js>`. O guia de escrita está em `content/GUIA-DE-ESCRITA.md`.
 
 ## Rodar no seu computador
 

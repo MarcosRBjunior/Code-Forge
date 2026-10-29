@@ -1,0 +1,72 @@
+---
+title: O problema das transações distribuídas
+kind: lesson
+---
+
+Dentro de um único banco relacional, garantir que "debitar estoque" e "criar pedido" aconteçam juntos é trivial: você abre uma transação, faz as duas escritas e dá `COMMIT`. O banco cuida de atomicidade, isolamento e durabilidade. O problema começa quando essas escritas moram em lugares diferentes: dois bancos, dois shards, dois microsserviços ou um banco e um broker de mensagens.
+
+## Por que é difícil
+
+Imagine um e-commerce com três serviços, cada um com o próprio banco:
+
+```text
+cliente -> Pedidos (Postgres A)
+              |-> Estoque (Postgres B): reservar 1 unidade
+              |-> Pagamentos (Postgres C): cobrar R$ 250
+```
+
+Cada serviço consegue ser atômico localmente, mas ninguém garante atomicidade **entre** eles. Veja o que pode dar errado:
+
+- O estoque é reservado, mas a cobrança falha. Agora há uma unidade presa sem pedido.
+- A cobrança é feita, mas o serviço de pedidos cai antes de gravar o pedido. O cliente pagou por nada.
+- A chamada para pagamentos dá timeout. Ela foi processada ou não? Você não sabe, e repetir pode cobrar duas vezes.
+
+Esse último caso é o coração do problema. Em redes reais, uma requisição sem resposta tem três explicações possíveis: a mensagem não chegou, o processamento falhou ou a resposta se perdeu. Do ponto de vista de quem chamou, elas são indistinguíveis.
+
+## O que se perde ao distribuir
+
+| Propriedade | Num banco só | Entre serviços |
+| --- | --- | --- |
+| Atomicidade | Rollback automático | Precisa de protocolo ou compensação |
+| Isolamento | Locks ou MVCC | Estados intermediários ficam visíveis |
+| Consistência | Constraints do banco | Invariantes cruzadas não têm quem verifique |
+| Durabilidade | WAL local | Cada participante tem a sua |
+
+Isolamento costuma ser a perda mais esquecida. Mesmo que você consiga atomicidade no fim, outro processo pode ler o estoque reservado antes de o pagamento falhar e tomar decisões em cima de um estado que vai ser desfeito.
+
+## As famílias de solução
+
+### Commit atômico (2PC, 3PC)
+
+Um coordenador pergunta a todos os participantes se podem confirmar e só manda confirmar quando todos dizem sim. Dá atomicidade de verdade, ao custo de bloqueio e acoplamento: os participantes seguram locks enquanto esperam o coordenador. Funciona bem dentro de um mesmo sistema, como entre shards de um banco distribuído, e mal entre serviços de times diferentes.
+
+### Sagas
+
+A operação vira uma sequência de transações locais. Se um passo falha, executam-se **compensações** que desfazem semanticamente os anteriores (estornar, liberar estoque). Não há isolamento, mas também não há locks distribuídos. É a abordagem padrão em microsserviços.
+
+### Outbox e eventos
+
+Muitas vezes o problema real é mais simples: gravar no banco **e** publicar um evento. O padrão outbox resolve isso gravando o evento na mesma transação local e publicando depois, de forma assíncrona e confiável.
+
+### Evitar o problema
+
+A melhor transação distribuída é a que você não precisa fazer. Se duas entidades sempre mudam juntas, talvez devam morar no mesmo serviço e no mesmo banco. Repensar fronteiras de serviço ou chaves de sharding (colocar pedido e itens no mesmo shard) costuma ser mais barato que qualquer protocolo.
+
+<Callout type="tip" title="Idempotência é pré-requisito">
+Qualquer que seja a solução, retries vão acontecer. Cada passo precisa aceitar ser executado mais de uma vez sem efeito duplicado, normalmente usando uma chave de idempotência gravada junto com o resultado.
+</Callout>
+
+## Trade-offs
+
+- **Consistência forte versus disponibilidade:** protocolos de commit atômico param quando um participante some; sagas continuam, mas expõem estados intermediários.
+- **Latência:** cada fase de coordenação adiciona idas e voltas pela rede.
+- **Complexidade de negócio:** compensações exigem que o domínio saiba desfazer coisas, e algumas ações (enviar um e-mail) não têm desfazer.
+
+## Na entrevista
+
+Quando seu desenho tiver uma operação que toca dois serviços ou dois shards, nomeie o problema antes que o entrevistador pergunte: "aqui precisamos de atomicidade entre Pedidos e Pagamentos; vou usar uma saga orquestrada com compensações e idempotência em cada passo". Follow-ups comuns: "por que não 2PC?" (bloqueio, acoplamento, coordenador como ponto de falha), "o que acontece se a compensação falhar?" (retry com backoff e, no limite, intervenção manual via dead letter queue).
+
+<QuizSet>
+<Quiz question="Uma chamada ao serviço de pagamentos deu timeout. O que o serviço chamador sabe com certeza?" options={["Que o pagamento não foi feito", "Que o pagamento foi feito", "Nada: o pagamento pode ou não ter sido processado", "Que o serviço de pagamentos está fora do ar"]} answer={2} explanation="Timeout não distingue mensagem perdida, falha no processamento ou resposta perdida. Por isso retries precisam ser idempotentes." />
+<Quiz question="Qual propriedade ACID as sagas abrem mão de forma explícita?" options={["Durabilidade", "Isolamento", "Atomicidade local", "Nenhuma"]} answer={1} explanation="Cada passo da saga confirma localmente, então outros processos enxergam estados intermediários antes da conclusão ou da compensação." />
+</QuizSet>

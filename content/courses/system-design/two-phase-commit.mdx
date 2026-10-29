@@ -1,0 +1,110 @@
+---
+title: Two-phase commit
+kind: lesson
+---
+
+O two-phase commit (2PC) é o protocolo clássico para fazer vários participantes confirmarem ou abortarem uma transação **juntos**. É usado por bancos distribuídos entre shards, pelo padrão XA (Java EE, alguns brokers) e internamente por sistemas como Spanner e CockroachDB, combinado com replicação por consenso.
+
+## Os papéis
+
+- **Coordenador:** conduz o protocolo e toma a decisão final. Pode ser um processo dedicado ou o próprio nó que recebeu a transação.
+- **Participantes:** cada banco ou recurso que executou parte do trabalho e precisa confirmar.
+
+## As duas fases
+
+### Fase 1: preparação (votação)
+
+O coordenador envia `PREPARE` a todos. Cada participante verifica se consegue confirmar: valida constraints, adquire os locks necessários e grava no seu log, de forma durável, tudo o que precisa para confirmar depois. Só então responde `SIM`. Se algo impedir, responde `NAO` e aborta localmente.
+
+Responder `SIM` é uma promessa: daqui em diante o participante **não pode mais desistir sozinho**. Ele precisa confirmar se o coordenador mandar, mesmo que reinicie no meio.
+
+### Fase 2: decisão
+
+- Se todos votaram `SIM`, o coordenador grava `COMMIT` no seu log (esse é o ponto de não retorno) e envia `COMMIT` a todos.
+- Se algum votou `NAO` ou não respondeu a tempo, grava `ABORT` e envia `ABORT`.
+
+Cada participante aplica a decisão, libera os locks e confirma o recebimento.
+
+```text
+Coordenador            Participante A        Participante B
+    |---- PREPARE ------->|                      |
+    |---- PREPARE ---------------------------->  |
+    |<--- SIM ------------|                      |
+    |<--- SIM ---------------------------------- |
+ grava COMMIT no log
+    |---- COMMIT -------->|                      |
+    |---- COMMIT ----------------------------->  |
+    |<--- ACK ------------|                      |
+    |<--- ACK ---------------------------------- |
+```
+
+## Um esboço em Python
+
+```python
+class Participante:
+    def __init__(self, nome, pode_confirmar=True):
+        self.nome = nome
+        self.pode_confirmar = pode_confirmar
+        self.estado = "inicial"
+
+    def preparar(self):
+        if not self.pode_confirmar:
+            self.estado = "abortado"
+            return False
+        self.estado = "preparado"   # locks presos, log gravado
+        return True
+
+    def confirmar(self):
+        self.estado = "confirmado"
+
+    def abortar(self):
+        self.estado = "abortado"
+
+
+def two_phase_commit(participantes):
+    votos = [p.preparar() for p in participantes]
+    decisao = all(votos)          # aqui o coordenador gravaria no log
+    for p in participantes:
+        p.confirmar() if decisao else p.abortar()
+    return decisao
+
+
+ps = [Participante("estoque"), Participante("pagamento", pode_confirmar=False)]
+print(two_phase_commit(ps), [p.estado for p in ps])
+```
+
+O esboço ignora rede e falhas justamente para mostrar o fluxo. Num sistema real, cada mensagem tem timeout e cada transição é gravada em disco antes de ser anunciada.
+
+## O calcanhar de Aquiles: bloqueio
+
+Considere um participante que votou `SIM` e, antes de receber a decisão, perde contato com o coordenador. Ele não pode confirmar (talvez outro participante tenha votado `NAO`) e não pode abortar (talvez o coordenador já tenha decidido `COMMIT`). Ele fica **em dúvida**, segurando locks, até o coordenador voltar.
+
+Se o coordenador caiu de vez e o log dele se perdeu, a situação só se resolve com intervenção manual. Por isso se diz que o 2PC é um protocolo **bloqueante**.
+
+<Callout type="warning" title="Locks presos afetam todo mundo">
+Enquanto um participante está em dúvida, as linhas que ele travou ficam indisponíveis para outras transações. Uma queda do coordenador vira indisponibilidade em cascata nos bancos participantes.
+</Callout>
+
+## Mitigações usadas na prática
+
+- **Coordenador replicado:** Spanner e CockroachDB gravam a decisão num grupo Paxos ou Raft, de modo que a queda de uma máquina não perde a decisão.
+- **Participantes perguntam uns aos outros:** se algum participante sabe que a decisão foi `ABORT` (ou ainda não votou), todos podem abortar. Isso ajuda, mas não resolve o caso em que todos votaram `SIM`.
+- **Timeouts antes do voto:** até votar, o participante pode abortar sozinho com segurança.
+
+## Trade-offs
+
+| Ponto | 2PC |
+| --- | --- |
+| Atomicidade | Forte |
+| Latência | Pelo menos duas idas e voltas, mais `fsync` em cada nó |
+| Disponibilidade | Cai se coordenador ou qualquer participante falhar |
+| Acoplamento | Todos precisam falar o mesmo protocolo |
+
+## Na entrevista
+
+2PC é a resposta certa para atomicidade entre shards de um mesmo banco ou entre recursos que suportam XA. Entre microsserviços de times diferentes, diga por que evitaria: bloqueio, acoplamento e baixa disponibilidade, e proponha saga. Follow-up comum: "o que acontece se o coordenador cair depois do PREPARE?" (participantes ficam em dúvida com locks presos até ele voltar ou até a decisão ser recuperada de um log replicado).
+
+<QuizSet>
+<Quiz question="Em que momento a decisão de COMMIT se torna irreversível no 2PC?" options={["Quando o primeiro participante vota SIM", "Quando o coordenador grava COMMIT no seu log", "Quando todos os participantes enviam ACK", "Quando o cliente recebe a resposta"]} answer={1} explanation="A gravação durável da decisão no log do coordenador é o ponto de não retorno; a partir daí todos devem confirmar, mesmo após quedas." />
+<Quiz question="Por que um participante que votou SIM não pode abortar sozinho ao perder o coordenador?" options={["Porque ele já liberou os locks", "Porque o coordenador pode já ter decidido COMMIT com base no voto dele", "Porque o protocolo não tem mensagem de abort", "Porque o log dele foi apagado"]} answer={1} explanation="O voto SIM é uma promessa. Se ele abortasse, outros participantes poderiam confirmar, quebrando a atomicidade." />
+</QuizSet>
