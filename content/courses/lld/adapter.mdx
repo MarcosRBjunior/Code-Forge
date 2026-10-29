@@ -1,0 +1,148 @@
+---
+title: Adapter
+kind: lesson
+---
+
+## O problema
+
+Seu sistema de checkout foi escrito em cima de uma interface simples: `GatewayPagamento.cobrar(valor_centavos, cartao_token)`. Ela devolve um `ResultadoCobranca` com `aprovado` e `codigo`. Tudo funciona até o time comercial fechar contrato com um novo provedor, a PagaFácil, cujo SDK tem outra cara: recebe o valor em reais como `Decimal`, chama o método `executar_transacao`, espera um dicionário de parâmetros e devolve um status em texto como `"APPROVED"` ou `"DECLINED"`.
+
+Você não controla o SDK (é código de terceiros) e não quer espalhar `if provedor == "pagafacil"` pelo checkout. O que você precisa é de uma peça que **traduza** uma interface na outra: o checkout continua falando a língua dele, e o SDK continua falando a dele. Essa peça é o **Adapter**.
+
+## Como funciona
+
+O Adapter implementa a interface que o cliente espera (o **alvo**) e, por dentro, guarda uma referência ao objeto incompatível (o **adaptado**). Cada chamada recebida é convertida: nomes de método, unidades, formatos de dados, códigos de erro. O cliente não sabe que existe tradução acontecendo.
+
+```text
+ +-------------+        usa        +---------------------+
+ |  Checkout   | ----------------> | <<interface>>       |
+ +-------------+                   | GatewayPagamento    |
+                                   | + cobrar(cent, tok) |
+                                   +---------------------+
+                                       ^            ^
+                          implementa   |            |  implementa
+                  +--------------------+            +----------------------+
+                  |                                                       |
+       +---------------------+                          +-----------------------------+
+       | GatewayInterno      |                          | PagaFacilAdapter            |
+       +---------------------+                          | - sdk: PagaFacilSDK         |
+                                                        | + cobrar(cent, tok)         |
+                                                        +-----------------------------+
+                                                                      | delega
+                                                                      v
+                                                        +-----------------------------+
+                                                        | PagaFacilSDK (terceiros)    |
+                                                        | + executar_transacao(dict)  |
+                                                        +-----------------------------+
+```
+
+Existem duas variantes clássicas. No **adapter de objeto** (o da figura), o adapter contém o adaptado por composição. No **adapter de classe**, o adapter herda do adaptado e da interface alvo ao mesmo tempo. Em Python as duas são possíveis, mas a de objeto é quase sempre preferível: funciona com qualquer instância (inclusive mocks) e não acopla você à hierarquia do terceiro.
+
+## Implementação em Python
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from decimal import Decimal
+
+
+@dataclass(frozen=True)
+class ResultadoCobranca:
+    aprovado: bool
+    codigo: str
+
+
+class GatewayPagamento(ABC):
+    @abstractmethod
+    def cobrar(self, valor_centavos: int, cartao_token: str) -> ResultadoCobranca: ...
+
+
+class GatewayInterno(GatewayPagamento):
+    def cobrar(self, valor_centavos, cartao_token):
+        return ResultadoCobranca(aprovado=valor_centavos <= 500_000, codigo="INT-OK")
+
+
+# --- SDK de terceiros: não podemos alterar este código ---
+class PagaFacilSDK:
+    def executar_transacao(self, params: dict) -> dict:
+        valor = params["amount"]
+        if params["card"].startswith("tok_bloq"):
+            return {"status": "DECLINED", "ref": "PF-000", "reason": "blocked_card"}
+        return {"status": "APPROVED", "ref": f"PF-{int(valor * 100)}"}
+
+
+class PagaFacilAdapter(GatewayPagamento):
+    """Traduz a interface do checkout para o SDK da PagaFácil."""
+
+    def __init__(self, sdk: PagaFacilSDK):
+        self._sdk = sdk
+
+    def cobrar(self, valor_centavos, cartao_token):
+        params = {
+            "amount": Decimal(valor_centavos) / 100,  # centavos -> reais
+            "card": cartao_token,
+            "currency": "BRL",
+        }
+        resposta = self._sdk.executar_transacao(params)
+        aprovado = resposta["status"] == "APPROVED"
+        codigo = resposta["ref"] if aprovado else resposta.get("reason", "erro")
+        return ResultadoCobranca(aprovado=aprovado, codigo=codigo)
+
+
+class Checkout:
+    def __init__(self, gateway: GatewayPagamento):
+        self._gateway = gateway
+
+    def finalizar(self, total_centavos: int, token: str) -> str:
+        r = self._gateway.cobrar(total_centavos, token)
+        return f"pedido pago ({r.codigo})" if r.aprovado else f"pagamento recusado: {r.codigo}"
+
+
+if __name__ == "__main__":
+    for gateway in (GatewayInterno(), PagaFacilAdapter(PagaFacilSDK())):
+        checkout = Checkout(gateway)
+        print(type(gateway).__name__, "->", checkout.finalizar(12_990, "tok_123"))
+    print(Checkout(PagaFacilAdapter(PagaFacilSDK())).finalizar(5_000, "tok_bloq_9"))
+```
+
+Repare que toda a conversão (centavos para reais, string de status para booleano, motivo de recusa para código) mora num único lugar. Se a PagaFácil mudar o SDK, só o adapter muda.
+
+## Quando usar
+
+- Integrar biblioteca de terceiros, sistema legado ou API externa cuja interface você não pode mudar.
+- Permitir que vários provedores (pagamento, SMS, armazenamento) fiquem atrás de uma interface única do seu domínio.
+- Isolar o domínio do vocabulário externo, criando uma "camada anticorrupção" pequena.
+
+## Quando evitar
+
+- Quando você controla as duas pontas: é mais simples alterar uma delas.
+- Quando a tradução vira lógica de negócio. Se o adapter começa a decidir regras (limites, retentativas, cálculo de juros), essas regras pertencem a outro lugar.
+- Quando as interfaces são semanticamente diferentes demais. Adaptar um serviço síncrono para um que só funciona por callback assíncrono, por exemplo, costuma esconder comportamento importante.
+
+<Callout type="warning" title="Cuidado com adapters que vazam">
+Se o código cliente precisa capturar exceções específicas do SDK adaptado, o adapter falhou no trabalho dele. Converta também os erros para exceções do seu domínio.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Interface exposta | Intenção |
+| --- | --- | --- |
+| Adapter | Diferente da do objeto interno | Tornar compatível algo incompatível |
+| Facade | Nova e mais simples | Esconder um subsistema inteiro |
+| Decorator | Igual à do objeto interno | Acrescentar comportamento |
+| Proxy | Igual à do objeto interno | Controlar acesso |
+
+A pergunta para diferenciar é: **a interface muda?** No Adapter, sim, e o motivo é compatibilidade com algo que já existe. Na Facade a interface também é nova, mas o objetivo é simplificar um conjunto de classes, não casar duas interfaces prontas.
+
+## Na entrevista
+
+Cite Adapter sempre que o enunciado mencionar "integrar com provedor X", "suportar vários gateways" ou "sistema legado". Desenhe a interface do seu domínio primeiro e mostre o adapter como detalhe de borda. Perguntas comuns de follow-up:
+
+- **Como testar?** Injete um SDK falso no adapter e verifique as conversões; o checkout é testado com um gateway fake, sem adapter nenhum.
+- **Adapter de classe ou de objeto?** Objeto, por composição: menos acoplamento e funciona com subclasses do adaptado.
+- **E se o provedor tiver funcionalidade extra?** Não force tudo na interface comum; exponha só o que o domínio precisa.
+
+<QuizSet>
+<Quiz question="Qual é a característica que melhor distingue o Adapter do Decorator?" options={["O Adapter sempre usa herança", "O Adapter muda a interface; o Decorator mantém a mesma", "O Decorator só funciona com classes de terceiros", "Não há diferença estrutural"]} answer={1} explanation="O Adapter converte uma interface em outra que o cliente espera. O Decorator mantém a interface e adiciona comportamento." />
+<Quiz question="Seu adapter de SMS deixa escapar a exceção TwilioTimeout para o serviço de notificações. Qual a correção mais adequada?" options={["Capturar TwilioTimeout no serviço de notificações", "Converter a exceção dentro do adapter para um erro do domínio", "Remover o adapter e chamar o SDK direto", "Ignorar a exceção"]} answer={1} explanation="O adapter deve traduzir também os erros, para que o cliente não dependa de detalhes do provedor." />
+</QuizSet>

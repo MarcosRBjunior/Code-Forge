@@ -1,0 +1,76 @@
+---
+title: Transações ACID
+kind: lesson
+---
+
+Uma transferência de R$ 100 da conta A para a B são duas escritas: debitar A e creditar B. Se o servidor cair entre elas, o dinheiro some. Se duas transferências lerem o mesmo saldo ao mesmo tempo, o dinheiro pode ser gasto duas vezes. Uma **transação** agrupa operações para que o banco trate esses problemas por você, e **ACID** resume as quatro garantias que ela oferece.
+
+## As quatro letras
+
+### Atomicidade
+
+Tudo ou nada. Se qualquer parte falhar, o banco desfaz as alterações já feitas (rollback). Não existe estado intermediário visível depois de um erro. Note que atomicidade é sobre **falhas**, não sobre concorrência.
+
+### Consistência
+
+A transação leva o banco de um estado válido a outro válido, respeitando as regras declaradas: chaves estrangeiras, `UNIQUE`, `CHECK (saldo >= 0)`. Na prática, boa parte das invariantes de negócio são responsabilidade da aplicação; o banco só garante as que você declarou. (Não confunda com o "C" do teorema CAP, que fala de réplicas vendo o mesmo dado.)
+
+### Isolamento
+
+Transações concorrentes não devem interferir umas nas outras. O ideal teórico é **serializabilidade**: o resultado é igual ao de alguma execução em fila. Como isso custa caro, bancos oferecem níveis mais fracos.
+
+### Durabilidade
+
+Depois do `COMMIT` confirmado, o dado sobrevive a quedas. O mecanismo típico é o **write-ahead log (WAL)**: antes de alterar as páginas de dados, o banco grava a mudança num log sequencial e força o `fsync`. Na recuperação, ele refaz o que estava no log. Em sistemas replicados, durabilidade também pode significar "confirmado em mais de uma máquina".
+
+## Exemplo
+
+```sql
+BEGIN;
+UPDATE contas SET saldo = saldo - 100 WHERE id = 'A' AND saldo >= 100;
+-- a aplicação verifica que 1 linha foi afetada; senão, ROLLBACK
+UPDATE contas SET saldo = saldo + 100 WHERE id = 'B';
+INSERT INTO extrato (origem, destino, valor) VALUES ('A', 'B', 100);
+COMMIT;
+```
+
+## Anomalias e níveis de isolamento
+
+Cada nível de isolamento impede certas anomalias:
+
+- **Dirty read:** ler dado de outra transação ainda não confirmada.
+- **Non-repeatable read:** ler a mesma linha duas vezes e obter valores diferentes.
+- **Phantom read:** repetir uma consulta por intervalo e aparecerem linhas novas.
+- **Lost update:** duas transações leem, calculam e gravam; uma sobrescreve a outra.
+- **Write skew:** duas transações leem o mesmo conjunto, cada uma grava em linhas diferentes, e juntas violam uma regra (dois médicos saem do plantão ao mesmo tempo, cada um vendo que o outro estava lá).
+
+| Nível | Dirty read | Non-repeatable | Phantom | Write skew |
+| --- | --- | --- | --- | --- |
+| Read uncommitted | Possível | Possível | Possível | Possível |
+| Read committed | Evita | Possível | Possível | Possível |
+| Repeatable read / snapshot | Evita | Evita | Depende do banco | Possível |
+| Serializable | Evita | Evita | Evita | Evita |
+
+O padrão do PostgreSQL é *read committed*; o do MySQL InnoDB é *repeatable read*. No PostgreSQL, *repeatable read* é implementado como **snapshot isolation**, que já impede phantoms mas não write skew; o nível *serializable* usa SSI (snapshot isolation serializável), que detecta conflitos e aborta uma das transações.
+
+## Como o banco implementa isolamento
+
+- **Locks em duas fases (2PL):** a transação adquire locks e só libera no fim. Leitores bloqueiam escritores e vice-versa.
+- **MVCC (controle de concorrência multiversão):** cada escrita cria uma nova versão da linha; cada transação lê um *snapshot* consistente. Leitores não bloqueiam escritores. É o que PostgreSQL, MySQL InnoDB e Oracle usam, combinados com locks para escritas conflitantes.
+
+<Callout type="warning" title="Lost update no código">
+`saldo = ler(); gravar(saldo - 100)` em duas requisições simultâneas perde uma das retiradas, mesmo dentro de transações em *read committed*. Use atualização atômica (`SET saldo = saldo - 100`), `SELECT ... FOR UPDATE` ou controle otimista com coluna de versão.
+</Callout>
+
+## ACID versus BASE
+
+Muitos bancos distribuídos seguem o estilo **BASE** (basically available, soft state, eventual consistency): priorizam disponibilidade e aceitam que réplicas convirjam com o tempo. Não é "melhor" nem "pior"; é outra troca, adequada a curtidas e feeds, inadequada a saldos.
+
+## Na entrevista
+
+Quando houver dinheiro, estoque ou reservas, diga explicitamente que a operação é uma transação e qual nível de isolamento você precisa. Follow-ups: "como evitar vender o mesmo assento duas vezes?" (lock de linha, constraint `UNIQUE` ou serializable), "e se a transação precisar cruzar dois serviços?" (saga ou outbox, vistos mais adiante).
+
+<QuizSet>
+<Quiz question="Qual mecanismo garante principalmente a durabilidade de uma transação confirmada?" options={["Índices B-tree", "Write-ahead log gravado em disco antes da confirmação", "MVCC", "Constraint UNIQUE"]} answer={1} explanation="O WAL registra a mudança de forma sequencial e persistente antes do commit; após uma queda, o banco o reaplica." />
+<Quiz question="Dois médicos de plantão, em transações concorrentes sob snapshot isolation, verificam que há outro médico disponível e cada um marca a própria saída. Ninguém fica de plantão. Que anomalia é essa?" options={["Dirty read", "Write skew", "Phantom read de leitura única", "Falha de durabilidade"]} answer={1} explanation="Cada transação leu o mesmo conjunto e gravou em linhas diferentes, violando juntas uma regra. Snapshot isolation não impede write skew; serializable impede." />
+</QuizSet>

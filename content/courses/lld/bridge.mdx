@@ -1,0 +1,152 @@
+---
+title: Bridge
+kind: lesson
+---
+
+## O problema
+
+Uma plataforma de alertas envia vários **tipos de alerta**: alerta simples, alerta urgente (que repete e marca como prioritário) e resumo diário (que agrupa vários eventos). Cada um pode sair por vários **canais**: e-mail, SMS e Slack.
+
+Se você modelar com herança, cada combinação vira uma classe: `AlertaUrgenteEmail`, `AlertaUrgenteSms`, `ResumoDiarioSlack`... São 3 tipos vezes 3 canais, 9 classes. Um quarto canal (WhatsApp) cria mais 3; um quarto tipo cria mais 4. O crescimento é multiplicativo, e a lógica de "como formatar um urgente" fica duplicada em três lugares.
+
+O problema real é que existem **duas dimensões de variação independentes** misturadas numa única hierarquia. O **Bridge** separa essas dimensões em duas hierarquias e liga uma à outra por composição: a "ponte".
+
+## Como funciona
+
+- A **abstração** (`Alerta`) define o que o cliente usa e contém uma referência a um **implementador** (`Canal`).
+- **Abstrações refinadas** (`AlertaUrgente`, `ResumoDiario`) variam a lógica de alto nível.
+- **Implementadores concretos** (`CanalEmail`, `CanalSms`) variam a parte de baixo nível.
+
+Com isso, 3 tipos e 3 canais viram 3 + 3 classes, e qualquer tipo funciona com qualquer canal.
+
+```text
+     ABSTRAÇÃO (o que)                       IMPLEMENTAÇÃO (como)
+ +-----------------------+    ponte     +---------------------------+
+ | Alerta                |------------->| <<interface>> Canal       |
+ | - canal: Canal        |              | + enviar(dest, titulo,    |
+ | + disparar(dest, ...) |              |          corpo, prioridade)|
+ +-----------------------+              +---------------------------+
+      ^            ^                      ^          ^          ^
+      |            |                      |          |          |
+ AlertaUrgente  ResumoDiario          CanalEmail  CanalSms  CanalSlack
+```
+
+A interface do implementador deve ser **primitiva** (operações básicas como "enviar texto com prioridade"), enquanto a abstração compõe essas primitivas em comportamentos mais ricos.
+
+## Implementação em Python
+
+```python
+from abc import ABC, abstractmethod
+
+
+# ---------- hierarquia de implementação ----------
+class Canal(ABC):
+    @abstractmethod
+    def enviar(self, destino: str, titulo: str, corpo: str, prioritario: bool) -> None: ...
+
+    limite_caracteres = None  # None = sem limite
+
+
+class CanalEmail(Canal):
+    def enviar(self, destino, titulo, corpo, prioritario):
+        flag = "[IMPORTANTE] " if prioritario else ""
+        print(f"EMAIL para {destino} | {flag}{titulo}\n  {corpo}")
+
+
+class CanalSms(Canal):
+    limite_caracteres = 70
+
+    def enviar(self, destino, titulo, corpo, prioritario):
+        texto = f"{titulo}: {corpo}"[: self.limite_caracteres]
+        print(f"SMS para {destino} | {texto}")
+
+
+class CanalSlack(Canal):
+    def enviar(self, destino, titulo, corpo, prioritario):
+        mencao = "@here " if prioritario else ""
+        print(f"SLACK #{destino} | {mencao}*{titulo}* {corpo}")
+
+
+# ---------- hierarquia de abstração ----------
+class Alerta:
+    def __init__(self, canal: Canal):
+        self.canal = canal
+
+    def disparar(self, destino: str, evento: str) -> None:
+        self.canal.enviar(destino, "Alerta", evento, prioritario=False)
+
+
+class AlertaUrgente(Alerta):
+    def __init__(self, canal, repeticoes=2):
+        super().__init__(canal)
+        self.repeticoes = repeticoes
+
+    def disparar(self, destino, evento):
+        for i in range(1, self.repeticoes + 1):
+            self.canal.enviar(destino, f"URGENTE ({i}/{self.repeticoes})", evento, prioritario=True)
+
+
+class ResumoDiario(Alerta):
+    def __init__(self, canal):
+        super().__init__(canal)
+        self._eventos = []
+
+    def disparar(self, destino, evento):
+        self._eventos.append(evento)
+
+    def fechar_dia(self, destino):
+        corpo = "; ".join(self._eventos) or "nada a relatar"
+        self.canal.enviar(destino, f"Resumo ({len(self._eventos)} eventos)", corpo, prioritario=False)
+        self._eventos.clear()
+
+
+if __name__ == "__main__":
+    AlertaUrgente(CanalSms()).disparar("+55 11 99999-0000", "Banco de dados primário fora do ar há 5 minutos")
+    AlertaUrgente(CanalSlack(), repeticoes=1).disparar("plantao", "Fila de pedidos acima de 10 mil")
+
+    resumo = ResumoDiario(CanalEmail())
+    resumo.disparar("time@empresa.com", "deploy v2.3")
+    resumo.disparar("time@empresa.com", "backup concluído")
+    resumo.fechar_dia("time@empresa.com")
+
+    resumo.canal = CanalSlack()  # a implementação pode ser trocada em tempo de execução
+    resumo.disparar("ops", "certificado renova em 7 dias")
+    resumo.fechar_dia("ops")
+```
+
+Adicionar WhatsApp é criar **uma** classe `CanalWhatsApp`; todos os tipos de alerta passam a funcionar com ela automaticamente. Adicionar "alerta silencioso" é criar **uma** subclasse de `Alerta`.
+
+## Quando usar
+
+- Duas (ou mais) dimensões que variam de forma independente: forma e renderizador, tipo de relatório e formato de saída, dispositivo e controle remoto, driver de banco e consultas de alto nível.
+- Você quer trocar a implementação em tempo de execução.
+- Você quer que mudanças numa dimensão não obriguem a recompilar ou reescrever a outra.
+
+## Quando evitar
+
+- Só existe uma dimensão de variação. Nesse caso, uma interface com implementações (ou uma Strategy) basta.
+- Quando a interface do implementador não consegue ser comum: se cada canal precisa de parâmetros completamente diferentes, a ponte vira um amontoado de casos especiais.
+- No início de um projeto, criar a separação "por precaução" é YAGNI. Introduza o Bridge quando a explosão de classes começar a aparecer.
+
+<Callout type="tip" title="Uma heurística rápida">
+Se você está nomeando classes com dois substantivos colados, como `RelatorioVendasPdf` e `RelatorioVendasCsv`, provavelmente há duas dimensões escondidas pedindo um Bridge.
+</Callout>
+
+## Padrões parecidos
+
+- **Strategy**: estruturalmente quase igual (um objeto delega a outro por composição). A diferença é de intenção e escala: Strategy troca **um algoritmo** dentro de um contexto; Bridge separa **duas hierarquias inteiras** que evoluem em paralelo, e a abstração também tem subclasses.
+- **Adapter**: aplicado **depois**, para fazer coisas existentes conversarem. Bridge é decidido **antes**, no design, para permitir que as partes evoluam separadamente.
+- **Abstract Factory**: pode ser usada para criar o par certo de abstração e implementação, por exemplo escolhendo o canal conforme a preferência do usuário.
+
+## Na entrevista
+
+Bridge aparece em "serviço de notificações" (tipo de mensagem e canal), "editor de formas" (forma e API gráfica) e "controle remoto de dispositivos". Comece mostrando a explosão de classes com herança (desenhe a matriz) e depois separe em duas hierarquias. Follow-ups comuns:
+
+- **Qual a diferença para Strategy?** Duas hierarquias versus um algoritmo plugável.
+- **Como escolher o canal?** Configuração do usuário, uma fábrica ou injeção de dependência.
+- **E se um canal não suportar prioridade?** Ele ignora o parâmetro; a interface do implementador deve ser o mínimo comum.
+
+<QuizSet>
+<Quiz question="Você tem 4 tipos de relatório e 3 formatos de saída, modelados como 12 subclasses. Qual padrão reduz isso para 4 + 3 classes?" options={["Decorator", "Bridge", "Singleton", "Memento"]} answer={1} explanation="Bridge separa as duas dimensões (relatório e formato) em hierarquias ligadas por composição." />
+<Quiz question="No Bridge, como a abstração se relaciona com o implementador?" options={["Herda dele", "Contém uma referência a ele (composição)", "Converte sua interface", "Clona seus objetos"]} answer={1} explanation="A ponte é justamente a referência da abstração para o implementador, o que permite trocá-lo e evoluir ambos separadamente." />
+</QuizSet>

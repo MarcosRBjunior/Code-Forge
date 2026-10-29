@@ -1,0 +1,172 @@
+---
+title: Projetar um gerador de IDs únicos
+kind: lesson
+---
+
+Num banco único, `AUTO_INCREMENT` resolve a geração de identificadores. Quando você tem dezenas de bancos particionados e milhares de servidores criando registros ao mesmo tempo, essa solução deixa de existir. Esta questão pede um serviço (ou biblioteca) que produza IDs únicos em escala, rápido e sem coordenação a cada chamada.
+
+## Requisitos
+
+### Funcionais
+
+- Gerar IDs **únicos** globalmente, sem nenhuma colisão.
+- IDs numéricos de 64 bits (cabem num `BIGINT` e indexam bem).
+- **Ordenáveis aproximadamente por tempo**: um ID gerado depois tende a ser maior.
+- Opcional: extrair o instante de criação a partir do ID.
+
+### Não funcionais
+
+- Altíssima taxa: centenas de milhares de IDs por segundo no total.
+- Latência mínima, idealmente sem chamada de rede.
+- Sem ponto único de falha.
+
+Pergunte se a ordenação precisa ser estrita. Quase sempre a resposta é "aproximada basta", e isso libera o design para ser descentralizado.
+
+## Estimativas
+
+- Pico de 1 milhão de IDs por segundo em todo o sistema.
+- Vida útil desejada: pelo menos 50 anos.
+- Com 64 bits, existem 1,8 × 10^19 valores possíveis; a quantidade em si não é problema. O desafio é **dividir os bits** para garantir unicidade sem coordenação.
+
+Cálculo dos bits de tempo: 50 anos em milissegundos são 50 × 365 × 86.400 × 1.000 ≈ 1,6 × 10^12. Como 2^41 ≈ 2,2 × 10^12, **41 bits** de milissegundos cobrem cerca de 69 anos a partir de uma época personalizada.
+
+## API
+
+Como biblioteca, embutida em cada serviço:
+
+```text
+proximo_id() -> 7134950028340203520
+decompor(id) -> { ts: 2026-10-29T12:00:00.123Z, maquina: 213, seq: 0 }
+```
+
+Como serviço de rede (menos comum, útil para linguagens sem a biblioteca):
+
+```text
+GET /ids?quantidade=100
+  resposta 200: { "ids": [7134950028340203520, ...] }
+```
+
+Pedir em lote amortiza o custo da chamada de rede.
+
+## Modelo de dados
+
+O gerador quase não tem estado persistente. O único dado coordenado é a **atribuição de ID de máquina**:
+
+```text
+maquinas_registradas
+  maquina_id (0..1023) | host | lease_expira_em
+```
+
+Cada instância, ao subir, obtém um `maquina_id` livre com um lease renovável (num ZooKeeper, etcd ou tabela de banco). Fora isso, tudo vive em memória: último timestamp e contador de sequência.
+
+## Arquitetura de alto nível
+
+Layout de 64 bits:
+
+```text
+ 0 | 41 bits: ms desde a época | 10 bits: máquina | 12 bits: sequência
+ ^
+ bit de sinal sempre 0 (ID positivo)
+```
+
+```text
++------------------+     lease do maquina_id     +-------------+
+| Serviço A        |<--------------------------->|  etcd /     |
+| [lib gerador]    |                             |  ZooKeeper  |
++------------------+                             |             |
+| Serviço B        |<--------------------------->|             |
+| [lib gerador]    |                             +-------------+
++------------------+
+        |
+        v  IDs gerados localmente, sem rede
+   +-----------+
+   |  Bancos   |
+   +-----------+
+```
+
+Capacidade: 12 bits de sequência dão 4.096 IDs por milissegundo **por máquina**, ou seja, 4 milhões por segundo por instância. Com 1.024 máquinas possíveis, o teto teórico passa de 4 bilhões por segundo, muito acima da necessidade.
+
+## Aprofundamentos
+
+### 1. O algoritmo
+
+```python
+import threading
+import time
+
+EPOCA_MS = 1704067200000  # 2024-01-01
+
+class GeradorIds:
+    def __init__(self, maquina_id: int):
+        assert 0 <= maquina_id < 1024
+        self.maquina_id = maquina_id
+        self.ultimo_ms = -1
+        self.seq = 0
+        self.trava = threading.Lock()
+
+    def _agora(self) -> int:
+        return int(time.time() * 1000) - EPOCA_MS
+
+    def proximo(self) -> int:
+        with self.trava:
+            ms = self._agora()
+            if ms < self.ultimo_ms:
+                raise RuntimeError("relógio voltou no tempo")
+            if ms == self.ultimo_ms:
+                self.seq = (self.seq + 1) & 0xFFF
+                if self.seq == 0:          # esgotou o milissegundo
+                    while ms <= self.ultimo_ms:
+                        ms = self._agora()
+            else:
+                self.seq = 0
+            self.ultimo_ms = ms
+            return (ms << 22) | (self.maquina_id << 12) | self.seq
+
+g = GeradorIds(maquina_id=213)
+print(g.proximo(), g.proximo())
+```
+
+O ID é único porque nenhuma outra máquina usa o mesmo `maquina_id`, e dentro da mesma máquina a combinação milissegundo mais sequência nunca se repete.
+
+### 2. O relógio que volta
+
+Sincronização NTP pode atrasar o relógio de um servidor em alguns milissegundos. Se o gerador emitir IDs com timestamp anterior ao último, pode repetir um ID já emitido. Estratégias:
+
+- Para recuos pequenos (poucos ms), **esperar** até o relógio alcançar o último timestamp.
+- Para recuos grandes, **recusar** e alertar; a instância sai de serviço.
+- Configurar o NTP para ajustar gradualmente (slew) em vez de saltar.
+- Guardar o último timestamp usado e, se ele estiver no futuro, continuar a partir dele (o "relógio lógico" segue o maior valor visto).
+
+### 3. Atribuição de ID de máquina
+
+Se duas instâncias receberem o mesmo `maquina_id`, a unicidade quebra silenciosamente. Por isso a atribuição precisa de um coordenador com leases: a instância só gera IDs enquanto seu lease é válido e para imediatamente se não conseguir renovar. Em ambientes com contêineres efêmeros, onde instâncias nascem e morrem o tempo todo, 10 bits podem ficar apertados; você pode trocar bits de sequência por bits de máquina, conforme o perfil de carga.
+
+<Callout type="note" title="Por que não UUID?">
+UUID v4 é único sem coordenação nenhuma, mas tem 128 bits e é aleatório. Em índices B-tree, inserções aleatórias espalham escritas por todas as páginas e degradam o desempenho. IDs ordenados por tempo inserem sempre no fim do índice.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Abordagem | Unicidade | Ordenação | Coordenação | Tamanho |
+| --- | --- | --- | --- | --- |
+| Auto-incremento num banco central | Sim | Estrita | Toda chamada | 64 bits |
+| Faixas pré-alocadas | Sim | Por faixa | Por bloco | 64 bits |
+| UUID v4 | Probabilística | Nenhuma | Nenhuma | 128 bits |
+| UUID v7 / ULID | Probabilística | Por tempo | Nenhuma | 128 bits |
+| Layout tempo + máquina + sequência | Sim | Aproximada | Só no boot | 64 bits |
+
+- Ordenação aproximada significa que dois IDs gerados em máquinas diferentes no mesmo milissegundo podem sair "fora de ordem". Para a maioria dos casos (paginação, índices) isso é irrelevante.
+- IDs revelam informação: timestamp e volume aproximado de criação. Se isso for sensível, ofusque antes de expor publicamente.
+- O layout é um contrato: mudar a divisão de bits depois exige cuidado para não colidir com IDs antigos.
+
+## Perguntas de follow-up comuns
+
+- O que acontece depois de 69 anos? Troca-se a época; IDs antigos continuam válidos, mas é preciso garantir que os novos não colidam, por exemplo usando o bit de sinal ou uma nova faixa.
+- Como gerar IDs em várias regiões? Reserve alguns bits de máquina para a região (por exemplo, 3 bits de região e 7 de máquina).
+- E se eu precisar de ordenação estrita global? Só com um sequenciador central (ou consenso), aceitando o gargalo e a latência.
+- Como gerar IDs curtos para URLs públicas? Converta o número para base62 e aplique uma permutação reversível.
+
+<QuizSet>
+<Quiz question="Quantos IDs por milissegundo uma máquina gera com 12 bits de sequência?" options={["1.024", "2.048", "4.096", "8.192"]} answer={2} explanation="2 elevado a 12 é 4.096 valores de sequência por milissegundo." />
+<Quiz question="O NTP recuou o relógio de um servidor em 3 ms. Qual reação é segura?" options={["Ignorar e continuar gerando", "Esperar até o relógio alcançar o último timestamp usado", "Zerar a sequência e continuar", "Trocar o maquina_id aleatoriamente"]} answer={1} explanation="Gerar com timestamp antigo pode repetir IDs; esperar é seguro para recuos pequenos." />
+</QuizSet>

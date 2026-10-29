@@ -1,0 +1,148 @@
+---
+title: Projetar o Uber
+kind: lesson
+---
+
+Um app de corridas junta duas dificuldades: rastrear em tempo real a posição de milhões de motoristas e casar cada pedido com um motorista próximo, sem que dois passageiros fiquem com o mesmo carro. A questão testa indexação geoespacial, escrita de alta frequência e consistência no momento crítico do aceite.
+
+## Requisitos
+
+### Funcionais
+
+- Passageiro informa origem e destino e vê uma estimativa de preço.
+- Passageiro solicita a corrida; o sistema encontra um motorista próximo disponível.
+- Motorista recebe a oferta e aceita ou recusa.
+- Ambos acompanham a posição um do outro durante a corrida.
+- Opcional: pagamento, avaliação, preço dinâmico.
+
+### Não funcionais
+
+- Encontrar motorista rápido: menos de 1 minuto no total, idealmente segundos.
+- **Um motorista nunca recebe duas corridas ao mesmo tempo.**
+- Atualizações de localização com atraso baixo (poucos segundos).
+- Alta disponibilidade no pedido de corrida.
+
+## Estimativas
+
+- 5 milhões de motoristas ativos no pico, enviando localização a cada 4 segundos: **1,25 milhão de atualizações por segundo**.
+- Cada atualização tem uns 100 bytes: 125 MB/s de entrada.
+- 20 milhões de corridas por dia: cerca de **230 pedidos por segundo**, com pico de 1.000/s.
+- Estado "posição atual" de todos os motoristas: 5 M × 100 B = **500 MB**. Cabe inteiro em memória.
+
+O contraste é instrutivo: as localizações são muitíssimas escritas de dados efêmeros (só a mais recente importa), enquanto as corridas são poucas escritas que precisam de consistência forte. São dois subsistemas com bancos diferentes.
+
+## API
+
+```text
+POST /api/v1/estimativas
+  body: { "origem": {"lat": -23.56, "lng": -46.65}, "destino": {...} }
+  resposta: { "estimativaId": "e_1", "preco": 32.50, "expiraEm": "..." }
+
+POST /api/v1/corridas
+  body: { "estimativaId": "e_1" }
+  resposta 202: { "corridaId": "r_77", "status": "procurando" }
+
+POST /api/v1/motoristas/localizacao     (ou via WebSocket)
+  body: { "lat": -23.561, "lng": -46.652, "ts": 1730203248 }
+
+POST /api/v1/corridas/r_77/aceitar      (motorista)
+  resposta 200 ou 409 se a oferta já expirou
+```
+
+Passageiro e motorista mantêm uma conexão persistente para receber eventos (oferta, motorista a caminho, posição) sem polling.
+
+## Modelo de dados
+
+```text
+corridas (banco relacional)
+  corrida_id | passageiro_id | motorista_id | status | origem | destino
+  | preco | criado_em | atualizado_em
+
+motoristas (banco relacional)
+  motorista_id | veiculo | status (offline/disponivel/em_oferta/em_corrida)
+
+localizacao_atual (em memória, índice geoespacial)
+  celula_geo -> conjunto de motorista_id
+  motorista_id -> (lat, lng, ts)
+
+historico_localizacao (série temporal, append-only, para auditoria)
+```
+
+## Arquitetura de alto nível
+
+```text
+ app motorista                             app passageiro
+      | localização a cada 4 s                   | pedido
++-----v-------------+                     +------v-----------+
+| Gateway WebSocket |<--------------------| Serviço de       |
++-----+-------------+   ofertas/eventos   | corridas         |
+      |                                   +---+----------+---+
++-----v-------------+                         |          |
+| Serviço de        |   busca próximos   +----v-----+  +-v--------------+
+| localização       |<-------------------| Matching |  | Banco de       |
++-----+-------------+                    +----+-----+  | corridas (SQL) |
+      |                                       |        +----------------+
++-----v-------------+                  +------v------+
+| Índice geo em     |                  | Lock de     |
+| memória (Redis    |                  | motorista   |
+| ou shards próprios|                  | (Redis/SQL) |
++-------------------+                  +-------------+
+      |
+      +--> Kafka --> histórico / ETA / preço dinâmico
+```
+
+## Aprofundamentos
+
+### 1. Indexação geoespacial
+
+Varrer 5 milhões de motoristas calculando distância a cada pedido é inviável. Você precisa de um índice que responda "quem está perto deste ponto". Opções:
+
+| Índice | Ideia | Observação |
+| --- | --- | --- |
+| Geohash | Codifica lat/lng numa string; prefixos comuns indicam proximidade | Simples, mas células vizinhas podem ter prefixos diferentes; consulte também as 8 vizinhas |
+| Quadtree | Divide o mapa recursivamente onde há densidade | Adapta-se a cidades densas; atualizar é mais caro |
+| Grade hexagonal | Células de tamanho uniforme com vizinhança regular | Boa para agregações como preço por região |
+
+Com geohash de precisão 6 (células de cerca de 1,2 km × 0,6 km), a busca vira: calcule a célula do passageiro, leia os motoristas dela e das vizinhas, filtre por disponibilidade e ordene por distância. Se houver poucos candidatos, amplie o raio. No Redis, os comandos geoespaciais nativos fazem exatamente isso.
+
+### 2. Atualizações de localização em alta taxa
+
+1,25 milhão de escritas por segundo não devem ir para um banco durável com transações. A posição atual só importa enquanto é atual: se uma atualização se perder, a próxima chega em 4 segundos. Por isso o índice fica em memória, particionado por região geográfica (cada cidade ou conjunto de células num shard), sem replicação síncrona. Em paralelo, as atualizações vão para um log (Kafka) que alimenta histórico, cálculo de ETA e preço dinâmico, todos assíncronos.
+
+Uma otimização relevante: o app do motorista pode reduzir a frequência quando o carro está parado ou não está disponível.
+
+### 3. Matching sem duplicidade
+
+O ponto mais delicado. O serviço de matching escolhe o melhor candidato e precisa **reservá-lo** antes de enviar a oferta. Se dois pedidos simultâneos escolherem o mesmo motorista, só um pode vencer:
+
+```sql
+UPDATE motoristas
+SET status = 'em_oferta', corrida_ofertada = 'r_77', oferta_expira = now() + interval '15 seconds'
+WHERE motorista_id = 4512 AND status = 'disponivel';
+-- 1 linha afetada: reservado. 0 linhas: tente o próximo candidato.
+```
+
+A oferta tem prazo. Se o motorista não responder em 15 segundos, um job (ou TTL no Redis) devolve o status a "disponível" e o matching passa ao próximo. Quando o motorista aceita, a transição para "em_corrida" também é condicional, garantindo que ele não aceite uma oferta já expirada.
+
+<Callout type="warning" title="Não confie só no índice em memória">
+O índice geoespacial diz quem está perto, mas pode estar alguns segundos desatualizado. A decisão de disponibilidade precisa vir de uma operação atômica numa fonte consistente.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Precisão versus custo**: atualizar a cada 2 segundos melhora ETA e matching, mas dobra a carga.
+- **Shards por região**: grandes eventos (show, final de campeonato) concentram motoristas e pedidos numa célula; shards precisam ser subdivididos dinamicamente.
+- **Matching guloso versus em lote**: atribuir imediatamente o mais próximo é simples; acumular pedidos por 2 segundos e otimizar o conjunto reduz o tempo médio de espera da cidade toda.
+- **Consistência**: localização é eventual e perdível; corrida e pagamento são fortes e transacionais.
+
+## Perguntas de follow-up comuns
+
+- Como calcular o preço dinâmico? Agregue oferta e demanda por célula em janelas de 1 minuto num processador de streaming e aplique um multiplicador.
+- Como estimar o tempo de chegada? Serviço de rotas com grafo viário e velocidades históricas e em tempo real.
+- E se o serviço de localização de uma região cair? Os motoristas reenviam a posição em segundos; o índice se reconstrói rapidamente a partir das próximas atualizações.
+- Como suportar corridas compartilhadas? O matching passa a considerar rotas compatíveis, um problema de otimização bem mais complexo.
+
+<QuizSet>
+<Quiz question="Por que as posições atuais dos motoristas podem ficar em memória sem replicação síncrona?" options={["Porque são criptografadas", "Porque são efêmeras e uma nova atualização chega em poucos segundos", "Porque o Redis nunca falha", "Porque o banco relacional é lento demais para leituras"]} answer={1} explanation="Perder uma posição é tolerável; a próxima atualização a substitui rapidamente." />
+<Quiz question="Como evitar que um motorista receba duas ofertas simultâneas?" options={["Enviando a oferta para todos e vendo quem responde", "Com uma atualização condicional de status de disponível para em_oferta", "Consultando o índice geoespacial duas vezes", "Aumentando a frequência de localização"]} answer={1} explanation="A operação condicional atômica garante que apenas um pedido reserve o motorista." />
+</QuizSet>

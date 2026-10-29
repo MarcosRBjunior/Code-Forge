@@ -1,0 +1,84 @@
+---
+title: Arquitetura de cache distribuído
+kind: lesson
+---
+
+Um cache local, dentro do processo, é rapidíssimo, mas cada instância da aplicação tem o seu, e eles não conversam. Com 50 servidores, a mesma chave pode estar em 50 cópias com valores diferentes, e a memória total usada é 50 vezes o necessário. Quando o conjunto de dados quentes passa de alguns gigabytes ou você precisa de uma visão única, o cache vira um **sistema distribuído** próprio.
+
+## Níveis de cache
+
+Na prática, sistemas grandes empilham camadas:
+
+```text
+Requisição
+   │
+   ▼
+L1: cache em processo (ex.: Caffeine, dict com LRU)   ~100 ns, poucos MB, por instância
+   │ miss
+   ▼
+L2: cluster distribuído (Redis, Memcached)              ~0,5 ms, centenas de GB, compartilhado
+   │ miss
+   ▼
+Banco de dados                                          ~5-50 ms
+```
+
+O L1 absorve as chaves quentíssimas e protege o L2 de *hot keys*. O preço é que o L1 fica velho mais facilmente; use TTL curto (segundos) ou invalide via pub/sub.
+
+## Distribuindo as chaves
+
+Um cluster com N nós precisa decidir em qual nó cada chave mora.
+
+### Hash módulo N
+
+`no = hash(chave) % N`. Simples, mas ao adicionar ou remover um nó quase todas as chaves mudam de lugar. Para um cache, isso é um apagão de taxa de acerto e uma avalanche no banco.
+
+### Hashing consistente
+
+Nós e chaves são mapeados num anel; cada chave pertence ao primeiro nó no sentido horário. Adicionar um nó move só cerca de 1/N das chaves. **Nós virtuais** (cada servidor aparece várias vezes no anel) equilibram a carga. Clientes de Memcached usam essa técnica há anos.
+
+### Hash slots
+
+O **Redis Cluster** divide o espaço em 16.384 slots (`CRC16(chave) mod 16384`) e atribui faixas de slots a cada nó primário. Para rebalancear, você move slots inteiros entre nós. Chaves com a mesma *hash tag*, como `pedido:{42}:itens` e `pedido:{42}:total`, caem no mesmo slot e podem ser usadas juntas em operações multi-chave.
+
+## Quem faz o roteamento
+
+| Modelo | Como | Exemplo | Trade-off |
+| --- | --- | --- | --- |
+| Cliente inteligente | A biblioteca do cliente conhece o mapa e fala direto com o nó | Redis Cluster, clientes Memcached | Menor latência, clientes mais complexos |
+| Proxy | Um proxy recebe tudo e encaminha | Twemproxy, Envoy, mcrouter | Cliente simples, um salto a mais |
+| Servidor redireciona | Qualquer nó responde "vá para o nó X" | MOVED no Redis Cluster | Funciona com clientes que atualizam o mapa |
+
+## Alta disponibilidade
+
+Um cache que cai leva o banco junto, porque toda a carga desaba sobre ele. Então:
+
+- **Réplicas:** cada primário tem uma ou mais réplicas assíncronas. Se o primário morre, uma réplica é promovida (Redis Sentinel ou o failover embutido do Cluster). Escritas recentes podem se perder, o que é aceitável para cache.
+- **Sem replicação, com redundância de capacidade:** no Memcached clássico, a perda de um nó só gera misses; você dimensiona o banco para aguentar a perda de um nó.
+- **Multi-região:** cada região tem seu cluster, e a invalidação viaja entre regiões por eventos.
+
+## Problemas típicos
+
+### Hot keys
+
+Uma chave muito acessada (o perfil de uma celebridade) concentra a carga num único nó. Soluções: cache L1 local, **replicar a chave** em várias cópias com sufixo (`perfil:99#1` a `perfil:99#8`) e escolher uma ao acaso na leitura.
+
+### Big keys
+
+Um valor de 50 MB bloqueia o nó durante a serialização e satura a rede. Quebre em partes ou guarde em object storage, deixando no cache só o ponteiro.
+
+### Fan-out
+
+Montar uma página que precisa de 200 chaves espalhadas em 40 nós aumenta a latência de cauda: a resposta espera pelo nó mais lento. Use `MGET` agrupado por nó, paralelismo e, quando possível, dados agregados numa chave só.
+
+<Callout type="note" title="Redis ou Memcached?">
+Memcached é multi-thread, só guarda strings e é ótimo como cache puro e simples. Redis tem estruturas ricas (listas, sets ordenados, streams), persistência opcional, replicação e scripts. Hoje o Redis (ou forks compatíveis, como Valkey) é a escolha padrão, mas o Memcached ainda brilha em cargas gigantes de chave-valor simples.
+</Callout>
+
+## Na entrevista
+
+Desenhe L1 + L2, diga como as chaves são distribuídas (hashing consistente ou slots) e o que acontece quando um nó cai. Follow-ups: "como lidar com uma hot key?", "o que acontece com a taxa de acerto ao adicionar nós?", "replicar o cache vale o custo?".
+
+<QuizSet>
+<Quiz question="Seu cluster de cache usa hash(chave) % N. Ao passar de 10 para 11 nós, o banco recebe uma onda de carga. Por quê?" options={["O novo nó está vazio, mas só ele gera misses", "Quase todas as chaves mudam de nó, então a maior parte das leituras vira miss", "O TTL foi zerado no rebalanceamento", "O Redis bloqueia leituras durante a adição de nós"]} answer={1} explanation="Com módulo N, mudar N remapeia a grande maioria das chaves. Hashing consistente ou hash slots limitam a movimentação a uma fração pequena." />
+<Quiz question="Uma única chave recebe 40% de todas as leituras e satura um nó do cluster. O que ajuda mais?" options={["Aumentar o TTL dessa chave", "Usar um cache local L1 e/ou replicar a chave com sufixos em vários nós", "Trocar LRU por LFU", "Reduzir o número de nós"]} answer={1} explanation="Hot keys se resolvem distribuindo as leituras: cópias locais na aplicação ou várias cópias da chave espalhadas pelo cluster." />
+</QuizSet>

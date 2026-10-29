@@ -1,0 +1,139 @@
+---
+title: Projetar um chat (WhatsApp)
+kind: lesson
+---
+
+Um aplicativo de mensagens parece simples para o usuário: digitar, enviar, ver os dois tiques. Por trás há conexões persistentes com centenas de milhões de aparelhos, garantia de entrega mesmo com o destinatário offline e ordenação de mensagens dentro de cada conversa. É uma das questões mais ricas que você vai encontrar.
+
+## Requisitos
+
+### Funcionais
+
+- Conversas um a um e em grupo (até 500 participantes).
+- Enviar e receber mensagens de texto em tempo real.
+- Entregar mensagens que chegaram enquanto o usuário estava offline.
+- Confirmações de status: enviada, entregue, lida.
+- Opcional: mídia (fotos, áudio), presença online, histórico em múltiplos aparelhos.
+
+### Não funcionais
+
+- Latência ponta a ponta baixa: abaixo de 300 ms quando ambos estão online.
+- **Nenhuma mensagem perdida**, e ordem preservada dentro de cada conversa.
+- Altíssima disponibilidade.
+- Escala de centenas de milhões de usuários conectados simultaneamente.
+
+Combine com o entrevistador o escopo: costuma-se deixar criptografia ponta a ponta e chamadas de voz fora, apenas mencionando-as.
+
+## Estimativas
+
+- 500 milhões de usuários ativos por dia, cada um enviando 40 mensagens: **20 bilhões de mensagens por dia**.
+- Taxa média: 20 B / 86.400 ≈ **230 mil mensagens por segundo**; pico em torno de 700 mil/s.
+- Tamanho médio com metadados: 200 bytes. Por dia: 20 B × 200 B = **4 TB**. Em um ano, cerca de 1,5 PB se tudo for retido no servidor.
+- Conexões simultâneas: se 40% dos usuários diários estiverem online no pico, são 200 milhões de conexões. Um servidor bem ajustado segura uns 500 mil WebSockets ociosos; logo, **cerca de 400 servidores de conexão**, mais folga.
+
+Esse último número é o que define a arquitetura: o serviço de conexões é um tipo de máquina específico, otimizado para memória e descritores de arquivo, não para CPU.
+
+## API
+
+O cliente mantém um WebSocket aberto. Mensagens trafegam como frames:
+
+```json
+{ "tipo": "enviar", "idCliente": "c-77f1", "conversaId": "cv_123",
+  "texto": "chego em 10 min" }
+
+{ "tipo": "ack", "idCliente": "c-77f1", "mensagemId": 918273, "seq": 4412 }
+
+{ "tipo": "nova", "conversaId": "cv_123", "mensagemId": 918273,
+  "seq": 4412, "remetente": "u_9", "texto": "chego em 10 min" }
+
+{ "tipo": "recibo", "conversaId": "cv_123", "ateSeq": 4412, "status": "lida" }
+```
+
+Endpoints HTTP complementam: `GET /conversas/:id/mensagens?depoisDe=seq` para sincronizar histórico e `POST /midia` para obter URL de upload.
+
+O `idCliente` é gerado no aparelho e serve como chave de idempotência: se o envio for repetido por causa de rede ruim, o servidor reconhece e não duplica.
+
+## Modelo de dados
+
+```text
+mensagens (particionada por conversa_id, ordenada por seq)
+  conversa_id | seq | mensagem_id | remetente_id | texto | criado_em
+
+participantes
+  conversa_id | usuario_id | ultimo_seq_lido | ultimo_seq_entregue
+
+caixa_de_entrada (por usuário, para quem está offline)
+  usuario_id | conversa_id | seq   (removido após entrega)
+```
+
+Um banco de colunas largas como Cassandra encaixa bem: a chave de partição `conversa_id` agrupa a conversa e `seq` como chave de ordenação permite ler "as 50 mais recentes" com uma única consulta sequencial.
+
+## Arquitetura de alto nível
+
+```text
+ app A                                         app B
+   |  WebSocket                        WebSocket |
++--v-----------+                     +-----------v--+
+| Servidor de  |                     | Servidor de  |
+| conexão 17   |                     | conexão 203  |
++--+-----------+                     +-----------^--+
+   |                                             |
+   v                                             |
++-----------------+    +----------------+        |
+| Serviço de      |--->| Registro de    |        |
+| mensagens       |    | sessões (Redis)|        |
++---+---------+---+    | usuario->srv   |        |
+    |         |        +----------------+        |
+    |         +---------> fila por servidor -----+
+    v
++-----------------+     +------------------+
+| Cassandra       |     | Serviço de push  |
+| (mensagens)     |     | (APNs / FCM)     |
++-----------------+     +------------------+
+```
+
+Fluxo de envio:
+
+1. A envia o frame ao servidor de conexão 17.
+2. O servidor repassa ao serviço de mensagens, que atribui o próximo `seq` da conversa e persiste em Cassandra.
+3. Só depois de persistir, devolve `ack` para A (um tique).
+4. Consulta o registro de sessões: B está no servidor 203? Publica na fila desse servidor, que empurra a mensagem pelo WebSocket de B.
+5. Se B está offline, grava na caixa de entrada e dispara push notification.
+6. O app de B confirma recebimento; o status vira "entregue" e A é notificado (dois tiques).
+
+## Aprofundamentos
+
+### 1. Ordenação e números de sequência
+
+Relógios de servidores diferentes não são confiáveis para ordenar mensagens. A solução é um contador por conversa: `seq` cresce de 1 em 1 e é atribuído por um único dono lógico da conversa (por exemplo, a partição responsável por `conversa_id`, ou um incremento atômico em Redis). Com sequência contígua, o cliente detecta lacunas: se recebeu 4410 e depois 4412, sabe que precisa buscar a 4411. Isso transforma "entrega garantida" num problema de sincronização simples.
+
+### 2. Entrega com o destinatário offline
+
+O modelo mais robusto é **pull com dica de push**. A mensagem está sempre persistida; o push (WebSocket ou notificação do sistema operacional) é só um aviso de que há novidades. Quando o app reconecta, envia o último `seq` que conhece de cada conversa e o servidor devolve o que falta. Assim, mesmo que um push se perca, nada some: a próxima sincronização recupera.
+
+### 3. Grupos
+
+Em grupos, um envio vira N entregas. Para 500 membros, o serviço de mensagens persiste **uma** vez e faz fan-out apenas de notificações para os membros online. Como os grupos são limitados em tamanho, fan-out na escrita é aceitável. Recibos de leitura em grupos grandes são agregados ("lida por 37") e enviados com atraso, para não gerar uma tempestade de eventos.
+
+<Callout type="note" title="Por que o ack só depois de persistir">
+Se o servidor confirmasse antes de gravar e caísse em seguida, o remetente acharia que a mensagem foi enviada e ela sumiria. Persistir primeiro é o que sustenta a promessa de nenhuma perda.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Servidores de conexão são stateful**: reiniciar um deles derruba 500 mil conexões que reconectam ao mesmo tempo. Use desligamento gradual e reconexão com atraso aleatório (jitter) no cliente.
+- **Registro de sessões**: precisa ser rápido e tolerar inconsistência breve. Se apontar para um servidor errado, a mensagem cai na caixa de entrada e é sincronizada depois.
+- **Retenção**: guardar tudo para sempre custa petabytes. O WhatsApp original apagava do servidor após entrega; produtos com histórico multi-dispositivo precisam reter. É uma decisão de produto com impacto direto em custo.
+- **Contador de sequência**: um grupo muito ativo concentra escritas numa partição. Grupos limitados a centenas de membros mantêm isso sob controle.
+
+## Perguntas de follow-up comuns
+
+- Como suportar vários aparelhos por usuário? Cada aparelho tem seu próprio cursor de sincronização; o registro de sessões mapeia usuário para vários servidores.
+- Como implementar "digitando..."? Evento efêmero, não persistido, enviado só se o destinatário estiver online.
+- E a criptografia ponta a ponta? O servidor passa a armazenar apenas blobs cifrados; troca de chaves acontece entre aparelhos, e grupos exigem distribuição de chaves por membro.
+- Como enviar mídia? Upload para object storage via URL pré-assinada; a mensagem carrega apenas a referência e uma miniatura.
+
+<QuizSet>
+<Quiz question="Para que serve o número de sequência por conversa?" options={["Para medir latência", "Para ordenar mensagens e permitir que o cliente detecte lacunas", "Para criptografar mensagens", "Para balancear carga"]} answer={1} explanation="Uma sequência contígua por conversa define a ordem e deixa o cliente saber exatamente o que falta sincronizar." />
+<Quiz question="O app ficou offline por duas horas. Como ele recupera as mensagens perdidas de forma confiável?" options={["Esperando os pushes antigos chegarem", "Enviando o último seq conhecido de cada conversa e recebendo o que falta", "Baixando todo o histórico de novo", "Pedindo ao remetente que reenvie"]} answer={1} explanation="O modelo pull com dica de push usa o cursor do cliente para sincronizar, sem depender de nenhum push individual." />
+</QuizSet>

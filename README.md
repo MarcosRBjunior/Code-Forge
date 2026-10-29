@@ -1,36 +1,56 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# CodeForge (versão pessoal)
 
-## Getting Started
+Plataforma de estudo para entrevistas de engenharia, para um único usuário. Tem leitor com destaques e notas, áudio sincronizado, editor com testes, quizzes e caderno. Tudo roda em serviços gratuitos.
 
-First, run the development server:
+## Rodar no seu computador
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Abra http://localhost:3000. Os dados (progresso, destaques, notas e rascunhos de código) ficam num Postgres embutido em `.data/pglite`. Não é preciso instalar nada além do Node.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Publicar de graça (Vercel + Neon)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Crie um banco no [Neon](https://neon.tech) (plano Free) e copie a *connection string*.
+2. Suba esta pasta para um repositório no GitHub e importe-o na [Vercel](https://vercel.com) (plano Hobby).
+3. Em *Settings → Environment Variables*, defina:
+   - `DATABASE_URL`: a connection string do Neon (obrigatória na Vercel, porque lá o disco é somente leitura).
+   - `APP_PASSWORD`: uma senha. Sem ela, qualquer pessoa com o link vê e altera seus dados.
+4. Faça o deploy. As tabelas são criadas sozinhas no primeiro acesso.
 
-## Learn More
+## Variáveis de ambiente
 
-To learn more about Next.js, take a look at the following resources:
+| Variável | Para quê | Padrão |
+|---|---|---|
+| `DATABASE_URL` | Postgres (Neon) | ausente = PGlite local em `.data/pglite` |
+| `APP_PASSWORD` | Protege o app com senha | ausente = acesso livre (ok só no seu computador) |
+| `ANTHROPIC_API_KEY` | Liga o Tutor de IA. **É pago por uso**, então fica desligado por padrão | ausente = botão do tutor escondido |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Como funciona (e por que é grátis)
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Recurso | Implementação |
+|---|---|
+| Executar código | No próprio navegador: Python via Pyodide (WebAssembly) e JavaScript em Web Worker. Não usa servidor; loops infinitos são cortados em 6 s |
+| Áudio | Web Speech API do navegador, que lê bloco a bloco e destaca a palavra atual. Clique duas vezes num parágrafo, com o áudio ativo, para ouvir a partir dele |
+| Banco | PGlite local, ou Neon Free em produção |
+| Hospedagem | Vercel Hobby |
 
-## Deploy on Vercel
+## Adicionar conteúdo
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Cada curso fica em `content/courses/<curso>/`:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `course.json`: título, descrição e a lista de módulos com a ordem dos capítulos.
+- `<capitulo>.mdx`: o texto em Markdown, com frontmatter (`title`, `kind: lesson | problem | quiz`).
+  - Componentes disponíveis: `<Callout type="note|tip|warning" title="…">` e `<Quiz question="…" options={[…]} answer={0} explanation="…" />`.
+  - Problemas (`kind: problem`) levam no frontmatter `fn` (nome da função em Python), `fnJs`, `starter` e `tests`. Veja `two-sum.mdx`. Use `checkArg: 0` quando a função altera o argumento in-place em vez de retornar.
+
+Depois de editar, o `npm run dev` recarrega na hora. Em produção, um novo deploy publica as mudanças.
+
+## Atalhos
+
+- Selecionar texto: abre a barra de destaque (5 cores, + Nota e Perguntar à IA).
+- Clicar num destaque: abre o painel de notas nele.
+- `Ctrl+Enter` no editor: executa os testes.
+- Botão `Aa`: tema, tamanho, entrelinha, largura e fonte do texto.

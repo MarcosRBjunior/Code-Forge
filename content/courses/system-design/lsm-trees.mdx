@@ -1,0 +1,85 @@
+---
+title: LSM trees
+kind: lesson
+---
+
+B-trees atualizam dados no lugar: cada escrita localiza uma página no disco e a reescreve. Com milhões de escritas por segundo espalhadas por chaves aleatórias, isso vira um mar de escritas aleatórias e páginas reescritas por causa de poucos bytes. A **LSM tree** (Log-Structured Merge tree) inverte a lógica: **nunca altera dados já gravados**. Toda escrita vai para memória e, de lá, para arquivos imutáveis gravados de forma sequencial. É a estrutura por trás de RocksDB, LevelDB, Cassandra, ScyllaDB, HBase e do armazenamento de vários bancos modernos.
+
+## Os componentes
+
+```text
+ escrita ──▶ WAL (append no disco, para durabilidade)
+    │
+    ▼
+ Memtable (árvore ordenada em memória)
+    │ cheia? vira imutável e é descarregada (flush)
+    ▼
+ Nível 0:  [SSTable] [SSTable] [SSTable]        ← arquivos recém-gravados
+    │ compactação
+    ▼
+ Nível 1:  [SSTable a–f] [g–m] [n–z]            ← faixas sem sobreposição
+    │
+    ▼
+ Nível 2:  ... ~10x maior que o nível anterior
+```
+
+- **WAL:** cada escrita é anexada a um log antes de qualquer coisa, para sobreviver a quedas.
+- **Memtable:** estrutura ordenada em memória (skip list ou árvore balanceada). Escritas são só inserções nela.
+- **SSTable (Sorted String Table):** quando a memtable enche, ela é gravada em disco como um arquivo **ordenado e imutável**, com um índice esparso e um **Bloom filter**.
+- **Compactação:** processo em segundo plano que mescla SSTables, descarta versões antigas e remove dados apagados.
+
+## Escrita
+
+Gravar é: append no WAL e inserção na memtable. Nada de buscar página no disco. Por isso LSM trees aceitam taxas de escrita altíssimas e funcionam bem em discos onde escrita sequencial é muito mais barata que aleatória.
+
+**Atualização** é só uma nova escrita da mesma chave com timestamp ou número de sequência maior. **Remoção** grava um marcador especial, a **tombstone**. A versão antiga continua no disco até a compactação.
+
+## Leitura
+
+A chave pode estar em vários lugares, então a leitura procura do mais novo para o mais velho:
+
+1. Memtable ativa e memtables aguardando flush.
+2. SSTables do nível 0 (podem se sobrepor, então verifica todas).
+3. Uma SSTable por nível nos níveis seguintes.
+
+Para não abrir arquivos à toa, cada SSTable tem um **Bloom filter**: se ele disser "a chave não está aqui", é garantido, e o arquivo é pulado. Só falsos positivos geram leituras desnecessárias. Mesmo assim, uma leitura de chave inexistente ou consultas por intervalo podem tocar vários arquivos.
+
+## Compactação
+
+Sem compactação, o número de SSTables cresceria sem parar e as leituras ficariam cada vez piores. As duas estratégias principais:
+
+| Estratégia | Como funciona | Favorece | Custo |
+| --- | --- | --- | --- |
+| **Size-tiered** | Mescla arquivos de tamanho parecido quando há vários | Escrita | Mais espaço temporário, leituras tocam mais arquivos |
+| **Leveled** | Cada nível tem faixas sem sobreposição e é ~10x maior que o anterior | Leitura e espaço | Mais reescrita de dados (write amplification) |
+
+Cassandra usa size-tiered como padrão em muitas configurações; RocksDB usa leveled.
+
+## As três amplificações
+
+Toda estrutura de armazenamento negocia entre:
+
+- **Write amplification:** bytes gravados no disco por byte escrito pela aplicação.
+- **Read amplification:** quantos lugares uma leitura precisa consultar.
+- **Space amplification:** espaço ocupado versus tamanho real dos dados.
+
+| | B+ tree | LSM tree |
+| --- | --- | --- |
+| Escrita | Aleatória, página inteira por mudança | Sequencial, em lote |
+| Leitura pontual | Previsível, uma descida | Pode consultar vários níveis; Bloom filters ajudam |
+| Leitura por intervalo | Excelente (folhas ligadas) | Boa, mas mescla vários arquivos |
+| Espaço | Páginas parcialmente vazias | Versões antigas até compactar; boa compressão |
+| Latência | Estável | Picos possíveis durante compactação |
+
+<Callout type="warning" title="Tombstones acumuladas">
+Em cargas que apagam muito (filas implementadas sobre Cassandra, por exemplo), as tombstones se acumulam até a compactação e as leituras passam a pular milhares de marcadores. É uma causa clássica de lentidão. Modele para evitar remoções em massa ou use TTL por partição.
+</Callout>
+
+## Na entrevista
+
+Quando o sistema tem escrita intensa (eventos, métricas, logs, mensagens de chat), diga que um banco baseado em LSM é adequado e explique o porquê em uma frase: "escritas viram appends sequenciais e a compactação acontece em segundo plano". Follow-ups: "como uma leitura evita abrir todos os arquivos?" (Bloom filter e índice esparso), "como funciona um delete?" (tombstone), "por que a latência tem picos?" (compactação competindo por I/O).
+
+<QuizSet>
+<Quiz question="Para que serve o Bloom filter associado a cada SSTable?" options={["Comprimir os dados do arquivo", "Dizer com certeza que uma chave não está no arquivo, evitando leituras desnecessárias", "Ordenar as chaves da memtable", "Garantir durabilidade da escrita"]} answer={1} explanation="Bloom filters não têm falsos negativos: se respondem que a chave não está, o arquivo pode ser pulado com segurança." />
+<Quiz question="Como uma LSM tree trata a remoção de uma chave?" options={["Apaga imediatamente a chave de todas as SSTables", "Grava uma tombstone; os dados antigos só somem na compactação", "Reescreve a página da B-tree correspondente", "Remove apenas da memtable"]} answer={1} explanation="SSTables são imutáveis, então a remoção é uma nova escrita de marcador. A compactação depois descarta a chave e o marcador." />
+</QuizSet>

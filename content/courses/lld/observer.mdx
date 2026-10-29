@@ -1,0 +1,200 @@
+---
+title: Observer
+kind: lesson
+---
+
+## O problema
+
+Quando um pedido é pago numa loja online, várias coisas precisam acontecer: o estoque baixa, o cliente recebe um e-mail, o financeiro emite a nota e o time de analytics registra a conversão. A tentação é colocar tudo dentro de `Pedido.pagar()`. O resultado é uma classe que conhece e-mail, estoque, nota fiscal e analytics, e que precisa ser editada toda vez que alguém quer "também ser avisado".
+
+O Observer **inverte essa dependência**: o objeto que muda (o sujeito, ou publisher) mantém uma lista de interessados e avisa todos quando algo acontece, sem saber o que cada um faz com o aviso. Novos interessados se inscrevem sem que o sujeito mude.
+
+## Estrutura
+
+```text
++------------------------+        notifica       +-------------------+
+|  Sujeito               |---------------------->|  Observador       |
+|------------------------|  1              0..*  |  (iface)          |
+| - observadores: lista  |                       |-------------------|
+| + inscrever(obs)       |                       | + atualizar(evt)  |
+| + cancelar(obs)        |                       +-------------------+
+| + notificar(evt)       |                          ^      ^      ^
++------------------------+                          |      |      |
+                                            Estoque  EmailCliente  Analytics
+```
+
+Dois estilos de entrega:
+
+- **Push**: o sujeito envia os dados do evento junto com o aviso.
+- **Pull**: o sujeito avisa "mudei" e cada observador consulta o que precisar.
+
+Push é mais comum e evita que observadores dependam de getters do sujeito.
+
+## Implementação em Python
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass(frozen=True)
+class PedidoPago:
+    pedido_id: str
+    email: str
+    itens: dict
+    total: float
+
+
+class Observador(ABC):
+    @abstractmethod
+    def atualizar(self, evento: PedidoPago) -> None: ...
+
+
+class Pedido:
+    def __init__(self, pedido_id: str, email: str, itens: dict, total: float):
+        self.pedido_id = pedido_id
+        self.email = email
+        self.itens = itens
+        self.total = total
+        self.status = "aguardando"
+        self._observadores: List[Observador] = []
+
+    def inscrever(self, obs: Observador) -> None:
+        if obs not in self._observadores:
+            self._observadores.append(obs)
+
+    def cancelar_inscricao(self, obs: Observador) -> None:
+        self._observadores.remove(obs)
+
+    def _notificar(self, evento: PedidoPago) -> None:
+        for obs in list(self._observadores):  # cópia: alguém pode se desinscrever
+            try:
+                obs.atualizar(evento)
+            except Exception as erro:  # um observador quebrado não derruba os outros
+                print(f"[aviso] {type(obs).__name__} falhou: {erro}")
+
+    def pagar(self) -> None:
+        self.status = "pago"
+        self._notificar(PedidoPago(self.pedido_id, self.email, self.itens, self.total))
+
+
+class Estoque(Observador):
+    def __init__(self, saldo: dict):
+        self.saldo = saldo
+
+    def atualizar(self, evento: PedidoPago) -> None:
+        for sku, qtd in evento.itens.items():
+            self.saldo[sku] -= qtd
+        print("estoque:", self.saldo)
+
+
+class EmailCliente(Observador):
+    def atualizar(self, evento: PedidoPago) -> None:
+        print(f"e-mail para {evento.email}: pedido {evento.pedido_id} confirmado")
+
+
+class NotaFiscal(Observador):
+    def atualizar(self, evento: PedidoPago) -> None:
+        if evento.total <= 0:
+            raise ValueError("total inválido para nota")
+        print(f"nota emitida: R$ {evento.total:.2f}")
+
+
+class Analytics(Observador):
+    def __init__(self):
+        self.receita = 0.0
+
+    def atualizar(self, evento: PedidoPago) -> None:
+        self.receita += evento.total
+        print("receita acumulada:", self.receita)
+
+
+estoque = Estoque({"camiseta": 10, "caneca": 5})
+analytics = Analytics()
+
+pedido = Pedido("A-1001", "joana@exemplo.com", {"camiseta": 2, "caneca": 1}, 139.90)
+for obs in (estoque, EmailCliente(), NotaFiscal(), analytics):
+    pedido.inscrever(obs)
+pedido.pagar()
+
+print("---")
+brinde = Pedido("A-1002", "rui@exemplo.com", {"caneca": 1}, 0.0)
+for obs in (estoque, NotaFiscal(), EmailCliente()):
+    brinde.inscrever(obs)
+brinde.pagar()
+```
+
+No segundo pedido a nota fiscal falha, mas o e-mail é enviado mesmo assim. Isolar falhas é uma decisão importante: sem o `try`, um observador defeituoso impediria os demais de serem avisados.
+
+### Variação: barramento de eventos
+
+Em sistemas maiores, o sujeito costuma ser um **event bus** central, com tópicos nomeados. Os observadores viram simples funções:
+
+```python
+from collections import defaultdict
+from typing import Callable, DefaultDict, List
+
+Handler = Callable[[dict], None]
+
+
+class EventBus:
+    def __init__(self):
+        self._assinantes: DefaultDict[str, List[Handler]] = defaultdict(list)
+
+    def assinar(self, topico: str, handler: Handler) -> Callable[[], None]:
+        self._assinantes[topico].append(handler)
+        return lambda: self._assinantes[topico].remove(handler)
+
+    def publicar(self, topico: str, dados: dict) -> None:
+        for handler in list(self._assinantes[topico]):
+            handler(dados)
+
+
+bus = EventBus()
+cancelar_sms = bus.assinar("usuario.cadastrado", lambda d: print("SMS para", d["telefone"]))
+bus.assinar("usuario.cadastrado", lambda d: print("boas-vindas para", d["nome"]))
+
+bus.publicar("usuario.cadastrado", {"nome": "Leo", "telefone": "+55 11 90000-0000"})
+cancelar_sms()
+bus.publicar("usuario.cadastrado", {"nome": "Bia", "telefone": "+55 21 90000-0001"})
+```
+
+Retornar uma função de cancelamento é um truque prático: evita vazamento de memória por observadores esquecidos.
+
+## Quando usar e quando evitar
+
+**Use quando:**
+
+- Uma mudança num objeto precisa disparar reações em outros, e você não sabe de antemão quantos nem quais.
+- Você quer desacoplar o núcleo do domínio de efeitos colaterais (notificações, métricas, auditoria).
+
+**Evite ou tome cuidado quando:**
+
+- A ordem de execução importa. Observer não garante ordem de forma explícita; se "baixar estoque" tem de acontecer antes de "emitir nota", modele isso como um fluxo.
+- Cadeias de eventos disparando eventos ficam difíceis de depurar ("quem chamou isso?").
+- Observadores lentos travam o sujeito. Em produção, considere notificação assíncrona (fila, thread).
+
+<Callout type="warning" title="Vazamento de memória">
+O sujeito guarda referências fortes para os observadores. Se ninguém cancela a inscrição, objetos que deveriam morrer continuam vivos. Ofereça sempre uma forma de cancelar e, em casos específicos, use referências fracas.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Diferença |
+| --- | --- |
+| Mediator | No Mediator, um objeto central coordena colegas e **decide** quem faz o quê. No Observer, o sujeito só transmite; não coordena nada. |
+| Pub/Sub | Variação distribuída: publisher e subscriber nem se conhecem, há um broker no meio (fila, tópico). O Observer clássico é em memória e o sujeito conhece a lista de observadores. |
+| Chain of Responsibility | Passa um pedido adiante até alguém tratá-lo; normalmente só um trata. No Observer, todos recebem. |
+
+## Na entrevista
+
+- Aparece em notificações, leilões (avisar lances), bolsa de valores, chat, sistema de elevadores (painéis exibindo andar). Diga: "o pedido publica um evento e os serviços interessados se inscrevem".
+- Follow-ups: "e se um observador falhar?", "como garantir entrega se o processo cair?" (aí você sai do Observer em memória e vai para fila persistente), "como evitar que um observador lento atrase os outros?".
+- Mostre a diferença entre push e pull se o entrevistador perguntar sobre o formato do evento.
+
+<QuizSet>
+<Quiz question="Qual é a principal dependência que o Observer elimina?" options={["Do observador para o sujeito", "Do sujeito para as classes concretas que reagem ao evento", "Do cliente para o banco de dados", "Entre duas estratégias"]} answer={1} explanation="O sujeito só conhece a interface Observador. Novas reações são adicionadas sem alterar o sujeito." />
+<Quiz question="Por que iterar sobre uma cópia da lista de observadores ao notificar?" options={["Para melhorar a performance", "Porque um observador pode cancelar a inscrição durante a notificação", "Para garantir ordem alfabética", "Porque listas Python são imutáveis"]} answer={1} explanation="Remover itens da lista enquanto ela é percorrida faz o loop pular elementos. A cópia evita isso." />
+<Quiz question="Seu fluxo exige que o estoque seja baixado antes da emissão da nota. O que fazer?" options={["Confiar na ordem de inscrição dos observadores", "Modelar a sequência explicitamente (um serviço orquestrador ou eventos encadeados)", "Usar Singleton", "Adicionar sleep entre notificações"]} answer={1} explanation="Observer não é ferramenta de orquestração. Dependências de ordem devem ser explícitas." />
+</QuizSet>

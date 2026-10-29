@@ -1,0 +1,147 @@
+---
+title: Flyweight
+kind: lesson
+---
+
+## O problema
+
+Um sistema de mapas de entregas desenha no mapa todas as **paradas** de todos os entregadores de uma cidade grande: centenas de milhares de marcadores. Cada marcador tem posição (latitude, longitude), número do pedido e um **estilo**: ícone (bitmap de alguns KB), cor, fonte do rótulo, tamanho. Só que existem apenas meia dúzia de estilos: "pendente", "em rota", "entregue", "falhou".
+
+Se cada marcador guardar seu próprio bitmap e sua própria fonte, você multiplica alguns KB por centenas de milhares de objetos e estoura a memória do navegador ou do servidor de renderização. E quase toda essa memória é **dado repetido**.
+
+O **Flyweight** separa o estado do objeto em duas partes e **compartilha** a parte repetida entre muitos objetos.
+
+## Como funciona
+
+- **Estado intrínseco**: o que é igual entre muitos objetos e não muda (ícone, cor, fonte). Fica no flyweight, que é **imutável** e compartilhado.
+- **Estado extrínseco**: o que é único de cada objeto (posição, número do pedido). Fica fora, no objeto leve que referencia o flyweight, ou é passado como parâmetro na hora de usar.
+- **Fábrica de flyweights**: garante que exista uma única instância por combinação de estado intrínseco, normalmente com um dicionário.
+
+```text
+ +----------------------------+          +-----------------------------+
+ | FabricaEstilos             |  cria/   | EstiloMarcador (flyweight)  |
+ | - cache: dict[chave,Estilo]|--------->| - icone (bytes, grande)     |
+ | + obter(status) -> Estilo  |  reusa   | - cor, fonte                |
+ +----------------------------+          | + desenhar(lat, lon, rotulo)|
+                                         +-----------------------------+
+                                                     ^  compartilhado
+                                                     |  por milhares
+ +----------------------------+                      |
+ | Parada (contexto, leve)    |----------------------+
+ | - lat, lon, pedido         |   (estado extrínseco)
+ | - estilo: EstiloMarcador   |
+ +----------------------------+
+```
+
+## Implementação em Python
+
+```python
+import sys
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class EstiloMarcador:
+    """Flyweight: estado intrínseco, imutável e compartilhado."""
+    nome: str
+    cor: str
+    fonte: str
+    icone: bytes  # simula um bitmap pesado
+
+    def desenhar(self, lat: float, lon: float, rotulo: str) -> str:
+        return f"[{self.cor}] {rotulo} em ({lat:.4f}, {lon:.4f}) com ícone de {len(self.icone)} bytes"
+
+
+class FabricaEstilos:
+    _DEFINICOES = {
+        "pendente": ("cinza", "Inter 10"),
+        "em_rota": ("azul", "Inter 10 bold"),
+        "entregue": ("verde", "Inter 10"),
+        "falhou": ("vermelho", "Inter 10 bold"),
+    }
+
+    def __init__(self):
+        self._cache: dict[str, EstiloMarcador] = {}
+
+    def obter(self, status: str) -> EstiloMarcador:
+        if status not in self._cache:
+            cor, fonte = self._DEFINICOES[status]
+            icone = bytes(4096)  # carregar o bitmap só uma vez por estilo
+            self._cache[status] = EstiloMarcador(status, cor, fonte, icone)
+        return self._cache[status]
+
+    def total_criados(self) -> int:
+        return len(self._cache)
+
+
+class Parada:
+    """Contexto: guarda só o estado extrínseco e uma referência ao flyweight."""
+    __slots__ = ("lat", "lon", "pedido", "estilo")
+
+    def __init__(self, lat, lon, pedido, estilo):
+        self.lat, self.lon, self.pedido, self.estilo = lat, lon, pedido, estilo
+
+    def desenhar(self):
+        return self.estilo.desenhar(self.lat, self.lon, f"#{self.pedido}")
+
+
+if __name__ == "__main__":
+    fabrica = FabricaEstilos()
+    status = ["pendente", "em_rota", "entregue", "falhou"]
+    paradas = [
+        Parada(-23.55 + i * 1e-5, -46.63 - i * 1e-5, 100_000 + i, fabrica.obter(status[i % 4]))
+        for i in range(200_000)
+    ]
+
+    print(paradas[0].desenhar())
+    print(paradas[3].desenhar())
+    print("paradas:", len(paradas), "| estilos criados:", fabrica.total_criados())
+
+    memoria_icones_compartilhada = fabrica.total_criados() * 4096
+    memoria_icones_sem_flyweight = len(paradas) * 4096
+    print(f"ícones com flyweight: {memoria_icones_compartilhada / 1024:.0f} KB")
+    print(f"ícones sem flyweight: {memoria_icones_sem_flyweight / 1024 / 1024:.0f} MB")
+    print("mesmo objeto?", paradas[0].estilo is paradas[4].estilo)
+    print("tamanho de uma Parada:", sys.getsizeof(paradas[0]), "bytes")
+```
+
+Duzentas mil paradas compartilham quatro estilos. Os ícones ocupam 16 KB em vez de cerca de 780 MB. Cada `Parada` usa `__slots__` para ficar ainda mais leve, já que não carrega um dicionário de atributos.
+
+<Callout type="warning" title="Flyweights precisam ser imutáveis">
+Se alguém alterar a cor de um estilo compartilhado, todas as paradas com aquele estilo mudam junto. Por isso o exemplo usa `dataclass(frozen=True)`. Estado que varia por objeto nunca deve morar no flyweight.
+</Callout>
+
+## Quando usar
+
+- Quantidade muito grande de objetos parecidos, a ponto de a memória ser um problema mensurável.
+- A maior parte do estado pode ser fatorada como intrínseca e compartilhada.
+- A identidade individual do objeto compartilhado não importa para o domínio.
+
+Exemplos reais: glifos de caracteres num editor de texto (a letra "a" é um objeto só; posição e formatação ficam fora), tipos de árvore num jogo com uma floresta de milhões de árvores, tiles de um mapa, e o próprio interning de strings e de inteiros pequenos que linguagens fazem internamente.
+
+## Quando evitar
+
+- Poucos objetos: a complexidade extra não se paga.
+- Quando o estado "repetido" na verdade muda com frequência por objeto.
+- Quando separar o estado extrínseco espalha parâmetros por todo o código e piora a legibilidade mais do que a economia justifica. Meça antes.
+- Em cenários concorrentes, a fábrica precisa de sincronização para não criar duplicatas.
+
+## Padrões parecidos
+
+- **Singleton**: uma única instância de uma classe. Flyweight tem uma instância **por valor de estado intrínseco**, gerenciada por uma fábrica.
+- **Cache / memoização**: a fábrica de flyweights é um cache, mas o foco do padrão é o compartilhamento de objetos imutáveis e a separação entre intrínseco e extrínseco, não só evitar recomputação.
+- **Prototype**: cria cópias independentes; Flyweight faz o oposto, evita cópias.
+- **Composite**: folhas idênticas de uma árvore grande podem ser flyweights.
+
+## Na entrevista
+
+Flyweight é menos frequente, mas aparece em "projete um editor de texto", "um jogo com muitos objetos" ou como otimização num follow-up do tipo "e se forem 10 milhões de vagas ou assentos?". Mostre a separação intrínseco versus extrínseco, a fábrica com dicionário e uma conta rápida de memória. Follow-ups comuns:
+
+- **Como garantir que ninguém altera o flyweight?** Imutabilidade.
+- **E com várias threads?** Lock na fábrica ou pré-carregar todos os flyweights na inicialização.
+- **Qual o custo?** Mais indireção e parâmetros extras; vale só quando a economia é grande.
+
+<QuizSet>
+<Quiz question="Num editor de texto, o que seria estado intrínseco de um glifo flyweight?" options={["Linha e coluna do caractere", "O desenho vetorial da letra numa fonte", "O parágrafo ao qual pertence", "Se está selecionado"]} answer={1} explanation="O desenho da letra é igual em todas as ocorrências e pode ser compartilhado. Posição e seleção são extrínsecos." />
+<Quiz question="Por que flyweights devem ser imutáveis?" options={["Para serem mais rápidos de criar", "Porque são compartilhados; uma alteração afetaria todos os que o referenciam", "Porque Python exige", "Para permitir herança"]} answer={1} explanation="Como muitos contextos apontam para o mesmo objeto, mutá-lo causaria efeitos colaterais em todos eles." />
+</QuizSet>

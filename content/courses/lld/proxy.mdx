@@ -1,0 +1,159 @@
+---
+title: Proxy
+kind: lesson
+---
+
+## O problema
+
+Num sistema de prontuário eletrônico, a classe `RepositorioExames` carrega laudos e imagens de um armazenamento lento. Três necessidades aparecem:
+
+1. Abrir a ficha do paciente não deveria baixar todas as imagens de ressonância; só quando alguém clicar nelas.
+2. Apenas médicos responsáveis podem ver exames; recepcionistas, não.
+3. A auditoria exige registrar quem acessou qual exame.
+
+Você não quer colocar checagem de permissão, auditoria e carregamento preguiçoso dentro da classe que lê do armazenamento: isso mistura responsabilidades. E você também não quer que cada tela lembre de checar permissão antes de chamar o repositório.
+
+O **Proxy** coloca um **substituto** na frente do objeto real. O substituto tem a mesma interface, então o cliente não percebe a diferença, mas ele decide **se**, **quando** e **como** a chamada chega ao objeto real.
+
+## Como funciona
+
+O proxy implementa a mesma interface do **sujeito real** e guarda (ou sabe criar) uma referência a ele. Variações comuns:
+
+- **Proxy virtual**: adia a criação de um objeto caro até o primeiro uso.
+- **Proxy de proteção**: verifica permissões antes de delegar.
+- **Proxy remoto**: representa localmente um objeto que vive em outro processo ou máquina (stubs de gRPC são isso).
+- **Proxy de cache** e **proxy de log**: guardam respostas ou registram chamadas.
+
+```text
+          +----------------------------+
+          | <<interface>> Exames       |
+          | + obter_laudo(id, usuario) |
+          +----------------------------+
+               ^                   ^
+               |                   |
+  +--------------------+   +-------------------------------+
+  | RepositorioExames  |<--| ProxyExames                   |
+  | (sujeito real,     |   | - real: RepositorioExames?    |
+  |  lento)            |   | - auditoria: list             |
+  +--------------------+   | + obter_laudo(id, usuario)    |
+                           |   1. checa permissão          |
+                           |   2. registra auditoria       |
+                           |   3. cria real se preciso     |
+                           |   4. delega                   |
+                           +-------------------------------+
+```
+
+## Implementação em Python
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Usuario:
+    nome: str
+    papel: str  # "medico" ou "recepcao"
+    pacientes: frozenset = frozenset()
+
+
+class Exames(ABC):
+    @abstractmethod
+    def obter_laudo(self, exame_id: str, usuario: Usuario) -> str: ...
+
+
+class RepositorioExames(Exames):
+    _BASE = {"EX-1": ("pac-7", "Ressonância de joelho: sem alterações.")}
+
+    def __init__(self):
+        print("[real] conectando ao armazenamento de imagens (caro)...")
+
+    def obter_laudo(self, exame_id, usuario):
+        return self._BASE[exame_id][1]
+
+    @classmethod
+    def paciente_do_exame(cls, exame_id):
+        return cls._BASE[exame_id][0]
+
+
+class AcessoNegado(Exception):
+    pass
+
+
+class ProxyExames(Exames):
+    def __init__(self):
+        self._real = None  # proxy virtual: só cria quando precisar
+        self.auditoria = []
+
+    def _sujeito(self):
+        if self._real is None:
+            self._real = RepositorioExames()
+        return self._real
+
+    def obter_laudo(self, exame_id, usuario):
+        paciente = RepositorioExames.paciente_do_exame(exame_id)
+        permitido = usuario.papel == "medico" and paciente in usuario.pacientes
+        self.auditoria.append((usuario.nome, exame_id, "ok" if permitido else "negado"))
+        if not permitido:
+            raise AcessoNegado(f"{usuario.nome} não pode ver {exame_id}")
+        return self._sujeito().obter_laudo(exame_id, usuario)
+
+
+def tela_do_exame(repo: Exames, exame_id: str, usuario: Usuario):
+    try:
+        print(f"{usuario.nome}: {repo.obter_laudo(exame_id, usuario)}")
+    except AcessoNegado as e:
+        print("bloqueado:", e)
+
+
+if __name__ == "__main__":
+    repo = ProxyExames()
+    print("proxy criado, nenhuma conexão ainda")
+    tela_do_exame(repo, "EX-1", Usuario("Carla", "recepcao"))
+    tela_do_exame(repo, "EX-1", Usuario("Dr. Paulo", "medico", frozenset({"pac-7"})))
+    tela_do_exame(repo, "EX-1", Usuario("Dr. Paulo", "medico", frozenset({"pac-7"})))
+    print("auditoria:", repo.auditoria)
+```
+
+Na saída, a conexão cara só aparece quando o primeiro acesso autorizado acontece, e uma única vez. A recepcionista foi bloqueada sem que o repositório real sequer fosse instanciado.
+
+## Quando usar
+
+- Objetos caros de criar ou de carregar (imagens, conexões, modelos de ML) que nem sempre são usados.
+- Controle de acesso centralizado, sem poluir a classe de negócio.
+- Objetos remotos: o cliente chama um método local e o proxy cuida de serialização e rede.
+- Contagem de referências, rate limiting ou circuit breaker na frente de um serviço.
+
+## Quando evitar
+
+- Quando a indireção esconde custos importantes. Um proxy remoto que parece uma chamada local pode induzir alguém a chamá-lo dentro de um laço de mil iterações.
+- Quando o atraso do carregamento preguiçoso só desloca a lentidão para um momento pior (por exemplo, no meio de uma interação do usuário).
+- Quando a checagem pertence à regra de negócio e precisa de contexto que o proxy não tem.
+
+<Callout type="note" title="Proxies prontos no ecossistema">
+ORMs usam proxies virtuais para relacionamentos carregados sob demanda, e bibliotecas de RPC geram proxies remotos automaticamente. Reconhecer o padrão ajuda a entender por que uma simples leitura de atributo às vezes dispara uma consulta ao banco.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Mesma interface? | Quem cria o objeto real? | Intenção |
+| --- | --- | --- | --- |
+| Proxy | Sim | Geralmente o próprio proxy | Controlar acesso |
+| Decorator | Sim | O cliente, que monta as camadas | Acrescentar comportamento |
+| Adapter | Não | Quem monta o adapter | Compatibilizar interfaces |
+| Facade | Não, nova interface | A fachada usa vários objetos | Simplificar subsistema |
+
+Na prática, a fronteira entre proxy de cache e decorator de cache é tênue. O critério útil é a intenção: se o objetivo é **proteger ou gerenciar** o acesso ao objeto real, chame de proxy; se é **enriquecer** o comportamento de forma combinável, chame de decorator.
+
+## Na entrevista
+
+Cite proxy em "projete um cache", "um sistema de arquivos com permissões", "carregamento de imagens numa galeria" ou "cliente de serviço remoto". Follow-ups comuns:
+
+- **O proxy virtual é thread-safe?** No exemplo, não: duas threads poderiam criar o objeto real ao mesmo tempo. Use um lock com dupla checagem.
+- **Proxy de proteção ou checagem no serviço?** O proxy centraliza, mas regras que dependem do domínio ficam melhor no serviço.
+- **Como o cliente sabe que fala com um proxy?** Não deve saber; essa é a graça.
+
+<QuizSet>
+<Quiz question="Uma galeria mostra miniaturas e só baixa a imagem em alta resolução quando o usuário clica. Qual variação de Proxy é essa?" options={["Proxy remoto", "Proxy virtual", "Proxy de proteção", "Proxy de log"]} answer={1} explanation="O proxy virtual adia a criação ou carga do objeto caro até o primeiro uso real." />
+<Quiz question="Qual afirmação sobre Proxy é verdadeira?" options={["Expõe uma interface diferente do objeto real", "Expõe a mesma interface e controla o acesso ao objeto real", "Sempre é criado pelo cliente em camadas", "Serve para percorrer coleções"]} answer={1} explanation="O cliente usa o proxy como se fosse o objeto real; o proxy decide se, quando e como delegar." />
+</QuizSet>

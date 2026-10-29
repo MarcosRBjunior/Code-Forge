@@ -1,0 +1,174 @@
+---
+title: Prototype
+kind: lesson
+---
+
+## O problema
+
+Num editor de documentos, o usuário escolhe um modelo, "Contrato de prestação de serviços", e recebe um documento novo já com cabeçalho, cláusulas, estilos e metadados. Construir esse documento do zero exige ler arquivos, aplicar estilos e montar dezenas de objetos. E quem pede o documento nem sempre sabe a classe concreta do modelo (pode ser um `Contrato`, uma `Proposta`, um `Relatorio` com seções customizadas).
+
+O **Prototype** cria objetos novos **copiando uma instância existente** (o protótipo), em vez de chamar o construtor. A cópia já sai configurada e você só ajusta o que muda.
+
+## Estrutura
+
+```text
+ +------------------------+         +-----------------------------+
+ |  CatalogoDeModelos     |-------->|  Documento (protótipo)      |
+ +------------------------+  guarda +-----------------------------+
+ | + registrar(nome, doc) |         | + clonar(): Documento       |
+ | + novo(nome): Documento|         | titulo, estilo, secoes,     |
+ +------------------------+         | metadados                   |
+         |                          +-----------------------------+
+         | novo("contrato")                   ^          ^
+         |   -> protótipo.clonar()            |          |
+         v                            Contrato       Proposta
+   documento independente             clonar()       clonar()
+   (cópia profunda das seções)
+
+ Cada classe sabe se copiar; o catálogo não conhece classes concretas.
+```
+
+Papéis: **Protótipo** (interface com `clonar`), **Protótipos concretos** e, frequentemente, um **Registro** (catálogo) que guarda protótipos por nome.
+
+## Implementação em Python
+
+O módulo `copy` faz a parte pesada. O ponto delicado é escolher entre **cópia rasa** (compartilha objetos internos) e **cópia profunda** (duplica tudo), e decidir o que **não** deve ser copiado, como o identificador e a data de criação.
+
+```python
+import copy
+import itertools
+from dataclasses import dataclass, field
+from datetime import datetime
+
+_ids = itertools.count(1)
+
+
+@dataclass(frozen=True)
+class Estilo:
+    """Imutável: pode ser compartilhado entre cópias sem risco."""
+    fonte: str
+    tamanho: int
+
+
+@dataclass
+class Secao:
+    titulo: str
+    paragrafos: list[str] = field(default_factory=list)
+
+
+class Documento:
+    def __init__(self, titulo: str, estilo: Estilo, secoes: list[Secao]):
+        self.id = next(_ids)
+        self.criado_em = datetime.now()
+        self.titulo = titulo
+        self.estilo = estilo
+        self.secoes = secoes
+        self.metadados: dict[str, str] = {}
+
+    def clonar(self) -> "Documento":
+        novo = copy.deepcopy(self)
+        novo.id = next(_ids)               # identidade nunca é copiada
+        novo.criado_em = datetime.now()
+        return novo
+
+    def __deepcopy__(self, memo):
+        cls = type(self)
+        novo = cls.__new__(cls)
+        memo[id(self)] = novo
+        for nome, valor in self.__dict__.items():
+            if nome == "estilo":
+                setattr(novo, nome, valor)                   # compartilha o imutável
+            else:
+                setattr(novo, nome, copy.deepcopy(valor, memo))
+        return novo
+
+    def resumo(self) -> str:
+        nomes = ", ".join(s.titulo for s in self.secoes)
+        return f"#{self.id} {self.titulo} [{self.estilo.fonte} {self.estilo.tamanho}] -> {nomes}"
+
+
+class Contrato(Documento):
+    def assinar_como(self, parte: str) -> None:
+        self.metadados.setdefault("assinantes", "")
+        self.metadados["assinantes"] += parte + ";"
+
+
+class CatalogoDeModelos:
+    def __init__(self):
+        self._prototipos: dict[str, Documento] = {}
+
+    def registrar(self, nome: str, prototipo: Documento) -> None:
+        self._prototipos[nome] = prototipo
+
+    def novo(self, nome: str) -> Documento:
+        return self._prototipos[nome].clonar()
+
+
+# Montar o protótipo é caro só uma vez
+estilo_juridico = Estilo("Times New Roman", 12)
+modelo = Contrato(
+    "Contrato de prestação de serviços",
+    estilo_juridico,
+    [
+        Secao("Partes", ["CONTRATANTE: ____", "CONTRATADA: ____"]),
+        Secao("Objeto", ["Prestação de serviços de desenvolvimento de software."]),
+        Secao("Pagamento", ["Valor mensal de R$ ____."]),
+    ],
+)
+
+catalogo = CatalogoDeModelos()
+catalogo.registrar("contrato", modelo)
+
+doc1 = catalogo.novo("contrato")
+doc1.secoes[0].paragrafos[0] = "CONTRATANTE: Padaria Pão Quente Ltda."
+doc1.secoes.append(Secao("Foro", ["Fica eleito o foro de Campinas/SP."]))
+doc1.assinar_como("Padaria Pão Quente")
+
+doc2 = catalogo.novo("contrato")
+
+print(modelo.resumo())
+print(doc1.resumo())
+print(doc2.resumo())
+print("protótipo intacto:", modelo.secoes[0].paragrafos[0])
+print("tipo preservado:", type(doc2).__name__)
+print("estilo compartilhado:", doc1.estilo is modelo.estilo)
+print("metadados isolados:", modelo.metadados, doc1.metadados)
+```
+
+Observe três decisões de design:
+
+1. **Cópia profunda** das seções: editar o `doc1` não altera o protótipo nem o `doc2`.
+2. **Compartilhamento intencional** do `Estilo`, que é imutável. Copiar seria desperdício.
+3. **Campos de identidade regenerados** (`id`, `criado_em`). Um clone com o mesmo id é uma fonte clássica de bugs.
+
+<Callout type="warning" title="Cópia rasa é a armadilha número 1">
+`copy.copy` copia só o objeto de fora: a lista `secoes` seria a mesma nas duas instâncias. Uma edição num documento apareceria no outro. Sempre pense no grafo de objetos antes de clonar.
+</Callout>
+
+## Quando usar e quando evitar
+
+| Use quando | Evite quando |
+| --- | --- |
+| Criar do zero é caro (I/O, parsing, cálculos) e as variações são pequenas | O construtor é barato e simples |
+| O cliente não conhece a classe concreta, só tem uma instância | O objeto tem referências circulares complexas ou recursos externos (sockets, arquivos abertos) |
+| Você quer configurações pré-prontas (presets, modelos, inimigos de um jogo) | A cópia precisa de regras tão específicas que vira um construtor disfarçado |
+
+## Padrões parecidos
+
+- **Factory Method / Abstract Factory:** criam a partir de **classes**; o Prototype cria a partir de **instâncias**. Um catálogo de protótipos pode substituir uma hierarquia inteira de fábricas.
+- **Memento:** também tira uma "foto" do estado, mas para **restaurar** o mesmo objeto depois (desfazer). O Prototype cria um objeto **novo e independente**.
+- **Flyweight:** compartilha estado para economizar memória; o Prototype duplica estado para dar independência. No exemplo, o `Estilo` compartilhado é uma pitada de Flyweight dentro do Prototype.
+
+## Na entrevista
+
+Cite Prototype ao falar de modelos e presets: duplicar uma playlist, criar uma reserva a partir da anterior, gerar peças de um tabuleiro a partir de um molde, clonar configurações de um tenant. Follow-ups comuns:
+
+- "Cópia rasa ou profunda?" Justifique campo a campo: mutáveis profundos, imutáveis compartilhados.
+- "O que não deve ser copiado?" Ids, timestamps, locks, conexões.
+- "Como lidar com referências cíclicas?" `deepcopy` usa o dicionário `memo` exatamente para isso.
+
+<QuizSet>
+<Quiz question="Qual é a ideia central do Prototype?" options={["Garantir instância única", "Criar novos objetos copiando uma instância existente já configurada", "Separar abstração de implementação", "Encadear handlers"]} answer={1} explanation="O Prototype clona um objeto pronto e ajusta só o que muda." />
+<Quiz question="Você clonou um documento com copy.copy e, ao editar uma seção do clone, o original mudou. Por quê?" options={["Bug do Python", "A cópia rasa compartilha a mesma lista de seções entre os dois objetos", "O deepcopy foi chamado duas vezes", "Dataclasses são imutáveis"]} answer={1} explanation="copy.copy duplica só o objeto externo; listas e objetos internos continuam compartilhados." />
+<Quiz question="Qual campo não deveria ser copiado igual ao original num clone?" options={["O título", "As seções", "O identificador único", "A lista de parágrafos"]} answer={2} explanation="Identidade (id, timestamps de criação) deve ser regenerada para evitar dois objetos 'iguais' no sistema." />
+</QuizSet>

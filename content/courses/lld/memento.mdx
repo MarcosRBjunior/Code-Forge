@@ -1,0 +1,186 @@
+---
+title: Memento
+kind: lesson
+---
+
+## O problema
+
+Um painel de administração permite alterar a configuração de um load balancer: lista de servidores, pesos, timeout, modo de manutenção. Uma mudança errada derruba o site, então o sistema precisa de um botão "voltar para a versão anterior" e de rollback automático quando o health check falha depois de aplicar uma alteração.
+
+A forma ingênua seria outra classe ler todos os campos da configuração, guardar numa cópia e depois escrevê-los de volta. Isso obriga a configuração a expor todo o seu estado interno, inclusive campos que deveriam ser privados, e qualquer campo novo precisa ser lembrado nessa rotina de cópia.
+
+O Memento **captura o estado interno de um objeto num objeto opaco**, sem violar o encapsulamento, para que esse estado possa ser restaurado depois. Só o próprio objeto sabe criar e ler o memento; quem guarda o histórico apenas segura a "caixa fechada".
+
+## Estrutura
+
+```text
++---------------------------+  cria/restaura  +------------------+
+|  Originador               |---------------->|  Memento         |
+|---------------------------|                 |------------------|
+| - estado interno          |                 | - estado (cópia, |
+| + salvar() -> Memento     |                 |   imutável)      |
+| + restaurar(m: Memento)   |                 +------------------+
++---------------------------+                          ^
+                                                       | guarda (sem ler)
+                                            +---------------------+
+                                            |  Zelador (caretaker)|
+                                            |---------------------|
+                                            | - historico: pilha  |
+                                            | + checkpoint()      |
+                                            | + desfazer()        |
+                                            +---------------------+
+```
+
+- **Originador**: o objeto cujo estado será salvo. É o único que conhece o conteúdo do memento.
+- **Memento**: a foto do estado. Deve ser imutável.
+- **Zelador**: decide quando salvar e quando restaurar, e mantém o histórico. Não inspeciona nem altera o memento.
+
+## Implementação: configuração de load balancer com rollback
+
+```python
+import copy
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Callable, Dict, List
+
+
+@dataclass(frozen=True)
+class SnapshotConfig:  # memento
+    _estado: dict = field(repr=False)
+    rotulo: str
+    criado_em: str
+
+
+class ConfigBalanceador:  # originador
+    def __init__(self):
+        self._servidores: Dict[str, int] = {"app-1": 1, "app-2": 1}
+        self._timeout_ms = 3000
+        self._manutencao = False
+
+    def definir_peso(self, servidor: str, peso: int) -> None:
+        self._servidores[servidor] = peso
+
+    def remover(self, servidor: str) -> None:
+        del self._servidores[servidor]
+
+    def definir_timeout(self, ms: int) -> None:
+        self._timeout_ms = ms
+
+    def ativos(self) -> List[str]:
+        return [s for s, peso in self._servidores.items() if peso > 0]
+
+    def salvar(self, rotulo: str) -> SnapshotConfig:
+        estado = {
+            "servidores": copy.deepcopy(self._servidores),  # cópia profunda!
+            "timeout_ms": self._timeout_ms,
+            "manutencao": self._manutencao,
+        }
+        return SnapshotConfig(estado, rotulo, datetime.now().strftime("%H:%M:%S"))
+
+    def restaurar(self, snap: SnapshotConfig) -> None:
+        self._servidores = copy.deepcopy(snap._estado["servidores"])
+        self._timeout_ms = snap._estado["timeout_ms"]
+        self._manutencao = snap._estado["manutencao"]
+
+    def __str__(self) -> str:
+        return f"servidores={self._servidores} timeout={self._timeout_ms}ms"
+
+
+class GerenciadorDeVersoes:  # zelador
+    def __init__(self, config: ConfigBalanceador, limite: int = 5):
+        self._config = config
+        self._historico: List[SnapshotConfig] = []
+        self._limite = limite
+
+    def aplicar(self, rotulo: str, mudanca: Callable[[ConfigBalanceador], None],
+                health_check: Callable[[ConfigBalanceador], bool]) -> bool:
+        snap = self._config.salvar(f"antes de: {rotulo}")
+        mudanca(self._config)
+        if not health_check(self._config):
+            self._config.restaurar(snap)  # rollback automático
+            print(f"'{rotulo}' falhou no health check, revertido")
+            return False
+        self._historico.append(snap)
+        if len(self._historico) > self._limite:
+            self._historico.pop(0)  # descarta o mais antigo
+        print(f"'{rotulo}' aplicado")
+        return True
+
+    def desfazer(self) -> None:
+        if self._historico:
+            snap = self._historico.pop()
+            self._config.restaurar(snap)
+            print(f"restaurado: {snap.rotulo}")
+
+    def versoes(self) -> List[str]:
+        return [s.rotulo for s in self._historico]
+
+
+def pelo_menos_um_ativo(cfg: ConfigBalanceador) -> bool:
+    return len(cfg.ativos()) >= 1
+
+
+config = ConfigBalanceador()
+versoes = GerenciadorDeVersoes(config)
+
+versoes.aplicar("adicionar app-3", lambda c: c.definir_peso("app-3", 2), pelo_menos_um_ativo)
+versoes.aplicar("timeout menor", lambda c: c.definir_timeout(1500), pelo_menos_um_ativo)
+
+
+def desligar_tudo(c: ConfigBalanceador) -> None:
+    for s in list(c.ativos()):
+        c.definir_peso(s, 0)
+
+
+versoes.aplicar("zerar pesos", desligar_tudo, pelo_menos_um_ativo)
+print(config)
+
+print("histórico:", versoes.versoes())
+versoes.desfazer()
+print(config)
+versoes.desfazer()
+print(config)
+```
+
+Pontos de atenção no código:
+
+1. **Cópia profunda**. Se `salvar` guardasse a referência para o mesmo dicionário de servidores, mudanças futuras alterariam o snapshot também, e o rollback não voltaria a nada. Esse é o bug mais comum ao implementar Memento.
+2. **Imutabilidade**. O memento é um dataclass congelado; o zelador não consegue alterá-lo por acidente.
+3. **Encapsulamento**. Em Python, o prefixo `_` é só convenção: o zelador tecnicamente poderia ler `_estado`. Em linguagens com classes aninhadas ou visibilidade de pacote, o memento pode ser realmente opaco. Na entrevista, explique a intenção mesmo que a linguagem não force.
+4. **Limite de histórico**. Snapshots consomem memória; o zelador descarta os mais antigos.
+
+## Quando usar e quando evitar
+
+**Use quando:**
+
+- Você precisa de desfazer, checkpoints, rollback ou "salvar jogo".
+- Expor o estado interno para outra classe copiar quebraria o encapsulamento.
+- Transações em memória: salve antes, restaure se algo falhar no meio.
+
+**Evite ou adapte quando:**
+
+- O estado é muito grande e muda pouco a cada passo. Salvar a foto inteira toda vez é caro; prefira Command com operação inversa, ou snapshots diferenciais (só o que mudou).
+- O estado inclui recursos externos (conexões, arquivos abertos, chamadas a APIs). Um memento restaura memória, não desfaz efeitos no mundo real.
+
+<Callout type="tip" title="Memento e Command juntos">
+Uma combinação comum: cada Command salva um memento do receptor antes de executar e o usa para desfazer. Você ganha o histórico de ações do Command sem precisar escrever a operação inversa de cada uma.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Diferença |
+| --- | --- |
+| Command | Desfaz executando a operação inversa e representa **ações**. Memento desfaz restaurando uma **foto do estado**. |
+| Prototype | Também copia objetos, mas para criar novos objetos independentes, não para restaurar o mesmo objeto a um ponto anterior. |
+| State | Modela em qual situação o objeto está e como reage. Memento só guarda e devolve dados, sem regras de comportamento. |
+
+## Na entrevista
+
+- Aparece em editores de texto, jogos (checkpoint), formulários com rascunho, sistemas de configuração com rollback e no follow-up "e como você implementaria desfazer?" de quase qualquer problema.
+- Mencione os três papéis (originador, memento, zelador) e por que o zelador não deve ler o conteúdo.
+- Follow-ups: "e se o estado for enorme?" (diferencial, compressão, limite de histórico), "como persistir entre sessões?" (serializar o memento), "como desfazer efeitos externos?" (não dá com Memento; use ações de compensação).
+
+<QuizSet>
+<Quiz question="Por que a cópia profunda é importante ao criar um memento?" options={["Para ganhar performance", "Para que alterações futuras no originador não modifiquem o snapshot já salvo", "Para permitir herança", "Porque dataclasses exigem"]} answer={1} explanation="Com cópia rasa, snapshot e objeto compartilham as mesmas estruturas mutáveis, e o rollback restauraria o estado já alterado." />
+<Quiz question="Qual é o papel do zelador (caretaker)?" options={["Ler e modificar o estado salvo", "Decidir quando salvar e restaurar, guardando os mementos sem inspecioná-los", "Criar o memento a partir dos campos do originador", "Validar as regras de negócio"]} answer={1} explanation="Só o originador conhece o conteúdo. O zelador apenas guarda e devolve os mementos." />
+</QuizSet>

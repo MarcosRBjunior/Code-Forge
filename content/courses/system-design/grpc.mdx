@@ -1,0 +1,94 @@
+---
+title: gRPC
+kind: lesson
+---
+
+Dentro de uma arquitetura de microsserviços, uma única requisição do usuário pode gerar dezenas de chamadas internas. Se cada uma serializa JSON, abre conexões e depende de contratos documentados à mão, você paga em latência, CPU e bugs de integração. O **gRPC**, framework de RPC aberto pelo Google em 2015, ataca esses três pontos: contrato formal em **Protocol Buffers**, serialização binária compacta e transporte sobre **HTTP/2**.
+
+## Contrato primeiro
+
+Tudo começa num arquivo `.proto`, que define mensagens e serviços:
+
+```text
+syntax = "proto3";
+
+package frete.v1;
+
+service FreteService {
+  rpc Calcular (CalcularRequest) returns (CalcularResponse);
+  rpc AcompanharEntrega (EntregaRequest) returns (stream Posicao);
+}
+
+message CalcularRequest {
+  string cep_destino = 1;
+  int32 peso_gramas = 2;
+}
+
+message CalcularResponse {
+  int64 valor_centavos = 1;
+  int32 prazo_dias = 2;
+}
+
+message EntregaRequest { string codigo = 1; }
+
+message Posicao {
+  double lat = 1;
+  double lng = 2;
+  int64 timestamp = 3;
+}
+```
+
+O compilador `protoc` gera stubs de cliente e servidor em várias linguagens. O cliente em Go chama `Calcular` como se fosse uma função local; o servidor em Java implementa a interface gerada. Divergência de contrato vira erro de compilação, não bug em produção.
+
+## Por que é rápido
+
+- **Protobuf binário:** mensagens bem menores que JSON e parsing mais barato.
+- **HTTP/2:** uma única conexão TCP carrega muitas chamadas simultâneas (multiplexação em streams), com compressão de cabeçalhos (HPACK). Isso elimina o custo de abrir conexões e o bloqueio de uma requisição esperando outra na mesma conexão no nível HTTP.
+- **Conexões longas:** o canal fica aberto e é reutilizado.
+
+## Quatro tipos de chamada
+
+| Tipo | Cliente envia | Servidor responde | Exemplo |
+| --- | --- | --- | --- |
+| Unária | 1 mensagem | 1 mensagem | Calcular frete |
+| Streaming do servidor | 1 | várias | Posições de uma entrega |
+| Streaming do cliente | várias | 1 | Upload de métricas em lote |
+| Bidirecional | várias | várias | Chat, sincronização contínua |
+
+## Recursos operacionais
+
+- **Deadlines:** o cliente define um prazo absoluto, que se propaga pelas chamadas seguintes. Se o serviço A tem 300 ms e já gastou 200, o serviço B recebe só os 100 restantes, evitando trabalho inútil depois que o cliente desistiu.
+- **Cancelamento:** se o cliente cancela, o servidor é notificado.
+- **Metadados:** pares chave-valor (como cabeçalhos) para autenticação e tracing.
+- **Códigos de status próprios:** `OK`, `INVALID_ARGUMENT`, `NOT_FOUND`, `DEADLINE_EXCEEDED`, `UNAVAILABLE`, `PERMISSION_DENIED`, entre outros. `UNAVAILABLE` é o sinal clássico de que vale retentar.
+- **Interceptors:** middleware para logging, métricas, autenticação e retry.
+
+<Callout type="warning" title="Balanceamento com conexões longas">
+Como o gRPC reutiliza uma conexão HTTP/2 por muito tempo, um load balancer de camada 4 distribui conexões, não chamadas: todas as requisições de um cliente podem cair no mesmo servidor. Use balanceamento de camada 7 (Envoy, service mesh) ou balanceamento no próprio cliente.
+</Callout>
+
+## Limitações
+
+- **Browsers:** não expõem controle suficiente sobre HTTP/2 para gRPC puro. É preciso gRPC-Web com um proxy que traduz, ou expor REST/GraphQL na borda.
+- **Depuração:** payload binário não se lê no `curl`; ferramentas como `grpcurl` ajudam, desde que haja reflection ou o `.proto`.
+- **Cache HTTP:** praticamente inexistente; cache fica na aplicação.
+- **Disciplina de schema:** números de campo nunca podem ser reutilizados, e mudanças de tipo quebram compatibilidade.
+
+## gRPC vs REST
+
+| Aspecto | gRPC | REST com JSON |
+| --- | --- | --- |
+| Contrato | `.proto` obrigatório | OpenAPI opcional |
+| Payload | Binário, compacto | Texto, legível |
+| Streaming | Nativo nos dois sentidos | Limitado (SSE, chunked) |
+| Browser | Via gRPC-Web | Nativo |
+| Melhor para | Tráfego interno, baixa latência | APIs públicas, integrações |
+
+## Na entrevista
+
+Proponha gRPC para comunicação entre serviços internos com alto volume ou necessidade de streaming, e REST ou GraphQL na borda voltada ao cliente. Citar propagação de deadlines e o problema de balanceamento com HTTP/2 mostra experiência prática. Follow-ups comuns: como versionar `.proto`, como expor para o browser e como fazer retry com segurança.
+
+<QuizSet>
+<Quiz question="Um serviço gRPC tem 4 réplicas atrás de um load balancer TCP, mas uma réplica recebe quase todo o tráfego. Qual é a causa provável?" options={["Protobuf é mais lento em algumas réplicas", "As conexões HTTP/2 são longas e multiplexadas, então o balanceamento de camada 4 distribui conexões e não chamadas", "O gRPC não suporta múltiplas réplicas", "O deadline está curto demais"]} answer={1} explanation="Com poucas conexões persistentes, um LB de camada 4 fixa cada cliente numa réplica. A solução é balancear por requisição na camada 7 ou no cliente." />
+<Quiz question="Qual tipo de chamada gRPC é mais adequado para enviar continuamente a posição de um entregador para o app do cliente?" options={["Unária", "Streaming do cliente", "Streaming do servidor", "Nenhum, gRPC não faz streaming"]} answer={2} explanation="O cliente faz uma requisição e o servidor devolve um fluxo de mensagens Posicao à medida que elas surgem." />
+</QuizSet>

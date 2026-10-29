@@ -1,0 +1,93 @@
+---
+title: Estratégias de cache
+kind: lesson
+---
+
+Colocar um cache na frente do banco é fácil. A parte difícil é decidir **quem** lê e escreve no cache, **quando** isso acontece e o que fazer quando cache e banco discordam. Cada estratégia responde a essas perguntas de um jeito, e cada resposta muda latência, consistência e risco de perder dados.
+
+## As duas metades do problema
+
+Pense em duas decisões independentes:
+
+1. **Caminho de leitura:** quem busca o dado na fonte quando há um miss? A aplicação ou o próprio cache?
+2. **Caminho de escrita:** quando o dado muda, a escrita passa pelo cache, vai direto para o banco ou vai só para o cache?
+
+Combinando essas respostas, você chega aos padrões clássicos.
+
+## Padrões de leitura
+
+### Cache-aside (lazy loading)
+
+A aplicação controla tudo: consulta o cache, e em caso de miss lê do banco e popula o cache. O cache não sabe que o banco existe.
+
+- **Prós:** só entra no cache o que é realmente lido; se o cache cair, a aplicação continua funcionando (mais lenta).
+- **Contras:** o primeiro acesso a cada chave sempre paga o miss; a lógica de cache fica espalhada pelo código.
+
+### Read-through
+
+A aplicação conversa **só com o cache**. Em um miss, o próprio cache (ou uma biblioteca que o envolve) chama um *loader* que busca no banco. O código da aplicação fica mais limpo, e o cache pode deduplicar buscas simultâneas pela mesma chave.
+
+```python
+class ReadThroughCache:
+    def __init__(self, loader, ttl):
+        self.loader = loader   # função que busca na fonte
+        self.ttl = ttl
+        self.dados = {}
+
+    def get(self, chave):
+        if chave not in self.dados:
+            self.dados[chave] = self.loader(chave)   # o cache busca sozinho
+        return self.dados[chave]
+
+produtos = ReadThroughCache(loader=banco.buscar_produto, ttl=600)
+produtos.get("sku-42")
+```
+
+## Padrões de escrita
+
+### Write-through
+
+A escrita vai ao cache, e o cache grava no banco **de forma síncrona** antes de confirmar. Cache e banco ficam alinhados, e leituras logo após uma escrita veem o valor novo. O custo é latência de escrita maior e o risco de encher o cache com dados que ninguém vai ler.
+
+### Write-behind (write-back)
+
+A escrita vai só ao cache e é confirmada imediatamente. Um processo em segundo plano descarrega as alterações para o banco em lotes. Ótimo para cargas com muitas escritas no mesmo registro (contadores, posição de jogador), porque várias atualizações viram uma só gravação. O risco: se o nó de cache morrer antes do descarregamento, as escritas se perdem.
+
+### Write-around
+
+A escrita vai **direto ao banco**, e o cache é apenas invalidado (ou ignorado). O dado só volta ao cache quando alguém o ler. Faz sentido quando dados escritos raramente são lidos logo em seguida, como logs de auditoria ou uploads de relatório.
+
+### Refresh-ahead
+
+O cache renova chaves populares **antes** de expirarem, por exemplo quando 80% do TTL já passou e a chave foi acessada. Elimina o miss periódico das chaves quentes, mas desperdiça trabalho se a previsão errar.
+
+## Comparando
+
+| Estratégia | Latência de leitura | Latência de escrita | Consistência | Risco de perda |
+| --- | --- | --- | --- | --- |
+| Cache-aside | Miss no 1º acesso | Baixa (só banco) | Depende da invalidação | Nenhum |
+| Read-through | Miss no 1º acesso | Baixa | Depende da invalidação | Nenhum |
+| Write-through | Alta taxa de hit | Mais alta | Forte entre cache e banco | Nenhum |
+| Write-behind | Alta taxa de hit | Muito baixa | Banco fica atrasado | Alto |
+| Write-around | Miss após escrita | Baixa | Boa | Nenhum |
+
+Na prática, você combina: **read-through + write-through** para um catálogo que precisa estar sempre coerente; **cache-aside + write-around** para um feed em que um pouco de atraso não importa.
+
+<Callout type="warning" title="Ordem das operações no cache-aside">
+Ao atualizar, prefira gravar no banco e **depois** apagar a chave do cache. Atualizar o cache antes do banco abre janela para uma leitura concorrente gravar o valor antigo de volta e deixá-lo lá até o TTL vencer.
+</Callout>
+
+## Armadilhas
+
+- **Write-behind sem durabilidade:** se a fila de descarregamento vive só em memória, uma queda leva dados confirmados ao cliente. Use replicação do cache ou um log persistente.
+- **Write-through com dados frios:** cada escrita ocupa memória. Combine com TTL para que o que ninguém lê saia sozinho.
+- **Duas fontes de verdade:** em write-behind, o cache passa a ser a verdade temporária. Relatórios que leem direto do banco verão dados atrasados.
+
+## Na entrevista
+
+Diga qual padrão escolheu e **por quê**, amarrando à proporção leitura/escrita e à tolerância a dados velhos. Follow-ups comuns: "o que acontece se o cache cair no write-behind?", "como você evita servir dado velho logo após uma escrita?", "por que não usar write-through em tudo?".
+
+<QuizSet>
+<Quiz question="Um jogo atualiza a pontuação de cada jogador dezenas de vezes por segundo e aceita perder alguns segundos de progresso numa falha rara. Qual estratégia de escrita reduz mais a carga no banco?" options={["Write-through", "Write-around", "Write-behind", "Cache-aside sem escrita no cache"]} answer={2} explanation="Write-behind agrupa muitas atualizações do mesmo registro em poucas gravações no banco, ao custo de possível perda se o cache cair antes do descarregamento." />
+<Quiz question="Qual a principal diferença entre cache-aside e read-through?" options={["Read-through não tem TTL", "No read-through, quem busca na fonte durante um miss é o próprio cache, não a aplicação", "Cache-aside sempre grava no banco antes do cache", "Read-through só funciona com Redis"]} answer={1} explanation="Em cache-aside a aplicação orquestra o miss; em read-through o cache tem um loader e a aplicação só fala com ele." />
+</QuizSet>

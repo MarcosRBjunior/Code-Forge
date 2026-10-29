@@ -1,0 +1,199 @@
+---
+title: State
+kind: lesson
+---
+
+## O problema
+
+Pense no ciclo de vida de uma entrega: o pedido é criado, separado no depósito, despachado, entregue ou devolvido. Cada ação ("cancelar", "despachar", "confirmar entrega") tem regras diferentes conforme o momento: cancelar é permitido antes do despacho, proibido depois; confirmar entrega só faz sentido se estiver em trânsito.
+
+A versão ingênua guarda um campo `status` como string e enche cada método de condicionais:
+
+```text
+def cancelar(self):
+    if self.status == "criado" or self.status == "separando": ...
+    elif self.status == "em_transito": raise ...
+    elif self.status == "entregue": raise ...
+```
+
+Com cinco estados e quatro ações, você tem vinte combinações espalhadas em vários métodos. Adicionar um estado novo ("aguardando retirada") significa revisar todos eles.
+
+O State **move o comportamento dependente de estado para classes de estado**. O objeto principal (o contexto) delega cada ação ao seu estado atual, e o próprio estado decide qual é o próximo. Cada classe responde à pergunta: "estando aqui, o que acontece com cada ação?".
+
+## Estrutura
+
+```text
++---------------------+   delega   +--------------------+
+|  Contexto           |----------->|  Estado (iface)    |
+|---------------------|            |--------------------|
+| - estado: Estado    |            | + acao_a(ctx)      |
+| + acao_a()          |            | + acao_b(ctx)      |
+| + acao_b()          |            +--------------------+
+| + mudar_para(e)     |               ^       ^       ^
++---------------------+               |       |       |
+                                  EstadoX  EstadoY  EstadoZ
+                       (cada estado chama ctx.mudar_para(...) para transicionar)
+```
+
+Compare com o diagrama de máquina de estados que você viu no módulo de UML: cada estado do diagrama vira uma classe, e cada seta vira uma chamada a `mudar_para`.
+
+## Implementação: entrega de pedido
+
+```python
+from abc import ABC
+from typing import List
+
+
+class TransicaoInvalida(Exception):
+    pass
+
+
+class EstadoEntrega(ABC):
+    nome = "?"
+
+    # comportamento padrão: ação não permitida neste estado
+    def separar(self, entrega: "Entrega") -> None:
+        self._recusar("separar")
+
+    def despachar(self, entrega: "Entrega", codigo: str) -> None:
+        self._recusar("despachar")
+
+    def confirmar_entrega(self, entrega: "Entrega") -> None:
+        self._recusar("confirmar entrega")
+
+    def cancelar(self, entrega: "Entrega") -> None:
+        self._recusar("cancelar")
+
+    def _recusar(self, acao: str) -> None:
+        raise TransicaoInvalida(f"não é possível {acao} no estado '{self.nome}'")
+
+
+class Criado(EstadoEntrega):
+    nome = "criado"
+
+    def separar(self, entrega):
+        entrega.mudar_para(Separando())
+
+    def cancelar(self, entrega):
+        entrega.mudar_para(Cancelado())
+
+
+class Separando(EstadoEntrega):
+    nome = "separando"
+
+    def despachar(self, entrega, codigo):
+        entrega.codigo_rastreio = codigo
+        entrega.mudar_para(EmTransito())
+
+    def cancelar(self, entrega):
+        entrega.registrar("itens devolvidos à prateleira")
+        entrega.mudar_para(Cancelado())
+
+
+class EmTransito(EstadoEntrega):
+    nome = "em trânsito"
+
+    def confirmar_entrega(self, entrega):
+        entrega.mudar_para(Entregue())
+
+
+class Entregue(EstadoEntrega):
+    nome = "entregue"
+
+
+class Cancelado(EstadoEntrega):
+    nome = "cancelado"
+
+
+class Entrega:
+    def __init__(self, pedido_id: str):
+        self.pedido_id = pedido_id
+        self.codigo_rastreio = ""
+        self.historico: List[str] = []
+        self._estado: EstadoEntrega = Criado()
+        self.registrar("criado")
+
+    @property
+    def estado(self) -> str:
+        return self._estado.nome
+
+    def mudar_para(self, novo: EstadoEntrega) -> None:
+        self.registrar(f"{self._estado.nome} -> {novo.nome}")
+        self._estado = novo
+
+    def registrar(self, msg: str) -> None:
+        self.historico.append(msg)
+
+    # a API pública só delega
+    def separar(self):
+        self._estado.separar(self)
+
+    def despachar(self, codigo: str):
+        self._estado.despachar(self, codigo)
+
+    def confirmar_entrega(self):
+        self._estado.confirmar_entrega(self)
+
+    def cancelar(self):
+        self._estado.cancelar(self)
+
+
+e = Entrega("P-77")
+e.separar()
+e.despachar("BR123456789")
+try:
+    e.cancelar()
+except TransicaoInvalida as erro:
+    print("erro:", erro)
+e.confirmar_entrega()
+print("estado final:", e.estado)
+print("\n".join(e.historico))
+
+print("---")
+outra = Entrega("P-78")
+outra.separar()
+outra.cancelar()
+print("estado final:", outra.estado)
+print("\n".join(outra.historico))
+```
+
+Repare em três decisões:
+
+1. A classe base implementa todas as ações recusando. Cada estado só sobrescreve o que é válido. Isso deixa explícito, por omissão, tudo que é proibido.
+2. Os estados recebem o contexto como parâmetro, então não precisam guardar referência a ele e podem até ser compartilhados (sem estado interno, poderiam ser singletons).
+3. A transição é feita pelo estado (`entrega.mudar_para(...)`), mas o registro do histórico fica centralizado no contexto.
+
+## Quando usar e quando evitar
+
+**Use quando:**
+
+- O comportamento de um objeto muda bastante conforme o estado e você vê o mesmo `if status ==` repetido em vários métodos.
+- As regras de transição são parte importante do domínio (pedidos, pagamentos, máquina de venda, elevador, semáforo, documentos com workflow de aprovação).
+
+**Evite quando:**
+
+- Há dois ou três estados com pouca diferença de comportamento. Um enum com uma tabela de transições permitidas é mais simples.
+- As transições são puramente dados (configuráveis pelo usuário). Aí uma tabela `estado x evento -> próximo estado` lida de configuração é melhor que classes.
+
+<Callout type="note" title="Tabela de transições como alternativa">
+Quando os estados não têm comportamento próprio, só regras de "pode ir de A para B", um dicionário como `PERMITIDAS = {"criado": {"separando", "cancelado"}}` resolve com menos código. Use classes de estado quando cada estado faz coisas diferentes, não apenas permite coisas diferentes.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Diferença |
+| --- | --- |
+| Strategy | Mesmo formato (contexto delega para objeto intercambiável). Mas no Strategy o cliente escolhe a estratégia e elas não se conhecem; no State, os estados **trocam a si mesmos** e conhecem seus sucessores. |
+| Command | Command representa uma ação; State representa a situação em que o objeto se encontra e como ele reage a ações. |
+| Memento | Pode guardar o estado de um objeto para restaurar depois. Não tem relação com regras de transição. |
+
+## Na entrevista
+
+- Máquina de vendas, caixa eletrônico, elevador, semáforo e reserva de hotel são praticamente perguntas sobre State. Comece desenhando os estados e as setas antes de codar; o entrevistador quer ver que você enxerga a máquina.
+- Diga explicitamente o que acontece numa ação inválida (exceção, ignorar, mensagem). Muitos candidatos esquecem.
+- Follow-ups: "quem é responsável pela transição, o contexto ou o estado?" (ambos são válidos; estados fazendo a transição deixam o contexto mais simples, uma tabela central facilita visualizar), "como persistir?" (salve só o nome do estado e reconstrua a classe ao carregar), "e concorrência?" (proteja a transição com lock ou controle otimista de versão).
+
+<QuizSet>
+<Quiz question="Qual é a diferença mais marcante entre State e Strategy?" options={["State usa herança, Strategy usa composição", "No State os próprios estados provocam a troca para o próximo estado", "Strategy não usa interfaces", "State só funciona com enums"]} answer={1} explanation="A estrutura é parecida, mas no State as transições acontecem de dentro dos estados; em Strategy, quem troca é o cliente." />
+<Quiz question="Na implementação mostrada, por que a classe base recusa todas as ações por padrão?" options={["Para deixar o código mais lento", "Para que cada estado só precise implementar as ações válidas, e o resto falhe de forma explícita", "Porque Python exige", "Para impedir herança"]} answer={1} explanation="Os comportamentos inválidos ficam centralizados e cada estado concreto declara apenas o que permite." />
+</QuizSet>

@@ -1,0 +1,106 @@
+---
+title: Design de banco de dados
+kind: lesson
+---
+
+A escolha do banco e do modelo de dados é uma das decisões mais difíceis de reverter num sistema real. Na entrevista, é onde o entrevistador percebe se você pensa em **padrões de acesso** ou só em entidades. O caminho certo é: liste as consultas que o sistema faz, depois escolha armazenamento, chaves e índices que tornam essas consultas baratas.
+
+## Comece pelas consultas
+
+Antes de escrever qualquer tabela, enumere como os dados serão lidos e escritos. Para um app de mensagens, por exemplo:
+
+1. Inserir mensagem numa conversa.
+2. Ler as últimas 50 mensagens de uma conversa, em ordem de tempo.
+3. Listar as conversas de um usuário, ordenadas pela atividade mais recente.
+
+Essas três frases definem praticamente todo o modelo. A consulta 2 pede dados agrupados por conversa e ordenados por tempo. A 3 pede uma estrutura separada, indexada por usuário.
+
+## Relacional ou não relacional
+
+| Critério | Relacional favorece | NoSQL favorece |
+| --- | --- | --- |
+| Relacionamentos e joins | Muitos, variados | Poucos, previsíveis |
+| Transações entre várias entidades | Necessárias | Raras ou limitadas a uma chave |
+| Esquema | Estável, com integridade | Flexível ou muito variado |
+| Volume de escrita | Moderado a alto | Muito alto, distribuído |
+| Consultas | Ad hoc, analíticas | Conhecidas de antemão |
+
+Não existe vencedor universal. Pagamentos e estoque vão bem num relacional. Mensagens e eventos em massa vão bem num wide-column. Muitos sistemas usam os dois, cada um para o que faz melhor.
+
+<Callout type="tip" title="Relacional é um ótimo padrão">
+Se não houver um motivo claro (volume extremo, esquema muito flexível, acesso puramente por chave), começar com um banco relacional é uma escolha defensável. Explique o motivo quando sair dele, não quando ficar.
+</Callout>
+
+## Modelando no relacional
+
+Normalize para evitar inconsistências, depois desnormalize onde a leitura exigir. Um exemplo de esquema para posts e curtidas:
+
+```sql
+CREATE TABLE users (
+  id          BIGINT PRIMARY KEY,
+  username    TEXT UNIQUE NOT NULL,
+  created_at  TIMESTAMP NOT NULL
+);
+
+CREATE TABLE posts (
+  id          BIGINT PRIMARY KEY,
+  author_id   BIGINT NOT NULL REFERENCES users(id),
+  body        TEXT,
+  like_count  INT NOT NULL DEFAULT 0,   -- desnormalizado para leitura rápida
+  created_at  TIMESTAMP NOT NULL
+);
+CREATE INDEX idx_posts_author_time ON posts (author_id, created_at DESC);
+
+CREATE TABLE likes (
+  post_id     BIGINT NOT NULL,
+  user_id     BIGINT NOT NULL,
+  created_at  TIMESTAMP NOT NULL,
+  PRIMARY KEY (post_id, user_id)        -- impede curtida duplicada
+);
+```
+
+Repare em três decisões: o índice composto atende "posts de um autor por data"; a chave primária de `likes` garante unicidade sem lógica extra; `like_count` evita contar linhas a cada leitura, ao custo de manter o contador atualizado.
+
+## Modelando num wide-column
+
+Em bancos como Cassandra, você projeta **uma tabela por consulta**. A chave tem duas partes: a de partição decide em qual nó o dado fica, e a de ordenação define a ordem dentro da partição.
+
+```text
+Tabela messages_by_conversation
+  partição:  conversation_id
+  ordenação: message_id (ordenável por tempo), decrescente
+  colunas:   sender_id, body, sent_at
+
+Tabela conversations_by_user
+  partição:  user_id
+  ordenação: last_activity, decrescente
+  colunas:   conversation_id, preview
+```
+
+Os dados se repetem entre tabelas, e isso é intencional: troca-se espaço por leituras que atingem uma única partição.
+
+## Índices
+
+Índices aceleram leituras e encarecem escritas. Crie para as consultas frequentes, não para todas as colunas. Índices compostos seguem a ordem das colunas: um índice em `(author_id, created_at)` atende filtro por autor, e por autor mais data, mas não por data sozinha.
+
+## Particionamento
+
+Quando um nó não basta, divida os dados por uma chave:
+
+- **Por hash da chave:** distribui uniformemente, mas consultas por intervalo viram consultas a todos os nós.
+- **Por intervalo:** mantém consultas por faixa eficientes, mas cria pontos quentes se as chaves forem sequenciais (como datas).
+
+Escolha uma chave com **alta cardinalidade** e acesso bem distribuído. Particionar por país, por exemplo, deixa um nó com o Brasil inteiro e outro quase vazio. E pense nas celebridades: um usuário com milhões de seguidores pode sobrecarregar a partição dele.
+
+## Replicação
+
+Réplicas aumentam disponibilidade e capacidade de leitura. Com replicação assíncrona, uma leitura na réplica pode não ver a escrita recente. Se o usuário precisa ver o que acabou de postar, leia do primário logo após a escrita, ou garanta leitura das próprias escritas de outra forma.
+
+## Na entrevista
+
+Diga as consultas primeiro, depois mostre as tabelas com chaves e índices que as atendem. Follow-ups frequentes: como você particionaria esta tabela? O que acontece com usuários muito populares? Como manter o contador desnormalizado consistente? Como migrar o esquema sem parar o sistema?
+
+<QuizSet>
+<Quiz question="Num banco wide-column, por que é comum duplicar dados em várias tabelas?" options={["Por erro de modelagem", "Para que cada consulta leia uma única partição, trocando espaço por desempenho", "Porque não há chaves primárias", "Para economizar armazenamento"]} answer={1} explanation="O modelo é orientado a consultas: cada tabela atende um padrão de acesso, mesmo repetindo dados." />
+<Quiz question="Você particiona pedidos por data de criação usando intervalos. Qual risco surge?" options={["Consultas por data ficam impossíveis", "Todas as escritas novas caem na mesma partição, criando um ponto quente", "Os dados ficam inconsistentes", "Não é possível criar índices"]} answer={1} explanation="Chaves sequenciais concentram escrita na partição mais recente." />
+</QuizSet>

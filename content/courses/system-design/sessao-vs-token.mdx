@@ -1,0 +1,74 @@
+---
+title: Sessão vs token
+kind: lesson
+---
+
+HTTP não tem memória: cada requisição chega sem saber que a anterior existiu. Depois que o usuário prova quem é com senha ou passkey, você não quer pedir a senha de novo a cada clique. Precisa de algo que o cliente apresente nas próximas requisições para dizer "sou eu, já me autentiquei". Existem duas famílias de solução: **sessões com estado no servidor** e **tokens autocontidos**.
+
+## Sessão no servidor
+
+Após o login, o servidor cria um registro de sessão (ID aleatório, usuário, expiração) num armazenamento e devolve só o ID num cookie.
+
+```text
+HTTP/1.1 200 OK
+Set-Cookie: sid=Q2x8f9...; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400
+```
+
+Em cada requisição, o browser envia o cookie automaticamente; o servidor busca `sid` no armazenamento e descobre o usuário.
+
+- **Revogação imediata:** logout ou "desconectar de todos os dispositivos" é apagar o registro.
+- **ID opaco:** o cookie não carrega dados; não há o que decodificar.
+- **Custo:** toda requisição faz uma consulta ao armazenamento de sessões.
+
+Com várias instâncias, a sessão não pode ficar na memória de uma delas. As opções são **sticky sessions** no load balancer (frágil: se a instância cai, a sessão some) ou, melhor, um **armazenamento compartilhado** como Redis, que é rápido e mantém as instâncias stateless.
+
+## Token autocontido
+
+O servidor emite um token assinado que já contém as informações (usuário, papéis, expiração). O cliente envia o token em cada requisição, normalmente em `Authorization: Bearer ...`, e qualquer serviço valida a **assinatura** localmente, sem consultar banco. O formato mais comum é o JWT, assunto do próximo capítulo.
+
+- **Sem consulta por requisição:** escala horizontalmente e funciona bem entre microsserviços.
+- **Revogação difícil:** o token vale até expirar, a menos que você mantenha uma lista de revogação, o que reintroduz estado.
+- **Tamanho:** tokens carregam dados e podem ser bem maiores que um ID de sessão.
+
+## Comparação
+
+| Aspecto | Sessão com estado | Token autocontido |
+| --- | --- | --- |
+| Onde fica o estado | Servidor (Redis, banco) | No próprio token |
+| Validação | Busca no armazenamento | Verificação de assinatura |
+| Revogação | Imediata | Só na expiração, ou com lista de bloqueio |
+| Escala entre serviços | Exige armazenamento compartilhado | Natural |
+| Clientes não browser | Possível, menos comum | Natural (mobile, APIs) |
+| Tamanho | ID pequeno | Centenas de bytes ou mais |
+
+## O meio-termo usado na prática
+
+A combinação mais adotada é: **access token de vida curta** (5 a 15 minutos) mais **refresh token de vida longa** guardado no servidor. O access token é validado sem estado; o refresh token é verificado no banco quando o cliente pede um novo access token. Assim, revogar o refresh token derruba o acesso em, no máximo, alguns minutos.
+
+```text
+1. Login              -> access (15 min) + refresh (30 dias)
+2. Chamadas à API     -> Authorization: Bearer access
+3. Access expirou     -> POST /token com refresh
+4. Servidor confere o refresh no banco, emite novo par e invalida o refresh antigo (rotação)
+5. Refresh reutilizado -> sinal de roubo: revoga toda a família de tokens
+```
+
+A **rotação** de refresh tokens detecta vazamentos: se um refresh antigo aparece de novo, alguém está usando uma cópia.
+
+## Onde guardar no browser
+
+- **Cookie `HttpOnly`:** JavaScript não lê, o que protege contra roubo via XSS. Por ser enviado automaticamente, exige defesa contra CSRF (`SameSite=Lax` ou `Strict`, tokens anti-CSRF).
+- **`localStorage`:** prático para enviar em `Authorization`, mas qualquer script injetado (XSS) consegue ler e exfiltrar.
+
+<Callout type="warning" title="Não existe opção sem risco">
+Cookie HttpOnly troca o risco de XSS pelo de CSRF, que é mais fácil de mitigar com SameSite. Para aplicações web, cookies seguros costumam ser a escolha mais defensável; para apps mobile e chamadas entre serviços, tokens em cabeçalho são naturais.
+</Callout>
+
+## Na entrevista
+
+Não diga só "usamos JWT". Explique o trade-off: sessões dão revogação fácil ao custo de um lookup; tokens escalam sem estado ao custo de revogação difícil. Proponha access curto mais refresh rotativo. Follow-ups comuns: como fazer logout com JWT, como lidar com sessões em várias regiões, XSS vs CSRF e por que sticky sessions são frágeis.
+
+<QuizSet>
+<Quiz question="Um requisito diz que o administrador deve conseguir desconectar um usuário imediatamente. Qual abordagem atende com menos complexidade?" options={["JWT de 24 horas sem lista de revogação", "Sessão armazenada no servidor, como Redis", "Guardar a senha no localStorage", "Sticky sessions sem armazenamento"]} answer={1} explanation="Com sessão no servidor, revogar é apagar o registro. Com tokens autocontidos de vida longa, seria preciso manter uma lista de bloqueio consultada a cada requisição." />
+<Quiz question="Para que serve a rotação de refresh tokens?" options={["Para diminuir o tamanho do access token", "Para detectar reutilização de um refresh token roubado e revogar a sessão", "Para dispensar HTTPS", "Para permitir sticky sessions"]} answer={1} explanation="Cada uso gera um novo refresh e invalida o anterior. Se um refresh já usado reaparecer, há duas cópias em circulação, e o servidor pode revogar tudo." />
+</QuizSet>

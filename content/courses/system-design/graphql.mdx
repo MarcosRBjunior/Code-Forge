@@ -1,0 +1,109 @@
+---
+title: GraphQL
+kind: lesson
+---
+
+Imagine a tela inicial de um app de streaming: dados do usuário, lista "continuar assistindo" com progresso, recomendações com capa e nota. Com REST, ou você faz várias chamadas sequenciais (lento em rede móvel), ou cria um endpoint específico para essa tela (que vira manutenção a cada mudança de layout). E cada endpoint devolve campos que a tela nem usa. O **GraphQL**, criado no Facebook e aberto em 2015, inverte a responsabilidade: o **cliente** descreve o formato exato dos dados de que precisa, e o servidor monta a resposta.
+
+## Como funciona
+
+O servidor publica um **schema** tipado que descreve tipos e relacionamentos. Há três tipos de operação:
+
+- **Query:** leitura.
+- **Mutation:** escrita.
+- **Subscription:** fluxo de eventos em tempo real, normalmente sobre WebSocket.
+
+```text
+type Usuario {
+  id: ID!
+  nome: String!
+  assistindo: [Progresso!]!
+}
+
+type Progresso {
+  titulo: Titulo!
+  percentual: Int!
+}
+
+type Titulo {
+  id: ID!
+  nome: String!
+  capaUrl: String
+}
+
+type Query {
+  usuario(id: ID!): Usuario
+}
+```
+
+O cliente envia, em geral via `POST /graphql`, uma consulta com exatamente os campos desejados:
+
+```text
+query TelaInicial {
+  usuario(id: "42") {
+    nome
+    assistindo {
+      percentual
+      titulo { nome capaUrl }
+    }
+  }
+}
+```
+
+A resposta espelha a forma da consulta, dentro de um objeto `data`. Erros vêm num array `errors` ao lado, e a resposta pode ser parcial: alguns campos resolvidos, outros com erro, ainda com status HTTP 200.
+
+## Resolvers e o problema N+1
+
+Cada campo do schema tem um **resolver**, uma função que sabe buscar aquele dado. O servidor percorre a consulta chamando resolvers. Isso é flexível, mas esconde uma armadilha: se `usuario.assistindo` devolve 20 itens e o resolver de `titulo` faz uma consulta por item, você tem 1 + 20 consultas ao banco.
+
+A solução padrão é o **DataLoader**: dentro de uma requisição, ele acumula as chaves pedidas no mesmo ciclo e faz uma única busca em lote.
+
+```python
+class TituloLoader:
+    def __init__(self, repo):
+        self.repo = repo
+        self.pendentes = []
+
+    def carregar(self, titulo_id):
+        self.pendentes.append(titulo_id)
+
+    def despachar(self):
+        ids = list(set(self.pendentes))
+        self.pendentes = []
+        linhas = self.repo.buscar_por_ids(ids)  # um único SELECT ... WHERE id IN (...)
+        return {t.id: t for t in linhas}
+```
+
+## Vantagens
+
+- **Sem over-fetching nem under-fetching:** uma requisição, só os campos necessários.
+- **Schema como contrato:** tipado, introspectável, gera documentação e código de cliente.
+- **Evolução sem versões:** adiciona-se campos livremente e marca-se antigos com `@deprecated`, acompanhando quem ainda os usa.
+- **Agregação:** um servidor GraphQL pode unificar vários microsserviços (padrão comum de BFF ou federação).
+
+## Desvantagens e cuidados
+
+| Problema | Por quê | Mitigação |
+| --- | --- | --- |
+| Cache HTTP difícil | Tudo vai em POST para uma URL | Persisted queries via GET, cache por campo no cliente |
+| Consultas abusivas | Aninhamento profundo explode o custo | Limite de profundidade, análise de custo, timeout |
+| N+1 no backend | Resolvers por campo | DataLoader e batching |
+| Rate limiting | Uma requisição pode valer 1 ou 10 mil operações | Limitar por custo calculado, não por chamada |
+| Monitoramento | Tudo retorna 200 | Métricas por operação e por resolver |
+
+<Callout type="tip" title="Persisted queries">
+Em apps próprios, registre as consultas permitidas no build e envie só um hash. O servidor recusa consultas desconhecidas, o que fecha a porta para abuso e permite usar GET com cache em CDN.
+</Callout>
+
+## Quando usar
+
+GraphQL vale a pena quando há **muitos clientes diferentes** (web, iOS, Android, TV) consumindo os mesmos dados com necessidades distintas, telas ricas que combinam várias entidades, e times de frontend que evoluem rápido. Para APIs públicas simples, CRUD direto ou comunicação entre serviços de backend, REST ou gRPC costumam ser mais simples e baratos de operar.
+
+## Na entrevista
+
+Se o problema tiver um feed ou tela agregadora com vários tipos de cliente, GraphQL é uma boa proposta para a camada de borda. Mostre que conhece os custos: N+1 e DataLoader, limitação por complexidade de consulta e a perda do cache HTTP nativo. Follow-ups comuns: como fazer rate limiting em GraphQL, como lidar com erros parciais e como fazer subscriptions escalarem.
+
+<QuizSet>
+<Quiz question="Uma consulta GraphQL lista 50 pedidos e, para cada um, o cliente. O backend dispara 51 consultas ao banco. Qual é a solução típica?" options={["Trocar para REST", "Usar DataLoader para agrupar as buscas de clientes em lote", "Aumentar o pool de conexões", "Remover o campo cliente do schema"]} answer={1} explanation="Esse é o problema N+1. O DataLoader acumula os IDs pedidos durante a resolução e faz uma única consulta com todos eles." />
+<Quiz question="Por que rate limiting por número de requisições é insuficiente em GraphQL?" options={["Porque GraphQL não usa HTTP", "Porque uma única requisição pode ter custo muito variável dependendo da consulta", "Porque GraphQL não tem autenticação", "Porque mutations são sempre gratuitas"]} answer={1} explanation="Uma consulta rasa e uma consulta profundamente aninhada contam como uma requisição cada, mas podem ter custos de ordens de grandeza diferentes. O limite deve considerar o custo estimado." />
+</QuizSet>

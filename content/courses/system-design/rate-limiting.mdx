@@ -1,0 +1,108 @@
+---
+title: Rate limiting
+kind: lesson
+---
+
+Toda API exposta vai, em algum momento, receber mais tráfego do que deveria: um cliente com bug em loop, um script de scraping, um ataque de força bruta no login ou simplesmente um pico legítimo. Sem controle, um único consumidor pode esgotar CPU, conexões de banco ou cota de um fornecedor e derrubar o serviço para todos. **Rate limiting** limita quantas requisições um cliente pode fazer numa janela de tempo e rejeita o excesso de forma previsível.
+
+## Para que serve
+
+- **Proteção:** impedir que abuso ou bugs derrubem o sistema.
+- **Justiça:** um cliente barulhento não prejudica os demais.
+- **Segurança:** dificultar força bruta e enumeração.
+- **Custo e produto:** aplicar cotas por plano (gratuito, pago, empresarial).
+
+## Algoritmos
+
+### Janela fixa
+
+Conta requisições por intervalo alinhado (por exemplo, por minuto cheio). Simples: um contador por chave com expiração. Problema: um cliente pode mandar 100 requisições às 12:00:59 e mais 100 às 12:01:00, ou seja, o dobro do limite em dois segundos.
+
+### Janela deslizante com log
+
+Guarda o timestamp de cada requisição e conta as que caem nos últimos 60 segundos. Preciso, mas consome memória proporcional ao volume.
+
+### Janela deslizante com contador
+
+Aproximação barata: combina o contador da janela atual com uma fração do contador da anterior, proporcional ao quanto da janela anterior ainda está dentro dos últimos 60 segundos. Bom equilíbrio entre precisão e memória.
+
+### Token bucket
+
+Um balde com capacidade C recebe R fichas por segundo. Cada requisição consome uma ficha; sem fichas, é rejeitada. Permite **rajadas** de até C requisições, mantendo a taxa média R. É o algoritmo mais usado em APIs.
+
+### Leaky bucket
+
+As requisições entram numa fila que é esvaziada a uma taxa constante. Suaviza o tráfego de saída, útil para proteger um downstream sensível, mas adiciona latência de fila.
+
+| Algoritmo | Permite rajada | Memória | Precisão |
+| --- | --- | --- | --- |
+| Janela fixa | Sim, inclusive no limite das janelas | Baixa | Baixa |
+| Log deslizante | Não | Alta | Alta |
+| Contador deslizante | Moderada | Baixa | Boa |
+| Token bucket | Sim, controlada por C | Baixa | Boa |
+| Leaky bucket | Não, saída constante | Fila | Alta |
+
+## Exemplo: token bucket
+
+```python
+import time
+
+class TokenBucket:
+    def __init__(self, capacidade, taxa_por_seg):
+        self.capacidade = capacidade
+        self.taxa = taxa_por_seg
+        self.fichas = capacidade
+        self.ultimo = time.monotonic()
+
+    def permitir(self):
+        agora = time.monotonic()
+        decorrido = agora - self.ultimo
+        self.fichas = min(self.capacidade, self.fichas + decorrido * self.taxa)
+        self.ultimo = agora
+        if self.fichas >= 1:
+            self.fichas -= 1
+            return True
+        return False
+
+balde = TokenBucket(capacidade=10, taxa_por_seg=2)
+print([balde.permitir() for _ in range(12)])  # 10 True, depois False
+```
+
+Note que não há timer reabastecendo o balde: as fichas são calculadas preguiçosamente a partir do tempo decorrido.
+
+## Rate limiting distribuído
+
+Com várias instâncias da API, cada uma com seu contador em memória, o limite efetivo vira N vezes o configurado. As soluções:
+
+- **Armazenamento central** (Redis): contadores compartilhados, atualizados de forma atômica com `INCR` + `EXPIRE` ou um script Lua que implementa o token bucket inteiro numa só operação.
+- **Limites locais aproximados:** cada instância aplica limite dividido por N. Sem rede extra, mas impreciso quando o tráfego não é uniforme.
+- **No gateway:** API gateways e service meshes oferecem rate limiting pronto, perto da borda.
+
+Defina também a **chave** do limite: por usuário autenticado, por chave de API, por IP (cuidado com NAT, em que muitos usuários compartilham um IP) ou por rota (login mais restrito que leitura).
+
+## Respondendo ao cliente
+
+Rejeite com **429 Too Many Requests** e informe quando tentar de novo:
+
+```text
+HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 12
+```
+
+`Retry-After` é padrão HTTP; os cabeçalhos `RateLimit-*` (ou as variantes `X-RateLimit-*`) variam entre provedores. Clientes bem-comportados devem usar **backoff exponencial com jitter** ao receber 429.
+
+<Callout type="note" title="Falhar aberto ou fechado?">
+Se o Redis do rate limiter cair, você bloqueia tudo (falha fechada) ou deixa passar (falha aberta)? Para a maioria das APIs, falhar aberto com um limite local de emergência é melhor do que derrubar o serviço por causa do limitador.
+</Callout>
+
+## Na entrevista
+
+Rate limiting aparece como requisito não funcional em quase todo design e também como problema próprio ("projete um rate limiter"). Explique o token bucket, onde fica o estado (Redis com operação atômica), qual é a chave e como o cliente é informado (429 e `Retry-After`). Follow-ups comuns: condições de corrida entre instâncias, latência extra por consultar o Redis, limites por plano e o que fazer se o armazenamento central falhar.
+
+<QuizSet>
+<Quiz question="Qual algoritmo permite rajadas curtas acima da taxa média, mas mantém a média sob controle?" options={["Leaky bucket", "Token bucket", "Log deslizante", "Round robin"]} answer={1} explanation="No token bucket as fichas acumulam até a capacidade C, permitindo rajadas de até C requisições, enquanto o reabastecimento a R por segundo controla a média." />
+<Quiz question="Sua API tem 5 instâncias, cada uma com contador em memória e limite de 100 req/min por usuário. Qual é o limite real?" options={["100 req/min", "Até 500 req/min, dependendo de como o LB distribui", "20 req/min", "Ilimitado"]} answer={1} explanation="Cada instância conta separadamente. Se as requisições se espalham, o usuário pode chegar a 5 vezes o limite. Um contador central resolve." />
+</QuizSet>

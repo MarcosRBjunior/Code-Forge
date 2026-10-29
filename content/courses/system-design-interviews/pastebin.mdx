@@ -1,0 +1,150 @@
+---
+title: Projetar um Pastebin
+kind: lesson
+---
+
+Um Pastebin permite colar um bloco de texto e receber um link para compartilhá-lo. À primeira vista é um primo do encurtador de URL, mas há uma diferença decisiva: agora o conteúdo é grande e variável. Isso muda onde você guarda os dados e como pensa em custo.
+
+## Requisitos
+
+### Funcionais
+
+- Criar um paste com texto (até 10 MB), recebendo um link único.
+- Ler o paste pelo link.
+- Expiração configurável: 10 minutos, 1 dia, 1 mês ou nunca.
+- Visibilidade: público, não listado (só quem tem o link) ou privado (exige login).
+- Opcional: realce de sintaxe por linguagem e "queimar após leitura".
+
+### Não funcionais
+
+- Leitura domina escrita, algo como 10 para 1.
+- Durabilidade: um paste salvo não pode sumir antes de expirar.
+- Latência de leitura baixa para pastes populares.
+- Links não devem ser adivinháveis, já que pastes "não listados" dependem disso.
+
+## Estimativas
+
+Suponha 5 milhões de pastes novos por dia.
+
+- Escritas: 5 M / 86.400 ≈ **60 por segundo**; pico de 300/s.
+- Leituras: 10× isso, **600 por segundo**; pico de 3.000/s.
+- Tamanho médio: a maioria é pequena. Assuma média de 20 KB (logs e trechos de código), com cauda longa até 10 MB.
+- Armazenamento diário: 5 M × 20 KB = **100 GB por dia**. Em um ano, 36 TB; em 5 anos, cerca de 180 TB, desconsiderando expirações.
+- Metadados: uns 300 bytes por paste, ou 5 M × 300 B = 1,5 GB por dia, cerca de 2,7 TB em 5 anos.
+
+A conta mostra a separação natural: **conteúdo** é volumoso e imutável (bom candidato para object storage), **metadados** são pequenos e consultados por chave (bom para banco).
+
+## API
+
+```text
+POST /api/v1/pastes
+  body: { "conteudo": "...", "linguagem": "python",
+          "expiraEm": "1d", "visibilidade": "nao_listado" }
+  resposta 201: { "id": "Kx81pQ2zVb", "url": "https://paste.cf/Kx81pQ2zVb" }
+
+GET /api/v1/pastes/:id
+  resposta 200: { "id": "...", "linguagem": "python", "criadoEm": "...",
+                  "conteudoUrl": "https://cdn.paste.cf/..." }
+
+DELETE /api/v1/pastes/:id     (somente o dono)
+```
+
+Para pastes grandes, uma boa variação é o cliente pedir uma **URL pré-assinada** e enviar o conteúdo direto ao object storage, sem passar pelos seus servidores de aplicação.
+
+## Modelo de dados
+
+```sql
+CREATE TABLE pastes (
+  id            VARCHAR(12) PRIMARY KEY,
+  dono_id       BIGINT,
+  chave_objeto  TEXT NOT NULL,      -- caminho no object storage
+  tamanho_bytes INT NOT NULL,
+  linguagem     VARCHAR(30),
+  visibilidade  SMALLINT NOT NULL,
+  criado_em     TIMESTAMP NOT NULL,
+  expira_em     TIMESTAMP
+);
+CREATE INDEX ix_pastes_expira ON pastes (expira_em);
+CREATE INDEX ix_pastes_dono ON pastes (dono_id, criado_em);
+```
+
+O conteúdo vai para algo como S3 sob a chave `pastes/Kx/Kx81pQ2zVb`. Pastes muito pequenos (menos de 1 KB) podem até ficar inline no banco para evitar uma viagem extra, mas isso é otimização opcional.
+
+## Arquitetura de alto nível
+
+```text
+ cliente
+   |
+   v
++------+     +--------------+     +-------------------+
+| CDN  |<----| Object store |<----| upload direto     |
++--+---+     | (conteúdo)   |     | (URL pré-assinada)|
+   |         +------^-------+     +---------^---------+
+   v                |                       |
++---------------+   |                       |
+| Load balancer |   |                       |
++-------+-------+   |                       |
+        |           |                       |
++-------v--------+  |        +--------------+--+
+| API de pastes  |--+------->| Gerador de IDs  |
++---+--------+---+           +-----------------+
+    |        |
++---v---+ +--v-----------+
+| Redis | | Banco de     |
+| meta  | | metadados    |
++-------+ +------+-------+
+                 |
+        +--------v---------+
+        | Job de expiração |
+        +------------------+
+```
+
+Fluxo de escrita: a API gera o ID, grava o conteúdo no object storage, depois grava o metadado no banco. Se o segundo passo falhar, sobra um objeto órfão, o que é inofensivo e pode ser coletado por um job que compara objetos sem metadado. A ordem inversa seria pior: metadado apontando para conteúdo inexistente.
+
+Fluxo de leitura: a API consulta o metadado (Redis, depois banco), verifica expiração e permissão, e devolve o conteúdo ou um redirecionamento para a CDN.
+
+## Aprofundamentos
+
+### 1. IDs imprevisíveis
+
+Como pastes não listados dependem do segredo do link, um contador sequencial é inaceitável. Gere 10 caracteres aleatórios em base62: 62^10 ≈ 8 × 10^17 combinações. Com 10 bilhões de pastes, a chance de um palpite aleatório acertar algum é cerca de 1 em 80 milhões por tentativa, o que, somado a rate limit, torna varredura inviável. Colisões são raríssimas, mas trate-as com inserção condicional e nova tentativa.
+
+### 2. Expiração e limpeza
+
+Há duas camadas:
+
+1. **Na leitura**: se `expira_em` já passou, responda 404 mesmo que o dado exista. Isso garante a semântica correta imediatamente.
+2. **Em segundo plano**: um job percorre o índice `expira_em` em lotes e apaga metadado e objeto. Object stores costumam ter regras de ciclo de vida; você pode organizar as chaves por data de expiração (`exp/2026-11-01/...`) e deixar uma regra apagar prefixos inteiros.
+
+"Queimar após leitura" exige atomicidade: duas pessoas abrindo o link ao mesmo tempo não podem ambas ver o conteúdo. Use um `UPDATE ... SET lido = true WHERE id = ? AND lido = false` e só sirva o conteúdo a quem conseguiu mudar a linha.
+
+### 3. Cache e CDN
+
+Pastes públicos e não listados são imutáveis, então o conteúdo pode ser cacheado agressivamente na CDN com TTL até a expiração. Pastes privados não podem ir para cache compartilhado; sirva-os pela API, ou com URLs assinadas de vida curta. Um paste que viraliza num fórum é absorvido pela CDN sem tocar o banco.
+
+<Callout type="warning" title="Cuidado com o tamanho máximo">
+Se você permitir 10 MB passando pelo servidor de aplicação, poucos uploads simultâneos ocupam muita memória e banda. Upload direto para o object storage resolve e é um ponto que entrevistadores gostam de ouvir.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Decisão | Opção A | Opção B |
+| --- | --- | --- |
+| Onde guardar conteúdo | Banco (simples, uma consulta) | Object storage (barato, escala, mais um salto) |
+| Expiração | Só verificação na leitura (dados acumulam) | Job de limpeza (custo de processamento) |
+| Compressão | Comprimir no servidor (economiza ~70% em texto) | Não comprimir (menos CPU, mais disco) |
+| Deduplicação | Hash do conteúdo, um objeto compartilhado | Um objeto por paste, mais simples para apagar |
+
+Texto comprime muito bem; gzip em código-fonte costuma reduzir para 25–30% do tamanho. Os 180 TB estimados viram algo perto de 50 TB, uma economia que vale citar.
+
+## Perguntas de follow-up comuns
+
+- Como evitar que o serviço seja usado para hospedar malware ou dados vazados? Varredura assíncrona do conteúdo, denúncias e rate limit por IP.
+- Como suportar busca em pastes públicos? Indexar de forma assíncrona num motor de busca textual, alimentado por eventos de criação.
+- Como contar visualizações? Mesmo padrão do encurtador: evento em fila e agregação em lote.
+- O que muda se pastes puderem ser editados? Versionamento: cada edição gera um novo objeto e o metadado aponta para a versão atual; o cache passa a precisar de invalidação.
+
+<QuizSet>
+<Quiz question="Por que separar conteúdo e metadados em armazenamentos diferentes?" options={["Porque bancos não aceitam texto", "Porque conteúdo é volumoso e imutável, enquanto metadados são pequenos e consultados por chave", "Para facilitar joins", "Porque object storage é mais rápido que qualquer banco"]} answer={1} explanation="Os perfis de acesso e custo são diferentes: object storage é barato para blobs grandes, banco é bom para consultas de metadados." />
+<Quiz question="Qual a forma segura de implementar 'queimar após leitura'?" options={["Apagar o paste com um job a cada hora", "Usar cache com TTL curto", "Fazer uma atualização condicional atômica e servir apenas a quem a venceu", "Confiar no cliente para não abrir duas vezes"]} answer={2} explanation="A atualização condicional garante que só uma leitura vença a corrida." />
+</QuizSet>

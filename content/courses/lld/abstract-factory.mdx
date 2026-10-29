@@ -1,0 +1,232 @@
+---
+title: Abstract Factory
+kind: lesson
+---
+
+## O problema
+
+Sua plataforma de pagamentos integra com dois provedores, digamos **Provedor A** e **Provedor B**. Para cada um você precisa de três objetos que trabalham juntos: um cliente de cobrança, um validador de webhook (cada provedor assina as notificações de um jeito) e um conversor de status (cada um usa códigos diferentes para "pago"). Misturar peças, como validar um webhook do A com o validador do B, é um bug grave e silencioso.
+
+O **Abstract Factory** fornece uma interface para criar **famílias de objetos relacionados** sem especificar suas classes concretas. Você escolhe a fábrica uma vez (na configuração do lojista) e todo o resto do código recebe peças garantidamente compatíveis.
+
+## Estrutura
+
+```text
+                  +--------------------------------+
+                  |  FabricaDeProvedor (abstrata)  |
+                  +--------------------------------+
+                  | + criar_cobranca(): Cobranca   |
+                  | + criar_validador(): Validador |
+                  | + criar_status(): ConversorSt. |
+                  +--------------------------------+
+                        ^                    ^
+                        |                    |
+          +-------------------+     +-------------------+
+          |   FabricaProvA    |     |   FabricaProvB    |
+          +-------------------+     +-------------------+
+            |   |   |                 |   |   |
+            v   v   v                 v   v   v
+   CobrancaA ValidadorA StatusA   CobrancaB ValidadorB StatusB
+
+  Cliente (CheckoutService) conhece só FabricaDeProvedor e as interfaces
+  Cobranca, Validador e ConversorStatus.
+```
+
+Papéis: **Fábrica abstrata**, **Fábricas concretas** (uma por família), **Produtos abstratos** (um por tipo de peça) e **Produtos concretos**.
+
+## Implementação em Python
+
+```python
+import hashlib
+import hmac
+from abc import ABC, abstractmethod
+from enum import Enum
+
+
+class StatusPagamento(Enum):
+    PENDENTE = "pendente"
+    PAGO = "pago"
+    RECUSADO = "recusado"
+
+
+# ---------- Produtos abstratos ----------
+class Cobranca(ABC):
+    @abstractmethod
+    def criar(self, pedido_id: str, centavos: int) -> dict: ...
+
+
+class ValidadorWebhook(ABC):
+    @abstractmethod
+    def valido(self, corpo: bytes, assinatura: str) -> bool: ...
+
+
+class ConversorStatus(ABC):
+    @abstractmethod
+    def converter(self, codigo_externo: str) -> StatusPagamento: ...
+
+
+# ---------- Família do Provedor A ----------
+class CobrancaA(Cobranca):
+    def criar(self, pedido_id, centavos):
+        return {"endpoint": "/v1/charges", "reference": pedido_id, "amount": centavos}
+
+
+class ValidadorA(ValidadorWebhook):
+    def __init__(self, segredo: bytes):
+        self._segredo = segredo
+
+    def valido(self, corpo, assinatura):
+        esperado = hmac.new(self._segredo, corpo, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(esperado, assinatura)
+
+
+class StatusA(ConversorStatus):
+    _MAPA = {"succeeded": StatusPagamento.PAGO, "failed": StatusPagamento.RECUSADO}
+
+    def converter(self, codigo):
+        return self._MAPA.get(codigo, StatusPagamento.PENDENTE)
+
+
+# ---------- Família do Provedor B ----------
+class CobrancaB(Cobranca):
+    def criar(self, pedido_id, centavos):
+        return {"endpoint": "/api/pagamentos", "id_pedido": pedido_id, "valor": f"{centavos / 100:.2f}"}
+
+
+class ValidadorB(ValidadorWebhook):
+    def __init__(self, token: str):
+        self._token = token
+
+    def valido(self, corpo, assinatura):
+        # B manda um token fixo + sha1 do corpo
+        esperado = self._token + ":" + hashlib.sha1(corpo).hexdigest()
+        return hmac.compare_digest(esperado, assinatura)
+
+
+class StatusB(ConversorStatus):
+    _MAPA = {"APROVADO": StatusPagamento.PAGO, "NEGADO": StatusPagamento.RECUSADO}
+
+    def converter(self, codigo):
+        return self._MAPA.get(codigo.upper(), StatusPagamento.PENDENTE)
+
+
+# ---------- Fábricas ----------
+class FabricaDeProvedor(ABC):
+    @abstractmethod
+    def criar_cobranca(self) -> Cobranca: ...
+
+    @abstractmethod
+    def criar_validador(self) -> ValidadorWebhook: ...
+
+    @abstractmethod
+    def criar_conversor(self) -> ConversorStatus: ...
+
+
+class FabricaProvedorA(FabricaDeProvedor):
+    def __init__(self, segredo: bytes):
+        self._segredo = segredo
+
+    def criar_cobranca(self):
+        return CobrancaA()
+
+    def criar_validador(self):
+        return ValidadorA(self._segredo)
+
+    def criar_conversor(self):
+        return StatusA()
+
+
+class FabricaProvedorB(FabricaDeProvedor):
+    def __init__(self, token: str):
+        self._token = token
+
+    def criar_cobranca(self):
+        return CobrancaB()
+
+    def criar_validador(self):
+        return ValidadorB(self._token)
+
+    def criar_conversor(self):
+        return StatusB()
+
+
+# ---------- Cliente ----------
+class ServicoDeCheckout:
+    def __init__(self, fabrica: FabricaDeProvedor):
+        self._cobranca = fabrica.criar_cobranca()
+        self._validador = fabrica.criar_validador()
+        self._conversor = fabrica.criar_conversor()
+
+    def iniciar(self, pedido_id: str, centavos: int) -> dict:
+        return self._cobranca.criar(pedido_id, centavos)
+
+    def receber_webhook(self, corpo: bytes, assinatura: str, codigo: str) -> StatusPagamento:
+        if not self._validador.valido(corpo, assinatura):
+            raise PermissionError("assinatura de webhook inválida")
+        return self._conversor.converter(codigo)
+
+
+def fabrica_para(lojista: dict) -> FabricaDeProvedor:
+    if lojista["provedor"] == "A":
+        return FabricaProvedorA(lojista["segredo"].encode())
+    if lojista["provedor"] == "B":
+        return FabricaProvedorB(lojista["segredo"])
+    raise ValueError("provedor desconhecido")
+
+
+corpo = b'{"pedido": "P-77"}'
+
+checkout_a = ServicoDeCheckout(fabrica_para({"provedor": "A", "segredo": "s3gr3d0"}))
+print(checkout_a.iniciar("P-77", 15990))
+assinatura_a = hmac.new(b"s3gr3d0", corpo, hashlib.sha256).hexdigest()
+print(checkout_a.receber_webhook(corpo, assinatura_a, "succeeded"))
+
+checkout_b = ServicoDeCheckout(fabrica_para({"provedor": "B", "segredo": "tok-123"}))
+print(checkout_b.iniciar("P-78", 4500))
+assinatura_b = "tok-123:" + hashlib.sha1(corpo).hexdigest()
+print(checkout_b.receber_webhook(corpo, assinatura_b, "negado"))
+
+try:
+    checkout_b.receber_webhook(corpo, assinatura_a, "APROVADO")
+except PermissionError as erro:
+    print("bloqueado:", erro)
+```
+
+O `ServicoDeCheckout` não importa nenhuma classe concreta. Trocar de provedor é trocar a fábrica, e é impossível montar um checkout com cobrança do A e validador do B.
+
+## Trade-offs
+
+- **Adicionar uma família nova é fácil** (uma fábrica e seus produtos). **Adicionar um tipo de produto novo é caro**: toda fábrica precisa ganhar um método. Avalie qual eixo muda mais no seu domínio.
+- Muitas classes pequenas. Para duas famílias com um produto cada, é exagero.
+
+## Quando usar e quando evitar
+
+| Use quando | Evite quando |
+| --- | --- |
+| Há famílias de objetos que precisam ser usados juntos (provedores, temas de UI, bancos de dados) | Os objetos são independentes entre si |
+| A família é escolhida uma vez, por configuração | Você só cria um tipo de objeto: use Factory Method ou uma função |
+| Você quer impedir misturas incompatíveis | Novos tipos de produto surgem toda semana |
+
+## Padrões parecidos
+
+- **Factory Method:** um método que cria **um** produto e é sobrescrito por subclasses. A Abstract Factory é um **objeto** com vários métodos fábrica, normalmente passado por composição. Muitas vezes cada método da Abstract Factory é implementado como um Factory Method.
+- **Builder:** monta um objeto complexo passo a passo; a Abstract Factory devolve cada produto pronto de uma vez.
+- **Singleton:** fábricas concretas costumam ter uma instância só por configuração, mas isso não precisa ser forçado pelo padrão.
+
+<Callout type="tip" title="Pista no enunciado">
+Quando o problema diz "suportar vários provedores/plataformas/temas, e cada um tem seu próprio jeito de fazer X, Y e Z", é quase sempre Abstract Factory.
+</Callout>
+
+## Na entrevista
+
+Bons gatilhos: suporte a múltiplos provedores de pagamento, múltiplos bancos de dados (conexão, dialeto SQL e migrador), UI multiplataforma, jogos com temas. Follow-ups comuns:
+
+- "Como você adiciona um quarto produto?" Admita o custo: todas as fábricas mudam.
+- "Quem escolhe a fábrica?" A composição na inicialização (configuração do tenant), uma vez.
+- "Como testar?" Uma fábrica falsa que devolve dublês para os três produtos.
+
+<QuizSet>
+<Quiz question="O que caracteriza o Abstract Factory?" options={["Uma classe com uma única instância", "Uma interface para criar famílias de objetos relacionados sem especificar classes concretas", "Copiar objetos existentes", "Montar um objeto passo a passo"]} answer={1} explanation="A ideia central são famílias compatíveis criadas por uma mesma fábrica." />
+<Quiz question="Em qual mudança o Abstract Factory é mais caro?" options={["Adicionar uma nova família (novo provedor)", "Adicionar um novo tipo de produto a todas as famílias", "Trocar a fábrica em tempo de execução", "Criar testes"]} answer={1} explanation="Um novo tipo de produto exige um novo método na interface e em todas as fábricas concretas." />
+<Quiz question="Qual benefício de segurança o exemplo de pagamentos ilustra?" options={["Criptografia mais forte", "Impossibilidade de combinar validador de um provedor com cobrança de outro", "Menos requisições HTTP", "Cache de webhooks"]} answer={1} explanation="A fábrica garante consistência entre as peças da mesma família." />
+</QuizSet>

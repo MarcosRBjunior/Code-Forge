@@ -1,0 +1,85 @@
+---
+title: Aquecimento de cache
+kind: lesson
+---
+
+Um cache recém-criado está **frio**: vazio, com taxa de acerto zero. Se o sistema foi dimensionado contando com 95% de acertos, o banco recebe 20 vezes mais carga do que suporta até o cache encher sozinho. **Aquecimento** (cache warming) é popular o cache antes, ou logo depois, de ele receber tráfego real.
+
+## Quando o cache esfria
+
+- Deploy de um novo cluster ou de uma nova região.
+- Reinício de um nó (cache em memória sem persistência perde tudo).
+- Failover para um ambiente de reserva.
+- Mudança no formato das chaves (`v2:produto:42`), que torna todas as chaves antigas inúteis.
+- Um evento previsível de pico: Black Friday, lançamento de um álbum, abertura de inscrições.
+
+## Estratégias
+
+### Pré-carregamento com a lista de chaves quentes
+
+Antes de abrir o tráfego, um script lê do banco os itens mais acessados e grava no cache. De onde vem a lista?
+
+- **Logs de acesso** ou métricas das últimas horas.
+- **Snapshot das chaves** do cluster antigo (por exemplo, varrer com `SCAN` e registrar as chaves com mais acessos).
+- **Regras de negócio:** os 10 mil produtos mais vendidos, a home, as categorias principais.
+
+```python
+def aquecer(chaves_quentes, lote=500):
+    for i in range(0, len(chaves_quentes), lote):
+        ids = chaves_quentes[i:i + lote]
+        produtos = banco.buscar_produtos(ids)          # 1 consulta por lote
+        pipe = cache.pipeline()
+        for p in produtos:
+            ttl = 3600 + random.randint(0, 600)         # jitter para não expirar junto
+            pipe.set(f"produto:{p.id}", serializar(p), ex=ttl)
+        pipe.execute()
+        time.sleep(0.05)                                # não esmagar o banco
+```
+
+Note os três cuidados: consultas em lote, gravação em pipeline e **ritmo controlado**. Um aquecimento agressivo demais pode derrubar o banco que ele queria proteger.
+
+### Replay de tráfego
+
+Capture uma amostra de requisições reais (ou espelhe o tráfego de produção, *shadow traffic*) e reproduza contra o novo cluster. O cache esquenta com a distribuição real de acessos, sem que usuários vejam as respostas.
+
+### Abertura gradual
+
+Envie 1%, depois 5%, 20% e 100% do tráfego ao novo cluster. Cada degrau aquece o cache o suficiente para o próximo. Combina bem com deploys canary e com balanceadores que fazem *slow start* (aumentam aos poucos o peso de uma instância nova).
+
+### Persistência e réplicas
+
+Evite esfriar em primeiro lugar:
+
+- Redis pode recarregar um snapshot RDB ou log AOF no reinício.
+- Uma réplica aquecida pode ser promovida em vez de subir um nó vazio.
+- Para mudança de formato de chave, faça **leitura dupla**: no miss em `v2`, tente `v1`, converta e grave em `v2`.
+
+### Aquecimento de CDN
+
+Para um lançamento, requisite antecipadamente os arquivos grandes em cada região (ou use o modelo push), para que o primeiro usuário de cada PoP não pague o miss até a origem.
+
+## Comparando
+
+| Estratégia | Fidelidade ao tráfego real | Esforço | Risco |
+| --- | --- | --- | --- |
+| Lista de chaves quentes | Média | Baixo | Lista desatualizada |
+| Replay / shadow | Alta | Alto | Efeitos colaterais se requisições não forem só leitura |
+| Abertura gradual | Alta | Médio | Deploy mais lento |
+| Persistência / réplica | Total | Baixo | Dados possivelmente velhos após o reinício |
+
+<Callout type="warning" title="Não aqueça o que não deve">
+Pré-carregar dados personalizados ou sensíveis (sessões, carrinhos) raramente vale a pena e aumenta o risco de vazamento. E se o replay incluir requisições de escrita, você pode duplicar pedidos. Filtre só leituras idempotentes.
+</Callout>
+
+## Como saber que funcionou
+
+Monitore a **taxa de acerto**, a latência p99 e a carga do banco durante a abertura. Defina um critério de saída, como "taxa de acerto acima de 90% antes de passar de 20% para 100% do tráfego".
+
+## Na entrevista
+
+Quando falar de cache em um sistema com picos previsíveis ou multi-região, mencione: "antes de abrir a região, aqueço o cache com as chaves mais acessadas e libero o tráfego em degraus". Follow-ups: "de onde vem a lista de chaves?", "como evitar que o aquecimento derrube o banco?", "e se um nó reiniciar no meio do pico?".
+
+<QuizSet>
+<Quiz question="Você vai abrir uma nova região e quer que o cache reflita a distribuição real de acessos. Qual estratégia é mais fiel?" options={["Pré-carregar as 100 chaves mais recentes", "Espelhar tráfego de leitura de produção (shadow traffic) para a nova região antes de abri-la", "Esperar o cache encher sozinho", "Aumentar o TTL"]} answer={1} explanation="O tráfego espelhado reproduz exatamente o padrão de acesso real, aquecendo as chaves que de fato serão pedidas." />
+<Quiz question="Qual cuidado é essencial ao escrever um script de aquecimento?" options={["Usar TTL idêntico para todas as chaves", "Controlar o ritmo e consultar em lotes para não sobrecarregar o banco", "Executá-lo só depois de abrir 100% do tráfego", "Desligar a política de remoção"]} answer={1} explanation="O aquecimento lê muito do banco. Sem lotes e sem controle de ritmo, ele mesmo pode causar a sobrecarga que queria evitar." />
+</QuizSet>

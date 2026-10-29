@@ -1,0 +1,97 @@
+---
+title: Cache stampede
+kind: lesson
+---
+
+Imagine a chave `home:destaques`, lida 20 mil vezes por segundo, com TTL de 60 segundos. No instante em que ela expira, todas as requisições daquele milissegundo dão miss ao mesmo tempo, e cada uma dispara a mesma consulta pesada ao banco. Em vez de uma consulta, o banco recebe milhares. Ele fica lento, as consultas demoram mais, mais requisições chegam e também dão miss. Isso é um **cache stampede** (também chamado de *thundering herd* ou *dogpile*).
+
+## Por que é tão perigoso
+
+O cache estava escondendo a capacidade real do banco. Se o banco aguenta 500 consultas por segundo e o cache absorvia 20 mil, uma expiração expõe o banco a uma carga 40 vezes maior que sua capacidade. O pior: o problema se retroalimenta e pode derrubar o banco, o que faz **todas** as chaves pararem de ser recarregadas.
+
+Variações do mesmo fenômeno:
+
+- Muitas chaves criadas juntas (após um deploy ou aquecimento) com o mesmo TTL **expiram juntas**.
+- Um nó de cache reinicia vazio.
+- Uma invalidação em massa (purge de uma tag grande).
+
+## Técnicas de defesa
+
+### 1. Lock na recomputação (single flight)
+
+Só uma requisição recalcula; as outras esperam ou recebem o valor antigo.
+
+```python
+import time
+
+def get_com_lock(chave, recomputar, ttl=60):
+    valor = cache.get(chave)
+    if valor is not None:
+        return valor
+    # SET NX com expiração: só um processo consegue o lock
+    if cache.set(f"lock:{chave}", "1", nx=True, ex=10):
+        try:
+            valor = recomputar()
+            cache.set(chave, valor, ex=ttl)
+            return valor
+        finally:
+            cache.delete(f"lock:{chave}")
+    # quem não pegou o lock espera um pouco e tenta de novo
+    for _ in range(20):
+        time.sleep(0.05)
+        valor = cache.get(chave)
+        if valor is not None:
+            return valor
+    return recomputar()  # último recurso
+```
+
+Dentro de um mesmo processo, a ideia é ainda mais barata: uma estrutura de *single flight* (como `singleflight` em Go) faz goroutines concorrentes compartilharem a mesma chamada em andamento.
+
+### 2. Servir o valor velho enquanto recalcula
+
+Guarde o valor com dois prazos: um **TTL lógico** (quando deve ser renovado) e um **TTL físico** maior (quando realmente some). Após o lógico, a primeira requisição dispara a renovação em segundo plano e todo mundo continua recebendo o valor velho. É o mesmo princípio do `stale-while-revalidate` das CDNs.
+
+### 3. Expiração antecipada probabilística
+
+Cada leitor decide, com probabilidade crescente à medida que o fim do TTL se aproxima, recalcular **antes** de expirar. Como a decisão é aleatória, em geral só um ou poucos leitores fazem isso. Uma fórmula conhecida (XFetch) é:
+
+```text
+recalcular se:  agora - delta * beta * ln(rand()) >= expira_em
+  delta = quanto tempo a recomputação costuma levar
+  beta  = agressividade (1.0 é um bom padrão)
+```
+
+Não precisa de lock nem de coordenação.
+
+### 4. Jitter no TTL
+
+Em vez de `ttl=3600` para todas as chaves, use `3600 + random(0, 300)`. As expirações se espalham e deixam de formar picos.
+
+### 5. Refresh ativo
+
+Para um punhado de chaves críticas, um job renova o valor periodicamente e a chave nunca expira por inatividade.
+
+### 6. Proteger o banco de qualquer jeito
+
+Mesmo com tudo acima, coloque **limite de concorrência** ou um *circuit breaker* nas chamadas ao banco. Melhor devolver erro rápido a parte dos usuários do que derrubar todo mundo.
+
+## Comparando
+
+| Técnica | Elimina pico? | Custo | Observação |
+| --- | --- | --- | --- |
+| Lock / single flight | Sim | Espera de quem não tem o lock | Cuidado com lock que nunca é liberado: use expiração |
+| Stale-while-revalidate | Sim | Dado levemente velho | Melhor experiência para o usuário |
+| Expiração probabilística | Quase | Recomputações extras ocasionais | Sem coordenação |
+| Jitter | Reduz picos em massa | Nenhum | Use sempre |
+| Refresh ativo | Sim | Job extra | Só para poucas chaves |
+
+<Callout type="tip" title="Na entrevista">
+Quando você desenhar um cache para uma chave muito popular, antecipe a pergunta: "e quando ela expirar?". Mencionar lock com SET NX, stale-while-revalidate e jitter em uma frase mostra experiência de produção.
+</Callout>
+
+Follow-ups comuns: "o que acontece se o processo que pegou o lock morrer?" (o lock tem expiração), "como evitar stampede após reiniciar um nó de cache?" (aquecimento e limite de concorrência no banco).
+
+<QuizSet>
+<Quiz question="Após um deploy, você populou 2 milhões de chaves com TTL fixo de 1 hora. Exatamente uma hora depois, o banco sofre um pico. Qual a correção mais simples?" options={["Aumentar o TTL para 2 horas", "Adicionar jitter aleatório ao TTL", "Trocar para write-behind", "Usar LFU"]} answer={1} explanation="Com TTL idêntico, as chaves expiram juntas. Jitter espalha as expirações ao longo do tempo." />
+<Quiz question="Na técnica de lock contra stampede, por que o lock precisa ter tempo de expiração?" options={["Para economizar memória", "Para que, se o processo que recalcula morrer, outro possa assumir em vez de todos esperarem para sempre", "Porque o Redis exige", "Para aumentar a taxa de acerto"]} answer={1} explanation="Sem expiração, um processo que falha segurando o lock bloquearia a recomputação indefinidamente." />
+</QuizSet>

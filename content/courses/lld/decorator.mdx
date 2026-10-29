@@ -1,0 +1,158 @@
+---
+title: Decorator
+kind: lesson
+---
+
+## O problema
+
+Você tem um cliente HTTP interno, `ClienteHttp.get(url)`, usado por vários serviços. Agora surgem pedidos: o serviço de catálogo quer **cache**; o de pagamentos quer **retentativa** com backoff; todo mundo quer **log de latência**; o de relatórios quer cache **e** log, mas não retentativa.
+
+Com herança, você acabaria com `ClienteComCache`, `ClienteComRetry`, `ClienteComCacheELog`, `ClienteComRetryELog`... uma explosão combinatória. E cada combinação seria fixa em tempo de compilação.
+
+O **Decorator** resolve isso: cada comportamento extra vira um objeto que **tem a mesma interface** do cliente original e **embrulha** outro cliente. Você empilha os embrulhos que quiser, na ordem que quiser, em tempo de execução.
+
+## Como funciona
+
+Todos implementam a mesma interface `Cliente`. O componente concreto faz o trabalho real. Cada decorator guarda uma referência a outro `Cliente` (que pode ser o concreto ou outro decorator), faz algo antes e/ou depois e delega.
+
+```text
+          +-------------------------+
+          | <<interface>> Cliente   |
+          | + get(url) -> str       |
+          +-------------------------+
+             ^                  ^
+             |                  |
+  +----------------+    +---------------------------+
+  | ClienteHttp    |    | ClienteDecorator          |
+  | (faz a chamada)|    | - interno: Cliente  ------+---> (outro Cliente)
+  +----------------+    +---------------------------+
+                          ^          ^          ^
+                          |          |          |
+                    ComCache   ComRetentativa   ComLog
+
+  Montagem em tempo de execução:
+  ComLog( ComCache( ComRetentativa( ClienteHttp ) ) )
+```
+
+A chamada atravessa as camadas de fora para dentro e a resposta volta de dentro para fora, como numa cebola.
+
+## Implementação em Python
+
+```python
+import time
+from abc import ABC, abstractmethod
+
+
+class Cliente(ABC):
+    @abstractmethod
+    def get(self, url: str) -> str: ...
+
+
+class ClienteHttp(Cliente):
+    """Simula a rede: falha nas duas primeiras chamadas para /instavel."""
+
+    def __init__(self):
+        self.chamadas = 0
+
+    def get(self, url):
+        self.chamadas += 1
+        if url.endswith("/instavel") and self.chamadas <= 2:
+            raise ConnectionError("timeout")
+        return f"conteúdo de {url}"
+
+
+class ClienteDecorator(Cliente):
+    def __init__(self, interno: Cliente):
+        self._interno = interno
+
+    def get(self, url):
+        return self._interno.get(url)
+
+
+class ComRetentativa(ClienteDecorator):
+    def __init__(self, interno, tentativas=3, espera=0.01):
+        super().__init__(interno)
+        self._tentativas = tentativas
+        self._espera = espera
+
+    def get(self, url):
+        for n in range(1, self._tentativas + 1):
+            try:
+                return self._interno.get(url)
+            except ConnectionError:
+                if n == self._tentativas:
+                    raise
+                time.sleep(self._espera * 2 ** (n - 1))  # backoff exponencial
+
+
+class ComCache(ClienteDecorator):
+    def __init__(self, interno):
+        super().__init__(interno)
+        self._cache = {}
+
+    def get(self, url):
+        if url not in self._cache:
+            self._cache[url] = self._interno.get(url)
+        return self._cache[url]
+
+
+class ComLog(ClienteDecorator):
+    def get(self, url):
+        inicio = time.perf_counter()
+        try:
+            return self._interno.get(url)
+        finally:
+            ms = (time.perf_counter() - inicio) * 1000
+            print(f"[log] GET {url} em {ms:.1f} ms")
+
+
+if __name__ == "__main__":
+    base = ClienteHttp()
+    cliente = ComLog(ComCache(ComRetentativa(base)))
+    print(cliente.get("https://api.loja/instavel"))
+    print(cliente.get("https://api.loja/instavel"))  # vem do cache
+    print("chamadas reais à rede:", base.chamadas)
+
+    so_log = ComLog(ClienteHttp())
+    print(so_log.get("https://api.loja/produtos"))
+```
+
+A ordem importa. Com `ComCache(ComRetentativa(...))`, as retentativas acontecem só quando o cache erra. Se você invertesse para `ComRetentativa(ComCache(...))`, o efeito seria o mesmo aqui, mas em outros casos (por exemplo, log dentro ou fora do retry) muda o que é medido: o log externo mede o tempo total com retentativas; o log interno mede cada tentativa.
+
+<Callout type="note" title="E os decorators do Python?">
+A sintaxe `@algo` do Python é um parente próximo: ela embrulha **funções**. O padrão Decorator do design orientado a objetos embrulha **objetos** que compartilham uma interface. A ideia é a mesma: acrescentar comportamento sem mudar o código original.
+</Callout>
+
+## Quando usar
+
+- Adicionar responsabilidades transversais (cache, log, métricas, autorização, compressão, criptografia) sem tocar na classe original.
+- Quando as combinações de comportamento variam por cliente ou por configuração.
+- Quando você não pode ou não quer criar subclasses (classe final, código de terceiros).
+
+## Quando evitar
+
+- Se só existe uma combinação possível, uma única classe é mais simples.
+- Pilhas profundas dificultam depuração: o stack trace fica cheio de camadas parecidas.
+- Se o comportamento extra precisa acessar detalhes internos do objeto embrulhado, o decorator não serve, pois ele só enxerga a interface pública.
+- Identidade: `isinstance(cliente, ClienteHttp)` deixa de funcionar quando o objeto está decorado. Código que depende do tipo concreto quebra.
+
+## Padrões parecidos
+
+- **Proxy**: mesma estrutura (embrulha algo com a mesma interface), intenção diferente. O proxy **controla o acesso** (adiar criação, checar permissão, chamar remotamente) e geralmente gerencia o ciclo de vida do objeto real. O decorator **acrescenta comportamento** e é montado pelo cliente, muitas vezes em camadas.
+- **Composite**: também tem um objeto que referencia outros da mesma interface, mas com **vários** filhos e para representar hierarquias. O decorator tem exatamente **um** interno.
+- **Chain of Responsibility**: cada elo pode **interromper** a cadeia e decidir não repassar. No decorator, a expectativa é sempre delegar.
+- **Strategy**: troca o "miolo" do algoritmo; o decorator muda a "casca".
+
+## Na entrevista
+
+Decorator aparece com frequência em "projete um logger", "um rate limiter", "preço de uma pizza ou café com adicionais" e "pipeline de requisições". Mostre a interface comum, um concreto, a classe base de decorator e dois decorators. Perguntas de follow-up:
+
+- **Por que não herança?** Explosão de subclasses e combinações fixas.
+- **A ordem dos decorators importa?** Sim; dê um exemplo concreto, como log dentro ou fora do retry.
+- **Como evitar montar a pilha à mão em todo lugar?** Use uma fábrica ou um builder que monta a pilha a partir da configuração.
+
+<QuizSet>
+<Quiz question="Você precisa adicionar cache, log e métricas a um repositório, em combinações diferentes por serviço. Qual padrão se encaixa melhor?" options={["Singleton", "Decorator", "Abstract Factory", "Memento"]} answer={1} explanation="Decorators com a mesma interface do repositório podem ser empilhados em qualquer combinação." />
+<Quiz question="Qual a diferença de intenção entre Decorator e Proxy?" options={["Proxy muda a interface", "Decorator acrescenta comportamento; Proxy controla o acesso ao objeto real", "Decorator só funciona com herança", "São sinônimos"]} answer={1} explanation="As estruturas são parecidas, mas o Proxy existe para controlar acesso (lazy, remoto, permissão), e o Decorator para estender comportamento." />
+<Quiz question="Num decorator de log que embrulha um decorator de retentativa, o que o log mede?" options={["Apenas a primeira tentativa", "O tempo total, incluindo todas as tentativas", "Nada, pois o retry engole as chamadas", "Apenas a última tentativa"]} answer={1} explanation="O decorator externo envolve toda a execução do interno, incluindo as retentativas." />
+</QuizSet>

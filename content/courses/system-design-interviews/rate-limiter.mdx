@@ -1,0 +1,172 @@
+---
+title: Projetar um rate limiter
+kind: lesson
+---
+
+Um rate limiter decide, para cada requisição, se ela pode passar ou deve ser rejeitada por excesso. Ele protege serviços contra abuso, controla custo e garante justiça entre clientes. A entrevista costuma testar três coisas: se você conhece os algoritmos, se sabe implementá-los de forma distribuída e se pensa no que acontece quando o próprio limitador falha.
+
+## Requisitos
+
+### Funcionais
+
+- Limitar requisições por chave: usuário, chave de API, IP ou combinação com o endpoint.
+- Regras configuráveis, por exemplo "100 requisições por minuto por usuário em `/pedidos`".
+- Ao exceder, responder HTTP 429 com cabeçalhos informando limite, saldo e quando tentar de novo.
+- Regras alteráveis sem novo deploy.
+
+### Não funcionais
+
+- Latência adicional mínima: abaixo de 2 ms por verificação.
+- Funcionar com dezenas de servidores de API atrás de um load balancer (limite global, não por máquina).
+- Alta disponibilidade: se o limitador cair, a API não pode cair junto.
+- Precisão "boa o suficiente": tolera-se um pequeno excesso pontual.
+
+## Estimativas
+
+- A API recebe 500 mil requisições por segundo no pico.
+- Cada requisição exige uma verificação: **500 mil operações por segundo** no armazenamento de contadores.
+- Chaves ativas: 20 milhões de usuários ativos por dia × 3 regras = 60 milhões de chaves. Com uns 50 bytes por chave (identificador mais contadores), **3 GB** de estado.
+
+Três gigabytes cabem em memória com folga. O desafio não é volume, é **taxa de operações** e latência. Um nó Redis faz algo como 100 mil operações por segundo de forma confortável; com scripts atômicos, um cluster de 8 a 10 shards atende, mais réplicas.
+
+## API
+
+O limitador não é exposto ao usuário final; é um serviço interno ou uma biblioteca no gateway.
+
+```text
+verificar(chave="u_42:/pedidos", custo=1)
+  -> { permitido: true, restante: 37, reiniciaEm: 1730203260 }
+```
+
+Resposta ao cliente quando bloqueado:
+
+```text
+HTTP/1.1 429 Too Many Requests
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+Retry-After: 12
+```
+
+As regras ficam num serviço de configuração:
+
+```yaml
+- dominio: api-publica
+  chave: usuario
+  endpoint: /pedidos
+  algoritmo: token_bucket
+  capacidade: 100
+  reposicaoPorSegundo: 1.67
+```
+
+## Modelo de dados
+
+O estado depende do algoritmo. Para token bucket, por chave:
+
+```text
+rl:u_42:/pedidos -> { tokens: 37.4, ultimo_ts: 1730203248.120 }   TTL 2 min
+```
+
+Para janela deslizante com contadores:
+
+```text
+rl:u_42:/pedidos:28836720 -> 61    (minuto atual)
+rl:u_42:/pedidos:28836719 -> 88    (minuto anterior)
+```
+
+TTL em todas as chaves garante que usuários inativos não ocupem memória.
+
+## Arquitetura de alto nível
+
+```text
+ cliente
+   |
++--v---------------+      +-------------------+
+| API gateway      |----->| Serviço de regras |
+| + middleware de  |      | (config, cache    |
+|   rate limit     |      |  local de 30 s)   |
++--+-----------+---+      +-------------------+
+   |           |
+   | permitido | verificação atômica (script Lua)
+   |           v
+   |     +----------------------+
+   |     | Cluster Redis        |
+   |     | (shard por chave)    |
+   |     +----------------------+
+   v
++---------------------+
+| Serviços de backend |
++---------------------+
+```
+
+A verificação roda no gateway, antes de qualquer trabalho caro. As regras são lidas uma vez e mantidas em memória local, atualizadas periodicamente.
+
+## Aprofundamentos
+
+### 1. Escolha do algoritmo
+
+| Algoritmo | Ideia | Prós | Contras |
+| --- | --- | --- | --- |
+| Janela fixa | Contador por minuto do relógio | Trivial | Rajada dupla na virada da janela |
+| Log deslizante | Guarda timestamp de cada requisição | Exato | Memória proporcional ao limite |
+| Janela deslizante com contadores | Pondera janela atual e anterior | Barato e bem preciso | Aproximação |
+| Token bucket | Balde enche a taxa fixa; cada requisição gasta um token | Permite rajadas controladas | Dois parâmetros para ajustar |
+| Leaky bucket | Fila esvazia a taxa constante | Suaviza saída | Rajadas ficam esperando |
+
+O token bucket é a escolha padrão para APIs: a capacidade define a rajada tolerada e a reposição define a taxa sustentada. Ele também guarda só dois números por chave, sem precisar de timer: a reposição é calculada preguiçosamente a cada verificação.
+
+```python
+import time
+
+class TokenBucket:
+    def __init__(self, capacidade: float, taxa: float):
+        self.capacidade = capacidade
+        self.taxa = taxa
+        self.tokens = capacidade
+        self.ultimo = time.monotonic()
+
+    def permitir(self, custo: float = 1) -> bool:
+        agora = time.monotonic()
+        decorrido = agora - self.ultimo
+        self.tokens = min(self.capacidade, self.tokens + decorrido * self.taxa)
+        self.ultimo = agora
+        if self.tokens >= custo:
+            self.tokens -= custo
+            return True
+        return False
+```
+
+### 2. Atomicidade no modo distribuído
+
+Com vários servidores, ler o contador, decidir e gravar em passos separados cria condição de corrida: dois servidores leem 99, ambos permitem, e o limite de 100 vira 101 (ou muito mais sob carga). A solução é executar a lógica inteira **no** armazenamento, de forma atômica. No Redis, um script Lua lê o estado, calcula a reposição, decide e grava numa única operação. O relógio usado deve ser o do Redis (comando `TIME`), não o de cada servidor de API, para evitar distorção entre máquinas.
+
+### 3. O que fazer quando o limitador falha
+
+Se o Redis ficar indisponível, você tem duas opções:
+
+- **Fail open**: deixa tudo passar. Mantém o produto no ar, mas remove a proteção.
+- **Fail closed**: rejeita tudo. Protege o backend, mas derruba o produto.
+
+Para a maioria das APIs, fail open com um limitador local de emergência é o melhor equilíbrio: cada servidor aplica um limite aproximado em memória (limite global dividido pelo número de servidores) até o Redis voltar.
+
+<Callout type="tip" title="Reduza idas ao Redis">
+Para chaves de altíssimo volume, cada servidor pode reservar lotes de tokens (por exemplo, 10 de uma vez) e consumi-los localmente. Você troca um pouco de precisão por muito menos tráfego no armazenamento central.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Precisão versus custo**: log deslizante é exato e caro; contadores aproximados são baratos e erram pouco.
+- **Hot keys**: um único cliente gigante concentra tudo num shard. Use lotes locais ou divida a chave em subchaves.
+- **Multi-região**: um contador global entre continentes adiciona dezenas de milissegundos. O comum é limitar por região com cotas proporcionais e sincronizar assincronamente.
+- **Onde rodar**: no gateway protege tudo de uma vez; dentro de cada serviço permite regras mais específicas (por custo da operação, por exemplo).
+
+## Perguntas de follow-up comuns
+
+- Como limitar por custo, e não por contagem? Cada requisição gasta tokens proporcionais ao custo (uma busca pesada gasta 10, uma leitura simples gasta 1).
+- Como diferenciar planos gratuito e pago? A regra é escolhida pelo plano do cliente, carregado junto com a autenticação.
+- Como evitar que clientes martelem depois do 429? Cabeçalho `Retry-After` e, em SDKs próprios, backoff exponencial com jitter.
+- Como testar regras novas com segurança? Modo sombra: a regra calcula e registra, mas não bloqueia.
+
+<QuizSet>
+<Quiz question="Qual problema clássico a janela fixa tem?" options={["Usa memória demais", "Permite até o dobro do limite em rajada na virada entre duas janelas", "Não funciona com Redis", "Bloqueia requisições legítimas aleatoriamente"]} answer={1} explanation="Um cliente pode gastar o limite no fim de uma janela e de novo no início da próxima, em poucos segundos." />
+<Quiz question="Dois servidores leem o mesmo contador ao mesmo tempo e ambos permitem a requisição. Qual a correção adequada?" options={["Aumentar o limite", "Usar o relógio local de cada servidor", "Executar leitura, decisão e escrita atomicamente no armazenamento, como em um script Lua", "Usar um banco relacional"]} answer={2} explanation="A operação precisa ser atômica para eliminar a condição de corrida entre servidores." />
+</QuizSet>

@@ -1,0 +1,194 @@
+---
+title: Chain of Responsibility
+kind: lesson
+---
+
+## O problema
+
+Uma empresa tem uma política de aprovação de despesas: até R$ 500 o coordenador aprova; até R$ 5.000, o gerente; até R$ 50.000, a diretoria; acima disso, só o CFO. Outra situação parecida: uma requisição HTTP precisa passar por autenticação, limite de taxa, validação de payload e só então chegar ao controlador; qualquer etapa pode barrar a requisição.
+
+Colocar isso num único método com uma cascata de `if` acopla quem envia o pedido a todas as regras e à ordem delas. Adicionar um aprovador intermediário ou uma etapa de log exige editar o método central.
+
+O Chain of Responsibility **encadeia objetos handlers**. O pedido entra no primeiro elo; cada handler decide se trata o pedido, se o repassa ao próximo, ou as duas coisas. Quem envia o pedido conhece só o início da cadeia.
+
+## Estrutura
+
+```text
+ Cliente
+    |
+    v
++-----------+  proximo  +-----------+  proximo  +-----------+
+| HandlerA  |---------->| HandlerB  |---------->| HandlerC  |----> (fim)
++-----------+           +-----------+           +-----------+
+      ^                       ^                       ^
+      +-----------------------+-----------------------+
+                              |
+                  +-------------------------+
+                  |  Handler (abstrato)     |
+                  |-------------------------|
+                  | - proximo: Handler      |
+                  | + definir_proximo(h)    |
+                  | + tratar(pedido)        |
+                  +-------------------------+
+```
+
+Existem duas variações comuns:
+
+- **Um trata e para**: o primeiro handler capaz resolve e a cadeia termina (aprovação de despesas, suporte em níveis).
+- **Todos podem agir, qualquer um pode interromper**: cada elo faz sua parte e repassa, mas pode cortar o fluxo (middlewares HTTP, filtros de validação).
+
+## Implementação 1: aprovação de despesas
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class Despesa:
+    descricao: str
+    valor: float
+
+
+class Aprovador(ABC):
+    def __init__(self, nome: str):
+        self.nome = nome
+        self._proximo: Optional["Aprovador"] = None
+
+    def definir_proximo(self, proximo: "Aprovador") -> "Aprovador":
+        self._proximo = proximo
+        return proximo  # permite encadear: a.definir_proximo(b).definir_proximo(c)
+
+    def aprovar(self, despesa: Despesa) -> str:
+        if self.pode_aprovar(despesa):
+            return f"{despesa.descricao} (R$ {despesa.valor:,.2f}) aprovada por {self.nome}"
+        if self._proximo is None:
+            return f"{despesa.descricao}: ninguém na cadeia pode aprovar"
+        return self._proximo.aprovar(despesa)
+
+    @abstractmethod
+    def pode_aprovar(self, despesa: Despesa) -> bool: ...
+
+
+class PorLimite(Aprovador):
+    def __init__(self, nome: str, limite: float):
+        super().__init__(nome)
+        self.limite = limite
+
+    def pode_aprovar(self, despesa: Despesa) -> bool:
+        return despesa.valor <= self.limite
+
+
+class CFO(Aprovador):
+    def pode_aprovar(self, despesa: Despesa) -> bool:
+        return "pessoal" not in despesa.descricao.lower()
+
+
+coordenador = PorLimite("Coordenadora Lia", 500)
+coordenador.definir_proximo(PorLimite("Gerente Caio", 5_000)) \
+           .definir_proximo(PorLimite("Diretoria", 50_000)) \
+           .definir_proximo(CFO("CFO Marta"))
+
+for d in [Despesa("Táxi", 80), Despesa("Notebook", 7_800),
+          Despesa("Servidor", 120_000), Despesa("Viagem pessoal", 90_000)]:
+    print(coordenador.aprovar(d))
+```
+
+## Implementação 2: pipeline de middlewares
+
+Aqui cada elo é uma função que recebe a requisição e o "próximo". Esse formato é o que frameworks web usam por baixo dos panos.
+
+```python
+import time
+from typing import Callable, Dict, List
+
+Requisicao = Dict[str, object]
+Resposta = Dict[str, object]
+Proximo = Callable[[Requisicao], Resposta]
+Middleware = Callable[[Requisicao, Proximo], Resposta]
+
+TOKENS_VALIDOS = {"abc123": "ana"}
+contagem: Dict[str, int] = {}
+
+
+def autenticacao(req: Requisicao, proximo: Proximo) -> Resposta:
+    usuario = TOKENS_VALIDOS.get(str(req.get("token")))
+    if usuario is None:
+        return {"status": 401, "corpo": "não autenticado"}
+    req["usuario"] = usuario
+    return proximo(req)
+
+
+def limite_de_taxa(req: Requisicao, proximo: Proximo) -> Resposta:
+    usuario = str(req["usuario"])
+    contagem[usuario] = contagem.get(usuario, 0) + 1
+    if contagem[usuario] > 2:
+        return {"status": 429, "corpo": "muitas requisições"}
+    return proximo(req)
+
+
+def cronometro(req: Requisicao, proximo: Proximo) -> Resposta:
+    inicio = time.perf_counter()
+    resposta = proximo(req)  # age antes E depois do restante da cadeia
+    resposta["ms"] = round((time.perf_counter() - inicio) * 1000, 3)
+    return resposta
+
+
+def controlador(req: Requisicao) -> Resposta:
+    return {"status": 200, "corpo": f"olá, {req['usuario']}"}
+
+
+def montar(middlewares: List[Middleware], final: Proximo) -> Proximo:
+    cadeia = final
+    for mw in reversed(middlewares):
+        cadeia = (lambda m, p: (lambda req: m(req, p)))(mw, cadeia)
+    return cadeia
+
+
+app = montar([cronometro, autenticacao, limite_de_taxa], controlador)
+
+print(app({"token": "errado"})["status"])
+for _ in range(3):
+    r = app({"token": "abc123"})
+    print(r["status"], r["corpo"])
+```
+
+O `cronometro` mostra uma vantagem desse formato: o handler pode agir antes e depois do restante da cadeia.
+
+## Quando usar e quando evitar
+
+**Use quando:**
+
+- Mais de um objeto pode tratar um pedido e o tratador certo só é conhecido em tempo de execução.
+- Você quer montar ou reordenar etapas de processamento por configuração (middlewares, filtros, validações).
+- O remetente não deve conhecer os detalhes de quem trata.
+
+**Evite quando:**
+
+- Existe sempre exatamente um tratador conhecido; chame-o direto.
+- A cadeia fica longa e é difícil saber por que um pedido foi barrado. Adicione logs por elo.
+
+<Callout type="warning" title="Pedido que cai no vazio">
+Se nenhum elo trata o pedido, ele pode simplesmente sumir. Sempre defina o que acontece no fim da cadeia: um handler padrão, uma exceção ou uma resposta explícita, como o 'ninguém na cadeia pode aprovar' do exemplo.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Diferença |
+| --- | --- |
+| Decorator | Estrutura idêntica (objetos que embrulham o próximo). O Decorator sempre repassa e só adiciona comportamento; o Chain pode **interromper** o fluxo ou tratar e parar. |
+| Observer | Todos os observadores recebem o evento. No Chain, o pedido percorre a cadeia em ordem e normalmente um elo resolve. |
+| Command | O pedido que percorre a cadeia muitas vezes é um objeto Command. |
+| Composite | Em árvores (componentes de interface), o pedido pode subir de filho para pai, formando uma cadeia natural. |
+
+## Na entrevista
+
+- Aparece em aprovação de despesas, sistemas de suporte em níveis (bot, atendente, especialista), caixa eletrônico (dispensar notas de 100, depois 50, depois 20) e validação de requisições num rate limiter ou gateway.
+- O exemplo do caixa eletrônico é clássico: cada handler entrega o máximo de notas do seu valor e repassa o restante.
+- Follow-ups: "como mudar a ordem sem recompilar?" (montar a cadeia a partir de configuração), "e se nenhum tratar?", "como testar?" (cada elo isolado, com um próximo falso).
+
+<QuizSet>
+<Quiz question="O que diferencia Chain of Responsibility de Decorator, já que a estrutura é parecida?" options={["Decorator usa herança e Chain não", "No Chain um elo pode interromper o fluxo ou tratar e parar; o Decorator sempre repassa", "Chain só funciona com funções", "Decorator não permite encadear objetos"]} answer={1} explanation="Decorators adicionam comportamento e sempre delegam. Handlers de uma cadeia decidem se tratam, repassam ou barram." />
+<Quiz question="Uma despesa de R$ 7.800 entra na cadeia coordenador (500), gerente (5.000), diretoria (50.000). Quem aprova?" options={["Coordenador", "Gerente", "Diretoria", "Ninguém"]} answer={2} explanation="Coordenador e gerente não têm alçada e repassam; a diretoria é o primeiro elo com limite suficiente." />
+</QuizSet>

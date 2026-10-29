@@ -1,0 +1,192 @@
+---
+title: Factory Method
+kind: lesson
+---
+
+## O problema
+
+Você tem um processo de exportação de relatórios financeiros: buscar os lançamentos do mês, formatar e salvar. O fluxo é sempre o mesmo, mas o **formato** muda: CSV para o contador, JSON para a integração com o ERP, texto alinhado para quem lê no terminal. Se o código do fluxo fizer `CsvFormatador()` diretamente, ele fica preso a uma classe concreta, e cada formato novo exige mexer no fluxo.
+
+O **Factory Method** define um método responsável por criar o objeto, e deixa que **subclasses decidam qual classe concreta instanciar**. O código que usa o objeto depende só da interface do produto.
+
+## Estrutura
+
+```text
+        +-------------------------------+           +---------------------+
+        |   ExportadorDeRelatorio (abs) |  cria     |  Formatador (abs)   |
+        +-------------------------------+---------->+---------------------+
+        | + exportar(lancamentos): str  |           | + cabecalho(): str  |
+        | # criar_formatador() (abstr.) |           | + linha(l): str     |
+        +-------------------------------+           +---------------------+
+             ^             ^                            ^            ^
+             |             |                            |            |
+ +-------------------+ +-------------------+   +-------------+ +--------------+
+ | ExportadorCsv     | | ExportadorJson    |   | FormatCsv   | | FormatJson   |
+ | criar_formatador()| | criar_formatador()|   +-------------+ +--------------+
+ |  -> FormatCsv     | |  -> FormatJson    |
+ +-------------------+ +-------------------+
+
+ exportar() é o algoritmo fixo; criar_formatador() é o "gancho" de criação.
+```
+
+Papéis: **Produto** (`Formatador`), **Produtos concretos**, **Criador** (`ExportadorDeRelatorio`, que contém lógica de negócio e declara o método fábrica) e **Criadores concretos**.
+
+## Implementação em Python
+
+```python
+import json
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Lancamento:
+    data: str
+    descricao: str
+    valor: float
+
+
+class Formatador(ABC):
+    @abstractmethod
+    def formatar(self, lancamentos: list[Lancamento]) -> str: ...
+
+
+class FormatadorCsv(Formatador):
+    def formatar(self, lancamentos):
+        linhas = ["data;descricao;valor"]
+        linhas += [f"{l.data};{l.descricao};{l.valor:.2f}".replace(".", ",") for l in lancamentos]
+        return "\n".join(linhas)
+
+
+class FormatadorJson(Formatador):
+    def formatar(self, lancamentos):
+        return json.dumps([l.__dict__ for l in lancamentos], ensure_ascii=False)
+
+
+class FormatadorTerminal(Formatador):
+    def formatar(self, lancamentos):
+        return "\n".join(f"{l.data}  {l.descricao:<20}{l.valor:>10.2f}" for l in lancamentos)
+
+
+class ExportadorDeRelatorio(ABC):
+    """Criador: tem a regra de negócio e delega a criação ao método fábrica."""
+
+    @abstractmethod
+    def criar_formatador(self) -> Formatador: ...
+
+    def exportar(self, lancamentos: list[Lancamento]) -> str:
+        validos = [l for l in lancamentos if l.valor != 0]
+        ordenados = sorted(validos, key=lambda l: l.data)
+        formatador = self.criar_formatador()        # o ponto de variação
+        conteudo = formatador.formatar(ordenados)
+        total = sum(l.valor for l in ordenados)
+        return f"{conteudo}\n-- {len(ordenados)} lançamentos, saldo {total:.2f}"
+
+
+class ExportadorContador(ExportadorDeRelatorio):
+    def criar_formatador(self):
+        return FormatadorCsv()
+
+
+class ExportadorErp(ExportadorDeRelatorio):
+    def criar_formatador(self):
+        return FormatadorJson()
+
+
+class ExportadorTerminal(ExportadorDeRelatorio):
+    def criar_formatador(self):
+        return FormatadorTerminal()
+
+
+mes = [
+    Lancamento("2026-10-05", "Aluguel", -3200.0),
+    Lancamento("2026-10-01", "Venda #551", 1890.5),
+    Lancamento("2026-10-03", "Estorno zerado", 0.0),
+    Lancamento("2026-10-10", "Venda #560", 4100.0),
+]
+
+for exportador in (ExportadorContador(), ExportadorErp(), ExportadorTerminal()):
+    print(f"== {type(exportador).__name__}")
+    print(exportador.exportar(mes))
+```
+
+Repare que `exportar` (filtrar, ordenar, totalizar) foi escrito **uma vez**. As subclasses só respondem à pergunta "qual formatador?".
+
+### A variante mais comum: fábrica simples com registro
+
+Em Python, muitas vezes a escolha da classe depende de um valor em tempo de execução (configuração, campo de uma requisição). Nesse caso, um dicionário de classes resolve sem herança. Tecnicamente isso é uma **Simple Factory**, não o Factory Method clássico, mas é o que você mais vai usar:
+
+```python
+class Formatador:
+    def formatar(self, itens: list[str]) -> str:
+        raise NotImplementedError
+
+
+class Csv(Formatador):
+    def formatar(self, itens):
+        return ";".join(itens)
+
+
+class Markdown(Formatador):
+    def formatar(self, itens):
+        return "\n".join(f"- {i}" for i in itens)
+
+
+_REGISTRO: dict[str, type[Formatador]] = {}
+
+
+def registrar(nome: str):
+    def decorador(cls):
+        _REGISTRO[nome] = cls
+        return cls
+    return decorador
+
+
+registrar("csv")(Csv)
+registrar("md")(Markdown)
+
+
+def criar_formatador(nome: str) -> Formatador:
+    try:
+        return _REGISTRO[nome]()
+    except KeyError:
+        raise ValueError(f"formato não suportado: {nome}. Opções: {sorted(_REGISTRO)}") from None
+
+
+print(criar_formatador("md").formatar(["boleto", "pix", "cartão"]))
+print(criar_formatador("csv").formatar(["boleto", "pix", "cartão"]))
+try:
+    criar_formatador("xlsx")
+except ValueError as erro:
+    print(erro)
+```
+
+O registro mantém o **princípio aberto/fechado**: um formato novo se registra sozinho, sem editar `criar_formatador`.
+
+## Quando usar e quando evitar
+
+| Use quando | Evite quando |
+| --- | --- |
+| Um algoritmo fixo precisa de um objeto cuja classe varia | Existe uma única implementação e nenhuma previsão de outra |
+| Frameworks: você quer que o usuário estenda e escolha o produto | A escolha é trivial e um parâmetro de classe resolve |
+| Você quer isolar `import`s e construções caras de quem usa | A hierarquia de criadores cresceria só para espelhar a de produtos sem nenhuma lógica comum |
+
+## Padrões parecidos
+
+- **Simple Factory:** uma função ou classe com um `if`/dicionário que decide o que criar. Não usa herança. É o primo informal.
+- **Abstract Factory:** cria **famílias** de produtos relacionados (vários métodos fábrica num objeto). O Factory Method cria **um** produto e vive dentro de um criador que tem outra responsabilidade.
+- **Template Method:** o Factory Method frequentemente é um passo de um Template Method, como em `exportar()`. A diferença é a intenção: Template Method varia passos de um algoritmo; Factory Method varia a criação.
+
+## Na entrevista
+
+Use quando o enunciado fala em "vários tipos de X" que precisam ser criados a partir de um dado (tipo de veículo no estacionamento, tipo de notificação, tipo de pagamento). Mostre a interface do produto primeiro e a fábrica depois. Follow-ups comuns:
+
+- "Como adicionar um tipo novo sem alterar a fábrica?" Registro de classes ou subclasse de criador.
+- "Qual a diferença para Abstract Factory?" Um produto versus uma família de produtos compatíveis.
+- "Onde validar o tipo desconhecido?" Na fábrica, com erro claro listando as opções.
+
+<QuizSet>
+<Quiz question="No Factory Method clássico, quem decide qual classe concreta é instanciada?" options={["O cliente, com um if", "As subclasses do criador, sobrescrevendo o método fábrica", "O produto concreto", "Um Singleton global"]} answer={1} explanation="O criador declara o método fábrica e as subclasses o implementam, escolhendo o produto." />
+<Quiz question="Um dicionário que mapeia 'csv' para a classe Csv e uma função criar(nome) é melhor descrito como:" options={["Abstract Factory", "Prototype", "Simple Factory (fábrica com registro)", "Builder"]} answer={2} explanation="É uma fábrica simples, sem a hierarquia de criadores do Factory Method. Muito comum em Python." />
+<Quiz question="Qual a principal vantagem de exportar() chamar self.criar_formatador() em vez de FormatadorCsv()?" options={["Fica mais rápido", "O algoritmo de exportação não depende de nenhuma classe concreta de formatador", "Evita exceções", "Permite herança múltipla"]} answer={1} explanation="O fluxo depende só da abstração Formatador; trocar o formato não toca no algoritmo." />
+</QuizSet>

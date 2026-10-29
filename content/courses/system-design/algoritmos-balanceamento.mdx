@@ -1,0 +1,89 @@
+---
+title: Algoritmos de balanceamento
+kind: lesson
+---
+
+O balanceador sabe quais backends estão saudáveis. Falta decidir, a cada requisição ou conexão, para qual deles mandar. A escolha do algoritmo parece detalhe, mas define se a carga fica equilibrada quando as requisições têm custos diferentes, quando as máquinas têm tamanhos diferentes e quando instâncias entram e saem.
+
+## Algoritmos estáticos
+
+Não olham o estado atual dos backends; decidem por uma regra fixa.
+
+### Round robin
+
+Envia para cada backend em sequência: A, B, C, A, B, C... Simples, sem estado relevante, e funciona bem quando os servidores são iguais e as requisições têm custo parecido. Falha quando algumas requisições são muito mais pesadas: um backend pode acumular várias lentas por azar.
+
+### Weighted round robin
+
+Cada backend tem um peso proporcional à capacidade. Com pesos 3, 1 e 1, o servidor A recebe 3 de cada 5 requisições. Útil em frotas heterogêneas ou para canary (peso pequeno para a versão nova).
+
+### Aleatório
+
+Escolhe um backend ao acaso. Com volume alto, a distribuição se aproxima da uniforme, e não exige coordenação entre várias instâncias do balanceador.
+
+### Hash do IP ou de uma chave
+
+Aplica um hash ao IP do cliente (ou a um ID de usuário, de sessão) para escolher o backend. O mesmo cliente cai sempre no mesmo servidor, o que dá afinidade sem cookie. O problema: com `hash % N`, quando N muda quase todos os clientes trocam de servidor. Hashing consistente reduz essa movimentação. Também há o risco de desequilíbrio quando muitos clientes compartilham um IP (NAT corporativo).
+
+## Algoritmos dinâmicos
+
+Usam informação em tempo real sobre os backends.
+
+### Least connections
+
+Envia para o backend com menos conexões ativas. Lida bem com requisições de duração variável e conexões longas (WebSocket, streaming), porque um servidor ocupado com tarefas lentas naturalmente recebe menos. A versão ponderada divide as conexões pelo peso.
+
+### Least response time
+
+Combina poucas conexões ativas com menor latência observada. Favorece backends rápidos e afasta os que estão degradados, mas depende de medições confiáveis e pode oscilar.
+
+### Power of two choices
+
+Sorteia **dois** backends ao acaso e escolhe o menos carregado entre eles. Parece pouco, mas reduz drasticamente o desequilíbrio em relação ao aleatório puro e evita um problema real do least connections em sistemas com vários balanceadores: todos eles enxergarem o mesmo servidor como "o menos carregado" e o inundarem ao mesmo tempo (efeito manada). Envoy e outros proxies modernos usam essa estratégia.
+
+```python
+import random
+
+class Backend:
+    def __init__(self, nome):
+        self.nome = nome
+        self.ativas = 0
+
+def escolher_p2c(backends):
+    a, b = random.sample(backends, 2)
+    return a if a.ativas <= b.ativas else b
+
+pool = [Backend(f"app{i}") for i in range(5)]
+for _ in range(1000):
+    escolhido = escolher_p2c(pool)
+    escolhido.ativas += 1
+    if random.random() < 0.7:          # simula requisições terminando
+        random.choice(pool).ativas = max(0, random.choice(pool).ativas - 1)
+print({b.nome: b.ativas for b in pool})
+```
+
+## Comparação
+
+| Algoritmo | Usa estado dos backends | Bom para | Cuidado com |
+| --- | --- | --- | --- |
+| Round robin | não | servidores iguais, requisições homogêneas | requisições de custo muito variado |
+| Weighted round robin | não (pesos fixos) | frotas heterogêneas, canary | pesos desatualizados |
+| Hash (IP ou chave) | não | afinidade, caches locais | redistribuição ao mudar N, clientes atrás de NAT |
+| Least connections | sim | conexões longas, duração variável | efeito manada com muitos balanceadores |
+| Least response time | sim | backends com desempenho desigual | oscilação, medição ruidosa |
+| Power of two choices | sim (parcial) | escala, muitos balanceadores | levemente menos ótimo que olhar todos |
+
+## Armadilhas
+
+- **Slow start:** uma instância recém-adicionada tem zero conexões, e least connections manda tudo para ela antes que aqueça cache e JIT. Muitos balanceadores aumentam gradualmente o peso de instâncias novas.
+- **Conexões longas:** com HTTP/2 ou gRPC, um balanceador L4 distribui conexões, não requisições; se cada cliente abre uma única conexão duradoura, a carga pode ficar torta. Use L7 ou balanceamento no cliente.
+- **Afinidade demais:** sticky sessions e hash por IP prendem carga a servidores específicos e dificultam escalar.
+
+<Callout type="tip" title="Na entrevista">
+Comece com round robin para serviços stateless e homogêneos e justifique a troca quando houver motivo: least connections para WebSockets, hash consistente para afinidade com cache local, pesos para máquinas diferentes. Citar power of two choices mostra profundidade. Follow-ups comuns: "e se um servidor for duas vezes mais potente?", "como balancear conexões de longa duração?".
+</Callout>
+
+<QuizSet>
+<Quiz question="Um serviço de chat mantém WebSockets abertos por horas, e alguns clientes são muito mais ativos que outros. Qual algoritmo tende a equilibrar melhor?" options={["Round robin", "Least connections", "Hash do IP", "Aleatório"]} answer={1} explanation="Como as conexões são longas e de duração variável, distribuir pela quantidade de conexões ativas evita acumular carga em um servidor." />
+<Quiz question="Por que power of two choices funciona bem com vários balanceadores independentes?" options={["Porque usa criptografia", "Porque o sorteio evita que todos os balanceadores escolham o mesmo servidor menos carregado ao mesmo tempo", "Porque sempre escolhe o servidor mais rápido do pool", "Porque dispensa health checks"]} answer={1} explanation="Ao comparar apenas dois candidatos aleatórios, as decisões ficam espalhadas e evitam o efeito manada, mantendo boa distribuição." />
+</QuizSet>

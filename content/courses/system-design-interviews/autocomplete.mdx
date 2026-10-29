@@ -1,0 +1,151 @@
+---
+title: Projetar autocomplete
+kind: lesson
+---
+
+Enquanto você digita na caixa de busca, sugestões aparecem a cada tecla. Para parecer instantâneo, o sistema precisa responder em poucas dezenas de milissegundos, várias vezes por busca, para bilhões de buscas por dia. O truque da questão é perceber que quase nada é calculado na hora: as respostas são preparadas antes e só consultadas.
+
+## Requisitos
+
+### Funcionais
+
+- Dado um prefixo, devolver as 5 a 10 sugestões mais populares que começam com ele.
+- Sugestões refletem popularidade recente (um assunto do dia aparece no mesmo dia).
+- Opcional: personalização, correção de erros de digitação, idiomas diferentes.
+
+### Não funcionais
+
+- Latência muito baixa: p99 abaixo de 50 ms no servidor, já que o usuário espera uma resposta por tecla.
+- Altíssima taxa de leitura.
+- Atualização das sugestões pode atrasar algumas horas (ou minutos, para tendências).
+- Filtrar termos ofensivos ou proibidos.
+
+## Estimativas
+
+- 5 bilhões de buscas por dia.
+- O cliente espera 100 ms sem digitação antes de consultar (debounce) e a busca média tem 20 caracteres, mas o usuário digita em rajadas; estime **6 consultas de autocomplete por busca**: 30 bilhões por dia, ou cerca de **350 mil por segundo**, pico de 1 milhão/s.
+- Termos distintos relevantes: depois de cortar a cauda (termos buscados menos de algumas vezes por dia), sobram uns 100 milhões de consultas únicas.
+- Prefixos: cada termo de 20 caracteres gera até 20 prefixos, mas muitos são compartilhados. Estime 1 bilhão de prefixos distintos. Guardando para cada um o top 10 já calculado (10 × 30 bytes = 300 B), dá **300 GB**. Distribuído em shards, cabe em memória.
+
+## API
+
+```text
+GET /api/v1/sugestoes?q=como+faz&idioma=pt-BR&limite=8
+  resposta 200: { "prefixo": "como faz",
+                  "sugestoes": ["como fazer bolo de cenoura",
+                                "como fazer pão caseiro", ...] }
+```
+
+Resposta pequena e cacheável. Prefixos curtos e populares (uma ou duas letras) são idênticos para todos os usuários e devem ser cacheados na CDN e no próprio navegador.
+
+## Modelo de dados
+
+Dois mundos:
+
+```text
+Caminho offline (dados brutos e agregados)
+  log_buscas        termo | ts | idioma | regiao       (bilhões de linhas/dia)
+  contagem_termos   termo | idioma | contagem_ponderada
+
+Caminho online (estrutura de serviço)
+  prefixo -> [ (termo, pontuação) x 10 ]   já ordenado
+```
+
+A estrutura online pode ser uma **trie** em memória com o top K armazenado em cada nó, ou simplesmente uma tabela chave-valor de prefixo para lista. Ambas entregam leitura O(1) em relação ao número de termos.
+
+## Arquitetura de alto nível
+
+```text
+                   CAMINHO DE LEITURA
+ navegador --> CDN --> LB --> Serviço de sugestões --> shards em memória
+                                                       (prefixo -> top K)
+                                                             ^
+                   CAMINHO DE CONSTRUÇÃO                     | carga de
+                                                             | snapshot
+ logs de busca --> Kafka --> agregador (janelas) --+         |
+                                                   v         |
+                         armazenamento de contagens          |
+                                   |                         |
+                         job de construção (por hora) -------+
+                         - filtra termos proibidos
+                         - calcula top K por prefixo
+                         - gera snapshot versionado
+```
+
+## Aprofundamentos
+
+### 1. Trie com top K pré-computado
+
+Numa trie ingênua, responder "top 10 que começam com `co`" exige percorrer toda a subárvore abaixo de `co`, potencialmente milhões de nós. A otimização decisiva é guardar em cada nó a lista dos K termos mais populares de sua subárvore. A consulta vira: descer pelos caracteres do prefixo (no máximo uns 50 passos) e devolver a lista pronta.
+
+```python
+class No:
+    def __init__(self):
+        self.filhos = {}
+        self.top = []  # lista de (pontuacao, termo), maior primeiro
+
+def inserir(raiz, termo, pontuacao, k=10):
+    no = raiz
+    for ch in termo:
+        no = no.filhos.setdefault(ch, No())
+        no.top.append((pontuacao, termo))
+        no.top.sort(reverse=True)
+        del no.top[k:]
+
+def sugerir(raiz, prefixo):
+    no = raiz
+    for ch in prefixo:
+        no = no.filhos.get(ch)
+        if no is None:
+            return []
+    return [t for _, t in no.top]
+
+raiz = No()
+for t, p in [("como fazer bolo", 90), ("como fazer pão", 70), ("comprar carro", 50)]:
+    inserir(raiz, t, p)
+print(sugerir(raiz, "com"))
+```
+
+O custo é memória extra e uma construção mais cara, mas a construção acontece offline.
+
+### 2. Construção e atualização
+
+Atualizar a trie a cada busca seria caro e criaria contenção. Em vez disso:
+
+1. Logs de busca fluem para um agregador que conta termos em janelas (por exemplo, de 1 hora).
+2. A pontuação combina janelas com **decaimento**: buscas de hoje valem mais que as da semana passada. Isso faz tendências subirem rápido e modas antigas sumirem.
+3. Um job periódico constrói a estrutura nova completa, filtra termos proibidos e publica um snapshot versionado.
+4. Os servidores carregam o snapshot novo em memória e trocam o ponteiro atomicamente, sem downtime.
+
+Para tendências urgentes (um evento acontecendo agora), uma camada pequena e de atualização rápida, alimentada por streaming, pode ser mesclada com o resultado base no momento da consulta.
+
+### 3. Particionamento
+
+Um bilhão de prefixos não cabe numa máquina só com folga. Particionar pela primeira letra gera desequilíbrio (muito mais termos começam com "c" do que com "x"). Melhor: particionar por faixas de prefixo balanceadas com base no volume real, ou por hash do prefixo completo quando a estrutura é chave-valor. Cada shard é replicado várias vezes para aguentar a taxa de leitura.
+
+<Callout type="tip" title="Reduza as consultas no cliente">
+Debounce, cache local de prefixos já consultados e a observação de que, se o prefixo `cas` devolveu menos de 10 resultados, `casa` é um subconjunto que o cliente pode filtrar sozinho. Mencionar otimizações no cliente mostra visão completa.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Decisão | Trade-off |
+| --- | --- |
+| Top K em cada nó | Leitura instantânea contra memória e construção caras |
+| Reconstrução periódica | Simplicidade e consistência contra atraso para tendências |
+| Cortar termos raros | Estrutura muito menor contra perder sugestões de nicho |
+| Personalização | Relevância contra cache: respostas personalizadas não vão para a CDN |
+
+Personalização geralmente é feita como camada separada: o resultado global vem do cache, e o histórico recente do usuário é mesclado no servidor ou no próprio cliente.
+
+## Perguntas de follow-up comuns
+
+- Como tolerar erros de digitação? Busca aproximada por distância de edição sobre um conjunto limitado de candidatos, aplicada quando o prefixo exato devolve pouco.
+- Como evitar sugestões ofensivas? Lista de bloqueio aplicada na construção, e mecanismo de remoção emergencial que filtra na leitura sem esperar o próximo snapshot.
+- Como suportar vários idiomas? Uma estrutura por idioma ou região, escolhida pelo contexto da requisição.
+- Como medir qualidade? Taxa de clique nas sugestões e quantos caracteres o usuário economizou.
+
+<QuizSet>
+<Quiz question="Por que guardar o top K em cada nó da trie?" options={["Para economizar memória", "Para evitar percorrer toda a subárvore a cada consulta", "Para permitir escrita em tempo real", "Para ordenar alfabeticamente"]} answer={1} explanation="Com o top K pronto, a consulta só desce pelo prefixo e devolve a lista." />
+<Quiz question="Como fazer termos em alta aparecerem rápido sem reconstruir tudo a cada minuto?" options={["Desligar o cache", "Mesclar uma camada pequena alimentada por streaming com o snapshot base", "Aumentar o K", "Particionar pela primeira letra"]} answer={1} explanation="Uma camada de tendências de atualização rápida complementa a estrutura principal reconstruída periodicamente." />
+</QuizSet>

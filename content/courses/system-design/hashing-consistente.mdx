@@ -1,0 +1,100 @@
+---
+title: Hashing consistente
+kind: lesson
+---
+
+Quando você distribui dados ou requisições entre vários servidores (shards de cache, partições de banco), precisa de uma regra que diga em qual servidor cada chave mora. A regra mais simples é `hash(chave) % N`, em que N é o número de servidores. Ela funciona bem até o dia em que N muda.
+
+## O problema do módulo
+
+Suponha 4 servidores de cache e a regra `hash % 4`. Um servidor cai e N passa a ser 3. Agora quase toda chave muda de lugar: uma chave com hash 10 ia para o servidor 2 (10 % 4) e passa a ir para o servidor 1 (10 % 3). Em média, ao ir de N para N+1 servidores, cerca de N/(N+1) das chaves se movem, ou seja, quase todas.
+
+Num cache, isso significa uma avalanche de cache misses batendo no banco ao mesmo tempo. Num banco particionado, significa migrar praticamente todos os dados.
+
+## A ideia do anel
+
+O hashing consistente coloca servidores e chaves no mesmo espaço de hash, visto como um círculo (por exemplo, de 0 a 2 elevado a 32, menos 1, voltando a 0).
+
+1. Cada servidor é posicionado no anel pelo hash do seu identificador.
+2. Cada chave é posicionada pelo hash dela.
+3. A chave pertence ao **primeiro servidor encontrado andando no sentido horário** a partir da sua posição.
+
+```text
+posições no anel (0 a 99, por simplicidade), sentido horário:
+
+  0 ---- 20 ---- 45 ---- 70 ---- 99 -> volta ao 0
+         S_A     S_B     S_C
+
+chave com hash 12 -> próximo servidor: S_A (20)
+chave com hash 30 -> próximo servidor: S_B (45)
+chave com hash 80 -> passa do fim, volta ao início: S_A (20)
+
+cada servidor é dono do arco entre o servidor anterior e ele
+```
+
+Quando um servidor sai, só as chaves do arco dele passam para o próximo servidor. Quando um servidor entra, ele "rouba" apenas uma parte do arco do vizinho. Em média, apenas cerca de 1/N das chaves se move.
+
+## Nós virtuais
+
+Com poucos servidores, as posições no anel ficam desiguais: um servidor pode acabar com um arco enorme e receber 50% das chaves. Além disso, quando um servidor sai, toda a carga dele cai sobre um único vizinho.
+
+A solução são **nós virtuais**: cada servidor físico ocupa várias posições no anel (por exemplo, 100 a 200), usando hashes como `servidorA#0`, `servidorA#1` e assim por diante. Isso suaviza a distribuição e, quando um servidor sai, a carga dele se espalha entre muitos servidores. Também permite dar pesos: uma máquina com o dobro de capacidade recebe o dobro de nós virtuais.
+
+## Implementação
+
+```python
+import bisect
+import hashlib
+
+def _hash(valor: str) -> int:
+    return int(hashlib.md5(valor.encode()).hexdigest(), 16)
+
+class AnelConsistente:
+    def __init__(self, vnodes: int = 100):
+        self.vnodes = vnodes
+        self.posicoes = []   # hashes ordenados
+        self.dono = {}       # hash -> servidor
+
+    def adicionar(self, servidor: str):
+        for i in range(self.vnodes):
+            h = _hash(f"{servidor}#{i}")
+            bisect.insort(self.posicoes, h)
+            self.dono[h] = servidor
+
+    def remover(self, servidor: str):
+        for i in range(self.vnodes):
+            h = _hash(f"{servidor}#{i}")
+            self.posicoes.remove(h)
+            del self.dono[h]
+
+    def servidor_para(self, chave: str) -> str:
+        h = _hash(chave)
+        idx = bisect.bisect_right(self.posicoes, h) % len(self.posicoes)
+        return self.dono[self.posicoes[idx]]
+
+anel = AnelConsistente()
+for s in ["cache-a", "cache-b", "cache-c"]:
+    anel.adicionar(s)
+print(anel.servidor_para("usuario:42"))
+```
+
+A busca usa pesquisa binária na lista ordenada, então custa O(log V), em que V é o total de nós virtuais. O `% len(...)` faz a volta no anel quando a chave fica depois da última posição. MD5 aparece aqui só como função de distribuição, não por segurança.
+
+## Onde é usado
+
+- Clientes de cache distribuído (Memcached) para escolher o servidor de cada chave.
+- Bancos como Cassandra e DynamoDB para distribuir partições; a réplica de uma chave costuma ir para os próximos nós no anel.
+- Load balancers que precisam de afinidade (mesmo cliente no mesmo backend) sem quebrar tudo quando um backend muda.
+
+<Callout type="note" title="Alternativas">
+Existem outras abordagens com a mesma propriedade de mover poucas chaves, como rendezvous hashing (cada chave escolhe o servidor com maior hash combinado) e jump consistent hash. Muitos bancos também usam um número fixo de partições lógicas mapeadas para nós, movendo partições inteiras em vez de chaves.
+</Callout>
+
+## Na entrevista
+
+Cite hashing consistente sempre que houver sharding ou cache distribuído com nós entrando e saindo. Explique o problema do módulo em uma frase, o anel em outra e mencione nós virtuais. Follow-ups comuns: "como lidar com uma chave muito quente?" (o anel não resolve; replique a chave ou divida-a), "como fica a replicação?" (próximos N nós distintos no sentido horário).
+
+<QuizSet>
+<Quiz question="Com hash(chave) % N, o que acontece quando N muda de 10 para 11?" options={["Cerca de 1/11 das chaves muda de servidor", "A grande maioria das chaves muda de servidor", "Nenhuma chave muda", "Só as chaves do servidor novo mudam"]} answer={1} explanation="O resto da divisão muda para quase todos os valores, então cerca de 10/11 das chaves passam para outro servidor." />
+<Quiz question="Para que servem os nós virtuais no hashing consistente?" options={["Para criptografar as chaves", "Para equilibrar a distribuição e espalhar a carga de um servidor que sai", "Para eliminar a necessidade de réplicas", "Para tornar a busca O(1)"]} answer={1} explanation="Com muitas posições por servidor, os arcos ficam mais uniformes e a carga de um nó removido se divide entre vários vizinhos." />
+</QuizSet>

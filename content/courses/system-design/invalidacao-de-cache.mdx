@@ -1,0 +1,83 @@
+---
+title: Invalidação de cache
+kind: lesson
+---
+
+Todo cache é uma cópia, e toda cópia pode ficar desatualizada. **Invalidação** é o conjunto de mecanismos que garante que essa cópia não fique errada por mais tempo do que o negócio tolera. O difícil não é apagar uma chave; é saber **quais** chaves apagar, **quando**, e lidar com as corridas entre leitores e escritores.
+
+## Primeiro, defina a tolerância
+
+Antes de escolher técnica, pergunte: quanto tempo um dado velho pode ser servido?
+
+- Saldo bancário exibido antes de uma transferência: quase zero.
+- Contagem de curtidas: alguns segundos ou minutos.
+- Página "Sobre nós": horas.
+
+Essa resposta decide se TTL basta ou se você precisa de invalidação ativa.
+
+## Técnicas
+
+### Expiração por tempo (TTL)
+
+Cada chave vence sozinha. É simples e **limita o pior caso**: um dado errado nunca dura mais que o TTL. A desvantagem é o meio-termo forçado: TTL curto gera mais misses, TTL longo gera dados velhos. Adicione um pouco de aleatoriedade (*jitter*) para que milhares de chaves criadas juntas não expirem juntas.
+
+### Invalidação explícita na escrita
+
+O código que altera o banco também apaga (ou atualiza) as chaves afetadas. Dá frescor quase imediato, mas acopla o caminho de escrita a **todas** as chaves derivadas daquele dado. Se o preço de um produto muda, você precisa apagar `produto:42`, mas também `categoria:7:pagina:1`, `busca:tenis`... É aqui que bugs aparecem.
+
+### Invalidação por eventos
+
+Em vez de cada serviço lembrar das chaves, o banco publica mudanças. Uma ferramenta de **change data capture** (como Debezium lendo o log do banco) emite um evento por linha alterada, e um consumidor apaga as chaves correspondentes. Desacopla quem escreve de quem mantém o cache e pega até alterações feitas por scripts manuais.
+
+```text
+App ──escreve──▶ Banco ──log de mudanças──▶ CDC ──evento──▶ Invalidador ──DEL──▶ Cache
+```
+
+### Chaves versionadas
+
+Em vez de apagar, você muda o nome da chave. Um contador de versão por entidade (ou um hash do conteúdo) entra na chave: `produto:42:v17`. Quando o produto muda, a versão vira 18 e as leituras passam a buscar a chave nova; a antiga morre por TTL ou eviction. É o mesmo truque de arquivos estáticos com hash no nome (`app.3f9a1c.js`).
+
+### Tags ou namespaces
+
+Agrupe chaves sob um rótulo, como `tag:categoria:7`, e guarde a versão do rótulo. Para invalidar a categoria inteira, basta incrementar a versão da tag: todas as chaves que a incluem no nome viram lixo de uma vez.
+
+## A corrida clássica
+
+Mesmo com invalidação na escrita, a ordem dos eventos pode estragar tudo:
+
+```text
+t1  Leitor: miss no cache, lê preço=100 do banco
+t2  Escritor: grava preço=120 no banco
+t3  Escritor: DEL produto:42
+t4  Leitor: SET produto:42 = 100   ← valor velho volta e fica até o TTL
+```
+
+Mitigações comuns:
+
+- **TTL sempre**, para limitar o estrago.
+- **Delete atrasado (double delete):** apagar de novo algumas centenas de milissegundos depois da escrita.
+- **Lease / token de escrita:** no miss, o cache entrega um token ao leitor; um DEL posterior invalida o token, e o SET com token velho é rejeitado. É a técnica que o Facebook descreveu para o memcache.
+- **Set condicional por versão:** só grava se a versão do valor for maior que a já armazenada.
+
+<Callout type="warning" title="Atualizar em vez de apagar">
+Prefira apagar a chave a escrever o novo valor nela. Duas escritas concorrentes que atualizam o cache podem chegar fora de ordem e deixar o valor mais antigo por último. Um DEL é idempotente e o próximo leitor busca o valor certo.
+</Callout>
+
+## Comparando
+
+| Técnica | Frescor | Complexidade | Melhor uso |
+| --- | --- | --- | --- |
+| TTL | Limitado pelo TTL | Mínima | Base de tudo |
+| Explícita | Imediato | Alta com chaves derivadas | Entidades simples |
+| Eventos (CDC) | Quase imediato | Infraestrutura extra | Muitos escritores |
+| Versionamento | Imediato | Baixa | Conteúdo imutável por versão |
+| Tags | Imediato em grupo | Média | Listagens e páginas agregadas |
+
+## Na entrevista
+
+Mostre que você pensa em **limite de dano** (TTL), **caminho feliz** (invalidação na escrita ou CDC) e **corridas** (lease ou versão). Perguntas comuns: "como invalidar um cache replicado em várias regiões?", "o que acontece se a mensagem de invalidação se perder?" (resposta: o TTL é a rede de segurança).
+
+<QuizSet>
+<Quiz question="Vários serviços e scripts de manutenção alteram a tabela de pedidos diretamente. Qual técnica garante que o cache seja invalidado em todos os casos?" options={["Invalidação explícita em cada serviço", "Change data capture lendo o log do banco", "Aumentar o TTL", "Política LFU"]} answer={1} explanation="CDC observa o log do banco, então captura qualquer escrita, inclusive as feitas fora do código da aplicação." />
+<Quiz question="Por que, após uma escrita, é mais seguro apagar a chave do cache em vez de gravar o novo valor nela?" options={["Porque DEL é mais rápido que SET", "Porque escritas concorrentes no cache podem chegar fora de ordem e deixar um valor antigo", "Porque o Redis não aceita SET após escrita no banco", "Porque apagar renova o TTL"]} answer={1} explanation="DEL é idempotente; o próximo leitor busca o valor atual no banco. Dois SETs concorrentes podem se inverter." />
+</QuizSet>

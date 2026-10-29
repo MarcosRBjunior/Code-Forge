@@ -1,0 +1,157 @@
+---
+title: Projetar um encurtador de URL
+kind: lesson
+---
+
+O encurtador de URL é a questão de aquecimento mais comum em entrevistas de system design. Parece trivial, mas esconde decisões interessantes: como gerar códigos curtos sem colisão, como servir bilhões de redirecionamentos com latência baixa e o que fazer com estatísticas de clique.
+
+## Requisitos
+
+### Funcionais
+
+- Dada uma URL longa, gerar um link curto, como `cf.ly/aZ3k9Qx`.
+- Acessar o link curto redireciona para a URL original.
+- Opcional: alias personalizado (`cf.ly/promo-natal`) e data de expiração.
+- Opcional: contagem de cliques por link.
+
+### Não funcionais
+
+- **Leitura muito mais frequente que escrita**: um link é criado uma vez e clicado muitas vezes.
+- Redirecionamento rápido: alvo de p99 abaixo de 50 ms no servidor.
+- Alta disponibilidade: link quebrado é pior que link lento.
+- Códigos não devem ser facilmente adivinháveis em sequência (para não permitir varrer todos os links).
+
+Pergunte ao entrevistador se links podem ser editados ou apagados. Normalmente a resposta é "não", e isso simplifica muito o cache.
+
+## Estimativas
+
+Suponha 100 milhões de links novos por mês e uma proporção de 100 leituras para cada escrita.
+
+- Escritas: 100 M / (30 × 86.400 s) ≈ 100 M / 2,6 M ≈ **40 por segundo**, com pico de uns 200/s.
+- Leituras: 40 × 100 = **4.000 por segundo**, com pico de 20.000/s.
+- Armazenamento: cada registro tem URL longa (média 200 bytes) mais código, datas e dono, digamos 500 bytes. Em 5 anos: 100 M × 12 × 5 = 6 bilhões de links × 500 B = **3 TB**. Cabe em um cluster modesto.
+- Espaço de códigos: com alfabeto base62 (a–z, A–Z, 0–9) e 7 caracteres, temos 62^7 ≈ 3,5 trilhões de combinações. Para 6 bilhões de links, ocupamos menos de 0,2% do espaço.
+- Cache: se 20% dos links geram 80% dos cliques, guardar os 20% mais quentes do último dia exige cerca de 0,2 × 4.000 × 86.400 × 500 B ≈ 35 GB. Um punhado de nós Redis resolve.
+
+## API
+
+```text
+POST /api/v1/links
+  body: { "url": "https://...", "alias": "opcional", "expiraEm": "2027-01-01" }
+  resposta 201: { "codigo": "aZ3k9Qx", "curta": "https://cf.ly/aZ3k9Qx" }
+
+GET /:codigo
+  resposta 302 Location: https://url-original
+  resposta 404 se não existir ou expirou
+
+GET /api/v1/links/:codigo/estatisticas
+  resposta 200: { "cliques": 1823, "porDia": [...] }
+```
+
+A escolha entre **301** (permanente) e **302** (temporário) importa: com 301 o navegador guarda o redirecionamento e os cliques seguintes nem chegam ao seu servidor. Ótimo para carga, péssimo para estatísticas. Se analytics é requisito, use 302.
+
+## Modelo de dados
+
+```sql
+CREATE TABLE links (
+  codigo      VARCHAR(10) PRIMARY KEY,
+  url_longa   TEXT NOT NULL,
+  dono_id     BIGINT,
+  criado_em   TIMESTAMP NOT NULL,
+  expira_em   TIMESTAMP
+);
+```
+
+O acesso é sempre por chave primária, sem joins. Isso aponta para um armazenamento chave-valor (DynamoDB, Cassandra) ou para um banco relacional particionado por `codigo`. Ambos funcionam; o importante é justificar. Cliques ficam em outro lugar, pois têm volume e padrão de escrita completamente diferentes.
+
+## Arquitetura de alto nível
+
+```text
+                +-------------+
+ cliente -----> |   CDN/edge  |  (cache de redirecionamentos populares)
+                +------+------+
+                       |
+                +------v------+
+                | Load balancer|
+                +------+------+
+          +------------+-------------+
+          |                          |
+   +------v------+            +------v------+
+   | Serviço de  |            | Serviço de  |
+   | escrita     |            | leitura     |
+   +--+-------+--+            +--+-------+--+
+      |       |                  |       |
+      |  +----v-----+       +----v---+   |
+      |  | Gerador  |       | Redis  |   |
+      |  | de IDs   |       | cache  |   |
+      |  +----------+       +--------+   |
+      |                                  |
+   +--v----------------------------------v--+
+   |    Banco chave-valor (particionado)    |
+   +----------------------------------------+
+                       |
+          eventos de clique -> Kafka -> agregador -> banco de estatísticas
+```
+
+Separar leitura e escrita permite escalar cada lado de forma independente: o serviço de leitura terá dezenas de instâncias; o de escrita, poucas.
+
+## Aprofundamentos
+
+### 1. Como gerar o código
+
+Três abordagens aparecem com frequência:
+
+| Abordagem | Como funciona | Problema |
+| --- | --- | --- |
+| Hash da URL | MD5/SHA da URL, pega os 7 primeiros caracteres em base62 | Colisões exigem verificação e nova tentativa; a mesma URL gera sempre o mesmo código |
+| Contador global + base62 | Um contador incrementa e o número vira texto base62 | Códigos sequenciais e previsíveis; o contador vira ponto único |
+| Faixas pré-alocadas | Cada servidor reserva um bloco de 1 milhão de IDs de um coordenador e consome localmente | Perde IDs se o servidor cair, o que é aceitável |
+
+A terceira opção é a mais robusta: o coordenador (pode ser uma linha num banco com incremento atômico ou um ZooKeeper) só é consultado a cada milhão de links. Para evitar previsibilidade, aplique uma permutação reversível (por exemplo, um embaralhamento de bits com chave secreta) antes de converter para base62.
+
+```python
+ALFABETO = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def base62(n: int) -> str:
+    if n == 0:
+        return ALFABETO[0]
+    s = []
+    while n:
+        n, r = divmod(n, 62)
+        s.append(ALFABETO[r])
+    return "".join(reversed(s))
+```
+
+Aliases personalizados usam o mesmo espaço de chaves, então a inserção precisa ser condicional (`INSERT ... IF NOT EXISTS`) para detectar conflito.
+
+### 2. Caminho de leitura rápido
+
+O redirecionamento precisa ser barato. A ordem de consulta é: cache da CDN, depois Redis, depois o banco. Como links não mudam, o cache pode usar TTL longo sem medo de inconsistência. Para links inexistentes, guarde também uma entrada negativa curta (por exemplo, 60 segundos) para que robôs testando códigos aleatórios não martelem o banco. Um filtro de Bloom na frente do banco é outra forma de rejeitar códigos que certamente não existem.
+
+### 3. Estatísticas sem atrasar o redirecionamento
+
+Nunca incremente um contador no banco principal dentro da requisição de redirecionamento. Publique um evento (`codigo`, timestamp, país, user agent) numa fila e responda imediatamente. Um consumidor agrega em janelas de um minuto e grava somatórios num banco orientado a séries temporais ou colunar. Assim um link viral não cria hot key de escrita.
+
+<Callout type="tip" title="Mostre que você pensa no pior caso">
+Mencione um link viral recebendo 50 mil cliques por segundo. A resposta é cache em camadas: ele vive na CDN e no Redis, e o banco quase não sente.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Coordenador de IDs**: com faixas grandes, sua carga é mínima, mas ele precisa ser replicado. Se cair, os servidores continuam até esgotar a faixa atual.
+- **301 versus 302**: performance contra visibilidade de cliques.
+- **Hash versus contador**: hash dá deduplicação de URLs iguais de graça; contador dá ausência de colisão. Você pode deduplicar com um índice secundário por hash da URL, se for requisito.
+- **Expiração**: apagar links expirados de forma preguiçosa (verifica na leitura) mais um job noturno de limpeza. Reutilizar códigos expirados é arriscado, pois links antigos podem estar impressos em algum lugar.
+- **Banco relacional versus chave-valor**: 3 TB e acesso por chave favorecem chave-valor, mas um Postgres particionado também atende. O ponto é dizer por que.
+
+## Perguntas de follow-up comuns
+
+- Como impedir abuso, como encurtar URLs de phishing? Verificação assíncrona contra listas de bloqueio e rate limit por usuário/IP.
+- Como suportar várias regiões? Leitura local em cada região com replicação assíncrona; escrita pode ir para uma região primária ou usar faixas de IDs distintas por região.
+- E se a mesma URL for encurtada duas vezes? Depende do produto: links por usuário costumam ser distintos para ter estatísticas separadas.
+- Como fazer o código ter 6 caracteres em vez de 7? Refaça a conta: 62^6 ≈ 57 bilhões, suficiente para 6 bilhões, mas com margem menor.
+
+<QuizSet>
+<Quiz question="Por que um redirecionamento 301 pode prejudicar a coleta de estatísticas?" options={["Porque 301 é mais lento", "Porque o navegador guarda o redirecionamento e cliques seguintes não chegam ao servidor", "Porque 301 não funciona com CDN", "Porque 301 exige HTTPS"]} answer={1} explanation="O 301 é permanente e cacheável pelo navegador, então cliques repetidos não passam pelo seu serviço." />
+<Quiz question="Qual a vantagem principal de pré-alocar faixas de IDs por servidor?" options={["Elimina a necessidade de banco", "Gera códigos mais curtos", "Reduz a dependência do coordenador a uma consulta por bloco", "Garante que IDs nunca sejam perdidos"]} answer={2} explanation="O coordenador só é consultado quando um bloco acaba, então ele deixa de ser gargalo." />
+</QuizSet>

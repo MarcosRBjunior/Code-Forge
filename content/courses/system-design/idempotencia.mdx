@@ -1,0 +1,85 @@
+---
+title: Idempotência
+kind: lesson
+---
+
+Redes falham de um jeito traiçoeiro: às vezes a requisição chega, o servidor processa, e é a **resposta** que se perde. O cliente vê um timeout e não tem como saber se a operação aconteceu. A reação natural é tentar de novo. Se a operação for "cobrar R$ 300 no cartão", tentar de novo pode cobrar duas vezes. **Idempotência** é a propriedade que torna a retentativa segura: executar a mesma operação uma ou várias vezes produz o mesmo efeito no sistema.
+
+## Definição precisa
+
+Uma operação é idempotente se `f(f(x)) = f(x)`. Em APIs, isso significa que o **estado do servidor** depois de N requisições idênticas é igual ao estado depois de uma. A **resposta** pode variar: apagar um recurso pode devolver 204 na primeira vez e 404 na segunda, e a operação continua idempotente, porque o efeito (o recurso não existe) é o mesmo.
+
+Não confunda com **segurança** (safe): uma operação segura não altera estado nenhum. Toda operação segura é idempotente, mas o contrário não vale.
+
+## Métodos HTTP
+
+| Método | Seguro | Idempotente | Observação |
+| --- | --- | --- | --- |
+| GET, HEAD, OPTIONS | Sim | Sim | Só leitura |
+| PUT | Não | Sim | Substitui o recurso pelo conteúdo enviado |
+| DELETE | Não | Sim | Apagar duas vezes deixa o recurso apagado |
+| POST | Não | Não | Cada chamada pode criar algo novo |
+| PATCH | Não | Depende | `definir saldo = 10` é idempotente; `somar 10 ao saldo` não é |
+
+A especificação define a **intenção** de cada método. Cabe à sua implementação respeitá-la: um `PUT` que incrementa um contador viola o contrato.
+
+## Tornando o POST idempotente: chaves de idempotência
+
+O padrão mais usado (popularizado por gateways de pagamento) é o cliente gerar um identificador único por **intenção de operação** e enviá-lo num cabeçalho, como `Idempotency-Key`. O servidor guarda o resultado associado à chave e, se receber a mesma chave de novo, devolve o resultado salvo sem reexecutar.
+
+```text
+POST /v1/pagamentos
+Idempotency-Key: 5f1c9a2e-7b44-4c1e-9d3a-0e2f6a8b1c77
+Content-Type: application/json
+
+{"pedido_id": 991, "valor": 300.00}
+```
+
+```python
+def criar_pagamento(chave, corpo):
+    # Insere a chave atomicamente; falha se já existir
+    registro = idem.inserir_se_ausente(chave, status="processando",
+                                       hash_corpo=hash(corpo))
+    if not registro.novo:
+        if registro.hash_corpo != hash(corpo):
+            return 422, "chave reutilizada com outro corpo"
+        if registro.status == "processando":
+            return 409, "requisição em andamento, tente depois"
+        return registro.resposta_salva
+
+    resposta = gateway.cobrar(corpo)
+    idem.concluir(chave, resposta, expira_em_horas=24)
+    return resposta
+```
+
+Detalhes que fazem diferença:
+
+- **Inserção atômica:** use uma restrição `UNIQUE` ou `SET NX` no Redis. Checar e depois inserir abre janela para duas requisições simultâneas passarem.
+- **Validar o corpo:** a mesma chave com payload diferente indica bug no cliente; rejeite.
+- **Estado "em andamento":** evita que uma retentativa rápida dispare um segundo processamento enquanto o primeiro ainda roda.
+- **Expiração:** as chaves não precisam viver para sempre; 24 horas a alguns dias cobre as retentativas realistas.
+- **Mesma transação:** se possível, grave o efeito (o pagamento) e o registro da chave na mesma transação do banco.
+
+## Outras técnicas
+
+- **Identificador natural:** se cada pedido gera no máximo um pagamento, uma restrição única em `pedido_id` já impede duplicatas.
+- **Upsert:** `INSERT ... ON CONFLICT DO UPDATE` transforma criação em operação idempotente.
+- **Escritas condicionais:** com `ETag` e `If-Match`, a atualização só ocorre se o recurso estiver na versão esperada.
+- **Deduplicação no consumidor:** em mensageria, o consumidor registra os IDs de mensagens já processadas, pois brokers costumam entregar ao menos uma vez.
+
+<Callout type="warning" title="Retentativa sem idempotência é bug">
+Clientes HTTP, SDKs, load balancers e service meshes fazem retry automático. Se o endpoint não é idempotente, alguma camada vai duplicar operações em produção, cedo ou tarde.
+</Callout>
+
+## Trade-offs
+
+Guardar chaves custa armazenamento e uma escrita extra por requisição. A chave precisa ser gerada pelo **cliente** e reutilizada em cada retentativa da mesma intenção; se o cliente gerar uma chave nova a cada tentativa, o mecanismo não protege nada. E a idempotência local não resolve efeitos externos: se seu serviço chama outro sistema, ele também precisa ser idempotente ou receber a chave repassada.
+
+## Na entrevista
+
+Sempre que aparecer pagamento, reserva, envio de mensagem ou qualquer escrita com retry, cite idempotência espontaneamente. Explique a chave enviada pelo cliente, o armazenamento com restrição única e o TTL. Follow-ups prováveis: o que acontece com duas requisições simultâneas com a mesma chave, onde guardar as chaves e como isso se relaciona com entrega "pelo menos uma vez" em filas.
+
+<QuizSet>
+<Quiz question="Um DELETE /itens/7 retorna 204 na primeira chamada e 404 na segunda. Ele é idempotente?" options={["Não, porque as respostas são diferentes", "Sim, porque o estado final do servidor é o mesmo", "Só se o cliente enviar Idempotency-Key", "Não, DELETE nunca é idempotente"]} answer={1} explanation="Idempotência é sobre o efeito no estado do servidor, não sobre a resposta. Após uma ou várias chamadas, o item não existe." />
+<Quiz question="Por que a chave de idempotência deve ser inserida de forma atômica?" options={["Para economizar espaço em disco", "Para impedir que duas requisições simultâneas com a mesma chave executem a operação", "Para criptografar a chave", "Para que a chave nunca expire"]} answer={1} explanation="Se você verifica a existência e só depois insere, duas requisições concorrentes podem ambas ver a chave ausente e processar em dobro. Uma restrição única ou SET NX fecha essa janela." />
+</QuizSet>

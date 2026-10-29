@@ -1,0 +1,137 @@
+---
+title: Singleton
+kind: lesson
+---
+
+## O problema
+
+Algumas coisas devem existir **uma vez só** no processo: o pool de conexões com o banco, o registro de configurações carregado do arquivo `.env`, o contador de métricas que exporta dados para o Prometheus. Se cada módulo criar a sua própria instância, você abre conexões demais, lê o arquivo de configuração várias vezes ou espalha métricas em objetos que ninguém agrega.
+
+O **Singleton** garante que uma classe tenha uma única instância e oferece um ponto de acesso global a ela.
+
+## Estrutura
+
+```text
++-------------------------------+
+|        ConfiguracaoApp        |
++-------------------------------+
+| - _instancia: ConfiguracaoApp |  (atributo de classe)
+| - _trava: Lock                |
+| - valores: dict               |
++-------------------------------+
+| + obter(): ConfiguracaoApp    |  (cria na 1a chamada,
+| + get(chave): str             |   devolve a mesma depois)
++-------------------------------+
+        ^
+        | todos os clientes chamam ConfiguracaoApp.obter()
+   ServicoPagamento   ServicoEmail   Worker
+```
+
+Os papéis são só dois: a classe Singleton, que controla a própria criação, e os clientes, que nunca usam o construtor diretamente.
+
+## Implementação em Python
+
+Um exemplo realista: a configuração de um gateway de pagamentos, carregada uma vez e compartilhada entre threads. A criação usa **double-checked locking** para ser segura sob concorrência sem pagar o lock em toda leitura.
+
+```python
+import threading
+
+
+class ConfiguracaoApp:
+    _instancia = None
+    _trava = threading.Lock()
+
+    def __new__(cls):
+        raise TypeError("use ConfiguracaoApp.obter()")
+
+    @classmethod
+    def obter(cls) -> "ConfiguracaoApp":
+        if cls._instancia is None:              # 1a checagem, sem lock
+            with cls._trava:
+                if cls._instancia is None:      # 2a checagem, com lock
+                    instancia = object.__new__(cls)
+                    instancia._carregar()
+                    cls._instancia = instancia
+        return cls._instancia
+
+    def _carregar(self) -> None:
+        # Em produção viria de variáveis de ambiente ou de um arquivo.
+        self._valores = {
+            "gateway_url": "https://api.pagamentos.exemplo/v2",
+            "timeout_segundos": "5",
+            "moeda_padrao": "BRL",
+        }
+        self.carregamentos = getattr(self, "carregamentos", 0) + 1
+
+    def get(self, chave: str) -> str:
+        return self._valores[chave]
+
+
+class ServicoPagamento:
+    def cobrar(self, valor: float) -> str:
+        cfg = ConfiguracaoApp.obter()
+        return f"POST {cfg.get('gateway_url')}/cobrancas valor={valor:.2f} {cfg.get('moeda_padrao')}"
+
+
+# Várias threads pedindo a configuração ao mesmo tempo
+vistas = []
+threads = [threading.Thread(target=lambda: vistas.append(id(ConfiguracaoApp.obter()))) for _ in range(20)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("instâncias distintas:", len(set(vistas)))
+print("carregamentos:", ConfiguracaoApp.obter().carregamentos)
+print(ServicoPagamento().cobrar(149.9))
+
+try:
+    ConfiguracaoApp()
+except TypeError as erro:
+    print("bloqueado:", erro)
+```
+
+### A forma idiomática em Python
+
+Em Python, **um módulo já é importado uma vez só** e fica em `sys.modules`. Por isso, a forma mais simples de ter uma instância única é criá-la no nível do módulo (`config = Configuracao()`) e importar `config` onde precisar. A classe acima vale quando você precisa de criação preguiçosa (lazy) ou de controle explícito.
+
+## O lado ruim
+
+O Singleton é o padrão mais criticado da lista, e com razão:
+
+- **Estado global disfarçado.** Qualquer função pode ler e alterar a instância, o que cria dependências invisíveis na assinatura dos métodos.
+- **Testes difíceis.** Um teste que altera o Singleton contamina os próximos. Você acaba escrevendo métodos de "reset" só para testes.
+- **Viola o SRP.** A classe cuida da sua regra de negócio e também do seu ciclo de vida.
+- **Concorrência.** Sem lock, duas threads podem criar duas instâncias; com estado mutável, você precisa sincronizar também o uso.
+
+<Callout type="warning" title="Prefira injeção de dependência">
+Na maioria dos casos, crie o objeto uma vez na inicialização da aplicação (composition root) e passe-o pelos construtores. Você ganha a instância única sem o acesso global escondido, e os testes podem injetar um dublê.
+</Callout>
+
+## Quando usar e quando evitar
+
+| Use quando | Evite quando |
+| --- | --- |
+| O recurso é caro e realmente único no processo (pool, cache local, logger) | Você só quer "acesso fácil" a um objeto |
+| O objeto é imutável ou thread-safe | O objeto guarda estado mutável de negócio |
+| Não há framework de DI disponível | Você precisa de instâncias diferentes em testes ou por tenant |
+
+## Padrões parecidos
+
+- **Monostate (Borg):** várias instâncias compartilham o mesmo `__dict__`. O efeito é parecido, mas a identidade dos objetos difere. Raramente vale a pena.
+- **Factory com cache:** uma fábrica que devolve sempre a mesma instância para uma chave (por exemplo, um cliente HTTP por host). É "um por chave", não "um global".
+- **Flyweight:** compartilha muitas instâncias pequenas e imutáveis; o Singleton compartilha uma só.
+
+## Na entrevista
+
+Cite o Singleton para recursos como logger, gerenciador de configuração ou o próprio sistema (por exemplo, `Estacionamento` único no problema do estacionamento), mas mostre maturidade: diga que você implementaria com lock (ou no nível do módulo) e que prefere injetar a instância. Follow-ups comuns:
+
+- "Como deixar thread-safe?" Double-checked locking ou inicialização ansiosa (eager) na carga do módulo.
+- "Como testar código que usa Singleton?" Injetar a dependência ou expor um método de reset restrito a testes.
+- "Por que é considerado anti-padrão?" Estado global, acoplamento oculto, dificuldade de testes.
+
+<QuizSet>
+<Quiz question="Por que o código usa duas checagens de `_instancia is None`?" options={["Por estilo, a segunda é redundante", "A primeira evita o custo do lock nas leituras comuns; a segunda evita que duas threads que passaram pela primeira criem duas instâncias", "Para suportar herança múltipla", "Para liberar memória"]} answer={1} explanation="É o double-checked locking: rápido no caminho comum e correto quando há disputa na primeira criação." />
+<Quiz question="Qual a forma mais idiomática de ter uma instância única em Python, na maioria dos casos?" options={["Metaclasse com __call__ customizado", "Criar o objeto no nível de um módulo e importá-lo", "Usar variável global dentro de cada função", "Herdar de uma classe Singleton genérica"]} answer={1} explanation="Módulos são carregados uma vez e cacheados em sys.modules, então um objeto definido neles já é único." />
+<Quiz question="Qual a principal crítica ao Singleton?" options={["Consome muita memória", "Não funciona em Python", "Introduz estado global e dependências ocultas, dificultando testes", "Impede o uso de herança"]} answer={2} explanation="Quem usa o Singleton não declara essa dependência, e o estado compartilhado vaza entre testes." />
+</QuizSet>

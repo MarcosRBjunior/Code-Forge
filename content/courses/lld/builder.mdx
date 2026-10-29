@@ -1,0 +1,202 @@
+---
+title: Builder
+kind: lesson
+---
+
+## O problema
+
+Imagine montar uma requisição de envio de e-mail transacional: remetente, destinatários, cópias, assunto, corpo em texto, corpo em HTML, anexos, cabeçalhos, prioridade, data de agendamento. Quase tudo é opcional, mas existem regras: precisa de pelo menos um destinatário, assunto não pode ser vazio, anexos têm limite de tamanho.
+
+Um construtor com doze parâmetros vira o famoso **construtor telescópico**: ninguém lembra a ordem, chamadas ficam ilegíveis e a validação se espalha. Criar o objeto vazio e ir preenchendo com setters deixa o objeto **inválido** durante um tempo e mutável para sempre.
+
+O **Builder** separa a montagem passo a passo de um objeto complexo da sua representação final. Você configura um construtor auxiliar com chamadas nomeadas e, no fim, pede `build()`, que valida tudo e devolve um objeto pronto (de preferência imutável).
+
+## Estrutura
+
+```text
+ Cliente
+    |
+    | EmailBuilder().de(...).para(...).assunto(...).build()
+    v
++----------------------------+          +-------------------------+
+|        EmailBuilder        |  build() |      Email (frozen)     |
++----------------------------+--------->+-------------------------+
+| - _remetente               |          | remetente               |
+| - _destinatarios: list     |          | destinatarios: tuple    |
+| - _anexos: list            |          | assunto, texto, html    |
++----------------------------+          | anexos: tuple           |
+| + de(endereco): self       |          +-------------------------+
+| + para(endereco): self     |
+| + anexar(nome, bytes): self|
+| + build(): Email           |  (valida regras e congela)
++----------------------------+
+
+ Opcional: Diretor (ex.: ModelosDeEmail) que conhece receitas prontas
+ e chama a sequência de passos do builder.
+```
+
+## Implementação em Python
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass(frozen=True)
+class Anexo:
+    nome: str
+    conteudo: bytes
+
+
+@dataclass(frozen=True)
+class Email:
+    remetente: str
+    destinatarios: tuple
+    copias: tuple
+    assunto: str
+    texto: str
+    html: str | None
+    anexos: tuple
+    agendado_para: datetime | None
+
+
+class EmailInvalido(ValueError):
+    pass
+
+
+class EmailBuilder:
+    LIMITE_ANEXOS_BYTES = 10 * 1024 * 1024
+
+    def __init__(self) -> None:
+        self._remetente = "nao-responda@loja.exemplo"
+        self._destinatarios: list[str] = []
+        self._copias: list[str] = []
+        self._assunto = ""
+        self._texto = ""
+        self._html: str | None = None
+        self._anexos: list[Anexo] = []
+        self._agendado_para: datetime | None = None
+
+    def de(self, endereco: str) -> "EmailBuilder":
+        self._remetente = endereco
+        return self
+
+    def para(self, *enderecos: str) -> "EmailBuilder":
+        self._destinatarios.extend(enderecos)
+        return self
+
+    def com_copia(self, *enderecos: str) -> "EmailBuilder":
+        self._copias.extend(enderecos)
+        return self
+
+    def assunto(self, texto: str) -> "EmailBuilder":
+        self._assunto = texto.strip()
+        return self
+
+    def corpo(self, texto: str, html: str | None = None) -> "EmailBuilder":
+        self._texto, self._html = texto, html
+        return self
+
+    def anexar(self, nome: str, conteudo: bytes) -> "EmailBuilder":
+        self._anexos.append(Anexo(nome, conteudo))
+        return self
+
+    def agendar(self, quando: datetime) -> "EmailBuilder":
+        self._agendado_para = quando
+        return self
+
+    def build(self) -> Email:
+        if not self._destinatarios:
+            raise EmailInvalido("informe ao menos um destinatário")
+        if not self._assunto:
+            raise EmailInvalido("assunto obrigatório")
+        total = sum(len(a.conteudo) for a in self._anexos)
+        if total > self.LIMITE_ANEXOS_BYTES:
+            raise EmailInvalido(f"anexos somam {total} bytes, acima do limite")
+        return Email(
+            remetente=self._remetente,
+            destinatarios=tuple(self._destinatarios),
+            copias=tuple(self._copias),
+            assunto=self._assunto,
+            texto=self._texto,
+            html=self._html,
+            anexos=tuple(self._anexos),
+            agendado_para=self._agendado_para,
+        )
+
+
+class ModelosDeEmail:
+    """Diretor: conhece receitas prontas de montagem."""
+
+    @staticmethod
+    def nota_fiscal(cliente: str, numero: int, pdf: bytes) -> Email:
+        return (
+            EmailBuilder()
+            .para(cliente)
+            .assunto(f"Sua nota fiscal nº {numero}")
+            .corpo("Segue em anexo a nota fiscal da sua compra.")
+            .anexar(f"nf-{numero}.pdf", pdf)
+            .build()
+        )
+
+
+email = (
+    EmailBuilder()
+    .de("vendas@loja.exemplo")
+    .para("ana@cliente.exemplo", "bruno@cliente.exemplo")
+    .com_copia("financeiro@loja.exemplo")
+    .assunto("  Pedido 8841 confirmado ")
+    .corpo("Seu pedido foi confirmado.", "<p>Seu pedido foi <b>confirmado</b>.</p>")
+    .agendar(datetime(2026, 11, 2, 9, 0))
+    .build()
+)
+print(email.assunto, "->", email.destinatarios, "| agendado:", email.agendado_para)
+
+nf = ModelosDeEmail.nota_fiscal("carla@cliente.exemplo", 1203, b"%PDF-1.7 ...")
+print(nf.assunto, [a.nome for a in nf.anexos])
+
+try:
+    EmailBuilder().assunto("sem destinatário").build()
+except EmailInvalido as erro:
+    print("erro:", erro)
+```
+
+Pontos a notar:
+
+- Cada método devolve `self`, o que permite a **interface fluente** (encadeamento).
+- O produto `Email` é `frozen`: depois de construído, não muda. Toda a mutabilidade fica confinada ao builder.
+- A validação mora em **um só lugar**, o `build()`.
+- O **Diretor** (`ModelosDeEmail`) é opcional. Ele guarda sequências de passos reutilizáveis.
+
+<Callout type="note" title="E os argumentos nomeados do Python?">
+Com `dataclass` e parâmetros com valor padrão, você já evita o construtor telescópico em muitos casos. O Builder se justifica quando há montagem incremental (adicionar anexos em um laço), validação entre campos ou receitas de montagem reutilizáveis.
+</Callout>
+
+## Quando usar e quando evitar
+
+| Use quando | Evite quando |
+| --- | --- |
+| O objeto tem muitos campos opcionais e regras entre eles | O objeto tem 3 ou 4 campos simples |
+| A montagem acontece em etapas (laços, condicionais) | Argumentos nomeados com padrão resolvem |
+| Você quer o produto imutável e sempre válido | O objeto precisa mesmo ser mutável depois |
+| A mesma montagem gera representações diferentes (texto, HTML, SQL) | Só existe uma forma de criar |
+
+## Padrões parecidos
+
+- **Factory Method / Abstract Factory:** decidem **qual classe** instanciar e devolvem o objeto numa única chamada. O Builder foca em **como montar** um objeto complexo em vários passos.
+- **Prototype:** cria copiando um objeto existente. Às vezes um builder começa a partir de um protótipo ("copie o pedido anterior e troque o endereço").
+- **Composite:** builders são ótimos para montar árvores Composite (por exemplo, um construtor de menus ou de consultas SQL).
+
+## Na entrevista
+
+O Builder aparece naturalmente em problemas com entidades ricas: montar um `Pedido` no carrinho, uma `Pizza` com ingredientes, uma `ConsultaSQL`, uma `Notificacao` multicanal. Diga explicitamente: "vou usar um builder para garantir que o objeto nunca exista em estado inválido". Follow-ups comuns:
+
+- "Onde fica a validação?" No `build()`, antes de criar o produto.
+- "Por que não setters?" Setters permitem objeto parcialmente inicializado e mutável.
+- "O builder é thread-safe?" Normalmente não precisa ser: ele é local a quem monta; o produto imutável é que pode ser compartilhado.
+
+<QuizSet>
+<Quiz question="Qual problema o Builder ataca diretamente?" options={["Ter instância única de uma classe", "Construtores com muitos parâmetros opcionais e objetos que ficam inválidos durante a montagem", "Converter uma interface em outra", "Notificar vários objetos sobre mudanças"]} answer={1} explanation="O Builder organiza a montagem passo a passo e só entrega o produto depois de validado." />
+<Quiz question="Por que os métodos do builder retornam self?" options={["Para economizar memória", "Para permitir encadeamento das chamadas (interface fluente)", "Porque o Python exige", "Para tornar o builder um Singleton"]} answer={1} explanation="Retornar self permite escrever builder.para(...).assunto(...).build() numa expressão só." />
+<Quiz question="Qual o papel do Diretor no Builder?" options={["É obrigatório e valida o produto", "Guarda receitas de montagem reutilizáveis que chamam os passos do builder", "Substitui o produto final", "Controla o acesso concorrente"]} answer={1} explanation="O Diretor é opcional e encapsula sequências de passos, como o modelo de e-mail de nota fiscal." />
+</QuizSet>

@@ -1,0 +1,105 @@
+---
+title: JWT
+kind: lesson
+---
+
+Quando dez microsserviços precisam saber quem é o usuário de cada requisição, consultar um armazenamento central de sessões em todas elas vira gargalo e ponto de falha. O **JSON Web Token** (JWT, RFC 7519) resolve isso empacotando as informações de identidade num token **assinado**: qualquer serviço que tenha a chave de verificação confirma que o token é autêntico e não foi alterado, sem chamar ninguém.
+
+## Estrutura
+
+Um JWT assinado (formalmente, um JWS) tem três partes em Base64URL separadas por pontos:
+
+```text
+eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiI0MiIsImV4cCI6MTc2MTc1MDAwMH0.c2lnbmF0dXJl...
+        header                               payload                          assinatura
+```
+
+**Header**: algoritmo e identificador da chave.
+
+```json
+{"alg": "RS256", "typ": "JWT", "kid": "k1"}
+```
+
+**Payload**: as *claims*, afirmações sobre o sujeito.
+
+```json
+{
+  "iss": "https://auth.loja.com",
+  "sub": "42",
+  "aud": "api.loja.com",
+  "iat": 1761749100,
+  "exp": 1761750000,
+  "jti": "b7e1c0",
+  "papeis": ["cliente"]
+}
+```
+
+| Claim | Significado |
+| --- | --- |
+| `iss` | Quem emitiu |
+| `sub` | Sobre quem é o token (o usuário) |
+| `aud` | Para quem o token foi emitido |
+| `exp` | Expiração (segundos desde a época Unix) |
+| `nbf` | Não é válido antes de |
+| `iat` | Momento de emissão |
+| `jti` | ID único, útil para revogação e anti-replay |
+
+**Assinatura**: calculada sobre `base64url(header) + "." + base64url(payload)`.
+
+## Assinado não é criptografado
+
+Base64URL é só codificação. Qualquer pessoa que tenha o token lê o payload. A assinatura garante **integridade e autenticidade**, não **sigilo**. Nunca coloque senha, CPF ou dados sensíveis num JWT. Se precisar de confidencialidade, existe o JWE (token criptografado), bem menos comum.
+
+## Algoritmos: simétrico vs assimétrico
+
+- **HS256 (HMAC):** a mesma chave secreta assina e verifica. Todo serviço que verifica também consegue emitir tokens. Adequado só quando um único serviço faz as duas coisas.
+- **RS256 / ES256 (RSA, ECDSA):** o servidor de autenticação assina com a chave **privada**; os serviços verificam com a **pública**. Nenhum consumidor consegue forjar tokens. É o padrão em arquiteturas distribuídas.
+
+As chaves públicas costumam ser publicadas num endpoint **JWKS** (por exemplo, `/.well-known/jwks.json`). O `kid` do header diz qual chave usar, o que permite **rotacionar chaves** sem quebrar tokens já emitidos.
+
+## Validando corretamente
+
+```python
+import jwt  # PyJWT
+
+def validar(token, jwks_client):
+    chave = jwks_client.get_signing_key_from_jwt(token).key
+    return jwt.decode(
+        token,
+        chave,
+        algorithms=["RS256"],          # lista fixa, nunca vinda do token
+        audience="api.loja.com",
+        issuer="https://auth.loja.com",
+        leeway=30,                     # tolerância a diferença de relógio
+    )
+```
+
+Checklist de validação: assinatura com algoritmo da lista permitida, `exp` e `nbf`, `iss` esperado e `aud` igual ao seu serviço.
+
+<Callout type="warning" title="Ataques clássicos">
+Aceitar o algoritmo que vem no header permite o ataque alg none (token sem assinatura aceito) e a confusão RS256/HS256 (o atacante assina com HMAC usando a chave pública como segredo). Fixe os algoritmos aceitos no servidor e use bibliotecas mantidas.
+</Callout>
+
+## O problema da revogação
+
+Um JWT válido continua válido até `exp`, mesmo que o usuário faça logout ou tenha a conta bloqueada. Estratégias:
+
+- **Expiração curta** (5 a 15 minutos) mais refresh token guardado no servidor.
+- **Lista de bloqueio** de `jti` revogados, em cache rápido, consultada na validação. Funciona, mas reintroduz um lookup.
+- **Versão do usuário:** uma claim `ver` comparada com um contador no banco ou cache; incrementar o contador invalida todos os tokens antigos.
+
+## Armadilhas
+
+- **Payload inchado:** colocar todas as permissões no token aumenta cada requisição e deixa dados desatualizados até a expiração.
+- **Tokens longos sem refresh:** um token de 30 dias vazado vale 30 dias.
+- **Não validar `aud`:** um token emitido para outro serviço passa a ser aceito no seu.
+- **Usar JWT como sessão de browser em `localStorage`:** exposto a XSS.
+
+## Na entrevista
+
+Descreva o fluxo: o serviço de autenticação emite JWT assinado com RS256, o API gateway ou cada serviço valida localmente com a chave pública do JWKS, e o token expira rápido com refresh rotativo. Mostre que sabe que JWT não é criptografado e que revogação é o calcanhar de Aquiles. Follow-ups: como fazer logout, como rotacionar chaves, HS256 vs RS256 e o que colocar ou não no payload.
+
+<QuizSet>
+<Quiz question="Qual afirmação sobre um JWT assinado com RS256 é correta?" options={["O payload é criptografado e ninguém sem a chave consegue lê-lo", "Qualquer serviço com a chave pública consegue emitir novos tokens", "Serviços verificam com a chave pública, mas só quem tem a privada consegue assinar", "Ele não pode expirar"]} answer={2} explanation="No esquema assimétrico, a chave privada assina e a pública só verifica. O payload, porém, é apenas Base64URL e pode ser lido por qualquer um." />
+<Quiz question="Por que a lista de algoritmos aceitos deve ser fixada no servidor?" options={["Para o token ficar menor", "Para evitar ataques como alg none e confusão entre RS256 e HS256", "Porque o header não tem campo de algoritmo", "Para dispensar a validação de exp"]} answer={1} explanation="Se o servidor confiar no alg do header, o atacante escolhe um algoritmo fraco ou inexistente e forja tokens aceitos como válidos." />
+</QuizSet>

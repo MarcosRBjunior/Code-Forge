@@ -1,0 +1,196 @@
+---
+title: Visitor
+kind: lesson
+---
+
+## O problema
+
+Uma nota fiscal tem itens de tipos diferentes: produtos físicos, serviços e assinaturas. Cada tipo tem regras próprias de imposto (ICMS para produto, ISS para serviço), de exportação para o sistema contábil e de cálculo de comissão do vendedor. Se você coloca `calcular_imposto()`, `exportar_contabil()` e `comissao()` dentro de cada classe de item, as classes de domínio viram depósito de assuntos não relacionados: cada nova operação (relatório para auditoria, cálculo de frete) obriga a editar **todas** as classes de item.
+
+O Visitor **separa operações da estrutura de objetos sobre a qual elas atuam**. Cada operação vira uma classe visitante, com um método por tipo de elemento. Os elementos só precisam de um método `aceitar(visitante)`, que chama de volta o método certo. Adicionar uma operação nova é criar um visitante novo, sem tocar nos elementos.
+
+## Estrutura
+
+```text
++------------------------+                +-----------------------------+
+|  Elemento (iface)      |                |  Visitante (iface)          |
+|------------------------|                |-----------------------------|
+| + aceitar(v)           |                | + visitar_produto(p)        |
++------------------------+                | + visitar_servico(s)        |
+     ^          ^                         | + visitar_assinatura(a)     |
+     |          |                         +-----------------------------+
+ Produto     Servico ...                         ^               ^
+ aceitar(v):                                     |               |
+   v.visitar_produto(self)              CalculoImposto    ExportacaoContabil
+```
+
+O truque central é o **double dispatch**: a operação executada depende de dois tipos ao mesmo tempo, o do elemento e o do visitante. A chamada `item.aceitar(v)` resolve o tipo do elemento (polimorfismo comum) e, lá dentro, `v.visitar_produto(self)` resolve o tipo do visitante.
+
+## Implementação: itens de nota fiscal
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import List
+
+
+# ---------- elementos ----------
+class ItemNota(ABC):
+    @abstractmethod
+    def aceitar(self, visitante: "VisitanteNota"): ...
+
+
+@dataclass
+class Produto(ItemNota):
+    descricao: str
+    preco: float
+    quantidade: int
+    importado: bool = False
+
+    def aceitar(self, visitante):
+        return visitante.visitar_produto(self)
+
+
+@dataclass
+class Servico(ItemNota):
+    descricao: str
+    horas: float
+    valor_hora: float
+
+    def aceitar(self, visitante):
+        return visitante.visitar_servico(self)
+
+
+@dataclass
+class Assinatura(ItemNota):
+    plano: str
+    mensalidade: float
+    meses: int
+
+    def aceitar(self, visitante):
+        return visitante.visitar_assinatura(self)
+
+
+# ---------- visitantes ----------
+class VisitanteNota(ABC):
+    @abstractmethod
+    def visitar_produto(self, p: Produto): ...
+
+    @abstractmethod
+    def visitar_servico(self, s: Servico): ...
+
+    @abstractmethod
+    def visitar_assinatura(self, a: Assinatura): ...
+
+
+class CalculoImposto(VisitanteNota):
+    def visitar_produto(self, p):
+        aliquota = 0.18 + (0.10 if p.importado else 0.0)
+        return round(p.preco * p.quantidade * aliquota, 2)
+
+    def visitar_servico(self, s):
+        return round(s.horas * s.valor_hora * 0.05, 2)
+
+    def visitar_assinatura(self, a):
+        return round(a.mensalidade * a.meses * 0.05, 2)
+
+
+class ExportacaoContabil(VisitanteNota):
+    def visitar_produto(self, p):
+        return f"MERC|{p.descricao}|{p.quantidade}|{p.preco:.2f}"
+
+    def visitar_servico(self, s):
+        return f"SERV|{s.descricao}|{s.horas}h|{s.valor_hora:.2f}"
+
+    def visitar_assinatura(self, a):
+        return f"RECR|{a.plano}|{a.meses}m|{a.mensalidade:.2f}"
+
+
+class ComissaoVendedor(VisitanteNota):
+    """Visitante com estado: acumula enquanto percorre."""
+
+    def __init__(self):
+        self.total = 0.0
+
+    def visitar_produto(self, p):
+        self.total += p.preco * p.quantidade * 0.03
+
+    def visitar_servico(self, s):
+        self.total += s.horas * s.valor_hora * 0.10
+
+    def visitar_assinatura(self, a):
+        self.total += a.mensalidade  # comissão = primeira mensalidade
+
+
+nota: List[ItemNota] = [
+    Produto("Monitor 27", 1500.0, 2),
+    Produto("Teclado mecânico", 400.0, 1, importado=True),
+    Servico("Instalação", 3, 120.0),
+    Assinatura("Suporte Pro", 99.0, 12),
+]
+
+imposto = CalculoImposto()
+print("impostos:", [item.aceitar(imposto) for item in nota])
+print("total de impostos:", round(sum(item.aceitar(imposto) for item in nota), 2))
+
+for linha in (item.aceitar(ExportacaoContabil()) for item in nota):
+    print(linha)
+
+comissao = ComissaoVendedor()
+for item in nota:
+    item.aceitar(comissao)
+print("comissão:", round(comissao.total, 2))
+```
+
+As classes de item não sabem nada de imposto, contabilidade ou comissão. Cada operação mora num único arquivo, com todas as variações por tipo lado a lado, o que facilita revisar uma regra fiscal inteira de uma vez.
+
+### E em Python, sem o aceitar?
+
+Python tem `functools.singledispatchmethod`, que escolhe a implementação pelo tipo do argumento. Isso dispensa o `aceitar` nos elementos, útil quando você não pode alterar as classes (vieram de uma biblioteca). Em entrevista, a versão clássica com `aceitar` comunica melhor a ideia; cite a alternativa como refinamento.
+
+## O trade-off central
+
+O Visitor torna fácil uma direção de mudança e difícil a outra:
+
+| Mudança | Sem Visitor (métodos nos elementos) | Com Visitor |
+| --- | --- | --- |
+| Nova operação | Editar todas as classes de elemento | Criar um visitante novo |
+| Novo tipo de elemento | Criar uma classe nova | Editar **todos** os visitantes |
+
+Por isso, só use Visitor quando a hierarquia de elementos é estável e as operações crescem com frequência. Árvores sintáticas de compiladores são o caso clássico: os tipos de nó mudam pouco, mas surgem novas análises o tempo todo (checagem de tipos, otimização, formatação).
+
+<Callout type="note" title="Encapsulamento">
+Visitantes precisam ler os dados dos elementos. Isso costuma exigir expor atributos que antes eram privados. É um custo real; avalie se ele compensa.
+</Callout>
+
+## Quando usar e quando evitar
+
+**Use quando:**
+
+- A estrutura tem tipos estáveis e você precisa adicionar muitas operações diferentes sobre ela.
+- As operações não pertencem conceitualmente aos elementos (relatórios, exportações, análises).
+- Você percorre estruturas compostas (árvores) e quer manter a lógica de cada análise junta.
+
+**Evite quando:**
+
+- Novos tipos de elemento aparecem com frequência.
+- Só existe uma ou duas operações; polimorfismo simples é mais claro.
+
+## Padrões parecidos
+
+| Padrão | Diferença |
+| --- | --- |
+| Iterator | Só percorre e entrega elementos. O Visitor define **o que fazer com cada tipo** e pode ser combinado com um iterador. |
+| Composite | Fornece a árvore; o Visitor é a forma comum de rodar operações sobre ela. |
+| Strategy | Troca um algoritmo para um único contexto. O Visitor traz uma família de algoritmos, um por tipo de elemento. |
+
+## Na entrevista
+
+- É menos frequente que Strategy ou Observer, mas aparece em sistemas de arquivos (calcular tamanho, buscar por extensão), calculadoras de expressão, carrinhos com tipos de item e geração de relatórios.
+- Explique double dispatch em uma frase e mostre a tabela do trade-off. Isso mostra maturidade: você sabe o que o padrão custa.
+- Follow-ups: "e se eu adicionar um novo tipo de item?" (todos os visitantes mudam; se isso for comum, Visitor é a escolha errada), "como evitar quebrar visitantes antigos?" (um visitante base com implementação padrão para tipos novos).
+
+<QuizSet>
+<Quiz question="Qual mudança fica mais cara quando você usa Visitor?" options={["Adicionar uma nova operação", "Adicionar um novo tipo de elemento", "Renomear um visitante", "Percorrer a estrutura"]} answer={1} explanation="Cada tipo novo exige um método novo em todos os visitantes. Por isso o padrão pede hierarquias estáveis." />
+<Quiz question="O que é double dispatch no contexto do Visitor?" options={["Chamar o mesmo método duas vezes", "Escolher a operação com base no tipo do elemento e do visitante", "Enviar a mesma mensagem para dois observadores", "Executar em duas threads"]} answer={1} explanation="aceitar resolve o tipo do elemento e, dentro dele, visitar_x resolve o tipo do visitante." />
+</QuizSet>

@@ -1,0 +1,141 @@
+---
+title: Projetar o YouTube
+kind: lesson
+---
+
+Projetar uma plataforma de vídeo coloca três problemas difíceis na mesa ao mesmo tempo: receber arquivos enormes de forma confiável, transformá-los em dezenas de versões para todo tipo de aparelho e rede, e entregar petabytes por dia sem quebrar o orçamento. Na entrevista, concentre-se em upload, processamento e entrega; recomendação e comentários ficam como menção.
+
+## Requisitos
+
+### Funcionais
+
+- Criadores enviam vídeos (até alguns GB).
+- Espectadores assistem com qualidade adaptativa à conexão.
+- Página do vídeo com título, descrição, canal e contagem de visualizações.
+- Busca por título (pode ser mencionada, não detalhada).
+
+### Não funcionais
+
+- Reprodução começa rápido: menos de 2 segundos até o primeiro quadro.
+- Sem travamentos frequentes (rebuffering).
+- Uploads tolerantes a falhas de rede: retomar de onde parou.
+- Vídeo publicado é durável; nunca se perde o original.
+- Disponibilidade alta para assistir; o processamento pode levar minutos.
+
+## Estimativas
+
+- 1 bilhão de espectadores por dia, 5 vídeos cada: **5 bilhões de visualizações/dia**, ou cerca de 58 mil inícios de reprodução por segundo.
+- Upload: 500 horas de vídeo por minuto. São 720 mil horas por dia.
+- Armazenamento do original: 1 hora em alta qualidade ≈ 3 GB. Por dia: 720 mil × 3 GB ≈ **2,2 PB** só de originais.
+- Versões transcodificadas (várias resoluções e codecs) somam talvez 1,5× o original: mais 3,2 PB/dia. Total na ordem de **5 PB por dia**, ou quase 2 EB por ano.
+- Banda de saída: se a visualização média é 5 minutos a 3 Mbps, cada uma transfere uns 110 MB. 5 B × 110 MB = 550 PB por dia, cerca de **50 Tbps** em média.
+
+Esses números deixam claro que a entrega precisa vir de uma CDN com nós próximos aos usuários; nenhum data center sozinho serve 50 Tbps. E o custo de armazenamento força uma política de camadas: vídeos pouco vistos em armazenamento frio.
+
+## API
+
+```text
+POST /api/v1/uploads
+  body: { "titulo": "...", "tamanhoBytes": 2147483648 }
+  resposta 201: { "videoId": "v_9x2", "uploadUrl": "...", "tamanhoParte": 8388608 }
+
+PUT  <uploadUrl>?parte=17      (envio de cada parte, retomável)
+POST /api/v1/uploads/v_9x2/concluir
+
+GET /api/v1/videos/v_9x2
+  resposta: { "titulo": "...", "status": "pronto",
+              "manifesto": "https://cdn.../v_9x2/master.m3u8" }
+```
+
+O player baixa o **manifesto** e, a partir dele, segmentos de poucos segundos de vídeo direto da CDN.
+
+## Modelo de dados
+
+```text
+videos        video_id | canal_id | titulo | descricao | status
+              | duracao | criado_em | manifesto_url
+renditions    video_id | resolucao | codec | bitrate | prefixo_storage
+visualizacoes video_id -> contador agregado (serviço separado)
+canais        canal_id | dono_id | nome | inscritos
+```
+
+Metadados vão para um banco relacional particionado por `video_id` (MySQL com sharding é uma escolha clássica). Vídeos vão para object storage. Contadores de visualização vivem num sistema de contagem próprio, porque o padrão de escrita é completamente diferente.
+
+## Arquitetura de alto nível
+
+```text
+ CRIADOR                                          ESPECTADOR
+    |                                                  |
+    | upload em partes                                 | segmentos
++---v----------+                               +-------v------+
+| Object store |                               |     CDN      |
+| (originais)  |                               | (edge caches)|
++---+----------+                               +-------^------+
+    | evento "upload concluído"                        | origem
++---v----------+    +-------------------+      +-------+------+
+| Orquestrador |--->| Fila de tarefas   |      | Object store |
+| de pipeline  |    +---------+---------+      | (renditions) |
++---+----------+              |                +-------^------+
+    |               +---------v---------+              |
+    |               | Workers de        +--------------+
+    |               | transcodificação  |
+    |               | (milhares)        |
+    |               +-------------------+
++---v-------------+      +-----------------+
+| Banco de        |<-----| API de vídeos   |<---- página do vídeo
+| metadados       |      +-----------------+
++-----------------+
+```
+
+## Aprofundamentos
+
+### 1. Upload retomável
+
+Mandar 3 GB numa única requisição HTTP é receita para falha. O cliente divide o arquivo em partes de 8 MB, envia cada uma diretamente ao object storage com URLs pré-assinadas e, ao final, chama "concluir". Se a conexão cair na parte 200, ele pergunta quais partes já chegaram e continua dali. Partes podem ser enviadas em paralelo para aproveitar a banda. Os servidores de aplicação nunca tocam nos bytes do vídeo.
+
+### 2. Pipeline de transcodificação
+
+O original é dividido em pedaços de alguns segundos (cortados em quadros-chave). Cada pedaço é uma tarefa independente: transcodificar para 1080p, 720p, 480p, 360p, em H.264 e num codec mais eficiente. Isso forma um DAG:
+
+```text
+original -> dividir -> [pedaço 1..N] x [resoluções] -> juntar segmentos
+                                                      -> gerar miniaturas
+                                                      -> gerar manifesto
+                                                      -> marcar "pronto"
+```
+
+Paralelizar por pedaço transforma um trabalho de uma hora numa tarefa de minutos com centenas de workers. Cada tarefa é idempotente (escreve num caminho determinístico), então se um worker morrer, outra máquina refaz a tarefa sem efeito colateral. O orquestrador guarda o estado de cada etapa para retomar após falhas. Workers podem rodar em instâncias baratas e interrompíveis, já que as tarefas são curtas e repetíveis.
+
+### 3. Streaming adaptativo e CDN
+
+Cada resolução é cortada em segmentos de 2 a 6 segundos e listada num manifesto (HLS ou DASH). O player mede a banda disponível e, a cada segmento, escolhe a qualidade: se a rede piora, baixa o próximo em 480p em vez de travar. Isso move a inteligência para o cliente e torna os servidores simples distribuidores de arquivos estáticos.
+
+Para a CDN, a distribuição de popularidade é extremamente concentrada: uma pequena fração dos vídeos responde pela maior parte das visualizações. Vídeos populares ficam nos edges; a cauda longa é buscada na origem sob demanda. Para lançamentos esperados, você pode pré-aquecer os edges antes da estreia.
+
+<Callout type="tip" title="Separe os caminhos">
+Diga explicitamente que o caminho de upload e o de reprodução são sistemas diferentes, com requisitos opostos: um prioriza durabilidade e throughput, o outro latência e custo de banda.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Decisão | Trade-off |
+| --- | --- |
+| Quantas versões gerar | Mais versões melhoram a experiência e custam CPU e armazenamento |
+| Transcodificar tudo na hora vs. sob demanda | Vídeos sem audiência podem receber só 2 resoluções até ganharem visualizações |
+| Codec moderno | Arquivos 30–50% menores, mas codificação mais cara e suporte desigual nos aparelhos |
+| CDN própria vs. terceirizada | Escala enorme justifica nós próprios dentro de provedores; no começo, terceirizar é mais sensato |
+| Camadas de armazenamento | Vídeos antigos em armazenamento frio economizam muito, mas a primeira reprodução fica mais lenta |
+
+Contador de visualizações: não faça `UPDATE ... +1` por play. Agregue eventos num pipeline de streaming e atualize o contador a cada poucos segundos; a exibição pode ficar levemente atrasada.
+
+## Perguntas de follow-up comuns
+
+- Como evitar que vídeos duplicados ou com direitos autorais sejam publicados? Impressão digital de áudio e vídeo calculada no pipeline e comparada com um índice.
+- Como gerar a miniatura? Etapa do DAG que extrai quadros candidatos; o criador escolhe ou envia a sua.
+- E transmissões ao vivo? Mesmo formato de segmentos, mas a transcodificação é em tempo real e o manifesto é atualizado continuamente.
+- Como retomar onde o usuário parou? O player envia a posição periodicamente para um serviço chave-valor indexado por usuário e vídeo.
+
+<QuizSet>
+<Quiz question="Por que dividir o vídeo original em pedaços antes de transcodificar?" options={["Para reduzir a qualidade", "Para paralelizar o trabalho entre muitos workers e reduzir o tempo total", "Porque a CDN só aceita arquivos pequenos", "Para criptografar o vídeo"]} answer={1} explanation="Pedaços independentes podem ser processados em paralelo e refeitos individualmente em caso de falha." />
+<Quiz question="A conexão do espectador piora no meio do vídeo. O que o streaming adaptativo faz?" options={["O servidor reduz a qualidade do arquivo", "O player passa a baixar os próximos segmentos numa resolução menor", "A reprodução pausa até a rede melhorar", "A CDN troca de região"]} answer={1} explanation="O player escolhe a qualidade a cada segmento com base na banda medida." />
+</QuizSet>

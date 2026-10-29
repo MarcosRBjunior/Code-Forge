@@ -1,0 +1,146 @@
+---
+title: Facade
+kind: lesson
+---
+
+## O problema
+
+Pense no fluxo de "matricular um aluno num curso pago" numa plataforma de ensino. Para fazer isso direito você precisa: verificar se ainda há vagas na turma, reservar a vaga, cobrar o cartão, liberar o acesso no sistema de conteúdo, emitir nota fiscal e mandar o e-mail de boas-vindas. São cinco ou seis serviços diferentes, cada um com sua API e sua ordem certa de chamada.
+
+Se o controller HTTP, o job de importação em lote e o painel administrativo fizerem essa coreografia cada um do seu jeito, você terá três cópias da mesma sequência, cada uma com um bug diferente. Pior: qualquer mudança no subsistema (trocar o emissor de nota, por exemplo) obriga a mexer em todos esses pontos.
+
+O **Facade** resolve isso oferecendo **uma porta de entrada simples** para um subsistema complexo. O cliente chama `matricular(aluno, curso, cartao)` e a fachada cuida de orquestrar as peças.
+
+## Como funciona
+
+A fachada conhece as classes do subsistema e sabe em que ordem usá-las. Ela não adiciona capacidades novas: apenas expõe um caminho de alto nível. As classes internas continuam existindo e podem ser usadas diretamente por quem precisar de controle fino.
+
+```text
+                 +------------------------------+
+  Controller --> |   MatriculaFacade            |
+  Job lote   --> |  + matricular(aluno, curso)  |
+  Admin      --> +------------------------------+
+                    |      |       |      |      |
+                    v      v       v      v      v
+            +--------+ +-------+ +------+ +-----+ +-------+
+            | Turmas | | Cobr. | |Acesso| | NF  | | Email |
+            +--------+ +-------+ +------+ +-----+ +-------+
+                     subsistema (classes independentes)
+```
+
+Uma boa fachada também concentra o tratamento de falhas da sequência. Se a cobrança falhar depois da vaga reservada, é a fachada que libera a vaga de volta.
+
+## Implementação em Python
+
+```python
+class ServicoTurmas:
+    def __init__(self):
+        self._vagas = {"python-101": 2}
+        self._reservas = []
+
+    def reservar(self, curso, aluno):
+        if self._vagas.get(curso, 0) == 0:
+            raise ValueError(f"turma {curso} lotada")
+        self._vagas[curso] -= 1
+        self._reservas.append((curso, aluno))
+
+    def liberar(self, curso, aluno):
+        self._reservas.remove((curso, aluno))
+        self._vagas[curso] += 1
+
+
+class ServicoCobranca:
+    def cobrar(self, cartao, valor):
+        if cartao.endswith("0000"):
+            raise RuntimeError("cartão recusado")
+        return f"tx-{abs(hash((cartao, valor))) % 10_000}"
+
+
+class ServicoAcesso:
+    def __init__(self):
+        self.liberados = set()
+
+    def liberar(self, aluno, curso):
+        self.liberados.add((aluno, curso))
+
+
+class EmissorNota:
+    def emitir(self, aluno, valor):
+        return f"NF para {aluno}: R$ {valor:.2f}"
+
+
+class Mailer:
+    def enviar(self, para, assunto):
+        print(f"[email] {para}: {assunto}")
+
+
+class MatriculaFacade:
+    PRECOS = {"python-101": 199.90}
+
+    def __init__(self, turmas, cobranca, acesso, notas, mailer):
+        self._turmas = turmas
+        self._cobranca = cobranca
+        self._acesso = acesso
+        self._notas = notas
+        self._mailer = mailer
+
+    def matricular(self, aluno, curso, cartao):
+        preco = self.PRECOS[curso]
+        self._turmas.reservar(curso, aluno)
+        try:
+            tx = self._cobranca.cobrar(cartao, preco)
+        except RuntimeError:
+            self._turmas.liberar(curso, aluno)  # compensação
+            raise
+        self._acesso.liberar(aluno, curso)
+        nota = self._notas.emitir(aluno, preco)
+        self._mailer.enviar(aluno, f"Bem-vindo ao {curso}!")
+        return {"transacao": tx, "nota": nota}
+
+
+if __name__ == "__main__":
+    turmas = ServicoTurmas()
+    facade = MatriculaFacade(turmas, ServicoCobranca(), ServicoAcesso(), EmissorNota(), Mailer())
+    print(facade.matricular("ana@ex.com", "python-101", "4111-1111"))
+    try:
+        facade.matricular("bia@ex.com", "python-101", "4111-0000")
+    except RuntimeError as e:
+        print("falhou:", e, "| vagas restantes:", turmas._vagas["python-101"])
+```
+
+O cliente nunca precisa saber que existe compensação de vaga, nem que a nota é emitida depois do acesso. Se amanhã o e-mail virar mensagem numa fila, só a fachada e o `Mailer` mudam.
+
+## Quando usar
+
+- Um caso de uso que exige coordenar vários serviços numa ordem específica.
+- Expor uma API simples de uma biblioteca grande (por exemplo, "converter vídeo" escondendo codecs, buffers e containers).
+- Definir camadas: cada camada conversa com a seguinte apenas pela fachada dela.
+
+## Quando evitar
+
+- Quando a fachada vira um **objeto Deus**: dezenas de métodos sem relação, que importam metade do sistema. Prefira várias fachadas pequenas, uma por caso de uso.
+- Quando ela só repassa chamadas uma a uma, sem simplificar nada. Aí é indireção sem ganho.
+- Quando os clientes precisam de controle fino sobre cada passo. Nesse caso, deixe-os usar o subsistema direto.
+
+<Callout type="tip" title="Facade não proíbe o acesso direto">
+A fachada é um atalho, não uma muralha. Classes do subsistema continuam públicas; você apenas oferece o caminho fácil para o caso comum.
+</Callout>
+
+## Padrões parecidos
+
+- **Adapter**: também embrulha código existente, mas para casar uma interface com outra que o cliente já espera. A fachada cria uma interface nova e mais simples sobre **vários** objetos.
+- **Mediator**: coordena objetos que conversam entre si; os colegas conhecem o mediador e mandam eventos para ele. Na fachada, o subsistema não sabe que a fachada existe, e a comunicação é de mão única.
+- **Service layer / application service**: na prática, um serviço de aplicação em arquitetura em camadas costuma ser exatamente uma fachada sobre o domínio.
+
+## Na entrevista
+
+Em problemas como "projete um sistema de reserva de hotel" ou "um caixa eletrônico", é natural ter uma classe como `SistemaReservas` ou `CaixaEletronico` que expõe as operações do enunciado e delega para classes especializadas. Diga explicitamente: "essa classe é uma fachada; ela orquestra, mas a lógica fica nas classes especializadas". Follow-ups comuns:
+
+- **Como evitar que ela cresça demais?** Separar por caso de uso e mover regras para as classes de domínio.
+- **E transações distribuídas?** A fachada é um bom lugar para compensações simples (saga local), como liberar a vaga quando a cobrança falha.
+- **Como testar?** Injetar dublês dos serviços no construtor, como no exemplo.
+
+<QuizSet>
+<Quiz question="Qual é a principal intenção do Facade?" options={["Converter uma interface incompatível", "Oferecer uma interface simples para um subsistema complexo", "Adicionar responsabilidades dinamicamente", "Controlar o acesso a um objeto caro"]} answer={1} explanation="O Facade simplifica o uso de um conjunto de classes, expondo operações de alto nível." />
+<Quiz question="Sua classe SistemaLoja tem 60 métodos e importa quase todos os módulos. O que isso indica?" options={["Uma fachada bem-sucedida", "Um objeto Deus; convém dividir em fachadas por caso de uso", "Que falta herança", "Que o sistema deveria usar Singleton"]} answer={1} explanation="Fachadas devem ser focadas. Quando crescem sem coesão, viram um ponto central de acoplamento." />
+</QuizSet>

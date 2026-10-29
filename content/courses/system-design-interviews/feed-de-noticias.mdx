@@ -1,0 +1,139 @@
+---
+title: Projetar um feed de notícias
+kind: lesson
+---
+
+O feed de notícias é a tela inicial de qualquer rede social: uma lista, ordenada, de publicações de quem você segue. A pergunta central da entrevista é uma só, embora apareça disfarçada: **você monta o feed quando alguém publica ou quando alguém abre o app?** Toda a discussão gira em torno dessa escolha e de como lidar com contas muito populares.
+
+## Requisitos
+
+### Funcionais
+
+- Usuário publica posts (texto, com mídia opcional).
+- Usuário segue outros usuários.
+- Usuário vê seu feed: posts de quem segue, paginados, mais recentes primeiro (ou ranqueados).
+- Opcional: curtidas e comentários aparecem no feed com contadores.
+
+### Não funcionais
+
+- Carregar o feed rápido: p99 abaixo de 200 ms.
+- Consistência eventual é aceitável: um post pode levar alguns segundos para aparecer para os seguidores.
+- Leitura de feed é muito mais frequente que publicação.
+- Disponibilidade acima de consistência: melhor mostrar um feed levemente desatualizado do que um erro.
+
+## Estimativas
+
+- 300 milhões de usuários ativos por dia.
+- Cada um abre o feed 10 vezes por dia: 3 bilhões de leituras/dia, ou **35 mil por segundo**, com pico de 100 mil/s.
+- 10% dos usuários publicam 1 post por dia: 30 milhões de posts/dia, ou **350 por segundo**.
+- Seguidores médios: 200. Se cada post for copiado para o feed de cada seguidor, são 30 M × 200 = **6 bilhões de inserções por dia**, cerca de 70 mil/s.
+- Feed pré-computado: guardar só IDs (8 bytes de post + 8 de autor) dos últimos 500 itens por usuário dá 300 M × 500 × 16 B = **2,4 TB**. Grande, mas viável em um cluster Redis particionado, ou mantendo em memória só os usuários ativos.
+
+A proporção de 100 leituras para cada publicação favorece fazer trabalho na escrita para deixar a leitura barata.
+
+## API
+
+```text
+POST /api/v1/posts
+  body: { "texto": "...", "midiaIds": ["m_1"] }
+  resposta 201: { "postId": "p_8812" }
+
+GET /api/v1/feed?cursor=abc&limite=20
+  resposta 200: { "itens": [ { "postId": "...", "autor": {...},
+                  "texto": "...", "curtidas": 31 } ],
+                  "proximoCursor": "def" }
+
+POST /api/v1/usuarios/:id/seguir
+DELETE /api/v1/usuarios/:id/seguir
+```
+
+Use paginação por cursor (o ID ou timestamp do último item visto), não por offset. Com offset, posts novos chegando no topo empurram itens e o usuário vê duplicados ao rolar.
+
+## Modelo de dados
+
+```text
+posts           post_id (PK) | autor_id | texto | midia | criado_em
+seguidores      seguido_id | seguidor_id | criado_em     (PK composta)
+seguindo        seguidor_id | seguido_id                (tabela espelho)
+feed_cache      usuario_id -> lista ordenada de (post_id, autor_id, ts)
+```
+
+`seguidores` e `seguindo` são a mesma relação indexada nos dois sentidos: uma responde "quem me segue" (fan-out) e outra "quem eu sigo" (montagem na leitura). Os posts ficam num banco particionado por `post_id` ou `autor_id`; o feed fica em cache, como lista ordenada (sorted set no Redis).
+
+## Arquitetura de alto nível
+
+```text
+ publicar                                   ler feed
+    |                                           |
++---v-----------+                       +-------v--------+
+| Serviço de    |                       | Serviço de     |
+| posts         |                       | feed           |
++---+-------+---+                       +---+--------+---+
+    |       |                               |        |
+    |   +---v-------+                       |   +----v-------------+
+    |   | Kafka:    |                       |   | Feed cache       |
+    |   | post      |                       |   | (Redis, por      |
+    |   | criado    |                       |   | usuário)         |
+    |   +---+-------+                       |   +----^-------------+
+    |       |                               |        |
+    |   +---v-----------+   escreve IDs     |        |
+    |   | Workers de    +-------------------+--------+
+    |   | fan-out       |                   |
+    |   +---+-----------+                   |
+    |       | consulta seguidores           | hidrata posts
++---v-------v---+                       +---v-----------+
+| Banco de      |                       | Cache de      |
+| posts / grafo |                       | posts         |
++---------------+                       +---------------+
+```
+
+O serviço de feed lê a lista de IDs do cache, busca os posts correspondentes num cache de posts (hidratação) e devolve. Contadores de curtidas vêm de um serviço separado, também cacheado.
+
+## Aprofundamentos
+
+### 1. Push (fan-out na escrita) versus pull (fan-out na leitura)
+
+| | Push | Pull |
+| --- | --- | --- |
+| Quando trabalha | Na publicação: copia o ID para o feed de cada seguidor | Na leitura: busca posts recentes de todos que o usuário segue e mescla |
+| Leitura | Muito rápida, uma consulta | Lenta: N consultas e um merge |
+| Escrita | Cara para quem tem muitos seguidores | Barata |
+| Desperdício | Gera feed para usuários inativos | Nenhum |
+
+Nenhum dos dois funciona sozinho em escala. O push sofre com celebridades: uma conta com 50 milhões de seguidores geraria 50 milhões de escritas por post. O pull sofre com usuários que seguem milhares de contas.
+
+### 2. A abordagem híbrida
+
+A solução padrão é combinar:
+
+- Para autores comuns (abaixo de, digamos, 10 mil seguidores), faça **push**.
+- Para celebridades, **não faça fan-out**. Na leitura, o serviço de feed busca a lista pré-computada e, adicionalmente, os posts recentes das poucas celebridades que o usuário segue, mesclando por timestamp.
+
+Como cada usuário segue poucas celebridades, a parte pull é pequena, e os posts das celebridades ficam quentes no cache de posts porque muita gente os lê. Outra otimização: só fazer push para seguidores ativos nos últimos 30 dias; inativos têm o feed reconstruído via pull quando voltam.
+
+### 3. Ranking
+
+Feed cronológico é só ordenar por tempo. Feed ranqueado adiciona um passo: o serviço busca uns 500 candidatos (vindos do cache pré-computado e das celebridades), calcula uma pontuação com sinais como afinidade com o autor, engajamento recente e tipo de conteúdo, e devolve os 20 melhores. O modelo de ML em si raramente é o foco; o importante é mostrar que **geração de candidatos** e **ordenação** são etapas separadas, e que a ordenação precisa caber no orçamento de latência.
+
+<Callout type="tip" title="Frase que resume a resposta">
+"Push para a maioria, pull para celebridades, mescla na leitura." Diga isso cedo e use o resto do tempo para detalhar os limiares e os casos de borda.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Fila de fan-out**: picos de publicação viram atraso no aparecimento dos posts, não erros. É uma degradação aceitável e deve ser monitorada como "atraso do consumidor".
+- **Post apagado**: com push, o ID já está em milhões de feeds. Em vez de remover de todos, filtre na hidratação: posts apagados simplesmente não são devolvidos.
+- **Deixar de seguir**: o feed pré-computado ainda contém posts antigos daquele autor; filtre na leitura ou remova de forma assíncrona.
+- **Memória do cache**: limitar a 500 itens por usuário e só manter usuários ativos controla o custo. Quem rolar além disso cai num caminho pull mais lento.
+
+## Perguntas de follow-up comuns
+
+- Como mostrar novos posts sem o usuário recarregar? Long polling ou um indicador "há novos posts" via conexão em tempo real.
+- Como definir o limiar de celebridade? Por número de seguidores, ajustado dinamicamente pela carga da fila de fan-out.
+- Como lidar com um usuário que segue 5 mil contas? O caminho push já resolve, pois o custo dele está na escrita dos outros.
+- E se o cache do feed for perdido? Reconstrói-se via pull, com custo maior temporário; por isso o fallback pull precisa existir sempre.
+
+<QuizSet>
+<Quiz question="Por que o fan-out na escrita é problemático para celebridades?" options={["Porque celebridades postam pouco", "Porque um único post gera milhões de escritas nos feeds dos seguidores", "Porque o pull é sempre mais rápido", "Porque o cache não suporta texto"]} answer={1} explanation="O custo do push é proporcional ao número de seguidores; para contas enormes ele explode." />
+<Quiz question="Um post foi apagado depois de distribuído para milhões de feeds. Qual a abordagem mais barata?" options={["Varrer todos os feeds e remover o ID", "Filtrar posts apagados na etapa de hidratação", "Reconstruir todos os feeds", "Bloquear a exclusão de posts"]} answer={1} explanation="A hidratação já consulta o post; se ele estiver marcado como apagado, basta não devolvê-lo." />
+</QuizSet>

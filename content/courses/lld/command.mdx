@@ -1,0 +1,213 @@
+---
+title: Command
+kind: lesson
+---
+
+## O problema
+
+Num editor de texto, o usuário digita, apaga, aplica negrito e espera conseguir desfazer cada passo com Ctrl+Z. As mesmas ações podem vir do teclado, de um botão na barra, de um menu ou de uma macro gravada. Se cada botão chamar diretamente métodos do documento, você não tem onde registrar o que foi feito, nem como desfazer, nem como reproduzir depois.
+
+O Command **transforma uma requisição em um objeto**. Esse objeto sabe executar a ação, carrega os parâmetros necessários e, se for o caso, sabe desfazê-la. Como é um objeto, pode ser guardado num histórico, colocado numa fila, enviado pela rede, agendado ou repetido.
+
+## Estrutura
+
+```text
++-------------+   aciona   +-------------------+       +-------------+
+|  Invocador  |----------->|  Comando (iface)  |       |  Receptor   |
+|-------------|            |-------------------|       |-------------|
+| - historico |            | + executar()      |       | (faz o      |
+| + rodar(c)  |            | + desfazer()      |       |  trabalho)  |
+| + desfazer()|            +-------------------+       +-------------+
++-------------+                     ^                         ^
+                                    |                         |
+                           ComandoConcreto ---- chama -------+
+                           (guarda parâmetros e
+                            estado para desfazer)
+```
+
+- **Receptor**: o objeto que realmente sabe fazer o trabalho (o documento).
+- **Comando concreto**: liga uma ação a um receptor, com os argumentos.
+- **Invocador**: dispara comandos sem saber o que fazem (botão, atalho, fila). Aqui, também guarda o histórico.
+- **Cliente**: monta o comando e entrega ao invocador.
+
+## Implementação: editor com desfazer e refazer
+
+```python
+from abc import ABC, abstractmethod
+from typing import List
+
+
+class Documento:  # receptor
+    def __init__(self):
+        self.texto = ""
+
+    def inserir(self, posicao: int, trecho: str) -> None:
+        self.texto = self.texto[:posicao] + trecho + self.texto[posicao:]
+
+    def remover(self, posicao: int, tamanho: int) -> str:
+        removido = self.texto[posicao:posicao + tamanho]
+        self.texto = self.texto[:posicao] + self.texto[posicao + tamanho:]
+        return removido
+
+
+class Comando(ABC):
+    @abstractmethod
+    def executar(self) -> None: ...
+
+    @abstractmethod
+    def desfazer(self) -> None: ...
+
+
+class Inserir(Comando):
+    def __init__(self, doc: Documento, posicao: int, trecho: str):
+        self.doc, self.posicao, self.trecho = doc, posicao, trecho
+
+    def executar(self) -> None:
+        self.doc.inserir(self.posicao, self.trecho)
+
+    def desfazer(self) -> None:
+        self.doc.remover(self.posicao, len(self.trecho))
+
+
+class Apagar(Comando):
+    def __init__(self, doc: Documento, posicao: int, tamanho: int):
+        self.doc, self.posicao, self.tamanho = doc, posicao, tamanho
+        self._apagado = ""  # estado necessário para desfazer
+
+    def executar(self) -> None:
+        self._apagado = self.doc.remover(self.posicao, self.tamanho)
+
+    def desfazer(self) -> None:
+        self.doc.inserir(self.posicao, self._apagado)
+
+
+class Macro(Comando):
+    """Comando composto: executa vários em ordem e desfaz na ordem inversa."""
+
+    def __init__(self, comandos: List[Comando]):
+        self.comandos = comandos
+
+    def executar(self) -> None:
+        for c in self.comandos:
+            c.executar()
+
+    def desfazer(self) -> None:
+        for c in reversed(self.comandos):
+            c.desfazer()
+
+
+class Editor:  # invocador
+    def __init__(self):
+        self._desfazer: List[Comando] = []
+        self._refazer: List[Comando] = []
+
+    def rodar(self, comando: Comando) -> None:
+        comando.executar()
+        self._desfazer.append(comando)
+        self._refazer.clear()  # nova ação invalida o "refazer"
+
+    def desfazer(self) -> None:
+        if self._desfazer:
+            comando = self._desfazer.pop()
+            comando.desfazer()
+            self._refazer.append(comando)
+
+    def refazer(self) -> None:
+        if self._refazer:
+            comando = self._refazer.pop()
+            comando.executar()
+            self._desfazer.append(comando)
+
+
+doc = Documento()
+editor = Editor()
+
+editor.rodar(Inserir(doc, 0, "Olá mundo"))
+editor.rodar(Inserir(doc, 9, "!"))
+editor.rodar(Apagar(doc, 0, 4))
+print(repr(doc.texto))
+
+editor.desfazer()
+print(repr(doc.texto))
+editor.desfazer()
+print(repr(doc.texto))
+editor.refazer()
+print(repr(doc.texto))
+
+assinatura = Macro([Inserir(doc, len(doc.texto), "\n--"), Inserir(doc, len(doc.texto) + 3, "\nAna")])
+editor.rodar(assinatura)
+print(repr(doc.texto))
+editor.desfazer()
+print(repr(doc.texto))
+```
+
+Note que `Apagar` guarda o texto removido durante `executar`. Sem isso, desfazer seria impossível. Todo comando reversível precisa capturar o estado mínimo para voltar atrás.
+
+### Comandos em fila
+
+O mesmo conceito serve para trabalho assíncrono: um job numa fila é um comando. O produtor cria o objeto; o worker só chama `executar()`.
+
+```python
+from collections import deque
+from dataclasses import dataclass
+
+
+@dataclass
+class EnviarEmail:
+    para: str
+    assunto: str
+
+    def executar(self) -> str:
+        return f"e-mail '{self.assunto}' enviado para {self.para}"
+
+
+@dataclass
+class GerarRelatorio:
+    mes: str
+
+    def executar(self) -> str:
+        return f"relatório de {self.mes} gerado"
+
+
+fila = deque([EnviarEmail("ana@ex.com", "Fatura"), GerarRelatorio("outubro")])
+while fila:
+    job = fila.popleft()
+    print(job.executar())
+```
+
+## Quando usar e quando evitar
+
+**Use quando:**
+
+- Você precisa de desfazer/refazer, histórico ou auditoria de ações.
+- Quer enfileirar, agendar, repetir ou executar remotamente operações.
+- A mesma ação é disparada de vários pontos da interface (botão, atalho, menu).
+
+**Evite quando:**
+
+- A ação é uma chamada simples sem histórico nem fila. Uma função ou um callback resolve.
+- Desfazer exigiria guardar estado enorme a cada passo. Nesse caso, combine com Memento ou snapshots periódicos.
+
+<Callout type="tip" title="Desfazer por inversão ou por snapshot">
+Há duas formas de desfazer: cada comando sabe a operação inversa (como acima) ou você guarda uma foto do estado antes de executar (Memento). Inversão economiza memória; snapshot é mais simples quando a operação inversa é difícil de calcular.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Diferença |
+| --- | --- |
+| Strategy | Strategy define **como** fazer algo e é trocada no contexto. Command representa **uma ação específica** a executar, com seus argumentos. |
+| Memento | Guarda o estado de um objeto. É frequentemente usado junto com Command para implementar desfazer. |
+| Chain of Responsibility | Um comando pode ser passado por uma cadeia de handlers até alguém executá-lo. |
+| Composite | A `Macro` é um Composite de comandos. |
+
+## Na entrevista
+
+- Em editores de texto, planilhas, jogos (desfazer jogada no xadrez), sistemas bancários (operações auditáveis) ou controle remoto de casa inteligente, Command é a resposta natural para "como implementar desfazer?".
+- Explique as duas pilhas e por que uma ação nova limpa o "refazer".
+- Follow-ups: "como desfazer uma operação que chamou um serviço externo?" (comando de compensação, como estornar um pagamento), "como persistir o histórico?" (serializar comandos, que é a base do event sourcing).
+
+<QuizSet>
+<Quiz question="Por que o comando Apagar guarda o texto removido?" options={["Para exibir na tela", "Porque precisa dele para desfazer a operação", "Para economizar memória", "Porque o invocador exige"]} answer={1} explanation="Comandos reversíveis capturam o estado mínimo necessário para voltar atrás." />
+<Quiz question="O usuário desfaz duas ações e então digita algo novo. O que acontece com a pilha de refazer?" options={["Mantém as duas ações", "É limpa", "Recebe a nova ação", "É mesclada com a pilha de desfazer"]} answer={1} explanation="Uma ação nova cria um novo ramo de história; refazer os comandos antigos deixaria o documento inconsistente." />
+</QuizSet>

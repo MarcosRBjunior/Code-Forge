@@ -1,0 +1,184 @@
+---
+title: Template Method
+kind: lesson
+---
+
+## O problema
+
+Uma empresa importa extratos bancários de vários bancos. Todos seguem o mesmo roteiro: ler o arquivo, converter as linhas em transações, validar, remover duplicadas e salvar. O que muda é só o formato: um banco manda CSV com ponto e vírgula, outro manda um layout de largura fixa, outro manda JSON. Se cada importador for escrito do zero, o roteiro é copiado três vezes, e uma correção na deduplicação precisa ser feita em três lugares (e alguém sempre esquece um).
+
+O Template Method **fixa o esqueleto de um algoritmo numa classe base** e deixa subclasses preencherem só os passos que variam. A ordem e as regras comuns ficam num único lugar; as partes específicas ficam nas subclasses.
+
+## Estrutura
+
+```text
++-----------------------------------+
+|  ClasseBase (abstrata)            |
+|-----------------------------------|
+| + executar()   <- método template |   chama, em ordem:
+|     passo_fixo_1()                |     - passos fixos (implementados aqui)
+|     passo_variavel()   (abstrato) |     - passos abstratos (obrigatórios)
+|     gancho()           (opcional) |     - ganchos (hooks) com padrão vazio
+|     passo_fixo_2()                |
++-----------------------------------+
+            ^                ^
+            |                |
+     SubclasseA          SubclasseB
+  (implementa passos  (implementa passos
+   variáveis)          variáveis e algum gancho)
+```
+
+Três tipos de passo:
+
+- **Fixos**: a base implementa e as subclasses não devem mudar.
+- **Abstratos**: obrigatórios, cada subclasse precisa fornecer.
+- **Ganchos (hooks)**: opcionais, com implementação padrão vazia ou trivial, que a subclasse pode sobrescrever para se encaixar no fluxo.
+
+## Implementação: importador de extratos
+
+```python
+import json
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass(frozen=True)
+class Transacao:
+    data: str
+    descricao: str
+    valor: float
+
+
+class ImportadorExtrato(ABC):
+    def importar(self, conteudo: str) -> List[Transacao]:
+        """Método template: a ordem dos passos é definida aqui e só aqui."""
+        conteudo = self.pre_processar(conteudo)
+        brutas = self.extrair_registros(conteudo)
+        transacoes = [self.converter(r) for r in brutas]
+        validas = [t for t in transacoes if self._valida(t)]
+        unicas = self._deduplicar(validas)
+        self.apos_importar(unicas)
+        return unicas
+
+    # passos abstratos
+    @abstractmethod
+    def extrair_registros(self, conteudo: str) -> list: ...
+
+    @abstractmethod
+    def converter(self, registro) -> Transacao: ...
+
+    # ganchos com comportamento padrão
+    def pre_processar(self, conteudo: str) -> str:
+        return conteudo.strip()
+
+    def apos_importar(self, transacoes: List[Transacao]) -> None:
+        pass
+
+    # passos fixos
+    def _valida(self, t: Transacao) -> bool:
+        return t.valor != 0 and len(t.data) == 10
+
+    def _deduplicar(self, transacoes: List[Transacao]) -> List[Transacao]:
+        vistas, resultado = set(), []
+        for t in transacoes:
+            if t not in vistas:
+                vistas.add(t)
+                resultado.append(t)
+        return resultado
+
+
+class ImportadorCSV(ImportadorExtrato):
+    def extrair_registros(self, conteudo):
+        linhas = conteudo.splitlines()[1:]  # pula cabeçalho
+        return [linha.split(";") for linha in linhas]
+
+    def converter(self, registro):
+        data, descricao, valor = registro
+        return Transacao(data, descricao, float(valor.replace(",", ".")))
+
+
+class ImportadorLarguraFixa(ImportadorExtrato):
+    # colunas: data 0-9, descrição 10-29, valor 30-39
+    def extrair_registros(self, conteudo):
+        return conteudo.splitlines()
+
+    def converter(self, linha):
+        return Transacao(linha[0:10], linha[10:30].strip(), float(linha[30:40]))
+
+
+class ImportadorJSON(ImportadorExtrato):
+    def __init__(self):
+        self.relatorio = ""
+
+    def pre_processar(self, conteudo):
+        # este banco envia um BOM no início do arquivo
+        return conteudo.lstrip("﻿").strip()
+
+    def extrair_registros(self, conteudo):
+        return json.loads(conteudo)["lancamentos"]
+
+    def converter(self, item):
+        return Transacao(item["dt"], item["hist"], item["vlr"])
+
+    def apos_importar(self, transacoes):
+        self.relatorio = f"{len(transacoes)} lançamentos importados via JSON"
+
+
+csv_banco = """data;descricao;valor
+2026-10-01;Padaria;-12,50
+2026-10-01;Padaria;-12,50
+2026-10-02;Salário;5000,00
+2026-10-03;Estorno zerado;0,00"""
+
+fixo_banco = (
+    "2026-10-05Mercado               -230.10\n"
+    "2026-10-06Pix recebido          150.00"
+)
+
+json_banco = '﻿{"lancamentos": [{"dt": "2026-10-07", "hist": "Uber", "vlr": -23.4}]}'
+
+print(ImportadorCSV().importar(csv_banco))
+print(ImportadorLarguraFixa().importar(fixo_banco))
+imp = ImportadorJSON()
+print(imp.importar(json_banco))
+print(imp.relatorio)
+```
+
+A regra "transações com valor zero são descartadas" e a deduplicação valem para todos os bancos automaticamente. Um banco novo exige só dois métodos.
+
+## Quando usar e quando evitar
+
+**Use quando:**
+
+- Vários algoritmos compartilham a mesma sequência de passos e diferem em detalhes.
+- Você precisa garantir que certos passos sempre aconteçam, na ordem certa (validação, auditoria, liberação de recursos).
+- Frameworks: o framework controla o fluxo e chama seus métodos nos pontos certos. É o "princípio de Hollywood": não nos chame, nós chamamos você.
+
+**Evite quando:**
+
+- As variações são muitas e combináveis (formato x destino x validação). Herança vira explosão de subclasses; prefira compor estratégias.
+- A subclasse precisa mudar a ordem dos passos. Isso indica que o esqueleto não é realmente comum.
+
+<Callout type="warning" title="Herança é acoplamento forte">
+Subclasses de Template Method dependem dos detalhes da base. Uma mudança na ordem dos passos da base pode quebrar subclasses que assumiam outra ordem. Mantenha o método template estável e documente o contrato de cada passo.
+</Callout>
+
+## Padrões parecidos
+
+| Padrão | Diferença |
+| --- | --- |
+| Strategy | Varia o algoritmo inteiro por **composição**, em tempo de execução. Template Method varia partes do algoritmo por **herança**, em tempo de definição da classe. Dá para converter um no outro: cada passo abstrato pode virar uma estratégia injetada. |
+| Factory Method | Frequentemente é um dos passos de um Template Method: o esqueleto chama um método abstrato que cria um objeto. |
+| Builder | Também tem etapas, mas o objetivo é construir um objeto, e quem decide a ordem é o cliente (ou um diretor). |
+
+## Na entrevista
+
+- Cite em geradores de relatórios (PDF, CSV, HTML), processadores de pagamento (validar, autorizar, capturar, notificar), pipelines de ETL e jogos de tabuleiro (inicializar, loop de turnos, verificar fim).
+- Mostre que sabe a diferença entre passo abstrato e gancho; é um detalhe que impressiona.
+- Follow-ups: "e se surgirem muitas combinações?" (migrar para Strategy), "como impedir que a subclasse sobrescreva o método template?" (em Java, `final`; em Python, convenção, documentação e testes).
+
+<QuizSet>
+<Quiz question="O que caracteriza um gancho (hook) no Template Method?" options={["Um passo que a subclasse é obrigada a implementar", "Um passo opcional com implementação padrão que a subclasse pode sobrescrever", "O método que define a ordem dos passos", "Um callback registrado por um observador"]} answer={1} explanation="Ganchos têm comportamento padrão (muitas vezes vazio). Passos abstratos são os obrigatórios." />
+<Quiz question="Qual mecanismo o Template Method usa para variar o comportamento?" options={["Composição de objetos em tempo de execução", "Herança e sobrescrita de métodos", "Clonagem de protótipos", "Troca de estados"]} answer={1} explanation="As variações ficam em subclasses que sobrescrevem passos. Strategy faria o mesmo via composição." />
+</QuizSet>
