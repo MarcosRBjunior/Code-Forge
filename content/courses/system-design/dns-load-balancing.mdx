@@ -1,0 +1,75 @@
+---
+title: Balanceamento via DNS
+kind: lesson
+---
+
+Antes mesmo de chegar ao load balancer, o cliente precisa descobrir um endereço IP. Se o DNS devolver endereços diferentes para clientes diferentes, ele já está distribuindo carga. Essa é a ideia do **balanceamento via DNS**: usar a resolução de nomes como primeira camada de distribuição, geralmente entre regiões ou datacenters.
+
+## Round robin de DNS
+
+A forma mais simples: o registro `api.loja.com` tem vários registros A, e o servidor autoritativo devolve a lista em ordem rotativa.
+
+```text
+consulta 1 -> 198.51.100.10, 198.51.100.20, 198.51.100.30
+consulta 2 -> 198.51.100.20, 198.51.100.30, 198.51.100.10
+consulta 3 -> 198.51.100.30, 198.51.100.10, 198.51.100.20
+```
+
+A maioria dos clientes tenta o primeiro endereço, então a carga se espalha. É barato e não exige nenhum componente no caminho dos dados.
+
+## Limitações do round robin puro
+
+- **Cache:** resolvedores guardam a resposta pelo TTL, e um único resolvedor de um provedor grande pode atender milhões de usuários. A distribuição real fica grosseira e desigual.
+- **Sem health check:** se um IP morre, o DNS básico continua entregando-o. Clientes que o receberem falham até expirar o cache (alguns tentam o próximo IP da lista, outros não).
+- **Sem noção de carga:** o DNS não sabe quantas conexões cada destino tem.
+- **Propagação lenta:** remover um endereço leva pelo menos um TTL para valer, e alguns clientes ignoram o TTL.
+
+## DNS inteligente (gerenciado)
+
+Provedores modernos de DNS (Route 53, Cloud DNS, NS1, Cloudflare e outros) vão além do rodízio:
+
+| Política | Como decide | Uso típico |
+| --- | --- | --- |
+| Ponderada | distribui por pesos | migração gradual entre ambientes, canary entre regiões |
+| Por latência | devolve a região com menor latência medida para a rede do cliente | aplicações globais |
+| Geográfica | decide pelo país ou continente de origem | requisitos legais de residência de dados, conteúdo regional |
+| Failover | devolve o primário; se o health check falhar, o secundário | recuperação de desastre ativo-passivo |
+| Multivalor com health check | devolve vários IPs, só os saudáveis | round robin com remoção automática |
+
+O provedor executa health checks de vários pontos do mundo e só devolve endereços saudáveis.
+
+### A localização do cliente
+
+O servidor autoritativo não vê o IP do usuário, e sim o do **resolvedor recursivo**. Se um usuário em São Paulo usa um resolvedor público cujo nó mais próximo está em outro país, a decisão geográfica pode errar. A extensão **EDNS Client Subnet** permite que o resolvedor repasse uma parte do endereço do cliente (um prefixo, não o IP completo) para melhorar essa decisão; nem todos os resolvedores a usam.
+
+## Arquitetura típica
+
+O DNS raramente balanceia direto para servidores de aplicação. Ele escolhe a região, e cada região tem seus próprios balanceadores:
+
+```text
+usuário -> DNS (política por latência + health check)
+             |-> região sa-east -> load balancer L7 -> instâncias
+             |-> região us-east -> load balancer L7 -> instâncias
+             |-> região eu-west -> load balancer L7 -> instâncias
+```
+
+Assim, o DNS cuida das decisões grossas e lentas (qual região), e o balanceador regional cuida das finas e rápidas (qual instância, em milissegundos).
+
+## Trade-offs
+
+**Vantagens:** fora do caminho dos dados (sem gargalo de banda), barato, escala globalmente, permite failover entre regiões.
+
+**Desvantagens:** granularidade limitada pelo cache, failover lento (TTL mais o tempo de detecção), dependência crítica do provedor de DNS e comportamento imprevisível de clientes que ignoram TTL.
+
+<Callout type="warning" title="TTL baixo não é mágica">
+TTLs de 30 a 60 segundos ajudam no failover, mas aumentam o volume de consultas e não garantem nada: navegadores, bibliotecas e pools de conexão podem manter o IP antigo por mais tempo. Conexões persistentes já abertas também continuam no destino antigo até serem fechadas.
+</Callout>
+
+## Na entrevista
+
+Use DNS para o primeiro nível em sistemas multi-região: "o DNS com roteamento por latência leva o usuário à região mais próxima; dentro dela, um balanceador L7 distribui entre instâncias". Follow-ups comuns: "quanto tempo leva o failover de uma região?", "por que não balancear só com DNS?", "como o DNS sabe onde o usuário está?".
+
+<QuizSet>
+<Quiz question="Por que balanceamento só por DNS round robin costuma distribuir carga de forma desigual?" options={["Porque o DNS usa TCP", "Porque resolvedores cacheiam a resposta e um único resolvedor pode servir muitos usuários com o mesmo IP", "Porque registros A só aceitam um IP", "Porque o DNS só funciona com IPv6"]} answer={1} explanation="O cache em resolvedores faz grandes grupos de usuários receberem a mesma resposta durante todo o TTL." />
+<Quiz question="Qual política de DNS você usaria para uma recuperação de desastre ativo-passivo entre duas regiões?" options={["Geográfica", "Failover com health check", "Round robin simples", "Ponderada com pesos iguais"]} answer={1} explanation="A política de failover devolve o primário enquanto ele está saudável e troca para o secundário quando o health check falha." />
+</QuizSet>

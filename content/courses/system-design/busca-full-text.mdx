@@ -1,0 +1,85 @@
+---
+title: Busca full-text
+kind: lesson
+---
+
+Tente encontrar "tênis corrida leve" numa tabela de 50 milhões de produtos com `WHERE descricao LIKE '%corrida%'`. O banco precisa ler cada linha (um índice B-tree não ajuda com curinga no início), não entende que "tenis" e "tênis" são a mesma coisa, não sabe que "correr" tem relação com "corrida" e não tem ideia de qual resultado é mais relevante. **Motores de busca full-text** resolvem tudo isso com uma estrutura central: o **índice invertido**.
+
+## O índice invertido
+
+Em vez de mapear documento para palavras, ele mapeia **cada termo para a lista de documentos que o contêm** (a *posting list*), muitas vezes com posições e frequências.
+
+```text
+Documentos:
+  1: "Tênis de corrida leve"
+  2: "Tênis casual de couro"
+  3: "Meia leve para corrida"
+
+Índice invertido (após análise):
+  tenis   → [1, 2]
+  corrida → [1, 3]
+  leve    → [1, 3]
+  casual  → [2]
+  couro   → [2]
+  meia    → [3]
+```
+
+Buscar "corrida leve" é intersectar `[1, 3]` com `[1, 3]`: resultado imediato, sem varrer documento algum. As posting lists ficam ordenadas e comprimidas, e a interseção é rápida mesmo com milhões de entradas.
+
+## Análise de texto
+
+Antes de indexar (e também na consulta), o texto passa por um **analisador**:
+
+1. **Tokenização:** quebrar em palavras.
+2. **Normalização:** minúsculas, remoção de acentos (`Tênis` vira `tenis`).
+3. **Stop words:** descartar palavras muito comuns (`de`, `para`), opcionalmente.
+4. **Stemming ou lematização:** reduzir a um radical (`corrida`, `correr`, `corredor` aproximam-se de `corr`).
+5. **Sinônimos e n-gramas:** `notebook` igual a `laptop`; n-gramas permitem busca por prefixo e autocomplete.
+
+O mesmo analisador precisa ser usado na indexação e na consulta; caso contrário, os termos não batem.
+
+## Relevância
+
+Encontrar documentos é metade do trabalho; ordená-los é a outra. O modelo padrão hoje é o **BM25**, que pontua um documento considerando:
+
+- **Frequência do termo** no documento, com saturação (a décima ocorrência vale menos que a primeira).
+- **Raridade do termo** na coleção (IDF): "couro" diz mais que "tênis".
+- **Tamanho do documento:** um termo num título curto pesa mais que num texto longo.
+
+Por cima disso, você combina sinais de negócio: popularidade, avaliações, estoque, recência, personalização.
+
+## Recursos típicos
+
+- **Tolerância a erros** (*fuzzy*), por distância de edição: `tenos` encontra `tenis`.
+- **Facetas:** contagens por marca, faixa de preço, cor, calculadas junto com a busca.
+- **Destaque** (*highlighting*) dos trechos que bateram.
+- **Autocomplete** com n-gramas de borda ou estruturas de prefixo.
+- **Busca híbrida:** combinar BM25 com similaridade vetorial (próximo assunto do módulo).
+
+## Arquitetura
+
+Elasticsearch e OpenSearch (ambos sobre a biblioteca Lucene) dividem um índice em **shards**; cada shard é um índice Lucene independente, com réplicas. Uma consulta vai a todos os shards, cada um devolve seus melhores resultados e um nó coordenador mescla.
+
+Internamente, o Lucene grava **segmentos imutáveis**, parecido com uma LSM tree: documentos novos ficam visíveis após um *refresh* (por padrão, cerca de 1 segundo), por isso a busca é **quase em tempo real**. Atualizar um documento é apagá-lo logicamente e indexar de novo; segmentos são mesclados em segundo plano.
+
+```text
+Banco principal ──CDC / eventos──▶ Indexador ──▶ Elasticsearch ◀── consultas de busca
+   (verdade)                                       (derivado)
+```
+
+<Callout type="warning" title="Não use o motor de busca como fonte da verdade">
+Motores de busca não oferecem transações e podem perder escritas recentes em falhas. Mantenha os dados no banco principal e trate o índice como derivado, que pode ser reconstruído a qualquer momento por reindexação.
+</Callout>
+
+## Alternativas mais leves
+
+Para volumes modestos, a busca textual do PostgreSQL (`tsvector`, índices GIN) já resolve bem e evita sincronizar dois sistemas. Meilisearch e Typesense são opções simples para busca de catálogo com foco em experiência do usuário.
+
+## Na entrevista
+
+Em sistemas com caixa de busca (e-commerce, posts, documentos), diga: "a busca vai para um Elasticsearch alimentado via CDC a partir do banco principal, com analisador em português e BM25 mais sinais de popularidade". Follow-ups: "como lidar com o atraso entre escrita e busca?", "como reindexar sem indisponibilidade?" (criar índice novo e trocar um alias).
+
+<QuizSet>
+<Quiz question="Por que LIKE com curinga no início é lento para busca textual num banco relacional?" options={["Porque o SQL não suporta curingas", "Porque um índice B-tree ordenado não ajuda a localizar um termo no meio do texto, forçando varredura completa", "Porque o resultado não pode ser ordenado", "Porque o banco bloqueia a tabela"]} answer={1} explanation="B-trees ajudam com prefixos. Termos no meio do texto exigem ler todas as linhas; um índice invertido resolve isso." />
+<Quiz question="Usuários buscam 'tenis' e não encontram produtos cadastrados como 'Tênis'. O que provavelmente falta?" options={["Mais réplicas", "Um analisador com normalização de acentos e minúsculas, aplicado na indexação e na consulta", "Aumentar o refresh interval", "Trocar BM25 por TF puro"]} answer={1} explanation="A análise transforma o texto em termos normalizados. Se 'Tênis' e 'tenis' viram termos diferentes, não há correspondência." />
+</QuizSet>

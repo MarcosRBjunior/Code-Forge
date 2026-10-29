@@ -1,0 +1,77 @@
+---
+title: Bancos chave-valor
+kind: lesson
+---
+
+O modelo de dados mais simples possível: uma chave única aponta para um valor. O banco não sabe nem quer saber o que há dentro do valor. Em troca dessa ignorância, ele entrega o que poucos outros conseguem: **latência previsível de microssegundos a poucos milissegundos** e **escala horizontal quase trivial**, porque cada chave pode morar em qualquer nó sem depender de nenhuma outra.
+
+## A interface
+
+```text
+PUT(chave, valor)
+GET(chave)  -> valor
+DELETE(chave)
+```
+
+Só isso. Alguns bancos adicionam operações extras: incremento atômico, compare-and-set, expiração por TTL, leitura por prefixo ou intervalo de chaves ordenadas.
+
+## Duas famílias bem diferentes
+
+| Tipo | Exemplos | Onde ficam os dados | Uso típico |
+| --- | --- | --- | --- |
+| **Em memória** | Redis, Valkey, Memcached | RAM (persistência opcional) | Cache, sessões, contadores, rate limiting, filas leves |
+| **Persistente distribuído** | DynamoDB, Riak, FoundationDB, etcd | Disco, replicado | Fonte da verdade com acesso por chave em grande escala |
+| **Embarcado** | RocksDB, LevelDB, LMDB | Disco local, dentro do processo | Motor de armazenamento de outros bancos |
+
+O Redis merece nota: os valores podem ser **estruturas** (listas, hashes, sets, sorted sets, streams, HyperLogLog), e as operações sobre elas são atômicas. Um ranking de jogo vira um sorted set:
+
+```bash
+ZADD ranking 3200 "ana" 2900 "bruno" 3500 "carla"
+ZINCRBY ranking 150 "bruno"
+ZREVRANGE ranking 0 2 WITHSCORES     # top 3
+```
+
+## Como escala
+
+Como não há relações entre chaves, o banco particiona por **hash da chave** (com hashing consistente ou faixas de slots) e replica cada partição em alguns nós. O DynamoDB, por exemplo, usa uma **chave de partição** obrigatória e, opcionalmente, uma **chave de ordenação**, o que permite consultar "todos os itens da partição X entre as chaves A e B":
+
+```text
+PK = usuario#42      SK = pedido#2026-10-01#1001
+PK = usuario#42      SK = pedido#2026-10-15#1044
+PK = usuario#42      SK = perfil
+```
+
+Esse padrão de **chaves compostas** permite guardar várias entidades relacionadas na mesma partição e lê-las juntas (o chamado *single-table design*).
+
+## Modelando com chave-valor
+
+Como você só consulta por chave, o desenho das chaves **é** o desenho do sistema:
+
+- **Inclua o tipo e o ID na chave:** `sessao:abc123`, `carrinho:usuario:42`.
+- **Pense nas consultas antes:** se você precisa de "pedidos do usuário por data", a chave (ou chave de ordenação) precisa conter usuário e data.
+- **Índices secundários** são caros ou inexistentes. Quando precisa de outro caminho de acesso, mantenha uma segunda chave apontando para a primeira, ou use o índice secundário global do banco, sabendo que ele é atualizado de forma assíncrona.
+
+## Consistência
+
+Bancos chave-valor distribuídos costumam oferecer escolha por requisição: leitura **eventualmente consistente** (mais barata, pode estar atrasada) ou **fortemente consistente** (lê do líder ou de um quorum). Sistemas no estilo Dynamo usam quorum configurável: com N réplicas, escrever em W e ler de R com `R + W > N` garante que a leitura encontre ao menos uma réplica com a escrita mais recente.
+
+Já o **etcd** e o ZooKeeper usam consenso (Raft/ZAB) e oferecem consistência linearizável, mas com volume pequeno: servem para configuração, descoberta de serviços e locks, não para dados de usuário.
+
+<Callout type="warning" title="Chaves quentes e valores grandes">
+Distribuir por hash só funciona se a carga estiver bem espalhada. Uma chave muito acessada concentra tudo num nó, e um valor de dezenas de MB bloqueia o servidor ao ser lido. Mantenha valores pequenos e espalhe chaves populares.
+</Callout>
+
+## Quando não usar
+
+- Você precisa filtrar ou agregar por campos dentro do valor.
+- As consultas mudam com frequência e são imprevisíveis.
+- Há transações complexas entre muitas entidades.
+
+## Na entrevista
+
+Chave-valor é a resposta natural para sessões, carrinhos, contadores, rate limiting, feature flags, encurtadores de URL e qualquer acesso "busca por ID" em escala. Mostre o formato da chave e a estratégia de partição. Follow-ups: "como listar os pedidos de um usuário?" (chave de ordenação ou chave secundária), "o que acontece se o Redis cair?" (réplica, persistência AOF, ou aceitar perda se for só cache).
+
+<QuizSet>
+<Quiz question="Num encurtador de URLs, a operação principal é: dado o código curto, devolver a URL longa, bilhões de vezes por dia. Qual modelo encaixa melhor?" options={["Banco de grafos", "Banco chave-valor com o código curto como chave", "Banco de séries temporais", "Motor de busca full-text"]} answer={1} explanation="O acesso é sempre por uma chave conhecida, sem relações nem filtros. Chave-valor dá latência baixa e particionamento simples." />
+<Quiz question="Num sistema estilo Dynamo com N = 3 réplicas, qual configuração garante que uma leitura veja a escrita mais recente?" options={["W = 1, R = 1", "W = 2, R = 2", "W = 1, R = 2", "W = 3, R = 0"]} answer={1} explanation="Com R + W maior que N, os conjuntos de leitura e escrita sempre se sobrepõem em pelo menos uma réplica. 2 + 2 = 4, maior que 3." />
+</QuizSet>

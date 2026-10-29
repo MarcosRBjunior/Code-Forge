@@ -1,0 +1,132 @@
+---
+title: Projetar um armazenamento chave-valor
+kind: lesson
+---
+
+Pedir para você projetar um armazenamento chave-valor distribuído é pedir que você junte, numa resposta só, quase todos os conceitos de sistemas distribuídos: particionamento, replicação, quóruns, detecção de falhas, resolução de conflitos e o motor de armazenamento em disco. A interface é minúscula (`get` e `put`); a profundidade está toda por baixo.
+
+## Requisitos
+
+### Funcionais
+
+- `put(chave, valor)`, `get(chave)` e `delete(chave)`.
+- Valores de até 1 MB; chaves de até 256 bytes.
+- Opcional: TTL por chave e operações condicionais (compare-and-set).
+
+### Não funcionais
+
+- Escala horizontal: adicionar nós aumenta capacidade e throughput.
+- Alta disponibilidade: continuar aceitando escritas mesmo com nós ou um data center fora.
+- Latência baixa: p99 abaixo de 10 ms para leitura e escrita.
+- Durabilidade: dado confirmado não se perde com a queda de uma máquina.
+- **Consistência ajustável**: o cliente escolhe entre leitura rápida e leitura sempre atualizada.
+
+Esclareça logo a posição no teorema CAP. A escolha mais comum nesta questão é priorizar disponibilidade (AP) com consistência eventual e quóruns configuráveis.
+
+## Estimativas
+
+- 100 mil leituras e 50 mil escritas por segundo no pico.
+- 10 bilhões de chaves com valor médio de 1 KB: **10 TB** de dados brutos.
+- Com fator de replicação 3: **30 TB**.
+- Se cada nó guarda 2 TB em SSD com folga para compactação, são cerca de **15 nós**; arredonde para 20, considerando crescimento e redistribuição.
+- Por nó: 150 mil operações / 20 nós × 3 réplicas tocadas ≈ 22 mil operações por segundo, bem dentro do que um SSD e um processo bem escrito suportam.
+
+## API
+
+```text
+GET    /kv/:chave?consistencia=quorum
+  resposta 200: { "valor": "...", "versao": "contexto-opaco" }
+PUT    /kv/:chave
+  body: { "valor": "...", "contexto": "contexto-opaco", "ttl": 3600 }
+DELETE /kv/:chave
+```
+
+O `contexto` devolvido na leitura carrega a informação de versão. Ao escrever, o cliente o reenvia, dizendo "esta escrita substitui aquela versão que eu li", o que permite detectar conflitos.
+
+## Modelo de dados
+
+Do ponto de vista do usuário, é só chave e valor. Internamente, cada registro armazena:
+
+```text
+chave | valor | versao (relógio vetorial ou timestamp) | tombstone? | expira_em
+```
+
+Exclusões viram **tombstones** (marcas de apagado) em vez de remoção imediata; caso contrário, uma réplica atrasada poderia "ressuscitar" o valor antigo durante a sincronização.
+
+## Arquitetura de alto nível
+
+```text
+            cliente
+               |
+       +-------v--------+
+       | Coordenador    |  (qualquer nó pode coordenar)
+       | da requisição  |
+       +---+----+----+--+
+           |    |    |        N = 3 réplicas
+     +-----v+ +-v----+ +v-----+
+     | Nó B | | Nó C | | Nó D |   anel de hashing consistente
+     +------+ +------+ +------+
+         \      |       /
+      gossip (membros, saúde), anti-entropia (Merkle trees)
+
+ Dentro de cada nó:
+   escrita -> commit log (disco, sequencial) -> memtable (memória)
+           memtable cheia -> SSTable imutável em disco
+           compactação em segundo plano mescla SSTables
+   leitura -> memtable -> filtros de Bloom -> SSTables
+```
+
+## Aprofundamentos
+
+### 1. Particionamento e replicação
+
+As chaves são distribuídas com **hashing consistente**: o espaço de hash forma um anel, cada nó ocupa várias posições (nós virtuais) e uma chave pertence ao primeiro nó encontrado no sentido horário. As N-1 posições seguintes, em nós físicos distintos, guardam as réplicas.
+
+Nós virtuais resolvem dois problemas: distribuem a carga de forma mais uniforme e, quando um nó entra ou sai, a redistribuição é dividida entre muitos nós em vez de sobrecarregar um vizinho. Para tolerar a perda de um data center, a escolha das réplicas considera a topologia (uma por zona de disponibilidade).
+
+### 2. Quóruns e consistência
+
+Com N réplicas, cada escrita espera confirmação de W nós e cada leitura consulta R nós.
+
+| Configuração | Efeito |
+| --- | --- |
+| R + W maior que N (ex.: N=3, W=2, R=2) | Leitura e escrita sempre se cruzam em pelo menos uma réplica: leitura vê a escrita mais recente confirmada |
+| W=1, R=1 | Máxima velocidade e disponibilidade, consistência eventual |
+| W=N | Escrita só conclui com todas as réplicas: forte, mas indisponível se um nó cair |
+
+O cliente escolhe por requisição. Um carrinho de compras pode usar W=1 para nunca recusar uma adição; um saldo usaria quórum.
+
+Quando uma réplica está fora, o coordenador grava temporariamente em outro nó com uma "dica" (**hinted handoff**) e entrega ao dono quando ele volta. Divergências mais antigas são corrigidas por **read repair** (a leitura percebe a réplica atrasada e a atualiza) e por **anti-entropia** em segundo plano, que compara árvores de Merkle entre réplicas para achar só os intervalos que diferem, sem transferir tudo.
+
+### 3. Conflitos e versionamento
+
+Se duas escritas concorrentes chegam a réplicas diferentes durante uma partição de rede, qual vence?
+
+- **Last write wins (LWW)**: o maior timestamp vence. Simples, mas depende de relógios e descarta silenciosamente uma das escritas.
+- **Relógios vetoriais**: cada versão carrega um contador por nó. Se uma versão domina a outra, ela vence; se são concorrentes, o sistema guarda as duas e devolve ambas ao cliente, que mescla segundo a regra do negócio (por exemplo, unir os itens de dois carrinhos).
+
+Muitos sistemas de produção escolhem LWW pela simplicidade e oferecem compare-and-set para casos que precisam de proteção contra escrita perdida.
+
+<Callout type="note" title="Por que LSM e não B-tree">
+O motor baseado em log (commit log, memtable e SSTables) transforma escritas aleatórias em escritas sequenciais, o que dá throughput de escrita muito alto. O custo é a leitura poder consultar várias SSTables, mitigado com filtros de Bloom e compactação.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Hot keys**: uma chave muito acessada sobrecarrega suas N réplicas, independentemente do tamanho do cluster. Cache no cliente ou divisão da chave ajudam.
+- **Compactação**: consome disco e CPU em segundo plano e pode causar picos de latência; precisa de controle de ritmo.
+- **Tombstones**: acumulam e tornam leituras lentas até serem removidos pela compactação, depois de um prazo de segurança.
+- **Detecção de falhas**: gossip com timeouts curtos detecta rápido, mas gera falsos alarmes; timeouts longos deixam requisições esperando nós mortos.
+- **CAP na prática**: em partição, escolher disponibilidade significa aceitar versões divergentes e resolvê-las depois.
+
+## Perguntas de follow-up comuns
+
+- Como adicionar um nó sem downtime? Ele assume nós virtuais no anel e recebe os dados correspondentes em streaming, enquanto os antigos donos continuam servindo até a transferência terminar.
+- Como oferecer consistência forte de verdade? Um grupo de consenso (Raft) por partição, com líder que ordena as escritas, ao custo de latência e disponibilidade durante eleições.
+- Como implementar TTL? Gravar `expira_em` junto do valor, filtrar na leitura e remover na compactação.
+- Como suportar consultas por faixa de chaves? Particionar por faixas em vez de hash, aceitando o risco de faixas quentes.
+
+<QuizSet>
+<Quiz question="Com N=3, qual combinação garante que a leitura veja a última escrita confirmada?" options={["W=1, R=1", "W=1, R=2", "W=2, R=2", "W=1, R=1 com cache"]} answer={2} explanation="R + W = 4 é maior que N = 3, então os conjuntos de leitura e escrita sempre se sobrepõem." />
+<Quiz question="Para que servem os tombstones?" options={["Para comprimir dados", "Para impedir que réplicas atrasadas ressuscitem valores apagados", "Para acelerar leituras", "Para implementar hashing consistente"]} answer={1} explanation="A marca de exclusão se propaga como uma escrita comum e vence a versão antiga durante a sincronização." />
+</QuizSet>

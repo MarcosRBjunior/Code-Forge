@@ -1,0 +1,146 @@
+---
+title: Projetar um sistema de notificações
+kind: lesson
+---
+
+Quase todo produto precisa avisar o usuário de algo: um pedido saiu para entrega, alguém comentou na foto, a fatura vence amanhã. Um sistema de notificações centraliza isso para dezenas de serviços internos, entregando por push no celular, e-mail e SMS. A questão testa filas, retentativas, idempotência, preferências do usuário e integração com provedores externos que você não controla.
+
+## Requisitos
+
+### Funcionais
+
+- Serviços internos enviam notificações para um ou muitos usuários.
+- Canais: push (iOS e Android), e-mail e SMS.
+- Respeitar preferências: o usuário desativa categorias ou canais.
+- Templates com variáveis e idioma do usuário.
+- Agendamento ("enviar amanhã às 9h") e campanhas em massa.
+- Consultar status de entrega.
+
+### Não funcionais
+
+- **Nenhuma notificação importante perdida** (código de verificação, alerta de segurança).
+- **Sem duplicidade**: receber o mesmo SMS três vezes é ruim e custa caro.
+- Notificações transacionais chegam em segundos; campanhas podem levar minutos.
+- Isolamento: uma campanha de marketing gigante não pode atrasar um código de login.
+
+## Estimativas
+
+- 100 milhões de usuários; em média 10 notificações por usuário por dia: **1 bilhão por dia**, ou cerca de **12 mil por segundo**.
+- Divisão por canal: 70% push, 25% e-mail, 5% SMS. SMS são 50 milhões por dia, e a um custo de alguns centavos cada, viram o item mais caro do sistema.
+- Picos: uma campanha para todos os 100 milhões de usuários, enviada em 30 minutos, exige 100 M / 1.800 ≈ **55 mil por segundo** só para ela.
+- Registro de status: 1 bilhão × 200 bytes = **200 GB por dia**. Com retenção de 30 dias, 6 TB.
+
+Provedores externos impõem limites de taxa (APNs, FCM e gateways de SMS), então o sistema precisa controlar o ritmo de saída por provedor.
+
+## API
+
+```text
+POST /api/v1/notificacoes
+  cabeçalho: Idempotency-Key: pedido-8812-saiu-para-entrega
+  body: { "usuarios": ["u_42"], "template": "pedido_enviado",
+          "variaveis": { "pedido": "8812" },
+          "categoria": "transacional", "canais": ["push", "email"],
+          "agendarPara": null }
+  resposta 202: { "notificacaoId": "n_551" }
+
+GET  /api/v1/notificacoes/n_551          -> status por canal
+PUT  /api/v1/usuarios/u_42/preferencias  -> { "marketing": { "email": false } }
+POST /api/v1/dispositivos                -> registra token de push do aparelho
+```
+
+A resposta é 202 porque o envio é assíncrono: o serviço aceita, persiste e processa depois.
+
+## Modelo de dados
+
+```text
+notificacoes    notificacao_id | idempotency_key (único) | template | variaveis
+                | categoria | criado_em | agendar_para
+entregas        notificacao_id | usuario_id | canal | status | tentativas
+                | provedor_msg_id | atualizado_em
+preferencias    usuario_id | categoria | canal | ativo
+dispositivos    usuario_id | token_push | plataforma | ultimo_uso
+templates       nome | idioma | canal | corpo | versao
+```
+
+## Arquitetura de alto nível
+
+```text
+ serviços internos
+        |
++-------v----------+     +-------------------+
+| API de           |---->| Banco (registro + |
+| notificações     |     | idempotência)     |
++-------+----------+     +-------------------+
+        |
++-------v----------+   preferências, template, contatos
+| Roteador /       |------------------------------+
+| renderizador     |                              |
++---+------+-----+-+                    +---------v--------+
+    |      |     |                      | Caches: prefs,   |
+    v      v     v                      | tokens, templates|
+ [fila   [fila  [fila      (filas separadas por canal     |
+  push]   email] sms]       e por prioridade)  +-----------+
+    |      |     |
++---v--+ +-v---+ +v-----+
+|Worker| |Work.| |Worker|  -- limite de taxa por provedor
+| push | |email| | sms  |
++--+---+ +--+--+ +--+---+
+   v        v       v
+ APNs/FCM  SMTP/   gateway
+           provedor  SMS
+   |        |       |
+   +--------+-------+--> callbacks de entrega --> tabela de entregas
+```
+
+## Aprofundamentos
+
+### 1. Confiabilidade e idempotência
+
+A sequência que evita perdas: a API grava a notificação no banco **antes** de responder 202, e publica na fila (ou usa o padrão outbox: a gravação e o evento ficam na mesma transação e um processo publica os eventos pendentes). Workers só confirmam a mensagem da fila depois de o provedor aceitar o envio. Se o worker cair no meio, a mensagem volta para a fila e é processada de novo.
+
+Isso implica entrega **pelo menos uma vez**, o que gera risco de duplicata. A defesa tem duas camadas:
+
+- Na entrada, a `Idempotency-Key` com índice único impede que um serviço que repetiu a chamada crie duas notificações.
+- Na saída, antes de chamar o provedor, o worker marca a entrega como "enviando" com uma atualização condicional; se já estiver "enviada", descarta.
+
+Retentativas usam backoff exponencial com jitter. Depois de N falhas, a mensagem vai para uma **fila de mensagens mortas** para análise, sem bloquear as demais.
+
+### 2. Prioridade e isolamento
+
+Um código de verificação e um e-mail promocional não podem disputar a mesma fila. Separe filas por canal **e** por prioridade (transacional, social, marketing), com workers dedicados ou pesos diferentes. Campanhas em massa passam ainda por um "expansor": a requisição de campanha é quebrada em lotes de milhares de usuários, enfileirados aos poucos, para não inundar o sistema de uma vez.
+
+### 3. Preferências, limites e horários
+
+Antes de enviar, o roteador consulta:
+
+- Preferências do usuário (categoria e canal desativados).
+- Limite de frequência: no máximo X notificações de marketing por dia por usuário.
+- Horário silencioso: notificações não urgentes agendadas para depois das 22h são adiadas até de manhã, no fuso do usuário.
+- Tokens inválidos: se APNs ou FCM responderem que o token não existe mais, remova-o para não insistir.
+
+Essas consultas acontecem para cada uma das 12 mil notificações por segundo, então preferências e tokens ficam em cache.
+
+<Callout type="tip" title="Provedores falham">
+Tenha um segundo provedor de SMS e de e-mail configurado. Quando a taxa de erro de um passa de um limiar, o roteador desvia o tráfego. Isso mostra maturidade operacional.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Decisão | Trade-off |
+| --- | --- |
+| Pelo menos uma vez vs. no máximo uma vez | Sem perdas, com deduplicação explícita, contra simplicidade com risco de perda |
+| Renderizar template no roteador vs. no worker | Centralizar facilita versionar; no worker, permite variações por canal |
+| Filas por prioridade | Isolamento contra mais componentes para operar |
+| Agrupar notificações ("5 pessoas curtiram") | Menos ruído para o usuário contra atraso na entrega |
+
+## Perguntas de follow-up comuns
+
+- Como rastrear se o usuário abriu a notificação? Pixel de rastreamento em e-mail, eventos de abertura do app para push, e tudo vai para o pipeline de analytics.
+- Como enviar notificação dentro do app aberto? Conexão em tempo real (WebSocket), com fallback para push quando o app está fechado.
+- Como evitar spam acidental de um serviço interno com bug? Limite de taxa por serviço chamador e por usuário destinatário.
+- Como agendar milhões de envios futuros? Tabela de agendamentos particionada por horário e um agendador que, a cada minuto, enfileira os que venceram.
+
+<QuizSet>
+<Quiz question="Por que separar filas por prioridade?" options={["Para economizar memória", "Para que campanhas grandes não atrasem notificações críticas como códigos de login", "Porque provedores exigem", "Para garantir ordem global"]} answer={1} explanation="Filas isoladas impedem que volume de baixa prioridade bloqueie o tráfego urgente." />
+<Quiz question="Um serviço repete a chamada à API após um timeout. Como evitar duas notificações?" options={["Ignorar retentativas", "Usar a Idempotency-Key com restrição de unicidade", "Enviar só por e-mail", "Aumentar o timeout"]} answer={1} explanation="A chave de idempotência faz a segunda chamada devolver a notificação já criada." />
+</QuizSet>

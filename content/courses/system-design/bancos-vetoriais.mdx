@@ -1,0 +1,89 @@
+---
+title: Bancos vetoriais
+kind: lesson
+---
+
+Um usuário pesquisa "como cancelar minha assinatura" e o artigo certo se chama "Encerrando seu plano". Nenhuma palavra em comum, então o índice invertido não ajuda. O que conecta os dois é o **significado**. Modelos de embedding transformam texto, imagens ou áudio em **vetores** de centenas ou milhares de números, de forma que conteúdos parecidos ficam próximos no espaço. Um **banco vetorial** guarda esses vetores e responde rápido à pergunta: "quais são os K vetores mais próximos deste?".
+
+## Do conteúdo ao vetor
+
+```text
+"Encerrando seu plano"          ──modelo de embedding──▶ [0.12, -0.03, 0.88, ..., 0.41]   (ex.: 768 dimensões)
+"como cancelar minha assinatura" ─modelo de embedding──▶ [0.10, -0.01, 0.85, ..., 0.39]
+                                                         ↑ vetores próximos = significados próximos
+```
+
+A proximidade é medida por uma métrica:
+
+- **Similaridade de cosseno:** ângulo entre vetores; a mais comum para texto.
+- **Produto interno:** equivalente ao cosseno se os vetores forem normalizados.
+- **Distância euclidiana (L2).**
+
+Use a mesma métrica para a qual o modelo foi treinado, e o **mesmo modelo** na indexação e na consulta.
+
+## O problema: busca exata não escala
+
+Comparar a consulta com cada um de 100 milhões de vetores de 768 dimensões são dezenas de bilhões de multiplicações por busca. Por isso bancos vetoriais usam **busca aproximada de vizinhos mais próximos (ANN)**: aceitam perder alguns dos vizinhos verdadeiros em troca de velocidade de milissegundos. A qualidade é medida pelo **recall@K**: que fração dos K vizinhos reais foi encontrada.
+
+## Índices ANN principais
+
+### HNSW (Hierarchical Navigable Small World)
+
+Um grafo em camadas: as superiores são esparsas e permitem saltos longos, as inferiores são densas e refinam a busca. A consulta entra no topo e desce, sempre caminhando para o vizinho mais próximo da consulta. Tem recall alto e latência baixa, mas consome bastante memória e a construção é mais lenta. É o padrão em muitos bancos.
+
+### IVF (Inverted File)
+
+Agrupa os vetores em clusters (por k-means). Na consulta, encontra os clusters mais próximos e só compara com os vetores deles. O parâmetro `nprobe` (quantos clusters visitar) troca velocidade por recall.
+
+### Quantização
+
+**Product quantization (PQ)** e quantização escalar comprimem vetores (por exemplo, de 3 KB para 64 bytes), permitindo manter bilhões em memória. Costuma ser combinada com IVF (IVF-PQ) e com uma etapa de **reordenação** usando os vetores completos.
+
+| Índice | Recall | Memória | Construção | Bom para |
+| --- | --- | --- | --- | --- |
+| Força bruta | 100% | Vetores completos | Nenhuma | Até centenas de milhares |
+| HNSW | Muito alto | Alta | Lenta | Baixa latência, até centenas de milhões |
+| IVF | Ajustável | Média | Rápida (após treinar clusters) | Grandes coleções |
+| IVF-PQ | Menor, ajustável | Muito baixa | Média | Bilhões de vetores |
+
+## Filtros e busca híbrida
+
+Na prática, a consulta raramente é só "parecidos com isto". É "parecidos com isto, **da categoria calçados, em estoque, deste cliente**". Filtrar depois da busca vetorial pode devolver zero resultados; por isso bons bancos aplicam o filtro durante a travessia do índice.
+
+A **busca híbrida** combina BM25 (acerta nomes próprios, códigos, termos exatos) com busca vetorial (acerta significado), fundindo as listas, por exemplo com *reciprocal rank fusion*.
+
+```sql
+-- pgvector no PostgreSQL
+CREATE TABLE artigos (id BIGSERIAL PRIMARY KEY, titulo TEXT, embedding VECTOR(768));
+CREATE INDEX ON artigos USING hnsw (embedding vector_cosine_ops);
+
+SELECT id, titulo
+FROM artigos
+ORDER BY embedding <=> $1      -- distância de cosseno até o vetor da consulta
+LIMIT 5;
+```
+
+## Opções
+
+- **Extensões em bancos existentes:** pgvector (PostgreSQL), recursos vetoriais em Elasticsearch/OpenSearch, Redis, MongoDB. Ótimas para começar e manter tudo num lugar.
+- **Bancos dedicados:** Milvus, Qdrant, Weaviate, Pinecone. Escalam melhor para bilhões de vetores e oferecem mais controle sobre índices.
+- **Bibliotecas:** FAISS e similares, embutidas na aplicação.
+
+<Callout type="note" title="RAG">
+Em aplicações com LLMs, o padrão RAG (geração aumentada por recuperação) quebra documentos em trechos, gera embeddings, guarda no banco vetorial e, a cada pergunta, recupera os trechos mais próximos para incluir no prompt. A qualidade da resposta depende muito do tamanho dos trechos, da busca híbrida e de uma etapa de reordenação.
+</Callout>
+
+## Armadilhas
+
+- **Trocar o modelo de embedding** exige reindexar tudo: vetores de modelos diferentes não são comparáveis.
+- **Memória:** 100 milhões de vetores de 768 floats de 4 bytes são cerca de 300 GB antes de qualquer índice.
+- **Atualizações e deletes** são mais caros em grafos HNSW; muitos sistemas marcam como apagado e reconstroem periodicamente.
+
+## Na entrevista
+
+Bancos vetoriais aparecem em busca semântica, recomendação, deduplicação de imagens e chatbots com RAG. Diga qual índice usaria e por quê, e mencione o trade-off recall versus latência. Follow-ups: "como combinar com filtros?", "como escalar para 1 bilhão de vetores?" (sharding mais quantização), "como medir a qualidade?" (recall@K contra força bruta numa amostra).
+
+<QuizSet>
+<Quiz question="Por que bancos vetoriais usam busca aproximada (ANN) em vez de exata?" options={["Porque a busca exata dá resultados errados", "Porque comparar a consulta com todos os vetores é caro demais em grandes coleções; ANN troca um pouco de recall por muita velocidade", "Porque embeddings não podem ser comparados exatamente", "Porque ANN usa menos dimensões"]} answer={1} explanation="Força bruta cresce linearmente com o número de vetores e dimensões. Índices como HNSW e IVF visitam só uma pequena parte do espaço." />
+<Quiz question="Usuários buscam pelo código exato de uma peça, como 'XJ-4021', e a busca vetorial devolve peças parecidas mas erradas. O que melhora isso?" options={["Aumentar a dimensão dos embeddings", "Busca híbrida, combinando busca lexical (BM25) com a vetorial", "Trocar HNSW por força bruta", "Usar distância euclidiana"]} answer={1} explanation="Termos exatos, códigos e nomes próprios são o ponto forte da busca lexical; a busca híbrida combina os dois sinais." />
+</QuizSet>

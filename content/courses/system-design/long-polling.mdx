@@ -1,0 +1,98 @@
+---
+title: Long polling
+kind: lesson
+---
+
+O modelo básico do HTTP é o cliente perguntar e o servidor responder. Mas muitas funcionalidades dependem do contrário: o servidor tem uma novidade (mensagem nova, pedido aprovado, partida começou) e quer avisar o cliente. Como o servidor não pode iniciar uma requisição HTTP para o browser, a primeira solução que vem à mente é perguntar repetidamente. **Long polling** é a versão inteligente dessa ideia, e funcionou como a base do "tempo real" na web por muitos anos.
+
+## Polling curto: o ponto de partida
+
+No polling curto, o cliente pergunta a cada N segundos:
+
+```text
+00:00  GET /mensagens?desde=100  -> 200 []      (nada novo)
+00:05  GET /mensagens?desde=100  -> 200 []      (nada novo)
+00:10  GET /mensagens?desde=100  -> 200 [101]  (chegou, mas a mensagem esperou até 5 s)
+```
+
+Os problemas são claros: a maioria das requisições volta vazia (desperdício de CPU, banda e bateria), e a latência de entrega é, em média, metade do intervalo. Diminuir o intervalo melhora a latência, mas multiplica a carga.
+
+## Como o long polling funciona
+
+No long polling, o servidor **segura** a requisição aberta até ter algo a dizer ou até um timeout:
+
+```text
+Cliente                                   Servidor
+  | GET /mensagens?desde=100 ------------>  |
+  |                                         |  (sem novidade: espera)
+  |                                         |  ... 12 s depois chega a 101
+  |  <------------- 200 [101]               |
+  | GET /mensagens?desde=101 ------------>  |  (reconecta imediatamente)
+  |                                         |  ... 30 s sem nada
+  |  <------------- 204 (timeout)           |
+  | GET /mensagens?desde=101 ------------>  |
+```
+
+Quando a resposta chega, o cliente processa e abre a próxima requisição imediatamente. A latência fica próxima da de uma conexão contínua, e quase não há respostas vazias.
+
+## Implementação do lado do servidor
+
+O ponto crítico é não prender uma thread por cliente esperando. Use um modelo assíncrono e um mecanismo de notificação:
+
+```python
+import asyncio
+
+class CaixaDeEntrada:
+    def __init__(self):
+        self.mensagens = []
+        self.evento = asyncio.Event()
+
+    def publicar(self, msg):
+        self.mensagens.append(msg)
+        self.evento.set()
+        self.evento = asyncio.Event()   # próximos esperam o próximo evento
+
+    async def aguardar(self, desde, timeout=30):
+        novas = self.mensagens[desde:]
+        if novas:
+            return novas
+        evento = self.evento
+        try:
+            await asyncio.wait_for(evento.wait(), timeout)
+        except asyncio.TimeoutError:
+            return []
+        return self.mensagens[desde:]
+```
+
+Com várias instâncias de servidor, a mensagem pode ser publicada numa instância enquanto o cliente espera em outra. É preciso um canal compartilhado (por exemplo, Redis Pub/Sub ou um broker) para acordar a instância certa.
+
+## Detalhes que importam
+
+- **Cursor:** o cliente informa o último ID recebido (`desde=101`). Se uma resposta se perder ou a conexão cair, nada é pulado na próxima requisição.
+- **Timeout menor que o dos intermediários:** proxies e load balancers costumam encerrar conexões ociosas em 60 segundos ou menos. Responda antes (20 a 30 segundos) com resposta vazia.
+- **Janela entre requisições:** entre receber a resposta e reconectar, novos eventos podem chegar. O cursor garante que eles venham na próxima chamada.
+- **Backoff em erros:** se o servidor responde 5xx, o cliente deve esperar com backoff exponencial, senão milhares de clientes reconectando juntos derrubam o servidor de novo.
+
+<Callout type="tip" title="Por que ainda usar">
+Long polling funciona sobre HTTP comum, atravessa qualquer proxy ou firewall corporativo e não exige suporte especial no servidor ou na CDN. Por isso ele aparece como plano B em bibliotecas de tempo real quando WebSocket falha.
+</Callout>
+
+## Trade-offs
+
+| Aspecto | Polling curto | Long polling |
+| --- | --- | --- |
+| Latência | Até o intervalo inteiro | Quase imediata |
+| Requisições vazias | Muitas | Poucas (só nos timeouts) |
+| Conexões abertas no servidor | Poucas e curtas | Uma por cliente, longa |
+| Complexidade no servidor | Mínima | Precisa de I/O assíncrono e notificação |
+
+Em relação a SSE e WebSockets, o long polling paga o custo de cabeçalhos HTTP e uma nova requisição a cada mensagem, o que fica caro quando os eventos são frequentes. É bom para atualizações esporádicas, não para fluxos com dezenas de mensagens por segundo.
+
+## Na entrevista
+
+Apresente a progressão: polling curto, long polling, SSE, WebSockets, justificando pela frequência de eventos e direção da comunicação. Para notificações esporádicas ou como fallback, long polling é aceitável. Follow-ups comuns: como lidar com várias instâncias (pub/sub interno), como não perder mensagens (cursor) e quantas conexões simultâneas um servidor aguenta (depende de I/O assíncrono e limites de descritores de arquivo).
+
+<QuizSet>
+<Quiz question="Qual é a principal diferença entre polling curto e long polling?" options={["Long polling usa UDP", "No long polling o servidor segura a requisição até haver dados ou expirar o timeout", "Polling curto mantém uma conexão bidirecional", "Long polling dispensa HTTP"]} answer={1} explanation="Em vez de responder vazio na hora, o servidor espera um evento. Isso reduz respostas vazias e entrega a novidade quase imediatamente." />
+<Quiz question="Por que o cliente envia o ID da última mensagem recebida em cada requisição?" options={["Para autenticação", "Para não perder eventos que chegam entre uma resposta e a próxima requisição", "Para comprimir a resposta", "Para escolher a instância do servidor"]} answer={1} explanation="O cursor permite ao servidor devolver tudo o que surgiu depois daquele ponto, inclusive eventos que chegaram enquanto o cliente reconectava." />
+</QuizSet>

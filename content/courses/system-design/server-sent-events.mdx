@@ -1,0 +1,111 @@
+---
+title: Server-Sent Events
+kind: lesson
+---
+
+Muitos casos de "tempo real" são, na verdade, de mão única: placar de jogo, cotações, progresso de um processamento, notificações, tokens de uma resposta de IA aparecendo aos poucos. O cliente não precisa mandar nada continuamente, só receber. Para isso, abrir um WebSocket é exagero, e long polling desperdiça uma requisição por mensagem. **Server-Sent Events (SSE)** é um padrão da web em que o servidor mantém uma resposta HTTP aberta e vai escrevendo eventos nela à medida que acontecem.
+
+## Como funciona
+
+O cliente faz um `GET` comum. O servidor responde com `Content-Type: text/event-stream` e não encerra a resposta: cada evento é um bloco de texto terminado por uma linha em branco.
+
+```text
+GET /pedidos/9001/eventos HTTP/1.1
+Accept: text/event-stream
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+
+id: 17
+event: status
+data: {"status": "separando"}
+
+id: 18
+event: status
+data: {"status": "enviado"}
+
+: comentário usado como heartbeat
+
+retry: 5000
+```
+
+Campos do formato:
+
+| Campo | Função |
+| --- | --- |
+| `data` | Conteúdo do evento (várias linhas `data` são concatenadas) |
+| `event` | Tipo do evento, para o cliente tratar separadamente |
+| `id` | Identificador; o browser lembra o último recebido |
+| `retry` | Quantos milissegundos esperar antes de reconectar |
+| linha iniciada com `:` | Comentário, ignorado; útil como keep-alive |
+
+## No browser
+
+A API `EventSource` cuida da conexão e da **reconexão automática**:
+
+```javascript
+const fonte = new EventSource("/pedidos/9001/eventos");
+
+fonte.addEventListener("status", (e) => {
+  const dados = JSON.parse(e.data);
+  atualizarTela(dados.status);
+});
+
+fonte.onerror = () => console.log("conexão caiu, o browser vai reconectar");
+```
+
+Ao reconectar, o browser envia o cabeçalho `Last-Event-ID` com o último `id` recebido. Se o servidor guarda um histórico recente de eventos, ele retoma exatamente de onde parou, sem perdas.
+
+## Lado do servidor
+
+```python
+async def eventos_do_pedido(request, pedido_id):
+    ultimo = int(request.headers.get("Last-Event-ID", 0))
+
+    async def gerar():
+        for ev in historico.desde(pedido_id, ultimo):      # reenvia o que faltou
+            yield f"id: {ev.id}\nevent: status\ndata: {ev.json}\n\n"
+        async for ev in barramento.assinar(pedido_id):     # eventos novos
+            yield f"id: {ev.id}\nevent: status\ndata: {ev.json}\n\n"
+
+    return StreamingResponse(gerar(), media_type="text/event-stream")
+```
+
+Assim como no long polling, com várias instâncias é preciso um barramento compartilhado (Redis Pub/Sub, Kafka, NATS) para que o evento gerado em uma instância chegue ao cliente conectado em outra.
+
+## Vantagens
+
+- **É só HTTP:** funciona com autenticação por cookie, proxies, HTTP/2 e ferramentas existentes.
+- **Reconexão e retomada embutidas:** com `id` e `Last-Event-ID`, de graça.
+- **Simples:** formato de texto, fácil de depurar com `curl -N`.
+- **Eficiente:** uma conexão, sem cabeçalhos por mensagem.
+
+## Limitações
+
+- **Só servidor para cliente.** Mensagens do cliente vão por requisições HTTP normais (o que muitas vezes é suficiente).
+- **Só texto UTF-8.** Binário precisa ser codificado, por exemplo em Base64.
+- **Limite de conexões no HTTP/1.1:** browsers permitem cerca de 6 conexões por domínio; várias abas com SSE esgotam esse limite. Com HTTP/2, as streams são multiplexadas numa única conexão e o problema desaparece.
+- **`EventSource` não permite cabeçalhos customizados**, como `Authorization`. Use cookies ou bibliotecas que implementam SSE sobre `fetch`.
+
+<Callout type="warning" title="Proxies que acumulam a resposta">
+Alguns proxies reversos fazem buffer da resposta antes de repassá-la, e os eventos chegam todos de uma vez no final. Desative o buffering para essas rotas e envie comentários periódicos para evitar que conexões ociosas sejam encerradas.
+</Callout>
+
+## Quando escolher
+
+| Necessidade | Escolha |
+| --- | --- |
+| Servidor envia atualizações, cliente só lê | SSE |
+| Comunicação frequente nos dois sentidos | WebSocket |
+| Eventos raros, ambiente muito restritivo | Long polling |
+| Streaming de resposta de LLM token a token | SSE (é o que a maioria das APIs usa) |
+
+## Na entrevista
+
+Para feeds ao vivo, notificações, dashboards e acompanhamento de pedidos, SSE costuma ser a resposta mais simples e defensável. Mostre que conhece `Last-Event-ID` para retomada, o barramento entre instâncias e o limite de conexões no HTTP/1.1. Follow-ups comuns: por que não WebSocket, como escalar para milhões de conexões e como autenticar o stream.
+
+<QuizSet>
+<Quiz question="Após uma queda de conexão, como o servidor SSE sabe de onde retomar?" options={["Pelo cookie de sessão", "Pelo cabeçalho Last-Event-ID enviado automaticamente pelo browser na reconexão", "Pelo endereço IP do cliente", "Não sabe; SSE sempre perde eventos"]} answer={1} explanation="O EventSource guarda o último id recebido e o envia em Last-Event-ID ao reconectar, permitindo reenviar o que faltou." />
+<Quiz question="Qual cenário é mais adequado para SSE do que para WebSocket?" options={["Jogo multiplayer com comandos a cada 50 ms", "Painel que mostra cotações atualizadas pelo servidor", "Chamada de vídeo", "Editor colaborativo com cursor de cada usuário"]} answer={1} explanation="O fluxo é unidirecional, do servidor para o cliente. SSE resolve com HTTP comum e reconexão automática." />
+</QuizSet>

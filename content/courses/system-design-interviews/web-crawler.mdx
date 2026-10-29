@@ -1,0 +1,145 @@
+---
+title: Projetar um web crawler
+kind: lesson
+---
+
+Um web crawler baixa páginas da web, extrai os links que elas contêm e segue esses links, repetidamente, para alimentar um buscador, um arquivo histórico ou um pipeline de dados. O algoritmo cabe em dez linhas (uma busca em largura num grafo), mas em escala aparecem problemas que não existem no papel: ser educado com os sites, não baixar a mesma coisa mil vezes e sobreviver a armadilhas criadas de propósito ou por acidente.
+
+## Requisitos
+
+### Funcionais
+
+- Partir de um conjunto de URLs semente e descobrir novas páginas seguindo links.
+- Baixar e armazenar o HTML de cada página.
+- Respeitar o `robots.txt` e um limite de requisições por domínio.
+- Recoletar páginas periodicamente, com frequência maior para as que mudam muito.
+
+### Não funcionais
+
+- **Polidez**: nunca sobrecarregar um site; poucas requisições simultâneas por domínio.
+- Throughput alto: bilhões de páginas por mês.
+- Robustez: HTML malformado, servidores lentos, redirecionamentos infinitos e armadilhas não podem travar o sistema.
+- Extensível: novos tipos de processamento (extrair imagens, detectar idioma) sem reescrever o núcleo.
+
+## Estimativas
+
+- Meta: 1 bilhão de páginas por mês.
+- Taxa: 1 B / (30 × 86.400) ≈ **400 páginas por segundo** em média; planeje para 1.000/s.
+- Tamanho médio de uma página HTML: 100 KB. Por mês: 1 B × 100 KB = **100 TB**. Comprimido (HTML comprime para uns 20%), cerca de 20 TB por mês.
+- Banda: 1.000 páginas/s × 100 KB = 100 MB/s, ou **800 Mbps** de entrada.
+- URLs conhecidas: cada página tem dezenas de links; a fronteira pode acumular dezenas de bilhões de URLs. A 100 bytes cada, 10 bilhões de URLs são 1 TB, o que obriga a fronteira a viver em disco, não só em memória.
+
+Cada busca leva centenas de milissegundos esperando rede. Para 1.000 páginas por segundo com latência de 500 ms, você precisa de pelo menos **500 requisições em voo** o tempo todo: o crawler é limitado por I/O, então use I/O assíncrono e muitas conexões por máquina.
+
+## API
+
+Não há usuário final; a interface é operacional:
+
+```text
+POST /admin/sementes      body: { "urls": ["https://exemplo.com.br/"] }
+GET  /admin/dominios/:dominio/estado
+  resposta: { "paginasColetadas": 9182, "fila": 330, "atrasoMs": 2000 }
+PUT  /admin/dominios/:dominio/politica   body: { "maxPorSegundo": 0.5 }
+```
+
+A saída do sistema é um fluxo de eventos `pagina_coletada` (URL, timestamp, chave do conteúdo no storage) consumido por indexadores.
+
+## Modelo de dados
+
+```text
+fronteira (filas persistentes, uma por host)
+  host -> fila de (url, prioridade, profundidade)
+  heap de hosts ordenado por proximo_horario_permitido
+
+urls_vistas (filtro de Bloom + armazenamento chave-valor)
+  hash(url_normalizada) -> ultima_coleta, hash_conteudo, frequencia_mudanca
+
+conteudo (object storage)
+  pages/2026/10/29/<hash> -> HTML comprimido
+
+robots_cache
+  host -> regras, expira_em (cache de 24 h)
+```
+
+## Arquitetura de alto nível
+
+```text
+ sementes
+    |
++---v------------------+     +------------------+
+| Fronteira de URLs    |<----| Filtro de URLs   |
+| - prioridade         |     | - normalização   |
+| - fila por host      |     | - já vista?      |
+| - relógio de polidez |     | - robots.txt     |
++---+------------------+     +--------^---------+
+    | próxima URL permitida           | links novos
++---v------------------+     +--------+---------+
+| Fetchers (async)     |     | Parser /         |
+| DNS cache, timeouts, |---->| extrator de      |
+| limite de tamanho    |     | links            |
++---+------------------+     +--------+---------+
+    |                                 |
++---v------------------+     +--------v---------+
+| Object storage       |     | Dedup de         |
+| (HTML comprimido)    |     | conteúdo (hash)  |
++----------------------+     +--------+---------+
+                                      |
+                              evento pagina_coletada --> indexadores
+```
+
+O sistema é particionado por **host**: um hash do nome do host decide qual nó cuida dele. Assim, a polidez de um domínio é controlada por uma única máquina, sem coordenação distribuída.
+
+## Aprofundamentos
+
+### 1. A fronteira e a polidez
+
+A fronteira tem duas responsabilidades que puxam em direções opostas: **prioridade** (páginas importantes primeiro) e **polidez** (não bombardear o mesmo site). A organização clássica usa duas camadas:
+
+1. Filas de prioridade na entrada: URLs são classificadas por importância estimada (popularidade do domínio, profundidade, frequência de mudança).
+2. Uma fila por host na saída, mais um heap com o horário em que cada host pode receber a próxima requisição.
+
+O fetcher pede trabalho, o heap entrega o host cujo horário já chegou, e o host volta ao heap com horário atualizado (por exemplo, agora mais 2 segundos, ou o `Crawl-delay` do robots.txt). Se o servidor responder devagar ou com erro 429/503, o intervalo aumenta automaticamente.
+
+### 2. Deduplicação de URLs e de conteúdo
+
+A mesma página aparece com muitas URLs: `HTTP` e `HTTPS`, com e sem barra final, parâmetros de rastreamento (`utm_source`), maiúsculas no host. Normalize antes de tudo: minúsculas no host, remova fragmentos e parâmetros conhecidos de rastreamento, ordene os parâmetros restantes.
+
+Depois, a pergunta "já vi esta URL?" precisa ser respondida bilhões de vezes. Um filtro de Bloom em memória responde "certamente não" ou "talvez sim" com pouquíssima memória: para 10 bilhões de URLs e 1% de falso positivo, cerca de 12 GB, divididos entre os nós. Um falso positivo apenas faz você pular uma URL nova, o que é aceitável.
+
+Conteúdo duplicado (espelhos, páginas idênticas com URLs diferentes) é detectado por hash do conteúdo; quase-duplicados, por técnicas de impressão digital que toleram pequenas diferenças, como anúncios e datas.
+
+### 3. Armadilhas e robustez
+
+- **Calendários infinitos** e URLs geradas dinamicamente (`/pagina?data=...` sem fim): limite profundidade e número de páginas por host.
+- **Páginas enormes**: corte o download em alguns MB.
+- **Servidores lentos**: timeouts de conexão e de leitura curtos.
+- **Redirecionamentos em ciclo**: no máximo 5 saltos.
+- **DNS**: resolução é lenta e vira gargalo; mantenha cache próprio de DNS com TTL.
+
+<Callout type="warning" title="Polidez não é opcional">
+Um crawler mal comportado é bloqueado rapidamente e pode derrubar sites pequenos. Mencione robots.txt, limite por host e identificação no User-Agent logo no início da resposta.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Decisão | Trade-off |
+| --- | --- |
+| BFS puro vs. prioridade | BFS é simples; prioridade coleta primeiro o que importa |
+| Bloom filter vs. conjunto exato | Memória mínima contra perder uma fração pequena de URLs novas |
+| Particionar por host | Polidez sem coordenação, mas hosts gigantes desequilibram um nó |
+| Recoleta frequente | Índice mais atual contra banda e carga nos sites |
+| Renderizar JavaScript | Captura páginas modernas, mas custa 10 a 100 vezes mais CPU |
+
+A frequência de recoleta deve se adaptar: se uma página mudou nas últimas três visitas, visite com mais frequência; se nunca muda, espace. Requisições condicionais (`If-Modified-Since`) economizam banda quando nada mudou.
+
+## Perguntas de follow-up comuns
+
+- Como renderizar páginas que dependem de JavaScript? Um pool separado de navegadores headless, usado só para domínios que precisam dele.
+- Como priorizar páginas importantes sem conhecer o grafo inteiro? Use sinais incrementais, como quantos links apontam para a URL até agora.
+- O que acontece se um nó cai? Seus hosts são redistribuídos por hashing consistente, e a fronteira persistida em disco é retomada.
+- Como evitar spam e fazendas de links? Pontuação de qualidade por domínio e limites de páginas para domínios de baixa reputação.
+
+<QuizSet>
+<Quiz question="Por que particionar o crawler por host?" options={["Para reduzir o uso de disco", "Para que a polidez de cada domínio seja controlada por um único nó, sem coordenação", "Porque o DNS exige", "Para evitar o uso de filtro de Bloom"]} answer={1} explanation="Com cada host em um único nó, o limite de requisições por domínio é aplicado localmente." />
+<Quiz question="Um filtro de Bloom indica que uma URL talvez já tenha sido vista, mas ela é nova. Qual a consequência?" options={["O crawler entra em loop", "A URL é coletada duas vezes", "A URL nova é pulada, uma perda pequena e aceitável", "O filtro precisa ser reconstruído"]} answer={2} explanation="Falsos positivos fazem pular URLs novas; com taxa baixa, o impacto é desprezível." />
+</QuizSet>

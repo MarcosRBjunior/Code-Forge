@@ -1,0 +1,87 @@
+---
+title: Bancos wide-column
+kind: lesson
+---
+
+Imagine um app de mensagens com 1 bilhão de mensagens novas por dia, em que a consulta principal é "as últimas 50 mensagens desta conversa". Os dados não cabem numa máquina, a escrita é contínua e a leitura é sempre por conversa, em ordem de tempo. Esse é o terreno dos **bancos wide-column**: Apache Cassandra, ScyllaDB, HBase e Google Bigtable.
+
+## O modelo
+
+Apesar do nome, não pense em "uma tabela com muitas colunas". Pense num **mapa ordenado de dois níveis**:
+
+```text
+chave de partição  →  linhas ordenadas pela chave de clustering  →  colunas
+```
+
+- A **chave de partição** decide em qual nó os dados moram (por hash). Todas as linhas com a mesma chave de partição ficam juntas, no mesmo conjunto de réplicas.
+- A **chave de clustering** ordena as linhas **dentro** da partição no disco. Isso torna consultas por intervalo dentro de uma partição muito baratas.
+- Linhas podem ter colunas esparsas: uma coluna ausente não ocupa espaço.
+
+Em CQL (a linguagem do Cassandra, parecida com SQL):
+
+```sql
+CREATE TABLE mensagens (
+  conversa_id  uuid,
+  enviada_em   timeuuid,
+  autor_id     uuid,
+  texto        text,
+  PRIMARY KEY ((conversa_id), enviada_em)
+) WITH CLUSTERING ORDER BY (enviada_em DESC);
+
+-- eficiente: uma partição, leitura sequencial já ordenada
+SELECT * FROM mensagens WHERE conversa_id = ? LIMIT 50;
+```
+
+Repare no que **não** dá para fazer de forma eficiente: buscar mensagens por `autor_id` sem a `conversa_id`. O banco teria que consultar todas as partições de todos os nós.
+
+## Modelagem orientada a consultas
+
+No relacional, você modela entidades e depois escreve consultas. Aqui é o contrário: **cada consulta importante ganha sua própria tabela**, e os dados são duplicados entre elas.
+
+```sql
+-- mesma informação, outra consulta: "mensagens de um autor por data"
+CREATE TABLE mensagens_por_autor (
+  autor_id    uuid,
+  enviada_em  timeuuid,
+  conversa_id uuid,
+  texto       text,
+  PRIMARY KEY ((autor_id), enviada_em)
+);
+```
+
+A aplicação grava nas duas (o Cassandra tem *batches* lógicos para isso). Não há joins, e a desnormalização é a regra.
+
+## Por que escala tão bem
+
+- **Escrita baseada em LSM:** commit log mais memtable mais SSTables. Escritas são appends, muito baratas.
+- **Sem líder (no Cassandra/Scylla):** qualquer nó aceita requisições e as repassa às réplicas; não há primário único para cair. HBase e Bigtable, por outro lado, têm um servidor responsável por cada faixa de chaves.
+- **Particionamento por hash com anel de tokens** e nós virtuais: adicionar nós redistribui uma fração dos dados.
+- **Consistência ajustável por consulta:** `ONE`, `QUORUM`, `ALL`, `LOCAL_QUORUM` (quorum dentro do datacenter local). Com fator de replicação 3, escrita e leitura em `QUORUM` dão leitura das próprias escritas.
+- **Multi-datacenter nativo**, com replicação assíncrona entre regiões.
+
+## Armadilhas
+
+| Problema | Causa | Solução |
+| --- | --- | --- |
+| Partição gigante | Uma chave acumula dados sem limite (um canal com bilhões de mensagens) | Incluir um *bucket* de tempo na chave: `(canal_id, mes)` |
+| Hot partition | Uma chave recebe tráfego desproporcional | Espalhar com sufixos ou repensar a chave |
+| Tombstones | Muitos deletes ou TTLs | Evitar padrões de fila; compactação adequada |
+| Consulta sem chave de partição | Modelagem não previu o acesso | Nova tabela para a consulta |
+| Atualização perdida | Resolução por *last write wins* com relógios | Modelar como inserções imutáveis ou usar transações leves (Paxos) |
+
+<Callout type="tip" title="Bucketing">
+Uma regra prática do Cassandra é manter cada partição abaixo de algumas centenas de MB. Se os dados crescem com o tempo, coloque o período na chave: `PRIMARY KEY ((sensor_id, dia), leitura_em)`. Uma consulta de uma semana vira sete leituras de partição, em paralelo.
+</Callout>
+
+## Quando usar
+
+Bons casos: mensagens e chats, feeds e timelines, histórico de eventos, telemetria e IoT, logs de atividade, catálogos enormes acessados por chave. Casos ruins: relatórios ad hoc, transações entre entidades, consultas que mudam muito.
+
+## Na entrevista
+
+Escolha wide-column quando houver escrita massiva e consultas previsíveis por uma chave. Mostre a `PRIMARY KEY` com partição e clustering e explique por que ela atende à consulta principal. Follow-ups: "e se uma conversa tiver 100 milhões de mensagens?" (bucketing), "qual nível de consistência você usaria?", "como fazer outra consulta?" (outra tabela).
+
+<QuizSet>
+<Quiz question="Na tabela com PRIMARY KEY ((conversa_id), enviada_em), qual consulta é eficiente?" options={["Todas as mensagens de um autor", "As últimas 50 mensagens de uma conversa", "Mensagens que contêm a palavra 'oi'", "Contagem total de mensagens do sistema"]} answer={1} explanation="A consulta informa a chave de partição e usa a ordem da chave de clustering: uma leitura sequencial numa única partição." />
+<Quiz question="Um sensor grava uma leitura por segundo há anos na mesma partição, e as leituras ficaram lentas. Qual a correção típica?" options={["Criar um índice secundário", "Incluir um período (dia ou mês) na chave de partição", "Aumentar o fator de replicação", "Trocar para consistência ALL"]} answer={1} explanation="Bucketing limita o tamanho de cada partição e distribui os dados por vários nós." />
+</QuizSet>

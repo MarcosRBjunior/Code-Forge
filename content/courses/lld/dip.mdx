@@ -1,0 +1,155 @@
+---
+title: Princípio da inversão de dependência
+kind: lesson
+---
+
+O **Dependency Inversion Principle (DIP)** tem duas partes:
+
+1. Módulos de alto nível (regras de negócio) não devem depender de módulos de baixo nível (banco, rede, arquivos). **Ambos devem depender de abstrações.**
+2. Abstrações não devem depender de detalhes. **Detalhes devem depender de abstrações.**
+
+A "inversão" está na direção das setas: em vez de a regra de negócio apontar para o banco de dados, o banco de dados passa a implementar um contrato definido pela regra de negócio.
+
+## O problema
+
+Quando a regra de negócio cria e usa diretamente classes de infraestrutura, ela fica presa a elas. Trocar o banco exige reescrever a regra; testar a regra exige um banco rodando; e uma mudança na biblioteca de e-mail quebra o código de cadastro.
+
+```text
+Sem DIP:   ServicoDeAssinatura ──> RepositorioMySQL ──> driver
+Com DIP:   ServicoDeAssinatura ──> RepositorioDeAssinaturas (abstração)
+                                           △
+                                           ┊
+                                   RepositorioMySQL
+```
+
+## Exemplo que viola o DIP
+
+```python
+class BancoMySQL:
+    def __init__(self) -> None:
+        self._tabela: dict[str, str] = {}
+        print("conectando ao MySQL de produção...")
+
+    def executar_insert(self, email: str, plano: str) -> None:
+        self._tabela[email] = plano
+
+
+class GatewayCartaoXPay:
+    def cobrar_cartao(self, email: str, centavos: int) -> bool:
+        print(f"XPay cobrando {centavos} de {email}")
+        return True
+
+
+class ServicoDeAssinatura:
+    PRECOS = {"basico": 1990, "pro": 4990}
+
+    def __init__(self) -> None:
+        self.banco = BancoMySQL()          # alto nível cria baixo nível
+        self.gateway = GatewayCartaoXPay()
+
+    def assinar(self, email: str, plano: str) -> None:
+        if self.gateway.cobrar_cartao(email, self.PRECOS[plano]):
+            self.banco.executar_insert(email, plano)
+
+
+ServicoDeAssinatura().assinar("leo@ex.com", "pro")
+```
+
+Para testar `assinar`, você conecta ao MySQL e cobra no XPay. Para trocar de gateway, edita a regra de negócio. O serviço conhece até nomes de métodos específicos de cada fornecedor (`executar_insert`, `cobrar_cartao`).
+
+## Versão corrigida
+
+A regra de negócio define os contratos de que precisa, na língua do domínio. A infraestrutura implementa esses contratos, e as instâncias concretas são entregues de fora (injeção de dependência):
+
+```python
+from abc import ABC, abstractmethod
+
+
+class RepositorioDeAssinaturas(ABC):
+    @abstractmethod
+    def salvar(self, email: str, plano: str) -> None: ...
+
+
+class Cobranca(ABC):
+    @abstractmethod
+    def cobrar(self, email: str, centavos: int) -> bool: ...
+
+
+class ServicoDeAssinatura:
+    PRECOS = {"basico": 1990, "pro": 4990}
+
+    def __init__(self, repo: RepositorioDeAssinaturas, cobranca: Cobranca) -> None:
+        self.repo = repo
+        self.cobranca = cobranca
+
+    def assinar(self, email: str, plano: str) -> bool:
+        if plano not in self.PRECOS:
+            raise ValueError("plano inexistente")
+        if not self.cobranca.cobrar(email, self.PRECOS[plano]):
+            return False
+        self.repo.salvar(email, plano)
+        return True
+
+
+# Detalhes de infraestrutura dependem das abstrações
+class RepositorioEmMemoria(RepositorioDeAssinaturas):
+    def __init__(self) -> None:
+        self.dados: dict[str, str] = {}
+
+    def salvar(self, email: str, plano: str) -> None:
+        self.dados[email] = plano
+
+
+class CobrancaXPay(Cobranca):
+    def cobrar(self, email: str, centavos: int) -> bool:
+        print(f"XPay cobrando {centavos} de {email}")
+        return True
+
+
+class CobrancaRecusada(Cobranca):
+    """Dublê para testar o caminho de falha."""
+
+    def cobrar(self, email: str, centavos: int) -> bool:
+        return False
+
+
+# Ponto de montagem (composition root)
+repo = RepositorioEmMemoria()
+servico = ServicoDeAssinatura(repo, CobrancaXPay())
+print(servico.assinar("leo@ex.com", "pro"), repo.dados)
+
+# Teste sem banco e sem gateway real
+repo_teste = RepositorioEmMemoria()
+assert ServicoDeAssinatura(repo_teste, CobrancaRecusada()).assinar("x@ex.com", "basico") is False
+assert repo_teste.dados == {}
+print("testes ok")
+```
+
+`ServicoDeAssinatura` não importa nada de infraestrutura. Trocar XPay por outro gateway é criar uma nova classe que realiza `Cobranca` e mudar uma linha no ponto de montagem.
+
+## DIP, injeção de dependência e inversão de controle
+
+| Termo | O que é |
+| --- | --- |
+| DIP | princípio: dependa de abstrações, e a abstração pertence a quem a usa |
+| Injeção de dependência | técnica: entregar as dependências prontas pelo construtor ou parâmetro |
+| Inversão de controle | ideia mais ampla: o framework ou o ponto de montagem decide quem é criado e quando |
+
+Você pode fazer injeção de dependência sem DIP (injetando classes concretas) e pode aplicar DIP com um simples construtor, sem framework nenhum.
+
+<Callout type="tip" title="Quem é dono da interface?">
+No DIP, a interface fica junto da regra de negócio e é escrita com os termos dela (`salvar`, `cobrar`), não com os termos do fornecedor. Se a interface espelha a API do banco, a dependência não foi invertida de verdade.
+</Callout>
+
+## Trade-offs
+
+Cada abstração é uma indireção a mais. Para scripts pequenos ou código que nunca vai trocar de infraestrutura nem precisa de testes isolados, depender diretamente do concreto é aceitável. Aplique o DIP nas **fronteiras**: persistência, rede, relógio, serviços externos.
+
+## Na entrevista
+
+Mostre que suas classes centrais recebem repositórios, gateways e notificadores pelo construtor. Diga: "o `Estacionamento` depende de `RepositorioDeTickets`; em memória para a entrevista, banco em produção". Follow-ups comuns: "qual a diferença entre DIP e injeção de dependência?", "onde as instâncias concretas são criadas?", "como isso ajuda nos testes?".
+
+<QuizSet>
+<Quiz question="No DIP, de quem é a abstração?" options={["Do módulo de baixo nível, como o driver do banco", "Do módulo de alto nível, escrita nos termos da regra de negócio", "Do framework de injeção", "De nenhum dos dois"]} answer={1} explanation="A regra de negócio define o contrato de que precisa; a infraestrutura se adapta a ele." />
+<Quiz question="Qual a diferença entre DIP e injeção de dependência?" options={["São a mesma coisa", "DIP é um princípio sobre a direção das dependências; injeção é uma técnica para entregar dependências prontas", "Injeção de dependência só existe em Java", "DIP exige um framework"]} answer={1} explanation="Injetar classes concretas não cumpre o DIP; aplicar o DIP não exige framework." />
+</QuizSet>

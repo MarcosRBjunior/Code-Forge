@@ -1,6 +1,6 @@
 import "server-only";
 import { sql } from "drizzle-orm";
-import { pgTable, text, integer, timestamp, uuid, boolean, date } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, uuid, boolean, date, jsonb } from "drizzle-orm/pg-core";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
 
 /*
@@ -54,6 +54,17 @@ export const activityDays = pgTable("activity_days", {
   events: integer("events").notNull().default(0),
 });
 
+export const mockInterviews = pgTable("mock_interviews", {
+  id: uuid("id").primaryKey(),
+  config: jsonb("config").notNull(),
+  problems: jsonb("problems").notNull(),
+  scores: jsonb("scores").notNull(),
+  total: integer("total").notNull(),
+  notes: text("notes").notNull().default(""),
+  durationS: integer("duration_s").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 const DDL = [
   `CREATE TABLE IF NOT EXISTS chapter_progress (
      chapter_key text PRIMARY KEY,
@@ -90,6 +101,15 @@ const DDL = [
      code text NOT NULL,
      updated_at timestamptz NOT NULL DEFAULT now(),
      PRIMARY KEY (chapter_key, language))`,
+  `CREATE TABLE IF NOT EXISTS mock_interviews (
+     id uuid PRIMARY KEY,
+     config jsonb NOT NULL,
+     problems jsonb NOT NULL,
+     scores jsonb NOT NULL,
+     total integer NOT NULL CHECK (total BETWEEN 0 AND 100),
+     notes text NOT NULL DEFAULT '',
+     duration_s integer NOT NULL,
+     created_at timestamptz NOT NULL DEFAULT now())`,
   `CREATE TABLE IF NOT EXISTS activity_days (
      day date PRIMARY KEY,
      events integer NOT NULL DEFAULT 0)`,

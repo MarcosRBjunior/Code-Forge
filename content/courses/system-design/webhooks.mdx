@@ -1,0 +1,101 @@
+---
+title: Webhooks
+kind: lesson
+---
+
+Sua loja usa um gateway de pagamento. O cliente paga por boleto, e a confirmação pode chegar minutos ou dias depois. Ficar consultando a API do gateway a cada minuto para cada pedido pendente é caro e lento. O caminho natural é inverter a direção: **o gateway avisa você**. Um **webhook** é exatamente isso: uma requisição HTTP que um sistema faz para uma URL registrada por outro sistema quando um evento acontece. É, na prática, uma "API reversa" entre servidores.
+
+## Como funciona
+
+```text
+1. Você registra no provedor: URL https://loja.com/webhooks/pagamentos
+   e os eventos de interesse: pagamento.aprovado, pagamento.estornado
+
+2. Evento acontece no provedor.
+
+3. Provedor faz:
+   POST https://loja.com/webhooks/pagamentos
+   Content-Type: application/json
+   Webhook-Id: evt_7f3a
+   Webhook-Timestamp: 1761750000
+   Webhook-Signature: v1,9a1b...
+
+   {"id": "evt_7f3a", "tipo": "pagamento.aprovado", "pedido": 9001, "valor": 15980}
+
+4. Sua API responde 2xx rapidamente. Se não responder (erro ou timeout),
+   o provedor tenta de novo mais tarde, com backoff.
+```
+
+## Construindo um receptor robusto
+
+### 1. Verifique a assinatura
+
+A URL do webhook é pública; qualquer um pode mandar um POST para ela. O provedor assina o corpo com um segredo compartilhado (normalmente HMAC-SHA256), e você confere:
+
+```python
+import hmac, hashlib, time
+
+def verificar(corpo_bruto: bytes, ts: str, assinatura: str, segredo: bytes) -> bool:
+    if abs(time.time() - int(ts)) > 300:          # rejeita replays antigos
+        return False
+    base = ts.encode() + b"." + corpo_bruto
+    esperado = hmac.new(segredo, base, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(esperado, assinatura)
+```
+
+Detalhes: assine e verifique sobre o **corpo bruto**, não sobre o JSON reserializado; inclua o timestamp na assinatura para impedir reenvio de requisições capturadas; e use comparação em tempo constante.
+
+### 2. Responda rápido, processe depois
+
+O provedor tem timeout curto (geralmente poucos segundos). Valide, grave o evento numa fila ou tabela e responda 200. O processamento pesado (atualizar estoque, enviar e-mail) acontece num worker.
+
+### 3. Seja idempotente
+
+Provedores entregam **pelo menos uma vez**: se sua resposta se perder, o mesmo evento chega de novo. Guarde o ID do evento com restrição única e ignore duplicatas.
+
+### 4. Não confie na ordem
+
+`pagamento.estornado` pode chegar antes de `pagamento.aprovado` por causa de retentativas. Use timestamps ou versões do recurso, ou trate o webhook como um "algo mudou" e busque o estado atual na API do provedor.
+
+```python
+def receber_webhook(req):
+    if not verificar(req.body, req.headers["Webhook-Timestamp"],
+                     req.headers["Webhook-Signature"].split(",")[1], SEGREDO):
+        return 401
+    evento = json.loads(req.body)
+    inserido = eventos.inserir_se_ausente(evento["id"], evento)  # dedupe
+    if inserido:
+        fila.publicar("webhooks.pagamentos", evento["id"])
+    return 200
+```
+
+## Construindo o lado emissor
+
+Se você é quem envia webhooks para clientes:
+
+- **Fila de saída:** gere o evento, grave numa fila e deixe workers fazerem as chamadas, nunca na thread da requisição do usuário.
+- **Retentativas com backoff exponencial** ao longo de horas ou dias, e um destino para falhas definitivas (dead letter), com reenvio manual pelo painel.
+- **Timeouts curtos e isolamento:** um cliente com endpoint lento não pode travar a entrega para os outros.
+- **Desativação automática** de endpoints que falham por dias, com aviso ao dono.
+- **Segurança:** assinatura HMAC, rotação de segredos e proteção contra SSRF (não permita URLs que apontem para a sua rede interna).
+
+<Callout type="tip" title="Reconciliação">
+Webhooks podem se perder mesmo com retentativas, por exemplo se seu endpoint ficou fora do ar por mais tempo que a política do provedor. Um job periódico que compara o estado local com a API do provedor fecha essa lacuna.
+</Callout>
+
+## Webhooks vs alternativas
+
+| Abordagem | Quem inicia | Latência | Observação |
+| --- | --- | --- | --- |
+| Polling na API | Consumidor | Intervalo de consulta | Simples, desperdiça requisições |
+| Webhook | Provedor | Segundos | Exige endpoint público e robusto |
+| Fila ou stream compartilhado | Ambos via broker | Baixa | Comum dentro da mesma empresa |
+
+## Na entrevista
+
+Webhooks aparecem em integrações com pagamentos, GitHub, mensageria e qualquer plataforma que notifique terceiros. Destaque assinatura HMAC com timestamp, resposta rápida com processamento assíncrono, idempotência pelo ID do evento e retentativas com backoff. Se você for o emissor, fale de filas de saída, isolamento por cliente e dead letter. Follow-ups comuns: o que acontece se o receptor ficar fora do ar, como garantir ordem e como evitar SSRF.
+
+<QuizSet>
+<Quiz question="Por que o receptor de webhooks deve ser idempotente?" options={["Porque webhooks usam GET", "Porque o provedor reenvia o evento quando não recebe confirmação, podendo entregá-lo mais de uma vez", "Porque a assinatura HMAC exige isso", "Porque o corpo vem criptografado"]} answer={1} explanation="Se a resposta 200 se perder, o provedor considera falha e tenta de novo. Deduplicar pelo ID do evento evita processar duas vezes." />
+<Quiz question="Qual é a função do timestamp incluído na assinatura do webhook?" options={["Ordenar os eventos", "Impedir que uma requisição capturada seja reenviada muito tempo depois (replay)", "Medir a latência da rede", "Definir o fuso horário"]} answer={1} explanation="O receptor rejeita assinaturas com timestamp antigo; como o timestamp faz parte do conteúdo assinado, o atacante não consegue atualizá-lo." />
+</QuizSet>

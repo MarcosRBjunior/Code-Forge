@@ -1,0 +1,89 @@
+---
+title: Filas de mensagens
+kind: lesson
+---
+
+Quando um usuário finaliza uma compra, várias coisas precisam acontecer: gerar nota fiscal, enviar e-mail, atualizar estoque, avisar a transportadora. Se a API fizer tudo isso dentro da requisição, o usuário espera vários segundos, e uma falha no serviço de e-mail derruba a compra inteira. Uma **fila de mensagens** desacopla quem pede o trabalho de quem o executa: o produtor coloca uma mensagem na fila e segue a vida; consumidores retiram e processam no ritmo deles.
+
+## Como funciona
+
+```text
+[API de pedidos] --produz--> [ fila: emitir-nota ] --consome--> [Worker 1]
+                                                   --consome--> [Worker 2]
+                                                   --consome--> [Worker 3]
+```
+
+Numa fila clássica (ponto a ponto), **cada mensagem é processada por um único consumidor**. Vários workers na mesma fila dividem o trabalho entre si (padrão de *competing consumers*).
+
+O ciclo de vida típico de uma mensagem:
+
+1. O produtor publica; o broker persiste e confirma.
+2. Um consumidor recebe a mensagem. Ela fica **invisível** para os demais (ou reservada) por um tempo.
+3. O consumidor processa e envia **ack**. Só então a mensagem é removida.
+4. Se o consumidor falhar ou o prazo de visibilidade expirar sem ack, a mensagem volta para a fila e outro worker a recebe.
+
+Esse mecanismo é o que dá à fila a garantia de **pelo menos uma vez**, e também o motivo de consumidores precisarem ser **idempotentes**.
+
+## Benefícios
+
+- **Desacoplamento:** produtor e consumidor não precisam estar no ar ao mesmo tempo nem se conhecer.
+- **Absorção de picos (load leveling):** um pico de 10 mil pedidos por minuto vira uma fila que os workers drenam em ritmo constante, em vez de derrubar o serviço de notas.
+- **Resiliência:** se o consumidor cai, as mensagens esperam; nada se perde.
+- **Escala independente:** fila crescendo? Adicione workers. A profundidade da fila é uma ótima métrica para autoscaling.
+- **Latência percebida menor:** a API responde assim que publica.
+
+## Exemplo
+
+```python
+# Produtor (na API)
+def finalizar_pedido(pedido):
+    repo.salvar(pedido)
+    fila.publicar("emitir-nota", {"pedido_id": pedido.id})
+    return 202, {"status": "processando"}
+
+# Consumidor (worker)
+def loop_worker():
+    while True:
+        msg = fila.receber("emitir-nota", visibilidade_seg=60)
+        if msg is None:
+            continue
+        try:
+            if not notas.ja_emitida(msg.corpo["pedido_id"]):   # idempotência
+                notas.emitir(msg.corpo["pedido_id"])
+            fila.ack(msg)
+        except ErroTemporario:
+            fila.nack(msg, atraso_seg=30)   # tenta de novo mais tarde
+```
+
+Note o `202 Accepted`: a API reconhece o pedido, mas o trabalho termina depois. O cliente acompanha pelo status ou recebe uma notificação.
+
+## Cuidados de projeto
+
+- **Ordem:** filas comuns não garantem ordem global com vários consumidores. Se a ordem importa por entidade (todos os eventos de um mesmo pedido), use filas FIFO com grupo de mensagens ou partições por chave.
+- **Tempo de visibilidade:** curto demais e uma tarefa lenta é entregue a outro worker enquanto ainda roda (processamento duplicado); longo demais e uma falha demora a ser retentada. Workers longos podem estender o prazo.
+- **Mensagens venenosas:** uma mensagem que sempre falha volta para a fila infinitamente. Limite tentativas e envie para uma dead letter queue.
+- **Retentativa com backoff:** falhas temporárias de um downstream não devem virar uma tempestade de retentativas imediatas.
+- **Tamanho:** mensagens pequenas. Para payloads grandes, guarde o conteúdo em object storage e mande só a referência.
+- **Publicar e gravar de forma consistente:** se você grava no banco e depois publica, uma queda entre os dois passos perde a mensagem. O padrão outbox resolve isso.
+
+<Callout type="tip" title="Backpressure natural">
+A fila transforma sobrecarga em atraso, em vez de erro. Monitore a idade da mensagem mais antiga: ela diz quanto atraso seus usuários estão sentindo, coisa que a profundidade da fila sozinha não mostra.
+</Callout>
+
+## Fila vs chamada síncrona
+
+| Situação | Melhor escolha |
+| --- | --- |
+| O usuário precisa da resposta para continuar | Chamada síncrona |
+| Trabalho pode terminar segundos ou minutos depois | Fila |
+| Tarefa pesada ou sujeita a falhas externas | Fila com retentativa |
+| Picos muito acima da capacidade do consumidor | Fila |
+
+## Na entrevista
+
+Sempre que houver trabalho lento, sujeito a falhas ou com picos (envio de e-mail, transcodificação de vídeo, geração de relatório), coloque uma fila e workers. Fale de ack, visibilidade, idempotência, DLQ e autoscaling pela profundidade da fila. Follow-ups comuns: como garantir ordem, o que acontece se o worker morrer no meio, como evitar perder a mensagem entre gravar no banco e publicar.
+
+<QuizSet>
+<Quiz question="Um worker recebe uma mensagem, processa e morre antes de enviar o ack. O que acontece?" options={["A mensagem é perdida", "Após o prazo de visibilidade, a mensagem volta para a fila e é entregue a outro worker", "O broker envia a mensagem para todos os workers ao mesmo tempo", "O produtor é notificado e reenvia"]} answer={1} explanation="Sem ack, o broker assume que o processamento falhou e torna a mensagem visível de novo. Por isso o processamento pode ocorrer duas vezes e deve ser idempotente." />
+<Quiz question="Qual métrica representa melhor o atraso que os usuários sentem num sistema com fila?" options={["Número de workers", "Idade da mensagem mais antiga na fila", "Tamanho médio das mensagens", "Uso de CPU do broker"]} answer={1} explanation="A idade da mensagem mais antiga mostra há quanto tempo há trabalho esperando. Uma fila profunda que drena rápido pode ser inofensiva; uma pequena e parada, não." />
+</QuizSet>

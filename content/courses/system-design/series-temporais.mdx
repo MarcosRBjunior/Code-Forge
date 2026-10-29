@@ -1,0 +1,91 @@
+---
+title: Bancos de séries temporais
+kind: lesson
+---
+
+Uma frota de 100 mil servidores, cada um reportando 200 métricas a cada 10 segundos, gera 2 milhões de pontos por segundo. Esses dados têm um formato muito peculiar: chegam quase sempre **em ordem de tempo**, **nunca são atualizados**, são consultados por **janelas de tempo** e agregados (média, percentil, taxa), e perdem valor com a idade. Um banco genérico sofre com isso. Um **banco de séries temporais** (TSDB) é desenhado para exatamente esse padrão.
+
+## O modelo
+
+Uma **série** é identificada por um nome de métrica mais um conjunto de rótulos (*labels* ou *tags*). Cada ponto é um par (timestamp, valor).
+
+```text
+http_requests_total{servico="checkout", regiao="sa-east-1", status="500"}
+   1730000000  1523
+   1730000010  1531
+   1730000020  1549
+```
+
+Exemplos: Prometheus, InfluxDB, TimescaleDB (extensão do PostgreSQL), VictoriaMetrics, QuestDB. Bancos colunares como ClickHouse também são usados para isso.
+
+## As otimizações que fazem a diferença
+
+### Escrita por append
+
+Como os pontos chegam em ordem, o banco só anexa ao fim da série. Os dados recentes ficam em memória e em blocos curtos, que depois são fechados e compactados (estrutura semelhante a uma LSM tree, com blocos por janela de tempo).
+
+### Compressão agressiva
+
+Pontos vizinhos são parecidos, e isso é ouro para compressão:
+
+- **Delta-of-delta nos timestamps:** se os pontos chegam a cada 10 s, a diferença entre diferenças é zero e cabe em um bit.
+- **XOR nos valores de ponto flutuante** (técnica popularizada pelo Gorilla, do Facebook): valores parecidos geram XOR com muitos zeros.
+
+O resultado típico é algo em torno de 1 a 2 bytes por ponto, contra 16 bytes brutos.
+
+### Particionamento por tempo
+
+Os dados são divididos em blocos ou *chunks* por intervalo (por hora, por dia). Uma consulta das últimas 6 horas só toca os blocos relevantes, e apagar dados antigos é **descartar um bloco inteiro**, sem deletes linha a linha.
+
+### Retenção e downsampling
+
+Você raramente precisa de resolução de 10 segundos de um ano atrás. Políticas típicas:
+
+| Idade | Resolução guardada |
+| --- | --- |
+| Últimos 7 dias | Bruta (10 s) |
+| Até 90 dias | Agregada em 1 min (min, max, média, contagem) |
+| Até 2 anos | Agregada em 1 h |
+
+O downsampling é feito por **agregados contínuos** ou jobs periódicos, e reduz o armazenamento em ordens de grandeza.
+
+## Consultas
+
+As consultas são sobre janelas e agregações. Em TimescaleDB, com SQL:
+
+```sql
+SELECT time_bucket('5 minutes', ts) AS janela,
+       servico,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY latencia_ms) AS p99
+FROM requisicoes
+WHERE ts > now() - interval '6 hours'
+GROUP BY janela, servico
+ORDER BY janela;
+```
+
+Em PromQL (Prometheus), taxa de erros por serviço nos últimos 5 minutos:
+
+```text
+sum by (servico) (rate(http_requests_total{status=~"5.."}[5m]))
+```
+
+<Callout type="warning" title="Explosão de cardinalidade">
+Cada combinação distinta de rótulos é uma série nova, com seu próprio índice. Colocar `usuario_id` ou `request_id` como rótulo transforma 100 séries em 100 milhões e derruba o banco. Rótulos devem ter poucos valores possíveis (serviço, região, status); identificadores únicos vão para logs ou traces.
+</Callout>
+
+## Pull vs push
+
+O Prometheus **puxa** métricas de cada alvo periodicamente (scrape), o que facilita saber se um alvo está fora do ar. InfluxDB e muitos agentes de IoT **empurram** os pontos para o banco. Em escala, ambos usam armazenamento de longo prazo separado (Thanos, Mimir, ou o próprio cluster do TSDB).
+
+## Quando usar
+
+Monitoramento e métricas de infraestrutura, telemetria de IoT, dados financeiros de mercado, analytics de eventos por tempo. Se você precisa de busca por texto em mensagens de log, isso é outro problema (agregação de logs); se precisa de transações, é um relacional.
+
+## Na entrevista
+
+Em sistemas de métricas ou monitoramento, diga: "pontos vão para um TSDB, com retenção de 15 dias em resolução bruta e downsampling para meses". Mencione cardinalidade antes que perguntem. Follow-ups: "como guardar um ano de dados de forma barata?" (downsampling e armazenamento em object storage), "por que não usar PostgreSQL puro?" (compressão, particionamento por tempo e retenção nativos).
+
+<QuizSet>
+<Quiz question="Um time adicionou o rótulo user_id a uma métrica de latência no Prometheus e o uso de memória explodiu. Por quê?" options={["Rótulos não podem conter números", "Cada valor distinto de user_id cria uma nova série, causando explosão de cardinalidade", "O Prometheus não suporta métricas de latência", "Faltou downsampling"]} answer={1} explanation="Séries são identificadas pela combinação de rótulos. Identificadores únicos multiplicam o número de séries e o índice correspondente." />
+<Quiz question="Por que apagar dados antigos é barato num TSDB?" options={["Porque os dados nunca são apagados", "Porque os dados são particionados por intervalo de tempo e um bloco inteiro pode ser descartado de uma vez", "Porque usa B-trees", "Porque os deletes são assíncronos"]} answer={1} explanation="Com blocos por janela de tempo, a retenção é feita removendo blocos completos, sem deletes linha a linha nem tombstones." />
+</QuizSet>

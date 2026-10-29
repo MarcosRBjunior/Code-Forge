@@ -1,0 +1,96 @@
+---
+title: WebSockets
+kind: lesson
+---
+
+Em um chat, um jogo multiplayer ou um editor colaborativo, as mensagens fluem o tempo todo nos **dois sentidos** e a latência importa em milissegundos. Simular isso com requisições HTTP repetidas paga, a cada mensagem, cabeçalhos, possivelmente um handshake e o atraso do ciclo pedido-resposta. O protocolo **WebSocket** (RFC 6455) abre um canal **full-duplex** persistente sobre uma única conexão TCP: depois de estabelecido, cliente e servidor enviam mensagens quando quiserem, com overhead de poucos bytes por mensagem.
+
+## O handshake
+
+A conexão começa como HTTP/1.1 e é "promovida" para WebSocket:
+
+```text
+GET /chat HTTP/1.1
+Host: app.exemplo.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+Origin: https://app.exemplo.com
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+O `Sec-WebSocket-Accept` é o SHA-1 da chave do cliente concatenada a um GUID fixo, em Base64. Ele só prova que o servidor entende o protocolo; não é mecanismo de segurança. Depois do `101`, a mesma conexão TCP passa a transportar **frames** WebSocket. Os esquemas de URL são `ws://` e, com TLS, `wss://` (use sempre `wss` em produção).
+
+## Frames
+
+Cada mensagem é enviada em frames com um cabeçalho de 2 a 14 bytes. Tipos principais:
+
+| Tipo | Uso |
+| --- | --- |
+| Text | Mensagem em UTF-8 (geralmente JSON) |
+| Binary | Dados binários (Protobuf, áudio) |
+| Ping / Pong | Verificar se a conexão está viva |
+| Close | Encerrar com código e motivo |
+
+Frames enviados pelo cliente são mascarados com uma chave aleatória, uma proteção contra envenenamento de cache em proxies intermediários.
+
+## Exemplo
+
+```javascript
+const ws = new WebSocket("wss://app.exemplo.com/chat?sala=42");
+
+ws.onopen = () => ws.send(JSON.stringify({ tipo: "entrar", sala: 42 }));
+ws.onmessage = (ev) => mostrar(JSON.parse(ev.data));
+ws.onclose = (ev) => agendarReconexao(ev.code);
+```
+
+O protocolo não define o formato das mensagens nem semântica de salas, confirmação ou reenvio. Tudo isso é responsabilidade da sua aplicação, ou de uma biblioteca construída sobre WebSocket.
+
+## Escalando WebSockets
+
+O desafio não é o protocolo, é o **estado**: cada conexão fica presa a um servidor específico por horas.
+
+- **Muitas conexões por servidor:** use I/O assíncrono (event loop). Um servidor bem ajustado mantém centenas de milhares de conexões ociosas; ajuste limites de descritores de arquivo e memória por conexão.
+- **Roteamento entre servidores:** o usuário A está no servidor 1 e o B, no servidor 7. Para uma mensagem de A chegar a B, os servidores publicam num barramento (Redis Pub/Sub, Kafka, NATS) e cada um entrega às conexões locais.
+- **Registro de presença:** um armazenamento que diz em qual servidor cada usuário está conectado permite envio direcionado.
+- **Load balancer:** precisa suportar o `Upgrade` e timeouts longos. Como a conexão é longa, o balanceamento acontece só na conexão inicial; após um deploy ou escalonamento, a carga pode ficar desigual.
+
+```text
+Cliente A --wss--> [WS Servidor 1] --publica--> [ Barramento pub/sub ]
+                                                        |
+Cliente B <--wss-- [WS Servidor 7] <--assina------------+
+```
+
+## Confiabilidade
+
+- **Heartbeats:** pings periódicos detectam conexões mortas (TCP pode não perceber uma queda por minutos) e mantêm NATs e proxies abertos.
+- **Reconexão com backoff e jitter:** após um deploy, milhares de clientes reconectando ao mesmo tempo causam um "thundering herd".
+- **Retomada:** numere as mensagens; ao reconectar, o cliente informa o último número recebido e busca o que faltou via API. O WebSocket em si não garante nada após a queda.
+- **Backpressure:** se o cliente é lento, o buffer de envio cresce. Defina limites e descarte ou desconecte.
+
+<Callout type="warning" title="Segurança">
+Browsers não aplicam CORS ao WebSocket. Valide o cabeçalho Origin no handshake para evitar sequestro de conexão entre sites, autentique na abertura (cookie ou token de uso único) e valide cada mensagem recebida como se fosse uma requisição independente.
+</Callout>
+
+## Quando usar
+
+| Caso | Melhor opção |
+| --- | --- |
+| Chat, jogos, colaboração em tempo real | WebSocket |
+| Servidor só envia atualizações | SSE |
+| Atualizações raras | Long polling ou polling |
+| Áudio e vídeo entre usuários | WebRTC |
+
+## Na entrevista
+
+No design de chat ou colaboração, proponha um gateway de WebSocket stateful separado dos serviços stateless, com pub/sub para roteamento entre servidores e um serviço de presença. Mencione heartbeats, reconexão com retomada e drenagem de conexões em deploys. Follow-ups comuns: quantas conexões por servidor, como entregar mensagens a usuários offline (armazenar e enviar push) e como garantir ordem dentro de uma conversa.
+
+<QuizSet>
+<Quiz question="Qual código HTTP o servidor retorna para aceitar o upgrade para WebSocket?" options={["200 OK", "101 Switching Protocols", "204 No Content", "426 Upgrade Required"]} answer={1} explanation="O 101 confirma a troca de protocolo; a partir daí a conexão TCP passa a transportar frames WebSocket." />
+<Quiz question="Usuários de um chat estão conectados a servidores WebSocket diferentes. Como entregar uma mensagem de um para o outro?" options={["Usar sticky sessions para todos ficarem no mesmo servidor", "Publicar a mensagem num barramento pub/sub assinado por todos os servidores, que entregam às conexões locais", "Pedir ao cliente que faça polling", "Abrir um WebSocket entre os dois browsers"]} answer={1} explanation="Cada servidor só conhece suas conexões. O barramento compartilhado leva a mensagem ao servidor em que o destinatário está conectado." />
+</QuizSet>

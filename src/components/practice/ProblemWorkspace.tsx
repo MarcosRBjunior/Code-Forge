@@ -40,7 +40,16 @@ function show(v: unknown) {
   return typeof v === "string" ? JSON.stringify(v) : JSON.stringify(v);
 }
 
-export function ProblemWorkspace({ chapterKey, problem }: { chapterKey: string; problem: ProblemSpec }) {
+export function ProblemWorkspace({
+  chapterKey,
+  problem,
+  allowRun = true,
+}: {
+  chapterKey: string;
+  problem: ProblemSpec;
+  /** false = modo "sem executar" da mock interview: o candidato valida exemplos de cabeça. */
+  allowRun?: boolean;
+}) {
   const [language, setLanguage] = useState<Language>("python");
   const [code, setCode] = useState<Record<Language, string>>(problem.starter);
   const [running, setRunning] = useState(false);
@@ -117,7 +126,7 @@ export function ProblemWorkspace({ chapterKey, problem }: { chapterKey: string; 
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
-        if (!running) run();
+        if (!running && allowRun) run();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -161,7 +170,7 @@ export function ProblemWorkspace({ chapterKey, problem }: { chapterKey: string; 
         <button
           type="button"
           onClick={run}
-          disabled={running}
+          disabled={running || !allowRun}
           aria-busy={running}
           title="Ctrl+Enter"
           className="rounded-md bg-accent px-3.5 py-1.5 text-sm font-medium text-fg-on-accent hover:bg-accent-hover disabled:opacity-60"
@@ -190,7 +199,13 @@ export function ProblemWorkspace({ chapterKey, problem }: { chapterKey: string; 
       </div>
 
       <div className="border-t border-line px-4 py-3 text-sm" aria-live="polite">
-        {!outcome && !running && <p className="text-fg-muted">Execute para rodar os {problem.tests.length} casos de teste.</p>}
+        {!outcome && !running && (
+          <p className="text-fg-muted">
+            {allowRun
+              ? `Execute para rodar os ${problem.tests.length} casos de teste.`
+              : "Modo sem executar: percorra os exemplos manualmente. Os testes rodam ao final da entrevista."}
+          </p>
+        )}
         {running && <p className="text-fg-muted">Rodando os testes…</p>}
         {outcome?.kind === "timeout" && <p className="font-medium text-danger">Tempo limite excedido (6 s). Verifique se há um laço infinito.</p>}
         {outcome?.kind === "error" && <p className="font-medium text-danger">{outcome.message}</p>}
