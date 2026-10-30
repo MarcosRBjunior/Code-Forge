@@ -3,11 +3,15 @@ title: Caching
 kind: lesson
 ---
 
-Um cache guarda o resultado de operações caras em um armazenamento mais rápido, para que leituras repetidas não precisem ir até a fonte original.
+Uma página de produto faz cinco consultas ao banco, cada uma levando 20 ms. Se mil pessoas pedem a mesma página por segundo, o banco refaz o mesmo trabalho mil vezes, e a latência e o custo sobem sem necessidade. Um cache guarda o resultado de operações caras em um armazenamento mais rápido, geralmente memória, para que leituras repetidas não precisem ir até a fonte original. Uma leitura em Redis leva menos de 1 ms, contra dezenas de milissegundos de um banco sob carga, e o cache ainda protege o banco de picos de tráfego.
+
+## Onde o cache mora
+
+Há camadas em série: o cache do navegador, uma CDN para conteúdo estático, um cache de aplicação (Redis ou Memcached) e o cache interno do próprio banco. Quanto mais perto do usuário, menor a latência, mas mais difícil manter o dado fresco.
 
 ## Estratégias de escrita
 
-- **Cache-aside:** a aplicação lê do cache; se não encontrar, lê do banco e grava no cache. É a mais comum.
+- **Cache-aside:** a aplicação lê do cache; se não encontrar (*miss*), lê do banco e grava no cache. É a mais comum, porque o cache só guarda o que realmente é pedido.
 - **Write-through:** toda escrita vai ao cache e ao banco ao mesmo tempo. Leituras sempre frescas, escritas mais lentas.
 - **Write-back:** a escrita vai só ao cache e é persistida depois. Rápida, mas pode perder dados se o cache cair.
 
@@ -28,3 +32,53 @@ def get_usuario(id):
 <Callout type="note" title="Políticas de remoção">
 Quando o cache enche, algo precisa sair. LRU remove o menos usado recentemente e é o padrão na maioria dos casos.
 </Callout>
+
+## Um LRU que roda
+
+Veja uma implementação mínima de cache com LRU e TTL, usando só a biblioteca padrão. O `OrderedDict` mantém a ordem de uso: o que foi acessado vai para o fim e o mais antigo sai pelo começo.
+
+```python
+import time
+from collections import OrderedDict
+
+class CacheLRU:
+    def __init__(self, capacidade, ttl):
+        self.capacidade, self.ttl = capacidade, ttl
+        self.dados = OrderedDict()
+
+    def get(self, chave):
+        item = self.dados.get(chave)
+        if item is None or item[1] < time.time():
+            self.dados.pop(chave, None)
+            return None
+        self.dados.move_to_end(chave)
+        return item[0]
+
+    def set(self, chave, valor):
+        self.dados[chave] = (valor, time.time() + self.ttl)
+        self.dados.move_to_end(chave)
+        if len(self.dados) > self.capacidade:
+            self.dados.popitem(last=False)
+
+c = CacheLRU(2, ttl=60)
+c.set("a", 1); c.set("b", 2); c.get("a"); c.set("c", 3)
+print(c.get("b"), c.get("a"))  # None 1
+```
+
+## Armadilhas
+
+- **Dado desatualizado:** com TTL longo, o usuário vê informação velha. Escolha o TTL pelo quanto de defasagem o negócio tolera.
+- **Cache stampede:** quando uma chave popular expira, centenas de requisições batem no banco ao mesmo tempo. Mitigue com um lock por chave, TTL com variação aleatória ou renovação antecipada.
+- **Cache frio:** logo após um deploy ou reinício, o cache está vazio e o banco recebe toda a carga. Considere aquecer as chaves mais quentes.
+- **Consistência:** entre a escrita no banco e a invalidação do cache existe uma janela em que leitores veem o valor antigo. Em dados críticos, como saldo bancário, prefira ler direto da fonte.
+- **Cache de ausências:** consultas por chaves inexistentes sempre falham no cache e martelam o banco. Guarde também o resultado vazio, com TTL curto.
+
+## Na entrevista
+
+Diga o que será cacheado e por quê: "leitura pesada, dado que muda pouco, tolera alguns segundos de defasagem". Escolha a estratégia (cache-aside é o padrão), o TTL, a política de remoção e como invalidar. Mencione a taxa de acerto (*hit ratio*) como métrica a acompanhar. Follow-ups: "o que acontece se o cache cair?" (o banco precisa suportar a carga ou degradar com elegância), "como evitar stampede?" e "como manter vários caches consistentes?".
+
+<QuizSet>
+<Quiz question="Na estratégia cache-aside, o que a aplicação faz quando ocorre um miss?" options={["Retorna erro ao usuário", "Lê do banco e grava o resultado no cache", "Apaga todo o cache", "Espera o TTL expirar"]} answer={1} explanation="No cache-aside a aplicação busca na fonte original e popula o cache para as próximas leituras." />
+<Quiz question="Qual risco é exclusivo do write-back?" options={["Leituras sempre frescas demais", "Perder escritas ainda não persistidas se o cache falhar", "Escritas lentas por gravar em dois lugares", "O cache nunca expirar"]} answer={1} explanation="No write-back a escrita fica só no cache até ser persistida depois, então uma queda antes disso perde dados." />
+<Quiz question="Como reduzir um cache stampede numa chave muito popular?" options={["Desligar o cache", "Usar lock por chave ou variar o TTL aleatoriamente", "Aumentar o número de colunas do banco", "Guardar tudo em write-back"]} answer={1} explanation="Um lock deixa só uma requisição recarregar o dado, e TTLs variados evitam que muitas chaves expirem juntas." />
+</QuizSet>
