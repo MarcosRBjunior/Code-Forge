@@ -4,11 +4,12 @@ import remarkGfm from "remark-gfm";
 import rehypeSlug from "rehype-slug";
 import rehypePrettyCode from "rehype-pretty-code";
 import { rehypeBlockIds } from "./rehype-block-ids";
+import { Animation } from "@/components/mdx/Animation";
 import { Callout } from "@/components/mdx/Callout";
 import { Quiz } from "@/components/mdx/Quiz";
 import { QuizSet } from "@/components/mdx/QuizSet";
 
-const components = { Callout, Quiz, QuizSet };
+const components = { Animation, Callout, Quiz, QuizSet };
 
 /** Compila o MDX do capítulo no servidor (no build, para páginas estáticas). */
 export async function renderChapter(source: string) {

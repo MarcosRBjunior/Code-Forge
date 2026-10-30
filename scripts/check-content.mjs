@@ -11,7 +11,7 @@ import { compile } from "@mdx-js/mdx";
 import remarkGfm from "remark-gfm";
 
 const ROOT = path.join(process.cwd(), "content", "courses");
-const ALLOWED = new Set(["Callout", "Quiz", "QuizSet"]);
+const ALLOWED = new Set(["Animation", "Callout", "Quiz", "QuizSet"]);
 const KINDS = new Set(["lesson", "problem", "quiz"]);
 
 function allFiles() {
