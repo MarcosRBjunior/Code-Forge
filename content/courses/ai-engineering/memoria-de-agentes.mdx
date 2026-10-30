@@ -1,0 +1,129 @@
+---
+title: Memória de agentes
+kind: lesson
+---
+
+O modelo não lembra de nada entre chamadas. Tudo o que parece memória num assistente, desde "como eu disse antes" até "você prefere respostas curtas, certo?", é a sua aplicação decidindo o que guardar e o que colocar de volta no contexto. Sem um desenho deliberado, você cai em um de dois extremos: o assistente esquece o que o usuário disse há dez mensagens, ou você reenvia o histórico inteiro até estourar a janela e a conta.
+
+## Tipos de memória
+
+| Tipo | O que guarda | Onde costuma ficar | Exemplo |
+| --- | --- | --- | --- |
+| Curto prazo (trabalho) | A conversa e os passos da tarefa atual | No próprio contexto | Últimas mensagens, resultados de ferramentas |
+| Longo prazo semântica | Fatos sobre o usuário ou o domínio | Banco chave-valor, documento ou vetorial | "Prefere respostas em inglês", "trabalha com Go" |
+| Longo prazo episódica | O que aconteceu em sessões passadas | Resumos indexados por data e assunto | "Em março resolvemos o erro de deploy trocando a região" |
+| Procedimental | Como fazer as coisas | Instruções e prompts atualizados | "Neste repositório, rode os testes com make test" |
+
+## Memória de curto prazo: caber na janela
+
+A conversa cresce sem parar. As estratégias clássicas são janela deslizante (manter as N últimas mensagens), resumo progressivo (comprimir as antigas num parágrafo que fica no início) e descarte seletivo (remover resultados volumosos de ferramentas já usados). O resumo preserva o essencial e libera espaço, mas perde detalhes: um número de pedido citado há 30 mensagens pode sumir.
+
+```python
+def contar(msg):
+    return len(msg.split())
+
+def resumir(mensagens):
+    # no lugar de um LLM: guarda só as frases marcadas como importantes
+    fatos = [m.split("!")[1].strip() for m in mensagens if "!" in m]
+    return "RESUMO: " + "; ".join(fatos) if fatos else "RESUMO: conversa sem fatos relevantes"
+
+class MemoriaCurta:
+    def __init__(self, limite_palavras):
+        self.limite, self.resumo, self.msgs = limite_palavras, "", []
+
+    def adicionar(self, msg):
+        self.msgs.append(msg)
+        while sum(map(contar, self.msgs)) > self.limite and len(self.msgs) > 2:
+            antigas, self.msgs = self.msgs[:2], self.msgs[2:]
+            anteriores = [self.resumo.replace("RESUMO:", "!")] if self.resumo else []
+            self.resumo = resumir(anteriores + antigas)
+
+    def contexto(self):
+        return ([self.resumo] if self.resumo else []) + self.msgs
+
+mem = MemoriaCurta(limite_palavras=20)
+for m in [
+    "usuário: oi, preciso de ajuda com meu pedido",
+    "usuário: importante! pedido A-981",
+    "assistente: claro, vou verificar o pedido",
+    "usuário: chegou com a caixa amassada",
+    "usuário: importante! quer troca e não reembolso",
+    "assistente: entendi, vou abrir a troca agora",
+]:
+    mem.adicionar(m)
+for linha in mem.contexto():
+    print(linha)
+```
+
+```text
+Saída:
+RESUMO: pedido A-981
+usuário: importante! quer troca e não reembolso
+assistente: entendi, vou abrir a troca agora
+```
+
+## Memória de longo prazo: escrever e recuperar
+
+Memória persistente tem duas metades:
+
+- **Escrita:** decidir o que vale guardar. Pode ser explícita (o agente tem uma ferramenta "lembrar") ou um processo em segundo plano que, ao fim da sessão, extrai fatos com um LLM. Precisa lidar com **atualização**: se o usuário mudou de cidade, o fato antigo deve ser substituído, não somado.
+- **Leitura:** a cada nova conversa, buscar as memórias relevantes e inserir no contexto. A pontuação costuma combinar relevância (similaridade com a mensagem), recência e importância.
+
+```python
+import math
+
+class MemoriaLonga:
+    def __init__(self):
+        self.fatos = {}  # chave -> (valor, dia em que foi gravado, importância)
+
+    def lembrar(self, chave, valor, dia, importancia=1.0):
+        self.fatos[chave] = (valor, dia, importancia)   # sobrescreve: atualização
+
+    def recuperar(self, consulta, hoje, k=2, meia_vida=30):
+        termos = set(consulta.lower().split())
+        pontuados = []
+        for chave, (valor, dia, imp) in self.fatos.items():
+            relevancia = len(termos & set(f"{chave} {valor}".lower().split()))
+            if relevancia == 0:
+                continue
+            recencia = math.exp(-math.log(2) * (hoje - dia) / meia_vida)
+            pontuados.append((round(relevancia * recencia * imp, 3), chave, valor))
+        return sorted(pontuados, reverse=True)[:k]
+
+mem = MemoriaLonga()
+mem.lembrar("cidade", "mora em Recife", dia=1)
+mem.lembrar("linguagem", "programa em Go no trabalho", dia=10, importancia=1.5)
+mem.lembrar("cidade", "mora em Curitiba", dia=80)          # mudou-se
+mem.lembrar("restaurante", "é vegetariano", dia=85)
+
+print(mem.recuperar("onde ele mora", hoje=90))
+print(mem.recuperar("sugira um restaurante onde ele mora", hoje=90, k=3))
+```
+
+```text
+Saída:
+[(0.794, 'cidade', 'mora em Curitiba')]
+[(0.891, 'restaurante', 'é vegetariano'), (0.794, 'cidade', 'mora em Curitiba')]
+```
+
+O fato "mora em Recife" foi substituído, e a busca combina a relevância textual com o decaimento por idade. Em produção, a relevância viria de embeddings, e a extração e a consolidação dos fatos, de um LLM.
+
+<Callout type="warning" title="Memória é dado pessoal">
+O que o agente lembra sobre um usuário está sujeito a leis de proteção de dados (como a LGPD). Mostre ao usuário o que foi guardado, permita apagar, isole memórias por usuário e tenant e nunca deixe a memória de um vazar para outro. Memórias também são vetor de injeção: um texto malicioso gravado hoje é instrução amanhã.
+</Callout>
+
+## Armadilhas
+
+- **Guardar tudo:** a memória vira ruído, e fatos irrelevantes poluem o contexto de toda conversa.
+- **Fatos contraditórios:** sem atualização, o agente recebe "mora em Recife" e "mora em Curitiba" juntos.
+- **Memória que nunca expira:** preferências mudam; use decaimento, datas e revisão.
+- **Resumo como única fonte:** guarde também o histórico bruto em armazenamento barato, para auditoria e para reprocessar.
+
+## Na entrevista
+
+Separe curto prazo (gestão do contexto: janela, resumo, descarte) de longo prazo (fatos e episódios persistidos, com políticas de escrita, atualização, recuperação e expiração). Fale de privacidade e isolamento. Follow-ups: "como evitar que o resumo perca dados importantes?" (extrair entidades e fatos estruturados separadamente do resumo em prosa) e "como decidir o que vai para a memória longa?" (critérios de importância, confirmação do usuário para dados sensíveis, deduplicação e atualização por chave).
+
+<QuizSet>
+<Quiz question="O usuário disse no começo de uma conversa longa que o pedido é A-981 e, 40 mensagens depois, o assistente não sabe mais o número. A janela é deslizante, só com as últimas 20 mensagens. O que resolve melhor?" options={["Aumentar a temperatura", "Extrair e manter fatos-chave (como ids) num bloco fixo do contexto, além de resumir o histórico", "Trocar de modelo de embedding", "Reduzir a janela para 10 mensagens"]} answer={1} explanation="Janela deslizante descarta o início. Manter entidades importantes separadas, num bloco persistente, evita perdê-las." />
+<Quiz question="A memória de longo prazo devolve 'mora em Recife' e 'mora em Curitiba' para o mesmo usuário. Qual o problema de desenho?" options={["Falta de embeddings", "A escrita só acrescenta fatos, sem atualizar ou consolidar informações sobre a mesma chave", "A temperatura é baixa", "O contexto é pequeno"]} answer={1} explanation="Memória precisa de operação de atualização (ou consolidação periódica) para que fatos novos substituam os antigos." />
+</QuizSet>

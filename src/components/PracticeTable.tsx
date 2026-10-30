@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import type { PracticeList } from "@/lib/practice-lists";
 import { Fragment, useEffect, useMemo, useState } from "react";
 
 export interface PracticeProblem {
@@ -25,8 +26,17 @@ const DIFF = {
 
 const input = "rounded-md border border-line-input bg-surface-1 px-2.5 py-1.5 text-sm";
 
-export function PracticeTable({ problems }: { problems: PracticeProblem[] }) {
+export function PracticeTable({ problems: allProblems, lists }: { problems: PracticeProblem[]; lists: PracticeList[] }) {
   const router = useRouter();
+  const params = useSearchParams();
+  const listId = params.get("lista") ?? "";
+  const activeList = lists.find((l) => l.id === listId);
+  const problems = useMemo(() => {
+    if (!activeList) return allProblems;
+    const order = new Map(activeList.keys.map((k, i) => [k, i]));
+    return allProblems.filter((p) => order.has(p.key));
+  }, [allProblems, activeList]);
+  const chooseList = (id: string) => router.replace(id ? `/practice?lista=${id}` : "/practice", { scroll: false });
   const [solved, setSolved] = useState<Set<string>>(new Set());
   const [starred, setStarred] = useState<Set<string>>(new Set());
   const [q, setQ] = useState("");
@@ -75,6 +85,33 @@ export function PracticeTable({ problems }: { problems: PracticeProblem[] }) {
 
   return (
     <>
+      {/* Listas por prazo */}
+      <div className="mt-6 grid gap-3 sm:grid-cols-3" role="radiogroup" aria-label="Lista de problemas">
+        {[{ id: "", title: "Todos os problemas", period: "sem prazo", description: "Tudo, com os filtros abaixo.", keys: allProblems.filter((p) => p.available).map((p) => p.key) }, ...lists].map((l) => {
+          const done = l.keys.filter((k) => solved.has(k)).length;
+          const selected = (activeList?.id ?? "") === l.id;
+          return (
+            <button
+              key={l.id || "todos"}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              onClick={() => chooseList(l.id)}
+              className={`rounded-lg border p-3 text-left transition hover:bg-surface-2 ${selected ? "border-accent bg-accent-soft" : "border-line bg-surface-1"}`}
+            >
+              <span className="flex items-baseline justify-between gap-2">
+                <span className="font-medium">{l.title}</span>
+                <span className="text-xs text-fg-subtle">{l.period}</span>
+              </span>
+              <span className="mt-1 block text-xs text-fg-muted">{l.description}</span>
+              <span className="mt-2 block text-xs tabular-nums text-fg-muted">
+                {done} de {l.keys.length} resolvidos
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
       {/* Progresso por dificuldade */}
       <div className="mt-6 grid gap-3 sm:grid-cols-3">
         {(Object.keys(DIFF) as Array<keyof typeof DIFF>).map((d) => {

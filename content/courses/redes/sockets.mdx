@@ -1,0 +1,161 @@
+---
+title: Programando com sockets
+kind: lesson
+---
+
+Todo framework web, driver de banco e cliente de fila termina nas mesmas poucas chamadas de sistema: `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv` e `close`. Conhecê-las explica erros que aparecem em produção ("address already in use", "connection reset by peer", mensagens cortadas ao meio) e aparece em entrevistas quando pedem um servidor de chat, um proxy ou um rate limiter de conexões.
+
+## O ciclo de vida
+
+```text
+servidor                                  cliente
+socket()                                  socket()
+bind(127.0.0.1, porta)
+listen(backlog)
+accept()  ... bloqueia ...
+          <------- 3-way handshake ------ connect(ip, porta)
+accept() devolve um socket NOVO
+recv() <------------- dados ------------- sendall()
+sendall() ----------- dados ------------> recv()
+close()   ------------ FIN -------------> recv() devolve b""
+```
+
+O ponto que mais confunde: o socket que escuta nunca troca dados. Cada `accept` devolve um socket novo, um por conexão, identificado pela quádrupla de endereços. O `listen` só define o tamanho da fila de conexões já completadas pelo kernel que ainda não foram aceitas pela aplicação. Se ela enche, novos clientes esperam ou falham.
+
+## Um servidor TCP mínimo
+
+```python
+import socket, threading
+
+def servidor(sock):
+    conn, addr = sock.accept()
+    with conn:
+        while True:
+            dados = conn.recv(1024)
+            if not dados:          # b"" significa que o cliente fechou (FIN)
+                break
+            conn.sendall(dados.upper())
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 0))         # porta 0: o SO escolhe uma livre
+srv.listen(8)
+porta = srv.getsockname()[1]
+t = threading.Thread(target=servidor, args=(srv,))
+t.start()
+
+with socket.create_connection(("127.0.0.1", porta), timeout=5) as cli:
+    for msg in (b"ola", b"sockets"):
+        cli.sendall(msg)
+        print("eco:", cli.recv(1024).decode())
+
+t.join()
+srv.close()
+print("servidor encerrado")
+```
+
+```text
+Saída:
+eco: OLA
+eco: SOCKETS
+servidor encerrado
+```
+
+Três detalhes de produção estão aí. `SO_REUSEADDR` permite reabrir a porta logo após reiniciar o processo, mesmo com conexões antigas em TIME_WAIT. `sendall` repete `send` até enviar tudo, porque `send` pode aceitar só parte do buffer. E o `timeout` evita que um cliente fique pendurado para sempre esperando um servidor mudo.
+
+## TCP é um fluxo, não mensagens
+
+Este é o bug número um de quem começa: o TCP não preserva fronteiras. Dois `sendall` podem chegar num único `recv`, e um `sendall` grande pode chegar picado em vários. Neste exemplo funcionou porque cada mensagem esperou a resposta antes da próxima. A aplicação precisa de **framing**: um delimitador (como o `\r\n` do HTTP/1.1) ou um prefixo de tamanho.
+
+```python
+import socket, struct, threading
+
+def enviar(sock, msg: bytes):
+    sock.sendall(struct.pack("!I", len(msg)) + msg)
+
+def receber_exato(sock, n):
+    buf = b""
+    while len(buf) < n:
+        parte = sock.recv(n - len(buf))
+        if not parte:
+            raise ConnectionError("conexao fechada no meio da mensagem")
+        buf += parte
+    return buf
+
+def receber(sock):
+    (tam,) = struct.unpack("!I", receber_exato(sock, 4))
+    return receber_exato(sock, tam)
+
+a, b = socket.socketpair()
+msgs = [b"primeira", b"x" * 100_000, b"ultima"]
+t = threading.Thread(target=lambda: [enviar(a, m) for m in msgs])
+t.start()
+for _ in msgs:
+    m = receber(b)
+    print(len(m), "bytes:", m[:8].decode())
+t.join()
+a.close()
+b.close()
+```
+
+```text
+Saída:
+8 bytes: primeira
+100000 bytes: xxxxxxxx
+6 bytes: ultima
+```
+
+As três mensagens foram escritas de uma vez, sem esperar resposta, e mesmo assim saíram separadas corretamente. A mensagem de 100 mil bytes certamente chegou em vários pedaços, e `receber_exato` os juntou.
+
+## UDP: datagramas
+
+Com UDP não há `listen` nem `accept`: um socket só recebe datagramas de qualquer origem com `recvfrom`, que devolve também o endereço de quem mandou. Cada `sendto` vira exatamente um datagrama, então as fronteiras são preservadas, mas nada garante entrega nem ordem.
+
+```python
+import socket
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+srv.bind(("127.0.0.1", 0))
+cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+cli.settimeout(2)
+
+for i in range(3):
+    cli.sendto(f"ping {i}".encode(), srv.getsockname())
+for _ in range(3):
+    dados, origem = srv.recvfrom(2048)
+    srv.sendto(dados.replace(b"ping", b"pong"), origem)
+    print("servidor recebeu", dados.decode(), "| cliente:", cli.recv(2048).decode())
+srv.close()
+cli.close()
+```
+
+```text
+Saída:
+servidor recebeu ping 0 | cliente: pong 0
+servidor recebeu ping 1 | cliente: pong 1
+servidor recebeu ping 2 | cliente: pong 2
+```
+
+## Escalando para muitas conexões
+
+| Modelo | Como funciona | Limite |
+| --- | --- | --- |
+| Uma thread por conexão | Simples, código bloqueante | Memória e trocas de contexto com milhares de clientes |
+| Pool de threads | Reaproveita threads | Conexões lentas prendem o pool |
+| I/O não bloqueante + `epoll`/`kqueue` | Um laço de eventos atende milhares | Código assíncrono, cuidado com tarefas que bloqueiam |
+
+Nginx, Node.js, Netty e `asyncio` usam o terceiro modelo. Em Python, `selectors` expõe o mecanismo do sistema operacional de forma portátil.
+
+<Callout type="warning" title="Erros que você vai ver">
+ECONNREFUSED: nada escutando na porta, o kernel respondeu RST. ECONNRESET: o outro lado abortou a conexão, por exemplo porque o processo morreu ou fechou com dados não lidos. EADDRINUSE: outro socket já fez bind na porta. Timeout: pacotes sumindo, geralmente firewall descartando em silêncio.
+</Callout>
+
+## Na entrevista
+
+Ao desenhar um servidor, diga como você faz framing, como trata envio parcial, timeouts e desconexões, e qual modelo de concorrência usa. Follow-ups: "por que meu cliente às vezes recebe duas mensagens grudadas?" (TCP é fluxo; use prefixo de tamanho) e "como atender 100 mil conexões ociosas?" (I/O orientado a eventos com `epoll`, não uma thread por conexão; atenção ao limite de descritores de arquivo).
+
+<QuizSet>
+<Quiz question="O cliente faz dois send de 10 bytes e o servidor faz um recv(1024). O que pode acontecer?" options={["Sempre recebe só os 10 primeiros bytes", "Pode receber os 20 bytes juntos, ou só parte deles", "Recebe um erro por mensagem misturada", "O segundo send bloqueia até o recv"]} answer={1} explanation="TCP entrega um fluxo de bytes sem fronteiras; quem define onde termina cada mensagem é o protocolo da aplicação." />
+<Quiz question="O que o recv devolve quando o outro lado fecha a conexão de forma ordenada?" options={["Uma exceção", "None", "Bytes vazios (b'')", "O último dado recebido de novo"]} answer={2} explanation="O FIN faz o recv devolver b'' (zero bytes), sinal de fim de fluxo." />
+<Quiz question="Para que serve o socket devolvido por accept?" options={["Escutar novas conexões", "Conversar com aquele cliente específico", "Enviar datagramas UDP", "Configurar o backlog"]} answer={1} explanation="O socket de escuta só aceita conexões; cada accept cria um socket dedicado a uma conexão." />
+</QuizSet>

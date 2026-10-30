@@ -1,0 +1,156 @@
+---
+title: Assistente de chat em escala
+kind: lesson
+---
+
+"Projete um assistente de chat de uso geral, como os grandes produtos de consumo" é a pergunta de GenAI mais comum em entrevistas. Ela parece simples porque todo mundo já usou um, mas toca em quase todos os blocos do curso: servir modelos, streaming, histórico, contexto longo, custo, segurança e avaliação. O segredo é não tentar cobrir tudo com a mesma profundidade e escolher bem onde aprofundar.
+
+## Requisitos
+
+### Funcionais
+
+- O usuário cria conversas e troca mensagens com o assistente; respostas chegam em streaming.
+- Histórico de conversas listável, com título gerado automaticamente.
+- O usuário pode parar a geração, regenerar uma resposta e editar a última mensagem.
+- Anexar arquivos de texto curtos à conversa.
+- Planos gratuito e pago, com limites diferentes de uso e acesso a modelos.
+
+### Não funcionais
+
+- TTFT p95 abaixo de 1 segundo; geração fluida, acima da velocidade de leitura.
+- Alta disponibilidade: se um modelo ou provedor falhar, o chat continua, ainda que degradado.
+- Histórico durável: mensagens confirmadas nunca se perdem.
+- Custo por usuário compatível com a receita do plano.
+- Segurança: moderação de entrada e saída, isolamento total entre usuários.
+
+## Estimativas
+
+Todos os números são hipotéticos, para mostrar o raciocínio.
+
+```python
+import math
+
+dau = 20_000_000
+msgs_por_dia = 10                # mensagens do usuario por dia
+turnos_por_conversa = 6
+sistema, msg_media, resp_media = 800, 120, 450
+max_hist = 6_000                 # teto de historico enviado ao modelo
+
+# entrada media por turno: o historico cresce ate o teto
+entradas = []
+for turno in range(turnos_por_conversa):
+    hist = min(turno * (msg_media + resp_media), max_hist)
+    entradas.append(sistema + hist + msg_media)
+ent_media = sum(entradas) / len(entradas)
+
+req_s = dau * msgs_por_dia / 86_400
+pico = req_s * 3
+print(f"entrada media por turno: {ent_media:.0f} tokens")
+print(f"requisicoes/s: media {req_s:,.0f}, pico {pico:,.0f}")
+print(f"tokens de saida/s no pico: {pico * resp_media / 1e6:.2f} M")
+
+# GPUs (hipotese: replica de 4 GPUs sustenta 3.000 tok/s de saida a 65% de uso)
+replicas = math.ceil(pico * resp_media / (3_000 * 0.65))
+print(f"replicas: {replicas:,}  GPUs: {replicas * 4:,}")
+
+# streams abertos (Lei de Little) e armazenamento de mensagens
+dur_s = 0.6 + resp_media / 40
+print(f"streams simultaneos no pico: {pico * dur_s / 1e3:,.0f} mil")
+bytes_dia = dau * msgs_por_dia * (msg_media + resp_media) * 4
+print(f"historico: {bytes_dia / 1e12:.2f} TB/dia, {bytes_dia * 365 / 1e15:.2f} PB/ano")
+```
+
+```text
+Saída:
+entrada media por turno: 2345 tokens
+requisicoes/s: media 2,315, pico 6,944
+tokens de saida/s no pico: 3.12 M
+replicas: 1,603  GPUs: 6,412
+streams simultaneos no pico: 82 mil
+historico: 0.46 TB/dia, 0.17 PB/ano
+```
+
+Os números mostram onde está a dificuldade: milhões de tokens de saída por segundo no pico exigem milhares de GPUs, e o custo de inferência supera de longe o de armazenamento e banda. O histórico, embora grande, é um problema conhecido de banco de dados.
+
+## API
+
+```text
+POST   /conversas                              -> { id }
+GET    /conversas?cursor=...                   lista com titulos
+GET    /conversas/:id/mensagens?cursor=...
+POST   /conversas/:id/mensagens                corpo: texto, anexos, modelo
+       resposta: text/event-stream (eventos: inicio, delta, fim, erro)
+POST   /conversas/:id/mensagens/:mid/parar
+POST   /conversas/:id/mensagens/:mid/regenerar
+```
+
+O POST de mensagem devolve o stream SSE diretamente. Cada resposta recebe um `mensagem_id` no evento de início, que o cliente usa para parar ou para reconectar.
+
+## Arquitetura
+
+```text
+ cliente --HTTPS/SSE--> API gateway (auth, rate limit por plano)
+                            |
+                     servico de chat ------> banco de conversas (particionado por usuario)
+                            |                 cache de conversas recentes
+                            v
+                      orquestrador ---------> moderacao de entrada
+                       |  monta contexto       memoria do usuario
+                       |  (orcamento)          registro de prompts
+                       v
+                  gateway de modelos --+--> pool interativo (modelo grande)
+                   roteamento, cotas,  +--> pool interativo (modelo pequeno)
+                   fallback            '--> provedor externo (fallback)
+                       |
+                       v
+                  moderacao de saida (janelas)
+                       |
+            fila de eventos --> titulos, resumos de historico, metricas, avaliacao
+```
+
+## Componentes em detalhe
+
+### Serviço de chat e histórico
+
+O banco de conversas é particionado por `usuario_id`, já que quase todas as consultas são "minhas conversas" e "mensagens desta conversa". Um banco de colunas largas ou relacional particionado funciona bem. A mensagem do usuário é gravada antes de chamar o modelo; a resposta é gravada ao final do stream, com status `completa`, `parada` ou `erro`, mais modelo, versão do prompt e tokens. Durante a geração, os deltas ficam num buffer em memória distribuída para permitir reconexão.
+
+### Orquestrador e contexto
+
+O orquestrador monta o prompt com orçamento: instruções fixas no início (aproveitando cache de prefixo), memória do usuário, resumo dos turnos antigos, últimos turnos literais, anexos e a mensagem atual. O resumo é atualizado de forma assíncrona após cada resposta, para não somar latência. Títulos de conversa são gerados por um modelo pequeno, também assíncrono.
+
+### Gateway e servidores de inferência
+
+O gateway aplica cotas por plano em tokens, roteia (plano gratuito usa o modelo pequeno por padrão; tarefas difíceis no pago usam o grande) e mantém a cadeia de fallback. Os pools interativos usam batching contínuo com batches moderados, priorizando TTFT e tempo por token. O cancelamento do cliente é propagado até o servidor de inferência para liberar o slot.
+
+### Segurança
+
+Moderação de entrada por regras e classificador pequeno; moderação de saída em janelas durante o stream. O isolamento entre usuários é garantido no nível de dados: o orquestrador só lê conversas e memória do usuário autenticado, e nenhum cache de resposta é compartilhado entre usuários.
+
+<Callout type="tip" title="Escolha dois aprofundamentos">
+Com 45 minutos, aprofunde em servir o modelo com baixa latência e em gestão de contexto e histórico. Mencione os demais (moderação, avaliação, custo) em uma ou duas frases cada.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Ponto | Opção A | Opção B |
+| --- | --- | --- |
+| Histórico enviado ao modelo | Completo: melhor memória, caro | Janela mais resumo: barato, perde detalhes |
+| Moderação de saída | Ao final: segura, mata o streaming | Em janelas: fluida, pode precisar retirar texto |
+| Hospedagem | Provedor: rápido de lançar | Própria: custo menor em escala, operação pesada |
+| Batch | Grande: custo por token menor | Pequeno: latência melhor |
+
+- **Picos de tráfego:** quando a fila cresce, o gateway degrada o plano gratuito para o modelo pequeno e respostas mais curtas antes de recusar.
+- **Falha de região:** pools em várias regiões; o histórico é replicado e a conversa continua em outra região.
+- **Regenerar e editar:** criam um ramo da conversa; modele mensagens com `pai_id` para suportar árvores.
+
+## Follow-ups
+
+- **Como medir qualidade?** Polegar para cima ou para baixo, taxa de regeneração, conjunto de avaliação offline e comparação lado a lado em canários.
+- **Como adicionar busca na web?** Uma ferramenta chamada pelo orquestrador, com resultados tratados como dados não confiáveis e citados na resposta.
+- **Como suportar memória entre conversas?** Extração assíncrona de fatos estáveis, revisável pelo usuário, recuperada por relevância.
+- **E se o provedor principal cair?** Circuit breaker no gateway e fallback para outro modelo, com aviso discreto de qualidade reduzida.
+
+<QuizSet>
+<Quiz question="Por que gravar a mensagem do usuário antes de chamar o modelo e a resposta só ao final do stream?" options={["Para economizar espaço", "Para que a mensagem nunca se perca, mesmo se a geração falhar, e a resposta seja gravada uma vez com status e métricas", "Porque o modelo exige", "Para acelerar o TTFT"]} answer={1} explanation="A mensagem do usuário é o dado que não pode sumir; a resposta, gerada aos poucos, é persistida completa ou marcada como parada ou com erro." />
+<Quiz question="No pico, a fila de inferência cresce e o TTFT passa de 5 segundos. Qual a primeira medida sem novo hardware?" options={["Recusar todas as requisições", "Degradar o plano gratuito para o modelo pequeno e limitar o tamanho das respostas", "Desligar o streaming", "Aumentar o histórico enviado"]} answer={1} explanation="Degradação por plano reduz a carga no pool mais disputado mantendo o produto disponível." />
+</QuizSet>

@@ -1,0 +1,217 @@
+---
+title: O problema leitores-escritores
+kind: lesson
+---
+
+Um recurso compartilhado, como uma tabela de configuração, um índice em memória ou um cache, é lido o tempo todo e alterado de vez em quando. Um mutex comum resolve a corretude, mas serializa também as leituras, que poderiam rodar juntas sem risco. O **problema leitores-escritores** pergunta: como permitir muitos leitores simultâneos, garantir que um escritor trabalhe sozinho e, ao mesmo tempo, decidir **quem tem prioridade** quando os dois lados disputam o recurso?
+
+As regras de segurança são fixas:
+
+- Vários leitores podem estar dentro ao mesmo tempo.
+- Um escritor exige exclusividade: nenhum outro escritor e nenhum leitor.
+
+O que muda entre as variantes clássicas é a política de justiça, e é aí que mora a pergunta de entrevista.
+
+## As três variantes
+
+```text
+tempo ->
+R1 [=========lendo=========]
+W        chega e espera....
+R2            chega
+                ├─ prioridade a leitores:   R2 entra já; W espera R1 e R2 (e quem mais vier)
+                ├─ prioridade a escritores: R2 espera; W entra assim que R1 sai
+                └─ justa (ordem de chegada): W, depois R2
+```
+
+**Prioridade a leitores.** Um leitor só espera se houver um escritor *ativo*. É a mais simples e maximiza a vazão de leituras, mas com fluxo contínuo de leitores o escritor pode nunca entrar: **starvation de escritores**.
+
+**Prioridade a escritores.** Um leitor novo espera se houver escritor ativo *ou aguardando*. O dado atualizado aparece rápido, mas uma rajada de escritas pode deixar leitores famintos.
+
+**Justa.** Leitores e escritores passam por uma "catraca" em ordem de chegada. Ninguém passa fome, ao custo de um pouco menos de paralelismo entre leituras.
+
+O programa abaixo implementa as duas primeiras com uma `Condition` e reproduz o cenário do diagrama de forma determinística: o fluxo principal só avança quando o escritor e o segundo leitor já estão na posição esperada.
+
+```python
+import threading
+import time
+
+class RWLock:
+    def __init__(self, prioridade):
+        self.prioridade = prioridade
+        self.cond = threading.Condition()
+        self.leitores = 0
+        self.escrevendo = False
+        self.escritores_esperando = 0
+        self.leitores_esperando = 0
+
+    def adquirir_leitura(self):
+        with self.cond:
+            self.leitores_esperando += 1
+            while self.escrevendo or (self.prioridade == "escritores" and self.escritores_esperando > 0):
+                self.cond.wait()
+            self.leitores_esperando -= 1
+            self.leitores += 1
+
+    def liberar_leitura(self):
+        with self.cond:
+            self.leitores -= 1
+            if self.leitores == 0:
+                self.cond.notify_all()
+
+    def adquirir_escrita(self):
+        with self.cond:
+            self.escritores_esperando += 1
+            while self.escrevendo or self.leitores > 0:
+                self.cond.wait()
+            self.escritores_esperando -= 1
+            self.escrevendo = True
+
+    def liberar_escrita(self):
+        with self.cond:
+            self.escrevendo = False
+            self.cond.notify_all()
+
+def esperar_ate(condicao):
+    while not condicao():
+        time.sleep(0.001)
+
+def cenario(prioridade):
+    rw = RWLock(prioridade)
+    log = []
+    r1_dentro, solta_r1 = threading.Event(), threading.Event()
+
+    def r1():
+        rw.adquirir_leitura()
+        log.append("R1 le")
+        r1_dentro.set()
+        solta_r1.wait()
+        log.append("R1 sai")
+        rw.liberar_leitura()
+
+    def w():
+        rw.adquirir_escrita()
+        log.append("W escreve")
+        rw.liberar_escrita()
+
+    def r2():
+        rw.adquirir_leitura()
+        log.append("R2 le")
+        rw.liberar_leitura()
+
+    ts = [threading.Thread(target=f) for f in (r1, w, r2)]
+    ts[0].start(); r1_dentro.wait()
+    ts[1].start(); esperar_ate(lambda: rw.escritores_esperando == 1)
+    ts[2].start(); esperar_ate(lambda: "R2 le" in log or rw.leitores_esperando == 1)
+    solta_r1.set()
+    for t in ts:
+        t.join()
+    print(f"prioridade a {prioridade}: " + " -> ".join(log))
+
+cenario("leitores")
+cenario("escritores")
+```
+
+```text
+Saída:
+prioridade a leitores: R1 le -> R2 le -> R1 sai -> W escreve
+prioridade a escritores: R1 le -> R1 sai -> W escreve -> R2 le
+```
+
+Repare: com prioridade a leitores, R2 "furou a fila" do escritor. Agora imagine leitores chegando sem parar; W nunca escreve.
+
+## A solução justa com catraca
+
+Na versão justa, todo mundo passa por um mutex de entrada. O leitor atravessa e solta na hora; o escritor **segura a catraca** enquanto espera os leitores ativos saírem, então quem chega depois fica atrás dele.
+
+```python
+import threading
+
+class RWJusto:
+    def __init__(self):
+        self.catraca = threading.Lock()
+        self.cond = threading.Condition()
+        self.leitores = 0
+
+    def adquirir_leitura(self):
+        with self.catraca:          # passa pela catraca e solta
+            with self.cond:
+                self.leitores += 1
+
+    def liberar_leitura(self):
+        with self.cond:
+            self.leitores -= 1
+            if self.leitores == 0:
+                self.cond.notify_all()
+
+    def adquirir_escrita(self):
+        self.catraca.acquire()      # bloqueia novos leitores e escritores
+        with self.cond:
+            while self.leitores > 0:
+                self.cond.wait()
+
+    def liberar_escrita(self):
+        self.catraca.release()
+
+rw = RWJusto()
+dados = {"a": 0, "b": 0}
+inconsistentes = [0]
+leituras = [0]
+contador_lock = threading.Lock()
+
+def escritor():
+    for _ in range(200):
+        rw.adquirir_escrita()
+        dados["a"] += 1
+        dados["b"] += 1          # leitor nunca deve ver a != b
+        rw.liberar_escrita()
+
+def leitor():
+    for _ in range(300):
+        rw.adquirir_leitura()
+        ok = dados["a"] == dados["b"]
+        rw.liberar_leitura()
+        with contador_lock:
+            leituras[0] += 1
+            if not ok:
+                inconsistentes[0] += 1
+
+ts = [threading.Thread(target=escritor) for _ in range(3)]
+ts += [threading.Thread(target=leitor) for _ in range(5)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+
+print("a =", dados["a"], "b =", dados["b"])
+print("leituras:", leituras[0], "inconsistentes:", inconsistentes[0])
+```
+
+```text
+Saída:
+a = 600 b = 600
+leituras: 1500 inconsistentes: 0
+```
+
+## Trade-offs
+
+| Variante | Vantagem | Risco |
+| --- | --- | --- |
+| Prioridade a leitores | Máximo paralelismo de leitura | Escritor pode nunca entrar |
+| Prioridade a escritores | Dados novos visíveis rápido | Leitores famintos sob muitas escritas |
+| Justa (catraca/FIFO) | Sem starvation | Leituras concorrentes interrompidas por cada escritor |
+
+Na vida real, `ReentrantReadWriteLock` em Java tem modo justo opcional, `sync.RWMutex` em Go bloqueia novos leitores quando há escritor esperando (evita fome de escritores) e `std::shared_mutex` em C++ deixa a política para a implementação. Se as seções críticas são curtas, um mutex simples costuma ganhar, porque o RW lock tem mais contabilidade interna.
+
+<Callout type="warning" title="Upgrade de leitura para escrita">
+Um leitor que tenta virar escritor sem soltar a leitura espera que os leitores saiam, inclusive ele mesmo: deadlock. Se dois fazem isso juntos, nenhum sai. Solte a leitura, adquira a escrita e revalide o estado.
+</Callout>
+
+## Na entrevista
+
+Comece pelas regras de segurança, implemente a versão com prioridade a leitores e, antes que o entrevistador pergunte, aponte a starvation de escritores. Depois mostre como mudar a condição de espera do leitor para dar prioridade a escritores ou como a catraca torna a solução justa. Follow-ups comuns: "qual usar num cache com 99% de leituras?" (RW lock, ou cópia imutável trocada atomicamente) e "como implementar com semáforos?" (contador de leitores protegido por mutex; o primeiro leitor adquire o semáforo de escrita e o último libera).
+
+<QuizSet>
+<Quiz question="Com prioridade a leitores e leitores chegando continuamente, o que acontece com um escritor que está esperando?" options={["Entra depois do próximo leitor", "Pode nunca entrar: starvation de escritores", "Gera deadlock imediato", "Interrompe os leitores ativos"]} answer={1} explanation="Enquanto houver ao menos um leitor ativo, novos leitores entram e o contador nunca chega a zero, então o escritor espera indefinidamente." />
+<Quiz question="Na solução justa com catraca, por que o escritor mantém a catraca adquirida enquanto espera os leitores ativos saírem?" options={["Para ler mais rápido", "Para impedir que leitores que chegaram depois dele entrem na frente", "Porque a catraca é reentrante", "Para liberar os leitores ativos"]} answer={1} explanation="Segurando a catraca, ele barra novos leitores; só os que já estavam dentro terminam, e então ele entra." />
+</QuizSet>

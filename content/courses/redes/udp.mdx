@@ -1,0 +1,127 @@
+---
+title: UDP
+kind: lesson
+---
+
+Nem toda aplicação quer as garantias do TCP. Uma consulta DNS cabe num pacote e pode simplesmente ser repetida; um quadro de áudio que chega atrasado já não serve para nada; um jogo prefere a posição mais recente do jogador a uma antiga entregue em ordem. Para esses casos, pagar handshake, retransmissão e entrega ordenada só acrescenta latência. O UDP é a alternativa mínima: ele coloca portas em cima do IP e quase mais nada.
+
+## O que o UDP oferece
+
+- **Multiplexação por porta:** vários processos na mesma máquina, cada um na sua porta.
+- **Checksum:** detecta corrupção (obrigatório no IPv6, opcional no IPv4).
+- **Fronteiras de mensagem:** cada `sendto` vira exatamente um datagrama, e cada `recvfrom` lê exatamente um. Isso é o oposto do stream do TCP.
+
+E o que ele **não** oferece: conexão, confirmação, retransmissão, ordem, controle de fluxo ou de congestionamento. Se precisar de algo disso, a aplicação implementa por cima.
+
+## O cabeçalho inteiro
+
+São só 8 bytes: porta de origem, porta de destino, comprimento (cabeçalho mais dados) e checksum.
+
+```python
+import struct
+
+def datagrama(sport, dport, dados):
+    cab = struct.pack("!HHHH", sport, dport, 8 + len(dados), 0)
+    return cab + dados
+
+pacote = datagrama(53000, 53, b"\x12\x34consulta")
+sport, dport, comprimento, checksum = struct.unpack("!HHHH", pacote[:8])
+print("cabecalho:", pacote[:8].hex(" "))
+print(f"origem={sport} destino={dport} comprimento={comprimento} dados={len(pacote) - 8} bytes")
+```
+
+```text
+Saída:
+cabecalho: cf 08 00 35 00 12 00 00
+origem=53000 destino=53 comprimento=18 dados=10 bytes
+```
+
+Compare com os 20 bytes mínimos do TCP e com a ausência total de estado: um servidor UDP não guarda nada por cliente, o que permite atender milhões de consultas com pouca memória. É o motivo de DNS, NTP, DHCP e syslog serem UDP.
+
+## Fronteiras preservadas, em localhost
+
+O programa abaixo manda três datagramas para um socket UDP local e lê um por vez. Cada leitura devolve uma mensagem inteira, nunca pedaços nem mensagens coladas.
+
+```python
+import socket
+
+rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+rx.bind(("127.0.0.1", 0))
+tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+for msg in (b"posicao x=10", b"posicao x=11", b"fim"):
+    tx.sendto(msg, rx.getsockname())
+
+rx.settimeout(2)
+for _ in range(3):
+    dados, origem = rx.recvfrom(2048)
+    print(len(dados), "bytes:", dados.decode())
+tx.close()
+rx.close()
+```
+
+```text
+Saída:
+12 bytes: posicao x=10
+12 bytes: posicao x=11
+3 bytes: fim
+```
+
+Em localhost nada se perde. Numa rede real, qualquer um desses datagramas pode sumir ou chegar trocado, e o receptor não teria como saber sem um número de sequência próprio.
+
+## Construindo o que falta
+
+Aplicações sobre UDP escolhem exatamente as garantias que querem. Os padrões mais comuns:
+
+| Necessidade | Técnica típica | Exemplo |
+| --- | --- | --- |
+| Saber se a resposta chegou | Timeout e retentativa no cliente | Resolver DNS |
+| Descartar dado velho | Número de sequência e ignorar o que for menor | Jogos, telemetria |
+| Suavizar variação de atraso | Jitter buffer | VoIP, videochamada |
+| Confiabilidade e ordem por fluxo | Protocolo completo em espaço de usuário | QUIC |
+
+O segundo padrão em código: o receptor guarda o maior número de sequência visto e descarta qualquer coisa mais antiga, contando as lacunas como perdas.
+
+```python
+chegadas = [(1, "x=10"), (2, "x=11"), (4, "x=13"), (3, "x=12"), (6, "x=15")]
+ultimo = 0
+perdidos = 0
+for seq, estado in chegadas:
+    if seq <= ultimo:
+        print(f"seq {seq}: atrasado, descartado")
+        continue
+    perdidos += seq - ultimo - 1
+    ultimo = seq
+    print(f"seq {seq}: aplica {estado}")
+print("lacunas contadas como perda:", perdidos)
+```
+
+```text
+Saída:
+seq 1: aplica x=10
+seq 2: aplica x=11
+seq 4: aplica x=13
+seq 3: atrasado, descartado
+seq 6: aplica x=15
+lacunas contadas como perda: 2
+```
+
+## Armadilhas reais
+
+- **Tamanho do datagrama:** acima do MTU do caminho (tipicamente 1.500 bytes na Ethernet, menos em túneis), o IP fragmenta, e perder um fragmento perde o datagrama inteiro. Muitos firewalls descartam fragmentos. Por isso o DNS clássico limitava respostas a 512 bytes e hoje usa EDNS com cerca de 1.232, caindo para TCP quando não cabe.
+- **Sem controle de congestionamento:** um emissor UDP agressivo pode saturar um link e prejudicar os fluxos TCP que dividem a rota. Protocolos sérios sobre UDP, como o QUIC, implementam o próprio controle.
+- **Amplificação:** como não há handshake, o IP de origem pode ser forjado. Um atacante manda uma consulta pequena em nome da vítima e o servidor responde algo muito maior para ela. DNS aberto, NTP e memcached já foram usados assim.
+- **NAT e firewalls:** sem conexão explícita, o NAT mantém o mapeamento só por alguns segundos ou minutos de inatividade. Aplicações UDP de longa duração mandam keep-alives.
+
+<Callout type="note" title="UDP não é sinônimo de rápido">
+O UDP não acelera o link. Ele só remove o handshake e a espera por retransmissões. Se a sua aplicação reimplementa confiabilidade completa de forma ingênua, o resultado tende a ser pior que o TCP.
+</Callout>
+
+## Na entrevista
+
+Quando surgir a escolha entre TCP e UDP, decida pelo que acontece com um dado atrasado: se ainda serve, TCP; se perde o valor, UDP com as garantias que a aplicação precisa. Cite exemplos (DNS, streaming ao vivo, jogos, QUIC) e as armadilhas de MTU, congestionamento e amplificação. Follow-ups: "como você faria um chat de voz?" (UDP, sequência, jitter buffer, sem retransmitir áudio velho) e "por que o HTTP/3 usa UDP se precisa de confiabilidade?" (para implementar um transporte novo em espaço de usuário sem head-of-line blocking entre streams).
+
+<QuizSet>
+<Quiz question="Um cliente envia três datagramas UDP de 100 bytes. O que o receptor pode observar?" options={["Sempre um único recvfrom com 300 bytes", "Até três leituras de 100 bytes cada, possivelmente fora de ordem ou com alguma faltando", "Os bytes em ordem garantida", "Um erro se algum datagrama se perder"]} answer={1} explanation="UDP preserva as fronteiras de cada datagrama, mas não garante entrega nem ordem, e não avisa sobre perdas." />
+<Quiz question="Por que um datagrama UDP de 4.000 bytes é arriscado numa rede com MTU de 1.500?" options={["UDP não aceita mais de 1.500 bytes", "Ele será fragmentado no IP, e a perda de qualquer fragmento descarta o datagrama inteiro", "O checksum não cobre mais de 1.500 bytes", "O TCP vai interferir"]} answer={1} explanation="Fragmentação multiplica a chance de perda e muitos firewalls bloqueiam fragmentos. Mantenha datagramas abaixo do MTU do caminho." />
+</QuizSet>

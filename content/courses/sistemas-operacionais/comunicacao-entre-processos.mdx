@@ -1,0 +1,124 @@
+---
+title: Comunicação entre processos
+kind: lesson
+---
+
+O isolamento entre processos é ótimo para segurança e estabilidade, mas cria um problema: como dois processos trocam dados se nenhum enxerga a memória do outro? O kernel oferece vários mecanismos de **IPC** (Inter-Process Communication). Todos se encaixam em duas famílias: **troca de mensagens**, em que o kernel copia os dados de um lado para o outro, e **memória compartilhada**, em que o kernel mapeia a mesma memória física nos dois processos e sai do caminho.
+
+## Os mecanismos principais
+
+| Mecanismo | Família | Direção | Alcance | Uso típico |
+| --- | --- | --- | --- | --- |
+| Pipe anônimo | Mensagem (fluxo de bytes) | Uma via | Pai e filho | `ls \| grep` |
+| Pipe nomeado (FIFO) | Mensagem | Uma via | Mesma máquina | Processos sem parentesco |
+| Socket Unix | Mensagem | Duas vias | Mesma máquina | Docker daemon, PostgreSQL local |
+| Socket TCP | Mensagem | Duas vias | Rede | Microsserviços |
+| Fila de mensagens | Mensagem (com fronteiras) | Várias | Mesma máquina | POSIX `mq_*` |
+| Memória compartilhada | Memória | Qualquer | Mesma máquina | Bancos, buffers de vídeo |
+| Sinais | Notificação | Uma via | Mesma máquina | SIGTERM, SIGHUP |
+
+## Pipes: o clássico do Unix
+
+Um pipe é um buffer dentro do kernel com uma ponta de escrita e uma de leitura. Quem escreve num pipe cheio bloqueia; quem lê de um pipe vazio também. Isso dá **controle de fluxo** de graça: se o consumidor é lento, o produtor desacelera sozinho.
+
+```text
+ processo pai                 kernel                  processo filho
+ write(fd_w, dados) ──► [ buffer do pipe, ~64 KB ] ──► read(fd_r)
+                         cheio? quem escreve espera
+                         vazio? quem lê espera
+```
+
+O `subprocess` monta pipes ligados à entrada e à saída padrão de um filho. Aqui o pai manda linhas e o filho devolve cada uma em maiúsculas, com o número da linha:
+
+```python
+import subprocess
+import sys
+
+filho = (
+    "import sys\n"
+    "for i, linha in enumerate(sys.stdin, 1):\n"
+    "    print(i, linha.strip().upper())\n"
+)
+pedidos = "criar pedido\npagar pedido\nenviar pedido\n"
+r = subprocess.run([sys.executable, "-c", filho], input=pedidos,
+                   capture_output=True, text=True)
+print(r.stdout.strip())
+```
+
+```text
+Saída:
+1 CRIAR PEDIDO
+2 PAGAR PEDIDO
+3 ENVIAR PEDIDO
+```
+
+Cada byte passou duas vezes pela fronteira do kernel: copiado do pai para o buffer e do buffer para o filho. Para mensagens pequenas isso é irrelevante; para gigabytes, pesa.
+
+## Memória compartilhada: sem cópias
+
+Com memória compartilhada, os dois processos mapeiam a mesma região. Escrever nela é só uma instrução de store, sem syscall e sem cópia. A contrapartida é que agora você tem os mesmos problemas de threads: precisa de sincronização para não ler dados pela metade.
+
+O exemplo cria um arquivo, mapeia-o em memória com `mmap` e lança um filho que mapeia o mesmo arquivo e escreve nele. O pai enxerga a mudança na própria memória.
+
+```python
+import mmap
+import os
+import subprocess
+import sys
+import tempfile
+
+with tempfile.TemporaryDirectory() as pasta:
+    caminho = os.path.join(pasta, "compartilhado.bin")
+    with open(caminho, "wb") as f:
+        f.write(b"." * 16)
+
+    with open(caminho, "r+b") as f:
+        mem = mmap.mmap(f.fileno(), 16)
+        filho = (
+            "import mmap, sys\n"
+            "with open(sys.argv[1], 'r+b') as f:\n"
+            "    m = mmap.mmap(f.fileno(), 16)\n"
+            "    m[0:6] = b'filho!'\n"
+            "    m.close()\n"
+        )
+        subprocess.run([sys.executable, "-c", filho, caminho], check=True)
+        print("pai enxerga:", mem[:].decode())
+        mem[10:16] = b'pai-ok'
+        print("depois do pai:", mem[:].decode())
+        mem.close()
+```
+
+```text
+Saída:
+pai enxerga: filho!..........
+depois do pai: filho!....pai-ok
+```
+
+No Linux, `shm_open` ou `memfd_create` criam a região sem precisar de arquivo em disco. O Python oferece `multiprocessing.shared_memory` com a mesma ideia.
+
+## Como escolher
+
+- **Simplicidade e streaming entre pai e filho:** pipe.
+- **Serviços locais com requisição e resposta:** socket Unix, que é mais rápido que TCP em localhost e permite checar credenciais do processo do outro lado.
+- **Grandes volumes com latência mínima:** memória compartilhada mais um mecanismo de sincronização (semáforo, futex, ring buffer lock-free).
+- **Avisar sem dados:** sinais, por exemplo SIGHUP para recarregar configuração.
+
+<Callout type="note" title="Sinais são frágeis">
+Um tratador de sinal pode interromper seu código em qualquer ponto, inclusive dentro de um `malloc`. Por isso ele deve fazer o mínimo, como marcar uma flag, e deixar o trabalho real para o laço principal. Em Python, os tratadores rodam sempre na thread principal, entre instruções de bytecode.
+</Callout>
+
+```bash
+ls -l /proc/1234/fd          # pipes e sockets abertos aparecem aqui
+ss -xp                       # sockets Unix com o processo dono
+ipcs -m                      # segmentos de memória compartilhada System V
+```
+
+## Na entrevista
+
+Organize a resposta pelas duas famílias e compare custo (cópias e syscalls) contra complexidade (sincronização). Dê um exemplo real: o shell usa pipes, o PostgreSQL usa memória compartilhada para o buffer pool, o Docker CLI fala com o daemon por socket Unix. Follow-ups comuns: "o que acontece se o leitor de um pipe morre?" (o escritor recebe SIGPIPE ou EPIPE) e "por que memória compartilhada é mais rápida?" (sem cópia e sem syscall por mensagem).
+
+<QuizSet>
+<Quiz question="Um processo escreve num pipe muito mais rápido do que o outro lê. O que acontece?" options={["Os dados extras são descartados silenciosamente", "Quando o buffer do pipe enche, o escritor bloqueia até haver espaço", "O kernel aumenta o buffer sem limite", "O leitor é encerrado"]} answer={1} explanation="O buffer limitado do pipe gera contrapressão natural: o produtor espera o consumidor." />
+<Quiz question="Dois processos trocam frames de vídeo de 8 MB, 60 vezes por segundo, na mesma máquina. Qual mecanismo tende a ser mais eficiente?" options={["Socket TCP em localhost", "Memória compartilhada com sincronização", "Arquivos temporários", "Sinais"]} answer={1} explanation="Memória compartilhada evita copiar 480 MB por segundo pelo kernel; só é preciso coordenar quem escreve e quem lê." />
+<Quiz question="Por que usar socket Unix em vez de TCP para um serviço que só atende a mesma máquina?" options={["Socket Unix funciona entre máquinas", "Evita a pilha TCP/IP, é mais rápido e permite verificar as credenciais do processo cliente", "TCP não funciona em localhost", "Socket Unix não precisa de permissão"]} answer={1} explanation="O socket Unix não passa por checksums, roteamento e controle de congestionamento, e o kernel informa UID e PID do outro lado." />
+</QuizSet>

@@ -1,0 +1,168 @@
+---
+title: HTTP/1.1
+kind: lesson
+---
+
+HTTP/1.1 tem quase 30 anos e ainda carrega boa parte do tráfego entre serviços, proxies e load balancers. Como é um protocolo de texto, dá para ler cada byte, e é justamente nesses detalhes (onde termina uma mensagem, quando a conexão pode ser reaproveitada) que moram os problemas de latência e alguns bugs de segurança famosos.
+
+## O formato da mensagem
+
+Uma requisição é uma linha de início, cabeçalhos, uma linha em branco e, opcionalmente, um corpo. Cada linha termina com CRLF (`\r\n`).
+
+```text
+GET /pedidos/42 HTTP/1.1\r\n          <- método, alvo, versão
+Host: api.loja.com\r\n                <- obrigatório no 1.1 (vários sites por IP)
+Accept: application/json\r\n
+\r\n                                  <- fim dos cabeçalhos
+
+HTTP/1.1 200 OK\r\n                   <- versão, status, frase
+Content-Type: application/json\r\n
+Content-Length: 28\r\n                <- quantos bytes de corpo vêm a seguir
+\r\n
+{"id": 42, "status": "pago"}
+```
+
+O ponto central é o **enquadramento**: TCP entrega um fluxo de bytes sem fronteiras, então o receptor precisa saber onde termina o corpo. Há três formas:
+
+| Mecanismo | Como o fim é detectado | Quando aparece |
+| --- | --- | --- |
+| `Content-Length` | conta exatamente N bytes | corpo de tamanho conhecido |
+| `Transfer-Encoding: chunked` | blocos com tamanho em hexadecimal, terminando num bloco de tamanho 0 | respostas geradas em streaming |
+| fechar a conexão | EOF do TCP | legado do HTTP/1.0; impede reaproveitar a conexão |
+
+## Conexões persistentes
+
+No HTTP/1.0 cada requisição abria uma conexão TCP nova: handshake, slow start do zero e, com HTTPS, um handshake TLS a mais. O 1.1 tornou a conexão **persistente por padrão** (keep-alive): depois de ler a resposta inteira, o cliente pode mandar a próxima requisição no mesmo socket. Isso só funciona porque o enquadramento diz onde cada resposta termina.
+
+O programa abaixo sobe um servidor HTTP/1.1 mínimo em localhost e faz duas requisições pela mesma conexão TCP, lendo cada resposta pelo `Content-Length`.
+
+```python
+import socket, threading
+
+def ler_mensagem(arq):
+    linha_inicial = arq.readline().decode().strip()
+    cabecalhos = {}
+    while (linha := arq.readline()) not in (b"\r\n", b""):
+        nome, valor = linha.decode().split(":", 1)
+        cabecalhos[nome.strip().lower()] = valor.strip()
+    corpo = arq.read(int(cabecalhos.get("content-length", 0)))
+    return linha_inicial, cabecalhos, corpo
+
+conexoes = 0
+
+def servidor(sock):
+    global conexoes
+    conn, _ = sock.accept()
+    conexoes += 1
+    arq = conn.makefile("rb")
+    atendidas = 0
+    while True:
+        inicio, cab, _ = ler_mensagem(arq)
+        if not inicio:
+            break
+        atendidas += 1
+        corpo = f"req {atendidas}: {inicio.split()[1]}".encode()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                     + f"Content-Length: {len(corpo)}\r\n\r\n".encode() + corpo)
+    conn.close()
+
+srv = socket.socket()
+srv.bind(("127.0.0.1", 0))
+srv.listen()
+t = threading.Thread(target=servidor, args=(srv,))
+t.start()
+
+cli = socket.create_connection(srv.getsockname())
+arq = cli.makefile("rb")
+for caminho in ["/pedidos/1", "/pedidos/2"]:
+    cli.sendall(f"GET {caminho} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
+    status, cab, corpo = ler_mensagem(arq)
+    print(status, "|", cab["content-length"], "bytes |", corpo.decode())
+arq.close()
+cli.close()
+t.join()
+srv.close()
+print("conexoes aceitas pelo servidor:", conexoes)
+```
+
+```text
+Saída:
+HTTP/1.1 200 OK | 17 bytes | req 1: /pedidos/1
+HTTP/1.1 200 OK | 17 bytes | req 2: /pedidos/2
+conexoes aceitas pelo servidor: 1
+```
+
+## Head-of-line blocking e o limite de 6 conexões
+
+Numa conexão HTTP/1.1, as respostas saem na ordem das requisições, uma de cada vez. O **pipelining** (mandar várias requisições sem esperar) existe na especificação, mas a resposta lenta da primeira bloqueia todas as seguintes, e proxies quebrados tornaram o recurso inviável; navegadores o desativaram. A saída prática foi abrir **várias conexões paralelas por origem**, em geral até 6. Daí vieram as gambiarras da era 1.1: domain sharding (espalhar recursos por `img1`, `img2`...), sprites e concatenação de arquivos. Todas existem para contornar o fato de que uma conexão carrega uma resposta por vez.
+
+```text
+conexão 1:  [GET /a ......... resposta lenta .........][GET /b][GET /c]
+                                                     ^ /b e /c esperam
+```
+
+## Chunked na prática
+
+Quando o servidor não sabe o tamanho do corpo de antemão (uma consulta que vai sendo serializada, um log em streaming), ele usa chunked: cada bloco vem precedido pelo tamanho em hexadecimal.
+
+```python
+def decodificar_chunked(dados):
+    corpo, pos = b"", 0
+    while True:
+        fim_linha = dados.index(b"\r\n", pos)
+        tamanho = int(dados[pos:fim_linha], 16)
+        pos = fim_linha + 2
+        if tamanho == 0:
+            return corpo
+        corpo += dados[pos:pos + tamanho]
+        print(f"bloco de {tamanho} bytes (0x{tamanho:x})")
+        pos += tamanho + 2  # pula o CRLF que fecha o bloco
+
+def codificar_chunked(pedacos):
+    saida = b""
+    for p in pedacos:
+        saida += f"{len(p):x}\r\n".encode() + p + b"\r\n"
+    return saida + b"0\r\n\r\n"
+
+bruto = codificar_chunked([b'{"itens', b'": [1, 2, 3], "total": 3}'])
+print(bruto)
+print(decodificar_chunked(bruto).decode())
+```
+
+```text
+Saída:
+b'7\r\n{"itens\r\n19\r\n": [1, 2, 3], "total": 3}\r\n0\r\n\r\n'
+bloco de 7 bytes (0x7)
+bloco de 25 bytes (0x19)
+{"itens": [1, 2, 3], "total": 3}
+```
+
+<Callout type="warning" title="Request smuggling">
+Se uma requisição traz `Content-Length` e `Transfer-Encoding: chunked` ao mesmo tempo, e o proxy da frente usa um enquanto o servidor de trás usa o outro, os dois discordam sobre onde ela termina. O atacante "contrabandeia" uma segunda requisição dentro da primeira. A defesa é rejeitar mensagens ambíguas e normalizar o enquadramento no proxy.
+</Callout>
+
+## Trade-offs
+
+- **Texto legível** facilita depurar com `curl -v` e `tcpdump`, mas cabeçalhos repetidos (cookies, user-agent) são reenviados inteiros em toda requisição, sem compressão.
+- **Keep-alive** economiza handshakes, mas cada conexão ociosa ocupa memória no servidor; por isso servidores fecham conexões paradas depois de um timeout, e o cliente precisa tratar a corrida em que reenvia numa conexão que acabou de ser fechada.
+- **Várias conexões** contornam o HOL blocking, mas cada uma faz seu próprio slow start e disputa banda com as outras.
+
+```bash
+curl -sv http://localhost:8080/a http://localhost:8080/b 2>&1 | grep -E "Connected|Re-using|^< HTTP"
+```
+
+```text
+* Connected to localhost (127.0.0.1) port 8080
+< HTTP/1.1 200 OK
+* Re-using existing connection with host localhost
+< HTTP/1.1 200 OK
+```
+
+## Na entrevista
+
+Mostre que entende o enquadramento (Content-Length, chunked) e ligue isso a keep-alive e ao HOL blocking por conexão, que é a motivação direta do HTTP/2. Follow-ups: "por que o navegador abre 6 conexões por domínio?" (uma resposta por vez por conexão; paralelismo por força bruta) e "o que é request smuggling?" (proxy e backend discordam sobre o fim da mensagem).
+
+<QuizSet>
+<Quiz question="Um servidor HTTP/1.1 envia uma resposta sem Content-Length e sem chunked. Como o cliente sabe que o corpo acabou?" options={["Pelo cabeçalho Host", "Quando a conexão TCP é fechada, o que impede reaproveitá-la", "Pela linha em branco depois do corpo", "Pelo status 200"]} answer={1} explanation="Sem tamanho declarado nem chunked, o único delimitador é o EOF do TCP. A conexão não pode ser reaproveitada para outra requisição." />
+<Quiz question="Por que o pipelining do HTTP/1.1 não resolveu o problema de latência?" options={["Porque não funciona sobre TCP", "Porque as respostas precisam sair na ordem, e uma resposta lenta bloqueia as seguintes, além de proxies que o implementavam mal", "Porque exige TLS", "Porque só aceita GET"]} answer={1} explanation="O head-of-line blocking continua: a ordem das respostas é fixa. Na prática os navegadores desativaram o pipelining." />
+</QuizSet>

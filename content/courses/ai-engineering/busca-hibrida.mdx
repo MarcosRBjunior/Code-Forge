@@ -1,0 +1,130 @@
+---
+title: Busca híbrida e BM25
+kind: lesson
+---
+
+Busca vetorial é ótima para paráfrases e péssima para coisas exatas: o código de erro `E-4031`, o nome de uma função, um número de contrato, uma sigla interna. Busca por palavra-chave é o oposto. Em vez de escolher, sistemas de recuperação maduros combinam as duas: é a **busca híbrida**. Para entender por que ela funciona, você precisa conhecer o algoritmo lexical que ainda é o padrão da indústria: o **BM25**.
+
+## BM25 em uma frase
+
+O BM25 dá pontos a um documento para cada termo da consulta que ele contém, com três ajustes:
+
+- **Raridade (IDF):** termos raros na coleção valem mais. "kubernetes" diz muito mais que "de".
+- **Saturação da frequência:** aparecer 2 vezes é melhor que 1, mas aparecer 50 vezes não é 50 vezes melhor. O parâmetro `k1` controla essa curva.
+- **Normalização por tamanho:** documentos longos contêm mais palavras por acaso, então são penalizados em relação ao tamanho médio. O parâmetro `b` controla a força disso.
+
+```text
+score(D, Q) = soma sobre termos t de Q:
+    IDF(t) · f(t,D) · (k1 + 1) / ( f(t,D) + k1 · (1 - b + b · |D| / tamanho_medio) )
+```
+
+Valores comuns são `k1` entre 1,2 e 2 e `b` perto de 0,75. Uma implementação completa cabe em poucas linhas:
+
+```python
+import math
+from collections import Counter
+
+docs = {
+    "d1": "erro E-4031 ao emitir nota fiscal no sistema",
+    "d2": "como emitir nota fiscal eletronica passo a passo",
+    "d3": "o sistema caiu e nenhuma nota foi emitida hoje",
+    "d4": "politica de reembolso para clientes do plano anual",
+}
+
+def tokens(texto):
+    return texto.lower().split()
+
+class BM25:
+    def __init__(self, docs, k1=1.5, b=0.75):
+        self.k1, self.b = k1, b
+        self.tf = {d: Counter(tokens(t)) for d, t in docs.items()}
+        self.tam = {d: sum(c.values()) for d, c in self.tf.items()}
+        self.media = sum(self.tam.values()) / len(docs)
+        n = len(docs)
+        df = Counter(t for c in self.tf.values() for t in c)
+        self.idf = {t: math.log(1 + (n - f + 0.5) / (f + 0.5)) for t, f in df.items()}
+
+    def score(self, consulta, d):
+        s = 0.0
+        for t in tokens(consulta):
+            f = self.tf[d].get(t, 0)
+            if f == 0:
+                continue
+            norm = self.k1 * (1 - self.b + self.b * self.tam[d] / self.media)
+            s += self.idf[t] * f * (self.k1 + 1) / (f + norm)
+        return s
+
+    def buscar(self, consulta, k=3):
+        scores = {d: self.score(consulta, d) for d in self.tf}
+        return sorted(((round(s, 3), d) for d, s in scores.items() if s > 0), reverse=True)[:k]
+
+bm25 = BM25(docs)
+print(bm25.buscar("E-4031"))
+print(bm25.buscar("emitir nota fiscal"))
+```
+
+```text
+Saída:
+[(1.221, 'd1')]
+[(1.767, 'd2'), (1.767, 'd1'), (0.343, 'd3')]
+```
+
+Repare que "E-4031" encontra exatamente o documento certo, algo que um embedding pode não fazer. Em produção, o BM25 vem pronto em mecanismos de busca como Elasticsearch, OpenSearch, Lucene e extensões de bancos relacionais, com tokenização, stemming e stopwords por idioma.
+
+## Combinando os rankings
+
+Você roda as duas buscas em paralelo, cada uma devolvendo, por exemplo, os 50 melhores, e funde as listas. O problema: os scores não estão na mesma escala (BM25 não tem teto; cosseno vai de -1 a 1). Duas soluções comuns:
+
+- **Fusão por ranking recíproco (RRF):** ignora os scores e usa só a posição. Cada documento recebe `1 / (k + posição)` em cada lista, e as contribuições são somadas. Com `k` perto de 60, é robusto e não precisa de calibração.
+- **Combinação ponderada:** normaliza os scores (min-max por consulta) e faz `alfa · vetorial + (1 - alfa) · lexical`. Permite ajustar o peso, mas exige calibrar `alfa` com dados.
+
+```python
+def rrf(listas, k=60):
+    pontos = {}
+    for lista in listas:
+        for posicao, doc in enumerate(lista, start=1):
+            pontos[doc] = pontos.get(doc, 0.0) + 1 / (k + posicao)
+    return sorted(pontos.items(), key=lambda kv: -kv[1])
+
+# consulta: "sistema fora do ar ao gerar nota E-4031"
+lexical = ["d1", "d2", "d3"]          # BM25: acerta o codigo exato
+vetorial = ["d3", "d1", "d2", "d4"]   # embeddings: acerta o sentido "sistema caiu"
+
+for doc, score in rrf([lexical, vetorial]):
+    print(f"{doc}: {score:.4f}")
+```
+
+```text
+Saída:
+d1: 0.0325
+d3: 0.0323
+d2: 0.0320
+d4: 0.0156
+```
+
+O documento bem colocado nas duas listas sobe; o que só uma busca achou continua presente, mais abaixo. Depois da fusão, é comum passar o topo por um **re-ranker** (próximo módulo), que reordena com muito mais precisão.
+
+```text
+consulta ──┬──► BM25 (top 50) ──────┐
+           │                        ├──► fusão RRF ──► re-ranker ──► top 5 para o LLM
+           └──► vetorial (top 50) ──┘
+```
+
+<Callout type="tip" title="Comece pelo baseline lexical">
+Antes de montar um pipeline vetorial, meça o BM25 nas suas consultas reais. Em bases técnicas, com muitos códigos e nomes próprios, ele é um baseline surpreendentemente difícil de bater, e a busca híbrida costuma superar as duas isoladas.
+</Callout>
+
+## Armadilhas
+
+- Tokenização ruim no BM25 (sem tratar acentos, plural, maiúsculas) derruba o recall lexical em português.
+- Normalizar scores com min-max quando uma das listas vem vazia ou com um único item.
+- Manter dois índices exige mantê-los sincronizados: inserir, atualizar e apagar nos dois.
+
+## Na entrevista
+
+Proponha híbrido por padrão em RAG e justifique com exemplos concretos (códigos, nomes, siglas versus paráfrases). Explique o BM25 pelos três ingredientes (IDF, saturação, tamanho) e a fusão por RRF, citando por que ela dispensa calibração. Follow-ups: "por que não somar os scores direto?" (escalas diferentes) e "como escolher o peso entre lexical e vetorial?" (avaliar recall@k com um conjunto rotulado, por tipo de consulta).
+
+<QuizSet>
+<Quiz question="Por que o BM25 penaliza documentos mais longos?" options={["Porque documentos longos são sempre irrelevantes", "Porque eles contêm mais termos por acaso, e a normalização evita que ganhem só pelo tamanho", "Para economizar memória", "Porque o IDF não funciona em textos longos"]} answer={1} explanation="O parâmetro b compensa o tamanho em relação à média: um termo encontrado num documento curto é evidência mais forte de relevância." />
+<Quiz question="Qual a principal vantagem do RRF para fundir busca lexical e vetorial?" options={["Usa os scores brutos, que são mais precisos", "Usa só as posições, dispensando calibrar escalas de scores diferentes", "Funciona apenas com dois rankings", "Elimina a necessidade de re-ranking"]} answer={1} explanation="BM25 e cosseno têm escalas incompatíveis; o RRF soma 1/(k+posição), que depende só da ordem em cada lista." />
+</QuizSet>

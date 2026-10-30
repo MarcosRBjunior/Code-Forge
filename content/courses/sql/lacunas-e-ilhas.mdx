@@ -1,0 +1,201 @@
+---
+title: Lacunas e ilhas
+kind: lesson
+---
+
+"Qual a maior sequência de dias seguidos em que cada usuário fez login?" "Quais números de nota fiscal estão faltando?" "Agrupe os períodos contínuos em que o servidor ficou fora do ar." Esses enunciados formam a família **lacunas e ilhas** (gaps and islands): você tem uma sequência ordenada de valores e precisa encontrar os trechos contínuos (ilhas) ou os buracos entre eles (lacunas). Parece exigir um laço, mas sai em SQL puro com funções de janela, e por isso é um favorito de rodadas de data.
+
+## O esquema
+
+```sql
+CREATE TABLE logins (
+  usuario text NOT NULL,
+  dia     date NOT NULL,
+  PRIMARY KEY (usuario, dia)
+);
+
+CREATE TABLE notas (
+  numero integer PRIMARY KEY
+);
+
+INSERT INTO logins VALUES
+  ('ana', '2024-05-01'), ('ana', '2024-05-02'), ('ana', '2024-05-03'),
+  ('ana', '2024-05-06'), ('ana', '2024-05-07'),
+  ('beto', '2024-05-02'), ('beto', '2024-05-04'), ('beto', '2024-05-05'),
+  ('beto', '2024-05-06'), ('beto', '2024-05-07');
+
+INSERT INTO notas VALUES (100), (101), (102), (105), (106), (110);
+
+SELECT usuario, count(*) AS dias FROM logins GROUP BY usuario ORDER BY usuario;
+```
+
+```text
+Saída:
+usuario | dias
+ana | 5
+beto | 5
+```
+
+## Lacunas: o que está faltando
+
+Para achar buracos, compare cada valor com o seguinte usando `LEAD`. Onde o próximo não é o atual mais um, existe uma lacuna:
+
+```sql
+SELECT numero + 1 AS inicio_lacuna, proximo - 1 AS fim_lacuna
+FROM (
+  SELECT numero, LEAD(numero) OVER (ORDER BY numero) AS proximo
+  FROM notas
+) t
+WHERE proximo - numero > 1
+ORDER BY inicio_lacuna;
+```
+
+```text
+Saída:
+inicio_lacuna | fim_lacuna
+103 | 104
+107 | 109
+```
+
+Se precisar listar cada número faltante, um a um, o Postgres resolve com `generate_series` e um anti-join:
+
+```sql
+SELECT g AS faltando
+FROM generate_series((SELECT min(numero) FROM notas), (SELECT max(numero) FROM notas)) AS g
+WHERE NOT EXISTS (SELECT 1 FROM notas n WHERE n.numero = g)
+ORDER BY g;
+```
+
+```text
+Saída:
+faltando
+103
+104
+107
+108
+109
+```
+
+O MySQL não tem `generate_series`; lá você gera a sequência com uma CTE recursiva (`WITH RECURSIVE`, a partir do 8.0) ou com uma tabela auxiliar de números.
+
+## Ilhas: o truque da diferença
+
+A ideia central é esta: numere as linhas de cada usuário em ordem com `ROW_NUMBER`. Dentro de uma sequência contínua, a data e o número crescem juntos, de um em um. Então **data menos número** dá o mesmo valor para todas as linhas da mesma ilha, e muda quando há um buraco. Esse valor vira a chave do grupo.
+
+```sql
+SELECT usuario, dia,
+       ROW_NUMBER() OVER (PARTITION BY usuario ORDER BY dia) AS rn,
+       dia - (ROW_NUMBER() OVER (PARTITION BY usuario ORDER BY dia))::int AS grupo
+FROM logins
+WHERE usuario = 'ana'
+ORDER BY dia;
+```
+
+```text
+Saída:
+usuario | dia | rn | grupo
+ana | 2024-05-01 | 1 | 2024-04-30
+ana | 2024-05-02 | 2 | 2024-04-30
+ana | 2024-05-03 | 3 | 2024-04-30
+ana | 2024-05-06 | 4 | 2024-05-02
+ana | 2024-05-07 | 5 | 2024-05-02
+```
+
+No Postgres, `date - integer` devolve outra data, por isso o grupo aparece como data. No MySQL você escreveria `DATE_SUB(dia, INTERVAL rn DAY)`. Agora basta agrupar por usuário e grupo:
+
+```sql
+WITH marcados AS (
+  SELECT usuario, dia,
+         dia - (ROW_NUMBER() OVER (PARTITION BY usuario ORDER BY dia))::int AS grupo
+  FROM logins
+)
+SELECT usuario, min(dia) AS inicio, max(dia) AS fim, count(*) AS dias
+FROM marcados
+GROUP BY usuario, grupo
+ORDER BY usuario, inicio;
+```
+
+```text
+Saída:
+usuario | inicio | fim | dias
+ana | 2024-05-01 | 2024-05-03 | 3
+ana | 2024-05-06 | 2024-05-07 | 2
+beto | 2024-05-02 | 2024-05-02 | 1
+beto | 2024-05-04 | 2024-05-07 | 4
+```
+
+A maior sequência por usuário é só mais uma camada:
+
+```sql
+WITH marcados AS (
+  SELECT usuario, dia,
+         dia - (ROW_NUMBER() OVER (PARTITION BY usuario ORDER BY dia))::int AS grupo
+  FROM logins
+),
+ilhas AS (
+  SELECT usuario, count(*) AS dias
+  FROM marcados
+  GROUP BY usuario, grupo
+)
+SELECT usuario, max(dias) AS maior_sequencia
+FROM ilhas
+GROUP BY usuario
+ORDER BY usuario;
+```
+
+```text
+Saída:
+usuario | maior_sequencia
+ana | 3
+beto | 4
+```
+
+## A variante com marcador de início
+
+Quando a continuidade não é "mais um" (por exemplo, sessões em que um intervalo de até 30 minutos ainda conta como a mesma sessão), use outra técnica: marque com 1 a linha que **começa** uma ilha (a distância para a anterior passou do limite) e faça uma soma acumulada desses marcadores. A soma vira o número da ilha.
+
+```sql
+WITH marcas AS (
+  SELECT usuario, dia,
+         CASE WHEN dia - LAG(dia) OVER (PARTITION BY usuario ORDER BY dia) <= 2
+              THEN 0 ELSE 1 END AS novo
+  FROM logins
+)
+SELECT usuario, dia,
+       SUM(novo) OVER (PARTITION BY usuario ORDER BY dia) AS ilha
+FROM marcas
+WHERE usuario = 'beto'
+ORDER BY dia;
+```
+
+```text
+Saída:
+usuario | dia | ilha
+beto | 2024-05-02 | 1
+beto | 2024-05-04 | 1
+beto | 2024-05-05 | 1
+beto | 2024-05-06 | 1
+beto | 2024-05-07 | 1
+```
+
+Com tolerância de dois dias, o buraco de 03/05 não quebra a sequência do beto. O primeiro `LAG` de cada usuário é `NULL`, a comparação dá desconhecido e o `CASE` cai no `ELSE`, abrindo a primeira ilha, exatamente o que você quer.
+
+<Callout type="tip" title="Escolha a técnica pelo critério de continuidade">
+Passo fixo (dias seguidos, números consecutivos): diferença entre valor e `ROW_NUMBER`. Limite flexível (sessões, intervalos com tolerância): marcador de início com `LAG` mais soma acumulada.
+</Callout>
+
+## Armadilhas
+
+- **Duplicatas.** Dois logins no mesmo dia quebram o truque da diferença, porque `ROW_NUMBER` avança e a data não. Deduplique antes (`SELECT DISTINCT usuario, dia`) ou use `DENSE_RANK`.
+- **Timestamps.** Se a coluna for `timestamp`, converta para `date` antes de comparar dias.
+- **Esquecer o `PARTITION BY`.** Sem ele, as ilhas de usuários diferentes se misturam.
+
+## Na entrevista
+
+Reconheça o padrão em voz alta ("isso é gaps and islands"), explique o truque com uma tabela pequena de exemplo e só então escreva a consulta em camadas com CTE. Follow-ups comuns: "e se houver mais de um login por dia?" (deduplique primeiro) e "como contar sessões com 30 minutos de inatividade?" (marcador de início com `LAG` e soma acumulada).
+
+<QuizSet>
+<Quiz question="No truque da diferença, por que dia menos ROW_NUMBER identifica uma sequência contínua?" options={["Porque ROW_NUMBER ordena as datas", "Porque numa sequência sem buracos data e número crescem juntos, então a diferença fica constante", "Porque datas são inteiros no Postgres", "Porque a chave primária garante unicidade"]} answer={1} explanation="Cada passo soma um dia à data e um ao número; a diferença só muda quando há um buraco." />
+<Quiz question="Um usuário tem dois logins no mesmo dia. O que acontece com o truque da diferença sem tratamento?" options={["Nada muda", "A sequência é partida incorretamente, porque o número avança e a data não", "A consulta dá erro", "O dia duplicado é ignorado automaticamente"]} answer={1} explanation="Deduplique por dia antes ou use DENSE_RANK, que dá o mesmo número a datas iguais." />
+<Quiz question="Para agrupar eventos em sessões que terminam após 30 minutos sem atividade, qual técnica é a mais adequada?" options={["Diferença entre timestamp e ROW_NUMBER", "Marcar início de sessão com LAG e fazer soma acumulada dos marcadores", "GROUP BY por hora", "DISTINCT ON por usuário"]} answer={1} explanation="Com tolerância variável não há passo fixo; o marcador de início mais SUM acumulado numera as sessões." />
+</QuizSet>

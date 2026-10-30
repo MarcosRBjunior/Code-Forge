@@ -1,0 +1,210 @@
+---
+title: DNS e tipos de registro
+kind: lesson
+---
+
+Quase toda requisição que seu serviço faz começa com uma pergunta ao DNS, e boa parte dos incidentes misteriosos de "a API ficou lenta por alguns segundos" ou "metade dos clientes ainda vai para o servidor antigo" tem a ver com ele. Aqui você vai abrir a mensagem DNS byte a byte, entender o que cada tipo de registro faz e ver como o cache com TTL decide quanto tempo uma mudança leva para valer.
+
+## A mensagem DNS por dentro
+
+O DNS usa a mesma estrutura para pergunta e resposta: um cabeçalho fixo de 12 bytes seguido de quatro seções (pergunta, respostas, autoridade e adicionais). Por padrão a consulta vai em um único datagrama UDP para a porta 53.
+
+```text
+ 0                16               31
++-----------------+-----------------+
+|       ID        |      FLAGS      |   ID casa resposta com pergunta
++-----------------+-----------------+   FLAGS: QR, opcode, AA, TC, RD, RA, RCODE
+|     QDCOUNT     |     ANCOUNT     |   quantos itens há em cada seção
++-----------------+-----------------+
+|     NSCOUNT     |     ARCOUNT     |
++-----------------+-----------------+
+| pergunta: nome em rótulos + QTYPE + QCLASS
+| respostas, autoridade, adicionais: nome, tipo, classe, TTL, RDLENGTH, RDATA
+```
+
+Os bits de FLAGS que mais aparecem em diagnóstico:
+
+| Bit | Significado |
+| --- | --- |
+| QR | 0 = pergunta, 1 = resposta |
+| AA | resposta veio de um servidor autoritativo, não de cache |
+| TC | resposta truncada: não coube no UDP, refaça por TCP |
+| RD / RA | cliente pede recursão / servidor oferece recursão |
+| RCODE | 0 = NOERROR, 2 = SERVFAIL, 3 = NXDOMAIN |
+
+O nome não vai como texto com pontos: cada rótulo é precedido do seu tamanho, e o nome termina com um byte zero. `api.loja.com` vira `3api4loja3com0`. O programa abaixo monta uma consulta do tipo A exatamente como um resolvedor faria, sem enviar nada pela rede.
+
+```python
+import struct
+
+def codificar_nome(nome):
+    saida = b""
+    for rotulo in nome.split("."):
+        saida += bytes([len(rotulo)]) + rotulo.encode()
+    return saida + b"\x00"
+
+def montar_consulta(id_, nome, qtype=1):
+    flags = 0x0100  # RD=1: peço recursão
+    cabecalho = struct.pack("!HHHHHH", id_, flags, 1, 0, 0, 0)
+    pergunta = codificar_nome(nome) + struct.pack("!HH", qtype, 1)  # classe IN
+    return cabecalho + pergunta
+
+msg = montar_consulta(0xBEEF, "api.loja.com")
+print(len(msg), "bytes")
+print(msg[:12].hex(" "))
+print(msg[12:].hex(" "))
+```
+
+```text
+Saída:
+30 bytes
+be ef 01 00 00 01 00 00 00 00 00 00
+03 61 70 69 04 6c 6f 6a 61 03 63 6f 6d 00 00 01 00 01
+```
+
+São só 30 bytes. É por isso que o DNS sobre UDP é tão barato: uma ida e volta, sem handshake.
+
+## Compressão de nomes
+
+Uma resposta repete o mesmo nome várias vezes (na pergunta e em cada registro). Para economizar espaço, um nome pode ser substituído por um **ponteiro**: dois bytes cujos dois bits mais altos valem 1 e o resto é o deslocamento, a partir do início da mensagem, onde o nome já apareceu. `c0 0c` significa "o nome que começa no byte 12", ou seja, logo depois do cabeçalho. O parser abaixo lê uma resposta com dois registros A e segue esses ponteiros.
+
+```python
+import struct
+
+def ler_nome(msg, pos):
+    rotulos = []
+    while True:
+        tam = msg[pos]
+        if tam & 0xC0 == 0xC0:  # ponteiro de compressão
+            destino = struct.unpack("!H", msg[pos:pos + 2])[0] & 0x3FFF
+            nome, _ = ler_nome(msg, destino)
+            rotulos.append(nome)
+            return ".".join(rotulos), pos + 2
+        if tam == 0:
+            return ".".join(rotulos), pos + 1
+        rotulos.append(msg[pos + 1:pos + 1 + tam].decode())
+        pos += 1 + tam
+
+nome = b"\x03api\x04loja\x03com\x00"
+cab = struct.pack("!HHHHHH", 0xBEEF, 0x8180, 1, 2, 0, 0)
+pergunta = nome + struct.pack("!HH", 1, 1)
+def registro_a(ip, ttl):
+    return b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, ttl, 4) + bytes(int(x) for x in ip.split("."))
+resposta = cab + pergunta + registro_a("203.0.113.10", 300) + registro_a("203.0.113.11", 300)
+
+id_, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", resposta[:12])
+print(f"id={id_:#x} resposta={flags >> 15} rcode={flags & 0xF} respostas={an}")
+q, pos = ler_nome(resposta, 12)
+pos += 4
+print("pergunta:", q)
+for _ in range(an):
+    n, pos = ler_nome(resposta, pos)
+    tipo, classe, ttl, rdlen = struct.unpack("!HHIH", resposta[pos:pos + 10])
+    pos += 10
+    ip = ".".join(str(b) for b in resposta[pos:pos + rdlen])
+    pos += rdlen
+    print(f"{n} tipo={tipo} ttl={ttl} -> {ip}")
+print("tamanho total:", len(resposta), "bytes")
+```
+
+```text
+Saída:
+id=0xbeef resposta=1 rcode=0 respostas=2
+pergunta: api.loja.com
+api.loja.com tipo=1 ttl=300 -> 203.0.113.10
+api.loja.com tipo=1 ttl=300 -> 203.0.113.11
+tamanho total: 62 bytes
+```
+
+## Tipos de registro que você precisa saber
+
+| Tipo | Código | Para que serve |
+| --- | --- | --- |
+| A | 1 | nome para endereço IPv4 |
+| AAAA | 28 | nome para endereço IPv6 |
+| CNAME | 5 | apelido: "este nome é outro nome"; o resolvedor recomeça a busca |
+| NS | 2 | quais servidores são autoritativos para a zona (delegação) |
+| MX | 15 | servidores de e-mail, com prioridade |
+| TXT | 16 | texto livre: SPF, DKIM, verificação de domínio |
+| SOA | 6 | metadados da zona, incluindo o TTL de respostas negativas |
+| SRV | 33 | serviço, porta e peso (usado em descoberta de serviços) |
+| PTR | 12 | DNS reverso: IP para nome |
+
+Duas regras caem em entrevista. Primeiro, um nome que tem CNAME não pode ter outros registros, por isso o apex da zona (`loja.com`, sem subdomínio) não pode ser CNAME: ele já tem SOA e NS. Provedores contornam isso com registros sintéticos do tipo ALIAS ou ANAME, resolvidos no próprio servidor. Segundo, cada CNAME numa cadeia é potencialmente mais uma consulta, e cadeias longas de CDN somam latência.
+
+```bash
+dig +noall +answer www.exemplo.com.br A
+```
+
+```text
+www.exemplo.com.br.   300   IN  CNAME  exemplo.cdn.net.
+exemplo.cdn.net.      60    IN  A      198.51.100.7
+```
+
+## TTL, cache negativo e propagação
+
+Não existe "propagação" de DNS: existe cache expirando. Cada resolvedor guarda a resposta pelo TTL e só pergunta de novo depois. Respostas NXDOMAIN também são cacheadas, pelo tempo indicado no SOA, o que pega muita gente que consulta um nome antes de criá-lo.
+
+```python
+class CacheDNS:
+    def __init__(self, upstream):
+        self.upstream = upstream
+        self.dados = {}
+        self.consultas_upstream = 0
+
+    def resolver(self, nome, agora):
+        item = self.dados.get(nome)
+        if item and item[1] > agora:
+            return item[0], "cache", item[1] - agora
+        self.consultas_upstream += 1
+        valor, ttl = self.upstream(nome)
+        self.dados[nome] = (valor, agora + ttl)
+        return valor, "upstream", ttl
+
+zona = {"api.loja.com": ("203.0.113.10", 300)}
+def autoritativo(nome):
+    return zona.get(nome, ("NXDOMAIN", 900))  # TTL negativo vem do SOA
+
+cache = CacheDNS(autoritativo)
+for t, nome in [(0, "api.loja.com"), (100, "api.loja.com"), (120, "novo.loja.com")]:
+    print(t, nome, *cache.resolver(nome, t))
+zona["api.loja.com"] = ("203.0.113.99", 300)  # migração
+zona["novo.loja.com"] = ("203.0.113.50", 300)  # nome criado depois
+for t, nome in [(250, "api.loja.com"), (301, "api.loja.com"), (600, "novo.loja.com"), (1021, "novo.loja.com")]:
+    print(t, nome, *cache.resolver(nome, t))
+print("consultas ao autoritativo:", cache.consultas_upstream)
+```
+
+```text
+Saída:
+0 api.loja.com 203.0.113.10 upstream 300
+100 api.loja.com 203.0.113.10 cache 200
+120 novo.loja.com NXDOMAIN upstream 900
+250 api.loja.com 203.0.113.10 cache 50
+301 api.loja.com 203.0.113.99 upstream 300
+600 novo.loja.com NXDOMAIN cache 420
+1021 novo.loja.com 203.0.113.50 upstream 300
+consultas ao autoritativo: 4
+```
+
+Note que até o segundo 300 os clientes continuam recebendo o IP antigo, e que o `novo.loja.com` fica "inexistente" por 15 minutos porque alguém perguntou cedo demais.
+
+## Trade-offs e falhas reais
+
+- **TTL baixo** (30 a 60 s) permite failover rápido, mas multiplica consultas e expõe você à latência e à disponibilidade do autoritativo. **TTL alto** é barato e resiliente, mas trava migrações. A prática comum é baixar o TTL dias antes de uma troca planejada.
+- **UDP e truncamento**: respostas grandes (muitos registros, DNSSEC) passam do limite do UDP; o servidor marca TC e o cliente refaz por TCP, pagando um handshake. A extensão EDNS0 anuncia um buffer maior e evita isso na maioria dos casos.
+- **Clientes que ignoram TTL**: a JVM, por exemplo, pode cachear por tempo próprio, e pools de conexão mantêm o IP antigo enquanto a conexão viver.
+
+<Callout type="warning" title="Timeout de DNS vira latência de cauda">
+Se o resolvedor perde um pacote UDP, o cliente só tenta de novo depois do timeout, que costuma ser de 1 a 5 segundos. Um p99 com saltos de exatamente 5 s é um sinal clássico de perda de pacotes de DNS.
+</Callout>
+
+## Na entrevista
+
+Explique o caminho da consulta em uma frase e passe logo para o que importa no desenho: TTL como alavanca entre agilidade e custo, cache negativo, CNAME no apex e o fato de a consulta ser UDP com fallback para TCP. Follow-ups comuns: "por que mudei o registro e alguns usuários ainda vão para o servidor antigo?" (caches com TTL ainda válido, clientes que ignoram TTL, conexões persistentes) e "por que o DNS usa UDP?" (uma ida e volta, sem estado no servidor; TCP só para respostas grandes e transferência de zona).
+
+<QuizSet>
+<Quiz question="Uma resposta DNS chega com o bit TC ligado. O que o cliente deve fazer?" options={["Descartar e usar o cache antigo", "Repetir a consulta por TCP para receber a resposta completa", "Repetir por UDP com outro ID", "Tratar como NXDOMAIN"]} answer={1} explanation="TC indica que a resposta não coube no datagrama UDP. O cliente refaz a consulta por TCP na porta 53." />
+<Quiz question="Por que não se pode colocar um CNAME em loja.com (o apex da zona)?" options={["Porque CNAME só aceita IPv6", "Porque o apex já tem SOA e NS, e um nome com CNAME não pode ter outros registros", "Porque o TTL do apex é sempre zero", "Porque o apex não pode ser resolvido por recursivos"]} answer={1} explanation="A regra do CNAME é exclusividade: o nome não pode ter mais nenhum registro. O apex precisa de SOA e NS, então provedores usam ALIAS/ANAME." />
+<Quiz question="Você consultou novo.loja.com antes de criá-lo e, depois de criado, o nome continua sem resolver por vários minutos. Qual a causa?" options={["O registro A ainda não foi replicado entre os servidores raiz", "Cache negativo: o NXDOMAIN foi guardado pelo TTL definido no SOA", "O navegador bloqueia nomes novos", "O TTL do registro novo é zero"]} answer={1} explanation="Respostas NXDOMAIN são cacheadas pelos resolvedores pelo tempo negativo do SOA. Até expirar, o nome parece inexistente." />
+</QuizSet>

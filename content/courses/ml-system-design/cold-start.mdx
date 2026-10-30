@@ -1,0 +1,93 @@
+---
+title: Cold start
+kind: lesson
+---
+
+Modelos de recomendação vivem de histórico: o que o usuário clicou, quem assistiu ao vídeo, quais itens aparecem juntos. Quando o histórico não existe, o modelo fica cego. Isso é o **cold start**, e ele aparece em três sabores: usuário novo (acabou de instalar o app), item novo (vídeo publicado há cinco minutos) e sistema novo (um produto que ainda não tem dados). Em entrevistas é quase certo que aparece como follow-up, porque todo design baseado em embeddings de ID e filtragem colaborativa tropeça aqui.
+
+## Por que é um problema de sistema, não só de modelo
+
+O cold start se retroalimenta. Um item novo não tem cliques, então o ranqueador lhe dá pontuação baixa, então ele não é exibido, então nunca ganha cliques. Sem intervenção, o catálogo fica dominado pelos itens antigos e populares, criadores novos desistem e a qualidade cai no longo prazo. Por isso a solução combina features, regras de exposição e exploração.
+
+## Usuário novo
+
+- **Contexto da requisição**: país, idioma, dispositivo, horário, origem da instalação (uma campanha de jogos sugere interesse em jogos).
+- **Onboarding**: pedir alguns tópicos ou artistas favoritos no cadastro dá um vetor inicial barato.
+- **Popularidade segmentada**: o que é popular entre usuários parecidos (mesma região e faixa etária), não o top global.
+- **Atualização rápida na sessão**: os primeiros cliques valem muito. Um embedding de usuário calculado a partir dos itens da sessão atual (média dos embeddings clicados) adapta o feed em minutos, sem esperar o treino diário.
+
+## Item novo
+
+- **Features de conteúdo**: texto, imagem, áudio, categoria, criador. Uma torre de item que usa essas features (e não só o ID) gera embedding útil desde o primeiro segundo, e o item já pode ser recuperado por vizinhos aproximados.
+- **Herdar do criador**: um vídeo novo de um canal com bom histórico começa com o desempenho médio do canal como prior.
+- **Suavização**: em vez de CTR bruto (zero cliques em três exibições), use uma estimativa com prior, como `(cliques + a) / (exibicoes + b)`, que começa na média e converge para o valor real com dados.
+- **Exploração controlada**: reservar uma pequena fração das impressões para itens novos e usar algoritmos de bandit para decidir quem merece mais exposição.
+
+## Exemplo: guloso contra exploração
+
+O programa simula cinco itens hipotéticos: três antigos com bastante histórico e dois novos sem nenhum. Um dos novos é melhor que todos os antigos; o outro é ruim. A política gulosa sempre escolhe a maior taxa estimada e trata item sem histórico como zero. O Thompson sampling sorteia uma taxa plausível de cada item a partir de uma distribuição Beta e escolhe o maior sorteio, o que dá chance a quem tem incerteza alta.
+
+```python
+import random
+
+random.seed(5)
+ctr_real = {"antigo_1": 0.040, "antigo_2": 0.035, "antigo_3": 0.030, "novo_a": 0.060, "novo_b": 0.010}
+historico = {"antigo_1": (4000, 100000), "antigo_2": (3500, 100000), "antigo_3": (3000, 100000),
+             "novo_a": (0, 0), "novo_b": (0, 0)}
+PRIOR_CLIQUES, PRIOR_IMPRESSOES = 1, 30
+
+def simular(politica, rodadas=20000):
+    stats = {k: list(v) for k, v in historico.items()}
+    exibicoes = {k: 0 for k in stats}
+    cliques_total = 0
+    for _ in range(rodadas):
+        item = politica(stats)
+        clique = random.random() < ctr_real[item]
+        stats[item][0] += clique
+        stats[item][1] += 1
+        exibicoes[item] += 1
+        cliques_total += clique
+    return exibicoes, cliques_total
+
+def guloso(stats):
+    return max(stats, key=lambda k: (stats[k][0] + PRIOR_CLIQUES) / (stats[k][1] + PRIOR_IMPRESSOES) if stats[k][1] else 0.0)
+
+def thompson(stats):
+    return max(stats, key=lambda k: random.betavariate(stats[k][0] + PRIOR_CLIQUES,
+                                                         stats[k][1] - stats[k][0] + PRIOR_IMPRESSOES))
+
+for nome, pol in (("guloso sem historico = 0", guloso), ("thompson sampling", thompson)):
+    exib, cliques = simular(pol)
+    print(f"{nome}: cliques={cliques} exibicoes novo_a={exib['novo_a']} novo_b={exib['novo_b']}")
+```
+
+```text
+Saída:
+guloso sem historico = 0: cliques=804 exibicoes novo_a=0 novo_b=0
+thompson sampling: cliques=1125 exibicoes novo_a=18421 novo_b=91
+```
+
+A política gulosa nunca exibe os itens novos e fica presa no melhor antigo. O Thompson sampling testa os dois, descobre rápido que o `novo_b` é ruim (menos de cem exibições) e passa a maior parte do tráfego para o `novo_a`, rendendo cerca de 40% mais cliques no total. Em produção, a exploração costuma ficar limitada a uma fatia pequena do tráfego ou a uma posição específica do feed, para controlar o custo.
+
+## Trade-offs
+
+| Estratégia | Ganho | Custo |
+| --- | --- | --- |
+| Features de conteúdo | Embedding útil desde o início | Modelos de texto e imagem para manter |
+| Popularidade segmentada | Simples e robusto | Pouca personalização |
+| Exploração com bandit | Descobre bons itens novos | Algumas impressões desperdiçadas |
+| Onboarding explícito | Sinal forte imediato | Atrito no cadastro |
+
+<Callout type="tip" title="Mostre o laço de realimentação">
+Diga explicitamente que, sem exploração, itens novos nunca acumulam dados. Isso mostra ao entrevistador que você enxerga o sistema inteiro, não só o modelo.
+</Callout>
+
+## Na entrevista
+
+Quando o entrevistador perguntar sobre cold start, separe usuário novo de item novo e dê duas ou três táticas para cada um, terminando com exploração. Follow-ups comuns: "como avaliar se a exploração vale a pena?" (teste A/B medindo engajamento de longo prazo e saúde do catálogo, não só cliques do dia), "como um vídeo publicado agora entra na recuperação?" (embedding de conteúdo e atualização incremental do índice) e "como evitar que spam explore o bônus de item novo?" (filtros de qualidade antes da exploração).
+
+<QuizSet>
+<Quiz question="Um vídeo acabou de ser publicado e ainda não tem nenhuma interação. Como ele pode aparecer na recuperação por embeddings?" options={["Não pode até acumular cliques", "Usando uma torre de item baseada em features de conteúdo, que gera embedding sem histórico", "Copiando o embedding de um vídeo aleatório", "Esperando o retreino semanal"]} answer={1} explanation="Features de conteúdo (texto, imagem, criador) permitem calcular o embedding no momento da publicação." />
+<Quiz question="Por que uma política puramente gulosa prejudica o catálogo no longo prazo?" options={["Porque é cara computacionalmente", "Porque itens sem histórico nunca são exibidos e por isso nunca ganham dados", "Porque aumenta a latência", "Porque exige rótulos humanos"]} answer={1} explanation="Sem exploração, o laço de realimentação mantém os itens antigos no topo e esconde itens novos possivelmente melhores." />
+<Quiz question="Um usuário instalou o app agora e clicou em três vídeos de culinária. Qual ação adapta o feed mais rápido?" options={["Esperar o treino noturno", "Atualizar um embedding de sessão a partir dos itens clicados e recuperar vizinhos", "Mostrar o top global", "Pedir que ele avalie 50 vídeos"]} answer={1} explanation="Um vetor de sessão calculado na hora captura o interesse imediato sem depender de retreino." />
+</QuizSet>

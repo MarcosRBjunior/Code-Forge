@@ -1,0 +1,168 @@
+---
+title: Serviço de geração de imagens
+kind: lesson
+---
+
+"Projete um serviço em que usuários descrevem uma imagem em texto e recebem algumas opções geradas." À primeira vista é parecido com um chat, mas o perfil de carga é outro. Uma imagem leva segundos de GPU dedicada, não sai em streaming de tokens e o resultado é um arquivo de megabytes que precisa ser armazenado e entregue. A conversa gira em torno de **processamento assíncrono com filas**, dimensionamento de GPUs, prioridade entre planos, armazenamento e segurança do conteúdo gerado.
+
+## Requisitos
+
+### Funcionais
+
+- O usuário envia um prompt de texto e parâmetros (proporção, estilo, número de variações); recebe 4 imagens.
+- Variações e edições de uma imagem existente (refazer uma região, ampliar).
+- Galeria pessoal com histórico; compartilhamento por link.
+- Planos gratuito (fila mais lenta, cota diária) e pago (prioridade, resolução maior).
+
+### Não funcionais
+
+- Plano pago: p95 abaixo de 15 segundos do pedido às imagens prontas. Gratuito: melhor esforço, abaixo de 1 minuto fora de picos.
+- Nenhum conteúdo proibido pela política (ilegal, abusivo, imagens íntimas de pessoas reais) é entregue.
+- Imagens duráveis enquanto o usuário não apagar; entrega rápida no mundo todo.
+
+## Estimativas
+
+```python
+import math
+
+pedidos_dia = 8_000_000
+imagens_por_pedido = 4
+passos, ms_por_passo = 30, 50          # hipotetico: 30 passos de difusao a 50 ms em uma GPU
+lote_por_gpu = 4                       # as 4 variacoes saem juntas em um lote
+pico = 3
+
+seg_gpu_por_pedido = passos * ms_por_passo / 1000      # o lote de 4 leva o mesmo tempo que 1
+pedidos_s_pico = pedidos_dia / 86_400 * pico
+gpus = math.ceil(pedidos_s_pico * seg_gpu_por_pedido / 0.7)
+print(f"pedidos/s no pico: {pedidos_s_pico:.0f}")
+print(f"segundos de GPU por pedido: {seg_gpu_por_pedido:.1f}; GPUs necessarias: {gpus}")
+
+mb_por_imagem = 1.5
+tb_dia = pedidos_dia * imagens_por_pedido * mb_por_imagem / 1e6
+print(f"armazenamento: {tb_dia:.0f} TB/dia, {tb_dia * 365 / 1000:.1f} PB/ano")
+
+# Reduzir passos de 30 para 8 (modelo destilado, hipotetico) muda a frota
+gpus_destilado = math.ceil(pedidos_s_pico * 8 * ms_por_passo / 1000 / 0.7)
+print(f"com modelo destilado de 8 passos: {gpus_destilado} GPUs")
+```
+
+```text
+Saída:
+pedidos/s no pico: 278
+segundos de GPU por pedido: 1.5; GPUs necessarias: 596
+armazenamento: 48 TB/dia, 17.5 PB/ano
+com modelo destilado de 8 passos: 159 GPUs
+```
+
+Dois números guiam o desenho: centenas de GPUs ocupadas por segundos em cada pedido (a fila é inevitável em picos) e dezenas de terabytes por dia de arquivos (object storage com políticas de ciclo de vida). Reduzir passos de difusão é a alavanca de custo mais forte, ao preço de alguma qualidade.
+
+## API
+
+```text
+POST /geracoes                 corpo: prompt, proporcao, n, estilo, imagem_base opcional
+                               resposta 202: { id, posicao_estimada }
+GET  /geracoes/:id             status: na_fila | gerando | moderando | pronto | bloqueado
+GET  /geracoes/:id/eventos     SSE opcional com progresso (passo atual, previa em baixa resolucao)
+GET  /galeria?cursor=...
+```
+
+O modelo assíncrono é natural: o cliente recebe um `id` imediatamente e acompanha o status. Uma prévia em baixa resolução durante os passos melhora a percepção de espera.
+
+## Arquitetura
+
+```text
+cliente --> gateway (auth, cota) --> servico de geracao --> moderacao do prompt
+                                           |                      |
+                                           v                      v (bloqueado -> resposta)
+                                  filas por prioridade (pago, gratuito, lote)
+                                           |
+                                agendador de GPUs (agrupa pedidos compativeis)
+                                           |
+                           workers de GPU (modelo carregado, aquecidos)
+                                           |
+                              moderacao da imagem gerada (classificadores)
+                                           |
+                     object storage (originais) --> CDN (miniaturas e entrega)
+                                           |
+                      banco de metadados (pedido, prompt, versao do modelo, status)
+```
+
+## Componentes em detalhe
+
+### Filas e prioridade
+
+Filas separadas por plano evitam que uma enxurrada do plano gratuito atrase os pagantes. O agendador puxa sempre da fila de maior prioridade, mas reserva uma fração da capacidade para as demais, para que o gratuito não fique parado indefinidamente. A simulação abaixo mostra o efeito numa rajada.
+
+```python
+from collections import deque
+
+CAPACIDADE = 10              # pedidos concluidos por segundo pela frota (hipotetico)
+RAJADA = 5                   # segundos de rajada
+CHEGAM = {"pago": 12, "gratuito": 20}   # pedidos por segundo durante a rajada
+
+def simular(reserva_gratuito):
+    filas = {"pago": deque(), "gratuito": deque()}
+    espera = {"pago": [], "gratuito": []}
+    t = 0
+    while t < RAJADA or filas["pago"] or filas["gratuito"]:
+        if t < RAJADA:
+            for plano, n in CHEGAM.items():
+                filas[plano].extend([t] * n)
+        vagas = CAPACIDADE
+        garantidas = int(CAPACIDADE * reserva_gratuito)
+        for plano, limite in (("gratuito", garantidas), ("pago", vagas), ("gratuito", vagas)):
+            while filas[plano] and vagas and limite:
+                espera[plano].append(t - filas[plano].popleft())
+                vagas -= 1
+                limite -= 1
+        t += 1
+    return {p: (sum(e) / len(e), max(e)) for p, e in espera.items()}
+
+for reserva in (0.0, 0.2):
+    r = simular(reserva)
+    print(f"reserva {reserva:.0%}: " + "  ".join(
+        f"{p} media {m:.1f} s max {x} s" for p, (m, x) in r.items()))
+```
+
+```text
+Saída:
+reserva 0%: pago media 0.5 s max 1 s  gratuito media 8.5 s max 11 s
+reserva 20%: pago media 1.3 s max 3 s  gratuito media 8.0 s max 11 s
+```
+
+Sem reserva, o plano pago passa na frente de tudo e o gratuito fica parado durante toda a rajada. Com 20% da capacidade garantidos, o gratuito começa a andar desde o primeiro segundo e sua espera média cai, enquanto a do pago sobe um pouco. A espera máxima do gratuito quase não muda, porque o trabalho total é o mesmo: a reserva redistribui a espera, não a elimina. Quanto reservar é uma decisão de produto.
+
+### Workers de GPU
+
+Cada worker mantém o modelo carregado na memória da GPU. Trocar de modelo custa dezenas de segundos, então o agendador direciona pedidos para workers que já têm o modelo e a resolução certos e agrupa pedidos compatíveis no mesmo lote. O autoscaling olha a profundidade das filas e o tempo de espera estimado, com piso de máquinas aquecidas para o plano pago.
+
+### Moderação em dois pontos
+
+O prompt é verificado antes de gastar GPU (barato e evita trabalho inútil). A imagem gerada passa por classificadores antes de ser entregue, porque prompts inocentes podem gerar conteúdo problemático. Resultados bloqueados não são armazenados na galeria; o caso é registrado para auditoria.
+
+<Callout type="tip" title="Proveniência">
+Mencione que as imagens podem receber marca d'água invisível e metadados de proveniência indicando que foram geradas por IA. É um follow-up comum e mostra preocupação com uso indevido.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Ponto | Opção A | Opção B |
+| --- | --- | --- |
+| Passos de difusão | Muitos: mais qualidade | Poucos (modelo destilado): mais barato e rápido |
+| Entrega | Síncrona: simples para o cliente | Assíncrona com fila: aguenta picos |
+| Frota | Dimensionada para o pico: espera baixa | Para a média: filas em picos, custo menor |
+| Armazenamento | Guardar originais para sempre | Ciclo de vida: mover para camada fria ou expirar |
+
+- **Rajadas virais:** o plano gratuito absorve a fila; mostre a posição estimada e permita notificação quando pronto.
+- **Pedidos repetidos:** prompts idênticos com mesma semente podem reaproveitar o resultado (cache exato), mas usuários costumam querer variedade.
+
+## Follow-ups
+
+- **Como fazer edição de região?** O pedido inclui imagem base e máscara; o mesmo pipeline com outro modo do modelo.
+- **Como avaliar qualidade?** Preferência humana em comparações lado a lado, métricas automáticas de aderência ao prompt e taxa de regeneração.
+- **Como proteger pessoas reais?** Bloqueio de pedidos com nomes de pessoas reais em contextos sensíveis e classificadores de rosto na saída, conforme a política.
+
+<QuizSet>
+<Quiz question="Por que a API de geração devolve 202 com um id em vez de segurar a conexão até a imagem ficar pronta?" options={["Porque imagens não cabem em HTTP", "Porque o trabalho leva segundos de GPU e pode esperar em fila; o modelo assíncrono aguenta picos e permite acompanhar o status", "Para economizar armazenamento", "Porque SSE é proibido"]} answer={1} explanation="Com fila e status, o sistema absorve rajadas sem conexões presas e o cliente pode mostrar progresso." />
+<Quiz question="Por que moderar o prompt antes da geração se a imagem também é moderada depois?" options={["Não há motivo", "Para não gastar segundos de GPU com pedidos claramente proibidos; a moderação da imagem cobre o que passa pelo filtro de texto", "Porque a moderação de imagem é mais barata", "Para melhorar a qualidade"]} answer={1} explanation="A verificação barata na entrada economiza GPU; a da saída pega conteúdo indevido gerado a partir de prompts aparentemente inocentes." />
+</QuizSet>

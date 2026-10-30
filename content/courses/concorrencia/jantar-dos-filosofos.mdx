@@ -1,0 +1,126 @@
+---
+title: Jantar dos filósofos
+kind: lesson
+---
+
+Cinco filósofos sentam em volta de uma mesa redonda. Entre cada par vizinho há um garfo, totalizando cinco. Para comer, cada um precisa dos dois garfos ao seu lado; depois de comer, devolve os dois e volta a pensar. O enunciado parece um passatempo, mas é um modelo compacto de qualquer sistema em que tarefas precisam de **vários recursos exclusivos ao mesmo tempo**: transferências que travam duas contas, jobs que reservam dois arquivos, transações que bloqueiam duas linhas. Por isso ele aparece tanto em entrevista: testa se você reconhece deadlock e sabe quebrá-lo.
+
+## Onde a solução ingênua quebra
+
+A ideia óbvia é "pegue o garfo da esquerda, depois o da direita". Se todos fizerem isso ao mesmo tempo, cada um segura um garfo e espera o vizinho soltar o outro, para sempre.
+
+```text
+        F0
+    g4      g0          Fi pega g(i) (esquerda) e espera g(i+1) (direita)
+  F4          F1        F0 tem g0, espera g1 (com F1)
+    g3      g1          F1 tem g1, espera g2 (com F2)
+     F3 g2 F2           ...
+                        F4 tem g4, espera g0 (com F0)  -> ciclo
+```
+
+Estão presentes as quatro condições de Coffman: garfos são exclusivos, cada um **segura e espera**, ninguém tira o garfo de ninguém e há uma **espera circular**. Basta quebrar uma delas.
+
+O programa abaixo força esse cenário de forma determinística: uma barreira garante que todos já pegaram o garfo da esquerda antes de tentar o da direita, e a tentativa usa timeout para o programa não travar de verdade.
+
+```python
+import threading
+
+N = 5
+garfos = [threading.Lock() for _ in range(N)]
+todos_com_esquerdo = threading.Barrier(N)
+todos_tentaram = threading.Barrier(N)
+conseguiu = [False] * N
+
+def filosofo(i):
+    esquerdo, direito = garfos[i], garfos[(i + 1) % N]
+    with esquerdo:
+        todos_com_esquerdo.wait()
+        if direito.acquire(timeout=0.2):  # sem timeout, ficaria preso para sempre
+            conseguiu[i] = True
+            direito.release()
+        todos_tentaram.wait()  # ninguém solta o esquerdo antes de todos tentarem
+
+ts = [threading.Thread(target=filosofo, args=(i,)) for i in range(N)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+
+print("conseguiram os dois garfos:", sum(conseguiu))
+print("deadlock: todos seguravam um garfo e esperavam o vizinho")
+```
+
+```text
+Saída:
+conseguiram os dois garfos: 0
+deadlock: todos seguravam um garfo e esperavam o vizinho
+```
+
+## Três formas de resolver
+
+**1. Ordem global dos recursos.** Numere os garfos e exija que todo mundo pegue primeiro o de menor número. O filósofo 4 precisa de g4 e g0, então pega g0 antes. Agora é impossível formar um ciclo, porque toda espera vai de um número menor para um maior. É a solução mais usada na prática: em Java ou Go, ordenar locks por id antes de adquiri-los é o mesmo truque.
+
+**2. Garçom (limitar a concorrência).** Um semáforo com N menos 1 permissões deixa no máximo quatro filósofos tentarem comer ao mesmo tempo. Com cinco garfos e quatro pessoas, pelo princípio da casa dos pombos ao menos uma consegue os dois.
+
+**3. Tentar e desistir.** Pegue o primeiro, tente o segundo com `acquire(timeout=...)` ou `tryLock`; se falhar, solte o primeiro e tente de novo depois. Isso quebra o "segurar e esperar", mas pode gerar **livelock** se todos desistirem e tentarem no mesmo ritmo, então use espera aleatória.
+
+```python
+import threading
+
+N = 5
+REFEICOES = 3
+garfos = [threading.Lock() for _ in range(N)]
+garcom = threading.Semaphore(N - 1)
+comeu = [0] * N
+
+def filosofo_ordenado(i):
+    a, b = i, (i + 1) % N
+    primeiro, segundo = garfos[min(a, b)], garfos[max(a, b)]
+    for _ in range(REFEICOES):
+        with primeiro:
+            with segundo:
+                comeu[i] += 1
+
+def filosofo_com_garcom(i):
+    for _ in range(REFEICOES):
+        with garcom:
+            with garfos[i]:
+                with garfos[(i + 1) % N]:
+                    comeu[i] += 1
+
+for estrategia in (filosofo_ordenado, filosofo_com_garcom):
+    comeu = [0] * N
+    ts = [threading.Thread(target=estrategia, args=(i,)) for i in range(N)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    print(estrategia.__name__, "->", comeu)
+```
+
+```text
+Saída:
+filosofo_ordenado -> [3, 3, 3, 3, 3]
+filosofo_com_garcom -> [3, 3, 3, 3, 3]
+```
+
+## Trade-offs
+
+| Estratégia | Quebra qual condição | Custo |
+| --- | --- | --- |
+| Ordem global | Espera circular | Exige conhecer todos os recursos antes; pode ser injusta |
+| Garçom | Espera circular (limita participantes) | Reduz paralelismo; o semáforo é um ponto central |
+| Tentar e soltar | Segurar e esperar | Trabalho desperdiçado e risco de livelock |
+| Árbitro único (um lock para a mesa) | Tudo | Correto, mas serializa: só um come por vez |
+
+Evitar deadlock não garante justiça. Na solução por ordem, um filósofo pode perder repetidamente a disputa e passar fome (**starvation**). Se a pergunta exigir justiça, fale em filas de espera, locks justos (`ReentrantLock(true)` em Java) ou na solução de Chandy-Misra, em que garfos "sujos" são passados ao vizinho que pede.
+
+## Na entrevista
+
+Desenhe a mesa, mostre o ciclo e nomeie as condições de Coffman. Depois proponha a ordenação de recursos como solução principal, porque é simples e se generaliza para qualquer código com múltiplos locks. Mencione o garçom como alternativa e o timeout como último recurso. Follow-ups comuns: "sua solução evita starvation?" (não necessariamente; explique como torná-la justa) e "como isso aparece num sistema real?" (transferência bancária entre duas contas: sempre trave a conta de menor id primeiro).
+
+<QuizSet>
+<Quiz question="Na solução por ordem global, qual condição de Coffman deixa de existir?" options={["Exclusão mútua", "Segurar e esperar", "Ausência de preempção", "Espera circular"]} answer={3} explanation="Se todos adquirem recursos em ordem crescente, nenhuma cadeia de espera pode voltar ao início, então não há ciclo." />
+<Quiz question="Por que um semáforo com N-1 permissões resolve o deadlock com N filósofos?" options={["Porque deixa os garfos reentrantes", "Porque com no máximo N-1 filósofos disputando N garfos ao menos um consegue os dois", "Porque elimina a exclusão mútua", "Porque ordena os filósofos"]} answer={1} explanation="Pelo princípio da casa dos pombos, N-1 pessoas e N garfos garantem que alguém pega dois, come e libera." />
+<Quiz question="Na transferência entre contas A e B, como aplicar a lição dos filósofos?" options={["Travar sempre a conta de origem primeiro", "Travar sempre a conta de menor id primeiro, independentemente do sentido", "Não usar locks", "Usar sleep entre os dois locks"]} answer={1} explanation="Travar pela origem cria ciclo quando A paga B e B paga A ao mesmo tempo; uma ordem global pelo id elimina o ciclo." />
+</QuizSet>

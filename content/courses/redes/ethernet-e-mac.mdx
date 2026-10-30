@@ -1,0 +1,131 @@
+---
+title: Ethernet e endereços MAC
+kind: lesson
+---
+
+Antes de qualquer pacote IP atravessar a internet, ele precisa dar o primeiro salto: sair da sua placa de rede e chegar ao roteador do mesmo segmento. Esse salto local é trabalho da camada de enlace, e na maioria das redes cabeadas (e, com pequenas diferenças, no Wi-Fi) quem faz isso é a Ethernet. Entender o quadro Ethernet e o endereço MAC explica por que um switch "aprende" onde cada máquina está, por que existe um limite de 1500 bytes de payload e por que tráfego de broadcast derruba redes grandes demais.
+
+## O endereço MAC
+
+O endereço MAC tem 48 bits, escritos como seis bytes em hexadecimal: `3c:22:fb:9a:10:7e`. Os três primeiros bytes formam o **OUI**, um prefixo atribuído ao fabricante; os três últimos são escolhidos por ele. Dois bits do primeiro byte têm significado especial:
+
+| Bit do primeiro byte | Valor 0 | Valor 1 |
+| --- | --- | --- |
+| bit menos significativo (I/G) | unicast: um destino | multicast: um grupo |
+| segundo bit (U/L) | globalmente único (do fabricante) | administrado localmente |
+
+O endereço `ff:ff:ff:ff:ff:ff` é o broadcast: todo mundo no segmento recebe. Sistemas operacionais modernos usam MACs aleatórios (com o bit U/L ligado) ao procurar redes Wi-Fi, justamente para dificultar rastreamento.
+
+O MAC é **local**: ele só tem sentido dentro de um domínio de enlace. A cada roteador atravessado, o quadro é desmontado e um novo é montado, com MACs de origem e destino diferentes, enquanto os endereços IP continuam os mesmos de ponta a ponta.
+
+```python
+def descrever_mac(mac):
+    b = bytes(int(x, 16) for x in mac.split(":"))
+    if b == b"\xff" * 6:
+        return f"{mac}: broadcast"
+    tipo = "multicast" if b[0] & 1 else "unicast"
+    origem = "local" if b[0] & 2 else "global"
+    oui = b[:3].hex(":")
+    return f"{mac}: {tipo}, {origem}, OUI {oui}"
+
+for m in ["3c:22:fb:9a:10:7e", "01:00:5e:00:00:fb", "da:a1:19:00:22:33", "ff:ff:ff:ff:ff:ff"]:
+    print(descrever_mac(m))
+```
+
+```text
+Saída:
+3c:22:fb:9a:10:7e: unicast, global, OUI 3c:22:fb
+01:00:5e:00:00:fb: multicast, global, OUI 01:00:5e
+da:a1:19:00:22:33: unicast, local, OUI da:a1:19
+ff:ff:ff:ff:ff:ff: broadcast
+```
+
+O segundo endereço é do bloco `01:00:5e`, usado para mapear grupos multicast IPv4 (mDNS, por exemplo). O terceiro tem o bit local ligado: é típico de MAC aleatório ou de interface virtual de contêiner.
+
+## O quadro Ethernet
+
+```text
++-----------+-----------+------------+---------------------+-------+
+| MAC dest  | MAC orig  | EtherType  |      payload        |  FCS  |
+|  6 bytes  |  6 bytes  |  2 bytes   |   46 a 1500 bytes   | 4 B   |
++-----------+-----------+------------+---------------------+-------+
+```
+
+O destino vem primeiro de propósito: o switch pode começar a decidir a porta de saída assim que lê os seis primeiros bytes. O **EtherType** diz o que vai dentro (`0x0800` para IPv4, `0x86DD` para IPv6, `0x0806` para ARP). O **FCS** é um CRC-32: quadros corrompidos são descartados em silêncio, sem aviso a ninguém. Recuperar a perda fica para camadas acima, como o TCP.
+
+O limite de 1500 bytes de payload é o **MTU** padrão. Um pacote IP maior precisa ser fragmentado ou a origem precisa descobrir um tamanho menor. Túneis (VPN, VXLAN) somam cabeçalhos e reduzem o espaço útil, o que causa o clássico problema de conexões que abrem mas travam em respostas grandes.
+
+```python
+import struct
+
+quadro = bytes.fromhex(
+    "a4bb6d112233" "3c22fb9a107e" "0800"
+    "4500003c1c4640004006b1e6c0a8010ac0a80101"
+)
+dst, src, ethertype = struct.unpack("!6s6sH", quadro[:14])
+tipos = {0x0800: "IPv4", 0x86DD: "IPv6", 0x0806: "ARP"}
+print("destino :", dst.hex(":"))
+print("origem  :", src.hex(":"))
+print("tipo    :", hex(ethertype), tipos.get(ethertype, "?"))
+print("payload :", len(quadro) - 14, "bytes, inicia em", quadro[14:16].hex())
+```
+
+```text
+Saída:
+destino : a4:bb:6d:11:22:33
+origem  : 3c:22:fb:9a:10:7e
+tipo    : 0x800 IPv4
+payload : 20 bytes, inicia em 4500
+```
+
+O `!` no formato do `struct` indica ordem de rede (big-endian), que é como todos os protocolos da pilha escrevem números de vários bytes.
+
+## Como o switch aprende
+
+Um switch não tem configuração de endereços. Ele observa o **MAC de origem** de cada quadro que chega e anota em que porta ele está. Para encaminhar, consulta o **MAC de destino**: se conhece, manda só para aquela porta; se não conhece (ou é broadcast), inunda todas as portas menos a de entrada.
+
+```python
+tabela = {}
+
+def chega(porta, origem, destino, total_portas=4):
+    tabela[origem] = porta
+    if destino != "ff" and destino in tabela:
+        saida = [tabela[destino]]
+    else:
+        saida = [p for p in range(1, total_portas + 1) if p != porta]
+    print(f"{origem}->{destino} pela porta {porta}: sai por {saida}")
+
+chega(1, "A", "B")
+chega(2, "B", "A")
+chega(1, "A", "B")
+chega(3, "C", "ff")
+print("tabela:", tabela)
+```
+
+```text
+Saída:
+A->B pela porta 1: sai por [2, 3, 4]
+B->A pela porta 2: sai por [1]
+A->B pela porta 1: sai por [2]
+C->ff pela porta 3: sai por [1, 2, 4]
+tabela: {'A': 1, 'B': 2, 'C': 3}
+```
+
+As entradas expiram (tipicamente em 5 minutos), por isso uma máquina que fica muda por muito tempo volta a ser "desconhecida" e gera inundação.
+
+## Trade-offs e armadilhas
+
+- **Domínio de broadcast grande** significa muito ruído: cada ARP e cada DHCP chega a todas as máquinas. VLANs dividem um switch físico em domínios lógicos separados.
+- **Laços** entre switches fazem broadcasts circularem para sempre, porque o quadro Ethernet não tem TTL. O Spanning Tree Protocol bloqueia portas para formar uma árvore.
+- **MTU incompatível** gera falhas parciais: o ping pequeno funciona, mas o download trava.
+- **MAC não é segurança**: é trivial falsificar. Filtrar acesso por MAC só afasta curiosos.
+
+## Na entrevista
+
+Diga que o MAC identifica uma interface dentro do enlace local e o IP identifica o destino final, e que a cada salto os MACs mudam e o IP não. Mostre que sabe como o switch aprende (origem) e encaminha (destino), e cite o MTU de 1500 como causa de problemas reais com túneis. Follow-ups comuns: "qual a diferença entre hub, switch e roteador?" (hub repete tudo, switch encaminha por MAC, roteador encaminha por IP entre redes) e "o que acontece quando um laço se forma sem STP?" (tempestade de broadcast que satura a rede).
+
+<QuizSet>
+<Quiz question="Um pacote vai do seu notebook a um servidor a cinco roteadores de distância. O que muda no caminho?" options={["O IP de destino a cada roteador", "Os endereços MAC de origem e destino a cada salto", "Nada, MAC e IP são fixos ponta a ponta", "Só o MAC de origem"]} answer={1} explanation="Cada roteador remonta o quadro com seu próprio MAC de origem e o MAC do próximo salto; os IPs de origem e destino permanecem." />
+<Quiz question="Como um switch descobre em que porta está uma máquina?" options={["Pergunta ao roteador", "Lê o MAC de origem dos quadros que chegam por cada porta", "Faz um ping em todos os endereços", "Usa DNS reverso"]} answer={1} explanation="O aprendizado é passivo: o MAC de origem de cada quadro é associado à porta de entrada." />
+<Quiz question="O primeiro byte de um MAC é 0x01. O que isso indica?" options={["Endereço multicast", "Endereço de broadcast", "Endereço administrado localmente", "Endereço inválido"]} answer={0} explanation="O bit menos significativo do primeiro byte ligado indica destino de grupo (multicast)." />
+</QuizSet>

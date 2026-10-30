@@ -1,0 +1,136 @@
+---
+title: Prioridades e filas multinível
+kind: lesson
+---
+
+Nem todo processo merece o mesmo tratamento. O tratador de áudio precisa rodar a cada poucos milissegundos ou o som falha; o backup noturno pode esperar. **Escalonamento por prioridade** atribui um número a cada processo e sempre escolhe o pronto de maior prioridade. Simples na teoria, mas traz dois problemas sérios: inanição e inversão de prioridade. As **filas multinível com realimentação** (MLFQ) resolvem parte disso e são a base conceitual de vários escalonadores reais.
+
+## Prioridade e inanição
+
+Com prioridade estrita, um processo de baixa prioridade só roda quando não há ninguém mais importante pronto. Num sistema carregado, isso pode ser nunca: é a **inanição** (starvation). A correção clássica é o **envelhecimento** (aging): a prioridade efetiva de quem espera aumenta com o tempo, até que ele inevitavelmente rode.
+
+A simulação abaixo mostra o mesmo cenário com e sem aging. Chegam continuamente tarefas de alta prioridade; o processo `relatorio` tem prioridade baixa (número maior significa menos prioridade).
+
+```python
+def simular(aging, ciclos=16):
+    prontos = {"relatorio": 9}
+    espera = {"relatorio": 0}
+    linha = []
+    for t in range(ciclos):
+        nova = f"req{t}"
+        prontos[nova] = 2          # a cada ciclo chega uma requisicao urgente
+        espera[nova] = 0
+        efetiva = {n: p - (espera[n] // 2 if aging else 0) for n, p in prontos.items()}
+        escolhido = min(efetiva, key=lambda n: (efetiva[n], n))
+        linha.append("R" if escolhido == "relatorio" else ".")
+        del prontos[escolhido]
+        del espera[escolhido]
+        for n in espera:
+            espera[n] += 1
+    return "".join(linha), "relatorio" in prontos
+
+for aging in [False, True]:
+    linha, faminto = simular(aging)
+    print(f"aging={aging!s:<5} {linha}  relatorio ainda esperando: {faminto}")
+```
+
+```text
+Saída:
+aging=False ................  relatorio ainda esperando: True
+aging=True  ..............R.  relatorio ainda esperando: False
+```
+
+Sem aging, o relatório nunca roda. Com aging, a cada dois ciclos de espera sua prioridade sobe um nível, e em algum momento ele passa à frente das requisições novas.
+
+## Inversão de prioridade
+
+Imagine três tarefas: **A** (alta), **M** (média) e **B** (baixa). B pega um lock. A acorda e precisa do mesmo lock, então bloqueia esperando B. Agora M, que não usa o lock, fica pronta e, por ter prioridade maior que B, a preempta. Resultado: A, a mais importante, espera M, que nem tem relação com o lock. Foi exatamente esse bug que reiniciava a sonda Mars Pathfinder em 1997. A correção é a **herança de prioridade**: enquanto B segura um lock que A quer, B herda a prioridade de A, termina rápido e libera o lock.
+
+## Filas multinível com realimentação
+
+A ideia da MLFQ é aprender o comportamento do processo em vez de exigir que alguém informe a prioridade:
+
+```text
+ fila 0 (prioridade alta)   quantum 2   ◄── todo processo novo entra aqui
+ fila 1                     quantum 4
+ fila 2 (prioridade baixa)  quantum 8   ◄── processos que gastam CPU descem
+```
+
+Regras:
+
+1. Roda sempre a fila mais alta que não estiver vazia; dentro dela, Round Robin.
+2. Processo novo entra no topo.
+3. Se usou o quantum inteiro, desce um nível (parece limitado por CPU).
+4. Se bloqueou antes do fim do quantum, fica no mesmo nível (parece interativo).
+5. De tempos em tempos, todos voltam ao topo (**boost**), o que evita inanição e corrige processos que mudaram de comportamento.
+
+```python
+from collections import deque
+
+QUANTUM = [2, 4, 8]
+# rajadas de CPU de cada processo; 'io' bloqueia e volta pronto no mesmo nivel
+procs = {"editor": [1, "io", 1, "io", 1], "compilador": [14], "script": [3, "io", 2]}
+filas = [deque(sorted(procs)), deque(), deque()]
+estado = {n: list(r) for n, r in procs.items()}
+t, log = 0, []
+
+while any(filas):
+    nivel = next(i for i, f in enumerate(filas) if f)
+    n = filas[nivel].popleft()
+    rajada = estado[n].pop(0)
+    uso = min(rajada, QUANTUM[nivel])
+    t += uso
+    log.append(f"t={t:>2} {n:<10} nivel {nivel} usou {uso}")
+    if uso < rajada:                         # gastou o quantum inteiro: desce
+        estado[n].insert(0, rajada - uso)
+        filas[min(nivel + 1, 2)].append(n)
+    elif estado[n] and estado[n][0] == "io":  # bloqueou: mantem o nivel
+        estado[n].pop(0)
+        filas[nivel].append(n)
+
+print("\n".join(log))
+```
+
+```text
+Saída:
+t= 2 compilador nivel 0 usou 2
+t= 3 editor     nivel 0 usou 1
+t= 5 script     nivel 0 usou 2
+t= 6 editor     nivel 0 usou 1
+t= 7 editor     nivel 0 usou 1
+t=11 compilador nivel 1 usou 4
+t=12 script     nivel 1 usou 1
+t=14 script     nivel 1 usou 2
+t=22 compilador nivel 2 usou 8
+```
+
+O editor, que roda pouco e bloqueia, fica sempre no nível 0 e responde rápido. O compilador desce até o nível 2, onde recebe fatias maiores e menos frequentes, o que é eficiente para ele.
+
+## Do conceito ao Linux
+
+| Escalonador | Ideia central |
+| --- | --- |
+| MLFQ clássico | Filas por prioridade, rebaixa quem consome CPU |
+| CFS (Linux 2.6.23 a 6.5) | Roda quem acumulou menos tempo virtual de CPU; `nice` muda o peso |
+| EEVDF (Linux 6.6+) | Justiça por tempo virtual mais prazos para favorecer latência |
+| Tempo real (`SCHED_FIFO`, `SCHED_RR`) | Prioridade estrita acima dos processos normais |
+
+<Callout type="warning" title="Cuidado com prioridade de tempo real">
+Um processo `SCHED_FIFO` em laço infinito monopoliza o núcleo e pode travar a máquina. O Linux reserva por padrão 5% do tempo para tarefas normais (`sched_rt_runtime_us`) justamente para permitir que você recupere o controle.
+</Callout>
+
+```bash
+nice -n 10 ./backup.sh          # roda com prioridade menor
+renice -n -5 -p 1234            # aumenta a prioridade (exige privilégio)
+chrt -f 50 ./controle           # tempo real FIFO, prioridade 50
+```
+
+## Na entrevista
+
+Explique prioridade estrita, mostre o risco de inanição e a solução por aging, e descreva as regras da MLFQ destacando que ela favorece processos interativos sem saber nada deles de antemão. Follow-ups comuns: "o que é inversão de prioridade e como resolver?" (herança de prioridade) e "como um processo poderia enganar a MLFQ?" (bloquear logo antes do fim do quantum; a correção é contabilizar o tempo total usado em cada nível).
+
+<QuizSet>
+<Quiz question="Um job de baixa prioridade nunca roda porque sempre há jobs mais prioritários prontos. Qual técnica resolve?" options={["Reduzir o quantum", "Envelhecimento: aumentar a prioridade de quem espera há muito tempo", "Herança de prioridade", "Desativar a preempção"]} answer={1} explanation="O aging garante que a prioridade efetiva de quem espera cresça até ele ser escolhido." />
+<Quiz question="Uma tarefa de alta prioridade espera um lock segurado por uma de baixa prioridade, que por sua vez é preemptada por uma de prioridade média. Qual o nome do problema e a solução?" options={["Deadlock; ordenar locks", "Inversão de prioridade; herança de prioridade", "Inanição; aging", "Comboio; Round Robin"]} answer={1} explanation="A tarefa baixa herda temporariamente a prioridade da alta, termina a região crítica e libera o lock." />
+<Quiz question="Na MLFQ, por que um editor de texto tende a permanecer na fila de maior prioridade?" options={["Porque foi marcado como interativo pelo usuário", "Porque usa pouca CPU e bloqueia em E/S antes de gastar o quantum", "Porque é um processo do sistema", "Porque tem menos memória"]} answer={1} explanation="Quem não gasta o quantum inteiro não é rebaixado, então processos interativos ficam no topo naturalmente." />
+</QuizSet>

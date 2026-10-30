@@ -1,0 +1,114 @@
+---
+title: O modelo TCP/IP
+kind: lesson
+---
+
+O OSI foi desenhado por comitê antes de existir uma rede para ele. O TCP/IP nasceu ao contrário: primeiro os protocolos funcionaram na ARPANET, depois alguém descreveu as camadas. Por isso é ele que descreve a internet real, e é nele que você pensa quando lê o código de um kernel, um `tcpdump` ou a documentação de um load balancer.
+
+## Quatro camadas e um princípio
+
+| Camada TCP/IP | Equivale no OSI | O que faz | Onde roda |
+| --- | --- | --- | --- |
+| Aplicação | 5, 6 e 7 | Protocolos do programa: HTTP, DNS, TLS, SSH | Espaço do usuário |
+| Transporte | 4 | Portas, confiabilidade, controle de fluxo | Kernel (TCP, UDP) ou usuário (QUIC) |
+| Internet | 3 | Endereço IP, roteamento salto a salto | Kernel e roteadores |
+| Acesso à rede (enlace) | 1 e 2 | Quadros no meio físico local | Driver, placa de rede, switch |
+
+Algumas referências separam enlace e física e falam em cinco camadas. Tanto faz: o que importa é onde cada responsabilidade mora.
+
+O princípio que define o TCP/IP é o **fim a fim** (end-to-end): a rede no meio é simples e sem estado por conexão, só encaminha pacotes IP com melhor esforço. Pode perder, duplicar ou reordenar. Toda a inteligência (retransmitir, ordenar, controlar ritmo) fica nas pontas, dentro do TCP. Essa escolha explica por que a internet escalou: um roteador de backbone não precisa lembrar de bilhões de conexões, só da tabela de rotas.
+
+## A cintura fina
+
+```text
+   HTTP  gRPC  DNS  SMTP  SSH  QUIC-apps
+      \    |    |    |    /     |
+        TCP          UDP ------+
+            \       /
+               IP          <- um único protocolo no meio
+            /   |   \
+     Ethernet  Wi-Fi  4G/5G  fibra
+```
+
+Muitos protocolos em cima, muitos meios embaixo, e apenas o IP na cintura. Qualquer aplicação nova roda em qualquer rede nova, desde que as duas falem IP. O preço é que mudar o meio da ampulheta é quase impossível: veja quanto tempo o IPv6 leva para substituir o IPv4, ou por que o QUIC foi construído sobre UDP em vez de virar um protocolo novo ao lado do TCP (middleboxes descartariam o desconhecido).
+
+## Como o kernel entrega o dado ao processo certo
+
+Quando um pacote chega, cada camada lê o seu cabeçalho e decide para quem passar: o enlace olha o campo EtherType (é IPv4? IPv6?), o IP olha o campo protocolo (6 é TCP, 17 é UDP) e o transporte olha a porta de destino. Isso se chama **demultiplexação**. Para TCP, o kernel usa a quádrupla completa (IP e porta de origem, IP e porta de destino), porque várias conexões compartilham a porta 443 do servidor.
+
+```python
+PROTO = {6: "TCP", 17: "UDP"}
+
+# sockets abertos no servidor 10.0.0.5
+conexoes_tcp = {
+    ("203.0.113.7", 51000, "10.0.0.5", 443): "conexao A (worker 1)",
+    ("198.51.100.2", 40001, "10.0.0.5", 443): "conexao B (worker 2)",
+}
+escutando = {("TCP", 443): "listener HTTPS", ("UDP", 53): "servidor DNS"}
+
+def entregar(proto_num, src, sport, dst, dport):
+    proto = PROTO.get(proto_num, "?")
+    chave = (src, sport, dst, dport)
+    if proto == "TCP" and chave in conexoes_tcp:
+        return conexoes_tcp[chave]
+    if (proto, dport) in escutando:
+        return escutando[(proto, dport)]
+    return "nenhum socket: TCP responde RST, UDP gera ICMP port unreachable"
+
+print(entregar(6, "203.0.113.7", 51000, "10.0.0.5", 443))
+print(entregar(6, "198.51.100.2", 40001, "10.0.0.5", 443))
+print(entregar(6, "192.0.2.9", 60000, "10.0.0.5", 443))
+print(entregar(17, "192.0.2.9", 5353, "10.0.0.5", 53))
+print(entregar(6, "192.0.2.9", 60000, "10.0.0.5", 8080))
+```
+
+```text
+Saída:
+conexao A (worker 1)
+conexao B (worker 2)
+listener HTTPS
+servidor DNS
+nenhum socket: TCP responde RST, UDP gera ICMP port unreachable
+```
+
+O terceiro caso é um SYN novo: não há conexão estabelecida com aquela quádrupla, então ele cai no socket que está escutando, que vai criar uma conexão nova. O último caso explica a mensagem "connection refused" que você vê no cliente.
+
+## O que cada camada garante (e não garante)
+
+```python
+garantias = {
+    "Enlace (Ethernet)": ["detecta erro no quadro (CRC)", "entrega so no mesmo segmento"],
+    "Internet (IP)": ["enderecamento global", "sem garantia de entrega nem ordem"],
+    "Transporte (TCP)": ["entrega confiavel e ordenada", "controle de fluxo e congestionamento"],
+    "Transporte (UDP)": ["portas e checksum", "nada de retransmissao"],
+}
+for camada, itens in garantias.items():
+    print(f"{camada}: " + "; ".join(itens))
+```
+
+```text
+Saída:
+Enlace (Ethernet): detecta erro no quadro (CRC); entrega so no mesmo segmento
+Internet (IP): enderecamento global; sem garantia de entrega nem ordem
+Transporte (TCP): entrega confiavel e ordenada; controle de fluxo e congestionamento
+Transporte (UDP): portas e checksum; nada de retransmissao
+```
+
+<Callout type="note" title="Confiabilidade não é transitiva">
+TCP garante que os bytes chegaram ao kernel do outro lado, não que a aplicação os processou. Se o servidor cair depois do ACK e antes de gravar no banco, o cliente acha que deu certo. Por isso protocolos de aplicação têm suas próprias confirmações e idempotência.
+</Callout>
+
+## Trade-offs
+
+- **Simplicidade no núcleo, complexidade nas pontas:** a rede escala, mas cada host precisa de uma pilha TCP sofisticada.
+- **Transporte no kernel:** rápido e compartilhado, mas evoluir exige atualizar sistemas operacionais. É o motivo de o QUIC rodar em espaço de usuário.
+- **Melhor esforço:** sem reserva de banda, a latência varia com a fila dos roteadores. Aplicações sensíveis (voz, jogos) aceitam perda para não esperar retransmissão.
+
+## Na entrevista
+
+Quando perguntarem "OSI ou TCP/IP?", diga que o OSI é o vocabulário e o TCP/IP é o que está implementado, e mapeie um no outro. Mencione o princípio fim a fim e a cintura fina do IP: mostram que você entende por que a internet é como é. Follow-ups: "como o servidor sabe para qual conexão vai um pacote se todas usam a porta 443?" (pela quádrupla) e "por que o QUIC usa UDP?" (para atravessar middleboxes e evoluir fora do kernel).
+
+<QuizSet>
+<Quiz question="Dois clientes conectam na porta 443 do mesmo servidor. Como o kernel separa os segmentos de cada um?" options={["Pelo endereço MAC de origem", "Pela quádrupla IP/porta de origem e IP/porta de destino", "Pelo número de sequência TCP", "Cada cliente recebe uma porta de destino diferente"]} answer={1} explanation="A porta de destino é a mesma; o que muda é IP e porta de origem, e a quádrupla identifica a conexão." />
+<Quiz question="O que o princípio fim a fim diz sobre os roteadores no meio do caminho?" options={["Devem retransmitir pacotes perdidos", "Devem manter estado de cada conexão TCP", "Devem apenas encaminhar pacotes; confiabilidade fica nas pontas", "Devem ordenar os pacotes antes de entregar"]} answer={2} explanation="A rede faz melhor esforço e as pontas cuidam de retransmissão e ordem, o que mantém o núcleo simples e escalável." />
+</QuizSet>

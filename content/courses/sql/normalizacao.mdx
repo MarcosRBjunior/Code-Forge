@@ -1,0 +1,142 @@
+---
+title: "Normalização: 1FN a BCNF"
+kind: lesson
+---
+
+Uma tabela mal desenhada funciona no primeiro dia e começa a mentir no segundo: o endereço do cliente aparece de um jeito num pedido e de outro no pedido seguinte, apagar o último pedido de um produto apaga também o preço dele, e não dá para cadastrar um produto que ninguém comprou ainda. Essas são as **anomalias** de atualização, deleção e inserção. **Normalização** é o processo de decompor tabelas para eliminá-las, guiado por uma ideia: cada fato deve ser guardado num lugar só.
+
+## Dependência funcional
+
+O conceito central é a **dependência funcional**: A determina B (escreve-se `A -> B`) quando, conhecendo A, existe um único B possível. `cpf -> nome`, `produto_id -> preco`. As formas normais são regras sobre quais dependências podem existir numa tabela.
+
+## Um ponto de partida ruim
+
+```sql
+CREATE TABLE pedidos_planilha (
+  pedido_id     integer,
+  cliente_email text,
+  cliente_nome  text,
+  produto_id    integer,
+  produto_nome  text,
+  preco         numeric(8, 2),
+  quantidade    integer,
+  PRIMARY KEY (pedido_id, produto_id)
+);
+
+INSERT INTO pedidos_planilha VALUES
+  (1, 'ana@ex.com', 'Ana', 10, 'Caneca', 25.00, 2),
+  (1, 'ana@ex.com', 'Ana', 11, 'Camiseta', 60.00, 1),
+  (2, 'beto@ex.com', 'Beto', 10, 'Caneca', 25.00, 1),
+  (3, 'ana@ex.com', 'Ana Souza', 12, 'Boné', 40.00, 3);
+
+SELECT cliente_email, string_agg(DISTINCT cliente_nome, ', ') AS nomes
+FROM pedidos_planilha
+GROUP BY cliente_email
+ORDER BY cliente_email;
+```
+
+```text
+Saída:
+cliente_email | nomes
+ana@ex.com | Ana, Ana Souza
+beto@ex.com | Beto
+```
+
+O mesmo e-mail aparece com dois nomes: o fato "nome da cliente" está repetido e já divergiu. Vamos ver qual regra foi quebrada.
+
+## As formas normais
+
+**1FN (primeira forma normal):** cada coluna guarda um valor atômico e não há grupos repetidos. Uma coluna `produtos = 'Caneca, Camiseta'` viola a 1FN. Nossa tabela já está em 1FN: um produto por linha.
+
+**2FN:** está em 1FN e nenhuma coluna não chave depende de **parte** de uma chave composta. A chave é `(pedido_id, produto_id)`, mas `produto_nome` e `preco` dependem só de `produto_id`, e `cliente_email` depende só de `pedido_id`. São dependências parciais. A correção é separar: produtos numa tabela, cabeçalho do pedido em outra, itens numa terceira.
+
+**3FN:** está em 2FN e nenhuma coluna não chave depende de **outra coluna não chave** (dependência transitiva). Depois de separar o pedido, teríamos `pedido_id -> cliente_email -> cliente_nome`. O nome depende do pedido só através do e-mail, então ele vai para uma tabela de clientes.
+
+**BCNF (forma normal de Boyce-Codd):** para toda dependência `A -> B` não trivial, A precisa ser uma superchave. A 3FN tolera um caso raro em que a coluna determinada faz parte de uma chave candidata; a BCNF não. Exemplo clássico: numa tabela `(aluno, disciplina, professor)` em que cada professor ensina uma única disciplina, `professor -> disciplina`, mas professor sozinho não é chave. A tabela está em 3FN e não em BCNF; a decomposição separa `(professor, disciplina)` de `(aluno, professor)`.
+
+## O esquema normalizado
+
+```sql
+CREATE TABLE clientes (
+  email text PRIMARY KEY,
+  nome  text NOT NULL
+);
+
+CREATE TABLE produtos (
+  id    integer PRIMARY KEY,
+  nome  text NOT NULL,
+  preco numeric(8, 2) NOT NULL
+);
+
+CREATE TABLE pedidos (
+  id            integer PRIMARY KEY,
+  cliente_email text NOT NULL REFERENCES clientes (email)
+);
+
+CREATE TABLE itens (
+  pedido_id  integer REFERENCES pedidos (id),
+  produto_id integer REFERENCES produtos (id),
+  quantidade integer NOT NULL,
+  PRIMARY KEY (pedido_id, produto_id)
+);
+
+INSERT INTO clientes VALUES ('ana@ex.com', 'Ana Souza'), ('beto@ex.com', 'Beto');
+INSERT INTO produtos VALUES (10, 'Caneca', 25.00), (11, 'Camiseta', 60.00), (12, 'Boné', 40.00), (13, 'Chaveiro', 9.90);
+INSERT INTO pedidos VALUES (1, 'ana@ex.com'), (2, 'beto@ex.com'), (3, 'ana@ex.com');
+INSERT INTO itens VALUES (1, 10, 2), (1, 11, 1), (2, 10, 1), (3, 12, 3);
+
+SELECT p.id AS pedido, c.nome, SUM(i.quantidade * pr.preco) AS total
+FROM pedidos p
+JOIN clientes c ON c.email = p.cliente_email
+JOIN itens i ON i.pedido_id = p.id
+JOIN produtos pr ON pr.id = i.produto_id
+GROUP BY p.id, c.nome
+ORDER BY p.id;
+```
+
+```text
+Saída:
+pedido | nome | total
+1 | Ana Souza | 110.00
+2 | Beto | 25.00
+3 | Ana Souza | 120.00
+```
+
+Agora o nome da cliente existe uma vez só, e o chaveiro pode ser cadastrado sem nenhum pedido. Mudar o nome é um `UPDATE` de uma linha:
+
+```sql
+UPDATE clientes SET nome = 'Ana S.' WHERE email = 'ana@ex.com';
+
+SELECT p.id AS pedido, c.nome
+FROM pedidos p
+JOIN clientes c ON c.email = p.cliente_email
+ORDER BY p.id;
+```
+
+```text
+Saída:
+pedido | nome
+1 | Ana S.
+2 | Beto
+3 | Ana S.
+```
+
+<Callout type="warning" title="Preço do catálogo não é preço da venda">
+Normalizar demais também erra. O preço em `produtos` é o preço atual; o que o cliente pagou é um fato do item vendido e deve ser copiado para `itens.preco_unitario` no momento da compra. Caso contrário, um reajuste reescreve o histórico de faturamento.
+</Callout>
+
+## Armadilhas
+
+- **Decorar sem entender.** Em entrevista, explicar a anomalia concreta ("mudar o nome exige atualizar N linhas e alguma fica para trás") vale mais do que recitar definições.
+- **Confundir 2FN e 3FN.** Parcial é dependência de parte da chave; transitiva é dependência através de outra coluna não chave.
+- **Ignorar o tempo.** Dados que mudam e precisam de histórico (preço, endereço de entrega) são fatos do evento, não da entidade.
+
+## Na entrevista
+
+Quando receber uma tabela "planilha", aponte as dependências funcionais, mostre uma anomalia concreta e proponha a decomposição. Diga até onde vai: 3FN é o alvo prático na maioria dos sistemas transacionais. Follow-ups comuns: "qual a diferença entre 3FN e BCNF?" (BCNF exige que todo determinante seja superchave) e "quando você não normalizaria?" (leituras analíticas pesadas e caches, assunto do próximo capítulo).
+
+<QuizSet>
+<Quiz question="Numa tabela com chave (pedido_id, produto_id), a coluna produto_nome depende só de produto_id. Qual forma normal é violada?" options={["1FN", "2FN", "3FN apenas", "Nenhuma"]} answer={1} explanation="É uma dependência parcial de parte da chave composta, o que a 2FN proíbe." />
+<Quiz question="Na tabela pedidos(id, cliente_email, cliente_nome), qual o problema?" options={["Dependência parcial", "Dependência transitiva: id determina email, que determina nome", "Valor não atômico", "Falta de chave primária"]} answer={1} explanation="cliente_nome depende de uma coluna não chave (cliente_email), o que viola a 3FN." />
+<Quiz question="Qual anomalia aparece se apagar o último pedido de um produto também apaga o preço dele?" options={["Anomalia de inserção", "Anomalia de atualização", "Anomalia de deleção", "Anomalia de leitura"]} answer={2} explanation="Perder um fato (o preço) ao apagar outro (o pedido) é anomalia de deleção." />
+</QuizSet>

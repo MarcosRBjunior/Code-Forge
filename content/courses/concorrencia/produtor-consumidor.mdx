@@ -1,0 +1,172 @@
+---
+title: Produtor-consumidor
+kind: lesson
+---
+
+Quase todo sistema real tem uma parte que gera trabalho e outra que o executa: um servidor HTTP aceita requisições e workers as processam, um leitor de arquivo lê linhas e um parser as transforma, um serviço recebe eventos e outro grava no banco. Se os dois lados rodam no mesmo ritmo e na mesma thread, o mais lento dita a velocidade do todo. O padrão **produtor-consumidor** desacopla os dois lados com um buffer compartilhado no meio: produtores colocam itens, consumidores retiram, e cada lado anda no próprio ritmo.
+
+## Como funciona
+
+O buffer tem capacidade limitada. Isso é intencional: um buffer infinito só esconde o problema quando o produtor é mais rápido, até a memória acabar. Com limite, você ganha **backpressure**: o produtor que encontra o buffer cheio espera, e o sistema se autorregula.
+
+```text
+ produtor A ─┐                         ┌─> consumidor 1
+             ├──> [ ][x][x][x][ ] ─────┤
+ produtor B ─┘     buffer (cap. 5)     └─> consumidor 2
+
+ buffer cheio  -> produtor bloqueia até alguém retirar
+ buffer vazio  -> consumidor bloqueia até alguém colocar
+```
+
+As três exigências de corretude são:
+
+1. **Exclusão mútua** no acesso ao buffer, para dois threads não corromperem a estrutura.
+2. **Esperar sem gastar CPU** quando o buffer está cheio ou vazio, nada de laço `while cheio: pass`.
+3. **Encerramento limpo**: os consumidores precisam saber quando não virá mais nada.
+
+## Implementação com Condition
+
+A versão clássica usa um lock e duas variáveis de condição: `nao_cheio` para acordar produtores e `nao_vazio` para acordar consumidores. Repare no `while` em volta de cada `wait()`: depois de acordar, a thread precisa reverificar a condição, porque outra pode ter chegado antes ou o despertar pode ter sido espúrio.
+
+```python
+import threading
+from collections import deque
+
+class BufferLimitado:
+    def __init__(self, capacidade):
+        self.itens = deque()
+        self.capacidade = capacidade
+        self.lock = threading.Lock()
+        self.nao_cheio = threading.Condition(self.lock)
+        self.nao_vazio = threading.Condition(self.lock)
+        self.maior_ocupacao = 0
+
+    def colocar(self, item):
+        with self.nao_cheio:
+            while len(self.itens) == self.capacidade:
+                self.nao_cheio.wait()
+            self.itens.append(item)
+            self.maior_ocupacao = max(self.maior_ocupacao, len(self.itens))
+            self.nao_vazio.notify()
+
+    def retirar(self):
+        with self.nao_vazio:
+            while not self.itens:
+                self.nao_vazio.wait()
+            item = self.itens.popleft()
+            self.nao_cheio.notify()
+            return item
+
+buffer = BufferLimitado(3)
+consumidos = []
+lock_resultado = threading.Lock()
+
+def produtor(inicio):
+    for i in range(inicio, inicio + 10):
+        buffer.colocar(i)
+
+def consumidor():
+    while True:
+        item = buffer.retirar()
+        if item is None:  # sentinela: fim do trabalho
+            return
+        with lock_resultado:
+            consumidos.append(item)
+
+prods = [threading.Thread(target=produtor, args=(k * 100,)) for k in range(2)]
+cons = [threading.Thread(target=consumidor) for _ in range(3)]
+for t in prods + cons:
+    t.start()
+for t in prods:
+    t.join()
+for _ in cons:
+    buffer.colocar(None)  # uma sentinela por consumidor
+for t in cons:
+    t.join()
+
+print("itens consumidos:", len(consumidos))
+print("sem perdas nem duplicatas:", sorted(consumidos) == list(range(10)) + list(range(100, 110)))
+print("ocupacao nunca passou da capacidade:", buffer.maior_ocupacao <= 3)
+```
+
+```text
+Saída:
+itens consumidos: 20
+sem perdas nem duplicatas: True
+ocupacao nunca passou da capacidade: True
+```
+
+O encerramento usa **sentinelas** (pílulas de veneno): depois que todos os produtores terminam, você coloca um `None` por consumidor. Cada consumidor que retira um `None` sai do laço. Se você colocar só uma sentinela para três consumidores, dois ficam bloqueados para sempre.
+
+## A versão de produção: queue.Queue
+
+Na prática, você não reimplementa o buffer. Em Python, `queue.Queue(maxsize=n)` já é uma fila bloqueante thread-safe. Em Java, o equivalente é `BlockingQueue` (`ArrayBlockingQueue`, `LinkedBlockingQueue`) com `put` e `take`; em Go, um canal com buffer (`make(chan int, 5)`) é exatamente esse padrão embutido na linguagem, e `close(ch)` substitui a sentinela.
+
+```python
+import threading
+import queue
+
+fila = queue.Queue(maxsize=4)
+resultados = {}
+
+def produtor():
+    for n in range(1, 9):
+        fila.put(n)          # bloqueia se a fila estiver cheia
+
+def consumidor(nome):
+    while True:
+        n = fila.get()       # bloqueia se a fila estiver vazia
+        if n is None:
+            fila.task_done()
+            return
+        resultados[n] = (n * n, nome)
+        fila.task_done()
+
+consumidores = [threading.Thread(target=consumidor, args=(f"c{i}",)) for i in range(2)]
+for c in consumidores:
+    c.start()
+produtor()
+fila.join()                  # espera todos os itens serem processados
+for _ in consumidores:
+    fila.put(None)
+for c in consumidores:
+    c.join()
+
+for n in sorted(resultados):
+    print(n, "->", resultados[n][0])
+```
+
+```text
+Saída:
+1 -> 1
+2 -> 4
+3 -> 9
+4 -> 16
+5 -> 25
+6 -> 36
+7 -> 49
+8 -> 64
+```
+
+`task_done()` e `join()` da fila permitem esperar até que todo item colocado tenha sido marcado como processado, o que é diferente de a fila estar vazia: um item retirado pode ainda estar em processamento.
+
+## Armadilhas
+
+- **`if` no lugar de `while` antes do `wait()`**: com vários consumidores, dois podem acordar para um único item, e o segundo tenta retirar de um buffer vazio.
+- **Uma só condição para tudo**: com `notify()` numa condição compartilhada, um produtor pode acordar outro produtor em vez de um consumidor, e o sistema trava. Use duas condições ou `notify_all()`.
+- **Buffer ilimitado**: memória cresce sem controle quando o consumidor é mais lento. Limite e trate o produtor bloqueado como sinal de sobrecarga.
+- **Encerramento esquecido**: consumidores bloqueados em `get()` impedem o programa de terminar.
+
+<Callout type="tip" title="Dimensionando o buffer">
+O buffer absorve picos, não diferenças permanentes de vazão. Se o produtor é sempre mais rápido, aumentar o buffer só atrasa o bloqueio; a solução é adicionar consumidores ou descartar trabalho.
+</Callout>
+
+## Na entrevista
+
+O pedido mais comum é "implemente uma fila bloqueante limitada". Comece declarando as invariantes (tamanho entre zero e a capacidade), escolha lock mais duas condições, escreva `put` e `take` com `while` em volta de `wait()` e explique o encerramento. Depois diga que, em produção, você usaria `BlockingQueue` ou canais. Follow-ups comuns: "e se o produtor não puder bloquear?" (`offer` com timeout, descartar ou retornar erro) e "como garantir ordem de processamento com vários consumidores?" (particionar por chave, um consumidor por partição).
+
+<QuizSet>
+<Quiz question="Por que a espera em uma variável de condição deve ficar dentro de um while e não de um if?" options={["Porque if não funciona com locks", "Porque, ao acordar, a condição pode não valer mais: outra thread pegou o item ou o despertar foi espúrio", "Porque while é mais rápido", "Porque wait() só funciona em laços"]} answer={1} explanation="Acordar não garante que a condição seja verdadeira; a thread precisa reverificar antes de agir." />
+<Quiz question="Você tem 4 consumidores e encerra o trabalho colocando uma única sentinela None na fila. O que acontece?" options={["Todos encerram", "Um consumidor encerra e os outros três ficam bloqueados para sempre em get()", "A fila lança exceção", "O produtor bloqueia"]} answer={1} explanation="Cada sentinela é retirada por um só consumidor. É preciso uma por consumidor, ou um mecanismo de fechamento como close de canal em Go." />
+<Quiz question="Qual o principal motivo para limitar a capacidade do buffer?" options={["Deixar o código mais simples", "Gerar backpressure: o produtor desacelera quando o consumidor não acompanha, evitando estouro de memória", "Garantir ordem FIFO", "Evitar deadlock"]} answer={1} explanation="Um buffer limitado faz o produtor esperar, propagando a sobrecarga para trás em vez de acumular itens até a memória acabar." />
+</QuizSet>

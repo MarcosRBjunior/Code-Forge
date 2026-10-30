@@ -1,0 +1,108 @@
+---
+title: Roteamento entre modelos
+kind: lesson
+---
+
+Mandar toda requisição para o modelo mais capaz é a forma mais simples de garantir qualidade, e também a mais cara e lenta. Na maioria dos produtos, boa parte do tráfego é fácil: classificar uma intenção, reescrever uma frase, responder uma saudação. Um modelo pequeno resolve esses casos por uma fração do custo e com latência menor. O **roteador de modelos** é o componente que decide, para cada requisição, qual modelo atende, e o que fazer quando esse modelo falha.
+
+## Onde o roteador mora
+
+Ele costuma ficar dentro de um **gateway de modelos**, um serviço interno pelo qual passam todas as chamadas a LLMs da empresa. Além de rotear, o gateway centraliza credenciais dos provedores, cotas por equipe, rate limiting, registro de tokens e custo, retries e fallback. Os times de produto falam com uma API única e não precisam saber qual modelo, provedor ou região atendeu.
+
+```text
+aplicacao -> gateway de modelos
+               |- classificador / regras -> escolhe modelo
+               |- cotas e rate limit por equipe
+               |- chamada com timeout -> modelo escolhido
+               |      falhou? -> proximo da cadeia de fallback
+               '- registra tokens, custo, latencia, modelo usado
+```
+
+## Estratégias de roteamento
+
+- **Por regras:** tipo de tarefa declarado pela aplicação, tamanho do prompt, plano do cliente, necessidade de ferramentas. Simples, previsível e fácil de auditar. É o ponto de partida certo.
+- **Por classificador:** um modelo pequeno (ou até um classificador clássico) estima a dificuldade da pergunta e escolhe o nível. Precisa de dados rotulados e de avaliação para não mandar perguntas difíceis ao modelo fraco.
+- **Em cascata:** tenta o modelo barato primeiro; se a resposta falhar numa verificação (formato inválido, baixa confiança, avaliador reprovou), escala para o modelo maior. Economiza no caso comum e paga latência dobrada no caso difícil.
+
+## Um roteador por regras
+
+O programa abaixo roteia uma amostra de requisições e compara o custo com a alternativa de mandar tudo para o modelo grande. Preços e tamanhos são hipotéticos. Ele também simula uma cadeia de fallback com o modelo médio fora do ar.
+
+```python
+MODELOS = {  # preco hipotetico em USD por milhao de tokens (entrada, saida)
+    "pequeno": (0.10, 0.40),
+    "medio": (0.50, 2.00),
+    "grande": (3.00, 12.00),
+}
+FALLBACK = {"pequeno": ["pequeno", "medio"], "medio": ["medio", "grande"], "grande": ["grande", "medio"]}
+
+def rotear(req):
+    if req["tarefa"] in ("classificar", "extrair") and req["tok_in"] <= 4000:
+        return "pequeno"
+    if req["ferramentas"] or req["tarefa"] == "raciocinio" or req["plano"] == "enterprise":
+        return "grande"
+    return "medio"
+
+def custo(modelo, req):
+    p_in, p_out = MODELOS[modelo]
+    return (req["tok_in"] * p_in + req["tok_out"] * p_out) / 1e6
+
+amostra = [
+    {"tarefa": "classificar", "tok_in": 800, "tok_out": 10, "ferramentas": False, "plano": "free", "peso": 50},
+    {"tarefa": "extrair", "tok_in": 3000, "tok_out": 200, "ferramentas": False, "plano": "pro", "peso": 20},
+    {"tarefa": "conversa", "tok_in": 2000, "tok_out": 300, "ferramentas": False, "plano": "free", "peso": 20},
+    {"tarefa": "raciocinio", "tok_in": 5000, "tok_out": 800, "ferramentas": True, "plano": "pro", "peso": 10},
+]
+roteado = sum(custo(rotear(r), r) * r["peso"] for r in amostra)
+tudo_grande = sum(custo("grande", r) * r["peso"] for r in amostra)
+for r in amostra:
+    print(f"{r['tarefa']:<12} -> {rotear(r)}")
+print(f"custo por 100 req: roteado US$ {roteado:.4f}, tudo no grande US$ {tudo_grande:.4f}")
+print(f"economia: {1 - roteado / tudo_grande:.0%}")
+
+fora_do_ar = {"medio"}
+def chamar(req):
+    for m in FALLBACK[rotear(req)]:
+        if m not in fora_do_ar:
+            return m
+    return "erro 503"
+print("conversa com medio fora do ar ->", chamar(amostra[2]))
+```
+
+```text
+Saída:
+classificar  -> pequeno
+extrair      -> pequeno
+conversa     -> medio
+raciocinio   -> grande
+custo por 100 req: roteado US$ 0.2898, tudo no grande US$ 0.7920
+economia: 63%
+conversa com medio fora do ar -> grande
+```
+
+O resultado típico é revelador: a maior parte do custo vem da pequena fatia de requisições que realmente precisam do modelo grande. Rotear as fáceis para baixo corta a conta drasticamente sem tocar na qualidade das difíceis.
+
+## Fallback e resiliência
+
+Provedores de LLM têm quedas, limites de taxa e picos de latência. A cadeia de fallback define o próximo modelo para cada nível. Alguns cuidados:
+
+- **Timeouts por etapa:** com streaming, use timeout para o primeiro token, não para a resposta inteira.
+- **Fallback compatível:** o modelo reserva precisa aceitar o mesmo formato de prompt, ferramentas e tamanho de contexto. Mantenha templates por modelo e teste o caminho de fallback no conjunto de avaliação.
+- **Circuit breaker:** se o provedor A está falhando, pare de tentar por um tempo em vez de pagar o timeout em toda requisição.
+- **Fallback para baixo ou para cima:** cair para um modelo menor preserva disponibilidade com qualidade reduzida; subir para um maior preserva qualidade com custo maior. Decida por produto e deixe explícito.
+
+| Estratégia | Custo | Latência | Risco |
+| --- | --- | --- | --- |
+| Tudo no modelo grande | Alto | Alta | Baixo para qualidade |
+| Regras | Baixo | Baixa | Regras desatualizadas |
+| Classificador | Baixo | Um salto a mais | Erros de classificação silenciosos |
+| Cascata | Médio | Alta nos casos difíceis | Verificação fraca deixa passar resposta ruim |
+
+## Na entrevista
+
+Introduza o gateway de modelos como peça central e explique o roteamento começando por regras, com plano de evoluir para classificador quando houver dados. Sempre ligue a decisão ao conjunto de avaliação: "antes de mandar a tarefa X para o modelo pequeno, comparo a qualidade dos dois no mesmo conjunto". Follow-ups: "como você sabe que o roteador está errando?" (amostragem de respostas do modelo pequeno avaliadas pelo grande ou por humanos, taxa de escalonamento na cascata, feedback do usuário) e "e se o provedor principal cair por uma hora?" (fallback para outro provedor ou modelo próprio, com cotas e alerta).
+
+<QuizSet>
+<Quiz question="70% das requisições do seu produto são classificações curtas. Qual a primeira medida de custo a considerar?" options={["Comprar mais GPUs", "Rotear essas requisições para um modelo menor, validando a qualidade num conjunto de avaliação", "Aumentar o timeout", "Remover o streaming"]} answer={1} explanation="Tarefas simples e frequentes são o melhor alvo para modelos menores; a validação garante que a qualidade não caiu." />
+<Quiz question="Na estratégia em cascata, qual é o principal custo nos casos difíceis?" options={["Nenhum", "Latência maior, porque a requisição passa pelo modelo barato antes de escalar para o grande", "O modelo grande fica mais barato", "Perda do histórico"]} answer={1} explanation="O caso difícil paga duas chamadas em sequência; a cascata compensa quando a maioria dos casos para no primeiro nível." />
+</QuizSet>

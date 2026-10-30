@@ -1,0 +1,172 @@
+---
+title: Busca semântica
+kind: lesson
+---
+
+"Projete a busca de um marketplace (ou de uma central de ajuda) que entenda o que o usuário quis dizer, e não só as palavras que ele digitou." Busca por palavra-chave falha quando a consulta e o documento usam termos diferentes para a mesma coisa: "tênis para correr" contra "calçado de corrida". Busca semântica resolve isso com embeddings, mas traz novos problemas de custo, avaliação e latência.
+
+## Esclarecer o objetivo e a métrica
+
+Pergunte o domínio e o que o usuário faz depois de buscar:
+
+- **Marketplace**: sucesso é clique seguido de compra; métrica online é conversão por busca.
+- **Central de ajuda**: sucesso é o usuário não abrir um chamado; métrica é a taxa de resolução sem contato.
+- **Métrica de guarda**: taxa de buscas sem resultado clicado ("buscas abandonadas") e latência.
+
+Escala hipotética para o exemplo: catálogo de 50 milhões de produtos, milhares de consultas por segundo no pico, p99 abaixo de 300 ms.
+
+## Dados e rótulos
+
+- **Logs de busca**: consulta, resultados exibidos, posições, cliques, compras. Pares consulta-produto com compra são positivos fortes; clique sem compra é positivo fraco.
+- **Julgamentos humanos**: um conjunto pequeno de consultas rotuladas por avaliadores com notas de relevância (0 a 3). Caro, mas é o que permite avaliação offline confiável, inclusive em consultas raras.
+- **Negativos**: os aleatórios são fáceis demais. Use **negativos difíceis**: itens que o modelo atual põe no topo mas que ninguém clica.
+
+## Features e representações
+
+- **Embeddings densos**: um codificador de texto (bi-encoder) gera um vetor para a consulta e outro para cada produto (título, descrição, categoria). Similaridade = cosseno.
+- **Sinais lexicais**: BM25, correspondência exata de marca ou modelo ("iphone 13" não pode virar "iphone 12").
+- **Sinais de qualidade**: popularidade, avaliação, estoque, preço relativo.
+- **Personalização**: localização, histórico de categorias.
+
+## Modelo de base e evolução
+
+1. **Base**: índice invertido com BM25. Forte em consultas com nomes exatos e códigos.
+2. **Recuperação densa**: bi-encoder pré-treinado, depois ajustado com pares consulta-clique e negativos difíceis. Os vetores dos produtos ficam num índice ANN.
+3. **Híbrida**: une as listas lexical e densa. Um jeito simples e robusto é o **Reciprocal Rank Fusion** (RRF): cada documento ganha `1 / (k + posição)` em cada lista, e as somas definem a ordem.
+4. **Re-ranqueamento**: um cross-encoder (consulta e produto entram juntos no modelo) ou um modelo de learning to rank com features de qualidade, aplicado só aos 100 primeiros.
+
+O programa simula o efeito: a busca lexical só casa palavras, a "densa" usa um mapeamento de conceitos que imita um embedding treinado, e a híbrida funde as duas com RRF. A métrica é o MRR (média do inverso da posição do primeiro resultado relevante).
+
+```python
+docs = {
+    "d1": "calcado de corrida leve com amortecimento",
+    "d2": "calcado esportivo para maratona",
+    "d3": "mochila impermeavel para notebook",
+    "d4": "bolsa para laptop resistente a agua",
+    "d5": "fone bluetooth para academia",
+    "d6": "tenis casual de couro x200",
+}
+# imita um embedding treinado: palavras diferentes caem no mesmo conceito
+CONCEITO = {
+    "tenis": "calcado", "calcado": "calcado", "sapato": "calcado", "corrida": "corrida",
+    "correr": "corrida", "maratona": "corrida", "mochila": "bolsa", "bolsa": "bolsa",
+    "notebook": "laptop", "laptop": "laptop", "impermeavel": "agua", "agua": "agua",
+    "fone": "audio", "bluetooth": "audio", "academia": "treino", "treino": "treino",
+    "esportivo": "treino", "casual": "moda", "couro": "moda",
+}
+PARADAS = {"de", "para", "a", "com"}
+consultas = [  # (consulta, documento relevante)
+    ("sapato para correr", "d1"),
+    ("tenis x200", "d6"),
+    ("fone para treino", "d5"),
+    ("case de notebook impermeavel", "d4"),
+]
+
+def termos(texto):
+    return set(texto.split()) - PARADAS
+
+def lexical(q, d):
+    return len(termos(q) & termos(d))
+
+def densa(q, d):
+    cq = {CONCEITO[w] for w in termos(q) if w in CONCEITO}
+    cd = {CONCEITO[w] for w in termos(d) if w in CONCEITO}
+    return len(cq & cd) / ((len(cq) * len(cd)) ** 0.5 or 1)
+
+def ranking(q, f):  # só devolve documentos com pontuação positiva
+    achados = [k for k in docs if f(q, docs[k]) > 0]
+    return sorted(achados, key=lambda k: (-f(q, docs[k]), k))
+
+def rrf(listas, k=60):
+    s = {}
+    for lista in listas:
+        for pos, d in enumerate(lista, start=1):
+            s[d] = s.get(d, 0) + 1 / (k + pos)
+    return sorted(s, key=lambda d: (-s[d], d))
+
+def mrr(fn):
+    total = 0
+    for q, alvo in consultas:
+        lista = fn(q)
+        total += 1 / (lista.index(alvo) + 1) if alvo in lista else 0
+    return total / len(consultas)
+
+lex = lambda q: ranking(q, lexical)
+den = lambda q: ranking(q, densa)
+hib = lambda q: rrf([lex(q), den(q)])
+for nome, fn in [("lexical", lex), ("densa", den), ("hibrida", hib)]:
+    print(f"{nome:8s} MRR = {mrr(fn):.3f}")
+for q, _ in consultas[:2]:
+    print(f"'{q}': lexical {lex(q)[:2]}, densa {den(q)[:2]}, hibrida {hib(q)[:2]}")
+```
+
+```text
+Saída:
+lexical  MRR = 0.500
+densa    MRR = 0.750
+hibrida  MRR = 0.875
+'sapato para correr': lexical [], densa ['d1', 'd2'], hibrida ['d1', 'd2']
+'tenis x200': lexical ['d6'], densa ['d1', 'd6'], hibrida ['d6', 'd1']
+```
+
+A lexical não encontra nada para "sapato para correr", porque nenhum produto usa essas palavras. A densa acerta a intenção, mas em "tenis x200" coloca outro calçado na frente, já que o código do modelo não carrega significado para ela. A fusão herda o melhor de cada lista e chega ao maior MRR. É por isso que a maioria dos sistemas reais é híbrida.
+
+## Arquitetura de treino e servimento
+
+```text
+ OFFLINE                                         ONLINE
+ +-----------+   +-----------+   +----------+    consulta
+ | catálogo  |-->| bi-encoder|-->| índice   |       |
+ | produtos  |   | (lote)    |   | ANN      |   +---v--------------+
+ +-----+-----+   +-----^-----+   +----+-----+   | normalização,    |
+       |               |              |         | correção ortográf|
+       |         +-----+-----+        |         +---+----------+---+
+       |         | ajuste fino|       |             |          |
+       |         | pares      |       |       +-----v---+ +----v-----+
+       |         | consulta-  |       +------>| densa   | | BM25     |
+       |         | clique     |               | top 200 | | top 200  |
+       |         +-----^-----+                +----+----+ +----+-----+
+       |               |                           +-----+-----+
+       |         +-----+-----+                     +-----v-----+
+       +-------->| logs de   |<--- cliques ---     | fusão RRF |
+                 | busca     |                     +-----+-----+
+                 +-----------+                     +-----v-----+
+                                                   | re-ranker |-> top 20
+                                                   +-----------+
+```
+
+O embedding da consulta é calculado online (alguns milissegundos num modelo pequeno, com cache para consultas populares). Ao trocar o bi-encoder, **todo o índice precisa ser re-embedado**, porque vetores de modelos diferentes não são comparáveis. Planeje isso como uma migração: construa o índice novo em paralelo e troque atomicamente.
+
+## Avaliação
+
+- **Offline**: recall@100 da recuperação (o re-ranker não salva o que não foi recuperado); NDCG@10 e MRR com julgamentos humanos; análise separada por fatias, como consultas de cauda longa e consultas com marca.
+- **Online**: A/B com conversão por busca, taxa de buscas abandonadas e latência. Interleaving (misturar resultados de dois rankers na mesma lista) detecta diferenças com muito menos tráfego que um A/B tradicional.
+
+## Monitoramento
+
+Taxa de consultas sem resultado, distribuição da similaridade do primeiro resultado (queda indica consultas fora do domínio), frescor do índice (produtos novos ainda sem vetor), latência por estágio e drift de vocabulário: termos novos que aparecem nas consultas.
+
+<Callout type="tip" title="Recall primeiro, precisão depois">
+Ao propor a arquitetura, deixe claro que cada estágio tem sua métrica: recall@k para recuperação, NDCG para o re-ranker. Misturar as duas é um erro comum que o entrevistador costuma testar.
+</Callout>
+
+## Trade-offs
+
+| Decisão | Opção A | Opção B |
+| --- | --- | --- |
+| Recuperação | Lexical: exata, barata, sem sinônimos | Densa: entende intenção, erra termos exatos |
+| Re-ranker | Bi-encoder: rápido, menos preciso | Cross-encoder: preciso, caro por par |
+| Índice ANN | HNSW: rápido, muita memória | IVF com quantização: menos memória, perde recall |
+
+## Follow-ups comuns
+
+- **Consultas em vários idiomas?** Codificador multilíngue, avaliado por idioma.
+- **Produto novo sem cliques?** O bi-encoder usa só o texto, então ele já é recuperável; os sinais de popularidade entram depois.
+- **Filtros (preço, tamanho)?** Filtre antes ou durante a busca ANN; filtrar depois pode deixar a página vazia.
+- **Como reduzir custo?** Cache de embeddings de consultas frequentes e quantização dos vetores.
+
+<QuizSet>
+<Quiz question="Você trocou o modelo de embeddings. O que precisa acontecer com o índice?" options={["Nada, vetores são compatíveis", "Re-embedar todo o catálogo com o modelo novo antes de usá-lo", "Só os produtos novos", "Apenas reconstruir o índice BM25"]} answer={1} explanation="Espaços vetoriais de modelos diferentes não são comparáveis; consulta e documentos precisam vir do mesmo modelo." />
+<Quiz question="Qual métrica avalia melhor o estágio de recuperação?" options={["NDCG@10", "Recall@100", "Latência p50", "Taxa de cliques"]} answer={1} explanation="A recuperação precisa trazer os relevantes para o conjunto que o re-ranker vê; a ordem fina é avaliada depois." />
+<Quiz question="Por que usar negativos difíceis no ajuste fino do bi-encoder?" options={["São mais baratos de coletar", "Ensinam o modelo a separar itens parecidos, que é onde ele mais erra", "Aumentam a quantidade de positivos", "Eliminam a necessidade de avaliação"]} answer={1} explanation="Negativos aleatórios já são fáceis de separar; os difíceis carregam o sinal que melhora o ranking no topo." />
+</QuizSet>

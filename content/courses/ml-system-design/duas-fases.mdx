@@ -1,0 +1,104 @@
+---
+title: Arquitetura em duas fases
+kind: lesson
+---
+
+Imagine um catálogo com 50 milhões de vídeos e um ranqueador que olha centenas de features cruzadas entre usuário e item. Mesmo a 0,1 ms por item, pontuar o catálogo inteiro custaria mais de uma hora por requisição. O orçamento é de cerca de 100 ms. A saída, usada por praticamente todo sistema de recomendação, busca e anúncios em escala, é dividir o trabalho em **funil**: etapas baratas reduzem muito o conjunto, e etapas caras olham poucos itens com cuidado.
+
+## As fases
+
+```text
+ catalogo (milhoes)
+       |
+ [1] RECUPERACAO  -- varias fontes baratas, alto recall
+       |              (embeddings + ANN, co-ocorrencia, populares, seguidos)
+   ~ milhares
+       |
+ [2] PRE-RANQUEAMENTO (opcional) -- modelo leve
+       |
+   ~ centenas
+       |
+ [3] RANQUEAMENTO -- modelo pesado, muitas features cruzadas
+       |
+   ~ dezenas
+       |
+ [4] RE-RANQUEAMENTO -- regras de negocio, diversidade, frescor
+       |
+   pagina final
+```
+
+Cada etapa tem um objetivo diferente:
+
+- **Recuperação (candidate generation):** maximizar **recall**. O que ela não trouxer, nenhuma etapa posterior recupera. Usa modelos que permitem busca sublinear, como embeddings com busca aproximada de vizinhos (ANN), além de heurísticas: itens populares na região, itens de criadores seguidos, itens parecidos com o último assistido. Várias fontes rodam em paralelo e são mescladas.
+- **Ranqueamento:** maximizar **precisão no topo**. Com poucas centenas de candidatos, dá para usar features caras (histórico do usuário com aquele criador, contexto da sessão, interações cruzadas) e modelos grandes, prevendo clique, tempo de exibição, curtida.
+- **Re-ranqueamento:** ajustar a lista para objetivos que o modelo não otimiza sozinho: não mostrar cinco itens do mesmo autor seguidos, remover já vistos, aplicar políticas e impulsionar conteúdo novo.
+
+## O funil na prática
+
+O programa monta um catálogo de brinquedo com 20 mil itens. O "modelo pesado" é o score verdadeiro. A recuperação usa só uma aproximação barata (as primeiras 4 ou 10 das 16 dimensões do embedding) e passa K candidatos para o ranqueador. Medimos quantos dos 10 melhores de verdade chegam ao topo final e quantas avaliações caras foram feitas.
+
+```python
+import random
+
+random.seed(5)
+DIM, N = 16, 20_000
+
+def vetor():
+    return [random.gauss(0, 1) for _ in range(DIM)]
+
+itens = [vetor() for _ in range(N)]
+usuario = vetor()
+
+def score_caro(item):  # ranqueador: usa todas as dimensoes
+    return sum(u * x for u, x in zip(usuario, item))
+
+def recuperacao(dims):  # aproximacao barata: so as primeiras dimensoes
+    return sorted(range(N), key=lambda i: sum(u * x for u, x in zip(usuario[:dims], itens[i][:dims])), reverse=True)
+
+ideal = set(sorted(range(N), key=lambda i: score_caro(itens[i]), reverse=True)[:10])
+fraca, melhor = recuperacao(4), recuperacao(10)
+
+print("K candidatos | avaliacoes caras | recall@10 (4 dims) | recall@10 (10 dims)")
+for k in (100, 1000, 5000, N):
+    linha = []
+    for ordem in (fraca, melhor):
+        top = sorted(ordem[:k], key=lambda i: score_caro(itens[i]), reverse=True)[:10]
+        linha.append(len(ideal & set(top)) / 10)
+    print(f"{k:12d} | {k:16d} | {linha[0]:18.1f} | {linha[1]:19.1f}")
+```
+
+```text
+Saída:
+K candidatos | avaliacoes caras | recall@10 (4 dims) | recall@10 (10 dims)
+         100 |              100 |                0.0 |                 0.6
+        1000 |             1000 |                0.6 |                 0.8
+        5000 |             5000 |                0.8 |                 1.0
+       20000 |            20000 |                1.0 |                 1.0
+```
+
+Com a recuperação fraca, 100 candidatos não trazem nenhum dos 10 melhores, e só com 5 mil avaliações caras o funil chega a 80%. A recuperação melhor alcança 60% com 100 candidatos e 100% com 5 mil. Aumentar K melhora o recall, mas multiplica o custo do ranqueador. Os dois controles que você tem são: **melhorar a recuperação** (embeddings treinados para isso, várias fontes complementares) e **escolher K** pelo orçamento de latência do ranqueador.
+
+## Trade-offs
+
+| Decisão | Mais de um lado | Mais do outro |
+| --- | --- | --- |
+| Número de candidatos | Mais recall | Mais latência e custo no ranqueador |
+| Número de fontes de recuperação | Diversidade e cobertura | Complexidade e deduplicação |
+| Pré-ranqueador | Permite K maior na recuperação | Mais um modelo para treinar e manter |
+| Features no ranqueamento | Mais precisão | Mais buscas no feature store |
+
+Um problema sutil: o ranqueador é treinado com dados de itens que **já passaram pela recuperação** e foram exibidos. Se você trocar a recuperação, o ranqueador vê candidatos de uma distribuição diferente da que conheceu. Por isso mudanças em uma fase devem ser testadas com o funil inteiro, e o treino do ranqueador costuma incluir negativos amostrados além dos itens exibidos.
+
+<Callout type="tip" title="Meça cada fase separadamente">
+Registre o recall da recuperação (quantos itens que o usuário acabou consumindo estavam entre os candidatos) e a qualidade do ranqueamento (NDCG nos candidatos). Assim você sabe qual fase está limitando o sistema.
+</Callout>
+
+## Na entrevista
+
+Quase toda questão de recomendação, busca ou anúncios espera que você desenhe o funil logo no início, com ordens de grandeza em cada etapa (milhões, milhares, centenas, dezenas) e a métrica de cada fase. Depois aprofunde: quais fontes de recuperação, qual modelo de ranqueamento, quais regras no re-ranqueamento. Follow-ups comuns: como escolher o número de candidatos, como deduplicar fontes, como garantir diversidade e como avaliar a recuperação isoladamente.
+
+<QuizSet>
+<Quiz question="Qual é a métrica principal que a etapa de recuperação deve otimizar?" options={["Precisão no topo", "Recall: trazer os itens relevantes para dentro do conjunto de candidatos", "Latência zero", "Diversidade de autores"]} answer={1} explanation="O ranqueador só pode ordenar o que recebeu; item relevante que a recuperação perde está perdido para sempre." />
+<Quiz question="O ranqueador ficou muito melhor offline, mas a métrica online quase não mudou. A recuperação traz 300 candidatos e o recall dela é de 35%. Onde investir?" options={["Num ranqueador ainda maior", "Na recuperação: novas fontes ou embeddings melhores para aumentar o recall", "No re-ranqueamento por diversidade", "Em mais dados para o ranqueador"]} answer={1} explanation="Se só 35% dos itens relevantes chegam ao ranqueador, ele está limitado pela entrada; o gargalo é a recuperação." />
+<Quiz question="Onde regras como 'no máximo dois itens seguidos do mesmo autor' costumam ficar?" options={["Na recuperação", "No treino do embedding", "No re-ranqueamento, a última fase", "No feature store"]} answer={2} explanation="O re-ranqueamento aplica restrições de negócio e diversidade sobre a lista já ordenada pelo modelo." />
+</QuizSet>

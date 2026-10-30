@@ -1,0 +1,124 @@
+---
+title: Como LLMs funcionam
+kind: lesson
+---
+
+Você não precisa treinar um modelo para construir produtos com LLMs, mas precisa de um modelo mental correto do que acontece dentro dele. Quase todo comportamento estranho que você vai depurar (respostas inventadas, instruções ignoradas, custo que explode com o tamanho do prompt) se explica por uma ideia simples: um LLM é uma função que recebe uma sequência de tokens e devolve uma distribuição de probabilidade para o **próximo** token.
+
+## Prever o próximo token
+
+Durante o pré-treinamento, o modelo lê uma quantidade enorme de texto e é ajustado para acertar a palavra seguinte. Não existe banco de fatos nem consulta a uma tabela: o conhecimento fica espalhado em bilhões de pesos, como padrões estatísticos. Para gerar uma resposta, o sistema repete um laço:
+
+```text
+prompt ──► [modelo] ──► probabilidades do próximo token
+                              │
+                     escolhe um token (amostragem)
+                              │
+          prompt + token ◄────┘   (repete até um token de fim ou um limite)
+```
+
+Esse laço é chamado de geração **autorregressiva**. Cada token novo depende de todos os anteriores, por isso a saída sai em streaming, um pedaço por vez, e gerar mil tokens custa bem mais tempo do que ler mil tokens.
+
+O programa abaixo faz a mesma coisa em miniatura: conta quais palavras seguem quais num corpus pequeno (um modelo de bigramas) e gera texto escolhendo sempre a mais provável.
+
+```python
+from collections import Counter, defaultdict
+
+corpus = (
+    "o cache guarda respostas . o cache reduz custo . "
+    "o modelo gera tokens . o modelo gera texto . o token seguinte ."
+).split()
+
+seguintes = defaultdict(Counter)
+for atual, prox in zip(corpus, corpus[1:]):
+    seguintes[atual][prox] += 1
+
+def probabilidades(palavra):
+    total = sum(seguintes[palavra].values())
+    return {p: round(c / total, 2) for p, c in seguintes[palavra].most_common()}
+
+print("depois de 'o':", probabilidades("o"))
+
+def gerar(inicio, passos):
+    saida = [inicio]
+    for _ in range(passos):
+        candidatos = seguintes[saida[-1]]
+        if not candidatos:
+            break
+        saida.append(candidatos.most_common(1)[0][0])
+    return " ".join(saida)
+
+print(gerar("o", 4))
+```
+
+```text
+Saída:
+depois de 'o': {'cache': 0.4, 'modelo': 0.4, 'token': 0.2}
+o cache guarda respostas .
+```
+
+Um LLM real troca a contagem por uma rede neural que olha para o contexto inteiro, não só para a palavra anterior, mas a interface é a mesma: contexto entra, distribuição sai.
+
+## Por dentro do transformer
+
+A arquitetura dominante é o **transformer**. Em alto nível:
+
+1. O texto vira tokens, e cada token vira um vetor (embedding) somado a uma informação de posição.
+2. Uma pilha de camadas aplica **atenção**: cada posição calcula o quanto deve "olhar" para cada posição anterior e mistura os vetores com esses pesos. É assim que "ele" consegue se referir a um substantivo três frases atrás.
+3. A última camada produz um número (logit) por token do vocabulário, e uma **softmax** transforma esses números em probabilidades.
+
+A atenção é, no fundo, um produto escalar seguido de softmax. Veja a conta para uma única consulta:
+
+```python
+import math
+
+def softmax(xs):
+    m = max(xs)
+    exps = [math.exp(x - m) for x in xs]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+# vetores de "chave" de três tokens anteriores e a "consulta" do token atual
+chaves = {"gato": [1.0, 0.2], "subiu": [0.1, 1.0], "telhado": [0.9, 0.4]}
+consulta = [1.0, 0.3]
+d = len(consulta)
+
+scores = [sum(q * k for q, k in zip(consulta, v)) / math.sqrt(d) for v in chaves.values()]
+pesos = softmax(scores)
+for token, p in zip(chaves, pesos):
+    print(f"{token:8s} peso = {p:.3f}")
+```
+
+```text
+Saída:
+gato     peso = 0.385
+subiu    peso = 0.241
+telhado  peso = 0.374
+```
+
+Num modelo real isso acontece em dezenas de camadas, com várias "cabeças" de atenção em paralelo e vetores com milhares de dimensões. O custo da atenção cresce com o quadrado do tamanho do contexto, um dos motivos de contextos longos serem caros.
+
+## Do modelo base ao assistente
+
+O modelo que sai do pré-treinamento só completa texto. Para virar um assistente que segue instruções, ele passa por **ajuste fino supervisionado** com exemplos de conversa e por alguma forma de **aprendizado por preferências** (como RLHF), em que respostas melhores são reforçadas. É nessa fase que surgem o formato de chat, as recusas e o estilo de resposta.
+
+<Callout type="note" title="O modelo não tem memória entre chamadas">
+A API é sem estado: cada requisição envia o histórico inteiro da conversa. A "memória" de um chat é a sua aplicação reenviando as mensagens anteriores, e cada uma delas custa tokens de novo.
+</Callout>
+
+## Consequências práticas
+
+- **Alucinação:** o modelo gera o texto mais plausível, não o mais verdadeiro. Sem fonte no contexto, ele preenche lacunas com algo que soa certo.
+- **Corte de conhecimento:** o que aconteceu depois do treinamento não está nos pesos. Para dados atuais ou privados, você precisa colocar a informação no prompt (é a ideia do RAG).
+- **Não determinismo:** a etapa de escolha do token normalmente sorteia, então a mesma pergunta pode ter respostas diferentes.
+- **Custo proporcional a tokens:** entrada e saída são cobradas e medidas em tokens, e a latência cresce com o tamanho da saída.
+
+## Na entrevista
+
+Explique em uma frase ("prevê o próximo token, de forma autorregressiva, com um transformer") e conecte com as consequências de engenharia: alucinação, contexto limitado, custo e latência por token, ausência de estado. Follow-ups comuns: "por que o modelo inventa uma citação?" (otimiza plausibilidade, não verdade; resolva com fontes no contexto e verificação) e "por que a resposta chega em streaming?" (cada token depende do anterior, então ele é emitido assim que é escolhido).
+
+<QuizSet>
+<Quiz question="Seu chatbot 'esquece' o que o usuário disse cinco mensagens atrás. Qual a causa mais provável?" options={["O modelo apagou a memória interna", "A aplicação não reenviou essas mensagens no contexto da requisição", "A temperatura está alta demais", "O transformer só olha para o token anterior"]} answer={1} explanation="A API é sem estado; o modelo só vê o que está no contexto da chamada. Se o histórico foi cortado ou não enviado, a informação não existe para ele." />
+<Quiz question="Por que gerar 2.000 tokens de saída costuma demorar muito mais do que processar 2.000 tokens de entrada?" options={["A saída é cobrada em dobro", "A geração é autorregressiva: cada token de saída exige um passo do modelo, em sequência", "A entrada é armazenada em cache sempre", "Tokens de saída são maiores"]} answer={1} explanation="A entrada pode ser processada em paralelo, mas cada token de saída depende do anterior, então a geração acontece passo a passo." />
+<Quiz question="O que a camada de atenção calcula para cada posição?" options={["A frequência da palavra no corpus", "Pesos que dizem quanto cada token anterior influencia a representação do atual", "O próximo token diretamente", "O tamanho do vocabulário"]} answer={1} explanation="A atenção compara a consulta da posição atual com as chaves das demais (produto escalar + softmax) e mistura os valores com esses pesos." />
+</QuizSet>

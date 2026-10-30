@@ -1,0 +1,158 @@
+---
+title: Feed de notícias
+kind: lesson
+---
+
+No system design clássico, o feed é um problema de fan-out e cache. Em ML system design, a pergunta é outra: **dado um conjunto de posts que o usuário poderia ver, em que ordem mostrá-los?** O entrevistador quer ver como você transforma "engajamento significativo" em algo que um modelo consiga prever.
+
+## Esclarecer o objetivo e a métrica
+
+Pergunte o que é sucesso para o produto. Um feed que maximiza só cliques vira vitrine de polêmica. Uma formulação comum é um **valor esperado** por post:
+
+```text
+pontuação = w1 * P(curtir) + w2 * P(comentar) + w3 * P(compartilhar)
+          + w4 * P(passar mais de 5 s olhando) - w5 * P(ocultar ou denunciar)
+```
+
+Os pesos codificam a estratégia do produto: um comentário vale mais que uma curtida, ocultar pesa muito negativamente. Eles são ajustados com testes online, não aprendidos pelo modelo.
+
+- **Métrica online principal**: usuários ativos diários e sessões por usuário.
+- **Métricas de guarda**: taxa de ocultação, denúncias, tempo até o primeiro post de amigo próximo.
+- **Escala hipotética**: centenas de milhões de usuários, cada abertura do feed com 1.000 a 2.000 posts candidatos; ranqueamento em menos de 150 ms.
+
+## Dados e rótulos
+
+Cada impressão no feed gera uma linha de treino com rótulos binários para cada ação: curtiu, comentou, compartilhou, ocultou, tempo de permanência acima do limiar. Ações raras como compartilhar têm muito menos positivos; trate com amostragem negativa e recalibre as probabilidades depois, porque a soma ponderada só faz sentido se cada cabeça devolver probabilidades calibradas.
+
+Cuidado com rótulos atrasados: comentários chegam minutos ou horas depois da impressão. Feche a janela de rótulo (por exemplo, 24 horas) antes de gerar o dado de treino.
+
+## Features
+
+- **Autor e relação**: frequência de interação entre usuário e autor, se é amigo, grupo ou página, tempo desde a última interação.
+- **Post**: tipo (texto, foto, vídeo, link), idade, engajamento acumulado nos primeiros minutos, embedding do texto.
+- **Usuário**: tipos de conteúdo que costuma engajar, horário, dispositivo, conexão (vídeo pesado em 3G é má ideia).
+- **Contexto da sessão**: posts já vistos na sessão, para evitar repetição.
+
+A afinidade usuário-autor costuma ser a feature mais forte. Mantenha-a numa feature store com atualização frequente.
+
+## Modelo de base e evolução
+
+1. **Base**: ordem cronológica reversa. É o piso que o modelo precisa superar e o fallback quando ele falha.
+2. **Heurística**: cronológico com bônus por afinidade com o autor.
+3. **Modelo pontual**: regressão logística ou gradient boosting, um por ação.
+4. **Rede multitarefa**: uma base compartilhada com uma cabeça por ação. Ações raras se beneficiam do que a base aprende com as frequentes.
+
+O programa abaixo compara a ordem cronológica com a ordem por pontuação ponderada, medindo NDCG@5 contra o engajamento que de fato aconteceu numa sessão hipotética.
+
+```python
+import math
+
+posts = [
+    # (id, idade_min, p_curtir, p_comentar, p_ocultar, engajamento_real)
+    ("A", 5, 0.10, 0.01, 0.05, 0),
+    ("B", 12, 0.40, 0.10, 0.01, 3),
+    ("C", 20, 0.05, 0.00, 0.20, 0),
+    ("D", 31, 0.60, 0.25, 0.01, 3),
+    ("E", 45, 0.30, 0.02, 0.02, 1),
+    ("F", 60, 0.20, 0.15, 0.01, 2),
+    ("G", 90, 0.08, 0.01, 0.10, 0),
+    ("H", 120, 0.50, 0.05, 0.02, 2),
+]
+
+PESOS = {"curtir": 1.0, "comentar": 4.0, "ocultar": -10.0}
+
+def pontuacao(p):
+    return PESOS["curtir"] * p[2] + PESOS["comentar"] * p[3] + PESOS["ocultar"] * p[4]
+
+def dcg(rels):
+    return sum((2 ** r - 1) / math.log2(i + 2) for i, r in enumerate(rels))
+
+def ndcg_at(ordem, k):
+    rels = [p[5] for p in ordem][:k]
+    ideal = sorted((p[5] for p in posts), reverse=True)[:k]
+    return dcg(rels) / dcg(ideal)
+
+cronologica = sorted(posts, key=lambda p: p[1])
+ranqueada = sorted(posts, key=pontuacao, reverse=True)
+
+print("cronologica:", "".join(p[0] for p in cronologica), f"NDCG@5 = {ndcg_at(cronologica, 5):.3f}")
+print("ranqueada:  ", "".join(p[0] for p in ranqueada), f"NDCG@5 = {ndcg_at(ranqueada, 5):.3f}")
+for p in ranqueada[:3]:
+    print(f"  {p[0]}: pontuacao {pontuacao(p):.2f}")
+```
+
+```text
+Saída:
+cronologica: ABCDEFGH NDCG@5 = 0.536
+ranqueada:   DBFHEAGC NDCG@5 = 1.000
+  D: pontuacao 1.50
+  B: pontuacao 0.70
+  F: pontuacao 0.70
+```
+
+Neste exemplo de brinquedo a ordem ranqueada chega a NDCG@5 de 1,0 contra 0,54 da cronológica; num sistema real o ganho é bem menor, mas a direção é a mesma. O post C, recente mas com alta chance de ser ocultado, despenca na ordem ranqueada: o peso negativo de ocultar faz o trabalho de guarda dentro da própria pontuação.
+
+## Arquitetura de treino e servimento
+
+```text
+  usuário abre o feed
+          |
+  +-------v--------+     +-------------------+
+  | coleta de      |<----| posts de amigos,  |
+  | candidatos     |     | grupos, páginas   |
+  | (~2.000)       |     | (cache de fan-out)|
+  +-------+--------+     +-------------------+
+          |
+  +-------v--------+     +-------------------+
+  | ranker leve    |<----| feature store     |
+  | (~2.000 -> 300)|     | (afinidade, post) |
+  +-------+--------+     +---------+---------+
+          |                        ^
+  +-------v--------+               |
+  | ranker         |               |  atualização
+  | multitarefa    |      +--------+---------+
+  | (300 -> 50)    |      | jobs de features |
+  +-------+--------+      +--------+---------+
+          |                        ^
+  +-------v--------+      +--------+---------+     +-------------+
+  | regras: misturar|     | logs de          |---->| treino      |
+  | tipos, deduplicar|--->| impressões e     |     | diário +    |
+  +-------+--------+      | ações (Kafka)    |     | ajuste fino |
+          v               +------------------+     +------+------+
+        feed                                              |
+                                                 registro de modelos
+```
+
+## Avaliação
+
+- **Offline**: AUC e log loss por cabeça; calibração (probabilidade média prevista contra a taxa observada); NDCG da pontuação combinada. Sempre com divisão temporal.
+- **Online**: A/B com métricas de sessão e de guarda. Mudanças nos pesos `w` também passam por A/B, porque mudam a estratégia do produto mesmo com o mesmo modelo.
+
+## Monitoramento
+
+Calibração por cabeça ao longo do tempo, distribuição de tipos de conteúdo exibidos, latência do ranker, taxa de fallback cronológico e drift nas features de afinidade. Fique atento a ciclos de realimentação: o que o modelo mostra hoje vira o dado de treino de amanhã.
+
+<Callout type="warning" title="Calibração não é detalhe">
+Se P(comentar) estiver superestimada em 3 vezes, o peso efetivo de comentários triplica sem ninguém decidir isso. Em somas ponderadas, recalibre cada cabeça depois de amostragem negativa.
+</Callout>
+
+## Trade-offs
+
+| Decisão | Opção A | Opção B |
+| --- | --- | --- |
+| Objetivo | Um rótulo só: simples | Várias cabeças ponderadas: flexível, exige calibração |
+| Frescor | Treino diário | Ajuste incremental a cada hora, mais complexo |
+| Diversidade | Ordem pura pela pontuação | Regras de mistura: menos repetitivo, perde um pouco de NDCG offline |
+
+## Follow-ups comuns
+
+- **Como lidar com conteúdo viral?** Features de velocidade de engajamento em janelas curtas, alimentadas por streaming.
+- **Usuário que só lê, nunca interage?** Use tempo de permanência como sinal implícito.
+- **Como evitar polêmica?** Peso negativo forte para denúncias e um classificador de integridade antes do ranqueamento.
+- **E se o ranker estiver lento?** Corte candidatos no ranker leve e mantenha um orçamento de tempo com fallback.
+
+<QuizSet>
+<Quiz question="Por que cada cabeça do modelo multitarefa precisa estar calibrada?" options={["Para acelerar o treino", "Porque a pontuação final é uma soma ponderada de probabilidades e erros de escala mudam os pesos efetivos", "Porque AUC exige calibração", "Para reduzir o tamanho do modelo"]} answer={1} explanation="Uma probabilidade inflada multiplica o peso daquela ação na soma, distorcendo a estratégia definida pelo produto." />
+<Quiz question="Qual é o papel da ordem cronológica nesse design?" options={["Nenhum, é obsoleta", "Base de comparação e fallback quando o ranqueador falha", "É o modelo de produção", "Serve só para usuários novos"]} answer={1} explanation="Todo modelo precisa vencer uma base simples, e o sistema precisa de um caminho degradado confiável." />
+<Quiz question="Comentários chegam horas após a impressão. Como gerar os rótulos?" options={["Rotular na hora da impressão", "Esperar uma janela fixa, como 24 horas, antes de fechar o rótulo", "Ignorar comentários", "Usar só curtidas"]} answer={1} explanation="Fechar o rótulo cedo demais marca como negativo um post que ainda vai receber comentários." />
+</QuizSet>

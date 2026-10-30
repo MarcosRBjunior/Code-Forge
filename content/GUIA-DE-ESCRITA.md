@@ -18,6 +18,7 @@ Todo capítulo é um arquivo `content/courses/<curso>/<slug>.mdx`. O slug e o t�
   - `<Callout type="note|tip|warning" title="...">texto</Callout>`, no máximo 2 por capítulo.
   - `<Quiz question="..." options={["A", "B", "C", "D"]} answer={1} explanation="..." />`, em que `answer` é o índice da opção certa, começando em 0.
   - `<Animation slug="busca-binaria" />`: embute uma animação passo a passo de `src/lib/animations.ts` no ponto do texto. Use uma por conceito, logo depois de explicar a ideia.
+  - `<CodeTabs>` envolvendo blocos de código seguidos, um por linguagem: vira um bloco com abas, e a linguagem escolhida é a mesma do editor. Nas aulas de DSA, todo exemplo de código usa as 7 linguagens nesta ordem: python, javascript, typescript, java, cpp, csharp, go. Deixe uma linha em branco depois de `<CodeTabs>` e antes de `</CodeTabs>`. Confira com `node scripts/check-code-tabs.mjs <arquivo>`.
   - `<QuizSet>` envolvendo vários `<Quiz />`: mostra uma pergunta por vez com "1 / N" e botões Anterior/Próxima.
 - MDX: **não** use `{` `}` nem `<` soltos no texto corrido. Dentro de blocos de código e de `inline code` pode. Para comparações no texto, escreva "menor que" ou use `a < b` em código. Aspas duplas dentro de props devem virar aspas simples ou “tipográficas”.
 - Blocos de código com linguagem (```python, ```java, ```text, ```sql, ```json, ```yaml, ```bash). Use ```text para diagramas ASCII.

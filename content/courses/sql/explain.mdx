@@ -1,0 +1,180 @@
+---
+title: Lendo o EXPLAIN
+kind: lesson
+---
+
+"Essa consulta demora 8 segundos; investigue." A resposta madura não é chutar um índice, é pedir o plano de execução. `EXPLAIN` mostra como o otimizador decidiu executar a consulta: em que ordem lê as tabelas, com que algoritmo junta, onde ordena e quantas linhas espera em cada passo. Saber ler esse plano em voz alta é uma das habilidades que mais impressionam numa rodada de SQL de backend.
+
+## EXPLAIN e EXPLAIN ANALYZE
+
+- `EXPLAIN consulta` mostra o plano **estimado**, sem executar.
+- `EXPLAIN ANALYZE consulta` **executa** a consulta e mostra, ao lado das estimativas, os tempos e as contagens reais. Cuidado: num `UPDATE` ou `DELETE`, ele altera os dados de verdade (envolva em `BEGIN` e `ROLLBACK`).
+- `EXPLAIN (ANALYZE, BUFFERS)` acrescenta quantas páginas vieram do cache e quantas do disco.
+
+No MySQL, `EXPLAIN` devolve uma tabela com uma linha por tabela acessada (colunas `type`, `key`, `rows`, `Extra`), e o MySQL 8.0.18+ tem `EXPLAIN ANALYZE` com uma árvore parecida com a do Postgres.
+
+Vamos preparar dados com volume suficiente para o plano ficar interessante:
+
+```sql
+CREATE TABLE clientes (
+  id     integer PRIMARY KEY,
+  nome   text NOT NULL,
+  estado text NOT NULL
+);
+
+CREATE TABLE pedidos (
+  id         integer PRIMARY KEY,
+  cliente_id integer NOT NULL REFERENCES clientes (id),
+  valor      numeric(10, 2) NOT NULL,
+  status     text NOT NULL
+);
+
+INSERT INTO clientes
+SELECT g, 'cliente ' || g, (ARRAY['SP', 'RJ', 'MG', 'PE'])[1 + g % 4]
+FROM generate_series(1, 2000) AS g;
+
+INSERT INTO pedidos
+SELECT g, 1 + g % 2000, (g % 500) + 0.99, CASE WHEN g % 50 = 0 THEN 'cancelado' ELSE 'pago' END
+FROM generate_series(1, 20000) AS g;
+
+ANALYZE clientes;
+ANALYZE pedidos;
+
+SELECT status, count(*) AS pedidos FROM pedidos GROUP BY status ORDER BY status;
+```
+
+```text
+Saída:
+status | pedidos
+cancelado | 400
+pago | 19600
+```
+
+## Lendo um nó
+
+Um plano é uma árvore. Cada linha com `->` é um nó; os mais indentados executam primeiro e entregam linhas ao nó de cima.
+
+```sql
+EXPLAIN SELECT * FROM pedidos WHERE cliente_id = 42;
+```
+
+Um resultado típico, antes de existir índice em `cliente_id`:
+
+```text
+Seq Scan on pedidos  (cost=0.00..379.00 rows=10 width=19)
+  Filter: (cliente_id = 42)
+```
+
+Leia assim:
+
+| Campo | Significado |
+| --- | --- |
+| `Seq Scan` | Lê a tabela inteira, página por página. |
+| `cost=0.00..379.00` | Custo de inicialização e custo total, em unidades abstratas do otimizador. |
+| `rows=10` | Quantas linhas o otimizador **estima** que saem desse nó. |
+| `width=19` | Tamanho médio estimado de cada linha, em bytes. |
+| `Filter` | Condição aplicada depois de ler cada linha. |
+
+Com `ANALYZE`, cada nó ganha `actual time=... rows=... loops=...`. A comparação mais útil é **rows estimado contra rows real**: uma diferença de 100 vezes indica estatísticas ruins, e é aí que o otimizador escolhe planos errados.
+
+## Criando o índice e conferindo de novo
+
+```sql
+CREATE INDEX pedidos_cliente_idx ON pedidos (cliente_id);
+ANALYZE pedidos;
+
+SELECT id, valor FROM pedidos WHERE cliente_id = 42 ORDER BY id;
+```
+
+```text
+Saída:
+id | valor
+41 | 41.99
+2041 | 41.99
+4041 | 41.99
+6041 | 41.99
+8041 | 41.99
+10041 | 41.99
+12041 | 41.99
+14041 | 41.99
+16041 | 41.99
+18041 | 41.99
+```
+
+Agora o plano muda para algo como:
+
+```text
+Bitmap Heap Scan on pedidos  (cost=4.36..39.06 rows=10 width=19)
+  Recheck Cond: (cliente_id = 42)
+  ->  Bitmap Index Scan on pedidos_cliente_idx  (cost=0.00..4.36 rows=10 width=0)
+        Index Cond: (cliente_id = 42)
+```
+
+## Os tipos de acesso
+
+| Nó | Quando aparece |
+| --- | --- |
+| `Seq Scan` | Sem índice útil ou quando a consulta lê grande parte da tabela. |
+| `Index Scan` | Poucas linhas: percorre o índice e busca cada linha na tabela. |
+| `Index Only Scan` | O índice tem todas as colunas pedidas. |
+| `Bitmap Index Scan` + `Bitmap Heap Scan` | Quantidade média de linhas: marca as páginas no índice e lê cada página uma vez. |
+
+E os de junção:
+
+| Nó | Ideia | Bom quando |
+| --- | --- | --- |
+| `Nested Loop` | Para cada linha de fora, busca na de dentro. | O lado de fora é pequeno e o de dentro tem índice. |
+| `Hash Join` | Monta uma tabela hash com o lado menor e sonda com o maior. | Junções grandes por igualdade. |
+| `Merge Join` | Junta duas entradas já ordenadas pela chave. | Ambos os lados chegam ordenados. |
+
+Veja a junção mais comum de relatório:
+
+```sql
+EXPLAIN
+SELECT c.estado, sum(p.valor)
+FROM pedidos p
+JOIN clientes c ON c.id = p.cliente_id
+WHERE p.status = 'cancelado'
+GROUP BY c.estado;
+```
+
+Você provavelmente verá um `HashAggregate` no topo, um `Hash Join` abaixo e um `Seq Scan` em cada tabela, já que 400 pedidos cancelados espalhados por 20 mil não justificam índice em `status`. O resultado em si:
+
+```sql
+SELECT c.estado, sum(p.valor) AS total_cancelado
+FROM pedidos p
+JOIN clientes c ON c.id = p.cliente_id
+WHERE p.status = 'cancelado'
+GROUP BY c.estado
+ORDER BY c.estado;
+```
+
+```text
+Saída:
+estado | total_cancelado
+PE | 50198.00
+RJ | 40198.00
+```
+
+Repare que só aparecem RJ e PE. Não é bug do plano: os pedidos cancelados têm id múltiplo de 50, então caem sempre em clientes com id de resto 1 ou 3 na divisão por 4, que pelo jeito como os dados foram gerados são de RJ e PE. Ler o resultado com olhar crítico também faz parte do diagnóstico.
+
+<Callout type="tip" title="Roteiro de diagnóstico">
+Procure o nó com maior tempo real, compare linhas estimadas com reais, veja se há `Seq Scan` em tabela grande com filtro seletivo e se há `Sort` derramando em disco (`external merge`). Depois proponha uma mudança e meça de novo.
+</Callout>
+
+## Armadilhas
+
+- Rodar `EXPLAIN ANALYZE` num `DELETE` em produção sem `ROLLBACK`.
+- Achar que `Seq Scan` é sempre ruim: em tabela pequena ou filtro pouco seletivo, ele é a melhor escolha.
+- Comparar `cost` entre consultas diferentes como se fosse tempo: é uma unidade relativa.
+- Ignorar estatísticas velhas. Depois de uma carga grande, rode `ANALYZE` (o autovacuum faz isso sozinho, mas com atraso).
+
+## Na entrevista
+
+Narre o plano de baixo para cima: "ele faz um scan sequencial em pedidos filtrando por status, monta um hash dos clientes e junta". Aponte o gargalo e proponha a correção, seja índice, reescrita ou estatísticas. Follow-ups comuns: "qual a diferença entre `EXPLAIN` e `EXPLAIN ANALYZE`?" e "por que o otimizador escolheria `Seq Scan` mesmo existindo índice?" (seletividade baixa ou estimativa errada).
+
+<QuizSet>
+<Quiz question="No EXPLAIN ANALYZE, um nó mostra rows=5 estimado e rows=480000 real. O que isso sugere?" options={["O índice está corrompido", "Estatísticas desatualizadas ou correlação que o otimizador não conhece, levando a um plano ruim", "A consulta está correta e rápida", "Falta memória no servidor"]} answer={1} explanation="Estimativas muito erradas fazem o otimizador escolher, por exemplo, Nested Loop onde um Hash Join seria muito melhor." />
+<Quiz question="Qual cuidado é essencial antes de rodar EXPLAIN ANALYZE num DELETE?" options={["Nenhum, ele só estima", "Envolver em BEGIN e ROLLBACK, porque ele executa de verdade", "Desligar o autovacuum", "Criar um índice antes"]} answer={1} explanation="ANALYZE executa a instrução. Sem ROLLBACK, as linhas são apagadas." />
+<Quiz question="Para juntar duas tabelas grandes por igualdade, sem ordenação prévia, qual nó de junção é o mais típico?" options={["Nested Loop", "Hash Join", "Index Only Scan", "Bitmap Heap Scan"]} answer={1} explanation="Hash Join constrói uma tabela hash com o lado menor e sonda com o maior, em tempo linear." />
+</QuizSet>

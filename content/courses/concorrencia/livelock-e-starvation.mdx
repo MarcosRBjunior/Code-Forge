@@ -1,0 +1,106 @@
+---
+title: Livelock e starvation
+kind: lesson
+---
+
+Deadlock é o problema de progresso mais famoso, mas não o único. Um sistema pode ter todas as threads acordadas, consumindo CPU, e mesmo assim não sair do lugar (**livelock**). Ou pode estar progredindo muito bem no agregado enquanto uma thread específica nunca é atendida (**starvation**). Os dois são mais traiçoeiros que o deadlock porque o processo não parece travado: os gráficos mostram atividade.
+
+## Livelock: ocupados sem progredir
+
+Pense em duas pessoas que se encontram num corredor estreito. As duas, educadas, dão um passo para o lado ao mesmo tempo, e para o mesmo lado. Percebem, voltam, e de novo juntas. Ninguém está parado, mas ninguém passa.
+
+Em software isso aparece quando threads reagem umas às outras de forma simétrica e sincronizada. O caso típico é a "cura" para deadlock mal aplicada: duas threads tentam pegar dois locks com `tryLock`, falham, soltam tudo e tentam de novo imediatamente. Se o ritmo for o mesmo, elas colidem para sempre. Outros exemplos são retentativas de rede sem jitter, em que todos os clientes voltam no mesmo segundo, e protocolos de transação que abortam um ao outro em ciclo.
+
+A cura é **quebrar a simetria**: espera aleatória (backoff exponencial com jitter), prioridade fixa para desempatar (o de menor id cede) ou um árbitro central. A simulação abaixo é determinística (semente fixa) e mostra os dois comportamentos: cada rodada, os dois escolhem uma faixa, E ou D; se escolherem a mesma, continuam bloqueados.
+
+```python
+import random
+
+def trocar(lado):
+    return "D" if lado == "E" else "E"
+
+def simular(nome, politica, rodadas=8):
+    a = b = "E"  # os dois começam na mesma faixa: bloqueados
+    historico = [a + b]
+    for r in range(1, rodadas + 1):
+        a, b = politica(a), politica(b)
+        historico.append(a + b)
+        if a != b:
+            print(f"{nome}: passaram na rodada {r} -> {' '.join(historico)}")
+            return
+    print(f"{nome}: ainda bloqueados apos {rodadas} rodadas -> {' '.join(historico)}")
+
+# política simétrica: os dois sempre cedem juntos
+simular("educados", trocar)
+
+# quebra de simetria: cada um cede com probabilidade 1/2
+rng = random.Random(4)
+simular("com sorteio", lambda lado: trocar(lado) if rng.random() < 0.5 else lado)
+```
+
+```text
+Saída:
+educados: ainda bloqueados apos 8 rodadas -> EE DD EE DD EE DD EE DD EE
+com sorteio: passaram na rodada 5 -> EE DD EE DD DD DE
+```
+
+Com sorteio, a chance de colidirem em k rodadas seguidas cai como 1 sobre 2 elevado a k, então o impasse se desfaz rápido. É o mesmo princípio do backoff exponencial do Ethernet e das bibliotecas de retry: aleatoriedade transforma "colidir sempre" em "colidir raramente".
+
+## Starvation: alguém nunca é atendido
+
+Starvation (inanição) é quando uma thread fica esperando indefinidamente porque outras sempre passam na frente. O sistema progride, só não para ela. Causas comuns:
+
+- **Escalonamento por prioridade estrita**: enquanto houver trabalho de alta prioridade, o de baixa nunca roda.
+- **Locks sem justiça**: um lock "barging" deixa quem acabou de chegar (ou quem acabou de soltar) pegar de novo antes de quem está na fila. É mais rápido no agregado, mas uma thread azarada pode perder sempre.
+- **Leitores e escritores**: com preferência a leitores e leitura contínua, o escritor nunca entra.
+- **Seções críticas longas** que monopolizam o recurso.
+
+A correção clássica para prioridades é o **envelhecimento** (*aging*): quanto mais uma tarefa espera, maior fica sua prioridade efetiva, até que ela vença. No programa, `i` é a tarefa interativa (prioridade 10) e `l` é a de lote (prioridade 1); cada passo executa a de maior prioridade efetiva.
+
+```python
+def escalonar(prioridade, passos, bonus_por_espera):
+    espera = {nome: 0 for nome in prioridade}
+    ordem = []
+    for _ in range(passos):
+        efetiva = {n: prioridade[n] + bonus_por_espera * espera[n] for n in prioridade}
+        escolhida = max(sorted(efetiva), key=lambda n: efetiva[n])
+        ordem.append(escolhida[0])
+        for n in espera:
+            espera[n] = 0 if n == escolhida else espera[n] + 1
+    return "".join(ordem)
+
+prioridade = {"interativa": 10, "lote": 1}
+print("sem envelhecimento:", escalonar(prioridade, 16, 0))
+print("com envelhecimento:", escalonar(prioridade, 16, 2))
+```
+
+```text
+Saída:
+sem envelhecimento: iiiiiiiiiiiiiiii
+com envelhecimento: iiiiiliiiiiliiii
+```
+
+Para locks, a correção é **justiça** (*fairness*): atender em ordem de chegada. Java oferece `new ReentrantLock(true)` e `new Semaphore(n, true)`; um ticket lock faz o mesmo com dois contadores. O `threading.Lock` do Python e o `std::mutex` do C++ não prometem ordem. O `sync.Mutex` do Go entra em "modo de inanição" automaticamente quando um goroutine espera mais de 1 ms, passando o lock diretamente para o primeiro da fila.
+
+## Comparando os três
+
+| | Deadlock | Livelock | Starvation |
+| --- | --- | --- | --- |
+| Threads estão | Bloqueadas | Ativas, repetindo trabalho | Algumas progridem, uma não |
+| CPU | Ociosa | Alta | Normal |
+| Causa típica | Espera circular | Reações simétricas | Política injusta |
+| Correção | Ordem de locks, timeout | Aleatoriedade, desempate | Fila justa, aging |
+
+<Callout type="warning" title="Justiça custa caro">
+Locks justos reduzem bastante o throughput, porque cada passagem exige acordar exatamente a próxima thread da fila, mesmo quando outra já estava rodando e poderia entrar na hora. Use justiça quando a latência de cauda importa, não por padrão.
+</Callout>
+
+## Na entrevista
+
+Diferencie os três com uma frase cada e um sintoma observável: deadlock tem CPU parada, livelock tem CPU alta sem progresso, starvation tem progresso geral mas uma fila que não anda. Quando propuser `tryLock` com retentativa contra deadlock, antecipe o livelock e adicione backoff com jitter. Follow-ups comuns: "por que um lock justo não é o padrão?" (throughput) e "como evitar que escritores morram de fome num lock de leitura e escrita?" (ao chegar um escritor, bloquear novos leitores).
+
+<QuizSet>
+<Quiz question="Duas threads usam tryLock nos mesmos dois locks, falham, soltam tudo e tentam de novo imediatamente, em ciclo, com CPU alta. O que está acontecendo?" options={["Deadlock", "Livelock", "Starvation por prioridade", "Condição de corrida"]} answer={1} explanation="As threads estão ativas e reagindo uma à outra de forma simétrica, sem progresso. Backoff aleatório quebra a simetria." />
+<Quiz question="Num escalonador por prioridade estrita, tarefas de baixa prioridade nunca rodam sob carga. Qual técnica corrige isso mantendo as prioridades?" options={["Aumentar o número de núcleos", "Envelhecimento: elevar a prioridade efetiva conforme o tempo de espera", "Trocar por um lock reentrante", "Remover a exclusão mútua"]} answer={1} explanation="Com aging, toda tarefa que espera tempo suficiente acaba vencendo, o que garante progresso a todas." />
+<Quiz question="Por que locks justos (FIFO) não são o padrão na maioria das linguagens?" options={["Porque causam deadlock", "Porque reduzem o throughput ao forçar a entrega à próxima thread da fila, mesmo havendo outra pronta para entrar", "Porque não funcionam em multiprocessadores", "Porque exigem o GIL"]} answer={1} explanation="Permitir que uma thread já em execução pegue o lock evita trocas de contexto. Justiça troca vazão por previsibilidade." />
+</QuizSet>

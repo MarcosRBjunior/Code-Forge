@@ -1,0 +1,118 @@
+---
+title: Por que concorrência
+kind: lesson
+---
+
+Um programa sequencial faz uma coisa de cada vez: lê um arquivo, espera o disco responder, processa, chama uma API, espera a rede, processa de novo. Na maior parte desse tempo a CPU está parada, esperando. Concorrência é a técnica de estruturar o programa para que várias tarefas avancem no mesmo intervalo de tempo, aproveitando essas esperas e, quando há vários núcleos, executando trabalho de verdade em paralelo.
+
+Em entrevista, esse tema aparece de duas formas: como pergunta conceitual ("por que usar threads aqui?") e como pano de fundo de problemas de design (um web crawler, um cache compartilhado, um rate limiter). Entender a motivação ajuda você a justificar cada decisão.
+
+## Os dois motivos clássicos
+
+**Esconder latência de I/O.** Uma requisição HTTP leva dezenas de milissegundos; um acesso a SSD, dezenas de microssegundos; uma instrução de CPU, menos de um nanossegundo. Enquanto uma tarefa espera a rede, outra pode usar o processador. Servidores web, crawlers e clientes de banco ganham muito com isso.
+
+**Usar vários núcleos.** Uma máquina moderna tem 8, 16, 64 núcleos. Um programa de uma única thread usa só um. Para trabalho pesado de CPU (compressão, renderização, cálculo numérico), dividir o trabalho entre núcleos reduz o tempo total.
+
+Há um terceiro motivo, menos lembrado: **responsividade**. Uma interface gráfica que faz um download na mesma thread que desenha a tela congela. Separar o trabalho lento mantém a interface viva.
+
+```text
+Sequencial (uma tarefa por vez, CPU ociosa durante a espera):
+T1: [cpu][----espera rede----][cpu]
+T2:                                [cpu][----espera rede----][cpu]
+
+Concorrente (as esperas se sobrepõem):
+T1: [cpu][----espera rede----][cpu]
+T2:      [cpu][----espera rede----][cpu]
+```
+
+## Vendo o ganho em I/O
+
+O programa abaixo simula quatro chamadas de rede com `time.sleep`. Rodando em threads, as esperas se sobrepõem e o tempo total fica perto do de uma chamada só, não da soma.
+
+```python
+import threading
+import time
+
+def chamada_remota(i, resultados):
+    time.sleep(0.2)  # simula espera de rede
+    resultados[i] = f"resposta-{i}"
+
+resultados = [None] * 4
+
+inicio = time.perf_counter()
+for i in range(4):
+    chamada_remota(i, resultados)
+sequencial = time.perf_counter() - inicio
+
+resultados = [None] * 4
+inicio = time.perf_counter()
+threads = [threading.Thread(target=chamada_remota, args=(i, resultados)) for i in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+concorrente = time.perf_counter() - inicio
+
+print(resultados)
+print("sequencial levou pelo menos 0.8 s:", sequencial >= 0.8)
+print("concorrente levou menos de 0.6 s:", concorrente < 0.6)
+```
+
+```text
+Saída:
+['resposta-0', 'resposta-1', 'resposta-2', 'resposta-3']
+sequencial levou pelo menos 0.8 s: True
+concorrente levou menos de 0.6 s: True
+```
+
+Repare que cada thread escreve numa posição diferente da lista e que só imprimimos depois do `join`. Assim a saída não depende da ordem em que as threads terminam.
+
+## Uma forma mais idiomática
+
+Criar threads na mão é raro em código de produção. Normalmente você usa um pool, que reaproveita threads e devolve os resultados na ordem das entradas.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import time
+
+def buscar_preco(produto):
+    time.sleep(0.1)  # simula consulta a um serviço externo
+    precos = {"livro": 40, "caneta": 3, "mochila": 120}
+    return produto, precos[produto]
+
+produtos = ["livro", "caneta", "mochila"]
+with ThreadPoolExecutor(max_workers=3) as pool:
+    for produto, preco in pool.map(buscar_preco, produtos):
+        print(f"{produto}: R$ {preco}")
+```
+
+```text
+Saída:
+livro: R$ 40
+caneta: R$ 3
+mochila: R$ 120
+```
+
+Em Java o equivalente é `ExecutorService` com `invokeAll`; em Go você usaria goroutines e um `sync.WaitGroup`; em C++, `std::async` ou um pool próprio sobre `std::thread`.
+
+## O custo
+
+Concorrência não é de graça. Você troca simplicidade por desempenho e passa a lidar com:
+
+- **Condições de corrida:** duas threads mexendo no mesmo dado sem coordenação produzem resultados errados e intermitentes.
+- **Deadlocks:** threads esperando umas pelas outras para sempre.
+- **Depuração difícil:** o bug aparece uma vez em mil execuções e some quando você adiciona um log.
+- **Overhead:** criar threads, trocar de contexto e sincronizar custam tempo e memória. Para tarefas minúsculas, a versão sequencial pode ser mais rápida.
+
+<Callout type="tip" title="Regra prática">
+Pergunte primeiro onde o tempo é gasto. Se é esperando I/O, threads ou async ajudam. Se é CPU, você precisa de paralelismo real (processos, ou threads em linguagens sem GIL). Se é nenhum dos dois, concorrência só adiciona risco.
+</Callout>
+
+## Na entrevista
+
+Quando o problema envolver muitas operações independentes de I/O (baixar páginas, consultar serviços), proponha concorrência e explique o motivo em uma frase: "as chamadas são limitadas por rede, então sobrepor as esperas reduz a latência total". Em seguida, diga como vai limitar o paralelismo (um pool de tamanho fixo) e como vai proteger estado compartilhado. Follow-ups comuns: "quantas threads você usaria?" (para I/O, mais que o número de núcleos; para CPU, perto do número de núcleos) e "o que muda se o trabalho for de CPU?".
+
+<QuizSet>
+<Quiz question="Um serviço passa 95% do tempo esperando respostas de um banco remoto. O que a concorrência oferece aqui?" options={["Nada, porque a CPU não é o gargalo", "Sobrepor as esperas, atendendo mais requisições no mesmo tempo", "Tornar cada consulta individual mais rápida", "Eliminar a necessidade de índices no banco"]} answer={1} explanation="Com o gargalo em I/O, várias requisições podem esperar ao mesmo tempo; cada consulta continua igual, mas o throughput aumenta." />
+<Quiz question="Qual destes NÃO é um custo típico de adicionar concorrência?" options={["Condições de corrida", "Overhead de troca de contexto", "Bugs difíceis de reproduzir", "Garantia automática de resultados corretos"]} answer={3} explanation="Concorrência não garante nada sozinha; correção exige sincronização explícita." />
+</QuizSet>

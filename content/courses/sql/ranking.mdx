@@ -1,0 +1,165 @@
+---
+title: ROW_NUMBER, RANK e DENSE_RANK
+kind: lesson
+---
+
+"O segundo maior salário", "os três produtos mais vendidos de cada categoria", "remova os registros duplicados mantendo o mais recente". Esses enunciados aparecem em praticamente toda bateria de SQL, e todos se resolvem com uma das três funções de ranking. Saber escolher entre elas, e explicar por quê, é o que o entrevistador quer ver.
+
+## As três funções
+
+Todas numeram as linhas de cada partição segundo o `ORDER BY` do `OVER`. A diferença está nos **empates**:
+
+| Função | Empates | Sequência para 900, 800, 800, 700 |
+|---|---|---|
+| `row_number()` | números diferentes, ordem arbitrária entre empatados | 1, 2, 3, 4 |
+| `rank()` | mesmo número, e pula posições depois | 1, 2, 2, 4 |
+| `dense_rank()` | mesmo número, sem pular | 1, 2, 2, 3 |
+
+```sql
+CREATE TABLE funcionarios (
+  id      integer PRIMARY KEY,
+  nome    text NOT NULL,
+  depto   text NOT NULL,
+  salario numeric(10, 2) NOT NULL
+);
+
+INSERT INTO funcionarios VALUES
+  (1, 'Ana',    'dados',  9000),
+  (2, 'Bruno',  'dados',  8000),
+  (3, 'Carla',  'dados',  8000),
+  (4, 'Davi',   'dados',  7000),
+  (5, 'Elisa',  'vendas', 6500),
+  (6, 'Fabio',  'vendas', 5000),
+  (7, 'Gabi',   'vendas', 6500),
+  (8, 'Hugo',   'vendas', 4000);
+
+SELECT nome, depto, salario,
+       row_number() OVER w AS rn,
+       rank()       OVER w AS rk,
+       dense_rank() OVER w AS drk
+FROM funcionarios
+WINDOW w AS (PARTITION BY depto ORDER BY salario DESC, id)
+ORDER BY depto, salario DESC, id;
+```
+
+```text
+Saída:
+nome | depto | salario | rn | rk | drk
+Ana | dados | 9000.00 | 1 | 1 | 1
+Bruno | dados | 8000.00 | 2 | 2 | 2
+Carla | dados | 8000.00 | 3 | 3 | 3
+Davi | dados | 7000.00 | 4 | 4 | 4
+Elisa | vendas | 6500.00 | 1 | 1 | 1
+Gabi | vendas | 6500.00 | 2 | 2 | 2
+Fabio | vendas | 5000.00 | 3 | 3 | 3
+Hugo | vendas | 4000.00 | 4 | 4 | 4
+```
+
+O `id` no fim do `ORDER BY` da janela desempata o `row_number` de forma determinística, mas tem um efeito colateral: como as três funções compartilham a mesma janela, Bruno e Carla deixam de empatar também para `rank` e `dense_rank`, e as três colunas ficam iguais. Se você quer que salários iguais contem como empate, a janela de `rank` e `dense_rank` deve ordenar **só** por salário. Vamos corrigir separando as janelas:
+
+```sql
+SELECT nome, depto, salario,
+       row_number() OVER (PARTITION BY depto ORDER BY salario DESC, id) AS rn,
+       rank()       OVER (PARTITION BY depto ORDER BY salario DESC) AS rk,
+       dense_rank() OVER (PARTITION BY depto ORDER BY salario DESC) AS drk
+FROM funcionarios
+ORDER BY depto, salario DESC, id;
+```
+
+```text
+Saída:
+nome | depto | salario | rn | rk | drk
+Ana | dados | 9000.00 | 1 | 1 | 1
+Bruno | dados | 8000.00 | 2 | 2 | 2
+Carla | dados | 8000.00 | 3 | 2 | 2
+Davi | dados | 7000.00 | 4 | 4 | 3
+Elisa | vendas | 6500.00 | 1 | 1 | 1
+Gabi | vendas | 6500.00 | 2 | 1 | 1
+Fabio | vendas | 5000.00 | 3 | 3 | 2
+Hugo | vendas | 4000.00 | 4 | 4 | 3
+```
+
+Agora Bruno e Carla dividem a posição 2 em `rank` e `dense_rank`, e Davi aparece como 4 em `rank` e 3 em `dense_rank`.
+
+## O N-ésimo maior valor
+
+"Qual o segundo maior salário distinto da empresa?" Como o enunciado diz **distinto**, a função certa é `dense_rank`. E como funções de janela não podem ir no `WHERE`, calcule numa CTE e filtre fora:
+
+```sql
+WITH r AS (
+  SELECT salario, dense_rank() OVER (ORDER BY salario DESC) AS pos
+  FROM funcionarios
+)
+SELECT DISTINCT salario
+FROM r
+WHERE pos = 2;
+```
+
+```text
+Saída:
+salario
+8000.00
+```
+
+Com `row_number`, a resposta dependeria de empates e poderia repetir o maior salário. Se não existir segundo valor, a consulta devolve zero linhas; alguns enunciados pedem `NULL` nesse caso, o que se resolve envolvendo tudo numa subconsulta escalar: `SELECT (SELECT ...) AS segundo`.
+
+## Deduplicação
+
+`row_number` é a ferramenta para deduplicar, porque garante exatamente uma linha com o número 1 por grupo. Mantendo o cadastro mais recente de cada e-mail:
+
+```sql
+CREATE TABLE cadastros (
+  id         integer PRIMARY KEY,
+  email      text NOT NULL,
+  criado_em  date NOT NULL
+);
+
+INSERT INTO cadastros VALUES
+  (1, 'ana@x.com',   '2024-01-10'),
+  (2, 'ana@x.com',   '2024-02-15'),
+  (3, 'bia@x.com',   '2024-01-20'),
+  (4, 'caio@x.com',  '2024-03-01'),
+  (5, 'caio@x.com',  '2024-03-01'),
+  (6, 'caio@x.com',  '2024-02-01');
+
+DELETE FROM cadastros
+WHERE id IN (
+  SELECT id FROM (
+    SELECT id, row_number() OVER (PARTITION BY email ORDER BY criado_em DESC, id DESC) AS rn
+    FROM cadastros
+  ) t
+  WHERE rn > 1
+);
+
+SELECT id, email, criado_em FROM cadastros ORDER BY email;
+```
+
+```text
+Saída:
+id | email | criado_em
+2 | ana@x.com | 2024-02-15
+3 | bia@x.com | 2024-01-20
+5 | caio@x.com | 2024-03-01
+```
+
+Caio tem dois cadastros no mesmo dia; o `id DESC` como desempate escolhe o 5 de forma previsível.
+
+<Callout type="tip" title="Qual escolher">
+Precisa de exatamente uma linha por grupo: row_number. Empates devem compartilhar a posição e você quer o top N com todos os empatados: rank ou dense_rank. Pergunta fala em valores distintos (o N-ésimo maior salário distinto): dense_rank.
+</Callout>
+
+## Armadilhas
+
+- **`row_number` sem desempate.** Resultado não determinístico: duas execuções podem escolher linhas diferentes.
+- **`LIMIT` para top N por grupo.** `LIMIT` vale para o resultado inteiro, não por grupo. Use ranking com `PARTITION BY`.
+- **MySQL 5.7.** Não tem funções de janela. A alternativa clássica é a subconsulta correlacionada que conta quantos valores distintos são maiores: `WHERE 1 = (SELECT count(DISTINCT s2.salario) FROM ... WHERE s2.salario > s.salario)`.
+
+## Na entrevista
+
+Antes de escrever, pergunte como tratar empates. A resposta escolhe a função. Diga também qual coluna desempata. Follow-ups comuns: "e se houver menos de N valores?" (devolva vazio ou `NULL`, conforme o enunciado) e "como fazer no MySQL 5.7?" (subconsulta correlacionada com `count(DISTINCT ...)`). No Postgres, uma alternativa para uma linha por grupo é `DISTINCT ON (grupo) ... ORDER BY grupo, criterio`, que não existe no MySQL.
+
+<QuizSet>
+<Quiz question="Salários 900, 800, 800, 700. Qual dense_rank recebe o 700 em ordem decrescente?" options={["4", "3", "2", "1"]} answer={1} explanation="dense_rank não pula posições: 900 é 1, os dois 800 são 2 e 700 é 3. Com rank seria 4." />
+<Quiz question="Você precisa manter exatamente um registro por e-mail. Qual função usar?" options={["rank", "dense_rank", "row_number com desempate", "ntile"]} answer={2} explanation="row_number atribui números distintos dentro da partição, então só uma linha recebe 1. Um desempate torna a escolha determinística." />
+<Quiz question="Por que top N por grupo não se resolve com ORDER BY e LIMIT?" options={["LIMIT não aceita números maiores que 1", "LIMIT se aplica ao resultado inteiro, não a cada grupo", "ORDER BY não funciona com GROUP BY", "LIMIT é exclusivo do MySQL"]} answer={1} explanation="Para N linhas por grupo você precisa numerar dentro de cada partição e filtrar a numeração." />
+</QuizSet>

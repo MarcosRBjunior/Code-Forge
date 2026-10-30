@@ -1,0 +1,161 @@
+---
+title: Atendimento ao cliente com IA
+kind: lesson
+---
+
+"Projete um assistente de atendimento para um e-commerce que resolve dúvidas e problemas de pedidos, e passa para um humano quando necessário." Diferente do chat de uso geral, aqui o assistente age em nome da empresa: consulta pedidos, abre trocas, emite reembolsos. Um erro não é só uma resposta ruim, é dinheiro perdido ou um cliente maltratado. A pergunta testa RAG sobre políticas, uso de ferramentas com permissões, transferência para humanos e métricas de negócio.
+
+## Requisitos
+
+### Funcionais
+
+- Atendimento por chat no site e no app, com o mesmo histórico.
+- Responder dúvidas sobre políticas (prazos, trocas, frete) com base na base de conhecimento.
+- Consultar status de pedidos do cliente autenticado; iniciar trocas e reembolsos dentro de limites.
+- Transferir para um atendente humano com resumo do caso, sem o cliente repetir nada.
+- Painel para a equipe ajustar políticas, ver conversas e revisar casos.
+
+### Não funcionais
+
+- TTFT abaixo de 1,5 segundo; disponibilidade alta, com fallback para fila humana.
+- Ações financeiras auditáveis e idempotentes.
+- Nunca expor dados de um cliente a outro.
+- Picos sazonais grandes (datas promocionais, atrasos de entrega em massa).
+
+## Estimativas
+
+```python
+import math
+
+contatos_dia = 400_000
+resolucao_ia = 0.55            # fracao resolvida sem humano (hipotetica)
+min_por_caso_humano = 9
+horas_turno, ocupacao = 8, 0.75
+
+humanos_antes = math.ceil(contatos_dia * min_por_caso_humano / 60 / (horas_turno * ocupacao))
+transferidos = contatos_dia * (1 - resolucao_ia)
+# casos transferidos chegam com resumo: 2 minutos a menos por caso
+humanos_depois = math.ceil(transferidos * (min_por_caso_humano - 2) / 60 / (horas_turno * ocupacao))
+print(f"atendentes-turno antes: {humanos_antes:,}, depois: {humanos_depois:,}")
+
+turnos_por_conversa, tok_in, tok_out = 6, 3_500, 180
+custo_tok_in, custo_tok_out = 0.5, 2.0            # USD por milhao, hipotetico
+custo_conversa = turnos_por_conversa * (tok_in * custo_tok_in + tok_out * custo_tok_out) / 1e6
+custo_humano_caso = 3.0                            # USD hipotetico
+print(f"custo IA por conversa: US$ {custo_conversa:.3f}; humano por caso: US$ {custo_humano_caso:.2f}")
+print(f"pico (5x) em mensagens/s: {contatos_dia * turnos_por_conversa * 5 / 86_400:.0f}")
+```
+
+```text
+Saída:
+atendentes-turno antes: 10,000, depois: 3,500
+custo IA por conversa: US$ 0.013; humano por caso: US$ 3.00
+pico (5x) em mensagens/s: 139
+```
+
+O custo de inferência por conversa é pequeno perto do custo de um atendimento humano. A métrica que decide o sucesso é a **taxa de resolução com qualidade**, não o custo de tokens. Isso muda as prioridades: vale usar um modelo bom e gastar tokens com verificação.
+
+## API
+
+```text
+POST /conversas                        canal, cliente_id (do token de sessao)
+POST /conversas/:id/mensagens          SSE com deltas e eventos de acao
+POST /conversas/:id/transferir         motivo; devolve posicao na fila humana
+POST /acoes/:id/confirmar              o cliente confirma uma acao proposta (ex.: reembolso)
+GET  /admin/conversas?status=...       painel interno
+```
+
+## Arquitetura
+
+```text
+cliente --> gateway --> servico de conversa --> orquestrador
+                                                 |-- classificador de intencao e sentimento
+                                                 |-- RAG sobre politicas (versao vigente)
+                                                 |-- ferramentas: pedidos, trocas, reembolsos
+                                                 |      (via API interna com escopo do cliente)
+                                                 |-- motor de regras de escalonamento
+                                                 '-- LLM (gateway de modelos)
+                                                          |
+                         fila humana <-- transferencia com resumo e dados do caso
+                                                          |
+                    eventos --> metricas (resolucao, CSAT), revisao amostral, avaliacao
+```
+
+## Componentes em detalhe
+
+### Ferramentas com escopo
+
+O modelo não chama sistemas internos diretamente. Ele propõe uma chamada de ferramenta estruturada (`consultar_pedido`, `abrir_troca`, `reembolsar`), e o orquestrador executa com as credenciais do **cliente autenticado**, nunca com um token de serviço amplo. Assim, mesmo que o cliente convença o modelo a consultar o pedido de outra pessoa, a API interna recusa. Ações com efeito financeiro usam chave de idempotência e, acima de certos valores, pedem confirmação explícita do cliente ou aprovação humana.
+
+### Escalonamento para humanos
+
+A decisão de transferir não fica só a cargo do modelo. Regras determinísticas combinam sinais: pedido explícito do cliente, sentimento muito negativo, intenção sensível, valor alto, confiança baixa ou turnos demais sem resolução.
+
+```python
+REGRAS = [
+    (lambda c: c["pediu_humano"], "cliente pediu humano"),
+    (lambda c: c["intencao"] in {"fraude", "juridico"}, "assunto sensivel"),
+    (lambda c: c["intencao"] == "reembolso" and c["valor"] > 500, "reembolso acima do limite"),
+    (lambda c: c["sentimento"] < -0.6, "cliente muito insatisfeito"),
+    (lambda c: c["turnos_sem_progresso"] >= 3, "sem progresso"),
+]
+
+def decidir(caso):
+    motivos = [m for regra, m in REGRAS if regra(caso)]
+    return ("humano", motivos) if motivos else ("ia", [])
+
+casos = [
+    {"id": 1, "intencao": "rastreio", "valor": 0, "sentimento": 0.1, "pediu_humano": False, "turnos_sem_progresso": 0},
+    {"id": 2, "intencao": "reembolso", "valor": 1200, "sentimento": -0.3, "pediu_humano": False, "turnos_sem_progresso": 1},
+    {"id": 3, "intencao": "troca", "valor": 150, "sentimento": -0.8, "pediu_humano": False, "turnos_sem_progresso": 3},
+    {"id": 4, "intencao": "reembolso", "valor": 80, "sentimento": 0.0, "pediu_humano": False, "turnos_sem_progresso": 0},
+]
+for c in casos:
+    destino, motivos = decidir(c)
+    print(f"caso {c['id']}: {destino:<6} {'; '.join(motivos)}")
+```
+
+```text
+Saída:
+caso 1: ia
+caso 2: humano reembolso acima do limite
+caso 3: humano cliente muito insatisfeito; sem progresso
+caso 4: ia
+```
+
+Ao transferir, o orquestrador gera um resumo estruturado (problema, pedidos envolvidos, o que já foi tentado) para o atendente. Isso reduz o tempo de atendimento humano, como mostram as estimativas.
+
+### Base de conhecimento versionada
+
+Políticas mudam: prazo de troca estendido no fim do ano, frete grátis numa campanha. A base tem versões com data de vigência, e cada resposta registra a versão usada. Mudanças de política disparam reindexação e invalidam o cache semântico das perguntas relacionadas.
+
+### Revisão e melhoria contínua
+
+Uma amostra diária de conversas, com peso maior para as que terminaram em transferência, recontato ou nota baixa, vai para revisão humana. Cada erro encontrado vira um caso no conjunto de avaliação, classificado por causa: política mal recuperada, ferramenta chamada com argumento errado, tom inadequado ou escalonamento tardio. Assim, a próxima mudança de prompt ou de modelo é testada justamente contra os erros que já aconteceram em produção.
+
+<Callout type="tip" title="Fale em métricas de negócio">
+Taxa de resolução sem humano, satisfação do cliente após o atendimento, taxa de recontato em 7 dias e custo por caso resolvido convencem mais que acurácia do modelo. Mencione que a taxa de resolução sozinha engana: um bot que nunca transfere tem resolução alta e clientes furiosos.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Ponto | Opção A | Opção B |
+| --- | --- | --- |
+| Ações | IA executa sozinha: rápido | Confirmação ou aprovação: seguro, mais atrito |
+| Escalonamento | Agressivo: satisfação alta, custo maior | Conservador: custo menor, risco de frustração |
+| Modelo | Grande: menos erros em casos ambíguos | Pequeno: barato, mais transferências |
+| Pico | Fila humana absorve | IA atende com respostas mais curtas e aviso |
+
+- **Pico de atrasos em massa:** muitos clientes com a mesma pergunta. Mensagem proativa e resposta padronizada (cacheável) para esse incidente aliviam a fila.
+- **Fila humana cheia:** a IA informa o tempo de espera e oferece retorno assíncrono.
+
+## Follow-ups
+
+- **Como evitar que o cliente manipule o bot para conseguir reembolso?** Limites de valor no motor de regras, verificação de elegibilidade na API (não no prompt) e auditoria.
+- **Como avaliar antes de liberar uma mudança?** Reproduzir conversas reais anonimizadas contra a nova versão, com avaliação automática e revisão humana de amostras.
+- **Como atender em vários idiomas?** O mesmo fluxo com detecção de idioma; políticas mantidas numa fonte única.
+
+<QuizSet>
+<Quiz question="Um cliente pede ao bot o status do pedido de outra pessoa, informando o número do pedido. Onde essa tentativa deve ser barrada?" options={["No prompt de sistema, pedindo ao modelo que recuse", "Na API interna, que só aceita consultas com as credenciais do cliente autenticado", "No cache semântico", "No classificador de sentimento"]} answer={1} explanation="Autorização tem de ser garantida fora do modelo; instruções no prompt podem ser contornadas." />
+<Quiz question="A taxa de resolução sem humano subiu de 50% para 75% após uma mudança, mas a taxa de recontato em 7 dias dobrou. O que isso indica?" options={["Sucesso total", "O bot está encerrando casos sem resolvê-los de fato, e os clientes voltam", "Os clientes gostam de conversar", "O modelo ficou mais rápido"]} answer={1} explanation="Resolução deve ser medida junto com recontato e satisfação; caso contrário, o sistema otimiza a métrica errada." />
+</QuizSet>

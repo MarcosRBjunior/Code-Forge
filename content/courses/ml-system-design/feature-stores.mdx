@@ -1,0 +1,104 @@
+---
+title: Feature stores
+kind: lesson
+---
+
+Imagine três times de ML na mesma empresa, cada um calculando "número de compras do usuário nos últimos 30 dias" com seu próprio SQL. Um conta pedidos cancelados, outro não; um usa fuso UTC, outro o horário local. Pior: no treino a feature vem de uma consulta batch no data warehouse, e no servimento vem de um código Java escrito por outra pessoa. Os valores divergem, e o modelo, ótimo offline, piora em produção. Esse descompasso tem nome, **training-serving skew**, e o feature store existe principalmente para eliminá-lo.
+
+## O que é um feature store
+
+É uma camada que guarda **definições** de features e seus **valores**, servindo os mesmos números para treino e para inferência. Tem quatro partes:
+
+- **Registro de definições**: cada feature tem nome, entidade (usuário, item, comerciante), tipo, dono, fonte e a transformação que a calcula, escrita uma vez só.
+- **Armazenamento offline**: histórico completo dos valores com carimbo de tempo, num data lake ou warehouse. Serve para montar datasets de treino.
+- **Armazenamento online**: só o valor mais recente por entidade, num banco chave-valor de baixa latência (Redis, DynamoDB, Cassandra). Serve para o modelo em produção, em poucos milissegundos.
+- **Materialização**: jobs batch e de streaming que calculam as features e escrevem nos dois armazenamentos.
+
+```text
+              definições de features (código versionado)
+                              │
+            ┌─────────────────┴─────────────────┐
+            v                                   v
+     job batch diário                  job de streaming
+            │                                   │
+            v                                   v
+   offline store (histórico) ──sincroniza──> online store (último valor)
+            │                                   │
+   join point-in-time                    leitura por chave, p99 de poucos ms
+            │                                   │
+            v                                   v
+     dataset de treino                  serviço de predição
+```
+
+## A consulta point-in-time
+
+O ponto mais sutil é montar o dataset de treino. Para cada exemplo rotulado (usuário, momento, rótulo), você precisa do valor da feature **como estava naquele momento**, não como está hoje. Se usar o valor atual, você vaza o futuro para o passado. O feature store oferece um join "as of": para cada exemplo, pega o último valor com carimbo anterior ou igual ao momento do evento.
+
+```python
+import bisect
+
+historico = {
+    "u1": [("2026-01-05", 2), ("2026-02-01", 5), ("2026-03-01", 9)],
+    "u2": [("2026-01-20", 0), ("2026-02-25", 1)],
+}
+
+def as_of(usuario, momento):
+    linhas = historico.get(usuario, [])
+    datas = [d for d, _ in linhas]
+    i = bisect.bisect_right(datas, momento)
+    return linhas[i - 1][1] if i else None
+
+def ultimo_valor(usuario):
+    return historico[usuario][-1][1]
+
+exemplos = [("u1", "2026-01-15", 0), ("u1", "2026-02-10", 1), ("u2", "2026-02-01", 0), ("u2", "2026-01-10", 0)]
+print("usuario momento     correto  ingenuo")
+for usuario, momento, rotulo in exemplos:
+    print(f"{usuario}      {momento}  {str(as_of(usuario, momento)):>7}  {ultimo_valor(usuario):>7}")
+
+online = {u: ultimo_valor(u) for u in historico}
+print("online store:", online)
+```
+
+```text
+Saída:
+usuario momento     correto  ingenuo
+u1      2026-01-15        2        9
+u1      2026-02-10        5        9
+u2      2026-02-01        0        1
+u2      2026-01-10     None        1
+online store: {'u1': 9, 'u2': 1}
+```
+
+O join ingênuo dá ao modelo, em janeiro, um número de compras que só existiria em março. O modelo aprende a confiar demais nessa feature e decepciona em produção, onde só existe o valor de hoje. Repare também no `u2` em 10 de janeiro: antes do primeiro registro o valor correto é ausente, e o modelo precisa aprender a lidar com isso, como acontecerá com usuários novos.
+
+## Frescor e tipos de feature
+
+| Tipo | Exemplo | Como materializar |
+| --- | --- | --- |
+| Estática ou lenta | País, categoria do item | Batch diário ou sob demanda |
+| Agregado longo | Compras em 30 dias | Batch diário |
+| Agregado curto | Cliques na última hora | Streaming |
+| Da requisição | Hora do dia, dispositivo, consulta digitada | Calculada no próprio serviço, na hora |
+
+Features da requisição não passam pelo store, mas a lógica precisa ser a mesma no treino: uma solução é registrar no log exatamente o vetor de features usado em cada predição e treinar com esse log.
+
+## Trade-offs
+
+- **Custo**: manter histórico de milhares de features por centenas de milhões de entidades é caro. Defina TTL e apague features sem uso.
+- **Consistência entre stores**: o online pode estar alguns minutos à frente ou atrás do offline. Logar features no servimento resolve isso para o treino.
+- **Build ou buy**: soluções abertas e gerenciadas existem; para um time pequeno, uma tabela bem modelada e um cache podem bastar no começo.
+
+<Callout type="tip" title="Logue as features servidas">
+A forma mais robusta de evitar skew é gravar, junto de cada predição, o vetor exato de features que o modelo recebeu. O próximo treino usa esse log, e treino e servimento passam a ver os mesmos números por construção.
+</Callout>
+
+## Na entrevista
+
+Quando listar features, diga como cada uma é calculada e materializada e mencione o feature store como garantia de consistência. Follow-ups comuns: "como você monta o dataset de treino sem vazamento?" (join point-in-time), "o que acontece se o online store estiver indisponível?" (valores padrão e um modelo que tolera features ausentes) e "como lidar com uma feature que precisa ser atualizada a cada segundo?".
+
+<QuizSet>
+<Quiz question="Para um exemplo de treino de 10 de fevereiro, qual valor da feature 'compras em 30 dias' deve ser usado?" options={["O valor de hoje", "O último valor calculado até 10 de fevereiro", "A média de todos os valores", "O primeiro valor registrado"]} answer={1} explanation="O join point-in-time usa o valor que existia no momento do evento, evitando informação do futuro." />
+<Quiz question="O modelo vai bem offline e mal em produção; você descobre que a feature 'idade da conta' é calculada em dias no treino e em horas no servimento. Como se chama o problema?" options={["Overfitting", "Training-serving skew", "Cold start", "Viés de seleção"]} answer={1} explanation="A mesma feature produz valores diferentes nos dois caminhos; definições únicas num feature store evitam isso." />
+<Quiz question="Qual armazenamento serve o modelo em produção?" options={["O offline, com histórico completo", "O online, com o último valor por entidade e baixa latência", "O data lake bruto", "O registro de modelos"]} answer={1} explanation="O online store responde leituras por chave em milissegundos; o offline serve para montar datasets." />
+</QuizSet>

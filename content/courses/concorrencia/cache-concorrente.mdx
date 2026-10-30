@@ -1,0 +1,173 @@
+---
+title: Cache LRU concorrente
+kind: lesson
+---
+
+"Implemente um cache LRU" é clássico de entrevista. A versão concorrente acrescenta a pergunta que separa candidatos: "e se várias threads usarem esse cache ao mesmo tempo?". A resposta curta (ponha um lock em volta) está certa, mas o entrevistador quer ver se você entende **por que** o LRU é difícil de paralelizar, quanto isso custa e quais saídas existem quando o lock único vira gargalo.
+
+## Por que até o get escreve
+
+Um LRU combina um mapa (chave para nó) com uma lista duplamente ligada em ordem de uso. O detalhe que muda tudo: **toda leitura altera a lista**, porque o item lido precisa ir para a frente. Ou seja, `get` não é uma operação só de leitura, e um lock de leitura e escrita não ajuda. Duas threads fazendo `get` ao mesmo tempo podem corromper os ponteiros da lista se não houver exclusão mútua.
+
+```text
+get(b):   [a] <-> [b] <-> [c]      mover b para a frente
+          ^cabeça        ^cauda    (4 ponteiros mudam)
+
+put(d) cheio:  remove a cauda (c) e insere d na cabeça
+```
+
+Cada operação mexe em vários ponteiros e no mapa. Se uma thread for interrompida no meio, outra vê um estado intermediário: nó no mapa mas fora da lista, ou lista com ciclo. Por isso a seção crítica precisa cobrir mapa e lista juntos.
+
+## Versão 1: um lock para tudo
+
+Em Python, `OrderedDict` já faz o papel de mapa mais lista: `move_to_end` promove a chave e `popitem(last=False)` remove a mais antiga. Basta proteger tudo com um `threading.Lock`.
+
+```python
+import threading
+from collections import OrderedDict
+
+class LRUConcorrente:
+    def __init__(self, capacidade):
+        self.capacidade = capacidade
+        self.dados = OrderedDict()
+        self.lock = threading.Lock()
+        self.acertos = 0
+        self.falhas = 0
+
+    def get(self, chave):
+        with self.lock:
+            if chave not in self.dados:
+                self.falhas += 1
+                return None
+            self.dados.move_to_end(chave)
+            self.acertos += 1
+            return self.dados[chave]
+
+    def put(self, chave, valor):
+        with self.lock:
+            self.dados[chave] = valor
+            self.dados.move_to_end(chave)
+            if len(self.dados) > self.capacidade:
+                self.dados.popitem(last=False)
+
+cache = LRUConcorrente(capacidade=100)
+
+def trabalhador(base):
+    for i in range(1000):
+        chave = (base + i) % 150
+        if cache.get(chave) is None:
+            cache.put(chave, chave * 10)
+
+threads = [threading.Thread(target=trabalhador, args=(k * 37,)) for k in range(8)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("itens no cache:", len(cache.dados))
+print("operacoes de get:", cache.acertos + cache.falhas)
+print("valores consistentes:", all(v == k * 10 for k, v in cache.dados.items()))
+```
+
+```text
+Saída:
+itens no cache: 100
+operacoes de get: 8000
+valores consistentes: True
+```
+
+Repare que os contadores `acertos` e `falhas` também ficam dentro do lock. Quantos acertos houve depende do escalonamento, por isso o programa imprime só a soma, que é sempre 8000. Em Java a solução equivalente é um `LinkedHashMap` com `accessOrder = true` envolvido em `synchronized`; em Go, um `map` mais `container/list` protegidos por `sync.Mutex`.
+
+## Quando o lock único vira gargalo
+
+Com dezenas de núcleos e milhões de leituras por segundo, todas as threads disputam o mesmo lock. As saídas mais citadas:
+
+| Técnica | Ideia | Custo |
+| --- | --- | --- |
+| Striping (shards) | N caches LRU independentes, escolhidos por `hash(chave) % N` | LRU vira aproximado: cada shard expulsa só os seus |
+| Buffer de leituras | `get` registra o acesso numa fila e a reordenação é aplicada em lote | A ordem fica alguns instantes atrasada |
+| LRU aproximado | Bit de "usado recentemente" (CLOCK) em vez de lista | Expulsão menos precisa, leitura quase sem lock |
+| Mapa concorrente + TTL | Abrir mão de LRU estrito | Política diferente da pedida |
+
+O Caffeine (Java) combina buffers de leitura com uma política mais esperta que LRU, e o `ConcurrentHashMap` usa a ideia de dividir o lock por regiões. Em entrevista, striping é a resposta mais fácil de justificar: você troca precisão global por contenção dividida por N.
+
+## Evitando o estouro de cache (single flight)
+
+Outro problema real: a chave mais popular expira e 50 threads dão `miss` ao mesmo tempo. Todas vão ao banco calcular o mesmo valor. A correção é registrar, sob o lock, que alguém **já está carregando** aquela chave; as outras esperam o resultado em vez de repetir o trabalho.
+
+```python
+import threading
+from concurrent.futures import Future
+
+class CacheComCarga:
+    def __init__(self, carregar):
+        self.carregar = carregar
+        self.lock = threading.Lock()
+        self.valores = {}
+        self.em_andamento = {}
+        self.chamadas = 0
+
+    def get(self, chave):
+        with self.lock:
+            if chave in self.valores:
+                return self.valores[chave]
+            futuro = self.em_andamento.get(chave)
+            dono = futuro is None
+            if dono:
+                futuro = Future()
+                self.em_andamento[chave] = futuro
+                self.chamadas += 1
+        if dono:
+            valor = self.carregar(chave)  # fora do lock: outras chaves seguem livres
+            with self.lock:
+                self.valores[chave] = valor
+                del self.em_andamento[chave]
+            futuro.set_result(valor)
+        return futuro.result()
+
+cache = CacheComCarga(lambda chave: chave.upper())
+resultados = []
+lock_resultados = threading.Lock()
+
+def cliente():
+    valor = cache.get("usuario:42")
+    with lock_resultados:
+        resultados.append(valor)
+
+threads = [threading.Thread(target=cliente) for _ in range(20)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("respostas:", len(resultados), sorted(set(resultados)))
+print("vezes que o banco foi consultado:", cache.chamadas)
+```
+
+```text
+Saída:
+respostas: 20 ['USUARIO:42']
+vezes que o banco foi consultado: 1
+```
+
+Dois detalhes importam. Primeiro, a carga lenta acontece **fora** do lock global; segurá-lo durante uma consulta ao banco travaria o cache inteiro. Segundo, quem chega depois espera num `Future`, não num laço de espera ativa. Em Go isso existe pronto no pacote `singleflight`; em Java, `ConcurrentHashMap.computeIfAbsent` dá um efeito parecido por chave.
+
+<Callout type="warning" title="Não chame código externo segurando o lock">
+Carregar do banco, chamar um callback de expulsão ou fazer log síncrono dentro da seção crítica aumenta a contenção e abre espaço para deadlock se esse código tentar usar o cache de novo.
+</Callout>
+
+## Armadilhas
+
+- **Lock de leitura e escrita no LRU:** não funciona, porque `get` também reordena a lista.
+- **Verificar e depois inserir em duas seções críticas** separadas: entre elas, outra thread insere a mesma chave.
+- **Esquecer de remover a entrada de "em andamento" quando a carga falha**: as próximas threads esperam para sempre. Em produção, use `set_exception` e remova a chave num `finally`.
+
+## Na entrevista
+
+Comece pelo LRU sequencial (mapa mais lista dupla, tudo O(1)), mostre o lock único e explique por que leituras também precisam dele. Depois proponha melhorias guiadas por números: "se o perfil mostrar contenção, divido em 16 shards". Follow-ups comuns: "como evitar que muitas threads recalculem a mesma chave?" (single flight com futuro por chave) e "o LRU continua exato com shards?" (não, cada shard decide sozinho, o que costuma ser aceitável).
+
+<QuizSet>
+<Quiz question="Por que um lock de leitura e escrita não melhora um cache LRU clássico?" options={["Porque Python não tem esse tipo de lock", "Porque todo get também move o item na lista de uso, ou seja, escreve", "Porque locks de leitura são mais lentos que mutex", "Porque o put nunca precisa de lock"]} answer={1} explanation="Num LRU, a leitura atualiza a ordem de uso. Como get modifica a estrutura, ele precisa de acesso exclusivo." />
+<Quiz question="Seu cache shardeado em 16 partes ainda é um LRU exato?" options={["Sim, desde que todas as partes tenham o mesmo tamanho", "Não: cada shard expulsa o seu item mais antigo, que pode não ser o mais antigo do cache inteiro", "Sim, porque o hash distribui uniformemente", "Não, porque shards impedem expulsão"]} answer={1} explanation="Striping troca precisão global por menos contenção. A política vira um LRU aproximado, o que geralmente é aceitável." />
+<Quiz question="Vinte threads pedem a mesma chave ausente ao mesmo tempo. Qual técnica faz o banco ser consultado só uma vez?" options={["Aumentar a capacidade do cache", "Registrar sob o lock um futuro por chave em carga e fazer as demais esperarem por ele", "Usar um lock por thread", "Fazer cada thread dormir um tempo aleatório"]} answer={1} explanation="É o padrão single flight: a primeira thread vira dona da carga e as outras aguardam o mesmo resultado." />
+</QuizSet>

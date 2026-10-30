@@ -1,0 +1,178 @@
+---
+title: Subconsultas, IN e EXISTS
+kind: lesson
+---
+
+Muitas perguntas se resolvem em duas etapas: primeiro calcule algo (a média de preço, a lista de clientes ativos), depois use esse resultado para filtrar ou comparar. Uma **subconsulta** é um `SELECT` dentro de outro, e é a forma mais direta de expressar essas etapas. Em entrevista, o que mais pesa é saber quando ela é **correlacionada**, como `IN` e `EXISTS` se comportam com `NULL` e quando reescrever com join.
+
+## Os três formatos
+
+Uma subconsulta pode devolver:
+
+- **um valor só** (escalar), usado onde caberia uma constante;
+- **uma coluna com várias linhas**, usada com `IN`, `ANY` ou `ALL`;
+- **uma tabela**, usada no `FROM` como se fosse uma tabela derivada.
+
+```sql
+CREATE TABLE produtos (
+  id        integer PRIMARY KEY,
+  nome      text NOT NULL,
+  categoria text NOT NULL,
+  preco     numeric(10, 2) NOT NULL
+);
+
+CREATE TABLE vendas (
+  id         integer PRIMARY KEY,
+  produto_id integer REFERENCES produtos (id),
+  quantidade integer NOT NULL
+);
+
+INSERT INTO produtos VALUES
+  (1, 'Caneta', 'papelaria', 3.50),
+  (2, 'Caderno', 'papelaria', 22.00),
+  (3, 'Mochila', 'acessorios', 180.00),
+  (4, 'Estojo', 'acessorios', 35.00),
+  (5, 'Agenda', 'papelaria', 48.00),
+  (6, 'Garrafa', 'acessorios', 60.00);
+
+INSERT INTO vendas VALUES
+  (100, 1, 10), (101, 2, 3), (102, 3, 1),
+  (103, 1, 5), (104, 6, 2), (105, NULL, 1);
+
+SELECT nome, preco
+FROM produtos
+WHERE preco > (SELECT avg(preco) FROM produtos)
+ORDER BY preco DESC;
+```
+
+```text
+Saída:
+nome | preco
+Mochila | 180.00
+Garrafa | 60.00
+```
+
+A média dos seis preços é 58,08. A subconsulta escalar roda uma vez e o resultado vira uma constante na comparação. Se ela devolver mais de uma linha, o Postgres dá erro em tempo de execução.
+
+## Subconsulta correlacionada
+
+Uma subconsulta é **correlacionada** quando referencia uma coluna da consulta de fora. Conceitualmente, ela é reavaliada para cada linha externa. "Produtos mais caros que a média **da própria categoria**":
+
+```sql
+SELECT p.nome, p.categoria, p.preco
+FROM produtos p
+WHERE p.preco > (
+  SELECT avg(p2.preco)
+  FROM produtos p2
+  WHERE p2.categoria = p.categoria
+)
+ORDER BY p.categoria, p.nome;
+```
+
+```text
+Saída:
+nome | categoria | preco
+Mochila | acessorios | 180.00
+Agenda | papelaria | 48.00
+```
+
+O otimizador do Postgres às vezes consegue transformar esse padrão em join, mas nem sempre. Em tabelas grandes, a versão com uma tabela derivada (ou uma função de janela, que você verá adiante) costuma ser mais previsível: calcule a média por categoria uma vez e junte.
+
+## IN e EXISTS
+
+`IN` testa se um valor pertence à lista devolvida pela subconsulta. `EXISTS` testa se a subconsulta devolve **pelo menos uma linha**, sem olhar o conteúdo, por isso se escreve `SELECT 1`. Para "produtos que já venderam", os dois funcionam:
+
+```sql
+SELECT nome
+FROM produtos p
+WHERE EXISTS (SELECT 1 FROM vendas v WHERE v.produto_id = p.id)
+ORDER BY nome;
+```
+
+```text
+Saída:
+nome
+Caderno
+Caneta
+Garrafa
+Mochila
+```
+
+O Postgres planeja `IN` e `EXISTS` positivos como **semi-join**: para cada produto, basta achar uma venda e parar. Diferente de um `JOIN` comum, o semi-join não duplica a caneta, que tem duas vendas.
+
+## A armadilha do NOT IN com NULL
+
+Agora o inverso: "produtos que nunca venderam". Repare que a venda 105 tem `produto_id` nulo.
+
+```sql
+SELECT nome
+FROM produtos
+WHERE id NOT IN (SELECT produto_id FROM vendas)
+ORDER BY nome;
+```
+
+```text
+Saída:
+nome
+```
+
+Nenhuma linha. O motivo: `id NOT IN (1, 2, 3, 6, NULL)` equivale a `id <> 1 AND id <> 2 AND ... AND id <> NULL`. A comparação com `NULL` é desconhecida, e um `AND` com um termo desconhecido nunca é verdadeiro. Basta um nulo na subconsulta para o `NOT IN` não devolver nada.
+
+`NOT EXISTS` não tem esse problema, porque só pergunta se existe uma linha que casa:
+
+```sql
+SELECT nome
+FROM produtos p
+WHERE NOT EXISTS (SELECT 1 FROM vendas v WHERE v.produto_id = p.id)
+ORDER BY nome;
+```
+
+```text
+Saída:
+nome
+Agenda
+Estojo
+```
+
+<Callout type="warning" title="Prefira NOT EXISTS">
+Use NOT EXISTS (ou LEFT JOIN com IS NULL) para anti-joins. NOT IN só é seguro quando a coluna da subconsulta é NOT NULL, e mesmo assim o Postgres não consegue planejá-lo como anti-join hash, o que pode deixá-lo lento.
+</Callout>
+
+## Subconsulta no FROM
+
+Uma subconsulta no `FROM` (tabela derivada) é útil para agregar em etapas. No Postgres o apelido era obrigatório até a versão 15 e no MySQL ainda é:
+
+```sql
+SELECT categoria, max(total_vendido) AS mais_vendido
+FROM (
+  SELECT p.categoria, p.nome, coalesce(sum(v.quantidade), 0) AS total_vendido
+  FROM produtos p
+  LEFT JOIN vendas v ON v.produto_id = p.id
+  GROUP BY p.categoria, p.nome
+) t
+GROUP BY categoria
+ORDER BY categoria;
+```
+
+```text
+Saída:
+categoria | mais_vendido
+acessorios | 2
+papelaria | 15
+```
+
+## Armadilhas
+
+- **Escalar que devolve várias linhas.** Funciona no teste com poucos dados e quebra em produção. Garanta unicidade (agregação, chave) ou use `LIMIT 1` com `ORDER BY`.
+- **`NOT IN` com nulos.** Visto acima.
+- **Desempenho no MySQL antigo.** Antes da versão 5.6, o MySQL executava `IN (subconsulta)` como correlacionada, linha a linha; daí a fama de "subconsulta é lenta". Hoje os dois bancos fazem semi-join.
+
+## Na entrevista
+
+Escolha a forma mais legível primeiro e comente o custo. Para "existe ao menos um", use `EXISTS`; para "não existe nenhum", `NOT EXISTS`. Follow-ups comuns: "por que esse NOT IN não devolveu nada?" (um `NULL` na subconsulta) e "reescreva a correlacionada com join" (agregue por categoria numa tabela derivada e junte pela categoria).
+
+<QuizSet>
+<Quiz question="A subconsulta de um NOT IN devolve (1, 2, NULL). Quantas linhas a consulta externa devolve?" options={["Todas que não são 1 nem 2", "Nenhuma", "Só as nulas", "Dá erro"]} answer={1} explanation="x NOT IN (1, 2, NULL) inclui x <> NULL, que é desconhecido; o resultado nunca é verdadeiro." />
+<Quiz question="O que torna uma subconsulta correlacionada?" options={["Estar no FROM", "Referenciar uma coluna da consulta externa", "Usar agregação", "Devolver uma linha só"]} answer={1} explanation="A dependência de colunas externas faz com que ela seja, conceitualmente, avaliada por linha." />
+<Quiz question="Por que EXISTS (SELECT 1 ...) usa SELECT 1?" options={["Por exigência de sintaxe", "Porque EXISTS só verifica se há alguma linha; o conteúdo não importa", "Para limitar a uma linha", "Para evitar NULL"]} answer={1} explanation="EXISTS ignora as colunas; SELECT 1 deixa isso explícito." />
+</QuizSet>

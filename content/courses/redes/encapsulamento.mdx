@@ -1,0 +1,129 @@
+---
+title: Encapsulamento
+kind: lesson
+---
+
+Cada camada precisa de informação própria para fazer o seu trabalho: o transporte quer portas, a rede quer endereços IP, o enlace quer endereços MAC. Em vez de misturar tudo num formato único, cada camada pega o que veio de cima, trata como uma caixa fechada (o **payload**) e cola o seu próprio **cabeçalho** na frente. Isso é encapsulamento. Na chegada, o processo inverso, o desencapsulamento, remove um cabeçalho por camada até sobrar a mensagem original.
+
+## A boneca russa
+
+```text
+Aplicação                          [ GET / HTTP/1.1 ... ]
+Transporte              [ TCP 20B ][ dados da aplicação ]          = segmento
+Rede          [ IPv4 20B ][ TCP 20B ][ dados ]                     = pacote
+Enlace [ Eth 14B ][ IPv4 ][ TCP ][ dados ][ FCS 4B ]               = quadro
+Física  preâmbulo 8B + quadro + intervalo entre quadros 12B        = bits
+```
+
+Repare em três consequências:
+
+1. **Cada salto troca o envelope de enlace.** Um roteador remove o cabeçalho Ethernet, decide a rota olhando o IP, decrementa o TTL e coloca um cabeçalho Ethernet novo com o MAC do próximo salto. O IP de destino continua o mesmo de ponta a ponta (fora NAT).
+2. **Cabeçalhos custam banda.** Em mensagens pequenas, o overhead domina.
+3. **O tamanho máximo vem de baixo.** O payload Ethernet padrão é de 1.500 bytes (a **MTU**). Tirando 20 de IP e 20 de TCP, sobram 1.460 bytes de dados por segmento: o **MSS** que o TCP anuncia no handshake.
+
+## Montando um quadro byte a byte
+
+O programa abaixo encapsula uma mensagem em UDP, IPv4 e Ethernet usando `struct`, calcula o checksum do cabeçalho IP e depois faz o caminho inverso, como faria a pilha do receptor.
+
+```python
+import struct, ipaddress
+
+def checksum(dados: bytes) -> int:
+    if len(dados) % 2:
+        dados += b"\x00"
+    soma = sum(struct.unpack(f"!{len(dados)//2}H", dados))
+    while soma >> 16:
+        soma = (soma & 0xFFFF) + (soma >> 16)
+    return ~soma & 0xFFFF
+
+payload = b"ola, camada 7"
+udp = struct.pack("!HHHH", 50000, 9999, 8 + len(payload), 0) + payload
+
+src = ipaddress.IPv4Address("192.168.0.10").packed
+dst = ipaddress.IPv4Address("192.168.0.20").packed
+total = 20 + len(udp)
+cab_ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, 1, 0, 64, 17, 0, src, dst)
+cab_ip = cab_ip[:10] + struct.pack("!H", checksum(cab_ip)) + cab_ip[12:]
+pacote = cab_ip + udp
+
+mac_dst = bytes.fromhex("aabbccddeeff")
+mac_src = bytes.fromhex("112233445566")
+quadro = mac_dst + mac_src + struct.pack("!H", 0x0800) + pacote
+
+print("tamanho do quadro:", len(quadro), "bytes, sendo", len(payload), "de dados")
+print("cabecalho IP:", cab_ip.hex(" "))
+
+# desencapsulamento
+ethertype = struct.unpack("!H", quadro[12:14])[0]
+ip = quadro[14:]
+ver_ihl, _, tot, _, _, ttl, proto, csum, s, d = struct.unpack("!BBHHHBBH4s4s", ip[:20])
+print(f"EtherType 0x{ethertype:04x} -> IPv{ver_ihl >> 4}, TTL {ttl}, protocolo {proto}")
+print("checksum confere:", checksum(ip[:20]) == 0)
+sport, dport, ulen, _ = struct.unpack("!HHHH", ip[20:28])
+print(f"{ipaddress.IPv4Address(s)}:{sport} -> {ipaddress.IPv4Address(d)}:{dport}")
+print("dados:", ip[28:28 + ulen - 8].decode())
+```
+
+```text
+Saída:
+tamanho do quadro: 55 bytes, sendo 13 de dados
+cabecalho IP: 45 00 00 29 00 01 00 00 40 11 f9 54 c0 a8 00 0a c0 a8 00 14
+EtherType 0x0800 -> IPv4, TTL 64, protocolo 17
+checksum confere: True
+192.168.0.10:50000 -> 192.168.0.20:9999
+dados: ola, camada 7
+```
+
+Um detalhe útil: somar o cabeçalho inteiro, já com o checksum dentro, dá zero depois do complemento. É assim que o receptor valida sem recalcular campo a campo. Como o roteador altera o TTL, ele precisa recalcular esse checksum a cada salto, um dos motivos de o IPv6 ter removido o campo.
+
+## Quanto custa o envelope
+
+```python
+MTU = 1500
+CAB = {"Ethernet+FCS": 18, "preambulo+IFG": 20, "IPv4": 20, "TCP": 20}
+
+def eficiencia(dados):
+    no_fio = dados + sum(CAB.values())
+    return dados / no_fio
+
+for dados in (1, 100, 536, 1460):
+    print(f"{dados:>5} B de dados -> eficiencia {eficiencia(dados):6.1%}")
+
+mss = MTU - CAB["IPv4"] - CAB["TCP"]
+print("MSS com MTU 1500:", mss)
+print("MSS dentro de tunel com 50 B extras (VXLAN):", mss - 50)
+```
+
+```text
+Saída:
+    1 B de dados -> eficiencia   1.3%
+  100 B de dados -> eficiencia  56.2%
+  536 B de dados -> eficiencia  87.3%
+ 1460 B de dados -> eficiencia  94.9%
+MSS com MTU 1500: 1460
+MSS dentro de tunel com 50 B extras (VXLAN): 1410
+```
+
+Isso explica por que o algoritmo de Nagle agrupa escritas pequenas, por que protocolos binários e compressão de cabeçalho (HPACK no HTTP/2) importam em alto volume, e por que túneis (VPN, VXLAN, IPsec) reduzem o espaço útil.
+
+<Callout type="warning" title="O bug clássico da MTU">
+Dentro de um túnel, pacotes de 1.500 bytes não cabem. Se o remetente marcou "não fragmentar" e um firewall bloqueia o ICMP que avisaria "pacote grande demais", a conexão abre (o handshake é pequeno), mas trava ao transferir dados grandes. O sintoma típico: SSH conecta e congela no primeiro comando com saída longa. A correção é reduzir a MTU ou ajustar o MSS no túnel (MSS clamping).
+</Callout>
+
+## Trade-offs
+
+| Escolha | Ganho | Custo |
+| --- | --- | --- |
+| Cabeçalhos independentes por camada | Troca de tecnologia sem afetar o resto | Overhead em mensagens pequenas |
+| Jumbo frames (MTU 9000) | Menos pacotes e menos CPU por byte | Todo o caminho precisa suportar |
+| Fragmentação IP | Pacote grande atravessa enlace pequeno | Perder um fragmento perde o pacote inteiro |
+
+## Na entrevista
+
+Descreva o caminho de uma mensagem descendo a pilha e cite os tamanhos: 14 de Ethernet, 20 de IPv4, 20 de TCP, MTU de 1.500, MSS de 1.460. Isso mostra fluência. Follow-ups prováveis: "o que muda num pacote a cada roteador?" (enlace inteiro, TTL e checksum IP; o IP de destino não) e "por que uma conexão abre mas trava ao enviar respostas grandes?" (problema de MTU com ICMP bloqueado, o chamado black hole de PMTUD).
+
+<QuizSet>
+<Quiz question="Um pacote atravessa três roteadores. O que permanece igual de ponta a ponta, sem NAT?" options={["MAC de destino", "TTL", "IP de destino", "Checksum do cabeçalho IP"]} answer={2} explanation="Cada salto reescreve o cabeçalho de enlace e decrementa o TTL, o que obriga a recalcular o checksum. O IP de destino não muda." />
+<Quiz question="Com MTU de 1.500 bytes e cabeçalhos IPv4 e TCP sem opções, qual é o MSS?" options={["1500", "1480", "1460", "1440"]} answer={2} explanation="1.500 menos 20 de IPv4 menos 20 de TCP dá 1.460 bytes de dados por segmento." />
+<Quiz question="Uma conexão via VPN completa o handshake, mas trava ao baixar arquivos. Qual a causa mais provável?" options={["DNS errado", "MTU menor no túnel com ICMP de fragmentação bloqueado", "Certificado expirado", "Porta de destino fechada"]} answer={1} explanation="Pacotes pequenos passam; os cheios excedem a MTU do túnel e são descartados sem aviso porque o ICMP foi filtrado." />
+</QuizSet>

@@ -1,0 +1,146 @@
+---
+title: Ferramentas de diagnóstico
+kind: lesson
+---
+
+"Está lento" e "não conecta" são as duas reclamações mais comuns em produção, e em entrevistas de SRE ou backend sênior aparecem como cenário: "o serviço X começou a dar timeout para o Y; como você investiga?". Quem responde bem não chuta causas: escolhe a ferramenta que isola uma camada por vez e lê a saída com atenção.
+
+## O kit básico
+
+| Pergunta | Ferramenta | Camada |
+| --- | --- | --- |
+| O nome resolve? Para qual IP, com qual TTL? | `dig`, `nslookup` | Aplicação (DNS) |
+| O host responde? Qual o RTT e a perda? | `ping` | Rede (ICMP) |
+| Por onde o pacote passa e onde morre? | `traceroute`, `mtr` | Rede |
+| A porta está aberta e escutando? | `nc -vz`, `ss -ltnp` | Transporte |
+| Quanto tempo cada fase de uma requisição leva? | `curl -w` | Transporte a aplicação |
+| O que realmente trafega no fio? | `tcpdump`, Wireshark | Todas |
+
+## DNS com dig
+
+```bash
+dig +noall +answer api.exemplo.com A
+```
+
+```text
+api.exemplo.com.   60   IN   CNAME   api-lb.exemplo.net.
+api-lb.exemplo.net. 20  IN   A       203.0.113.10
+api-lb.exemplo.net. 20  IN   A       203.0.113.11
+```
+
+Leia o TTL (quanto tempo esse resultado ficará em cache em cada resolvedor), a cadeia de CNAME e quantos IPs voltaram. Use `dig @8.8.8.8` para comparar com outro resolvedor e `+trace` para ver a delegação desde a raiz, útil quando uma mudança "não propagou".
+
+## Caminho com traceroute
+
+O traceroute explora o TTL: envia pacotes com TTL 1, 2, 3 e assim por diante. Cada roteador decrementa o TTL e, quando ele chega a zero, descarta o pacote e devolve um ICMP "time exceeded" com o próprio endereço. Assim cada salto se revela.
+
+```python
+CAMINHO = [
+    ("192.168.0.1", 1.2),     # roteador de casa
+    ("100.64.0.1", 8.5),      # provedor (CGNAT)
+    ("*", None),              # roteador que não responde ICMP
+    ("198.51.100.9", 19.8),   # troca de tráfego
+    ("203.0.113.10", 21.4),   # destino
+]
+
+def traceroute(destino, max_ttl=30):
+    for ttl in range(1, max_ttl + 1):
+        ip, rtt = CAMINHO[ttl - 1]
+        if ip == "*":
+            print(f"{ttl:>2}  * * *")
+            continue
+        tipo = "echo reply" if ip == destino else "time exceeded"
+        print(f"{ttl:>2}  {ip:<14} {rtt:>5.1f} ms  ({tipo})")
+        if ip == destino:
+            break
+
+traceroute("203.0.113.10")
+```
+
+```text
+Saída:
+ 1  192.168.0.1      1.2 ms  (time exceeded)
+ 2  100.64.0.1       8.5 ms  (time exceeded)
+ 3  * * *
+ 4  198.51.100.9    19.8 ms  (time exceeded)
+ 5  203.0.113.10    21.4 ms  (echo reply)
+```
+
+Duas armadilhas de leitura: asteriscos no meio do caminho com os saltos seguintes respondendo normalmente não indicam problema, só um roteador que não gera ICMP. E um salto intermediário com RTT alto também pode ser só o roteador tratando ICMP com baixa prioridade. Problema real é quando a latência alta ou a perda **persistem** daquele salto até o destino. O `mtr` combina ping e traceroute continuamente e facilita essa leitura.
+
+## Tempos de uma requisição com curl
+
+```bash
+curl -o /dev/null -s -w "dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n" https://api.exemplo.com/saude
+```
+
+```text
+dns=0.012 tcp=0.052 tls=0.131 ttfb=0.912 total=0.915
+```
+
+Os valores são **acumulados** desde o início, então é preciso subtrair para achar a duração de cada fase:
+
+```python
+saida = "dns=0.012 tcp=0.052 tls=0.131 ttfb=0.912 total=0.915"
+t = {k: float(v) for k, v in (par.split("=") for par in saida.split())}
+
+fases = {
+    "DNS": t["dns"],
+    "handshake TCP": t["tcp"] - t["dns"],
+    "handshake TLS": t["tls"] - t["tcp"],
+    "servidor (ate 1o byte)": t["ttfb"] - t["tls"],
+    "download do corpo": t["total"] - t["ttfb"],
+}
+for nome, seg in fases.items():
+    print(f"{nome:<24}{seg * 1000:>6.0f} ms")
+pior = max(fases, key=fases.get)
+print("gargalo:", pior)
+print("RTT estimado pelo handshake TCP:", round(fases["handshake TCP"] * 1000), "ms")
+```
+
+```text
+Saída:
+DNS                         12 ms
+handshake TCP               40 ms
+handshake TLS               79 ms
+servidor (ate 1o byte)     781 ms
+download do corpo            3 ms
+gargalo: servidor (ate 1o byte)
+RTT estimado pelo handshake TCP: 40 ms
+```
+
+Aqui a rede está saudável: o handshake TCP mostra um RTT de 40 ms e o TLS levou cerca de 2 RTTs, o esperado para TLS 1.2 (com TLS 1.3 seria 1). Os 781 ms são do servidor (banco lento, fila, GC). Essa decomposição evita culpar "a rede" sem evidência, que é exatamente o que o entrevistador quer ver.
+
+## O fio com tcpdump
+
+```bash
+sudo tcpdump -i any -nn 'tcp port 443 and host 203.0.113.10'
+```
+
+```text
+10:00:00.000 IP 10.0.0.5.51000 > 203.0.113.10.443: Flags [S], seq 1000, win 64240
+10:00:01.003 IP 10.0.0.5.51000 > 203.0.113.10.443: Flags [S], seq 1000, win 64240
+10:00:03.007 IP 10.0.0.5.51000 > 203.0.113.10.443: Flags [S], seq 1000, win 64240
+```
+
+Três SYN iguais com intervalos crescentes (1 s, 2 s) e nenhum SYN-ACK: o pacote some no caminho, típico de firewall ou security group descartando. Se viesse `Flags [R.]` logo após o SYN, seria porta fechada. Aprenda a ler as flags: `S` (SYN), `.` (ACK), `P` (push), `F` (FIN), `R` (reset).
+
+<Callout type="tip" title="Ordem de investigação">
+Resolve? (dig) Alcança? (ping, traceroute) A porta abre? (nc) Em quanto tempo cada fase? (curl -w) E se nada disso explicar, olhe os pacotes (tcpdump). Comece sempre perto do cliente que vê o erro, porque o problema pode estar no DNS ou no proxy dele.
+</Callout>
+
+## Trade-offs e limites
+
+- **ICMP filtrado:** muitos ambientes de nuvem bloqueiam ping. Ping falhando não prova que o host caiu; teste a porta TCP real.
+- **Sobrecarga:** `tcpdump` sem filtro em servidor com muito tráfego gera arquivos enormes e consome CPU. Filtre por host e porta e limite com `-c`.
+- **TLS:** o tcpdump mostra só bytes cifrados. Para ver o HTTP, capture antes da cifra (logs do proxy) ou use chaves exportadas pelo cliente.
+
+## Na entrevista
+
+Conte a investigação como um funil, da camada mais baixa à mais alta, citando o comando e o que você espera ver em cada caso. Follow-ups: "ping funciona mas a aplicação dá timeout; e agora?" (porta e firewall com `nc`, depois fases com `curl -w`, depois o servidor) e "só alguns usuários reclamam de lentidão" (DNS ou anycast levando a uma região ruim, um backend específico, MTU em certas redes; compare traceroute e IP resolvido de quem reclama).
+
+<QuizSet>
+<Quiz question="O tcpdump mostra o mesmo SYN reenviado após 1 s e 3 s, sem resposta. O que isso indica?" options={["Porta fechada no servidor", "Pacotes descartados no caminho, como por firewall", "Certificado inválido", "Servidor lento para processar a requisição"]} answer={1} explanation="Porta fechada geraria RST imediato. Silêncio com retransmissões de SYN é descarte, tipicamente por firewall ou rota quebrada." />
+<Quiz question="No curl -w, time_connect é 0,052 e time_namelookup é 0,012. Quanto durou o handshake TCP?" options={["12 ms", "40 ms", "52 ms", "64 ms"]} answer={1} explanation="Os tempos são acumulados: 52 ms menos 12 ms de DNS dá 40 ms, aproximadamente um RTT." />
+<Quiz question="No traceroute, o salto 3 aparece como * * *, mas os saltos 4 e 5 respondem normalmente. Conclusão?" options={["O pacote está sendo perdido no salto 3", "O salto 3 apenas não responde ICMP; o caminho funciona", "O destino está fora do ar", "Há um loop de roteamento"]} answer={1} explanation="Se os saltos seguintes respondem, o tráfego passa pelo salto 3; ele só não gera mensagens de time exceeded." />
+</QuizSet>

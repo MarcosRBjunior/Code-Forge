@@ -1,0 +1,150 @@
+---
+title: Condições de corrida
+kind: lesson
+---
+
+Uma condição de corrida acontece quando o resultado de um programa depende da ordem em que threads intercalam operações sobre um estado compartilhado. Com uma ordem o resultado está certo, com outra está errado, e você não controla qual ordem o escalonador escolhe. É o bug mais comum em código concorrente e também o mais traiçoeiro: passa nos testes, roda bem por semanas e quebra em produção sob carga.
+
+## O padrão ler-modificar-escrever
+
+O exemplo clássico é `contador += 1`. Parece uma operação só, mas a máquina faz três passos: lê o valor, soma um e grava de volta. Se duas threads intercalam esses passos, um incremento some:
+
+```text
+contador = 5
+
+Thread A                 Thread B
+lê 5
+                         lê 5
+soma -> 6
+                         soma -> 6
+grava 6
+                         grava 6
+
+resultado: 6 (deveria ser 7)
+```
+
+Esse é o **lost update**. Em Python, `+=` sobre um atributo vira várias instruções de bytecode, e o interpretador pode trocar de thread entre elas. O GIL não resolve isso: ele protege as estruturas internas do interpretador, não a sua lógica. Em Java, `count++` num `int` comum tem exatamente o mesmo problema; em Go, o `go test -race` acusa esse padrão na hora.
+
+O código abaixo tem a corrida. Ele não é executado aqui porque o resultado varia de rodada para rodada, às vezes certo, às vezes menor que o esperado:
+
+```python
+# Versão com corrida: NÃO use
+contador = 0
+
+def trabalhar():
+    global contador
+    for _ in range(100_000):
+        contador += 1  # ler, somar e gravar podem ser intercalados
+
+# 4 threads rodando trabalhar() podem terminar com menos de 400000
+```
+
+## A correção: seção crítica
+
+A solução é transformar os três passos numa **seção crítica**, um trecho que só uma thread executa por vez. A ferramenta básica é o lock:
+
+```python
+import threading
+
+class Contador:
+    def __init__(self):
+        self.valor = 0
+        self._lock = threading.Lock()
+
+    def incrementar(self):
+        with self._lock:  # ler, somar e gravar acontecem sem interrupção
+            self.valor += 1
+
+def trabalhar(contador, n):
+    for _ in range(n):
+        contador.incrementar()
+
+c = Contador()
+threads = [threading.Thread(target=trabalhar, args=(c, 100_000)) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("esperado:", 4 * 100_000)
+print("obtido:", c.valor)
+```
+
+```text
+Saída:
+esperado: 400000
+obtido: 400000
+```
+
+Repare que o print acontece só depois de todos os `join`. Assim a saída é sempre a mesma, independentemente da ordem em que as threads rodaram.
+
+## O padrão verificar-e-agir
+
+A segunda forma clássica é **check-then-act**: você verifica uma condição e age com base nela, mas outra thread muda o estado entre a verificação e a ação. Exemplos: "se o saldo é suficiente, saque", "se a chave não está no cache, calcule e insira", "se o arquivo não existe, crie". Duas threads verificam ao mesmo tempo, ambas veem "pode" e ambas agem.
+
+A correção é a mesma ideia: a verificação e a ação precisam estar dentro da mesma seção crítica.
+
+```python
+import threading
+
+class Conta:
+    def __init__(self, saldo):
+        self.saldo = saldo
+        self._lock = threading.Lock()
+
+    def sacar(self, valor):
+        with self._lock:
+            if self.saldo >= valor:  # verificar...
+                self.saldo -= valor  # ...e agir, sem ninguém no meio
+                return True
+            return False
+
+conta = Conta(100)
+resultados = []
+resultados_lock = threading.Lock()
+
+def cliente():
+    ok = conta.sacar(30)
+    with resultados_lock:
+        resultados.append(ok)
+
+threads = [threading.Thread(target=cliente) for _ in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("saques aprovados:", resultados.count(True))
+print("saques negados:", resultados.count(False))
+print("saldo final:", conta.saldo)
+```
+
+```text
+Saída:
+saques aprovados: 3
+saques negados: 7
+saldo final: 10
+```
+
+Sem o lock dentro de `sacar`, quatro ou mais saques poderiam ser aprovados e o saldo ficaria negativo.
+
+<Callout type="warning" title="Data race não é o mesmo que race condition">
+Data race é um termo do modelo de memória: dois acessos ao mesmo endereço, pelo menos um de escrita, sem sincronização. Race condition é um erro de lógica por intercalação. Você pode ter uma sem a outra: um check-then-act feito com duas chamadas atômicas separadas não tem data race, mas ainda tem race condition.
+</Callout>
+
+## Armadilhas
+
+- **Testes não provam ausência de corrida.** A janela pode ser de nanossegundos. Use ferramentas como ThreadSanitizer (C++ e Go) e raciocine sobre o código.
+- **Proteger só a escrita não basta.** Se a leitura acontece fora do lock, ela pode ver um estado intermediário.
+- **Objetos compostos.** Atualizar dois campos relacionados (como `inicio` e `fim` de um intervalo) exige que ambos fiquem na mesma seção crítica, ou alguém lê um campo novo com um velho.
+- **Coleções "thread-safe" não tornam a sequência atômica.** Em Java, `if (!map.containsKey(k)) map.put(k, v)` sobre um `ConcurrentHashMap` ainda tem corrida; o certo é `putIfAbsent` ou `computeIfAbsent`.
+
+## Na entrevista
+
+Quando o entrevistador mostrar código com estado compartilhado, procure os dois padrões: ler-modificar-escrever e verificar-e-agir. Nomeie o problema, desenhe a intercalação que quebra (como no diagrama acima) e proponha a seção crítica mínima que resolve. Follow-ups comuns: "o GIL do Python não evita isso?" (não, a troca de thread pode ocorrer entre instruções de bytecode) e "como evitar o lock?" (estado não compartilhado, confinamento por thread, operações atômicas como `AtomicInteger.incrementAndGet` em Java ou `atomic.AddInt64` em Go).
+
+<QuizSet>
+<Quiz question="Duas threads executam saldo -= 10 sem sincronização, partindo de saldo 100. Qual resultado final é possível?" options={["Só 80", "80 ou 90", "Só 90", "Qualquer valor negativo"]} answer={1} explanation="Se as duas leem 100 antes de qualquer gravação, ambas gravam 90 e um débito se perde. Sem intercalação ruim, o resultado é 80." />
+<Quiz question="Um cache faz: se a chave não existe, calcula o valor e insere. Qual o problema em ambiente concorrente?" options={["Nenhum, dicionários são atômicos", "Check-then-act: duas threads podem calcular e inserir o mesmo valor", "Deadlock garantido", "O cache fica sempre vazio"]} answer={1} explanation="A verificação e a inserção são passos separados. Para evitar trabalho duplicado ou sobrescrita, as duas precisam ficar na mesma seção crítica ou usar uma operação atômica do tipo computeIfAbsent." />
+<Quiz question="Por que o GIL do CPython não impede a corrida em contador += 1?" options={["Porque o GIL só existe em Python 2", "Porque a troca de thread pode acontecer entre as instruções de bytecode de ler, somar e gravar", "Porque inteiros são imutáveis", "Porque o GIL só protege listas"]} answer={1} explanation="O GIL garante que uma instrução de bytecode por vez execute, mas o incremento são várias instruções e o interpretador pode trocar de thread entre elas." />
+</QuizSet>

@@ -1,0 +1,148 @@
+---
+title: Thread pools e executores
+kind: lesson
+---
+
+Criar uma thread por tarefa parece natural: chegou requisição, `Thread(target=atender).start()`. Funciona no teste local e quebra em produção. Cada thread custa memória de pilha (frequentemente na casa de megabytes reservados), tempo de criação e destruição no sistema operacional e trocas de contexto. Com mil requisições simultâneas, você tem mil threads disputando poucos núcleos e o sistema passa mais tempo alternando do que trabalhando. Pior: não há limite, então um pico de tráfego derruba o processo.
+
+Um **thread pool** resolve isso mantendo um número fixo (ou limitado) de threads vivas que retiram tarefas de uma fila. Você deixa de pensar em "threads" e passa a pensar em "tarefas submetidas a um executor".
+
+## Como funciona
+
+```text
+ submit(t1), submit(t2), ...
+          │
+          v
+   ┌──────────────────────┐       ┌──────────┐
+   │ fila de tarefas      │ ───>  │ worker 1 │──┐
+   │ [t5][t4][t3]         │ ───>  │ worker 2 │  ├─> resultados / futures
+   └──────────────────────┘ ───>  │ worker 3 │──┘
+                                  └──────────┘
+```
+
+Por baixo é um produtor-consumidor: quem chama `submit` produz, os workers consomem. As threads são reaproveitadas entre tarefas, e o tamanho do pool vira um **limite de concorrência** explícito. A versão mínima cabe em poucas linhas:
+
+```python
+import threading
+import queue
+
+class PoolSimples:
+    def __init__(self, n_workers):
+        self.tarefas = queue.Queue()
+        self.workers = [threading.Thread(target=self._loop) for _ in range(n_workers)]
+        for w in self.workers:
+            w.start()
+
+    def _loop(self):
+        while True:
+            item = self.tarefas.get()
+            if item is None:
+                return
+            func, args, saida, chave = item
+            saida[chave] = func(*args)
+
+    def submeter(self, func, args, saida, chave):
+        self.tarefas.put((func, args, saida, chave))
+
+    def desligar(self):
+        for _ in self.workers:
+            self.tarefas.put(None)
+        for w in self.workers:
+            w.join()
+
+def fatorial(n):
+    r = 1
+    for i in range(2, n + 1):
+        r *= i
+    return r
+
+pool = PoolSimples(3)
+resultados = {}
+for n in range(1, 9):
+    pool.submeter(fatorial, (n,), resultados, n)
+pool.desligar()
+
+for n in sorted(resultados):
+    print(f"{n}! = {resultados[n]}")
+```
+
+```text
+Saída:
+1! = 1
+2! = 2
+3! = 6
+4! = 24
+5! = 120
+6! = 720
+7! = 5040
+8! = 40320
+```
+
+## Na prática: executores
+
+Ninguém escreve o pool à mão em produção. Em Python há `concurrent.futures.ThreadPoolExecutor`; em Java, `ExecutorService` com `Executors.newFixedThreadPool(n)` ou, para controle fino, `ThreadPoolExecutor` com fila limitada e política de rejeição; em Go, o padrão é lançar N goroutines lendo do mesmo canal (goroutines são baratas, mas limitar concorrência ainda importa para proteger recursos externos); em C++ você usa uma biblioteca ou monta o seu com `std::thread` e uma fila.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+
+ativos = 0
+pico = 0
+lock = threading.Lock()
+
+def baixar(id_):
+    global ativos, pico
+    with lock:
+        ativos += 1
+        pico = max(pico, ativos)
+    time.sleep(0.1)  # simula espera de I/O
+    with lock:
+        ativos -= 1
+    return f"arquivo-{id_}"
+
+inicio = time.perf_counter()
+with ThreadPoolExecutor(max_workers=4) as executor:
+    nomes = list(executor.map(baixar, range(8)))  # map preserva a ordem de entrada
+duracao = time.perf_counter() - inicio
+
+print(nomes[:3], "...", nomes[-1])
+print("nunca mais de 4 ao mesmo tempo:", pico <= 4)
+print("8 esperas de 0.1 s em menos de 0.5 s:", duracao < 0.5)
+```
+
+```text
+Saída:
+['arquivo-0', 'arquivo-1', 'arquivo-2'] ... arquivo-7
+nunca mais de 4 ao mesmo tempo: True
+8 esperas de 0.1 s em menos de 0.5 s: True
+```
+
+O bloco `with` chama `shutdown(wait=True)` ao sair: o executor para de aceitar tarefas e espera as pendentes terminarem.
+
+## Dimensionando o pool
+
+- **Tarefas de CPU**: perto do número de núcleos. Mais threads só aumentam troca de contexto. Em CPython, por causa do GIL, use `ProcessPoolExecutor` para CPU pura.
+- **Tarefas de I/O**: mais threads que núcleos, porque elas passam a maior parte do tempo esperando. Uma heurística conhecida é núcleos vezes (1 + tempo de espera / tempo de CPU).
+- **Recurso externo limitado**: o limite real costuma ser o banco ou a API. Um pool de 200 threads contra um banco com 20 conexões só cria fila em outro lugar.
+
+## Armadilhas
+
+- **Fila ilimitada**: `newFixedThreadPool` em Java usa fila sem limite; sob carga, as tarefas se acumulam até a memória acabar. Prefira fila limitada e defina o que fazer quando ela enche (rejeitar, executar na thread chamadora, descartar).
+- **Deadlock de pool**: uma tarefa que submete outra ao mesmo pool e espera o resultado. Se todos os workers fizerem isso, ninguém sobra para executar as subtarefas.
+- **Exceções engolidas**: num executor, a exceção fica guardada no future. Se você nunca chama `result()`, o erro some em silêncio.
+- **Esquecer o shutdown**: threads não daemon do pool impedem o processo de terminar.
+
+<Callout type="warning" title="Pools separados para coisas diferentes">
+Misturar tarefas rápidas com chamadas lentas a um serviço externo no mesmo pool faz as lentas ocuparem todos os workers e travarem as rápidas. Isolar pools por tipo de trabalho (padrão bulkhead) limita o estrago.
+</Callout>
+
+## Na entrevista
+
+Se pedirem para implementar um pool, mostre a fila de tarefas, os workers em laço, o encerramento por sentinela e como devolver resultados (dicionário, callback ou future). Em perguntas de design, cite o tamanho do pool, a fila limitada e a política de rejeição como decisões explícitas. Follow-ups comuns: "quantas threads você usaria para um serviço que chama três APIs externas?" (dimensione pelo tempo de espera e pelos limites das APIs) e "o que acontece quando a fila enche?" (backpressure: rejeitar com erro 503, bloquear o chamador ou rodar na thread dele).
+
+<QuizSet>
+<Quiz question="Qual é o principal benefício de um thread pool em relação a criar uma thread por requisição?" options={["Torna o código assíncrono", "Reaproveita threads e impõe um limite de concorrência, evitando custo de criação e explosão de threads", "Elimina a necessidade de locks", "Garante ordem de execução"]} answer={1} explanation="O pool amortiza o custo de criação e limita quantas tarefas rodam ao mesmo tempo, protegendo memória e CPU." />
+<Quiz question="Um pool de 4 workers executa tarefas que, cada uma, submetem uma subtarefa ao mesmo pool e esperam o resultado. Com 4 tarefas ao mesmo tempo, o que pode ocorrer?" options={["Nada, o pool cresce sozinho", "Deadlock: todos os workers esperam subtarefas que não têm worker livre", "As subtarefas rodam na thread chamadora automaticamente", "Starvation apenas da primeira tarefa"]} answer={1} explanation="Todos os workers ficam bloqueados esperando, e as subtarefas ficam na fila sem ninguém para executá-las." />
+<Quiz question="Para tarefas majoritariamente de espera de rede, como dimensionar o pool?" options={["Exatamente 1 thread", "Igual ao número de núcleos", "Mais threads que núcleos, proporcional à razão entre espera e CPU, respeitando os limites do serviço externo", "Ilimitado"]} answer={2} explanation="Threads esperando I/O não usam CPU, então cabem mais que núcleos; o teto vem do recurso externo e da memória." />
+</QuizSet>

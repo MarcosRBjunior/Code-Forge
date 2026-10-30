@@ -1,0 +1,132 @@
+---
+title: TLB
+kind: lesson
+---
+
+Com tabelas de páginas de quatro níveis, cada leitura de memória precisaria de outras quatro só para descobrir o endereço físico. O programa ficaria várias vezes mais lento. O que salva o desempenho é a **TLB** (Translation Lookaside Buffer): um cache pequeno e muito rápido, dentro da MMU, que guarda traduções recentes de página virtual para quadro físico. Quando a tradução está lá (um **hit**), ela sai em cerca de um ciclo. Quando não está (um **miss**), o hardware percorre as tabelas (**page walk**) e guarda o resultado.
+
+## Por que funciona
+
+A TLB tem poucas entradas: algo como 64 no primeiro nível e de 1.000 a 2.000 no segundo. Mesmo assim, as taxas de acerto passam de 99% em programas comuns, graças à **localidade**:
+
+- **Temporal:** a página que você acabou de usar provavelmente será usada de novo (variáveis do laço, pilha).
+- **Espacial:** os próximos acessos tendem a cair na mesma página (percorrer um array, executar instruções seguidas).
+
+Uma entrada cobre 4 KB inteiros. Percorrer sequencialmente um array de 4 KB custa um miss e milhares de hits.
+
+```text
+ endereço virtual
+       │
+       ▼
+   ┌────────┐  hit (~1 ciclo)
+   │  TLB   │ ─────────────────────────► endereço físico
+   └────────┘
+       │ miss
+       ▼
+  page walk: PML4 → PDPT → PD → PT   (até 4 acessos à memória)
+       │
+       ├─ guarda na TLB (expulsando outra entrada)
+       ▼
+  endereço físico
+```
+
+## Simulando uma TLB
+
+A simulação usa uma TLB de 4 entradas com substituição LRU e compara dois padrões de acesso a uma matriz de 64 × 1024 inteiros de 4 bytes (cada linha ocupa exatamente uma página): percorrer por linhas e percorrer por colunas.
+
+```python
+from collections import OrderedDict
+
+class TLB:
+    def __init__(self, entradas):
+        self.cache = OrderedDict()
+        self.entradas = entradas
+        self.hits = self.misses = 0
+
+    def acessar(self, endereco):
+        vpn = endereco // 4096
+        if vpn in self.cache:
+            self.cache.move_to_end(vpn)
+            self.hits += 1
+        else:
+            self.misses += 1
+            if len(self.cache) >= self.entradas:
+                self.cache.popitem(last=False)
+            self.cache[vpn] = True
+
+LINHAS, COLUNAS, TAM = 64, 1024, 4
+for nome in ["por linhas", "por colunas"]:
+    tlb = TLB(entradas=4)
+    if nome == "por linhas":
+        ordem = ((i, j) for i in range(LINHAS) for j in range(COLUNAS))
+    else:
+        ordem = ((i, j) for j in range(COLUNAS) for i in range(LINHAS))
+    for i, j in ordem:
+        tlb.acessar((i * COLUNAS + j) * TAM)
+    total = tlb.hits + tlb.misses
+    print(f"{nome:<12} acessos={total} misses={tlb.misses:>5} taxa_de_acerto={tlb.hits / total:.2%}")
+```
+
+```text
+Saída:
+por linhas   acessos=65536 misses=   64 taxa_de_acerto=99.90%
+por colunas  acessos=65536 misses=65536 taxa_de_acerto=0.00%
+```
+
+Mesmo número de acessos, mesmo resultado, desempenho completamente diferente. Por colunas, cada acesso cai numa página diferente e a TLB minúscula nunca acerta. Esse é um dos motivos (junto com o cache de dados) para percorrer matrizes na ordem em que estão na memória.
+
+## Tempo efetivo de acesso
+
+O tempo médio de acesso à memória com TLB é uma média ponderada pela taxa de acerto. Supondo 1 ns para consultar a TLB, 100 ns por acesso à memória e page walk de 4 níveis:
+
+```python
+TLB_NS, MEM_NS, NIVEIS = 1, 100, 4
+
+print("taxa_acerto  tempo_efetivo   vs_sem_paginacao")
+for acerto in [0.80, 0.95, 0.99, 0.999]:
+    hit = TLB_NS + MEM_NS
+    miss = TLB_NS + NIVEIS * MEM_NS + MEM_NS
+    efetivo = acerto * hit + (1 - acerto) * miss
+    print(f"{acerto:>11.1%}  {efetivo:>10.1f} ns   {efetivo / MEM_NS:>8.2f}x")
+```
+
+```text
+Saída:
+taxa_acerto  tempo_efetivo   vs_sem_paginacao
+      80.0%       181.0 ns       1.81x
+      95.0%       121.0 ns       1.21x
+      99.0%       105.0 ns       1.05x
+      99.9%       101.4 ns       1.01x
+```
+
+Com 99% de acerto, a paginação custa só uns 5% a mais que acesso direto. Com 80%, o mesmo programa fica quase duas vezes mais lento. Na prática, caches de dados guardam parte das próprias tabelas de páginas, então o miss real costuma ser menor que o pior caso.
+
+## TLB e troca de contexto
+
+As entradas da TLB valem para um espaço de endereçamento. Ao trocar de processo, há duas opções:
+
+| Abordagem | Como funciona | Custo |
+| --- | --- | --- |
+| Esvaziar a TLB (flush) | Descarta tudo a cada troca | Processo que entra começa com TLB fria |
+| Etiquetas ASID/PCID | Cada entrada leva o id do espaço de endereçamento | Entradas de vários processos convivem |
+
+Quando o kernel muda uma entrada da tabela de páginas (por exemplo, ao liberar memória), precisa invalidar a TLB de todos os núcleos que podem ter aquela tradução. Isso é o **TLB shootdown**: uma interrupção entre processadores que custa microssegundos e aparece em workloads que fazem muito `munmap` ou `mprotect`.
+
+<Callout type="tip" title="Huge pages aumentam o alcance da TLB">
+Com 1.536 entradas de 4 KB, a TLB cobre cerca de 6 MB de memória. Com páginas de 2 MB, as mesmas entradas cobrem 3 GB. Para um banco de dados com buffer pool de dezenas de gigabytes, essa diferença reduz drasticamente os page walks.
+</Callout>
+
+```bash
+perf stat -e dTLB-loads,dTLB-load-misses ./programa
+grep -i huge /proc/meminfo
+```
+
+## Na entrevista
+
+Explique a TLB como cache de traduções, justifique por que funciona (localidade) e saiba calcular o tempo efetivo de acesso. Mostre consciência dos custos em troca de contexto (flush versus ASID) e de shootdowns. Follow-ups comuns: "por que percorrer uma matriz por colunas é lento?" (cada acesso cai em outra página e outra linha de cache) e "como huge pages ajudam?" (cada entrada cobre muito mais memória, reduzindo misses).
+
+<QuizSet>
+<Quiz question="Com 98% de acerto na TLB, 1 ns de consulta, 100 ns por acesso à memória e page walk de 4 níveis, qual o tempo efetivo aproximado?" options={["101 ns", "109 ns", "501 ns", "150 ns"]} answer={1} explanation="0,98 vezes 101 mais 0,02 vezes 501 dá cerca de 99 mais 10, ou seja, aproximadamente 109 ns." />
+<Quiz question="Por que identificadores como ASID ou PCID melhoram o desempenho em trocas de contexto?" options={["Eliminam a necessidade de tabelas de páginas", "Permitem manter na TLB entradas de vários processos, evitando esvaziá-la a cada troca", "Aumentam o tamanho das páginas", "Desativam a TLB durante a troca"]} answer={1} explanation="Com a etiqueta, a CPU só usa entradas do processo atual, e as dos outros continuam válidas para quando voltarem." />
+<Quiz question="Um banco de dados com 64 GB de buffer pool tem muitos misses de TLB. Qual ajuste costuma ajudar?" options={["Reduzir a RAM", "Usar huge pages para o buffer pool", "Aumentar o quantum do escalonador", "Desligar o swap"]} answer={1} explanation="Páginas de 2 MB ou 1 GB fazem cada entrada da TLB cobrir muito mais memória, diminuindo os page walks." />
+</QuizSet>

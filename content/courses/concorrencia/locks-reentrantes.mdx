@@ -1,0 +1,141 @@
+---
+title: Locks reentrantes
+kind: lesson
+---
+
+Imagine uma classe em que todo método público adquire o mesmo lock. Funciona até o dia em que um método público chama outro: a thread já está com o lock, tenta adquiri-lo de novo e fica esperando por ela mesma. É um **auto-deadlock**, e com um lock comum ele é garantido. O **lock reentrante** resolve isso: a mesma thread pode adquiri-lo várias vezes, e ele só fica livre quando ela libera o mesmo número de vezes.
+
+## Como funciona
+
+Um lock reentrante guarda dois dados além do estado: **quem é o dono** e um **contador de aquisições**.
+
+```text
+operação                    dono    contador
+inicial                     -       0
+T1 adquire                  T1      1
+T1 adquire de novo          T1      2   (não bloqueia: já é o dono)
+T2 tenta adquirir           T1      2   (T2 bloqueia)
+T1 libera                   T1      1
+T1 libera                   -       0   (agora T2 pode entrar)
+```
+
+Em Python, a versão reentrante é `threading.RLock`. Em Java, tanto `synchronized` quanto `ReentrantLock` são reentrantes por padrão, por isso um método `synchronized` pode chamar outro do mesmo objeto sem problema. Em Go, `sync.Mutex` **não** é reentrante, e isso é uma decisão de projeto deliberada. Em C++, existe `std::recursive_mutex` ao lado do `std::mutex` comum.
+
+## O auto-deadlock, sem travar o programa
+
+O programa abaixo mostra a diferença usando `acquire(timeout=...)` para que a segunda tentativa desista em vez de travar para sempre:
+
+```python
+import threading
+
+comum = threading.Lock()
+comum.acquire()
+print("Lock: segunda aquisicao pela mesma thread ->", comum.acquire(timeout=0.2))
+comum.release()
+
+reentrante = threading.RLock()
+reentrante.acquire()
+print("RLock: segunda aquisicao pela mesma thread ->", reentrante.acquire(timeout=0.2))
+reentrante.release()
+reentrante.release()
+
+# Só o dono pode liberar um RLock
+reentrante.acquire()
+erros = []
+
+def liberar_de_outra_thread():
+    try:
+        reentrante.release()
+    except RuntimeError as e:
+        erros.append(type(e).__name__)
+
+t = threading.Thread(target=liberar_de_outra_thread)
+t.start()
+t.join()
+reentrante.release()
+print("liberar RLock de outra thread ->", erros[0])
+```
+
+```text
+Saída:
+Lock: segunda aquisicao pela mesma thread -> False
+RLock: segunda aquisicao pela mesma thread -> True
+liberar RLock de outra thread -> RuntimeError
+```
+
+Sem o `timeout`, a segunda linha nunca terminaria com o `Lock` comum. Repare também que o `RLock` tem dono: outra thread não pode liberá-lo. Um `Lock` comum, curiosamente, pode ser liberado por qualquer thread em Python.
+
+## O caso típico: métodos que se chamam
+
+```python
+import threading
+
+class Carrinho:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._itens = []
+
+    def adicionar(self, nome, preco):
+        with self._lock:
+            self._itens.append((nome, preco))
+
+    def total(self):
+        with self._lock:
+            return sum(preco for _, preco in self._itens)
+
+    def adicionar_varios(self, itens):
+        with self._lock:  # mantém a operação composta atômica
+            for nome, preco in itens:
+                self.adicionar(nome, preco)  # readquire o mesmo lock
+            return self.total()              # e de novo
+
+carrinho = Carrinho()
+
+def comprar(base):
+    carrinho.adicionar_varios([(f"item{base + i}", 10) for i in range(3)])
+
+threads = [threading.Thread(target=comprar, args=(k * 3,)) for k in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("itens:", len(carrinho._itens))
+print("total:", carrinho.total())
+```
+
+```text
+Saída:
+itens: 12
+total: 120
+```
+
+`adicionar_varios` precisa segurar o lock durante a operação inteira para que ninguém veja o carrinho pela metade, e ao mesmo tempo quer reaproveitar `adicionar` e `total`. Com `Lock` comum, travaria na primeira chamada interna.
+
+## Trade-offs e armadilhas
+
+<Callout type="note" title="Reentrância pode esconder problemas de design">
+A equipe do Go deixou o mutex não reentrante de propósito: se você precisa readquirir um lock, o código provavelmente não sabe quais invariantes valem em cada ponto. A alternativa comum é separar métodos públicos, que adquirem o lock, de métodos privados, que assumem que o lock já está seguro (convenção como `_adicionar_sem_lock`).
+</Callout>
+
+- **Custo:** um lock reentrante precisa registrar o dono e o contador, então é um pouco mais caro que um mutex simples.
+- **Liberações desbalanceadas:** cada `acquire` precisa de um `release`. Se você liberar uma vez a menos, o lock fica preso. Use `with` sempre.
+- **Variáveis de condição:** esperar numa condição associada a um lock reentrante adquirido várias vezes libera todos os níveis e os restaura ao acordar. Funciona em Python e Java, mas confunde quem lê o código.
+- **Chamadas para fora:** reentrância incentiva chamar callbacks com o lock seguro. Se o callback chamar de volta o objeto, você entra de novo no meio de uma operação e pode ver invariantes quebradas.
+
+| Linguagem | Não reentrante | Reentrante |
+| --- | --- | --- |
+| Python | `threading.Lock` | `threading.RLock` |
+| Java | `StampedLock` | `synchronized`, `ReentrantLock` |
+| Go | `sync.Mutex` | não existe por padrão |
+| C++ | `std::mutex` | `std::recursive_mutex` |
+
+## Na entrevista
+
+Se você desenhar uma classe thread-safe em que métodos públicos chamam uns aos outros, cite o risco de auto-deadlock e escolha conscientemente: use um lock reentrante ou separe a versão interna sem lock. Saber que `synchronized` é reentrante e que o `sync.Mutex` do Go não é costuma impressionar. Follow-ups comuns: "como implementar um lock reentrante a partir de um mutex comum?" (guarde o id do dono e um contador, protegidos por um mutex interno e uma variável de condição) e "por que o Go não tem um?" (para forçar um desenho em que cada função sabe se o lock já está seguro).
+
+<QuizSet>
+<Quiz question="Uma thread adquire um RLock três vezes e o libera duas vezes. Qual é o estado do lock?" options={["Livre", "Ainda com a mesma thread como dona, contador 1", "Corrompido", "Liberado para qualquer thread por timeout"]} answer={1} explanation="O lock reentrante só fica livre quando o contador chega a zero, ou seja, depois de tantas liberações quanto aquisições." />
+<Quiz question="Em Java, um método synchronized chama outro método synchronized do mesmo objeto. O que acontece?" options={["Deadlock", "Exceção IllegalMonitorStateException", "Funciona, porque o monitor de synchronized é reentrante", "O segundo método roda sem lock"]} answer={2} explanation="Os monitores do Java são reentrantes: a thread que já é dona do monitor pode entrar de novo, incrementando um contador interno." />
+<Quiz question="Qual alternativa à reentrância é comum em Go?" options={["Usar sync.RWMutex", "Separar métodos públicos que adquirem o lock de métodos internos que assumem o lock já seguro", "Usar canais para tudo", "Chamar Unlock antes de chamar o outro método"]} answer={1} explanation="Como sync.Mutex não é reentrante, o padrão é ter funções internas que documentam que o chamador já segura o lock." />
+</QuizSet>

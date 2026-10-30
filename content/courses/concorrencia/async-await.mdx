@@ -1,0 +1,131 @@
+---
+title: async/await e event loop
+kind: lesson
+---
+
+Um servidor que atende 10 mil conexões passa quase todo o tempo esperando: rede, banco, disco. Criar uma thread por conexão custa memória (cada pilha ocupa de centenas de KB a alguns MB) e trocas de contexto no kernel. A alternativa é a **concorrência cooperativa**: uma única thread roda um **event loop** que alterna entre muitas tarefas leves, e cada tarefa devolve o controle sempre que vai esperar por I/O.
+
+## Como funciona
+
+Uma função declarada com `async def` é uma **corrotina**: chamá-la não executa nada, só cria um objeto que pode ser pausado e retomado. Dentro dela, `await` marca os pontos de pausa. Quando a corrotina chega a um `await` de algo que ainda não está pronto, ela devolve o controle ao loop, que escolhe outra tarefa pronta para rodar.
+
+```text
+ event loop (1 thread)
+ ┌──────────────────────────────────────────────┐
+ │ prontas: [A, B]   esperando I/O: [C (socket)] │
+ └──────────────────────────────────────────────┘
+   roda A até o próximo await ─► A vai esperar
+   roda B até o próximo await ─► B vai esperar
+   socket de C ficou pronto   ─► C volta para prontas
+```
+
+O loop usa o mecanismo do sistema operacional (epoll, kqueue, IOCP) para saber quais operações de I/O terminaram. Como só uma tarefa roda por vez e a troca só acontece em `await`, o código entre dois `await` é atômico em relação às outras tarefas. Isso elimina boa parte das condições de corrida, mas não todas: qualquer leitura e escrita separadas por um `await` ainda podem se intercalar com outra tarefa.
+
+O mesmo modelo aparece em JavaScript (`Promise` e `async/await` no event loop do Node), em C# (`Task`), em Rust (`Future` com runtimes como Tokio) e em Kotlin (corrotinas). Go segue outro caminho: goroutines parecem código bloqueante, mas o runtime as multiplexa sobre poucas threads do SO. Java 21 tem **virtual threads** com a mesma ideia.
+
+## Exemplo: esperas sobrepostas
+
+Três "requisições" de 0,2 s cada. Executadas em sequência levariam 0,6 s; com `asyncio.gather`, as esperas se sobrepõem. O programa imprime comparações booleanas em vez de tempos, para a saída ser estável.
+
+```python
+import asyncio
+import time
+
+async def buscar(nome, atraso):
+    await asyncio.sleep(atraso)      # simula I/O e devolve o controle ao loop
+    return f"{nome}: ok"
+
+async def main():
+    inicio = time.perf_counter()
+    respostas = await asyncio.gather(
+        buscar("usuarios", 0.2),
+        buscar("pedidos", 0.2),
+        buscar("estoque", 0.2),
+    )
+    total = time.perf_counter() - inicio
+    for r in respostas:              # gather preserva a ordem dos argumentos
+        print(r)
+    print("levou menos de 0,4 s:", total < 0.4)
+
+asyncio.run(main())
+```
+
+```text
+Saída:
+usuarios: ok
+pedidos: ok
+estoque: ok
+levou menos de 0,4 s: True
+```
+
+## Limitar concorrência e não bloquear o loop
+
+Disparar mil tarefas de uma vez pode derrubar o serviço do outro lado. Um `asyncio.Semaphore` limita quantas rodam simultaneamente. E qualquer chamada **bloqueante** (como `time.sleep`, uma biblioteca de banco síncrona ou um cálculo pesado) trava o loop inteiro, porque não há `await` para ceder o controle. Para esses casos, use `asyncio.to_thread`, que roda a função num pool de threads.
+
+```python
+import asyncio
+import time
+
+limite = asyncio.Semaphore(2)
+ativas = 0
+pico = 0
+
+async def baixar(i):
+    global ativas, pico
+    async with limite:               # no máximo 2 dentro deste bloco
+        ativas += 1
+        pico = max(pico, ativas)
+        await asyncio.sleep(0.05)
+        ativas -= 1
+        return i * 10
+
+def calculo_bloqueante(n):
+    time.sleep(0.05)                 # bloquearia o loop se chamado direto
+    return sum(range(n))
+
+async def main():
+    resultados = await asyncio.gather(*(baixar(i) for i in range(6)))
+    print("resultados:", resultados)
+    print("pico de concorrencia:", pico)
+    soma = await asyncio.to_thread(calculo_bloqueante, 101)
+    print("soma em outra thread:", soma)
+
+asyncio.run(main())
+```
+
+```text
+Saída:
+resultados: [0, 10, 20, 30, 40, 50]
+pico de concorrencia: 2
+soma em outra thread: 5050
+```
+
+Repare que `ativas += 1` não precisa de lock: entre a leitura e a escrita não há `await`, então nenhuma outra tarefa roda no meio.
+
+## Armadilhas e trade-offs
+
+- **Esquecer o `await`**: `buscar("x", 1)` sem `await` só cria a corrotina; nada acontece e o Python avisa que ela nunca foi aguardada.
+- **Bloquear o loop**: um `requests.get` ou `time.sleep` dentro de `async def` congela todas as tarefas.
+- **Contaminação**: quem chama uma função assíncrona também precisa ser assíncrono ("colored functions").
+- **CPU**: async não acelera cálculo. Ele brilha com muito I/O e pouca CPU; para CPU, use processos.
+- **Tarefas soltas**: `create_task` sem guardar a referência pode deixar exceções sem tratamento. Prefira `gather` ou `asyncio.TaskGroup`.
+
+| Modelo | Troca de contexto | Custo por unidade | Bom para |
+| --- | --- | --- | --- |
+| Threads do SO | Preemptiva, kernel | Alto | Código bloqueante, CPU em linguagens sem GIL |
+| async/await | Cooperativa, em `await` | Muito baixo | Milhares de conexões de I/O |
+| Goroutines/virtual threads | Runtime | Baixo | I/O com código no estilo bloqueante |
+
+<Callout type="warning" title="Async não é paralelismo">
+Com um único event loop, só uma corrotina executa por vez. Você ganha sobreposição de esperas, não uso de vários núcleos.
+</Callout>
+
+## Na entrevista
+
+Quando o cenário é "muitas chamadas de rede" (crawler, agregador de APIs, chat), mencione async/await como alternativa a um pool grande de threads, explique que a troca acontece só em `await` e diga como limitar concorrência (semáforo) e tratar código bloqueante (`to_thread` ou um executor). Follow-ups comuns: "o que acontece se uma tarefa fizer um cálculo de 2 segundos?" (todas as outras param) e "async precisa de lock?" (em geral não para trechos sem `await`, mas sim para invariantes que atravessam um `await`; use `asyncio.Lock`).
+
+<QuizSet>
+<Quiz question="Dentro de um handler async, você chama time.sleep(2). O que acontece com as outras requisições servidas pelo mesmo event loop?" options={["Continuam normalmente, o loop troca de tarefa", "Ficam todas paradas por 2 segundos, porque o loop está bloqueado", "São movidas para outra thread automaticamente", "Recebem erro de timeout imediatamente"]} answer={1} explanation="time.sleep bloqueia a thread do loop e não há await para ceder o controle. Use await asyncio.sleep ou to_thread." />
+<Quiz question="Para qual carga async/await traz mais ganho?" options={["Multiplicar matrizes grandes", "Comprimir arquivos em paralelo", "Fazer milhares de requisições HTTP concorrentes", "Ordenar uma lista de 10 milhões de números"]} answer={2} explanation="Async sobrepõe esperas de I/O com uma thread. Cargas de CPU não se beneficiam e precisam de paralelismo real." />
+<Quiz question="Em asyncio, por que 'contador += 1' entre dois awaits não sofre condição de corrida com outras tarefas do mesmo loop?" options={["Porque o GIL protege qualquer operação", "Porque a troca de tarefas só ocorre em pontos de await", "Porque inteiros são imutáveis", "Porque asyncio usa locks automaticamente"]} answer={1} explanation="O agendamento é cooperativo: sem await no meio, nenhuma outra corrotina executa entre a leitura e a escrita." />
+</QuizSet>

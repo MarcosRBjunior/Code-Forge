@@ -1,0 +1,110 @@
+---
+title: Ranqueamento
+kind: lesson
+---
+
+A recuperação entrega algumas centenas de candidatos plausíveis, escolhidos por um modelo barato que olha usuário e item separadamente. O **ranqueador** decide a ordem final. Como pontua poucos itens, pode ser bem mais caro: usa features cruzadas entre usuário e item, contexto da requisição e sinais em tempo real. É aqui que pequenas melhorias de qualidade viram ganho de negócio, porque o usuário olha quase só para o topo da lista.
+
+## O que o ranqueador prevê
+
+O ranqueador estima, para cada par usuário-item, uma ou mais probabilidades: clicar, assistir até o fim, comprar, compartilhar, denunciar. A ordem final vem de uma combinação dessas previsões, por exemplo:
+
+```text
+pontuação = 1,0 × P(clique) + 3,0 × P(assistir 50%) + 8,0 × P(compartilhar) − 20,0 × P(denúncia)
+```
+
+Os pesos são decisão de produto, ajustados com testes A/B. Modelar objetivos separados (em vez de um rótulo único) deixa você mudar a mistura sem retreinar e evita otimizar só o clique, que favorece títulos sensacionalistas.
+
+## Três formas de treinar
+
+| Abordagem | Unidade de treino | Perda típica | Quando usar |
+| --- | --- | --- | --- |
+| Pointwise | Um par usuário-item com rótulo | Log loss | Quando a probabilidade calibrada importa (anúncios) |
+| Pairwise | Dois itens da mesma lista, um melhor que o outro | Perda sobre a diferença de pontuações | Quando só a ordem importa (busca) |
+| Listwise | A lista inteira | Aproximações de NDCG | Quando há bons rótulos de relevância graduada |
+
+Na prática, a maioria dos sistemas de recomendação começa pointwise, com gradient boosting ou uma regressão logística, e evolui para redes profundas multitarefa, que aprendem interações entre features e compartilham representação entre objetivos.
+
+## Exemplo: regressão logística como ranqueador
+
+O programa gera interações hipotéticas com três features (afinidade do usuário com a categoria, popularidade do item e idade do item em dias), treina uma regressão logística com gradiente descendente e usa o modelo para ordenar os candidatos de um usuário.
+
+```python
+import math
+import random
+
+random.seed(11)
+
+def gerar(n):
+    dados = []
+    for _ in range(n):
+        afinidade = random.random()
+        popularidade = random.random()
+        idade = random.randint(0, 30)
+        z = -2.0 + 3.0 * afinidade + 1.0 * popularidade - 0.08 * idade
+        y = 1 if random.random() < 1 / (1 + math.exp(-z)) else 0
+        dados.append(([afinidade, popularidade, idade / 30], y))
+    return dados
+
+treino = gerar(3000)
+w, b, taxa = [0.0, 0.0, 0.0], 0.0, 0.5
+
+def prever(x):
+    z = b + sum(wi * xi for wi, xi in zip(w, x))
+    return 1 / (1 + math.exp(-z))
+
+for epoca in range(200):
+    gw, gb = [0.0, 0.0, 0.0], 0.0
+    for x, y in treino:
+        erro = prever(x) - y
+        for i in range(3):
+            gw[i] += erro * x[i]
+        gb += erro
+    w = [wi - taxa * g / len(treino) for wi, g in zip(w, gw)]
+    b -= taxa * gb / len(treino)
+
+perda = -sum(y * math.log(prever(x)) + (1 - y) * math.log(1 - prever(x)) for x, y in treino) / len(treino)
+print("pesos:", [round(v, 2) for v in w], "vies:", round(b, 2), "log loss:", round(perda, 3))
+
+candidatos = {
+    "video_a": [0.9, 0.2, 25 / 30],
+    "video_b": [0.4, 0.9, 1 / 30],
+    "video_c": [0.8, 0.6, 2 / 30],
+    "video_d": [0.1, 0.95, 0.0],
+}
+ordem = sorted(candidatos, key=lambda k: prever(candidatos[k]), reverse=True)
+for item in ordem:
+    print(f"{item}: P(clique) = {prever(candidatos[item]):.3f}")
+```
+
+```text
+Saída:
+pesos: [1.94, 0.53, -1.95] vies: -1.33 log loss: 0.491
+video_c: P(clique) = 0.599
+video_b: P(clique) = 0.463
+video_d: P(clique) = 0.345
+video_a: P(clique) = 0.247
+```
+
+Com 200 épocas os pesos ainda não chegaram aos valores usados na simulação, mas os sinais estão certos: afinidade e popularidade ajudam, idade atrapalha. O topo fica com o `video_c`, recente e com boa afinidade; o `video_d`, muito popular mas fora do gosto do usuário, cai para o terceiro lugar, e o `video_a` termina por último porque, apesar da afinidade alta, tem quase um mês. Em produção, o mesmo cálculo roda para centenas de candidatos por requisição, por isso o custo por item importa.
+
+## Problemas específicos de ranqueamento
+
+- **Viés de posição**: itens no topo recebem mais cliques só por estarem no topo. Se você treina com esses cliques, o modelo aprende a repetir a ordem antiga. Soluções: incluir a posição como feature no treino e fixá-la em um valor padrão no servimento, ou estimar a propensão de clique por posição e reponderar.
+- **Calibração**: se as pontuações entram em fórmulas com pesos ou preços, elas precisam ser probabilidades confiáveis. Verifique a curva de calibração e recalibre se necessário.
+- **Diversidade e regras de negócio**: depois do modelo, uma etapa de reordenação evita dez vídeos do mesmo canal seguidos, aplica filtros de conteúdo e garante espaço para itens novos.
+- **Latência**: features cruzadas são caras. Pré-calcule o que der, busque features em lote e limite o número de candidatos.
+
+<Callout type="note" title="Ranqueador leve e ranqueador pesado">
+Muitos sistemas têm três estágios: recuperação, um pré-ranqueador leve que corta milhares para centenas, e o ranqueador pesado. Cada estágio troca qualidade por custo de forma diferente.
+</Callout>
+
+## Na entrevista
+
+Descreva o rótulo (ou os rótulos), o tipo de perda, as features cruzadas e como as previsões viram uma única ordem. Mencione viés de posição e a etapa de reordenação. Follow-ups comuns: "por que não usar só cliques como rótulo?", "como combinar vários objetivos?", "como lidar com viés de posição nos dados de treino?" e "o que você faz se o ranqueador estourar a latência?" (menos candidatos, modelo destilado, cache de pontuações).
+
+<QuizSet>
+<Quiz question="Os dados de treino vêm de cliques numa lista ordenada pelo modelo antigo. Qual viés você precisa tratar?" options={["Viés de seleção por idade", "Viés de posição", "Viés de sobrevivência", "Nenhum"]} answer={1} explanation="Itens no topo recebem mais cliques independentemente da relevância; sem correção, o modelo novo imita o antigo." />
+<Quiz question="Num ranqueador de anúncios, a pontuação é multiplicada pelo lance. Qual abordagem de treino é mais adequada?" options={["Pairwise, porque só a ordem importa", "Pointwise com log loss e verificação de calibração", "Listwise com NDCG", "Clustering"]} answer={1} explanation="Como a probabilidade entra numa conta de valor esperado, ela precisa estar calibrada, o que a perda pointwise favorece." />
+<Quiz question="Por que prever vários objetivos (clique, tempo assistido, denúncia) em vez de um rótulo único?" options={["Porque é mais rápido de treinar", "Para combinar os objetivos com pesos ajustáveis e evitar otimizar só o clique", "Porque cada objetivo exige um banco de dados", "Para eliminar a necessidade de testes A/B"]} answer={1} explanation="Objetivos separados permitem ajustar a mistura por produto e reduzir efeitos colaterais como o caça-clique." />
+</QuizSet>

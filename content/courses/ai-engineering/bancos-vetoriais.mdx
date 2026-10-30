@@ -1,0 +1,152 @@
+---
+title: Bancos vetoriais e HNSW
+kind: lesson
+---
+
+Com mil documentos, comparar a pergunta contra todos os vetores leva microssegundos. Com cem milhões de trechos de mil dimensões, a busca exata vira centenas de bilhões de multiplicações por consulta, e a latência sai do aceitável. **Bancos vetoriais** existem para responder "quais são os k vetores mais próximos?" rápido em escala, usando índices de vizinho mais próximo **aproximado** (ANN): você troca um pouco de precisão por ordens de grandeza de velocidade.
+
+## Busca exata: a linha de base
+
+A busca exata (força bruta, ou kNN plano) calcula a similaridade contra todos os vetores e mantém os k melhores num heap. É simples, 100% correta e, até algumas dezenas ou centenas de milhares de vetores, frequentemente boa o bastante, sobretudo com filtros que reduzem o conjunto. Ela também é a referência para medir o **recall** de qualquer índice aproximado.
+
+```python
+import heapq, math, random
+
+rng = random.Random(7)
+DIM, N = 8, 2000
+
+def normalizar(v):
+    n = math.sqrt(sum(x * x for x in v))
+    return [x / n for x in v]
+
+base = [normalizar([rng.gauss(0, 1) for _ in range(DIM)]) for _ in range(N)]
+consulta = normalizar([rng.gauss(0, 1) for _ in range(DIM)])
+
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+def busca_exata(q, k):
+    return heapq.nlargest(k, range(len(base)), key=lambda i: dot(q, base[i]))
+
+top = busca_exata(consulta, 5)
+print("top-5 ids:", top)
+print("scores:", [round(dot(consulta, base[i]), 3) for i in top])
+print("comparacoes:", N)
+```
+
+```text
+Saída:
+top-5 ids: [8, 995, 1092, 849, 1078]
+scores: [0.9, 0.883, 0.878, 0.851, 0.847]
+comparacoes: 2000
+```
+
+## Famílias de índices aproximados
+
+| Índice | Ideia | Pontos fortes | Pontos fracos |
+| --- | --- | --- | --- |
+| IVF | Agrupa vetores (k-means) e só visita os grupos mais próximos | Simples, pouca memória extra | Recall cai se a consulta fica na borda dos grupos |
+| HNSW | Grafo de vizinhança em camadas, busca gulosa | Ótimo recall e latência, inserção incremental | Usa bastante memória, construção cara |
+| Quantização (PQ, escalar, binária) | Comprime cada vetor em poucos bytes | Cabe muito mais em RAM | Perde precisão; costuma exigir re-ranking com vetor completo |
+| Em disco (estilo DiskANN) | Grafo otimizado para SSD | Bilhões de vetores com pouca RAM | Mais complexo, latência um pouco maior |
+
+## Como o HNSW funciona
+
+O **HNSW** (Hierarchical Navigable Small World) liga cada vetor aos seus vizinhos mais próximos, formando um grafo em que dá para "caminhar" na direção da consulta. Para não começar a caminhada longe demais, ele mantém várias camadas: as de cima têm poucos nós e arestas longas (como rodovias), as de baixo têm todos os nós e arestas curtas (como ruas).
+
+```text
+camada 2:  A ─────────────────────── F            poucos nós, saltos longos
+camada 1:  A ───── C ────────── E ── F
+camada 0:  A ─ B ─ C ─ D ─ E ─ F ─ G ─ H          todos os nós, vizinhos próximos
+busca: entra no topo, desce quando não consegue melhorar, refina embaixo
+```
+
+Na busca, a partir de um ponto de entrada, você vai para o vizinho mais próximo da consulta enquanto houver melhora; ao travar, desce uma camada. Na camada 0, mantém uma lista de candidatos de tamanho `ef` para não parar num mínimo local. Os parâmetros principais: `M` (vizinhos por nó, afeta memória e recall), `ef_construction` (qualidade do grafo) e `ef_search` (recall versus latência na consulta).
+
+O programa abaixo implementa só a camada 0 (um grafo navegável simples) com busca gulosa e lista de candidatos, e mede recall contra a busca exata.
+
+```python
+import heapq, math, random
+
+rng = random.Random(7)
+DIM, N, M = 8, 800, 8
+
+def normalizar(v):
+    n = math.sqrt(sum(x * x for x in v))
+    return [x / n for x in v]
+
+def dist(a, b):
+    return 1 - sum(x * y for x, y in zip(a, b))
+
+base = [normalizar([rng.gauss(0, 1) for _ in range(DIM)]) for _ in range(N)]
+
+# construção: cada nó novo se liga aos M mais próximos já inseridos (arestas nos dois sentidos)
+vizinhos = {0: set()}
+for i in range(1, N):
+    proximos = heapq.nsmallest(M, range(i), key=lambda j: dist(base[i], base[j]))
+    vizinhos[i] = set(proximos)
+    for j in proximos:
+        vizinhos[j].add(i)
+
+def busca_grafo(q, k, ef):
+    calculos = 0
+    def d(i):
+        nonlocal calculos
+        calculos += 1
+        return dist(q, base[i])
+    visitados = {0}
+    candidatos = [(d(0), 0)]          # min-heap: o que explorar
+    melhores = [(-candidatos[0][0], 0)]  # max-heap dos ef melhores
+    while candidatos:
+        dc, c = heapq.heappop(candidatos)
+        if dc > -melhores[0][0] and len(melhores) >= ef:
+            break
+        for v in vizinhos[c]:
+            if v in visitados:
+                continue
+            visitados.add(v)
+            dv = d(v)
+            if len(melhores) < ef or dv < -melhores[0][0]:
+                heapq.heappush(candidatos, (dv, v))
+                heapq.heappush(melhores, (-dv, v))
+                if len(melhores) > ef:
+                    heapq.heappop(melhores)
+    return [v for _, v in sorted((-nd, v) for nd, v in melhores)][:k], calculos
+
+consultas = [normalizar([rng.gauss(0, 1) for _ in range(DIM)]) for _ in range(20)]
+for ef in (10, 40):
+    acertos, total_calc = 0, 0
+    for q in consultas:
+        exato = set(heapq.nsmallest(10, range(N), key=lambda j: dist(q, base[j])))
+        achados, calc = busca_grafo(q, 10, ef)
+        acertos += len(exato & set(achados))
+        total_calc += calc
+    print(f"ef={ef}: recall@10={acertos / (10 * len(consultas)):.2f} "
+          f"distancias por consulta={total_calc // len(consultas)} (exata: {N})")
+```
+
+```text
+Saída:
+ef=10: recall@10=0.95 distancias por consulta=143 (exata: 800)
+ef=40: recall@10=1.00 distancias por consulta=260 (exata: 800)
+```
+
+Com `ef` maior, o recall sobe e o número de distâncias calculadas também; esse é o botão que você ajusta em produção. Em dimensões reais (centenas ou milhares) e milhões de vetores, a economia relativa é muito maior do que neste exemplo pequeno.
+
+## O que um banco vetorial adiciona
+
+Um índice ANN sozinho é uma biblioteca (como FAISS ou hnswlib). Um banco vetorial acrescenta: persistência, atualização e remoção de itens, **filtros por metadados** (tenant, idioma, data), busca híbrida, réplicas, sharding e controle de acesso. Existem bancos dedicados e extensões vetoriais em bancos tradicionais (por exemplo, pgvector no PostgreSQL). Se você já usa Postgres e tem poucos milhões de vetores, a extensão costuma ser a escolha mais simples.
+
+<Callout type="warning" title="Filtros e ANN não se dão bem de graça">
+Filtrar depois da busca (pós-filtro) pode devolver menos que k resultados quando o filtro é seletivo. Filtrar antes (pré-filtro) pode quebrar a navegação do grafo. Verifique como o seu banco combina filtros e índice, e teste o recall com os filtros reais de produção, como o filtro por tenant.
+</Callout>
+
+## Na entrevista
+
+Comece pela busca exata como baseline e diga quando ela basta. Depois explique o HNSW (grafo em camadas, busca gulosa, parâmetros M e ef) e o trade-off recall, latência e memória. Calcule memória: um milhão de vetores de 1.024 dimensões em float32 ocupam cerca de 4 GB só nos vetores, antes do grafo; quantização reduz isso. Follow-ups: "como você mede se o índice está bom?" (recall@k contra busca exata numa amostra) e "como isolar dados de clientes?" (filtro por tenant, namespaces ou índices separados).
+
+<QuizSet>
+<Quiz question="O que o parâmetro ef_search controla no HNSW?" options={["O número de camadas do grafo", "O tamanho da lista de candidatos na busca: maior aumenta recall e latência", "A dimensão dos vetores", "Quantos vizinhos cada nó guarda"]} answer={1} explanation="ef_search define quantos candidatos a busca mantém; mais candidatos exploram mais o grafo, achando mais vizinhos verdadeiros a um custo maior." />
+<Quiz question="Sua base tem 50 mil trechos e as consultas sempre filtram por cliente (cerca de 500 trechos cada). O que é razoável?" options={["Obrigatoriamente um cluster de banco vetorial dedicado com HNSW", "Busca exata dentro do subconjunto filtrado, que é pequeno e tem recall perfeito", "Quantização binária agressiva", "Desistir de embeddings"]} answer={1} explanation="Com 500 vetores por consulta, força bruta é instantânea e exata. Índices aproximados só compensam quando o conjunto a varrer é grande." />
+<Quiz question="Como medir o recall de um índice aproximado?" options={["Pela latência média", "Comparando os k resultados dele com os k da busca exata numa amostra de consultas", "Pelo tamanho do índice em disco", "Perguntando ao LLM se a resposta ficou boa"]} answer={1} explanation="Recall@k é a fração dos verdadeiros k vizinhos (da busca exata) que o índice aproximado devolveu." />
+</QuizSet>

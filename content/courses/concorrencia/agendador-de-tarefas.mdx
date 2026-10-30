@@ -1,0 +1,163 @@
+---
+title: Agendador de tarefas com atraso
+kind: lesson
+---
+
+"Projete um agendador que executa tarefas depois de um atraso" aparece em entrevistas de backend com nomes variados: timer service, `ScheduledExecutorService`, fila de jobs com retry. O enunciado parece simples (guarde a tarefa e rode depois), mas a solução boa exige três ideias juntas: uma estrutura ordenada por prazo, uma thread que **dorme exatamente até o próximo prazo** e uma forma de acordá-la quando chega uma tarefa mais urgente.
+
+## A estrutura: heap por prazo
+
+Guarde cada tarefa como `(prazo, sequência, função)` num min-heap. O topo é sempre a próxima a vencer, a inserção custa O(log n) e consultar o próximo prazo custa O(1). A `sequência` serve de desempate: duas tarefas com o mesmo prazo saem na ordem em que chegaram, e o Python nunca precisa comparar funções.
+
+```text
+agendar(B, +300ms)  agendar(A, +100ms)  agendar(C, +200ms)
+
+heap:        (100, A)
+            /        \
+      (300, B)     (200, C)
+
+o trabalhador dorme até 100ms, roda A, depois dorme até 200ms...
+```
+
+Antes de pensar em threads, vale separar a lógica do relógio. Com um relógio falso, você testa a ordem de execução sem esperar nada de verdade:
+
+```python
+import heapq
+import itertools
+
+class AgendadorSimulado:
+    def __init__(self):
+        self.agora = 0
+        self.heap = []
+        self.seq = itertools.count()
+
+    def agendar(self, atraso, nome):
+        heapq.heappush(self.heap, (self.agora + atraso, next(self.seq), nome))
+
+    def avancar_ate(self, instante):
+        executadas = []
+        while self.heap and self.heap[0][0] <= instante:
+            prazo, _, nome = heapq.heappop(self.heap)
+            self.agora = prazo
+            executadas.append(f"t={prazo} {nome}")
+        self.agora = instante
+        return executadas
+
+ag = AgendadorSimulado()
+ag.agendar(300, "enviar relatorio")
+ag.agendar(100, "limpar sessoes")
+ag.agendar(200, "renovar token")
+ag.agendar(100, "aquecer cache")
+for linha in ag.avancar_ate(250):
+    print(linha)
+print("pendentes:", len(ag.heap))
+```
+
+```text
+Saída:
+t=100 limpar sessoes
+t=100 aquecer cache
+t=200 renovar token
+pendentes: 1
+```
+
+## O trabalhador: esperar com timeout numa condição
+
+A versão real tem uma thread trabalhadora. O erro mais comum é fazê-la acordar a cada 10 ms para conferir o heap (espera ativa disfarçada): gasta CPU e ainda erra o horário por até 10 ms. O certo é usar uma **variável de condição** e esperar com timeout igual ao tempo que falta para o topo:
+
+- heap vazio: `wait()` sem limite;
+- topo no futuro: `wait(prazo - agora)`;
+- topo vencido: retira e executa **fora do lock**.
+
+Quando `agendar` insere uma tarefa, ele chama `notify()`. Se a nova tarefa for mais urgente que o topo antigo, o trabalhador acorda, recalcula e dorme menos. O laço sempre reavalia o estado após acordar, então despertares espúrios ou timeouts não causam erro.
+
+```python
+import heapq
+import itertools
+import threading
+import time
+
+class Agendador:
+    def __init__(self):
+        self.heap = []
+        self.seq = itertools.count()
+        self.cond = threading.Condition()
+        self.cancelados = set()
+        self.ativo = True
+        self.trabalhador = threading.Thread(target=self._laco)
+        self.trabalhador.start()
+
+    def agendar(self, atraso, func):
+        with self.cond:
+            ident = next(self.seq)
+            heapq.heappush(self.heap, (time.monotonic() + atraso, ident, func))
+            self.cond.notify()
+            return ident
+
+    def cancelar(self, ident):
+        with self.cond:
+            self.cancelados.add(ident)
+
+    def _laco(self):
+        while True:
+            with self.cond:
+                while self.ativo and (not self.heap or self.heap[0][0] > time.monotonic()):
+                    falta = self.heap[0][0] - time.monotonic() if self.heap else None
+                    self.cond.wait(falta)
+                if not self.ativo:
+                    return
+                _, ident, func = heapq.heappop(self.heap)
+                if ident in self.cancelados:
+                    continue
+            func()  # fora do lock: tarefa lenta não bloqueia novos agendamentos
+
+    def encerrar(self):
+        with self.cond:
+            self.ativo = False
+            self.cond.notify()
+        self.trabalhador.join()
+
+log = []
+ag = Agendador()
+ag.agendar(0.30, lambda: log.append("C"))
+ag.agendar(0.10, lambda: log.append("A"))
+id_x = ag.agendar(0.15, lambda: log.append("X"))
+ag.agendar(0.20, lambda: log.append("B"))
+ag.cancelar(id_x)
+time.sleep(0.45)
+ag.encerrar()
+print("ordem de execucao:", log)
+```
+
+```text
+Saída:
+ordem de execucao: ['A', 'B', 'C']
+```
+
+Três detalhes fazem diferença. O relógio é `time.monotonic()`, que não anda para trás se alguém ajustar o horário do sistema. O cancelamento é preguiçoso: marcar o id é O(1) e a tarefa é descartada quando chega ao topo. E a função roda fora do lock; se rodasse dentro, uma tarefa lenta impediria qualquer `agendar` nesse meio-tempo.
+
+<Callout type="tip" title="Equivalentes em outras linguagens">
+Java oferece `ScheduledThreadPoolExecutor`, que usa internamente uma fila de atraso com heap e `Condition.awaitNanos`. Em Go, o idioma é `time.Timer` com `select`; em C++, `std::condition_variable::wait_until` com uma `std::priority_queue`.
+</Callout>
+
+## Trade-offs e extensões
+
+| Questão | Opção simples | Opção robusta |
+| --- | --- | --- |
+| Tarefa lenta atrasa as outras | Um só trabalhador | Trabalhador só despacha para um thread pool |
+| Tarefas periódicas | Reagendar ao terminar | Calcular o próximo prazo a partir do prazo anterior, para não acumular atraso |
+| Milhões de timers | Heap | Timing wheel: baldes por intervalo, inserção O(1) |
+| Sobreviver a reinício | Memória | Persistir em banco e recuperar pendências |
+| Muitas máquinas | Agendador local | Lease por tarefa para que só um nó a execute |
+
+Uma exceção dentro de `func()` mataria a thread trabalhadora e, com ela, o agendador inteiro. Em produção, envolva a chamada em `try/except` e registre o erro.
+
+## Na entrevista
+
+Comece pelos requisitos: precisão esperada, volume de tarefas, se há cancelamento e repetição. Proponha heap mais variável de condição, explique por que `wait` com timeout é melhor que sondagem e por que a tarefa roda fora do lock. Follow-ups comuns: "e se chegar uma tarefa mais urgente enquanto a thread dorme?" (o `notify` em `agendar` a acorda para recalcular) e "como escalar para milhões de timers ou várias máquinas?" (timing wheel, sharding por id e persistência).
+
+<QuizSet>
+<Quiz question="O trabalhador está dormindo até uma tarefa que vence em 10 s, e chega outra que vence em 1 s. O que garante que ela rode na hora?" options={["Nada, ela vai esperar os 10 s", "agendar chama notify; o trabalhador acorda, vê o novo topo do heap e dorme só 1 s", "O heap acorda a thread automaticamente", "O sistema operacional reordena as threads"]} answer={1} explanation="Inserir e notificar sob o mesmo lock faz o trabalhador reavaliar o prazo do topo assim que acorda." />
+<Quiz question="Por que usar time.monotonic() em vez de time.time() no agendador?" options={["É mais preciso em microssegundos", "Não volta no tempo quando o relógio do sistema é ajustado", "Funciona sem threads", "Ocupa menos memória"]} answer={1} explanation="O relógio de parede pode ser corrigido por NTP ou pelo usuário; o monotônico só avança, o que é o certo para medir intervalos." />
+<Quiz question="Por que a função agendada é executada fora do bloco with self.cond?" options={["Porque Python proíbe chamar funções dentro de with", "Para que uma tarefa lenta não impeça novos agendamentos e cancelamentos", "Para que a tarefa rode em outra thread automaticamente", "Para economizar memória do heap"]} answer={1} explanation="Segurar o lock durante a tarefa serializaria todo o agendador atrás dela e aumentaria o risco de deadlock." />
+</QuizSet>

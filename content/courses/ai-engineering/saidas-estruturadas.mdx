@@ -1,0 +1,147 @@
+---
+title: Saídas estruturadas
+kind: lesson
+---
+
+Quando a resposta do LLM é lida por uma pessoa, texto livre basta. Quando ela é lida por código (gravar no banco, chamar uma API, preencher um formulário), você precisa de uma estrutura confiável. Um `json.loads` que falha em 2% das chamadas vira 2% de requisições com erro em produção, e um campo com tipo errado pode passar despercebido até corromper dados.
+
+## Três níveis de garantia
+
+1. **Só no prompt:** você descreve o formato e dá um exemplo. Funciona na maioria das vezes, mas o modelo pode envolver o JSON em texto ("Claro! Aqui está:"), esquecer um campo ou inventar outro.
+2. **Modo JSON:** o provedor garante que a saída é JSON sintaticamente válido, mas não que segue o seu esquema.
+3. **Esquema imposto (decodificação restrita):** você envia um JSON Schema e o servidor só permite, a cada passo, tokens que mantêm a saída válida para aquele esquema. A estrutura fica garantida por construção; o conteúdo, não.
+
+A decodificação restrita funciona mascarando a distribuição do próximo token: tokens que quebrariam a gramática recebem probabilidade zero antes do sorteio. Vários provedores e bibliotecas de inferência local oferecem isso, cada um com o seu subconjunto suportado de JSON Schema. O mesmo mecanismo existe em tool calling: os argumentos de uma ferramenta são uma saída estruturada.
+
+Um esquema típico para extrair dados de um e-mail de suporte:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "categoria": { "type": "string", "enum": ["cobranca", "entrega", "defeito", "outro"] },
+    "pedido_id": { "type": ["string", "null"] },
+    "urgente": { "type": "boolean" },
+    "resumo": { "type": "string" }
+  },
+  "required": ["categoria", "pedido_id", "urgente", "resumo"],
+  "additionalProperties": false
+}
+```
+
+Repare em `pedido_id` aceitando `null`: dar ao modelo uma saída legítima para "não encontrei" reduz a chance de ele inventar um número.
+
+## Valide sempre do seu lado
+
+Mesmo com esquema imposto, valide. Você pode trocar de provedor, cair num fallback sem suporte ou ter regras que o esquema não expressa (um CPF com dígito verificador, uma data no futuro). Em Python, bibliotecas como Pydantic fazem isso; abaixo, um validador mínimo só com a stdlib.
+
+```python
+import json
+
+ESQUEMA = {
+    "categoria": (str, {"cobranca", "entrega", "defeito", "outro"}),
+    "pedido_id": ((str, type(None)), None),
+    "urgente": (bool, None),
+    "resumo": (str, None),
+}
+
+def validar(texto):
+    try:
+        dado = json.loads(texto)
+    except json.JSONDecodeError as e:
+        return None, [f"JSON invalido: {e.msg}"]
+    erros = []
+    for campo, (tipo, permitidos) in ESQUEMA.items():
+        if campo not in dado:
+            erros.append(f"falta o campo {campo}")
+        elif not isinstance(dado[campo], tipo):
+            erros.append(f"{campo} com tipo errado")
+        elif permitidos and dado[campo] not in permitidos:
+            erros.append(f"{campo} fora do enum: {dado[campo]}")
+    extras = set(dado) - set(ESQUEMA)
+    if extras:
+        erros.append(f"campos extras: {sorted(extras)}")
+    return (dado if not erros else None), erros
+
+saidas = [
+    '{"categoria": "entrega", "pedido_id": "A-981", "urgente": true, "resumo": "atrasou"}',
+    'Claro! Aqui esta: {"categoria": "entrega"}',
+    '{"categoria": "reembolso", "pedido_id": null, "urgente": "sim", "resumo": "quer o dinheiro"}',
+]
+for s in saidas:
+    dado, erros = validar(s)
+    print("ok" if dado else "falhou", erros)
+```
+
+```text
+Saída:
+ok []
+falhou ['JSON invalido: Expecting value']
+falhou ['categoria fora do enum: reembolso', 'urgente com tipo errado']
+```
+
+## Reparar com feedback
+
+Quando a validação falha, a estratégia mais barata costuma ser devolver o erro ao modelo e pedir correção, com um limite de tentativas. Abaixo, um modelo falso que erra na primeira vez e corrige quando recebe a mensagem de erro.
+
+```python
+import json
+
+def llm_falso(prompt):
+    if "Erros:" in prompt:
+        return '{"categoria": "defeito", "urgente": false}'
+    cerca = "`" * 3  # o modelo embrulhou o JSON num bloco de markdown
+    return cerca + 'json\n{"categoria": "defeito", "urgente": "nao"}\n' + cerca
+
+def extrair_json(texto):
+    inicio, fim = texto.find("{"), texto.rfind("}")
+    return texto[inicio:fim + 1] if inicio != -1 else texto
+
+def validar(dado):
+    erros = []
+    if dado.get("categoria") not in {"cobranca", "entrega", "defeito", "outro"}:
+        erros.append("categoria invalida")
+    if not isinstance(dado.get("urgente"), bool):
+        erros.append("urgente deve ser booleano")
+    return erros
+
+def chamar_com_reparo(prompt, max_tentativas=3):
+    for tentativa in range(1, max_tentativas + 1):
+        bruto = llm_falso(prompt)
+        dado = json.loads(extrair_json(bruto))
+        erros = validar(dado)
+        print(f"tentativa {tentativa}: erros={erros}")
+        if not erros:
+            return dado
+        prompt += f"\nSua resposta anterior era invalida. Erros: {erros}. Responda so o JSON."
+    raise ValueError("saida invalida apos tentativas")
+
+print(chamar_com_reparo("Extraia os dados do e-mail: a tela chegou trincada."))
+```
+
+```text
+Saída:
+tentativa 1: erros=['urgente deve ser booleano']
+tentativa 2: erros=[]
+{'categoria': 'defeito', 'urgente': False}
+```
+
+<Callout type="tip" title="Estrutura não é verdade">
+O esquema garante que `urgente` é booleano, não que o valor está certo. Avalie a precisão dos campos com casos rotulados, como em qualquer extração.
+</Callout>
+
+## Armadilhas
+
+- **Esquemas grandes e profundos** pioram a qualidade e podem não ser suportados pela decodificação restrita. Prefira estruturas rasas e campos com nomes autoexplicativos, com descrições.
+- **Ordem dos campos importa:** se houver um campo de justificativa, coloque-o antes da conclusão, para o modelo "pensar" antes de decidir.
+- **Formato forçado demais pode atrapalhar o raciocínio:** em tarefas difíceis, deixe o modelo raciocinar livre numa etapa e estruture o resultado em outra.
+- **Enum sem saída de escape:** sem uma opção "outro", o modelo encaixa à força em uma categoria errada.
+
+## Na entrevista
+
+Diga que você usaria esquema imposto quando disponível, validaria no servidor de qualquer forma e trataria falhas com reparo limitado e, se persistir, um caminho de erro explícito (fila para revisão humana, resposta padrão). Follow-ups: "como a decodificação restrita funciona?" (mascara tokens inválidos para a gramática a cada passo) e "o modelo preencheu um campo com um valor inventado, e agora?" (permitir null ou 'desconhecido', exigir evidência citada, avaliar precisão por campo).
+
+<QuizSet>
+<Quiz question="Seu provedor oferece 'modo JSON'. O que ele garante?" options={["Que todos os campos do seu esquema estarão presentes", "Que a saída é JSON sintaticamente válido, mas não que segue o seu esquema", "Que os valores estão corretos", "Que a resposta não terá alucinações"]} answer={1} explanation="Modo JSON garante sintaxe. Seguir um esquema específico exige decodificação restrita ao esquema ou validação com reparo." />
+<Quiz question="Um modelo inventa números de pedido quando o e-mail não menciona nenhum. Qual mudança no esquema ajuda mais?" options={["Tornar pedido_id obrigatório e do tipo inteiro", "Permitir null em pedido_id e instruir a usá-lo quando não houver número", "Remover o campo e pedir em texto livre", "Aumentar a temperatura"]} answer={1} explanation="Sem uma forma válida de dizer 'não há', o modelo preenche o campo com algo plausível. Uma saída legítima para ausência reduz a invenção." />
+</QuizSet>

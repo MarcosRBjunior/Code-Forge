@@ -1,0 +1,146 @@
+---
+title: Índices e B-trees
+kind: lesson
+---
+
+Sem índice, achar um pedido pelo id numa tabela de 50 milhões de linhas significa ler a tabela inteira. Com índice, são poucas leituras de página. Em entrevista, índices aparecem de dois jeitos: "essa consulta está lenta, o que você faz?" e "por que não indexar todas as colunas?". Para responder bem, você precisa entender a estrutura por trás, a B-tree, e as regras que decidem quando ela ajuda.
+
+## Como uma B-tree funciona
+
+O índice padrão no Postgres e no InnoDB é uma **B-tree** (na prática, uma B+tree): uma árvore larga e rasa em que cada nó é uma página de disco com centenas de chaves ordenadas. Os nós internos guiam a busca; as folhas guardam as chaves em ordem e apontam para as linhas (no Postgres, para a posição física na heap; no InnoDB, para a chave primária).
+
+```text
+                 [ 40 | 80 ]
+               /      |      \
+     [10|20|30]   [50|60|70]   [90|95]
+         folhas encadeadas em ordem ->
+```
+
+Como cada nó tem muitos filhos, uma árvore com 3 ou 4 níveis cobre bilhões de linhas. Isso dá busca por igualdade em O(log n), e, como as folhas estão em ordem e encadeadas, também acelera **faixas** (`BETWEEN`, `>`), **prefixos** (`LIKE 'abc%'`) e **ordenação** (`ORDER BY` na ordem do índice).
+
+O custo vem na escrita: cada `INSERT`, `UPDATE` de coluna indexada e `DELETE` precisa manter todos os índices da tabela. Índices também ocupam espaço e memória de cache.
+
+## Criando índices
+
+```sql
+CREATE TABLE usuarios (
+  id        integer PRIMARY KEY,
+  email     text NOT NULL,
+  pais      text NOT NULL,
+  criado_em date NOT NULL,
+  ativo     boolean NOT NULL
+);
+
+INSERT INTO usuarios VALUES
+  (1, 'ana@ex.com',   'BR', '2024-01-10', true),
+  (2, 'Bob@ex.com',   'US', '2024-01-12', true),
+  (3, 'caio@ex.com',  'BR', '2024-02-01', false),
+  (4, 'dani@ex.com',  'PT', '2024-02-15', true),
+  (5, 'edu@ex.com',   'BR', '2024-03-03', true),
+  (6, 'fabi@ex.com',  'US', '2024-03-09', false),
+  (7, 'gil@ex.com',   'BR', '2024-03-20', true);
+
+CREATE UNIQUE INDEX usuarios_email_lower_idx ON usuarios (lower(email));
+CREATE INDEX usuarios_pais_criado_idx ON usuarios (pais, criado_em);
+CREATE INDEX usuarios_inativos_idx ON usuarios (criado_em) WHERE NOT ativo;
+
+SELECT indexname FROM pg_indexes WHERE tablename = 'usuarios' ORDER BY indexname;
+```
+
+```text
+Saída:
+indexname
+usuarios_email_lower_idx
+usuarios_inativos_idx
+usuarios_pais_criado_idx
+usuarios_pkey
+```
+
+Quatro tipos aparecem aí:
+
+- `usuarios_pkey`: criado automaticamente pela chave primária.
+- **Índice de expressão** em `lower(email)`: só é usado por consultas que filtram pela mesma expressão. Ser `UNIQUE` também impede `Ana@ex.com` e `ana@ex.com` ao mesmo tempo. O MySQL 8 tem índices funcionais parecidos, com a expressão entre parênteses duplos.
+- **Índice composto** em `(pais, criado_em)`.
+- **Índice parcial**: indexa só as linhas com `NOT ativo`. É pequeno e ótimo quando você consulta sempre um subconjunto raro. O MySQL não tem índice parcial.
+
+## A regra do prefixo à esquerda
+
+Um índice composto ordena primeiro por `pais` e, dentro de cada país, por `criado_em`. Ele serve para filtros em `pais`, em `pais` e `criado_em` juntos, e para `WHERE pais = 'BR' ORDER BY criado_em`. Ele **não** serve bem para filtrar só por `criado_em`, porque as datas estão espalhadas por todos os países.
+
+```sql
+SELECT id, criado_em
+FROM usuarios
+WHERE pais = 'BR' AND criado_em >= '2024-02-01'
+ORDER BY criado_em;
+```
+
+```text
+Saída:
+id | criado_em
+3 | 2024-02-01
+5 | 2024-03-03
+7 | 2024-03-20
+```
+
+A regra prática para montar o composto: colunas comparadas por igualdade primeiro, depois a coluna de faixa ou de ordenação.
+
+O índice de expressão só entra quando a consulta repete a expressão:
+
+```sql
+SELECT id, email FROM usuarios WHERE lower(email) = 'bob@ex.com';
+```
+
+```text
+Saída:
+id | email
+2 | Bob@ex.com
+```
+
+## Quando o índice não é usado
+
+- **Função na coluna** sem índice de expressão: `WHERE date(criado_em) = ...` ou `WHERE lower(email) = ...` com índice só em `email`.
+- **Baixa seletividade**: se o filtro devolve boa parte da tabela, ler tudo sequencialmente é mais barato, e o otimizador escolhe isso de propósito.
+- **`LIKE '%abc'`**: o curinga no começo impede usar a ordem da B-tree.
+- **Tipos diferentes**: comparar coluna texto com número força conversão, especialmente no MySQL.
+- **Tabelas pequenas**: como a deste exemplo, em que um scan sequencial já é o mais rápido.
+
+## Índice de cobertura
+
+Se o índice contém todas as colunas que a consulta precisa, o banco nem visita a tabela: é um **index-only scan** no Postgres, ou "using index" no MySQL. No Postgres você pode anexar colunas só para leitura com `INCLUDE`:
+
+```sql
+CREATE INDEX usuarios_pais_cobre_idx ON usuarios (pais) INCLUDE (email);
+
+SELECT pais, count(*) AS total
+FROM usuarios
+GROUP BY pais
+ORDER BY pais;
+```
+
+```text
+Saída:
+pais | total
+BR | 4
+PT | 1
+US | 2
+```
+
+No InnoDB, todo índice secundário já carrega a chave primária, então `(pais)` cobre automaticamente consultas que leem `pais` e `id`.
+
+<Callout type="tip" title="Índice clusterizado">
+No InnoDB a tabela é a própria B-tree da chave primária, ordenada por ela. Por isso chaves primárias sequenciais inserem mais rápido que UUIDs aleatórios. No Postgres a tabela é uma heap separada e todos os índices são secundários.
+</Callout>
+
+## Outros tipos
+
+O Postgres tem também **Hash** (só igualdade), **GIN** (arrays, JSONB e busca textual), **GiST** (geometria, faixas) e **BRIN** (tabelas enormes cuja ordem física acompanha uma coluna, como logs por data). Em entrevista, saber que B-tree é o padrão e que GIN serve para JSONB e texto já cobre a maioria das perguntas.
+
+## Na entrevista
+
+Quando pedirem para otimizar uma consulta, olhe as colunas do `WHERE`, do `JOIN` e do `ORDER BY`, proponha um índice (composto, com igualdades primeiro) e diga como confirmaria com `EXPLAIN`. Mencione o custo de escrita. Follow-ups comuns: "um índice em `(a, b)` ajuda `WHERE b = 1`?" (em geral não) e "por que o banco ignorou meu índice?" (seletividade baixa, função na coluna ou estatísticas desatualizadas).
+
+<QuizSet>
+<Quiz question="Existe um índice em (cliente_id, criado_em). Qual consulta aproveita melhor esse índice?" options={["WHERE criado_em > '2024-01-01'", "WHERE cliente_id = 7 ORDER BY criado_em", "WHERE lower(cliente_id::text) = '7'", "WHERE criado_em = '2024-01-01' OR cliente_id = 7"]} answer={1} explanation="Igualdade na primeira coluna e ordenação pela segunda seguem exatamente a ordem do índice." />
+<Quiz question="Por que não criar índice em todas as colunas?" options={["O SQL proíbe", "Cada índice custa espaço e deixa INSERT, UPDATE e DELETE mais lentos", "Índices só funcionam em chaves primárias", "Porque índices tornam SELECT mais lento"]} answer={1} explanation="Toda escrita precisa atualizar cada índice afetado, além do custo de armazenamento e cache." />
+<Quiz question="Uma consulta filtra por WHERE email LIKE '%@gmail.com' e o índice B-tree em email não é usado. Por quê?" options={["LIKE nunca usa índice", "O curinga no início impede percorrer a B-tree pela ordem", "O índice precisa ser UNIQUE", "Porque email é text"]} answer={1} explanation="A B-tree ordena pelo começo da string; sem prefixo fixo não há por onde começar a busca." />
+</QuizSet>

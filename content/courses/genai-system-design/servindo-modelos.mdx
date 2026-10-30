@@ -1,0 +1,113 @@
+---
+title: "Servindo modelos: batching e KV cache"
+kind: lesson
+---
+
+Uma GPU moderna faz uma quantidade enorme de operações por segundo, mas gerar texto para um único usuário quase não aproveita isso. No decode, cada novo token exige ler todos os pesos do modelo da memória da GPU para fazer uma conta relativamente pequena. O gargalo é a **largura de banda de memória**, não a computação. Se você ler os pesos uma vez e usá-los para avançar 32 conversas ao mesmo tempo, o custo por token cai quase 32 vezes. É por isso que batching é a alavanca número um de eficiência em servidores de inferência.
+
+## Prefill e decode
+
+Toda requisição passa por duas fases:
+
+- **Prefill:** o prompt inteiro é processado de uma vez, em paralelo. É intensivo em computação e define o tempo até o primeiro token.
+- **Decode:** os tokens de saída saem um de cada vez, cada um dependendo dos anteriores. É limitado por memória e define a velocidade de geração.
+
+Para não recalcular tudo a cada novo token, o servidor guarda, para cada token já visto, os vetores de chave e valor da atenção em todas as camadas. Esse é o **KV cache**. Ele transforma o decode de quadrático em linear, mas cobra em memória: cada sequência ativa ocupa espaço proporcional ao seu comprimento.
+
+## Quanto cabe na GPU
+
+O tamanho do KV cache por token depende da arquitetura: duas matrizes (chave e valor) por camada, multiplicadas pelo número de cabeças de chave/valor, pela dimensão de cada cabeça e pelos bytes de cada número. Com um modelo hipotético:
+
+```python
+camadas, cabecas_kv, dim_cabeca, bytes_num = 32, 8, 128, 2
+por_token = 2 * camadas * cabecas_kv * dim_cabeca * bytes_num
+print(f"KV cache por token: {por_token / 1024:.0f} KiB")
+
+memoria_gpu_gb = 80     # hipotetico
+pesos_gb = 16           # modelo de ~8 bilhoes de parametros em 16 bits
+outros_gb = 4           # ativacoes, fragmentacao, runtime
+livre = (memoria_gpu_gb - pesos_gb - outros_gb) * 1024**3
+
+for contexto in (2_000, 8_000, 32_000):
+    seqs = livre // (por_token * contexto)
+    print(f"contexto {contexto:>6} tokens -> {seqs:>4} sequencias simultaneas")
+```
+
+```text
+Saída:
+KV cache por token: 128 KiB
+contexto   2000 tokens ->  245 sequencias simultaneas
+contexto   8000 tokens ->   61 sequencias simultaneas
+contexto  32000 tokens ->   15 sequencias simultaneas
+```
+
+A conclusão de entrevista: **contexto longo reduz o batch**. Se você reserva memória para o contexto máximo de cada requisição, mesmo que a maioria use pouco, desperdiça a maior parte da GPU. Servidores modernos alocam o KV cache em blocos pequenos sob demanda (a ideia de *paged attention*, inspirada em memória virtual), o que elimina a fragmentação e ainda permite compartilhar blocos de um prefixo comum, como um prompt de sistema longo, entre várias requisições.
+
+## Batching estático versus contínuo
+
+No **batching estático**, o servidor junta N requisições, roda até a mais longa terminar e só então aceita o próximo grupo. Se uma resposta tem 400 tokens e as outras 30, os slots das curtas ficam ociosos esperando. No **batching contínuo** (também chamado de *in-flight* ou por iteração), o agendador decide a cada passo de decode: quem terminou sai, quem está na fila entra. A simulação abaixo compara os dois com o mesmo limite de 4 slots.
+
+```python
+saidas = [30, 400, 25, 60, 35, 380, 40, 50, 20, 45, 30, 350]  # tokens de saida
+SLOTS = 4
+
+def estatico(saidas):
+    fim, t = [], 0
+    for i in range(0, len(saidas), SLOTS):
+        lote = saidas[i:i + SLOTS]
+        fim += [t + s for s in lote]
+        t += max(lote)
+    return t, fim
+
+def continuo(saidas):
+    fila = list(enumerate(saidas))
+    ativos, fim, t = {}, [0] * len(saidas), 0
+    while fila or ativos:
+        while fila and len(ativos) < SLOTS:
+            i, s = fila.pop(0)
+            ativos[i] = s
+        t += 1
+        for i in list(ativos):
+            ativos[i] -= 1
+            if ativos[i] == 0:
+                fim[i] = t
+                del ativos[i]
+    return t, fim
+
+for nome, f in (("estatico", estatico), ("continuo", continuo)):
+    total, fim = f(saidas)
+    uso = sum(saidas) / (SLOTS * total)
+    print(f"{nome:<9} passos={total:>5}  latencia media={sum(fim) / len(fim):6.1f}  uso dos slots={uso:.0%}")
+```
+
+```text
+Saída:
+estatico  passos= 1130  latencia media= 515.4  uso dos slots=32%
+continuo  passos=  500  latencia media= 176.7  uso dos slots=73%
+```
+
+Com a mesma GPU, o batching contínuo termina o trabalho em menos passos e reduz bastante a latência média, porque requisições curtas não esperam as longas. Na prática, os ganhos de throughput relatados para batching contínuo são de várias vezes, dependendo da variância dos comprimentos.
+
+## Outros recursos do servidor
+
+- **Prefill em pedaços (*chunked prefill*):** um prompt enorme pode travar o decode de todo o batch. Dividir o prefill em pedaços e intercalá-los com passos de decode mantém a latência por token estável.
+- **Cache de prefixo:** se muitas requisições começam com o mesmo prompt de sistema, o KV cache desse trecho é calculado uma vez e reutilizado, reduzindo o TTFT.
+- **Desagregação:** em escala, alguns sistemas rodam prefill e decode em pools de GPUs separados, já que têm perfis de recurso diferentes.
+- **Quantização:** pesos e KV cache em menos bits liberam memória para batches maiores, com alguma perda de qualidade a ser medida.
+
+| Técnica | Melhora | Custo |
+| --- | --- | --- |
+| Batch maior | Throughput | Latência por token sobe |
+| Batching contínuo | Throughput e latência média | Agendador mais complexo |
+| KV cache paginado | Ocupação de memória | Implementação no kernel de atenção |
+| Quantização | Memória e velocidade | Possível perda de qualidade |
+
+## Na entrevista
+
+Quando o desenho incluir modelos próprios, explique que o servidor de inferência faz batching contínuo e gerencia o KV cache em blocos, e que o tamanho do batch é limitado pela memória, não pela computação. Ligue isso aos requisitos: contexto longo diminui a concorrência por GPU; prompt de sistema compartilhado se beneficia de cache de prefixo. Follow-ups comuns: "por que não processar cada requisição isoladamente?" (desperdício de banda de memória) e "o que acontece quando a memória de KV acaba?" (a fila cresce, ou o servidor preempta sequências e as recalcula depois).
+
+<QuizSet>
+<Quiz question="Por que o decode de uma única requisição aproveita mal a GPU?" options={["Porque a GPU não suporta texto", "Porque cada token exige ler todos os pesos da memória para pouca computação; o gargalo é a banda de memória", "Porque o decode roda na CPU", "Porque o KV cache é desligado no decode"]} answer={1} explanation="Ler os pesos uma vez e reaproveitá-los para várias sequências no mesmo passo é o que torna o batching tão eficiente." />
+<Quiz question="Seu produto passou a aceitar documentos de 100 mil tokens. Qual efeito direto no servidor de inferência?" options={["Nenhum", "Cada sequência ocupa muito mais KV cache, então cabem menos requisições simultâneas por GPU", "O modelo fica mais preciso", "O decode fica mais rápido"]} answer={1} explanation="O KV cache cresce linearmente com o contexto; sequências longas consomem a memória que limitaria o tamanho do batch." />
+<Quiz question="No batching estático, uma resposta de 400 tokens divide o lote com três de 30 tokens. O que acontece?" options={["As curtas são canceladas", "Os slots das curtas ficam ociosos até a longa terminar, e o próximo lote espera", "O servidor divide a longa em quatro", "Nada; estático e contínuo são equivalentes"]} answer={1} explanation="O batching contínuo resolve isso liberando e preenchendo slots a cada passo de decode." />
+</QuizSet>

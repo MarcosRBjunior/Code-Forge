@@ -1,0 +1,111 @@
+---
+title: Controle de custo
+kind: lesson
+---
+
+Num serviço web comum, uma requisição a mais custa praticamente nada. Num produto com LLM, cada requisição tem um custo marginal visível, e uma minoria de usuários pode gerar a maior parte dele: alguém que cola documentos enormes, um script que chama a API em loop, um agente que entra num ciclo de ferramentas. Sem controle, a fatura cresce mais rápido que a receita. Controle de custo em GenAI tem duas frentes: **gastar menos por requisição** e **limitar quanto cada usuário, equipe ou cliente pode gastar**.
+
+## Gastar menos por requisição
+
+As alavancas, em ordem aproximada de esforço:
+
+1. **Encurtar prompts.** Instruções enxutas, poucos exemplos, só os trechos recuperados relevantes, histórico resumido.
+2. **Limitar a saída.** `max_tokens` adequado à tarefa e instruções de concisão. Tokens de saída costumam ser os mais caros.
+3. **Cachear.** Cache exato e semântico de respostas, cache de prefixo no servidor (ou o desconto de prompt em cache que alguns provedores oferecem), cache de embeddings e de buscas.
+4. **Rotear.** Modelo pequeno para tarefas simples, grande só onde necessário.
+5. **Processar em lote.** Trabalhos que não são interativos (classificar o backlog, gerar resumos noturnos) podem usar filas de lote, que costumam ter preço menor ou aproveitar GPUs ociosas.
+6. **Hospedar e otimizar.** Em volume alto e estável, modelos próprios quantizados com batching agressivo. Exige equipe e operação.
+
+As alavancas se multiplicam. Se o cache evita 25% das chamadas, o roteamento reduz em 50% o custo das restantes e prompts mais curtos cortam outros 20%, o custo final é 0,75 × 0,5 × 0,8 = 30% do original.
+
+## Limitar quanto cada um gasta
+
+Rate limiting por requisição não serve bem, porque uma requisição pode ter 100 tokens ou 100 mil. O limite precisa ser em **tokens** (ou em dinheiro), em duas escalas de tempo:
+
+- **Curto prazo (por minuto):** um token bucket por usuário protege a capacidade contra rajadas e scripts.
+- **Longo prazo (por dia ou mês):** uma cota de orçamento por usuário, equipe ou cliente, ligada ao plano contratado.
+
+Como o total de tokens de saída só é conhecido no fim, o sistema **reserva** uma estimativa antes (entrada mais `max_tokens`) e **ajusta** com o consumo real depois.
+
+```python
+class BaldeDeTokens:
+    def __init__(self, capacidade, recarga_por_s):
+        self.capacidade, self.recarga = capacidade, recarga_por_s
+        self.saldo, self.t = capacidade, 0.0
+
+    def tentar(self, agora, custo):
+        self.saldo = min(self.capacidade, self.saldo + (agora - self.t) * self.recarga)
+        self.t = agora
+        if custo <= self.saldo:
+            self.saldo -= custo
+            return True
+        return False
+
+    def devolver(self, valor):
+        self.saldo = min(self.capacidade, self.saldo + valor)
+
+# 20 mil tokens de rajada, recarga de 500 tokens/s (30 mil por minuto)
+balde = BaldeDeTokens(20_000, 500)
+pedidos = [(0, 3000, 1000, 400), (1, 3000, 1000, 350), (2, 12000, 2000, 1800),
+           (3, 8000, 1000, 900), (20, 8000, 1000, 700)]   # (s, entrada, max_tokens, saida real)
+for t, ent, max_tok, real in pedidos:
+    reserva = ent + max_tok
+    ok = balde.tentar(t, reserva)
+    if ok:
+        balde.devolver(max_tok - real)     # ajusta pela saida real
+    print(f"t={t:>2}s reserva={reserva:>5} -> {'aceito ' if ok else 'recusado (429)'} saldo={balde.saldo:,.0f}")
+
+# Alavancas combinadas sobre um custo mensal hipotetico
+base = 400_000
+fatores = {"cache (25% evitado)": 0.75, "roteamento (-50%)": 0.50, "prompt menor (-20%)": 0.80}
+custo = base
+for nome, f in fatores.items():
+    custo *= f
+    print(f"{nome:<22} US$ {custo:>9,.0f}")
+print(f"reducao total: {1 - custo / base:.0%}")
+```
+
+```text
+Saída:
+t= 0s reserva= 4000 -> aceito  saldo=16,600
+t= 1s reserva= 4000 -> aceito  saldo=13,750
+t= 2s reserva=14000 -> aceito  saldo=450
+t= 3s reserva= 9000 -> recusado (429) saldo=950
+t=20s reserva= 9000 -> aceito  saldo=750
+cache (25% evitado)    US$   300,000
+roteamento (-50%)      US$   150,000
+prompt menor (-20%)    US$   120,000
+reducao total: 70%
+```
+
+O quarto pedido é recusado porque a rajada esgotou o balde; no segundo 20, a recarga devolve saldo e o usuário volta a ser atendido. A devolução da parte não usada da reserva evita punir quem pede `max_tokens` alto mas gera pouco.
+
+## Atribuição e visibilidade
+
+Você não controla o que não mede. Cada chamada ao modelo deve gerar um registro com usuário, equipe, funcionalidade, modelo, tokens de entrada, de saída e em cache, e custo calculado. Isso permite:
+
+- **Custo por funcionalidade:** descobrir que o resumo automático de e-mails custa mais que o chat inteiro.
+- **Custo por cliente:** comparar com a receita do plano e ajustar preços ou limites.
+- **Alertas:** gasto diário de uma equipe 3 vezes acima da média, agente com dezenas de chamadas numa única tarefa.
+
+Para agentes, adicione **limites por tarefa**: número máximo de passos, de chamadas a ferramentas e de tokens. Um ciclo infinito de um agente é o equivalente GenAI de um vazamento de memória.
+
+| Mecanismo | Protege contra | Cuidado |
+| --- | --- | --- |
+| Token bucket por usuário | Rajadas, scripts | Calibrar por plano |
+| Cota mensal | Estouro de orçamento | Avisar antes de bloquear |
+| Limite por tarefa de agente | Ciclos e loops | Encerrar com resposta parcial útil |
+| Degradação | Picos de custo | Modelo menor pode piorar a qualidade |
+
+<Callout type="tip" title="Degradar antes de recusar">
+Quando o usuário se aproxima da cota, muitas vezes é melhor atendê-lo com um modelo menor ou respostas mais curtas do que devolver um erro. Decida isso por plano e deixe a regra visível no produto.
+</Callout>
+
+## Na entrevista
+
+Depois das estimativas, mostre que o custo é um requisito e cite as alavancas na ordem em que você as aplicaria, com uma conta rápida de redução combinada. Descreva o limite por tokens com reserva e ajuste, e o registro de custo por chamada. Follow-ups comuns: "um cliente enterprise quer limite de gasto mensal, como implementar?" (cota em dinheiro no gateway, contador distribuído com reserva e ajuste, alertas em 80%) e "como evitar que um agente gaste 100 dólares numa tarefa?" (limites de passos e tokens por tarefa, com interrupção e relatório).
+
+<QuizSet>
+<Quiz question="Por que limitar por número de requisições é insuficiente num produto com LLM?" options={["Porque requisições são raras", "Porque o custo de uma requisição varia enormemente com os tokens de entrada e de saída", "Porque o provedor já limita", "Porque requisições não têm custo"]} answer={1} explanation="Duas requisições podem diferir em custo por ordens de grandeza; o limite precisa ser em tokens ou em dinheiro." />
+<Quiz question="O gateway reserva entrada mais max_tokens antes da chamada. O que fazer quando a resposta usa bem menos que max_tokens?" options={["Nada, o usuário perde a diferença", "Devolver a diferença ao saldo do usuário, ajustando pela saída real", "Cobrar em dobro", "Aumentar o max_tokens"]} answer={1} explanation="Reservar a estimativa pessimista e ajustar pelo consumo real evita estourar cotas sem punir o usuário." />
+</QuizSet>

@@ -1,0 +1,99 @@
+---
+title: Saídas não determinísticas
+kind: lesson
+---
+
+Chame uma função de soma duas vezes com os mesmos argumentos e você recebe o mesmo número. Chame um LLM duas vezes com o mesmo prompt e pode receber duas respostas diferentes, às vezes uma certa e outra errada, às vezes um JSON válido e outro quebrado. Isso afeta tudo que o resto do sistema assume: testes, cache, reprodução de bugs, integração com código que espera um formato fixo. Na entrevista, saber de onde vem essa variação e como contê-la mostra que você já operou um sistema desses de verdade.
+
+## De onde vem a variação
+
+- **Amostragem.** A cada passo, o modelo produz uma distribuição de probabilidade sobre o próximo token. Com temperatura acima de zero, o token é sorteado dessa distribuição. A temperatura achata (valores altos) ou afia (valores baixos) a distribuição.
+- **Ruído numérico.** Mesmo com temperatura zero, a ordem das operações em ponto flutuante varia com o tamanho do batch e o hardware. Num servidor com batching contínuo, sua requisição divide o lote com outras diferentes a cada vez, e pequenas diferenças numéricas podem mudar um token, o que muda todo o resto.
+- **Mudanças fora do seu controle.** O provedor atualiza o modelo, a recuperação traz documentos diferentes porque a base mudou, o histórico tem um turno a mais.
+
+A consequência prática: **não conte com determinismo bit a bit**, nem com temperatura zero. Projete o sistema para tolerar variação.
+
+## O efeito da temperatura
+
+O programa abaixo amostra o próximo token a partir de logits fixos (números hipotéticos) com três temperaturas e conta quantas vezes cada token sai em mil sorteios. A semente fixa só serve para a saída do exemplo ser reproduzível.
+
+```python
+import math, random
+
+logits = {"aprovado": 2.0, "pendente": 1.2, "recusado": 0.3}
+
+def distribuicao(t):
+    exps = {k: math.exp(v / t) for k, v in logits.items()}
+    s = sum(exps.values())
+    return {k: e / s for k, e in exps.items()}
+
+rng = random.Random(42)
+for t in (0.2, 1.0, 2.0):
+    d = distribuicao(t)
+    amostras = rng.choices(list(d), weights=list(d.values()), k=1000)
+    cont = {k: amostras.count(k) for k in logits}
+    print(f"T={t}: " + "  ".join(f"{k}={cont[k]}" for k in logits))
+
+# Quantas tentativas para garantir JSON valido em 99,9% dos casos?
+p_valido = 0.95          # taxa hipotetica de saida valida por tentativa
+alvo = 0.999
+n = 1
+while 1 - (1 - p_valido) ** n < alvo:
+    n += 1
+print(f"tentativas necessarias: {n} (sucesso {1 - (1 - p_valido) ** n:.5f})")
+custo_medio = sum((1 - p_valido) ** i for i in range(n))
+print(f"chamadas medias por requisicao: {custo_medio:.4f}")
+```
+
+```text
+Saída:
+T=0.2: aprovado=978  pendente=21  recusado=1
+T=1.0: aprovado=614  pendente=289  recusado=97
+T=2.0: aprovado=469  pendente=321  recusado=210
+tentativas necessarias: 3 (sucesso 0.99987)
+chamadas medias por requisicao: 1.0525
+```
+
+Duas lições. Para tarefas com resposta certa (classificação, extração), temperatura baixa concentra a probabilidade no token mais provável. E retries com validação transformam uma taxa de sucesso de 95% em 99,9% com poucas tentativas extras e custo médio quase igual a uma chamada, desde que as falhas sejam independentes.
+
+## Técnicas para conter a variação
+
+### Saída estruturada
+
+Peça JSON com um esquema explícito e valide. Muitos servidores e provedores oferecem decodificação restrita, que só permite tokens compatíveis com o esquema; quando não houver, valide e repita com a mensagem de erro no prompt. O código a jusante nunca deve fazer parsing otimista.
+
+### Temperatura por tarefa
+
+Temperatura baixa para extração, classificação e chamadas de ferramenta; mais alta para redação criativa e geração de alternativas. Isso é configuração do prompt no registro, não decisão espalhada pelo código.
+
+### Votação e verificação
+
+Para decisões importantes, gere várias respostas e escolha a mais frequente (autoconsistência), ou use um verificador: um teste automático (o código compila? a soma bate?), um segundo modelo ou uma regra de negócio. Custa mais chamadas e deve ser reservado para onde o erro é caro.
+
+### Reprodutibilidade operacional
+
+Registre tudo que influencia a resposta: versão do prompt, modelo e versão, parâmetros de amostragem, semente se houver, documentos recuperados e histórico. Você não vai reproduzir o mesmo texto, mas vai conseguir entender por que a resposta saiu daquele jeito.
+
+## Testando um sistema não determinístico
+
+| Abordagem | O que verifica | Limitação |
+| --- | --- | --- |
+| Asserções exatas | Nada útil, quebram à toa | Saída varia |
+| Asserções de propriedade | Formato, campos, citações válidas, tamanho | Não mede qualidade do conteúdo |
+| Conjunto de avaliação com notas | Qualidade agregada por critério | Exige rotulagem e manutenção |
+| LLM como juiz | Qualidade em escala | O juiz também erra; calibre com humanos |
+
+A ideia central é trocar "a resposta é igual à esperada" por "a taxa de respostas boas no conjunto não caiu". Rode cada caso mais de uma vez quando a variância importar e compare distribuições, não amostras únicas.
+
+<Callout type="note" title="Temperatura zero não é contrato">
+Mesmo com temperatura zero, variações numéricas e atualizações de modelo podem mudar a resposta. Use temperatura baixa para reduzir variação, não para garantir igualdade.
+</Callout>
+
+## Na entrevista
+
+Quando o desenho tiver um consumidor programático da saída do modelo, diga como garante o formato (esquema, validação, retry limitado) e o que acontece após esgotar as tentativas (fallback para outro modelo ou erro tratado). Follow-ups comuns: "como você faz teste de regressão?" (conjunto de avaliação com métricas agregadas) e "o cache não quebra com respostas variadas?" (ao contrário: cachear fixa uma resposta boa e reduz variação para perguntas repetidas).
+
+<QuizSet>
+<Quiz question="Uma integração quebra 3% das vezes porque o modelo devolve JSON inválido, mesmo com temperatura zero. O que fazer?" options={["Aumentar a temperatura", "Validar contra um esquema, usar decodificação restrita quando disponível e repetir com limite de tentativas", "Fazer parsing com regex tolerante e seguir", "Trocar JSON por texto livre"]} answer={1} explanation="Temperatura zero não garante formato; validação e retry limitado levam a taxa de falha a níveis aceitáveis." />
+<Quiz question="Por que asserções de igualdade exata são um teste ruim para respostas de LLM?" options={["Porque são lentas", "Porque a saída varia legitimamente; o teste deve verificar propriedades e qualidade agregada", "Porque LLMs não podem ser testados", "Porque o provedor proíbe"]} answer={1} explanation="Testes por propriedade e conjuntos de avaliação medem o que importa sem quebrar a cada variação inofensiva." />
+</QuizSet>

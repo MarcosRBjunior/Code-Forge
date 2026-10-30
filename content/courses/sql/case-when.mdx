@@ -1,0 +1,170 @@
+---
+title: Expressões CASE
+kind: lesson
+---
+
+`CASE` é o `if` do SQL. Ele aparece em entrevistas em três papéis: classificar linhas em faixas ("cliente bronze, prata ou ouro"), transformar linhas em colunas (o famoso pivot) e montar ordenações personalizadas. Dominar `CASE` dentro de agregações resolve uma quantidade enorme de perguntas de relatório em uma única consulta.
+
+## As duas formas
+
+A forma **pesquisada** avalia condições em ordem e devolve o resultado da primeira verdadeira:
+
+```text
+CASE
+  WHEN condição_1 THEN resultado_1
+  WHEN condição_2 THEN resultado_2
+  ELSE resultado_padrão
+END
+```
+
+A forma **simples** compara uma expressão com valores: `CASE status WHEN 'pago' THEN 1 WHEN 'estornado' THEN -1 END`. Ela só faz igualdade, então não serve para faixas nem para `NULL`.
+
+Se nenhuma condição for verdadeira e não houver `ELSE`, o resultado é `NULL`. Todos os ramos precisam devolver tipos compatíveis.
+
+```sql
+CREATE TABLE assinaturas (
+  id          integer PRIMARY KEY,
+  usuario     text NOT NULL,
+  plano       text NOT NULL,
+  status      text NOT NULL,
+  mensalidade numeric(8, 2) NOT NULL,
+  meses       integer NOT NULL,
+  pais        text
+);
+
+INSERT INTO assinaturas VALUES
+  (1, 'ana', 'pro', 'ativa', 49.90, 26, 'BR'),
+  (2, 'bruno', 'basico', 'ativa', 19.90, 3, 'BR'),
+  (3, 'carla', 'pro', 'cancelada', 49.90, 11, 'PT'),
+  (4, 'diego', 'equipe', 'ativa', 199.00, 14, 'BR'),
+  (5, 'elisa', 'basico', 'inadimplente', 19.90, 7, NULL),
+  (6, 'fabio', 'pro', 'ativa', 49.90, 1, 'AR'),
+  (7, 'gabi', 'equipe', 'cancelada', 199.00, 30, 'BR'),
+  (8, 'hugo', 'basico', 'ativa', 19.90, 18, 'PT');
+
+SELECT usuario,
+       meses,
+       CASE
+         WHEN meses >= 24 THEN 'veterano'
+         WHEN meses >= 12 THEN 'fiel'
+         WHEN meses >= 3 THEN 'regular'
+         ELSE 'novo'
+       END AS faixa
+FROM assinaturas
+ORDER BY meses DESC;
+```
+
+```text
+Saída:
+usuario | meses | faixa
+gabi | 30 | veterano
+ana | 26 | veterano
+hugo | 18 | fiel
+diego | 14 | fiel
+carla | 11 | regular
+elisa | 7 | regular
+bruno | 3 | regular
+fabio | 1 | novo
+```
+
+A ordem dos `WHEN` importa. Como o banco para na primeira condição verdadeira, `meses >= 12` não precisa de `AND meses < 24`. Se você invertesse a ordem, todo veterano cairia em "regular".
+
+## CASE dentro de agregações: pivot
+
+Transformar valores de uma coluna em colunas separadas é a pergunta de relatório mais comum. Combine `CASE` com `sum` ou `count`:
+
+```sql
+SELECT plano,
+       count(*) AS total,
+       count(CASE WHEN status = 'ativa' THEN 1 END) AS ativas,
+       count(CASE WHEN status = 'cancelada' THEN 1 END) AS canceladas,
+       sum(CASE WHEN status = 'ativa' THEN mensalidade ELSE 0 END) AS mrr
+FROM assinaturas
+GROUP BY plano
+ORDER BY mrr DESC;
+```
+
+```text
+Saída:
+plano | total | ativas | canceladas | mrr
+equipe | 2 | 1 | 1 | 199.00
+pro | 3 | 2 | 1 | 99.80
+basico | 3 | 2 | 0 | 39.80
+```
+
+O truque no `count` é que `CASE` sem `ELSE` devolve `NULL` quando a condição falha, e `count` ignora nulos. No `sum`, o `ELSE 0` garante zero em vez de `NULL` quando nenhuma linha do grupo casa. Esse padrão funciona igual em Postgres e MySQL. No Postgres, `count(*) FILTER (WHERE status = 'ativa')` faz o mesmo de forma mais legível.
+
+## Taxas condicionais
+
+Combinando `CASE` com `avg`, você obtém uma proporção diretamente, porque a média de uma coluna de zeros e uns é a fração de uns:
+
+```sql
+SELECT COALESCE(pais, 'desconhecido') AS pais,
+       count(*) AS usuarios,
+       round(avg(CASE WHEN status = 'ativa' THEN 1.0 ELSE 0 END), 2) AS taxa_ativos
+FROM assinaturas
+GROUP BY COALESCE(pais, 'desconhecido')
+ORDER BY usuarios DESC, pais;
+```
+
+```text
+Saída:
+pais | usuarios | taxa_ativos
+BR | 4 | 0.75
+PT | 2 | 0.50
+AR | 1 | 1.00
+desconhecido | 1 | 0.00
+```
+
+O `1.0` força a média em `numeric`; com `1` e `0` inteiros, o Postgres também calcularia a média como `numeric`, mas o `1.0` deixa a intenção explícita e evita surpresas em outros bancos.
+
+## Ordenação personalizada
+
+Quando a ordem do negócio não é alfabética, use `CASE` no `ORDER BY`:
+
+```sql
+SELECT usuario, status
+FROM assinaturas
+ORDER BY CASE status
+           WHEN 'inadimplente' THEN 1
+           WHEN 'ativa' THEN 2
+           ELSE 3
+         END,
+         usuario;
+```
+
+```text
+Saída:
+usuario | status
+elisa | inadimplente
+ana | ativa
+bruno | ativa
+diego | ativa
+fabio | ativa
+hugo | ativa
+carla | cancelada
+gabi | cancelada
+```
+
+O MySQL também tem `FIELD(status, 'inadimplente', 'ativa')` para isso, mas `CASE` é portátil.
+
+## Armadilhas
+
+- **`CASE` simples com `NULL`**: `CASE pais WHEN NULL THEN ...` nunca casa, porque a comparação é por igualdade. Use a forma pesquisada com `WHEN pais IS NULL`.
+- **Tipos incompatíveis**: `CASE WHEN x THEN 'alto' ELSE 0 END` dá erro no Postgres. O MySQL converte silenciosamente.
+- **Esquecer o `ELSE`**: em classificações, linhas que não casam viram `NULL` e podem sumir de um relatório.
+- **Ordem dos ramos**: condições mais específicas primeiro.
+
+<Callout type="note" title="CASE não substitui o WHERE">
+Se a pergunta só quer as assinaturas ativas, filtre no `WHERE`. Use `CASE` dentro da agregação quando precisar de várias métricas com filtros diferentes na mesma linha do resultado.
+</Callout>
+
+## Na entrevista
+
+Quando o enunciado pedir "uma coluna para cada status" ou "quantos de cada tipo, lado a lado", reconheça o pivot e escreva `sum(CASE ...)` ou `count(CASE ...)` agrupado pela dimensão da linha. Explique por que o `count` funciona sem `ELSE`. Follow-ups comuns: "e se os status forem dinâmicos?" (SQL não cria colunas dinamicamente; seria preciso montar a consulta na aplicação ou usar `crosstab` da extensão `tablefunc`) e "como calcular a taxa de cancelamento por plano?" (`avg` de um `CASE` com 1 e 0).
+
+<QuizSet>
+<Quiz question="Um CASE sem ELSE em que nenhuma condição é verdadeira devolve:" options={["0", "Texto vazio", "NULL", "Erro"]} answer={2} explanation="Sem ELSE, o resultado padrão é NULL. Isso é o que faz count(CASE WHEN ... THEN 1 END) contar só as linhas que casam." />
+<Quiz question="As faixas WHEN meses >= 3 THEN 'regular' WHEN meses >= 12 THEN 'fiel' estão nessa ordem. O que acontece com quem tem 20 meses?" options={["Vira fiel", "Vira regular, porque a primeira condição verdadeira vence", "Vira NULL", "Erro de sobreposição"]} answer={1} explanation="O CASE para no primeiro WHEN verdadeiro. Coloque as condições mais restritivas primeiro." />
+<Quiz question="Como contar assinaturas canceladas por plano em uma coluna, de forma portátil?" options={["count(status = 'cancelada')", "sum(CASE WHEN status = 'cancelada' THEN 1 ELSE 0 END)", "count(DISTINCT status)", "max(status)"]} answer={1} explanation="sum de um CASE com 1 e 0 funciona em qualquer banco. count(status = 'cancelada') contaria todas as linhas, porque false não é nulo." />
+</QuizSet>

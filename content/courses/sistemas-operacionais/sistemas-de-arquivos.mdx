@@ -1,0 +1,158 @@
+---
+title: Sistemas de arquivos e inodes
+kind: lesson
+---
+
+Um disco, para o hardware, é só uma sequência enorme de blocos numerados. Arquivos com nome, diretórios, permissões, datas e links são uma construção do **sistema de arquivos**. Entender como ele organiza esses blocos explica comportamentos que pegam engenheiros de surpresa: o disco "cheio" com espaço sobrando, o arquivo apagado que continua ocupando espaço, o `mv` instantâneo de 50 GB e o rename atômico que todo banco de dados usa.
+
+## Inodes: o arquivo sem o nome
+
+Em sistemas Unix (ext4, XFS, btrfs), cada arquivo é representado por um **inode**: uma estrutura com tudo sobre o arquivo, **exceto o nome**.
+
+| No inode | Fora do inode |
+| --- | --- |
+| Tipo, permissões, dono | O nome do arquivo |
+| Tamanho, datas (mtime, ctime, atime) | O caminho |
+| Contador de links | |
+| Ponteiros para os blocos de dados (ou extents) | |
+
+O nome mora no **diretório**, que é só um arquivo especial contendo pares nome → número de inode. Abrir `/home/ana/notas.txt` significa: ler o diretório raiz, achar `home` e seu inode, ler esse diretório, achar `ana`, e assim por diante até o inode de `notas.txt`.
+
+```text
+ diretório /home/ana               tabela de inodes            blocos
+ ┌──────────────┬───────┐          ┌──────┬──────────────┐
+ │ notas.txt    │  812  │ ───────► │ 812  │ links=2      │ ──► [b40][b41][b77]
+ │ backup.txt   │  812  │ ───────► │      │ tam=10 KB    │
+ │ foto.jpg     │  913  │          │      │ modo=0644    │
+ └──────────────┴───────┘          └──────┴──────────────┘
+```
+
+## Links e por que apagar não libera espaço
+
+Um **hard link** é só mais uma entrada de diretório apontando para o mesmo inode. Não existe "original" e "cópia": os dois nomes são equivalentes. Por isso apagar um arquivo é, na verdade, `unlink`: remove o nome e decrementa o contador. O inode e os blocos só são liberados quando o contador de links chega a zero **e** nenhum processo mantém o arquivo aberto.
+
+Um **link simbólico** é diferente: é um arquivo pequeno cujo conteúdo é um caminho. Pode apontar para outro sistema de arquivos ou para algo que nem existe.
+
+A simulação implementa um mini sistema de arquivos com inodes, hard links e o detalhe dos arquivos abertos:
+
+```python
+class MiniFS:
+    def __init__(self):
+        self.inodes = {}
+        self.diretorio = {}
+        self.proximo = 100
+
+    def criar(self, nome, dados):
+        ino = self.proximo
+        self.proximo += 1
+        self.inodes[ino] = {"links": 1, "abertos": 0, "dados": dados}
+        self.diretorio[nome] = ino
+
+    def link(self, existente, novo):
+        ino = self.diretorio[existente]
+        self.diretorio[novo] = ino
+        self.inodes[ino]["links"] += 1
+
+    def abrir(self, nome):
+        ino = self.diretorio[nome]
+        self.inodes[ino]["abertos"] += 1
+        return ino
+
+    def fechar(self, ino):
+        self.inodes[ino]["abertos"] -= 1
+        self._talvez_liberar(ino)
+
+    def unlink(self, nome):
+        ino = self.diretorio.pop(nome)
+        self.inodes[ino]["links"] -= 1
+        self._talvez_liberar(ino)
+
+    def _talvez_liberar(self, ino):
+        i = self.inodes[ino]
+        if i["links"] == 0 and i["abertos"] == 0:
+            del self.inodes[ino]
+
+    def espaco_usado(self):
+        return sum(len(i["dados"]) for i in self.inodes.values())
+
+fs = MiniFS()
+fs.criar("app.log", "x" * 5000)
+fs.link("app.log", "app.log.bkp")
+print("nomes:", sorted(fs.diretorio), "inode:", fs.diretorio["app.log"], "links:", fs.inodes[100]["links"])
+
+fd = fs.abrir("app.log")          # um processo segue escrevendo no log
+fs.unlink("app.log")
+fs.unlink("app.log.bkp")
+print("depois do rm: nomes =", sorted(fs.diretorio), "| espaco usado =", fs.espaco_usado())
+fs.fechar(fd)
+print("depois de fechar:      espaco usado =", fs.espaco_usado())
+```
+
+```text
+Saída:
+nomes: ['app.log', 'app.log.bkp'] inode: 100 links: 2
+depois do rm: nomes = [] | espaco usado = 5000
+depois de fechar:      espaco usado = 0
+```
+
+É exatamente o que acontece quando você apaga um log de 40 GB e o `df` continua mostrando o disco cheio: o processo ainda tem o arquivo aberto. `lsof +L1` lista esses arquivos; reiniciar o processo (ou truncar o arquivo em vez de apagá-lo) libera o espaço.
+
+## Como os blocos são encontrados
+
+O ext2/ext3 clássico guardava 12 ponteiros diretos no inode, mais um ponteiro indireto simples, um duplo e um triplo. Arquivos pequenos ficam baratos e arquivos grandes ainda cabem. O ext4 e o XFS preferem **extents**, que descrevem faixas contíguas ("blocos 5.000 a 5.999") e são muito mais compactos.
+
+```python
+BLOCO = 4096
+PONTEIRO = 4
+por_bloco = BLOCO // PONTEIRO
+
+diretos = 12
+simples = por_bloco
+duplo = por_bloco ** 2
+triplo = por_bloco ** 3
+
+for nome, blocos in [("diretos", diretos), ("+ indireto simples", diretos + simples),
+                     ("+ indireto duplo", diretos + simples + duplo),
+                     ("+ indireto triplo", diretos + simples + duplo + triplo)]:
+    tamanho = blocos * BLOCO
+    for unidade, fator in [("TiB", 2**40), ("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10)]:
+        if tamanho >= fator:
+            print(f"{nome:<20} ate {tamanho / fator:8.2f} {unidade}")
+            break
+```
+
+```text
+Saída:
+diretos              ate    48.00 KiB
++ indireto simples   ate     4.05 MiB
++ indireto duplo     ate     4.00 GiB
++ indireto triplo    ate     4.00 TiB
+```
+
+## Operações que importam no dia a dia
+
+- **`rename` é atômico** dentro do mesmo sistema de arquivos: só troca entradas de diretório. Por isso o padrão seguro para atualizar um arquivo é escrever num temporário, fazer `fsync` e renomear por cima do original. Quem lê vê o arquivo antigo ou o novo, nunca um pela metade.
+- **`mv` no mesmo sistema de arquivos é instantâneo**, qualquer que seja o tamanho; entre sistemas de arquivos diferentes vira cópia mais remoção.
+- **Inodes acabam.** Milhões de arquivos minúsculos (cache de sessões, filas em disco) podem esgotar os inodes com espaço sobrando: `df -i` mostra.
+- **Journaling** (ext4, XFS) registra as mudanças de metadados num log antes de aplicá-las, para que uma queda de energia não deixe o sistema de arquivos inconsistente.
+
+<Callout type="note" title="VFS: uma interface, muitos sistemas de arquivos">
+O kernel expõe `open`, `read` e `write` iguais para ext4, XFS, NFS, `tmpfs` e até `/proc`. Essa camada é o VFS. É por ela que, em Linux, "tudo é arquivo", e é ela que permite ao overlayfs montar as camadas de uma imagem de container.
+</Callout>
+
+```bash
+stat arquivo.txt          # mostra inode, links e datas
+ls -li                    # número do inode na listagem
+df -i                     # uso de inodes
+lsof +L1                  # arquivos apagados ainda abertos
+```
+
+## Na entrevista
+
+Explique que o inode guarda metadados e ponteiros, e o diretório guarda nomes; a partir disso derive hard links, o comportamento do `rm` e o rename atômico. Follow-ups comuns: "apaguei um arquivo enorme e o espaço não voltou, por quê?" (um processo ainda o mantém aberto) e "como garantir que um arquivo de configuração nunca seja lido pela metade?" (escrever em temporário, `fsync` e `rename`).
+
+<QuizSet>
+<Quiz question="Onde fica o nome de um arquivo num sistema de arquivos Unix?" options={["No inode", "Na entrada do diretório que aponta para o inode", "No primeiro bloco de dados", "No superbloco"]} answer={1} explanation="O inode não tem nome; diretórios mapeiam nomes para números de inode, o que permite vários nomes para o mesmo arquivo." />
+<Quiz question="Você apaga um log de 30 GB, mas o df continua mostrando o disco cheio. O que está acontecendo?" options={["O df está com cache desatualizado", "Um processo ainda mantém o arquivo aberto, então o inode e os blocos não foram liberados", "O arquivo foi para a lixeira", "O journal está guardando uma cópia"]} answer={1} explanation="O espaço só é liberado quando não há links nem descritores abertos; reinicie o processo ou trunque o arquivo." />
+<Quiz question="Como atualizar um arquivo de configuração de modo que leitores nunca vejam conteúdo parcial?" options={["Escrever direto no arquivo com write grande", "Escrever num arquivo temporário, fazer fsync e renomeá-lo por cima do original", "Apagar e recriar o arquivo", "Usar um link simbólico para o diretório"]} answer={1} explanation="O rename no mesmo sistema de arquivos é atômico: leitores veem a versão antiga ou a nova inteira." />
+</QuizSet>

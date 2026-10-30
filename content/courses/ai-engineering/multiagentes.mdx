@@ -1,0 +1,131 @@
+---
+title: Sistemas multiagente
+kind: lesson
+---
+
+Um único agente com 40 ferramentas, um system prompt de 5 páginas e um histórico que cresce a cada passo começa a se perder: escolhe a ferramenta errada, esquece instruções e enche o contexto de resultados irrelevantes. Uma resposta é dividir o trabalho entre vários agentes, cada um com um papel, poucas ferramentas e um contexto limpo. Isso é um **sistema multiagente**. A ideia é poderosa, mas também é uma das formas mais fáceis de multiplicar custo e complexidade sem ganho real.
+
+## Por que dividir
+
+- **Contexto isolado:** cada subagente vê só o que precisa. Uma pesquisa que lê 30 páginas devolve ao coordenador um resumo de 10 linhas, não as 30 páginas.
+- **Especialização:** prompts e ferramentas focados num papel (pesquisador, programador, revisor) funcionam melhor do que um prompt que tenta cobrir tudo.
+- **Paralelismo:** subtarefas independentes rodam ao mesmo tempo, reduzindo a latência total.
+- **Separação de permissões:** o agente que lê e-mails não precisa da ferramenta que faz pagamentos.
+
+## Padrões comuns
+
+```text
+ORQUESTRADOR E TRABALHADORES          PIPELINE                 GERADOR E CRÍTICO
+        orquestrador                  A ──► B ──► C            gerador ──► crítico
+       /     |      \                                              ▲          │
+  trab. 1  trab. 2  trab. 3                                        └─ ajustes ┘
+       \     |      /
+         síntese
+```
+
+- **Orquestrador e trabalhadores:** um agente decompõe a tarefa, delega subtarefas e sintetiza os resultados. Bom para pesquisa ampla e tarefas paralelizáveis.
+- **Roteamento e handoff:** um agente de triagem identifica a intenção e passa a conversa a um especialista (cobrança, suporte técnico).
+- **Pipeline:** etapas fixas, cada uma feita por um agente. Na prática é um workflow.
+- **Gerador e crítico:** um produz, outro avalia com critérios explícitos, e o ciclo se repete até aprovar ou atingir um limite.
+
+O programa simula o orquestrador com trabalhadores em paralelo. Os "agentes" são funções determinísticas, mas a estrutura (decompor, executar com contexto isolado, sintetizar) é a de um sistema real.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+FONTES = {
+    "preco": "Concorrente A cobra 49 por mês; concorrente B cobra 59 por mês.",
+    "recursos": "A tem integração com ERP; B tem app mobile e API pública.",
+    "reclamacoes": "A recebe queixas de suporte lento; B de cobrança duplicada.",
+}
+
+def orquestrador_planejar(tarefa):
+    return [f"pesquisar {aspecto}" for aspecto in FONTES]
+
+def trabalhador(subtarefa):
+    aspecto = subtarefa.split()[-1]
+    contexto = FONTES[aspecto]                 # só o que esse trabalhador precisa
+    resumo = contexto.split(";")[0]           # "resumir": devolve algo curto
+    return {"aspecto": aspecto, "resumo": resumo, "tokens_lidos": len(contexto.split())}
+
+def sintetizar(resultados):
+    return " | ".join(f"{r['aspecto']}: {r['resumo']}" for r in resultados)
+
+tarefa = "Compare os concorrentes A e B"
+subtarefas = orquestrador_planejar(tarefa)
+with ThreadPoolExecutor(max_workers=3) as pool:
+    resultados = list(pool.map(trabalhador, subtarefas))   # map preserva a ordem
+
+for r in resultados:
+    print(f"{r['aspecto']:12s} leu {r['tokens_lidos']} palavras, devolveu: {r['resumo']}")
+print("síntese:", sintetizar(resultados))
+```
+
+```text
+Saída:
+preco        leu 12 palavras, devolveu: Concorrente A cobra 49 por mês
+recursos     leu 12 palavras, devolveu: A tem integração com ERP
+reclamacoes  leu 10 palavras, devolveu: A recebe queixas de suporte lento
+síntese: preco: Concorrente A cobra 49 por mês | recursos: A tem integração com ERP | reclamacoes: A recebe queixas de suporte lento
+```
+
+Repare que o "resumo" ingênuo de cada trabalhador descartou tudo sobre o concorrente B. A síntese parece completa, mas está errada: é a perda de informação entre agentes, um dos custos discutidos adiante.
+
+## Gerador e crítico
+
+Separar quem escreve de quem avalia ajuda porque o crítico recebe critérios objetivos e não está "comprometido" com o texto. O exemplo usa regras simples no lugar de um LLM crítico.
+
+```python
+def gerador(tentativa, feedback):
+    rascunhos = [
+        "Olá! Seu reembolso foi aprovado.",
+        "Olá! Seu reembolso foi aprovado e cai em até 10 dias úteis.",
+        "Olá! Seu reembolso de R$ 120 foi aprovado e cai em até 10 dias úteis.",
+    ]
+    return rascunhos[tentativa]
+
+def critico(texto):
+    problemas = []
+    if "dias" not in texto:
+        problemas.append("falta o prazo")
+    if "R$" not in texto:
+        problemas.append("falta o valor")
+    return problemas
+
+feedback = []
+for tentativa in range(3):
+    texto = gerador(tentativa, feedback)
+    feedback = critico(texto)
+    print(f"tentativa {tentativa + 1}: {'aprovado' if not feedback else feedback}")
+    if not feedback:
+        print("final:", texto)
+        break
+```
+
+```text
+Saída:
+tentativa 1: ['falta o prazo', 'falta o valor']
+tentativa 2: ['falta o valor']
+tentativa 3: aprovado
+final: Olá! Seu reembolso de R$ 120 foi aprovado e cai em até 10 dias úteis.
+```
+
+## Os custos reais
+
+- **Tokens:** cada agente tem seu system prompt, ferramentas e raciocínio. Sistemas multiagente costumam gastar várias vezes mais tokens que um agente único na mesma tarefa.
+- **Perda de informação entre agentes:** o resumo que o trabalhador devolve pode omitir justo o detalhe decisivo. Defina o formato do que cada um retorna.
+- **Coordenação:** trabalhadores podem duplicar esforço ou tomar decisões conflitantes (dois agentes editando o mesmo arquivo). Tarefas com muita dependência entre partes se beneficiam pouco.
+- **Depuração:** um erro pode nascer num agente e aparecer três agentes depois. Sem tracing com a árvore de chamadas, é quase impossível investigar.
+
+<Callout type="tip" title="Comece com um agente">
+Só divida quando houver um motivo mensurável: contexto que não cabe, subtarefas independentes e paralelizáveis, ou permissões que precisam ser separadas. Um agente bem desenhado com boas ferramentas resolve a maioria dos casos com menos custo.
+</Callout>
+
+## Na entrevista
+
+Mostre que você conhece os padrões (orquestrador-trabalhadores, roteamento, pipeline, gerador-crítico) e, principalmente, quando **não** usá-los. Justifique a divisão com contexto, paralelismo ou permissões e cite os custos: tokens, perda de informação nas passagens, coordenação e observabilidade. Follow-ups: "como os agentes trocam informação?" (mensagens estruturadas com formato definido, ou um estado compartilhado com escrita controlada) e "como evitar que o crítico e o gerador fiquem em ciclo eterno?" (limite de iterações e critérios objetivos).
+
+<QuizSet>
+<Quiz question="Qual é o melhor argumento para usar subagentes numa tarefa de pesquisa ampla?" options={["Subagentes sempre gastam menos tokens", "Cada subagente explora uma frente em paralelo, com contexto isolado, e devolve só um resumo ao orquestrador", "Modelos menores ficam mais inteligentes em grupo", "Evita a necessidade de ferramentas"]} answer={1} explanation="O ganho vem de paralelismo e de manter o contexto do orquestrador limpo. O custo total em tokens normalmente aumenta." />
+<Quiz question="Num sistema multiagente, a resposta final omite um dado que um trabalhador encontrou. Qual a causa mais provável?" options={["Temperatura alta no orquestrador", "Perda de informação na passagem: o resumo devolvido pelo trabalhador não incluía o dado", "Falta de cache", "O modelo do trabalhador é grande demais"]} answer={1} explanation="Cada passagem entre agentes é uma compressão. Defina o formato e os campos obrigatórios do que cada agente devolve." />
+</QuizSet>

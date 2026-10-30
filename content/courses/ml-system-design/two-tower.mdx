@@ -1,0 +1,127 @@
+---
+title: Modelos two-tower
+kind: lesson
+---
+
+A recuperação precisa achar algumas centenas de itens relevantes entre milhões em poucos milissegundos. Um modelo que recebe o par usuário-item e devolve um score não serve: você teria de rodá-lo milhões de vezes por requisição. A ideia do **two-tower** (duas torres) é separar o cálculo: uma rede transforma o usuário num vetor, outra transforma o item num vetor, e a relevância é simplesmente o **produto interno** entre os dois. Como os vetores dos itens não dependem do usuário, você os calcula antes e os coloca num índice de vizinhos mais próximos.
+
+## Como funciona
+
+```text
+ features do usuario            features do item
+ (id, historico, pais,          (id, categoria, texto,
+  hora, dispositivo)             idade, criador)
+        |                              |
+  +-----v------+                 +-----v------+
+  | torre do   |                 | torre do   |
+  | usuario    |                 | item       |
+  +-----+------+                 +-----+------+
+        | u (ex.: 64 dims)             | v (64 dims)
+        +-------------+----------------+
+                      |
+               score = u . v
+```
+
+- **Treino:** pares positivos (o usuário clicou, assistiu, comprou) contra negativos. Os negativos mais usados são os **in-batch**: num lote de B pares, os itens dos outros B - 1 pares servem de negativos para cada usuário, e a perda é uma softmax sobre o lote. É barato, mas favorece punir itens populares (eles aparecem mais nos lotes), o que se corrige subtraindo o log da frequência do item do score durante o treino.
+- **Indexação:** um job batch roda a torre do item sobre o catálogo inteiro e publica os vetores num índice ANN (HNSW, IVF, quantização de produto).
+- **Servimento:** a cada requisição, roda só a torre do usuário (uma inferência), consulta o índice e recebe os K itens de maior produto interno em poucos milissegundos.
+
+## Um two-tower de brinquedo
+
+O programa abaixo cria 60 usuários e 90 itens de 3 gêneros. Cada usuário prefere um gênero. A torre do item soma um embedding do id com um embedding do gênero; a do usuário é um embedding por id. O treino usa descida de gradiente com perda logística e negativos amostrados. Depois comparamos o acerto em interações separadas para teste com uma recomendação por popularidade.
+
+```python
+import math
+import random
+
+random.seed(1)
+D, U, I, G = 6, 60, 90, 3
+genero_item = [i % G for i in range(I)]
+gosto = [random.randrange(G) for _ in range(U)]
+
+def interacoes(n):
+    pares = []
+    for _ in range(n):
+        u = random.randrange(U)
+        g = gosto[u] if random.random() < 0.85 else random.randrange(G)
+        candidatos = [i for i in range(I) if genero_item[i] == g]
+        pares.append((u, random.choice(candidatos[: 10 + u % 20])))
+    return pares
+
+treino, teste = interacoes(3000), interacoes(300)
+
+def emb(n):
+    return [[random.gauss(0, 0.1) for _ in range(D)] for _ in range(n)]
+E_user, E_item, E_gen = emb(U), emb(I), emb(G)
+
+def torre_usuario(u):
+    return E_user[u]
+def torre_item(i):
+    return [a + b for a, b in zip(E_item[i], E_gen[genero_item[i]])]
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+lr = 0.1
+for epoca in range(15):
+    random.shuffle(treino)
+    for u, pos in treino:
+        for i, y in [(pos, 1)] + [(random.randrange(I), 0) for _ in range(3)]:
+            uv, iv = torre_usuario(u), torre_item(i)
+            g = 1 / (1 + math.exp(-dot(uv, iv))) - y
+            for d in range(D):
+                gu, gi = g * iv[d], g * uv[d]
+                E_user[u][d] -= lr * gu
+                E_item[i][d] -= lr * gi
+                E_gen[genero_item[i]][d] -= lr * gi * 0.2
+
+indice = [torre_item(i) for i in range(I)]  # pre-calculado, como num indice ANN
+popular = sorted(range(I), key=lambda i: -sum(1 for _, x in treino if x == i))[:10]
+
+def hit_rate(recomendar):
+    return sum(i in recomendar(u) for u, i in teste) / len(teste)
+
+def two_tower(u):
+    uv = torre_usuario(u)
+    return sorted(range(I), key=lambda i: -dot(uv, indice[i]))[:10]
+
+print(f"hit@10 popularidade: {hit_rate(lambda u: popular):.3f}")
+print(f"hit@10 two-tower:    {hit_rate(two_tower):.3f}")
+top = two_tower(0)[:5]
+print(f"usuario 0 gosta do genero {gosto[0]}; generos do top 5: {[genero_item[i] for i in top]}")
+```
+
+```text
+Saída:
+hit@10 popularidade: 0.153
+hit@10 two-tower:    0.440
+usuario 0 gosta do genero 0; generos do top 5: [0, 0, 0, 0, 0]
+```
+
+O two-tower acerta quase três vezes mais que a popularidade (0,44 contra 0,15) e, sem ninguém dizer quais são os gêneros, aprende a colocar no topo itens do gênero preferido do usuário. O que vale observar: a recomendação vem de um único produto interno por item, sobre vetores calculados antes. Num sistema real, essa varredura de 90 itens vira uma consulta ANN sobre milhões.
+
+## Trade-offs
+
+| Ponto | Vantagem | Limitação |
+| --- | --- | --- |
+| Separação das torres | Itens indexados offline; servimento barato | Sem interação fina entre features de usuário e item |
+| Produto interno | Busca ANN rápida | Expressividade menor que um ranqueador com features cruzadas |
+| Negativos in-batch | Treino eficiente | Viés de popularidade, exige correção |
+| Torre do item com conteúdo | Cobre itens novos | Embedding de id ainda é fraco para itens sem histórico |
+
+A limitação central é que usuário e item só se encontram no produto interno final. Uma feature como "este usuário já assistiu outros vídeos deste criador" não cabe naturalmente. Por isso o two-tower é ótimo para recuperação e raramente é o ranqueador final.
+
+Outros cuidados: os vetores do índice e a torre do usuário precisam vir **da mesma versão** do modelo (se você atualizar uma torre sem reindexar, os espaços deixam de ser compatíveis); e a torre do usuário pode usar features de sessão em tempo real, o que torna a recuperação sensível ao contexto.
+
+<Callout type="note" title="Itens novos">
+Se a torre do item usa só o id, um item recém-publicado tem embedding aleatório. Incluir conteúdo (texto, categoria, criador) na torre resolve boa parte do cold start na recuperação.
+</Callout>
+
+## Na entrevista
+
+Apresente o two-tower como a fonte principal de recuperação: descreva as features de cada torre, como escolher negativos e como o índice ANN é atualizado (reindexação periódica, inserções incrementais para itens novos). Follow-ups comuns: por que não usar o two-tower como ranqueador, como corrigir o viés de popularidade dos negativos in-batch, como manter as versões das torres sincronizadas e qual o custo de memória do índice (itens vezes dimensões vezes bytes por número).
+
+<QuizSet>
+<Quiz question="Por que o two-tower permite recuperar candidatos em milissegundos num catálogo de milhões?" options={["Porque a rede é pequena", "Porque os vetores dos itens são pré-calculados e a relevância é um produto interno, compatível com busca ANN", "Porque roda em GPU", "Porque só considera itens populares"]} answer={1} explanation="Com score = produto interno e vetores de itens fixos, a busca vira uma consulta de vizinhos mais próximos, que é sublinear." />
+<Quiz question="Você retreinou a torre do usuário e a publicou, mas o índice ainda tem os vetores de itens do modelo antigo. O que acontece?" options={["Nada, as torres são independentes", "As recomendações ficam sem sentido, pois os vetores vêm de espaços diferentes", "A latência aumenta", "Só os itens novos são afetados"]} answer={1} explanation="As duas torres aprendem um espaço compartilhado; misturar versões quebra a comparação por produto interno." />
+<Quiz question="Qual é a principal razão para não usar o two-tower como ranqueador final?" options={["É lento demais", "Não captura interações finas entre features do usuário e do item, que um ranqueador com features cruzadas captura", "Não pode ser treinado com cliques", "Precisa de rótulos manuais"]} answer={1} explanation="O encontro tardio no produto interno limita a expressividade; o ranqueador pode usar features cruzadas e modelos mais ricos sobre poucos candidatos." />
+</QuizSet>

@@ -1,0 +1,144 @@
+---
+title: Filas bloqueantes
+kind: lesson
+---
+
+Quase todo sistema concorrente tem um ponto em que uma parte do código produz trabalho e outra o consome. Você pode coordenar isso com lock e variável de condição, mas é fácil errar: esquecer o `while` em volta do `wait`, avisar a condição errada, deixar a fila crescer sem limite. A **fila bloqueante** empacota esse padrão numa estrutura pronta: ela é thread-safe, bloqueia quem tenta tirar de uma fila vazia e, se tiver capacidade máxima, bloqueia quem tenta colocar numa fila cheia.
+
+## Como funciona
+
+Por dentro, uma fila bloqueante é exatamente o que você montaria à mão: um buffer, um lock e duas condições, "não vazia" e "não cheia".
+
+```text
+ produtores                         consumidores
+   put() ──►  [ t1 | t2 | t3 | __ ]  ──► get()
+   bloqueia se cheia                 bloqueia se vazia
+              lock + not_full + not_empty
+```
+
+- `put(item)`: adquire o lock, espera enquanto a fila estiver cheia, insere e acorda um consumidor.
+- `get()`: adquire o lock, espera enquanto estiver vazia, remove e acorda um produtor.
+
+Esse limite de capacidade é o que dá **backpressure**: se os consumidores ficam lentos, os produtores param naturalmente em vez de encher a memória.
+
+Em Python a classe é `queue.Queue` (também existem `LifoQueue` e `PriorityQueue`). Em Java, a interface `BlockingQueue` tem `ArrayBlockingQueue` (limitada, array circular), `LinkedBlockingQueue` (opcionalmente limitada) e `SynchronousQueue` (capacidade zero, cada `put` espera um `take`). Em Go, o papel é do **canal** com buffer: `make(chan T, n)`. Em C++ não há fila bloqueante na biblioteca padrão; você escreve uma com `std::mutex` e `std::condition_variable`.
+
+## Exemplo: pipeline com fila limitada
+
+O programa abaixo tem um produtor e dois consumidores. O produtor envia um **sentinela** (`None`) por consumidor para avisar que acabou. Cada consumidor guarda seus resultados localmente e o programa só imprime depois dos `join`, com os dados ordenados, para a saída não depender do escalonador.
+
+```python
+import queue
+import threading
+
+fila = queue.Queue(maxsize=3)   # no máximo 3 itens esperando
+FIM = None
+resultados = []
+lock = threading.Lock()
+
+def produtor(n, consumidores):
+    for i in range(1, n + 1):
+        fila.put(i)              # bloqueia se a fila estiver cheia
+    for _ in range(consumidores):
+        fila.put(FIM)            # um sentinela por consumidor
+
+def consumidor():
+    locais = []
+    while True:
+        item = fila.get()        # bloqueia se a fila estiver vazia
+        if item is FIM:
+            break
+        locais.append(item * item)
+    with lock:
+        resultados.extend(locais)
+
+consumidores = [threading.Thread(target=consumidor) for _ in range(2)]
+for t in consumidores:
+    t.start()
+p = threading.Thread(target=produtor, args=(8, len(consumidores)))
+p.start()
+p.join()
+for t in consumidores:
+    t.join()
+
+print("quadrados:", sorted(resultados))
+print("soma:", sum(resultados))
+```
+
+```text
+Saída:
+quadrados: [1, 4, 9, 16, 25, 36, 49, 64]
+soma: 204
+```
+
+## Timeouts, operações não bloqueantes e task_done
+
+Bloquear para sempre raramente é o que você quer em produção. Toda fila bloqueante oferece variantes: esperar com tempo limite ou falhar na hora. Em Python, `put(item, timeout=s)` lança `queue.Full` e `get(timeout=s)` lança `queue.Empty`; `put_nowait` e `get_nowait` não esperam nada. Em Java são `offer`/`poll` com tempo, e em Go você usa `select` com `default` ou com `time.After`.
+
+Outra peça útil é a contagem de tarefas pendentes: cada `get` seguido de `task_done()` marca um item como processado, e `fila.join()` espera até todos os itens colocados terem sido concluídos.
+
+```python
+import queue
+import threading
+
+fila = queue.Queue(maxsize=2)
+fila.put("a")
+fila.put("b")
+try:
+    fila.put("c", timeout=0.05)
+except queue.Full:
+    print("cheia: 'c' foi recusado")
+
+print("tirou:", fila.get_nowait(), fila.get_nowait())
+try:
+    fila.get_nowait()
+except queue.Empty:
+    print("vazia: nada para tirar")
+
+trabalho = queue.Queue()         # fila nova: 'a' e 'b' nunca tiveram task_done
+processados = []
+
+def trabalhador():
+    while True:
+        item = trabalho.get()
+        processados.append(item.upper())
+        trabalho.task_done()     # avisa que este item terminou
+
+threading.Thread(target=trabalhador, daemon=True).start()
+for letra in "xyz":
+    trabalho.put(letra)
+trabalho.join()                  # espera todos os task_done
+print("processados:", processados)
+```
+
+```text
+Saída:
+cheia: 'c' foi recusado
+tirou: a b
+vazia: nada para tirar
+processados: ['X', 'Y', 'Z']
+```
+
+Aqui a ordem é garantida porque há um único trabalhador e a fila é FIFO.
+
+## Armadilhas e trade-offs
+
+- **Fila sem limite** esconde o problema: se o consumidor é mais lento, a memória cresce até o processo morrer. Prefira capacidade explícita.
+- **Encerramento**: sem sentinela, `close` ou cancelamento, consumidores ficam presos no `get` para sempre. Em Go, feche o canal e use `for x := range ch`; em Python 3.13, `Queue.shutdown()` também resolve.
+- **Esquecer `task_done`** faz o `join` travar; chamar a mais lança `ValueError`.
+- **Checar e agir**: `if not fila.empty(): fila.get()` é uma condição de corrida, porque outro consumidor pode esvaziar a fila entre as duas chamadas. Use `get_nowait` e trate a exceção.
+- **Capacidade** é um trade-off: pequena demais, produtores passam muito tempo bloqueados; grande demais, a latência dos itens enfileirados aumenta.
+
+<Callout type="tip" title="Fila como fronteira">
+Ao desenhar uma solução concorrente, pense em filas como fronteiras entre estágios. Cada estágio tem seu próprio número de threads, e o tamanho da fila define quanto trabalho pode se acumular entre eles.
+</Callout>
+
+## Na entrevista
+
+Se o problema tem estágios que produzem e consomem trabalho, proponha uma fila bloqueante limitada antes de escrever locks à mão, e explique o encerramento (sentinela ou fechamento) e o backpressure. Se pedirem para implementar a fila, use um lock com duas condições e `while` em volta de cada `wait`. Follow-ups comuns: "o que acontece se o consumidor for mais lento?" (a fila enche e o produtor bloqueia, ou você descarta com `offer` e tempo limite) e "como desligar os consumidores com segurança?" (um sentinela por consumidor ou fechar a fila).
+
+<QuizSet>
+<Quiz question="Um produtor gera eventos 10 vezes mais rápido que o consumidor processa. Qual o principal benefício de uma fila bloqueante com capacidade limitada?" options={["Faz o consumidor ficar mais rápido", "Aplica backpressure: o produtor bloqueia quando a fila enche, em vez de esgotar a memória", "Garante que nenhum evento será perdido mesmo se o processo cair", "Elimina a necessidade de locks no consumidor"]} answer={1} explanation="Com capacidade limitada, put bloqueia quando a fila está cheia, freando o produtor ao ritmo do consumidor." />
+<Quiz question="Você tem 4 consumidores lendo de uma fila e o produtor terminou. Qual é a forma mais simples de encerrá-los em Python?" options={["Chamar fila.empty() em cada consumidor", "Colocar 4 sentinelas na fila, um por consumidor", "Matar as threads com um sinal", "Colocar um único sentinela"]} answer={1} explanation="Cada consumidor consome um sentinela e sai. Com um só, apenas um consumidor terminaria e os outros ficariam presos no get." />
+<Quiz question="Por que 'if not fila.empty(): item = fila.get()' é perigoso com vários consumidores?" options={["empty() não existe em queue.Queue", "Outro consumidor pode pegar o último item entre a checagem e o get, e este get bloqueia", "get() sempre lança exceção", "A fila perde a ordem FIFO"]} answer={1} explanation="É um check-then-act: o estado muda entre as duas chamadas. Use get_nowait e trate queue.Empty." />
+</QuizSet>

@@ -1,0 +1,102 @@
+---
+title: Streaming de tokens com SSE
+kind: lesson
+---
+
+Se o modelo gera 40 tokens por segundo e a resposta tem 400 tokens, o usuário espera dez segundos por uma resposta síncrona. Com streaming, ele começa a ler em algumas centenas de milissegundos e a percepção de velocidade muda completamente, mesmo que o tempo total seja o mesmo. Quase todo produto de chat faz streaming, e na entrevista você precisa explicar como os tokens saem do servidor de inferência e chegam ao navegador passando por gateways, balanceadores e proxies.
+
+## Por que SSE
+
+Há três opções comuns:
+
+| Opção | Direção | Vantagens | Desvantagens |
+| --- | --- | --- | --- |
+| Server-Sent Events (SSE) | Servidor para cliente | HTTP comum, reconexão nativa, fácil de depurar | Só um sentido; texto |
+| WebSocket | Bidirecional | Baixa latência nos dois sentidos | Conexão com estado, mais difícil de balancear e observar |
+| Polling longo | Cliente pergunta | Funciona em qualquer lugar | Ineficiente e com mais latência |
+
+Para chat, o fluxo é essencialmente unidirecional: o cliente manda uma mensagem por POST e recebe uma sequência de pedaços. SSE encaixa bem: é uma resposta HTTP com `Content-Type: text/event-stream` que nunca fecha até o fim da geração, e cada evento é um bloco de linhas `data:` terminado por uma linha em branco. WebSocket faz sentido quando há interação contínua nos dois sentidos, como voz em tempo real ou edição colaborativa.
+
+## O caminho de um token
+
+```text
+servidor de inferencia --(gRPC stream)--> orquestrador --(SSE)--> gateway --(SSE)--> navegador
+         gera token          aplica guardrail incremental,      sem buffer,
+                             grava em buffer para o historico   timeout longo
+```
+
+Cada salto precisa repassar os pedaços assim que chegam. Os problemas clássicos são proxies que fazem **buffering** da resposta (o usuário vê tudo de uma vez no fim), **timeouts de inatividade** curtos que derrubam a conexão durante um prefill demorado e **compressão** que segura bytes até encher um bloco. A solução é desligar buffering e compressão nessa rota e mandar comentários de keep-alive enquanto o primeiro token não sai.
+
+## Simulando o fluxo
+
+O programa abaixo usa geradores para simular o servidor emitindo tokens e o orquestrador transformando-os em eventos SSE. O relógio é virtual, então nada espera de verdade. Ele também agrupa tokens em pedaços de até 3 para reduzir o número de eventos e mostra o cancelamento: quando o cliente desiste, o gerador para e a GPU deixa de gastar tokens com ele.
+
+```python
+def modelo(texto, ttft_ms=350, ms_por_token=25):
+    t = ttft_ms
+    for tok in texto.split(" "):
+        yield t, tok
+        t += ms_por_token
+
+def sse(tokens, agrupar=3, cancelar_em_ms=None):
+    buf = []
+    for t, tok in tokens:
+        if cancelar_em_ms is not None and t >= cancelar_em_ms:
+            yield t, "event: cancelado\ndata: \n"
+            return
+        buf.append(tok)
+        if len(buf) == agrupar:
+            yield t, "data: " + " ".join(buf) + "\n"
+            buf = []
+    if buf:
+        yield t, "data: " + " ".join(buf) + "\n"
+    yield t, "event: fim\ndata: [DONE]\n"
+
+resposta = "o cache guarda respostas para perguntas repetidas e reduz custo e latencia"
+eventos = list(sse(modelo(resposta)))
+for t, ev in eventos:
+    print(f"{t:4d} ms | " + ev.strip().replace("\n", " | "))
+print(f"primeiro pedaco em {eventos[0][0]} ms, fim em {eventos[-1][0]} ms, {len(eventos)} eventos")
+
+parcial = list(sse(modelo(resposta), cancelar_em_ms=420))
+print("cancelado:", [ev.strip().replace("\n", " | ") for _, ev in parcial])
+
+# Quantas conexoes abertas o gateway segura? Lei de Little: L = taxa x duracao
+req_s, duracao_s = 3000, 9
+print(f"conexoes SSE simultaneas: {req_s * duracao_s:,}".replace(",", "."))
+```
+
+```text
+Saída:
+ 400 ms | data: o cache guarda
+ 475 ms | data: respostas para perguntas
+ 550 ms | data: repetidas e reduz
+ 625 ms | data: custo e latencia
+ 625 ms | event: fim | data: [DONE]
+primeiro pedaco em 400 ms, fim em 625 ms, 5 eventos
+cancelado: ['data: o cache guarda', 'event: cancelado | data:']
+conexoes SSE simultaneas: 27.000
+```
+
+Repare no trade-off do agrupamento: pedaços maiores significam menos eventos e menos overhead de rede, mas o primeiro pedaço só sai depois de três tokens. Muitos sistemas mandam o primeiro token sozinho e agrupam o resto por tempo (por exemplo, a cada 50 ms).
+
+## Pontos de projeto
+
+- **Conexões longas custam memória.** Pela lei de Little, 3 mil requisições por segundo com duração média de 9 segundos mantêm 27 mil conexões abertas. Gateways baseados em I/O assíncrono aguentam isso bem; servidores com uma thread por conexão, não.
+- **Cancelamento de ponta a ponta.** Quando o cliente fecha a aba, o gateway precisa propagar o cancelamento até o servidor de inferência, senão a GPU continua gerando tokens que ninguém vai ler.
+- **Retomada.** SSE suporta `id:` em cada evento e o cabeçalho `Last-Event-ID` na reconexão. Para retomar de verdade, o orquestrador precisa guardar a resposta em andamento num buffer (Redis, por exemplo) indexado pela mensagem.
+- **Guardrails em streaming.** Se a moderação só olha o texto completo, o usuário já leu o conteúdo problemático. Use verificação incremental em janelas, aceitando que algo pode precisar ser retirado da tela depois.
+- **Persistência.** Grave a resposta completa no histórico ao final, com tokens, modelo e latências, e marque como parcial se houve cancelamento.
+
+<Callout type="warning" title="O vilão invisível é o buffering">
+Um único proxy no caminho com buffering ligado transforma seu streaming em resposta síncrona. Em produção, teste o fluxo de ponta a ponta através de todas as camadas, inclusive CDN e balanceadores.
+</Callout>
+
+## Na entrevista
+
+Diga que vai usar SSE sobre HTTP para a resposta, explique por que não WebSocket e mencione as três armadilhas: buffering, timeouts e cancelamento. Se sobrar tempo, fale de retomada após queda de conexão. Follow-ups comuns: "como você balanceia conexões longas?" (balanceamento por menos conexões ativas, drenagem gradual ao fazer deploy) e "como mede latência num stream?" (TTFT, tempo entre tokens e tempo total, separadamente).
+
+<QuizSet>
+<Quiz question="Depois do deploy de um novo proxy, os usuários passaram a ver a resposta inteira de uma vez, só no final. Qual a causa mais provável?" options={["O modelo ficou mais lento", "O proxy está fazendo buffering ou compressão da resposta", "SSE não funciona com HTTP/2", "O navegador desativou JavaScript"]} answer={1} explanation="Buffering ou compressão em qualquer salto retém os pedaços até o fim; é preciso desligá-los na rota de streaming." />
+<Quiz question="O usuário fecha a aba no meio de uma resposta de 2 mil tokens. O que o sistema deve fazer?" options={["Continuar gerando para salvar no histórico", "Propagar o cancelamento até o servidor de inferência para liberar o slot da GPU", "Reiniciar a geração", "Nada, a conexão expira em uma hora"]} answer={1} explanation="Sem cancelamento propagado, a GPU gasta tokens e ocupa memória de KV cache com uma resposta que ninguém vai ler." />
+</QuizSet>

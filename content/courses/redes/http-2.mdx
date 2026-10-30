@@ -1,0 +1,158 @@
+---
+title: HTTP/2
+kind: lesson
+---
+
+O HTTP/1.1 obriga cada conexão a carregar uma resposta por vez, e a indústria passou anos abrindo seis conexões por domínio para compensar. O HTTP/2 ataca o problema na raiz: mantém a semântica (métodos, status, cabeçalhos continuam iguais), mas troca o formato de texto por **frames binários** que permitem misturar muitas requisições numa única conexão TCP.
+
+## Frames, streams e a conexão
+
+Toda comunicação vira frames. Cada frame tem um cabeçalho fixo de 9 bytes:
+
+```text
++-----------------------------------------------+
+|              Length (24 bits)                 |  tamanho do payload
++---------------+---------------+---------------+
+|  Type (8)     |  Flags (8)    |
++-+-------------+---------------+---------------+
+|R|           Stream Identifier (31 bits)       |  a qual stream pertence
++-+---------------------------------------------+
+|              Payload (Length bytes)           |
++-----------------------------------------------+
+```
+
+Um **stream** é uma troca requisição/resposta, identificada por um número: o cliente usa ímpares (1, 3, 5...), o servidor pares, e o stream 0 é a própria conexão. Os tipos mais importantes:
+
+| Tipo | Código | Função |
+| --- | --- | --- |
+| DATA | 0x0 | corpo da mensagem |
+| HEADERS | 0x1 | cabeçalhos comprimidos com HPACK |
+| RST_STREAM | 0x3 | cancela um stream sem derrubar a conexão |
+| SETTINGS | 0x4 | parâmetros da conexão (ex.: máximo de streams simultâneos) |
+| PING | 0x6 | mede RTT e mantém a conexão viva |
+| GOAWAY | 0x7 | "não aceito streams novos depois do id N" (desligamento gracioso) |
+| WINDOW_UPDATE | 0x8 | libera crédito de controle de fluxo |
+
+Como cada frame diz a qual stream pertence, o remetente pode intercalá-los livremente. O programa a seguir monta frames de dois streams intercalados e depois os separa do lado do receptor, como faria uma implementação real.
+
+```python
+import struct
+
+TIPOS = {0: "DATA", 1: "HEADERS"}
+END_STREAM, END_HEADERS = 0x1, 0x4
+
+def frame(tipo, flags, stream, payload):
+    tamanho = len(payload)
+    cab = struct.pack("!BHBBI", tamanho >> 16, tamanho & 0xFFFF, tipo, flags, stream & 0x7FFFFFFF)
+    return cab + payload
+
+fio = b"".join([
+    frame(1, END_HEADERS, 1, b"<hpack /a>"),
+    frame(1, END_HEADERS, 3, b"<hpack /b>"),
+    frame(0, 0, 3, b"bbbb"),
+    frame(0, 0, 1, b"aaaaaa"),
+    frame(0, END_STREAM, 3, b"bb"),
+    frame(0, END_STREAM, 1, b"aa"),
+])
+print("bytes no fio:", len(fio))
+
+pos, streams = 0, {}
+while pos < len(fio):
+    alto, baixo, tipo, flags, sid = struct.unpack("!BHBBI", fio[pos:pos + 9])
+    tamanho = (alto << 16) | baixo
+    payload = fio[pos + 9:pos + 9 + tamanho]
+    pos += 9 + tamanho
+    fim = " END_STREAM" if tipo == 0 and flags & END_STREAM else ""
+    print(f"stream {sid}: {TIPOS[tipo]:7} {tamanho:2} bytes{fim}")
+    if tipo == 0:
+        streams[sid] = streams.get(sid, b"") + payload
+for sid, corpo in sorted(streams.items()):
+    print("corpo do stream", sid, "=", corpo.decode())
+```
+
+```text
+Saída:
+bytes no fio: 88
+stream 1: HEADERS 10 bytes
+stream 3: HEADERS 10 bytes
+stream 3: DATA     4 bytes
+stream 1: DATA     6 bytes
+stream 3: DATA     2 bytes END_STREAM
+stream 1: DATA     2 bytes END_STREAM
+corpo do stream 1 = aaaaaaaa
+corpo do stream 3 = bbbbbb
+```
+
+Esse intercalamento elimina o head-of-line blocking **na camada HTTP**: uma resposta lenta não impede que frames de outras respostas passem. Uma conexão por origem basta, e as gambiarras do 1.1 (domain sharding, sprites) passam a atrapalhar, porque espalham o tráfego por conexões que não compartilham compressão nem janela de congestionamento.
+
+## HPACK: comprimir cabeçalhos com estado
+
+No 1.1, cada requisição reenvia `cookie`, `user-agent` e `authorization` inteiros, e isso pode passar de 1 KB por requisição. O HPACK mantém, dos dois lados, uma **tabela estática** de 61 cabeçalhos comuns (como `:method: GET`) e uma **tabela dinâmica** com o que já foi enviado nesta conexão. Um cabeçalho repetido vira um índice de um ou dois bytes. A simulação simplificada abaixo mostra o efeito em três requisições seguidas.
+
+```python
+ESTATICA = [(":method", "GET"), (":scheme", "https"), (":path", "/")]
+
+class CompressorSimples:
+    def __init__(self):
+        self.dinamica = []
+
+    def codificar(self, cabecalhos):
+        total = 0
+        for par in cabecalhos:
+            tabela = ESTATICA + self.dinamica
+            if par in tabela:
+                total += 1  # só o índice
+            else:
+                total += 2 + len(par[0]) + len(par[1])  # literal
+                self.dinamica.insert(0, par)  # entra na tabela dinâmica
+        return total
+
+cabs = [(":method", "GET"), (":scheme", "https"), (":authority", "api.loja.com"),
+        ("user-agent", "app-ios/7.3.1 (iPhone; iOS 18)"), ("cookie", "sessao=" + "x" * 120)]
+comp = CompressorSimples()
+for i, caminho in enumerate(["/pedidos", "/carrinho", "/perfil"], 1):
+    pedido = cabs + [(":path", caminho)]
+    texto = sum(len(k) + len(v) + 4 for k, v in pedido)
+    print(f"requisicao {i}: texto ~{texto} bytes, comprimido {comp.codificar(pedido)} bytes")
+```
+
+```text
+Saída:
+requisicao 1: texto ~254 bytes, comprimido 218 bytes
+requisicao 2: texto ~255 bytes, comprimido 21 bytes
+requisicao 3: texto ~253 bytes, comprimido 19 bytes
+```
+
+A partir da segunda requisição só o caminho novo vai como literal. O custo é estado: a tabela dinâmica precisa ser decodificada na ordem exata, o que amarra todos os streams da conexão a uma sequência única de frames de cabeçalho.
+
+## Controle de fluxo e priorização
+
+Multiplexar cria um problema novo: um download grande pode encher os buffers do receptor e sufocar o resto. Por isso o HTTP/2 tem controle de fluxo próprio, **por stream e por conexão**, com janela inicial de 65.535 bytes. O receptor libera crédito com WINDOW_UPDATE. Uma janela pequena demais num link de alta latência limita a vazão mesmo com banda sobrando, um erro comum em proxies e clientes gRPC mal configurados.
+
+A priorização original (árvore de dependências com pesos) era complexa e mal implementada; hoje se usa um esquema mais simples de urgência anunciado em cabeçalho. O **server push** também existiu e foi abandonado pelos navegadores: o servidor raramente sabia o que o cliente já tinha em cache.
+
+## O que o HTTP/2 não resolve
+
+Todos os streams compartilham **uma** conexão TCP, e o TCP entrega bytes em ordem. Se um segmento se perde, tudo que veio depois fica parado no buffer do kernel até a retransmissão chegar, inclusive frames de streams que nada tinham a ver com o pacote perdido. Em redes com perda (celular, Wi-Fi ruim), o HTTP/2 pode ficar pior que seis conexões HTTP/1.1. Esse é o head-of-line blocking **de transporte**, e é a motivação do HTTP/3.
+
+<Callout type="note" title="Como a versão é negociada">
+Navegadores só usam HTTP/2 sobre TLS. A escolha acontece dentro do próprio handshake TLS, pela extensão ALPN: o cliente oferece `h2` e `http/1.1`, e o servidor escolhe. Não há ida e volta extra.
+</Callout>
+
+```bash
+curl -sI --http2 https://exemplo.com.br -o /dev/null -w "%{http_version}\n"
+```
+
+```text
+2
+```
+
+## Na entrevista
+
+Resuma em três ideias: frames binários com id de stream, multiplexação numa conexão só e HPACK. Depois mostre o limite: HOL blocking do TCP sob perda. Follow-ups: "gRPC usa o quê e por quê?" (HTTP/2, pelos streams bidirecionais e multiplexação de muitas chamadas numa conexão) e "por que um load balancer L4 distribui mal tráfego HTTP/2?" (uma conexão longa carrega milhares de requisições e fica presa a um backend; é preciso balancear em L7, por requisição).
+
+<QuizSet>
+<Quiz question="No HTTP/2, como o receptor sabe a qual requisição um frame DATA pertence?" options={["Pela ordem de chegada", "Pelo Stream Identifier no cabeçalho de 9 bytes do frame", "Pelo cabeçalho Content-Length", "Pela porta TCP de origem"]} answer={1} explanation="Cada frame carrega o id do stream, o que permite intercalar frames de várias requisições na mesma conexão." />
+<Quiz question="Num link móvel com 2% de perda, uma página sobre HTTP/2 carrega mais devagar que sobre HTTP/1.1 com seis conexões. Por quê?" options={["HPACK falha com perda", "Uma perda no TCP bloqueia todos os streams da única conexão até a retransmissão", "HTTP/2 não retransmite pacotes", "O server push consome a banda"]} answer={1} explanation="É o HOL blocking de transporte: o TCP entrega em ordem, então um segmento perdido trava todos os streams multiplexados." />
+<Quiz question="Seus pods gRPC atrás de um balanceador L4 estão desequilibrados: um recebe quase todo o tráfego. Qual a causa provável?" options={["gRPC não suporta balanceamento", "Conexões HTTP/2 são longas e multiplexadas, e o L4 balanceia por conexão, não por requisição", "O HPACK fixa o destino", "O TTL do DNS é alto demais"]} answer={1} explanation="Com HTTP/2 poucas conexões carregam todas as chamadas. É preciso balancear em L7 ou no cliente, por requisição." />
+</QuizSet>

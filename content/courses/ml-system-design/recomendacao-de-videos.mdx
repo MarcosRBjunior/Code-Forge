@@ -1,0 +1,153 @@
+---
+title: Recomendação de vídeos
+kind: lesson
+---
+
+"Projete o sistema de recomendação da página inicial de uma plataforma de vídeos" é talvez a pergunta mais comum de ML system design. Ela exercita tudo: definição de objetivo, rótulos implícitos, recuperação em escala, ranqueamento com muitos sinais e avaliação online. Vamos percorrer como uma entrevista de 45 minutos.
+
+## Esclarecer o objetivo e a métrica
+
+Comece perguntando o que o negócio quer. "Mais cliques" é uma resposta perigosa: otimizar só clique premia miniaturas apelativas e vídeos que o usuário abandona em 5 segundos. Uma proposta mais saudável:
+
+- **Métrica de negócio (online)**: tempo assistido por usuário por dia e retenção de 7 dias.
+- **Métrica de guarda**: taxa de "não tenho interesse", denúncias, diversidade de criadores.
+- **Escala hipotética**: centenas de milhões de usuários ativos, um catálogo da ordem de 1 bilhão de vídeos, latência de p99 abaixo de 200 ms para montar a página.
+
+Pergunte também se há restrições: conteúdo infantil, regiões, vídeos recém-publicados que precisam de exposição.
+
+## Dados e rótulos
+
+Quase não há rótulo explícito. Você constrói rótulos a partir de eventos de log:
+
+| Evento | Rótulo derivado |
+| --- | --- |
+| Impressão sem clique | negativo fraco |
+| Clique e assistiu menos de 10% | negativo ou neutro |
+| Assistiu mais de 50% | positivo |
+| Curtiu, compartilhou, se inscreveu | positivo forte |
+| "Não recomendar este canal" | negativo forte |
+
+Dois cuidados: **viés de posição** (itens no topo recebem mais clique só por estarem no topo) e **viés de exposição** (o modelo só vê feedback do que ele mesmo mostrou). Registre a posição como feature no treino e fixe-a num valor neutro no servimento; reserve uma fatia pequena de tráfego com exploração aleatória.
+
+## Features
+
+- **Usuário**: histórico recente de vídeos assistidos (como sequência de IDs), idioma, país, tipo de dispositivo, hora do dia.
+- **Vídeo**: embedding de título e miniatura, duração, idade do vídeo, canal, taxa histórica de conclusão.
+- **Cruzadas**: quantas vezes o usuário assistiu esse canal, similaridade entre o embedding do vídeo e a média dos últimos 20 assistidos.
+
+## Modelo: base e evolução
+
+Mostre que você sabe começar simples:
+
+1. **Base**: vídeos populares por país e idioma. Serve de fallback e de piso de comparação.
+2. **Recuperação**: um modelo two-tower que gera embeddings de usuário e de vídeo; busca de vizinhos aproximados (ANN) traz de 500 a 1.000 candidatos. Some fontes extras: inscrições, vídeos em alta, continuação de séries.
+3. **Ranqueamento**: um modelo mais pesado (árvores com gradient boosting no início, depois uma rede multitarefa) que prevê P(clique), tempo esperado assistido e P(curtida). A pontuação final é uma combinação ponderada dessas cabeças.
+4. **Re-ranqueamento**: regras de diversidade (no máximo 2 vídeos do mesmo canal no topo), remoção de já assistidos, políticas de conteúdo.
+
+O programa abaixo simula a cascata com embeddings de brinquedo: a recuperação usa só produto interno e o ranqueador adiciona um sinal de qualidade que a recuperação não vê.
+
+```python
+import random
+
+random.seed(7)
+DIM, N = 4, 2000
+
+def vetor():
+    return [random.gauss(0, 1) for _ in range(DIM)]
+
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+videos = [{"id": i, "emb": vetor(), "qualidade": random.random()} for i in range(N)]
+usuario = vetor()
+
+def relevancia_real(v):
+    return dot(usuario, v["emb"]) + 3 * v["qualidade"]
+
+ideal = sorted(videos, key=relevancia_real, reverse=True)[:10]
+ideal_ids = {v["id"] for v in ideal}
+
+candidatos = sorted(videos, key=lambda v: dot(usuario, v["emb"]), reverse=True)[:200]
+so_recuperacao = candidatos[:10]
+ranqueados = sorted(candidatos, key=relevancia_real, reverse=True)[:10]
+
+def acertos(lista):
+    return len(ideal_ids & {v["id"] for v in lista})
+
+print(f"catalogo: {N}, candidatos apos recuperacao: {len(candidatos)}")
+print(f"recall dos candidatos sobre o top-10 ideal: {acertos(candidatos)}/10")
+print(f"top-10 so com recuperacao: {acertos(so_recuperacao)}/10 acertos")
+print(f"top-10 apos ranqueamento: {acertos(ranqueados)}/10 acertos")
+```
+
+```text
+Saída:
+catalogo: 2000, candidatos apos recuperacao: 200
+recall dos candidatos sobre o top-10 ideal: 10/10
+top-10 so com recuperacao: 7/10 acertos
+top-10 apos ranqueamento: 10/10 acertos
+```
+
+A ordem da recuperação acerta 7 dos 10 melhores; como os 10 estavam entre os 200 candidatos, o ranqueador acerta todos. A recuperação só precisa ter **recall alto**: colocar os bons itens entre os candidatos. Quem acerta a ordem final é o ranqueador, que pode ser caro porque roda sobre 200 itens, não sobre o catálogo inteiro.
+
+## Arquitetura de treino e servimento
+
+```text
+             OFFLINE (diário / horário)                    ONLINE (por requisição)
+ +-----------+    +-------------+    +-----------+     +-----------+
+ | logs de   |--->| geração de  |--->| treino    |     | app abre  |
+ | eventos   |    | rótulos e   |    | two-tower |     | a home    |
+ | (Kafka)   |    | features    |    | e ranker  |     +-----+-----+
+ +-----+-----+    +------+------+    +-----+-----+           |
+       |                 |                 |           +-----v------+   embeddings
+       |          +------v------+    +-----v-----+     | recuperação|<--- de vídeo
+       +--------->| feature     |    | registro  |     | ANN + fontes|   (índice ANN)
+                  | store       |    | de modelos|     +-----+------+
+                  | (on/offline)|    +-----+-----+           | ~1.000
+                  +------+------+          |           +-----v------+
+                         |                 +---------->| ranker     |
+                         +---------------------------->| multitarefa|
+                                                       +-----+------+
+                                                             | ~50
+                                                       +-----v------+
+                                                       | re-ranking |-> página
+                                                       +------------+
+```
+
+Embeddings de vídeo são recalculados em lote e publicados num índice ANN; o embedding do usuário é calculado na hora, porque depende do que ele acabou de assistir. A feature store garante que treino e servimento usem a mesma definição de cada feature.
+
+## Avaliação
+
+- **Offline**: recall@k da recuperação; NDCG e AUC por cabeça do ranqueador, sempre com divisão temporal (treine até o dia D, avalie em D+1).
+- **Online**: teste A/B com tempo assistido por usuário como métrica principal e as métricas de guarda. Rode por pelo menos uma ou duas semanas para cobrir efeito de novidade e ciclos semanais.
+
+## Monitoramento
+
+Acompanhe distribuição das pontuações, fração de vídeos novos recomendados, latência por estágio, taxa de fallback para populares e drift de features como duração média dos vídeos assistidos. Um embedding velho no índice ANN é uma falha silenciosa: o sistema responde, só que pior.
+
+<Callout type="tip" title="Diga o que você otimiza e o que você protege">
+Entrevistadores gostam quando você nomeia uma métrica principal e duas de guarda. Isso mostra que você entende que maximizar engajamento sem freios degrada a experiência no longo prazo.
+</Callout>
+
+## Trade-offs
+
+| Decisão | Opção A | Opção B |
+| --- | --- | --- |
+| Objetivo | Clique: rótulo abundante, incentiva clickbait | Tempo assistido: mais alinhado, favorece vídeos longos |
+| Frescor do modelo | Treino diário: simples | Atualização contínua: capta tendências, mais risco |
+| Candidatos | Poucos: ranker barato | Muitos: mais recall, mais latência |
+
+Normalize o tempo assistido pela duração (ou use a fração assistida) para não favorecer só vídeos longos.
+
+## Follow-ups comuns
+
+- **Vídeo recém-publicado sem histórico?** Use embeddings de conteúdo (título, miniatura, áudio) e reserve exposição exploratória.
+- **Usuário novo?** Populares por região, perguntas de interesse no onboarding e aprendizado rápido com as primeiras sessões.
+- **Como evitar bolha de filtro?** Cota de exploração e regras de diversidade no re-ranqueamento.
+- **E se o ranker cair?** Degrade para a ordem da recuperação ou para populares em cache.
+
+<QuizSet>
+<Quiz question="Por que a recuperação usa um modelo mais simples que o ranqueador?" options={["Porque modelos simples são mais precisos", "Porque precisa varrer o catálogo inteiro em milissegundos, então só deve ter recall alto e ser barata", "Porque o ranqueador não usa features de usuário", "Porque a recuperação roda offline"]} answer={1} explanation="A recuperação filtra bilhões de itens para centenas; precisão fina fica para o ranqueador, que roda sobre poucos candidatos." />
+<Quiz question="Otimizar apenas a taxa de cliques tende a causar o quê?" options={["Mais diversidade", "Favorecimento de miniaturas apelativas que o usuário abandona logo", "Menor latência", "Menos dados de treino"]} answer={1} explanation="Clique é um sinal raso; combine com tempo assistido e métricas de guarda como 'não tenho interesse'." />
+<Quiz question="Como reduzir o viés de posição no treino do ranqueador?" options={["Remover os itens do topo do treino", "Usar a posição como feature no treino e fixá-la num valor neutro no servimento", "Treinar só com cliques", "Embaralhar os rótulos"]} answer={1} explanation="O modelo aprende quanto do clique vem da posição; no servimento, todas as posições ficam iguais e sobra o efeito do conteúdo." />
+</QuizSet>

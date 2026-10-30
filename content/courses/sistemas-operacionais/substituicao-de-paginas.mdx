@@ -1,0 +1,140 @@
+---
+title: Substituição de páginas
+kind: lesson
+---
+
+A RAM está cheia e um processo acaba de gerar um page fault. Para trazer a página nova, o kernel precisa expulsar alguma que está na memória. Se escolher uma que vai ser usada logo em seguida, terá outro page fault em instantes. A regra de escolha é o **algoritmo de substituição de páginas**, e o mesmo problema reaparece em qualquer cache que você projetar: Redis, CDN, buffer pool de banco ou um `functools.lru_cache`.
+
+## Os algoritmos clássicos
+
+| Algoritmo | Expulsa | Prós | Contras |
+| --- | --- | --- | --- |
+| FIFO | A página que entrou há mais tempo | Trivial | Ignora uso; sofre anomalia de Belady |
+| OPT (ótimo) | A que vai demorar mais para ser usada | Mínimo possível de faltas | Exige conhecer o futuro |
+| LRU | A usada há mais tempo | Ótima aproximação na prática | Caro de manter exato em hardware |
+| Clock (segunda chance) | A primeira sem bit de acesso, girando um ponteiro | Barato, aproxima LRU | Menos preciso que LRU |
+
+O OPT serve como régua: nenhum algoritmo real pode fazer menos faltas que ele. Os outros são comparados contra esse limite.
+
+## Simulando os quatro
+
+O simulador conta as faltas para a mesma sequência de referências, com 3 quadros:
+
+```python
+from collections import OrderedDict, deque
+
+def fifo(refs, quadros):
+    mem, fila, faltas = set(), deque(), 0
+    for p in refs:
+        if p not in mem:
+            faltas += 1
+            if len(mem) == quadros:
+                mem.remove(fila.popleft())
+            mem.add(p)
+            fila.append(p)
+    return faltas
+
+def lru(refs, quadros):
+    mem, faltas = OrderedDict(), 0
+    for p in refs:
+        if p in mem:
+            mem.move_to_end(p)
+        else:
+            faltas += 1
+            if len(mem) == quadros:
+                mem.popitem(last=False)
+            mem[p] = True
+    return faltas
+
+def opt(refs, quadros):
+    mem, faltas = [], 0
+    for i, p in enumerate(refs):
+        if p in mem:
+            continue
+        faltas += 1
+        if len(mem) == quadros:
+            futuro = refs[i + 1:]
+            vitima = max(mem, key=lambda q: futuro.index(q) if q in futuro else len(futuro) + 1)
+            mem.remove(vitima)
+        mem.append(p)
+    return faltas
+
+def clock(refs, quadros):
+    mem, bit, ponteiro, faltas = [None] * quadros, [0] * quadros, 0, 0
+    for p in refs:
+        if p in mem:
+            bit[mem.index(p)] = 1
+            continue
+        faltas += 1
+        while bit[ponteiro] == 1:          # segunda chance: zera e avanca
+            bit[ponteiro] = 0
+            ponteiro = (ponteiro + 1) % quadros
+        mem[ponteiro], bit[ponteiro] = p, 1
+        ponteiro = (ponteiro + 1) % quadros
+    return faltas
+
+refs = [7, 0, 1, 2, 0, 3, 0, 4, 2, 3, 0, 3, 2, 1, 2, 0, 1, 7, 0, 1]
+print("referencias:", len(refs))
+for nome, alg in [("FIFO", fifo), ("LRU", lru), ("Clock", clock), ("OPT", opt)]:
+    print(f"{nome:<6} faltas={alg(refs, 3)}")
+```
+
+```text
+Saída:
+referencias: 20
+FIFO   faltas=15
+LRU    faltas=12
+Clock  faltas=14
+OPT    faltas=9
+```
+
+## Anomalia de Belady
+
+Intuitivamente, mais memória deveria significar menos faltas. Com FIFO, nem sempre: existem sequências em que aumentar o número de quadros **aumenta** as faltas. LRU e OPT são **algoritmos de pilha** (o conteúdo com N quadros está sempre contido no conteúdo com N + 1) e por isso nunca sofrem dessa anomalia.
+
+```python
+from collections import deque
+
+def fifo(refs, quadros):
+    mem, fila, faltas = set(), deque(), 0
+    for p in refs:
+        if p not in mem:
+            faltas += 1
+            if len(mem) == quadros:
+                mem.remove(fila.popleft())
+            mem.add(p)
+            fila.append(p)
+    return faltas
+
+refs = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+for q in [3, 4]:
+    print(f"FIFO com {q} quadros: {fifo(refs, q)} faltas")
+```
+
+```text
+Saída:
+FIFO com 3 quadros: 9 faltas
+FIFO com 4 quadros: 10 faltas
+```
+
+## Como o Linux faz de verdade
+
+LRU exato exigiria atualizar uma estrutura a cada acesso à memória, algo impossível de fazer em software na velocidade da CPU. O hardware só oferece o **bit de acesso** na entrada da tabela, ligado automaticamente quando a página é usada. Com ele, o kernel aproxima LRU:
+
+- O Linux mantém listas de páginas **ativas** e **inativas**, separadas para páginas de arquivo e anônimas. Páginas novas entram na inativa e só sobem para a ativa se forem acessadas de novo, o que protege contra uma varredura única expulsar o working set (o mesmo problema que um `SELECT *` gigante causa num buffer pool com LRU ingênuo).
+- Desde o kernel 6.1, o **MGLRU** usa várias gerações em vez de duas listas, com melhor precisão sob pressão de memória.
+- Páginas **sujas** (modificadas) custam mais para expulsar, porque precisam ser escritas antes. Por isso o kernel prefere expulsar páginas limpas e grava as sujas em segundo plano.
+
+<Callout type="tip" title="O mesmo trade-off nos seus caches">
+LRU puro sofre com varreduras sequenciais; LFU sofre com itens que foram populares e deixaram de ser. Algoritmos como LRU-K, 2Q, ARC e W-TinyLFU (usado no Caffeine, em Java) combinam recência e frequência. Se o entrevistador perguntar como você escolheria a política de um cache, fale do padrão de acesso antes de citar um nome.
+</Callout>
+
+## Na entrevista
+
+Saiba rodar FIFO, LRU e OPT à mão numa sequência curta, explicar por que OPT é só uma referência e citar a anomalia de Belady. Depois, conecte com a aproximação real (bit de acesso, Clock, listas ativa e inativa). Follow-ups comuns: "implemente um LRU cache em O(1)" (hash map mais lista duplamente ligada) e "por que o Linux não usa LRU exato?" (custo de atualizar a ordem a cada acesso à memória).
+
+<QuizSet>
+<Quiz question="Qual algoritmo produz o menor número possível de page faults, mas não pode ser implementado na prática?" options={["LRU", "FIFO", "OPT", "Clock"]} answer={2} explanation="O OPT expulsa a página que demorará mais para ser usada, o que exige conhecer as referências futuras." />
+<Quiz question="O que é a anomalia de Belady?" options={["LRU fica mais lento com mais memória", "Com FIFO, aumentar o número de quadros pode aumentar o número de page faults", "O OPT erra em sequências aleatórias", "Páginas sujas nunca são expulsas"]} answer={1} explanation="FIFO não é um algoritmo de pilha, então o conjunto de páginas com mais quadros não contém necessariamente o de menos." />
+<Quiz question="Um job noturno lê sequencialmente uma tabela enorme uma única vez e, no dia seguinte, o cache do banco está frio. Qual a causa e uma solução?" options={["Falta de CPU; adicionar núcleos", "LRU ingênuo deixou a varredura expulsar o working set; usar uma política com duas listas ou que exija segundo acesso para promover", "O disco é lento; trocar por SSD", "Deadlock; ordenar locks"]} answer={1} explanation="Páginas lidas uma única vez não deveriam expulsar as quentes; listas ativa e inativa ou políticas como 2Q resolvem." />
+</QuizSet>

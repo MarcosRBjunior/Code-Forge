@@ -1,0 +1,164 @@
+---
+title: Busca corporativa com RAG
+kind: lesson
+---
+
+"Projete um assistente que responde perguntas sobre os documentos internos da empresa" é a versão GenAI da clássica busca corporativa. O modelo sozinho não conhece wikis, contratos e chamados da empresa, e mesmo se conhecesse, não saberia quem pode ver o quê. A resposta padrão é **RAG** (geração aumentada por recuperação): buscar os trechos relevantes e entregá-los ao modelo como contexto, pedindo uma resposta com citações. O que diferencia um candidato forte é tratar a recuperação como o coração do sistema e levar permissões a sério.
+
+## Requisitos
+
+### Funcionais
+
+- Perguntas em linguagem natural, respostas com citações clicáveis para os documentos de origem.
+- Fontes: wiki, drive de arquivos, sistema de chamados, e-mail de listas. Novas fontes por conectores.
+- O usuário só pode receber conteúdo que tem permissão para ver na fonte original.
+- Documentos novos ou alterados ficam pesquisáveis em minutos.
+
+### Não funcionais
+
+- TTFT p95 abaixo de 2 segundos.
+- Zero vazamento entre níveis de permissão, que é um requisito mais forte que qualquer meta de qualidade.
+- Respostas fundamentadas: se a informação não estiver nos documentos, o sistema diz que não sabe.
+- Multi-inquilino se for um produto SaaS: dados de clientes completamente isolados.
+
+## Estimativas
+
+```python
+docs = 50_000_000              # documentos de todos os clientes (hipotetico)
+paginas_por_doc = 4
+tokens_por_pagina = 600
+chunk, sobreposicao = 500, 50
+dim, bytes_por_valor = 768, 4  # embedding hipotetico em float32
+
+tokens = docs * paginas_por_doc * tokens_por_pagina
+chunks = tokens / (chunk - sobreposicao)
+mem_vetores = chunks * dim * bytes_por_valor
+print(f"tokens indexados: {tokens / 1e9:.0f} bilhoes")
+print(f"chunks: {chunks / 1e9:.2f} bilhoes")
+print(f"vetores float32: {mem_vetores / 1e12:.1f} TB; quantizados em 8 bits: {mem_vetores / 4 / 1e12:.1f} TB")
+
+# Reindexacao: 2% dos documentos mudam por dia
+emb_tok_s = 400_000            # throughput hipotetico do servico de embeddings
+mudam = tokens * 0.02
+print(f"reembedding diario: {mudam / 1e9:.1f} bi tokens, {mudam / emb_tok_s / 3600:.1f} h de servico")
+
+# Consultas: 2 milhoes de perguntas/dia, prompt com 8 trechos de 500 tokens
+perg_s = 2_000_000 / 86_400
+print(f"perguntas/s: {perg_s:.0f}, tokens de entrada/s: {perg_s * (8 * 500 + 700) / 1e3:.0f} mil")
+```
+
+```text
+Saída:
+tokens indexados: 120 bilhoes
+chunks: 0.27 bilhoes
+vetores float32: 0.8 TB; quantizados em 8 bits: 0.2 TB
+reembedding diario: 2.4 bi tokens, 1.7 h de servico
+perguntas/s: 23, tokens de entrada/s: 109 mil
+```
+
+Centenas de milhões de vetores e quase um terabyte de índice exigem um índice vetorial distribuído, particionado por inquilino, com quantização para caber em memória. O custo contínuo de embeddings depende da taxa de mudança, não do tamanho total.
+
+## API
+
+```text
+POST /perguntas            corpo: texto, conversa_id opcional, filtros (fonte, data)
+     resposta: SSE com deltas e, ao final, lista de citacoes (doc_id, trecho, url)
+POST /feedback             corpo: pergunta_id, util (sim/nao), comentario
+POST /conectores/:fonte/webhook   notificacoes de mudanca vindas das fontes
+```
+
+## Arquitetura
+
+```text
+         INGESTAO                                     CONSULTA
+fontes --> conectores --> fila --> parser/limpeza      usuario
+ (webhook + varredura)               |                    |
+                                     v                    v
+                              chunking + metadados   reescrita da pergunta
+                              (ACL, inquilino, data)      |
+                                     |                    v
+                              servico de embeddings   busca hibrida ----------+
+                                     |                 |- indice lexical      |
+                                     v                 '- indice vetorial     |
+                     indice lexical + indice vetorial    filtro de ACL        |
+                     (particionados por inquilino)            |               |
+                                                              v               |
+                                                      reranker (top 50 -> 8)  |
+                                                              v               |
+                                                  LLM com trechos + citacoes  |
+                                                              v               |
+                                                  verificacao de citacoes ----+
+```
+
+## Componentes em detalhe
+
+### Ingestão e chunking
+
+Conectores recebem webhooks de mudança e fazem varreduras periódicas para pegar o que escapou. Cada documento é convertido em texto, limpo e dividido em trechos que respeitam a estrutura (títulos, parágrafos, tabelas), com sobreposição pequena. Cada trecho carrega metadados: `inquilino`, `doc_id`, versão, data, URL e a **lista de controle de acesso** copiada da fonte. Ao atualizar um documento, todos os trechos da versão antiga são substituídos de forma atômica.
+
+### Busca híbrida e permissões
+
+Busca vetorial é boa em sinônimos e paráfrases; busca lexical é boa em códigos, nomes próprios e siglas. Rodar as duas e fundir os rankings é mais robusto que qualquer uma sozinha. O filtro de permissão é aplicado **dentro** da busca, como pré-filtro, e não depois: filtrar depois do top-k pode deixar zero resultados visíveis e, pior, uma falha no filtro vaza conteúdo.
+
+```python
+lexical = ["d7", "d2", "d9", "d4"]          # ranking da busca por palavras
+vetorial = ["d2", "d4", "d1", "d7", "d5"]   # ranking da busca por embeddings
+acl = {"d1": {"rh"}, "d2": {"todos"}, "d4": {"engenharia"}, "d5": {"todos"},
+       "d7": {"financeiro"}, "d9": {"todos"}}
+grupos_usuario = {"todos", "engenharia"}
+
+def rrf(*rankings, k=60):
+    pontos = {}
+    for ranking in rankings:
+        for pos, doc in enumerate(ranking, start=1):
+            pontos[doc] = pontos.get(doc, 0) + 1 / (k + pos)
+    return pontos
+
+pontos = rrf(lexical, vetorial)
+visiveis = {d: p for d, p in pontos.items() if acl[d] & grupos_usuario}
+for doc, p in sorted(visiveis.items(), key=lambda x: -x[1]):
+    print(f"{doc}  {p:.4f}")
+print("ocultos por permissao:", sorted(set(pontos) - set(visiveis)))
+```
+
+```text
+Saída:
+d2  0.0325
+d4  0.0318
+d9  0.0159
+d5  0.0154
+ocultos por permissao: ['d1', 'd7']
+```
+
+A fusão por posição recíproca (RRF) combina rankings sem calibrar escalas diferentes de score. Em produção, o filtro de ACL seria um predicado na própria consulta aos índices.
+
+As permissões mudam: alguém sai de um grupo, um documento vira restrito. Por isso, a ACL dos trechos precisa ser atualizada por eventos da fonte, e para fontes críticas vale uma checagem final contra a fonte no momento da resposta.
+
+### Geração com citações
+
+O prompt instrui o modelo a responder apenas com base nos trechos numerados e a citar os números. Uma verificação pós-geração confere se cada citação aponta para um trecho realmente entregue e, opcionalmente, se a frase citada é sustentada pelo trecho. Sem trechos relevantes acima de um limiar, o sistema responde que não encontrou a informação, em vez de deixar o modelo improvisar.
+
+<Callout type="warning" title="Permissão é requisito, não otimização">
+Diga explicitamente que o filtro de ACL é aplicado na consulta ao índice, que o cache de respostas é particionado por escopo de permissão e que uma falha na verificação de acesso bloqueia a resposta.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Ponto | Opção A | Opção B |
+| --- | --- | --- |
+| Tamanho do trecho | Pequeno: busca precisa, pouco contexto | Grande: mais contexto, busca menos precisa |
+| Reranker | Com: qualidade melhor | Sem: menos latência e custo |
+| Índice | Um por inquilino: isolamento forte | Compartilhado com filtro: mais eficiente |
+| Atualização | Por eventos: minutos | Varredura: simples, horas de atraso |
+
+## Follow-ups
+
+- **Como avaliar a qualidade?** Separe recuperação (o trecho certo veio no top-k?) de geração (a resposta é fiel aos trechos?). Use um conjunto de perguntas com documentos de referência.
+- **E perguntas que exigem juntar vários documentos?** Decomposição da pergunta em subperguntas, busca para cada uma e síntese.
+- **Como lidar com documentos desatualizados ou contraditórios?** Priorize por data e fonte oficial nos metadados e mostre a data nas citações.
+- **E o custo do reranker?** Rerankear só o top 50 com um modelo pequeno; pular o reranker quando os scores já forem muito claros.
+
+<QuizSet>
+<Quiz question="Por que aplicar o filtro de permissão antes de pegar o top-k, e não depois?" options={["É mais rápido de programar", "Filtrar depois pode deixar o resultado vazio e, se o filtro falhar, conteúdo restrito vaza para o prompt", "O índice vetorial não aceita filtros", "Para economizar memória"]} answer={1} explanation="O pré-filtro garante que só trechos visíveis concorrem pelo top-k e reduz o risco de vazamento." />
+<Quiz question="Usuários reclamam que buscas por códigos de produto como XR-2291 não encontram nada, mas perguntas descritivas funcionam. O que adicionar?" options={["Um modelo maior", "Busca lexical combinada com a vetorial (busca híbrida)", "Trechos maiores", "Mais temperatura"]} answer={1} explanation="Embeddings representam mal identificadores exatos; a busca lexical cobre esses casos e a fusão combina os dois." />
+</QuizSet>

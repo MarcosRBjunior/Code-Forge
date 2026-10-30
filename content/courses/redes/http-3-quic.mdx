@@ -1,0 +1,149 @@
+---
+title: HTTP/3 e QUIC
+kind: lesson
+---
+
+O HTTP/2 resolveu o bloqueio na camada HTTP, mas deixou todos os streams presos à entrega em ordem do TCP. Mudar o TCP é praticamente impossível: ele vive no kernel de bilhões de dispositivos e em middleboxes (firewalls, NATs) que inspecionam e às vezes reescrevem seus cabeçalhos. A solução foi construir um transporte novo, o **QUIC**, em espaço de usuário e por cima de UDP, que passa por qualquer rede. O HTTP/3 é o mapeamento da semântica HTTP sobre QUIC.
+
+## A pilha comparada
+
+```text
+   HTTP/2                    HTTP/3
++-----------+            +-----------+
+|  HTTP/2   |            |  HTTP/3   |   frames HTTP, QPACK
++-----------+            +-----------+
+|  TLS 1.2+ |            |   QUIC    |   streams, confiabilidade,
++-----------+            | (TLS 1.3  |   congestionamento e
+|    TCP    |            |  embutido)|   criptografia juntos
++-----------+            +-----------+
+|    IP     |            |    UDP    |
++-----------+            +-----------+
+                         |    IP     |
+                         +-----------+
+```
+
+O QUIC reimplementa o que o TCP fazia (retransmissão, controle de fluxo e de congestionamento) e acrescenta streams **independentes no próprio transporte**. Cada stream tem sua ordem; uma perda só atrasa o stream ao qual o pacote pertencia.
+
+## HOL blocking: TCP contra QUIC
+
+A simulação a seguir envia seis pacotes, cada um com um pedaço de um de três streams, e perde o pacote 2. Ela mostra o que a aplicação consegue ler antes de a retransmissão chegar.
+
+```python
+pacotes = [(1, "A", "A1"), (2, "B", "B1"), (3, "C", "C1"),
+           (4, "A", "A2"), (5, "B", "B2"), (6, "C", "C2")]
+perdido = 2
+chegaram = [p for p in pacotes if p[0] != perdido]
+
+# TCP: um único fluxo de bytes em ordem; tudo depois do buraco fica retido
+entregue_tcp = []
+for num, stream, dado in pacotes:
+    if num == perdido:
+        break
+    entregue_tcp.append(dado)
+
+# QUIC: a ordem é por stream; só o stream B espera
+entregue_quic = []
+bloqueados = set()
+for num, stream, dado in pacotes:
+    if num == perdido:
+        bloqueados.add(stream)
+        continue
+    if stream not in bloqueados:
+        entregue_quic.append(dado)
+
+print("chegaram ao receptor:", [d for _, _, d in chegaram])
+print("TCP entrega antes da retransmissao: ", entregue_tcp)
+print("QUIC entrega antes da retransmissao:", entregue_quic)
+print("presos no buffer (TCP): ", len(chegaram) - len(entregue_tcp))
+print("presos no buffer (QUIC):", len(chegaram) - len(entregue_quic))
+```
+
+```text
+Saída:
+chegaram ao receptor: ['A1', 'C1', 'A2', 'B2', 'C2']
+TCP entrega antes da retransmissao:  ['A1']
+QUIC entrega antes da retransmissao: ['A1', 'C1', 'A2', 'C2']
+presos no buffer (TCP):  4
+presos no buffer (QUIC): 1
+```
+
+Com o TCP, quatro pedaços que chegaram perfeitamente esperam por um que nada tem a ver com eles. Com o QUIC, só o B2 espera.
+
+## Handshake mais curto
+
+No TCP com TLS 1.3, você paga uma ida e volta para o handshake TCP e outra para o TLS antes do primeiro byte de aplicação. O QUIC faz as duas coisas no mesmo voo, porque o handshake de transporte **é** o handshake TLS 1.3.
+
+| Cenário | TCP + TLS 1.3 | QUIC |
+| --- | --- | --- |
+| Primeira conexão | 2 RTT até enviar a requisição | 1 RTT |
+| Reconexão com sessão retomada | 1 RTT (ou 0 com early data) | 0 RTT |
+
+Num link de 150 ms de RTT, economizar uma ida e volta é 150 ms a menos em toda conexão nova, e é por isso que o ganho do HTTP/3 aparece mais em celular e em usuários distantes do servidor. O **0-RTT** tem um preço: os dados enviados no primeiro voo podem ser **reenviados por um atacante** (replay), então servidores só devem aceitá-los para requisições idempotentes, como GET.
+
+## Connection ID e migração
+
+Uma conexão TCP é identificada pela quádrupla IP e porta de origem e destino. Quando o celular sai do Wi-Fi e entra no 4G, o IP muda e a conexão morre: novo handshake, nova requisição. O QUIC identifica a conexão por um **Connection ID** escolhido pelos pares, que sobrevive à troca de endereço.
+
+```python
+conexoes_tcp = {("192.168.0.10", 51000, "203.0.113.5", 443): "sessao-1"}
+conexoes_quic = {"c1d2e3": "sessao-1"}
+
+def chega_tcp(origem_ip, origem_porta):
+    chave = (origem_ip, origem_porta, "203.0.113.5", 443)
+    return conexoes_tcp.get(chave, "desconhecida -> RST, refazer handshake")
+
+def chega_quic(conn_id):
+    return conexoes_quic.get(conn_id, "desconhecida")
+
+print("Wi-Fi  TCP :", chega_tcp("192.168.0.10", 51000))
+print("4G     TCP :", chega_tcp("100.64.7.20", 40213))
+print("Wi-Fi  QUIC:", chega_quic("c1d2e3"))
+print("4G     QUIC:", chega_quic("c1d2e3"))
+```
+
+```text
+Saída:
+Wi-Fi  TCP : sessao-1
+4G     TCP : desconhecida -> RST, refazer handshake
+Wi-Fi  QUIC: sessao-1
+4G     QUIC: sessao-1
+```
+
+Na prática o QUIC também valida o novo caminho antes de mandar muitos dados para ele, para que alguém não use a migração para direcionar tráfego a uma vítima.
+
+## Outros detalhes que mudam o comportamento
+
+- **Números de pacote nunca se repetem.** Uma retransmissão vai num pacote novo, então o remetente sempre sabe se o ACK se refere ao original ou à cópia. No TCP essa ambiguidade atrapalha a medição de RTT.
+- **Quase tudo é criptografado**, inclusive os números de pacote e os ACKs. Middleboxes não conseguem inspecionar nem "otimizar" o protocolo, o que impede a ossificação que travou a evolução do TCP.
+- **QPACK** substitui o HPACK: como os streams não têm mais ordem global, a tabela dinâmica é atualizada por um stream dedicado, evitando que um cabeçalho perdido bloqueie os demais.
+
+## Trade-offs
+
+| Ponto | Efeito |
+| --- | --- |
+| UDP bloqueado em redes corporativas | cliente precisa de fallback para HTTP/2 sobre TCP |
+| Implementação em espaço de usuário | evolui rápido, mas gasta mais CPU por byte que TCP no kernel com offload de hardware |
+| Descoberta | o servidor anuncia suporte no cabeçalho `Alt-Svc` (ou em registro DNS HTTPS); a primeira visita costuma ir por TCP |
+| Observabilidade | `tcpdump` não mostra mais estado de conexão legível; é preciso exportar chaves ou usar logs do próprio QUIC |
+
+```bash
+curl -sI https://exemplo.com.br | grep -i alt-svc
+```
+
+```text
+alt-svc: h3=":443"; ma=86400
+```
+
+<Callout type="tip" title="Quando o HTTP/3 não ajuda">
+Entre serviços num mesmo datacenter, com RTT abaixo de 1 ms e perda quase zero, o ganho do QUIC é pequeno e o custo de CPU pesa. Ele brilha na borda, entre usuários móveis e a CDN.
+</Callout>
+
+## Na entrevista
+
+Conte a história em cadeia: HTTP/1.1 tem HOL por conexão, HTTP/2 move o problema para o TCP, QUIC resolve com streams independentes sobre UDP e junta transporte e TLS para cortar RTTs. Cite migração por Connection ID e o risco de replay do 0-RTT. Follow-ups: "por que não consertar o TCP?" (kernel e middleboxes ossificados) e "por que UDP e não um protocolo IP novo?" (NATs e firewalls só deixam passar TCP e UDP).
+
+<QuizSet>
+<Quiz question="Por que o QUIC roda sobre UDP em vez de ser um protocolo de transporte novo diretamente sobre IP?" options={["UDP é mais seguro que IP", "NATs e firewalls na internet só deixam passar TCP e UDP de forma confiável", "UDP já tem controle de congestionamento", "IP não suporta criptografia"]} answer={1} explanation="Um protocolo com número próprio seria descartado por grande parte dos middleboxes. UDP passa, e o QUIC implementa o resto em cima." />
+<Quiz question="Qual cuidado o servidor deve ter ao aceitar dados 0-RTT?" options={["Nenhum, são cifrados", "Aceitar só requisições idempotentes, porque os dados podem ser reenviados por um atacante", "Exigir HTTP/1.1", "Desligar o controle de congestionamento"]} answer={1} explanation="Dados 0-RTT não têm proteção contra replay. Um POST de pagamento repetido seria um desastre; um GET não." />
+<Quiz question="Um usuário troca do Wi-Fi para o 4G no meio de um download. O que permite a uma conexão QUIC continuar?" options={["O número de porta fixo", "O Connection ID, que identifica a conexão independentemente do IP e da porta", "O TTL do DNS", "O cabeçalho Alt-Svc"]} answer={1} explanation="O TCP identifica a conexão pela quádrupla de endereços, que muda. O QUIC usa um Connection ID e valida o novo caminho." />
+</QuizSet>

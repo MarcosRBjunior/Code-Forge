@@ -1,0 +1,160 @@
+---
+title: Variáveis de condição
+kind: lesson
+---
+
+Um lock garante que só uma thread mexe no estado por vez, mas não resolve outra necessidade comum: **esperar até que o estado fique de um jeito específico**. O consumidor precisa esperar a fila ter algum item; o produtor precisa esperar haver espaço. A solução ingênua é ficar num laço testando a condição (*busy waiting*), o que queima CPU e, se você soltar e pegar o lock a cada volta, ainda disputa o lock com quem poderia mudar o estado.
+
+A **variável de condição** é a primitiva feita para isso: ela permite que uma thread durma até ser avisada de que algo mudou, sem gastar CPU e sem segurar o lock enquanto dorme.
+
+## Como funciona
+
+Uma variável de condição sempre anda junto de um lock. O protocolo tem três operações:
+
+- `wait()`: chamada **com o lock na mão**. Ela solta o lock e coloca a thread para dormir de forma atômica; ao acordar, a thread readquire o lock antes de retornar.
+- `notify()`: acorda uma das threads que estão esperando.
+- `notify_all()`: acorda todas.
+
+```text
+consumidor                         produtor
+----------                         --------
+lock.acquire()
+while fila vazia:
+    wait()  -- solta o lock, dorme
+                                   lock.acquire()
+                                   fila.append(x)
+                                   notify()
+                                   lock.release()
+    (acorda, readquire o lock)
+item = fila.pop()
+lock.release()
+```
+
+A atomicidade de "soltar e dormir" é o ponto central. Se fossem dois passos separados, o produtor poderia notificar exatamente entre eles e o aviso se perderia: o consumidor dormiria para sempre esperando algo que já aconteceu (*lost wakeup*).
+
+Em Python a primitiva é `threading.Condition`. Em Java, cada objeto tem `wait`/`notify` ligados ao `synchronized`, e `ReentrantLock.newCondition()` dá condições nomeadas com `await`/`signal`. Em C++ existe `std::condition_variable`, usada com `std::unique_lock<std::mutex>`, e em Go há `sync.Cond`, embora em Go canais costumem ser a escolha idiomática.
+
+## Exemplo: fila limitada
+
+O exemplo clássico é um buffer de capacidade fixa. O produtor espera enquanto está cheio; o consumidor espera enquanto está vazio.
+
+```python
+import threading
+from collections import deque
+
+class FilaLimitada:
+    def __init__(self, capacidade):
+        self.itens = deque()
+        self.capacidade = capacidade
+        self.cond = threading.Condition()
+        self.estourou = False
+
+    def colocar(self, item):
+        with self.cond:
+            while len(self.itens) >= self.capacidade:
+                self.cond.wait()
+            self.itens.append(item)
+            if len(self.itens) > self.capacidade:
+                self.estourou = True
+            self.cond.notify_all()
+
+    def retirar(self):
+        with self.cond:
+            while not self.itens:
+                self.cond.wait()
+            item = self.itens.popleft()
+            self.cond.notify_all()
+            return item
+
+fila = FilaLimitada(2)
+consumidos = []
+
+def produtor():
+    for i in range(1, 7):
+        fila.colocar(i)
+    fila.colocar(None)  # sentinela: acabou
+
+def consumidor():
+    while True:
+        item = fila.retirar()
+        if item is None:
+            break
+        consumidos.append(item)
+
+tp = threading.Thread(target=produtor)
+tc = threading.Thread(target=consumidor)
+tp.start()
+tc.start()
+tp.join()
+tc.join()
+print("consumidos:", consumidos)
+print("passou da capacidade:", fila.estourou)
+```
+
+```text
+Saída:
+consumidos: [1, 2, 3, 4, 5, 6]
+passou da capacidade: False
+```
+
+Note o `while` em volta do `wait()`. Ele não é estilo: é obrigatório, pelos motivos da próxima seção.
+
+## Esperar por um predicado
+
+`Condition.wait_for(predicado, timeout)` encapsula o laço para você e devolve o valor final do predicado, o que deixa claro se você acordou porque a condição ficou verdadeira ou porque o tempo acabou.
+
+```python
+import threading
+
+cond = threading.Condition()
+liberado = False
+resultados = []
+
+def trabalhador(n):
+    with cond:
+        cond.wait_for(lambda: liberado)
+        resultados.append(n * n)
+
+threads = [threading.Thread(target=trabalhador, args=(n,)) for n in range(1, 4)]
+for t in threads:
+    t.start()
+
+with cond:
+    liberado = True
+    cond.notify_all()
+
+for t in threads:
+    t.join()
+print("resultados:", sorted(resultados))
+
+with cond:
+    ok = cond.wait_for(lambda: False, timeout=0.1)
+print("condicao satisfeita antes do timeout:", ok)
+```
+
+```text
+Saída:
+resultados: [1, 4, 9]
+condicao satisfeita antes do timeout: False
+```
+
+## Armadilhas
+
+- **Testar com `if` em vez de `while`.** Uma thread pode acordar sem que ninguém tenha notificado (*spurious wakeup*, permitido por POSIX e pela JVM) ou ser acordada e perder a corrida para outra thread que consumiu o item antes. Sempre reteste a condição depois de acordar.
+- **Mudar o estado sem o lock.** Se o produtor altera a fila fora do lock e notifica, o consumidor pode testar a condição, ver falso e dormir logo depois do aviso.
+- **`notify` quando havia vários tipos de espera.** Com uma condição só servindo produtores e consumidores, `notify()` pode acordar outro produtor, que volta a dormir, e o consumidor certo nunca acorda. Use `notify_all()` ou duas condições separadas (`nao_cheia` e `nao_vazia`) sobre o mesmo lock.
+- **Esquecer que `wait` exige o lock.** Chamar `wait()` sem segurá-lo gera erro em Python (`RuntimeError`) e em Java (`IllegalMonitorStateException`).
+
+<Callout type="tip" title="Regra de bolso">
+Lock na mão, laço `while` testando o predicado, `wait` dentro do laço, e quem muda o estado notifica ainda segurando o lock.
+</Callout>
+
+## Na entrevista
+
+Variáveis de condição aparecem quando pedem uma fila bloqueante, um pool de conexões ou "imprimir em ordem com várias threads". Escreva primeiro o predicado em palavras ("espero enquanto a fila estiver vazia"), depois o laço, e explique por que é `while`. Follow-ups comuns: "por que não usar só um lock e um laço?" (busy waiting e lost wakeup) e "quando `notify` basta e quando você precisa de `notify_all`?" (basta quando todos os que esperam aguardam a mesma condição e qualquer um deles pode progredir).
+
+<QuizSet>
+<Quiz question="Por que a chamada a wait() deve ficar dentro de um laço while que testa a condição?" options={["Porque wait() só funciona dentro de laços", "Porque a thread pode acordar sem a condição estar verdadeira, por spurious wakeup ou por outra thread ter consumido o estado antes", "Para evitar que o lock seja liberado", "Porque notify() acorda sempre todas as threads"]} answer={1} explanation="Acordar não garante que o predicado vale. Retestar depois de acordar é a única forma correta." />
+<Quiz question="O que wait() faz de forma atômica?" options={["Adquire o lock e notifica outra thread", "Solta o lock e coloca a thread para dormir", "Testa a condição e retorna", "Encerra a thread"]} answer={1} explanation="Soltar e dormir num passo só evita o lost wakeup, em que o aviso chega entre os dois passos e se perde." />
+<Quiz question="Uma única condição é usada por produtores e consumidores, e o código chama notify(). Qual o risco?" options={["Nenhum, notify é sempre suficiente", "Acordar uma thread do tipo errado, que volta a dormir, enquanto a que poderia progredir continua dormindo", "O lock nunca é liberado", "Os itens saem fora de ordem"]} answer={1} explanation="Com esperas de naturezas diferentes na mesma condição, use notify_all ou condições separadas." />
+</QuizSet>

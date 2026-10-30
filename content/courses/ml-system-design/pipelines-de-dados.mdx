@@ -1,0 +1,122 @@
+---
+title: Pipelines de dados
+kind: lesson
+---
+
+Modelos aprendem com dados, e em produção esses dados não chegam limpos num CSV. Eles chegam como eventos do app (impressões, cliques, compras), linhas de bancos transacionais, logs de servidor e rótulos de humanos, cada um com seu atraso, formato e taxa de erro. O pipeline de dados é o que transforma esse fluxo bagunçado em exemplos de treino confiáveis e em features para o servimento. Na prática, a maior parte dos incidentes de qualidade de modelos nasce aqui, não no algoritmo.
+
+## Como funciona
+
+```text
+  app / web ──> coletor de eventos ──> fila (Kafka) ──┬──> stream: agregados de minutos ──> feature store online
+                                                      │
+  banco transacional ──> CDC ─────────────────────────┤
+                                                      v
+                                     data lake (camada bruta, imutável, particionada por dia)
+                                                      │
+                                         validação + limpeza + deduplicação
+                                                      │
+                                     camada tratada ──> joins com rótulos ──> dataset de treino
+                                                      │
+                                              agregados diários ──> feature store offline
+```
+
+As peças principais:
+
+- **Coleta**: eventos com esquema versionado (Avro, Protobuf), um ID único por evento e dois carimbos de tempo, o do dispositivo e o do servidor.
+- **Camada bruta imutável**: você guarda tudo como chegou. Se descobrir um bug na limpeza, reprocessa sem perder nada.
+- **Validação**: esquema, tipos, faixas (idade negativa, preço zero), taxa de nulos e volume por partição. Uma queda de 40% no volume de um dia é um alarme, não um dado.
+- **Deduplicação**: clientes móveis reenviam eventos quando a rede falha; sem dedup por ID, um clique vira três.
+- **Eventos atrasados**: um celular offline manda os eventos de ontem hoje. O pipeline define uma **marca d'água** (até quanto tempo aceita atraso) e decide se reprocessa a partição antiga ou descarta.
+- **Orquestração**: um agendador (Airflow ou similar) roda as etapas como um grafo de dependências, com reexecução idempotente por partição.
+
+## Exemplo: da camada bruta às features
+
+O programa processa um lote pequeno de eventos com os problemas típicos e produz features diárias por usuário.
+
+```python
+from collections import defaultdict
+
+eventos = [
+    {"id": "e1", "usuario": "u1", "tipo": "clique", "dia": "2026-03-10", "valor": None},
+    {"id": "e2", "usuario": "u1", "tipo": "compra", "dia": "2026-03-10", "valor": 120.0},
+    {"id": "e2", "usuario": "u1", "tipo": "compra", "dia": "2026-03-10", "valor": 120.0},
+    {"id": "e3", "usuario": "u2", "tipo": "clique", "dia": "2026-03-10", "valor": None},
+    {"id": "e4", "usuario": None, "tipo": "clique", "dia": "2026-03-10", "valor": None},
+    {"id": "e5", "usuario": "u2", "tipo": "compra", "dia": "2026-03-10", "valor": -50.0},
+    {"id": "e6", "usuario": "u2", "tipo": "clique", "dia": "2026-03-07", "valor": None},
+    {"id": "e7", "usuario": "u3", "tipo": "compra", "dia": "2026-03-09", "valor": 80.0},
+]
+DIA_PROCESSADO = "2026-03-10"
+DIAS_ACEITOS_ATRASO = {"2026-03-09", "2026-03-10"}
+
+motivos = defaultdict(int)
+vistos, limpos, reprocessar = set(), [], set()
+for e in eventos:
+    if e["usuario"] is None:
+        motivos["sem usuario"] += 1
+    elif e["tipo"] == "compra" and (e["valor"] is None or e["valor"] <= 0):
+        motivos["valor invalido"] += 1
+    elif e["id"] in vistos:
+        motivos["duplicado"] += 1
+    elif e["dia"] not in DIAS_ACEITOS_ATRASO:
+        motivos["atrasado demais"] += 1
+    else:
+        vistos.add(e["id"])
+        limpos.append(e)
+        if e["dia"] != DIA_PROCESSADO:
+            reprocessar.add(e["dia"])
+
+print(f"entrada={len(eventos)} limpos={len(limpos)} descartados={dict(motivos)}")
+print(f"particoes antigas a reprocessar: {sorted(reprocessar)}")
+
+features = defaultdict(lambda: {"cliques": 0, "compras": 0, "gasto": 0.0})
+for e in limpos:
+    if e["dia"] != DIA_PROCESSADO:
+        continue
+    f = features[e["usuario"]]
+    if e["tipo"] == "clique":
+        f["cliques"] += 1
+    else:
+        f["compras"] += 1
+        f["gasto"] += e["valor"]
+for usuario in sorted(features):
+    print(usuario, features[usuario])
+```
+
+```text
+Saída:
+entrada=8 limpos=4 descartados={'duplicado': 1, 'sem usuario': 1, 'valor invalido': 1, 'atrasado demais': 1}
+particoes antigas a reprocessar: ['2026-03-09']
+u1 {'cliques': 1, 'compras': 1, 'gasto': 120.0}
+u2 {'cliques': 1, 'compras': 0, 'gasto': 0.0}
+```
+
+Sem a deduplicação, o gasto do `u1` dobraria; sem a validação, o `u2` teria gasto negativo. Esses erros não quebram nada visivelmente: o treino roda, a AUC sai, e o modelo aprende ruído.
+
+## Batch ou streaming?
+
+| | Batch | Streaming |
+| --- | --- | --- |
+| Frescor | Horas | Segundos ou minutos |
+| Complexidade | Baixa; reprocessar é rodar de novo | Alta; estado, janelas, ordem, exatamente-uma-vez |
+| Uso típico | Dataset de treino, agregados de 30 dias | Contadores recentes (cliques na última hora), fraude |
+| Custo | Barato por evento | Infra sempre ligada |
+
+Muitos sistemas usam os dois: o batch é a fonte da verdade e o streaming adianta os agregados recentes. O cuidado é garantir que a mesma definição de feature produza o mesmo valor nos dois caminhos.
+
+## Armadilhas
+
+- **Mudança silenciosa de esquema**: o app passa a mandar preço em centavos e o modelo vê preços 100 vezes maiores. Contratos de dados e validação por partição pegam isso.
+- **Join com o estado atual**: juntar eventos antigos com a tabela de usuários de hoje traz informação do futuro. Use snapshots ou tabelas com validade temporal.
+- **Amostragem no log**: se o cliente só registra 10% das impressões, os cliques parecem 10 vezes mais frequentes.
+
+## Na entrevista
+
+Ao falar de dados, cite a origem, o atraso e a qualidade de cada fonte, e mencione validação, dedup e reprocessamento idempotente. Follow-ups comuns: "o volume de eventos caiu pela metade ontem, o que você faz?" (bloquear o treino e investigar antes de publicar modelo), "como lidar com eventos que chegam com dias de atraso?" e "como garantir que a feature do treino é igual à do servimento?".
+
+<QuizSet>
+<Quiz question="Um app reenvia eventos quando a conexão falha. Qual mecanismo evita contar o mesmo clique várias vezes?" options={["Aumentar a retenção do Kafka", "Deduplicar pelo ID único do evento", "Amostrar 10% dos eventos", "Ordenar por timestamp"]} answer={1} explanation="Cada evento leva um ID gerado no cliente; o pipeline descarta repetições desse ID." />
+<Quiz question="O volume de eventos de ontem caiu 45% sem nenhuma mudança no produto. O que o pipeline deveria fazer?" options={["Treinar normalmente", "Disparar alerta e segurar o treino e a publicação até investigar", "Duplicar os eventos para compensar", "Descartar o dia sem avisar"]} answer={1} explanation="Queda de volume costuma indicar bug de coleta; treinar com esse dia pode degradar o modelo." />
+<Quiz question="Por que manter uma camada bruta imutável no data lake?" options={["Porque é mais barata que a tratada", "Para poder reprocessar tudo quando um bug de limpeza for descoberto", "Para servir features online", "Para evitar compressão"]} answer={1} explanation="Guardando os dados como chegaram, você corrige a lógica e recalcula as camadas seguintes sem perda." />
+</QuizSet>

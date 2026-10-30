@@ -1,0 +1,128 @@
+---
+title: Avaliação de sistemas com LLM
+kind: lesson
+---
+
+Em software tradicional, um teste diz se a função retorna 42. Com LLMs, a saída é texto livre, varia entre execuções e "correto" muitas vezes é questão de grau. Sem avaliação, todo ajuste vira opinião: alguém testa cinco perguntas, gosta do resultado e publica um prompt que piora 15% dos casos. **Avaliação (evals)** é o que transforma um protótipo impressionante num produto confiável, e é o assunto que mais separa candidatos em entrevistas de AI engineering.
+
+## O conjunto de avaliação
+
+Tudo começa com um **dataset de casos**: entradas reais (ou realistas) com o resultado esperado ou critérios de aceitação. Fontes boas: logs de produção anonimizados, perguntas que deram problema, casos difíceis criados pela equipe e exemplos sintéticos gerados por LLM e revisados por humanos. Algumas dezenas de casos bem escolhidos já pegam regressões grosseiras; centenas dão confiança estatística por categoria.
+
+Cubra: casos típicos, casos de borda, perguntas sem resposta na base (o sistema deve dizer "não sei"), tentativas de abuso e cada categoria importante do produto.
+
+## Tipos de métrica
+
+| Tipo | Exemplos | Quando usar |
+| --- | --- | --- |
+| Determinística | Correspondência exata, regex, JSON válido, F1 de tokens, a resposta contém o número certo | Extração, classificação, formato, respostas curtas |
+| Recuperação | Recall@k, MRR, nDCG | Etapa de busca do RAG |
+| LLM como juiz | Nota de 1 a 5 com rubrica, comparação par a par, verificação de fidelidade | Respostas abertas, tom, completude |
+| Humana | Revisão de especialistas, notas de usuários | Calibrar o juiz, casos de alto risco |
+| Online | Taxa de resolução, polegar para cima/baixo, retenção, escalonamento para humano | Medir impacto real após publicar |
+
+Prefira métricas determinísticas sempre que possível: são baratas, rápidas e reprodutíveis. O programa compara duas versões de um sistema com correspondência exata e F1 de tokens, que dá crédito parcial.
+
+```python
+from collections import Counter
+
+def normalizar(t):
+    return t.lower().replace(".", "").replace(",", "").split()
+
+def exato(pred, ref):
+    return float(normalizar(pred) == normalizar(ref))
+
+def f1(pred, ref):
+    p, r = normalizar(pred), normalizar(ref)
+    comuns = sum((Counter(p) & Counter(r)).values())
+    if comuns == 0:
+        return 0.0
+    precisao, revocacao = comuns / len(p), comuns / len(r)
+    return 2 * precisao * revocacao / (precisao + revocacao)
+
+casos = [
+    ("prazo de reembolso?", "10 dias úteis"),
+    ("aceita pix?", "sim"),
+    ("horário de suporte?", "das 8h às 18h"),
+]
+saidas = {
+    "v1": ["em até 10 dias úteis", "Sim, aceitamos.", "das 9h às 17h"],
+    "v2": ["10 dias úteis", "sim", "das 8h às 18h"],
+}
+for versao, preds in saidas.items():
+    em = sum(exato(p, ref) for p, (_, ref) in zip(preds, casos)) / len(casos)
+    f = sum(f1(p, ref) for p, (_, ref) in zip(preds, casos)) / len(casos)
+    print(f"{versao}: exato={em:.2f} f1={f:.2f}")
+```
+
+```text
+Saída:
+v1: exato=0.00 f1=0.64
+v2: exato=1.00 f1=1.00
+```
+
+## LLM como juiz
+
+Para respostas abertas, você usa outro modelo para avaliar, com uma **rubrica** explícita ("a resposta cita a fonte? contradiz o contexto? responde à pergunta?"). Funciona bem quando calibrado, mas tem vieses conhecidos:
+
+- **Posição:** em comparações A versus B, tende a preferir uma das posições. Rode as duas ordens.
+- **Verbosidade:** tende a preferir respostas longas.
+- **Autopreferência:** pode favorecer textos do próprio modelo.
+
+Calibre o juiz comparando as notas dele com notas humanas numa amostra, e prefira perguntas binárias e específicas ("a resposta contém alguma afirmação ausente do contexto?") a notas genéricas de 1 a 10.
+
+Em RAG, a métrica mais importante costuma ser a **fidelidade** (faithfulness): cada afirmação da resposta tem suporte no contexto recuperado? Um verificador de brinquedo, que checa se cada frase da resposta tem a maioria das palavras presente no contexto, mostra a ideia (um juiz real usaria um LLM ou um modelo de inferência textual):
+
+```python
+import re
+
+def palavras(t):
+    return set(re.findall(r"\w+", t.lower()))
+
+def fidelidade(resposta, contexto, minimo=0.6):
+    ctx = palavras(contexto)
+    frases = [f for f in re.split(r"(?<=\.)\s+", resposta) if f]
+    resultado = []
+    for frase in frases:
+        p = palavras(frase)
+        cobertura = len(p & ctx) / len(p)
+        resultado.append((frase, round(cobertura, 2), cobertura >= minimo))
+    return resultado
+
+contexto = "O plano anual custa 480 reais. O cancelamento é gratuito nos primeiros 7 dias."
+resposta = "O plano anual custa 480 reais. O cancelamento é gratuito em 7 dias. Inclui suporte 24 horas por telefone."
+for frase, cob, ok in fidelidade(resposta, contexto):
+    print(f"{'OK ' if ok else 'SEM SUPORTE'} {cob:.2f} | {frase}")
+```
+
+```text
+Saída:
+OK  1.00 | O plano anual custa 480 reais.
+OK  0.86 | O cancelamento é gratuito em 7 dias.
+SEM SUPORTE 0.00 | Inclui suporte 24 horas por telefone.
+```
+
+## Avaliação no ciclo de desenvolvimento
+
+```text
+mudança (prompt, modelo, chunking) ──► roda evals offline ──► compara com a versão atual
+         ▲                                                          │ melhorou e não regrediu?
+         │                                                          ▼
+   novos casos ◄── falhas e feedback de produção ◄── publica (A/B ou canário)
+```
+
+Rode as evals no CI a cada mudança relevante, acompanhe métricas por categoria (uma média boa pode esconder uma categoria que piorou) e transforme cada bug de produção num caso novo.
+
+<Callout type="tip" title="Olhe os dados">
+Nenhuma métrica substitui ler saídas reais. Separe um tempo para revisar amostras de falhas e acertos: é assim que você descobre os critérios que deveriam virar métricas.
+</Callout>
+
+## Na entrevista
+
+Quando perguntarem "como você sabe que funciona?", descreva: dataset versionado com casos reais e de borda, métricas determinísticas onde der, LLM como juiz calibrado com humanos para o resto, avaliação separada de recuperação e geração, evals no CI e métricas online após o lançamento. Follow-ups: "como evitar o viés do juiz?" (rubrica específica, inverter a ordem nas comparações, calibrar com humanos) e "quantos casos são suficientes?" (o bastante para detectar a diferença que importa em cada categoria; comece com dezenas e cresça com as falhas de produção).
+
+<QuizSet>
+<Quiz question="Você vai trocar o modelo do seu assistente por um mais barato. Qual o procedimento mais confiável?" options={["Testar manualmente dez perguntas", "Rodar o conjunto de avaliação nos dois modelos, comparar métricas por categoria e depois fazer um teste A/B", "Perguntar ao modelo novo se ele é tão bom quanto o antigo", "Trocar e esperar reclamações"]} answer={1} explanation="Evals offline detectam regressões antes do lançamento; o A/B confirma o impacto real com usuários." />
+<Quiz question="Numa comparação par a par, seu juiz LLM prefere a resposta A em 70% dos casos, mas quando você inverte a ordem, prefere a nova primeira posição. O que isso indica?" options={["A resposta A é melhor", "Viés de posição do juiz; avalie nas duas ordens e combine", "O juiz está perfeitamente calibrado", "As respostas são idênticas"]} answer={1} explanation="Se a preferência acompanha a posição e não o conteúdo, é viés. Avaliar as duas ordens e só contar vitórias consistentes mitiga isso." />
+<Quiz question="A média de acerto subiu de 82% para 85% com o novo prompt, mas os casos de cobrança caíram de 90% para 70%. Qual a lição?" options={["Publicar, pois a média subiu", "Acompanhar métricas por categoria, porque a média pode esconder regressões importantes", "Remover os casos de cobrança do dataset", "Aumentar a temperatura"]} answer={1} explanation="Médias agregadas mascaram regressões localizadas. Categorias críticas precisam de acompanhamento e de limites próprios." />
+</QuizSet>

@@ -1,0 +1,166 @@
+---
+title: Operações atômicas e CAS
+kind: lesson
+---
+
+Proteger um contador com um mutex funciona, mas é caro para algo tão pequeno: cada incremento pode virar uma chamada ao sistema operacional quando há disputa, e a thread que perde a disputa dorme e precisa ser acordada depois. Para operações curtas sobre uma única variável, o processador oferece algo melhor: **instruções atômicas**, que leem, modificam e escrevem uma posição de memória como um passo indivisível, sem lock nenhum.
+
+## O que é uma operação atômica
+
+`contador += 1` parece uma operação, mas são três: ler o valor, somar um, escrever de volta. Duas threads podem ler o mesmo valor antigo e uma escrita apaga a outra. Uma operação atômica faz as três etapas de modo que nenhuma outra thread observe um estado intermediário.
+
+As mais comuns:
+
+| Operação | O que faz |
+| --- | --- |
+| load / store atômico | Lê ou escreve com visibilidade garantida entre threads |
+| fetch-and-add | Soma e devolve o valor anterior, num passo só |
+| exchange | Troca o valor e devolve o antigo |
+| compare-and-swap (CAS) | Troca só se o valor atual for o esperado |
+
+Em Java elas estão em `AtomicInteger`, `AtomicLong` e `AtomicReference`. Em C++, em `std::atomic<T>` com `fetch_add` e `compare_exchange_weak`. Em Go, no pacote `sync/atomic`. Python puro não expõe CAS: o GIL torna algumas operações isoladas atômicas por acidente de implementação, mas `x += 1` continua não sendo, e com o Python sem GIL (3.13 free-threaded) contar com isso é ainda mais arriscado.
+
+## Compare-and-swap
+
+O CAS recebe três coisas: o endereço, o valor que você espera encontrar e o valor novo. Se o atual for igual ao esperado, ele grava o novo e devolve sucesso; senão, não faz nada e devolve falha. Com isso você constrói qualquer atualização sem lock usando um **laço de retentativa**:
+
+```text
+repita:
+    atual = ler(x)
+    novo  = f(atual)
+    se CAS(x, atual, novo): pronto
+    senão: alguém mudou x no meio; tente de novo
+```
+
+O programa abaixo simula um `AtomicInteger`. Como Python não tem a instrução de hardware, o `compare_and_set` usa um lock interno só para emular o passo indivisível; o ponto é o laço de retentativa no `incrementar`, que é exatamente o que `AtomicInteger.incrementAndGet` faz na JVM.
+
+```python
+import threading
+
+class AtomicInteger:
+    def __init__(self, valor=0):
+        self._valor = valor
+        self._hw = threading.Lock()  # emula a instrução atômica do processador
+
+    def get(self):
+        return self._valor
+
+    def compare_and_set(self, esperado, novo):
+        with self._hw:
+            if self._valor == esperado:
+                self._valor = novo
+                return True
+            return False
+
+    def incrementar(self):
+        while True:
+            atual = self.get()
+            if self.compare_and_set(atual, atual + 1):
+                return atual + 1
+
+contador = AtomicInteger()
+
+def trabalho():
+    for _ in range(2000):
+        contador.incrementar()
+
+threads = [threading.Thread(target=trabalho) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("esperado:", 4 * 2000)
+print("obtido:", contador.get())
+```
+
+```text
+Saída:
+esperado: 8000
+obtido: 8000
+```
+
+## Lock-free não é de graça
+
+Algoritmos baseados em CAS são chamados de **lock-free**: alguma thread sempre progride, mesmo que outra seja pausada no meio da operação. Isso evita deadlock e inversão de prioridade, mas traz custos:
+
+- **Contenção alta gera muitas retentativas.** Com dezenas de threads batendo na mesma variável, cada CAS falho é trabalho jogado fora e a linha de cache fica pulando entre núcleos. Java oferece `LongAdder`, que espalha a soma em várias células e só junta na leitura.
+- **Só cobre uma variável.** Atualizar duas variáveis de forma consistente exige um lock ou empacotar ambas num objeto imutável trocado por `AtomicReference`.
+- **O problema ABA.** O CAS compara valores, não histórias.
+
+### O problema ABA
+
+A thread 1 lê o topo de uma pilha, A, e é pausada. A thread 2 remove A, remove B e devolve A. Quando a thread 1 volta, o topo ainda é A, o CAS dá certo e ela instala como topo um nó que já tinha saído da pilha.
+
+```python
+class No:
+    def __init__(self, valor, prox=None):
+        self.valor = valor
+        self.prox = prox
+
+class Referencia:
+    def __init__(self, valor):
+        self.valor = valor
+    def compare_and_set(self, esperado, novo):
+        if self.valor is esperado:
+            self.valor = novo
+            return True
+        return False
+
+class ReferenciaComVersao:
+    def __init__(self, valor):
+        self.valor, self.versao = valor, 0
+    def compare_and_set(self, esperado, versao, novo):
+        if self.valor is esperado and self.versao == versao:
+            self.valor, self.versao = novo, self.versao + 1
+            return True
+        return False
+
+def cenario(com_versao):
+    c = No("C"); b = No("B", c); a = No("A", b)
+    topo = ReferenciaComVersao(a) if com_versao else Referencia(a)
+    # thread 1 lê o topo e o próximo, depois é pausada
+    visto, prox, v = topo.valor, topo.valor.prox, getattr(topo, "versao", 0)
+    # thread 2: remove A, remove B e devolve A
+    for _ in range(2):
+        x = topo.valor
+        if com_versao:
+            topo.compare_and_set(x, topo.versao, x.prox)
+        else:
+            topo.compare_and_set(x, x.prox)
+    a.prox = topo.valor
+    if com_versao:
+        topo.compare_and_set(topo.valor, topo.versao, a)
+    else:
+        topo.compare_and_set(topo.valor, a)
+    # thread 1 retoma o pop
+    if com_versao:
+        ok = topo.compare_and_set(visto, v, prox)
+    else:
+        ok = topo.compare_and_set(visto, prox)
+    return ok, topo.valor.valor
+
+print("sem versao:", cenario(False))
+print("com versao:", cenario(True))
+```
+
+```text
+Saída:
+sem versao: (True, 'B')
+com versao: (False, 'A')
+```
+
+Sem versão, o topo vira B, que já tinha sido removido. Com um contador de versão junto do ponteiro (o `AtomicStampedReference` do Java), a thread 1 percebe que o mundo mudou e tenta de novo.
+
+<Callout type="warning" title="Prefira o que já existe">
+Escrever estruturas lock-free corretas é difícil até para especialistas. Use os atômicos e as coleções concorrentes da linguagem e só desça ao CAS manual quando o profiling provar que o lock é o gargalo.
+</Callout>
+
+## Na entrevista
+
+Quando pedirem um contador ou um gerador de IDs concorrente, mencione que um atômico resolve sem lock e explique o laço de CAS. Se o assunto for estruturas lock-free, cite ABA e a solução com versão (ou *hazard pointers* e coleta de lixo, que evitam reaproveitar o nó). Follow-ups comuns: "atômico é sempre mais rápido que mutex?" (não sob contenção alta; aí `LongAdder` ou sharding do contador) e "como atualizar dois campos juntos sem lock?" (objeto imutável trocado por CAS de referência).
+
+<QuizSet>
+<Quiz question="O que o compare-and-swap faz quando o valor atual é diferente do esperado?" options={["Grava o novo valor mesmo assim", "Não altera nada e indica falha, para quem chamou tentar de novo", "Bloqueia a thread até o valor voltar ao esperado", "Lança uma exceção obrigatoriamente"]} answer={1} explanation="O CAS só escreve quando encontra o valor esperado; em caso de falha, o laço relê e tenta novamente." />
+<Quiz question="Uma pilha lock-free usa CAS no topo. Uma thread lê A, é pausada, outra remove A e B e devolve A. Como se chama o problema e uma solução?" options={["Deadlock; ordenar os locks", "ABA; acompanhar o ponteiro com um contador de versão", "Starvation; usar lock justo", "False sharing; adicionar padding"]} answer={1} explanation="O valor voltou a A, mas a estrutura mudou. Um carimbo de versão faz o CAS falhar nesse caso." />
+<Quiz question="Dezenas de threads incrementam o mesmo AtomicLong e o throughput caiu. O que ajuda?" options={["Trocar por um synchronized", "Usar um contador distribuído em células, como LongAdder, somando só na leitura", "Aumentar a prioridade das threads", "Chamar Thread.yield() após cada incremento"]} answer={1} explanation="Sob contenção alta, os CAS falham muito. Espalhar a escrita em várias células reduz a disputa." />
+</QuizSet>

@@ -1,0 +1,120 @@
+---
+title: Recuperação e re-ranking
+kind: lesson
+---
+
+A busca vetorial devolve os trechos cujo embedding está mais perto do embedding da pergunta. Isso é rápido, mas grosseiro: o vetor do documento foi calculado **sem saber qual seria a pergunta**, então detalhes como negação, quem fez o quê e qual versão do produto se perdem. O resultado típico é o trecho certo aparecer em 7º lugar, enquanto o prompt só leva os 3 primeiros. A solução padrão é dividir a recuperação em duas etapas: uma rápida e abrangente, outra lenta e precisa.
+
+## Recuperar muito, reordenar bem
+
+```text
+pergunta ──► 1ª etapa: híbrida (BM25 + vetorial), top 50-100   ← barata, alto recall
+              │
+              ▼
+           2ª etapa: re-ranker, reordena os candidatos         ← cara, alta precisão
+              │
+              ▼
+           top 3-8 trechos ──► prompt do LLM
+```
+
+- **Bi-encoder** (o embedding comum): codifica pergunta e documento separadamente. Os documentos são processados uma vez, na ingestão; por isso escala para milhões.
+- **Cross-encoder** (o re-ranker típico): lê pergunta e documento **juntos** e devolve um score de relevância. Ele vê as interações entre as palavras das duas, por isso é bem mais preciso, mas precisa rodar uma vez por par, a cada consulta. Só dá para aplicar nos poucos candidatos da primeira etapa.
+
+Re-rankers existem como modelos abertos e como APIs de provedores. Também dá para usar um LLM como re-ranker, pedindo uma nota de relevância por trecho, ao custo de mais latência.
+
+O programa simula as duas etapas. A primeira usa sobreposição de palavras (como um bi-encoder ingênuo); o "cross-encoder" de brinquedo olha para a pergunta e o trecho juntos e pune trechos que negam o que foi perguntado.
+
+```python
+import re
+
+TRECHOS = {
+    "t1": "O plano anual não permite reembolso após 7 dias.",
+    "t2": "O plano mensal permite cancelamento e reembolso proporcional a qualquer momento.",
+    "t3": "Reembolso do plano anual: permitido em até 7 dias após a compra.",
+    "t4": "O plano anual tem desconto em relação ao mensal.",
+}
+
+def palavras(t):
+    return set(re.findall(r"\w+", t.lower()))
+
+def etapa1(pergunta, k=4):
+    q = palavras(pergunta)
+    return sorted(TRECHOS, key=lambda d: -len(q & palavras(TRECHOS[d])))[:k]
+
+def cross_encoder(pergunta, trecho):
+    q, t = palavras(pergunta), palavras(trecho)
+    score = len(q & t) / len(q)
+    if "não" in t and "não" not in q:
+        score -= 0.3          # o trecho nega o que a pergunta quer
+    if "anual" in q and "anual" not in t:
+        score -= 0.5          # fala de outro plano
+    return round(score, 2)
+
+pergunta = "o plano anual permite reembolso em 7 dias"
+candidatos = etapa1(pergunta)
+print("etapa 1:", candidatos)
+reordenado = sorted(candidatos, key=lambda d: -cross_encoder(pergunta, TRECHOS[d]))
+print("re-rank:", [(d, cross_encoder(pergunta, TRECHOS[d])) for d in reordenado])
+```
+
+```text
+Saída:
+etapa 1: ['t1', 't3', 't2', 't4']
+re-rank: [('t3', 0.75), ('t1', 0.57), ('t4', 0.5), ('t2', 0.0)]
+```
+
+## Medindo a recuperação
+
+Avalie a recuperação isoladamente, com um conjunto de perguntas e os ids dos trechos relevantes de cada uma. Métricas comuns:
+
+- **Recall@k:** fração dos trechos relevantes que aparecem no top-k. Diz se a informação chegou ao prompt.
+- **MRR (Mean Reciprocal Rank):** média de 1/posição do primeiro relevante. Premia acertar logo no topo.
+- **nDCG:** considera graus de relevância e a posição de todos os acertos.
+
+```python
+def recall_at_k(ranking, relevantes, k):
+    return len(set(ranking[:k]) & relevantes) / len(relevantes)
+
+def reciprocal_rank(ranking, relevantes):
+    for pos, doc in enumerate(ranking, start=1):
+        if doc in relevantes:
+            return 1 / pos
+    return 0.0
+
+avaliacao = [
+    # (ranking sem re-ranker, ranking com re-ranker, relevantes)
+    (["t1", "t4", "t3", "t2"], ["t3", "t1", "t4", "t2"], {"t3"}),
+    (["t7", "t2", "t9", "t5"], ["t2", "t5", "t7", "t9"], {"t2", "t5"}),
+    (["t8", "t6", "t1", "t4"], ["t8", "t1", "t6", "t4"], {"t8"}),
+]
+for nome, idx in (("sem re-ranker", 0), ("com re-ranker", 1)):
+    r2 = sum(recall_at_k(c[idx], c[2], 2) for c in avaliacao) / len(avaliacao)
+    mrr = sum(reciprocal_rank(c[idx], c[2]) for c in avaliacao) / len(avaliacao)
+    print(f"{nome}: recall@2={r2:.2f} MRR={mrr:.2f}")
+```
+
+```text
+Saída:
+sem re-ranker: recall@2=0.50 MRR=0.61
+com re-ranker: recall@2=1.00 MRR=1.00
+```
+
+## Outras alavancas da recuperação
+
+- **Filtros por metadados:** produto, versão, idioma, data, permissão. Reduzem o espaço de busca e evitam trechos certos do produto errado.
+- **Diversidade (MMR):** evita que o top-k seja cinco cópias quase iguais do mesmo parágrafo, penalizando candidatos parecidos com os já escolhidos.
+- **Quantidade de trechos:** mais trechos aumentam o recall do prompt, mas também custo, latência e distração. Meça a qualidade final variando k.
+- **Ordem no prompt:** coloque os mais relevantes no início ou no fim, onde o modelo presta mais atenção.
+
+<Callout type="note" title="Latência do re-ranker">
+Re-ranquear 50 candidatos com um cross-encoder adiciona tipicamente dezenas a centenas de milissegundos, dependendo do modelo e do hardware. Ajuste o número de candidatos com medições: mais candidatos aumentam o recall da segunda etapa até um ponto em que só aumentam a latência.
+</Callout>
+
+## Na entrevista
+
+Proponha o pipeline em duas etapas e explique a diferença entre bi-encoder e cross-encoder (independente versus conjunto, escala versus precisão). Diga como você mediria cada etapa: recall@50 na primeira (o relevante precisa estar entre os candidatos) e MRR ou nDCG depois do re-ranking. Follow-ups: "por que não usar o cross-encoder na base inteira?" (precisaria de uma inferência por documento a cada pergunta) e "o que fazer se o top-5 tem vários trechos repetidos?" (deduplicação e MMR).
+
+<QuizSet>
+<Quiz question="Por que um cross-encoder é mais preciso que a busca por embeddings?" options={["Usa vetores com mais dimensões", "Processa pergunta e documento juntos, enxergando a interação entre eles", "Usa BM25 internamente", "É treinado com mais dados"]} answer={1} explanation="O bi-encoder codifica o documento sem conhecer a pergunta. O cross-encoder lê os dois ao mesmo tempo e captura nuances como negação e entidades." />
+<Quiz question="Seu re-ranker é excelente, mas a resposta continua errada em muitas perguntas. Você verifica e o trecho relevante não está nos 50 candidatos da primeira etapa. O que melhorar?" options={["O re-ranker", "O recall da primeira etapa: busca híbrida, mais candidatos, melhor chunking ou filtros", "A temperatura do LLM", "O tamanho da resposta"]} answer={1} explanation="O re-ranker só reordena o que recebe. Se o relevante não está entre os candidatos, o gargalo é a recuperação inicial." />
+</QuizSet>

@@ -1,0 +1,134 @@
+---
+title: Chunking
+kind: lesson
+---
+
+Você não indexa um manual de 80 páginas como um vetor só: o embedding viraria uma média borrada de todos os assuntos, e o trecho devolvido não caberia no prompt. Também não indexa frase por frase, porque cada frase isolada perde o contexto ("ele deve ser renovado anualmente": quem é "ele"?). **Chunking** é a decisão de como cortar documentos em pedaços recuperáveis, e é uma das alavancas de qualidade mais subestimadas de um RAG.
+
+## O dilema do tamanho
+
+| Chunks pequenos | Chunks grandes |
+| --- | --- |
+| Embedding focado, busca mais precisa | Mais contexto em cada trecho |
+| Perdem referências e contexto ao redor | Embedding diluído, misturam assuntos |
+| Mais vetores, índice maior | Menos trechos cabem no prompt |
+
+Não existe tamanho universal. Valores entre algumas centenas e cerca de mil tokens são pontos de partida comuns; o certo para a sua base sai de avaliação com perguntas reais.
+
+## Estratégias
+
+**Tamanho fixo com sobreposição.** Corta a cada N tokens (ou palavras) e repete os últimos M no início do próximo chunk. A sobreposição evita que uma ideia cortada no meio fique sem metade em ambos os pedaços. É simples e serve como baseline.
+
+```python
+texto = (
+    "O reembolso de viagens exige nota fiscal. A nota deve estar no nome da empresa. "
+    "Pedidos sem nota são recusados. O prazo de pagamento é de dez dias úteis. "
+    "Viagens internacionais seguem a mesma regra com câmbio do dia."
+)
+
+def chunk_fixo(texto, tamanho, sobreposicao):
+    palavras = texto.split()
+    passo = tamanho - sobreposicao
+    chunks = []
+    for inicio in range(0, len(palavras), passo):
+        pedaco = palavras[inicio:inicio + tamanho]
+        chunks.append(" ".join(pedaco))
+        if inicio + tamanho >= len(palavras):
+            break
+    return chunks
+
+for i, c in enumerate(chunk_fixo(texto, tamanho=14, sobreposicao=4)):
+    print(f"[{i}] {c}")
+```
+
+```text
+Saída:
+[0] O reembolso de viagens exige nota fiscal. A nota deve estar no nome da
+[1] estar no nome da empresa. Pedidos sem nota são recusados. O prazo de pagamento
+[2] O prazo de pagamento é de dez dias úteis. Viagens internacionais seguem a mesma
+[3] internacionais seguem a mesma regra com câmbio do dia.
+```
+
+O chunk 0 termina no meio de "no nome da empresa"; graças à sobreposição, o chunk 1 repete o fim e traz a frase completa. Sem ela, nenhum dos dois pedaços conteria a regra inteira.
+
+**Recursivo por separadores.** Tenta cortar primeiro nos limites mais "naturais" (seções, depois parágrafos, depois frases, depois palavras), descendo de nível só quando um pedaço ainda passa do limite. Respeita a estrutura do texto e é o padrão de muitas bibliotecas.
+
+**Estrutural.** Usa a estrutura do formato: títulos de Markdown e HTML, seções de um contrato, funções e classes em código, linhas de uma tabela. Tabelas e blocos de código nunca deveriam ser cortados no meio.
+
+**Semântico.** Calcula embeddings de frases consecutivas e corta onde a similaridade cai (mudança de assunto). Pode ajudar em textos sem estrutura, mas custa mais e nem sempre supera o recursivo.
+
+## Enriquecendo o chunk
+
+Um chunk solto perde o "endereço" dele no documento. Duas técnicas baratas ajudam muito:
+
+- **Prefixar o caminho de títulos** (documento › seção › subseção) ao texto que vai para o embedding.
+- **Guardar metadados**: id do documento, seção, página, data, permissões. Eles servem para filtrar, citar e reconstruir o contexto vizinho.
+
+```python
+DOC = """# Política de viagens
+## Reembolso
+Despesas são reembolsadas com nota fiscal em nome da empresa.
+O prazo de pagamento é de dez dias úteis.
+## Hospedagem
+O limite diário de hotel depende da cidade.
+Capitais têm limite maior.
+"""
+
+def chunk_por_secao(md, max_palavras=12):
+    titulo_doc, secao, linhas, chunks = "", "", [], []
+
+    def fechar():
+        if not linhas:
+            return
+        atual = []
+        for linha in linhas:
+            if atual and len(" ".join(atual + [linha]).split()) > max_palavras:
+                chunks.append({"secao": secao, "texto": f"{titulo_doc} > {secao}: " + " ".join(atual)})
+                atual = []
+            atual.append(linha)
+        chunks.append({"secao": secao, "texto": f"{titulo_doc} > {secao}: " + " ".join(atual)})
+        linhas.clear()
+
+    for linha in md.strip().splitlines():
+        if linha.startswith("## "):
+            fechar()
+            secao = linha[3:]
+        elif linha.startswith("# "):
+            titulo_doc = linha[2:]
+        elif linha.strip():
+            linhas.append(linha.strip())
+    fechar()
+    return chunks
+
+for c in chunk_por_secao(DOC):
+    print(c["texto"])
+```
+
+```text
+Saída:
+Política de viagens > Reembolso: Despesas são reembolsadas com nota fiscal em nome da empresa.
+Política de viagens > Reembolso: O prazo de pagamento é de dez dias úteis.
+Política de viagens > Hospedagem: O limite diário de hotel depende da cidade. Capitais têm limite maior.
+```
+
+Cada chunk agora "sabe" de que seção veio, o que melhora a busca ("limite de hotel" encontra "Hospedagem") e a citação.
+
+<Callout type="tip" title="Recupere pequeno, entregue grande">
+Uma técnica eficaz é indexar chunks pequenos (busca precisa) e, ao montar o prompt, entregar o chunk junto com seus vizinhos ou a seção inteira de onde ele veio (contexto suficiente). Chama-se às vezes de parent document retrieval ou small-to-big.
+</Callout>
+
+## Armadilhas
+
+- **Extração ruim antes do chunking:** PDF com colunas embaralhadas, cabeçalhos e rodapés repetidos em todo chunk, tabelas viradas em sopa de números. Limpe antes de cortar.
+- **Cortar no meio de tabela ou código:** o pedaço fica sem sentido para o modelo e para o embedding.
+- **Ignorar o limite do modelo de embedding:** texto acima do limite é truncado em silêncio.
+- **Mudar a estratégia sem reavaliar:** chunking altera recall; trate como mudança que exige rodar a avaliação de recuperação.
+
+## Na entrevista
+
+Diga que começaria com chunking recursivo (algumas centenas de tokens, sobreposição de 10% a 20%), respeitando estrutura do documento, com títulos e metadados anexados, e que ajustaria o tamanho medindo recall@k num conjunto de perguntas. Follow-ups: "como tratar tabelas?" (manter a tabela inteira, ou uma linha por chunk com o cabeçalho repetido) e "a resposta precisa de informação espalhada em várias seções, e agora?" (chunks maiores, recuperar vizinhos ou técnicas multi-hop do capítulo de RAG avançado).
+
+<QuizSet>
+<Quiz question="Para que serve a sobreposição entre chunks consecutivos?" options={["Aumentar o tamanho do índice de propósito", "Evitar que uma ideia cortada no limite fique incompleta nos dois pedaços", "Melhorar a velocidade do embedding", "Remover duplicatas"]} answer={1} explanation="Ao repetir algumas palavras do fim de um chunk no começo do seguinte, informação que cruzaria o corte aparece inteira em pelo menos um deles." />
+<Quiz question="Usuários perguntam 'qual o limite de hotel?' e o chunk certo diz só 'Capitais têm limite maior', sem mencionar hospedagem. O que ajuda mais?" options={["Diminuir ainda mais o chunk", "Prefixar o chunk com o caminho de títulos (Política de viagens › Hospedagem) antes de gerar o embedding", "Aumentar a temperatura do LLM", "Usar só busca lexical"]} answer={1} explanation="O título da seção traz o contexto que a frase isolada perdeu, tornando o chunk recuperável pela pergunta." />
+</QuizSet>

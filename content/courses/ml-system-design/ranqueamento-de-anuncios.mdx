@@ -1,0 +1,152 @@
+---
+title: Ranqueamento de anúncios
+kind: lesson
+---
+
+"Projete o sistema que escolhe quais anúncios mostrar no feed (ou na busca)." Parece um problema de recomendação, mas tem uma diferença central: o anunciante paga, e você está rodando um **leilão** a cada impressão. O modelo não só ordena itens; a probabilidade que ele prevê entra diretamente no preço. Por isso calibração, que em outros problemas é detalhe, aqui é requisito.
+
+## Esclarecer o objetivo e a métrica
+
+O sistema equilibra três partes:
+
+- **Plataforma**: receita.
+- **Anunciante**: retorno sobre o gasto (cliques e conversões ao menor custo).
+- **Usuário**: anúncios relevantes e em quantidade tolerável.
+
+A ordenação clássica usa o **valor esperado por impressão**: `eCPM = lance × P(clique) × 1000` para campanhas pagas por clique, ou `lance × P(clique) × P(conversão | clique)` para campanhas pagas por conversão. Muitos sistemas somam um termo de qualidade ou subtraem um custo de experiência do usuário.
+
+- **Métrica online**: receita por mil impressões, mas sempre acompanhada de métricas de usuário (taxa de ocultar anúncio, sessões) e de anunciante (custo por conversão).
+- **Escala hipotética**: milhões de anúncios ativos, centenas de milhares de leilões por segundo, decisão em poucas dezenas de milissegundos.
+
+## Dados e rótulos
+
+- **Rótulos**: clique na impressão (abundante) e conversão após o clique (rara e atrasada; uma compra pode ocorrer dias depois).
+- **Volume**: bilhões de impressões por dia. Faça **amostragem negativa** das impressões sem clique e corrija a probabilidade depois: se você manteve só uma fração `w` dos negativos, a probabilidade corrigida é `p / (p + (1 - p) / w)`.
+- **Viés de posição** e de seleção, como em recomendação: só há rótulo para o que ganhou o leilão.
+
+## Features
+
+- **Anúncio e campanha**: criativo (embedding de texto e imagem), categoria, CTR histórico do anúncio e do anunciante, idade da campanha.
+- **Usuário**: interesses inferidos, histórico de cliques em anúncios, dados demográficos permitidos pela política de privacidade.
+- **Contexto**: posição, superfície (feed, busca, vídeo), dispositivo, hora.
+- **Cruzadas**: interações do usuário com o anunciante, com a categoria.
+
+Features de ID de altíssima cardinalidade (ID de anúncio, de usuário) são tratadas com hashing ou embeddings aprendidos.
+
+## Modelo de base e evolução
+
+1. **Base**: CTR histórico do anúncio, suavizado para anúncios com poucas impressões.
+2. **Regressão logística** com features cruzadas e hashing: rápida e calibrada por natureza, ainda forte como referência.
+3. **Árvores + regressão logística** ou gradient boosting.
+4. **Redes profundas** com embeddings e camadas de interação entre features, treinadas continuamente porque campanhas novas entram o tempo todo.
+5. **Calibração** final (regressão isotônica ou escala de Platt) por segmento.
+
+## Por que a calibração decide o leilão
+
+O programa simula leilões entre anúncios hipotéticos e compara três políticas: ordenar só pelo lance, ordenar pelo eCPM com um modelo calibrado e ordenar pelo eCPM com um modelo que superestima em 2 vezes o CTR de metade dos anunciantes.
+
+```python
+import random
+
+random.seed(3)
+anuncios = []
+for i in range(40):
+    ctr = random.uniform(0.002, 0.05)
+    lance = random.uniform(0.2, 3.0)
+    vies = 2.0 if i % 2 else 1.0  # o modelo ruim infla metade dos anunciantes
+    anuncios.append({"id": i, "ctr": ctr, "lance": lance, "vies": vies})
+
+def receita_esperada(politica, leiloes=5000):
+    total = cliques = 0.0
+    for _ in range(leiloes):
+        candidatos = random.sample(anuncios, 8)
+        vencedor = max(candidatos, key=politica)
+        total += vencedor["lance"] * vencedor["ctr"]
+        cliques += vencedor["ctr"]
+    return 1000 * total / leiloes, 1000 * cliques / leiloes
+
+politicas = {
+    "so lance": lambda a: a["lance"],
+    "eCPM calibrado": lambda a: a["lance"] * a["ctr"],
+    "eCPM descalibrado": lambda a: a["lance"] * a["ctr"] * a["vies"],
+}
+for nome, pol in politicas.items():
+    random.seed(11)
+    rpm, cpm_cliques = receita_esperada(pol)
+    print(f"{nome:18s} receita/mil imp = {rpm:6.2f}  cliques/mil imp = {cpm_cliques:5.1f}")
+```
+
+```text
+Saída:
+so lance           receita/mil imp = 101.17  cliques/mil imp =  35.5
+eCPM calibrado     receita/mil imp = 108.14  cliques/mil imp =  40.1
+eCPM descalibrado  receita/mil imp =  94.58  cliques/mil imp =  40.0
+```
+
+Ordenar só pelo lance entrega anúncios caros que ninguém clica: a receita e os cliques caem. O modelo descalibrado erra a ordem dos leilões em que os anunciantes inflados competem com os outros, transferindo impressões para quem não as merecia. Em produção isso também distorce o preço cobrado, já que o custo por clique num leilão de segundo preço depende do eCPM do segundo colocado.
+
+## Arquitetura de treino e servimento
+
+```text
+ requisição de anúncio (usuário, contexto)
+         |
+ +-------v---------+   segmentação, orçamento,    +--------------------+
+ | seleção de      |<-- frequência, políticas ----| índice de campanhas|
+ | candidatos      |                              +--------------------+
+ | (milhares)      |
+ +-------+---------+
+         |
+ +-------v---------+        +-------------------+
+ | modelo leve     |<-------| feature store     |
+ | (-> centenas)   |        | online            |
+ +-------+---------+        +---------^---------+
+         |                            |
+ +-------v---------+                  |
+ | modelo pesado   |        +---------+---------+     +-----------------+
+ | pCTR, pCVR      |        | streaming de      |<----| logs: impressão,|
+ | + calibração    |        | features e rótulos|     | clique, conversão|
+ +-------+---------+        +---------+---------+     +-----------------+
+         |                            |
+ +-------v---------+        +---------v---------+
+ | leilão: eCPM,   |        | treino contínuo   |
+ | preço, pacing   |        | (minutos a horas) |
+ +-------+---------+        +-------------------+
+         v
+  anúncio exibido
+```
+
+O **pacing** controla o ritmo de gasto de cada campanha ao longo do dia, ajustando lances efetivos para que o orçamento não acabe às 9h da manhã.
+
+## Avaliação
+
+- **Offline**: log loss (sensível à calibração, diferente da AUC), **entropia normalizada** (log loss dividida pela de um preditor que sempre prevê a taxa média), AUC e gráficos de calibração por segmento.
+- **Online**: A/B com receita por mil impressões, CTR, custo por conversão dos anunciantes e métricas de experiência. Testes de leilão precisam de cuidado: os grupos competem pelo mesmo orçamento de anunciante, então prefira dividir por anunciante ou por orçamento quando o efeito puder vazar entre grupos.
+
+## Monitoramento
+
+Calibração por hora (a razão entre CTR previsto e observado deve ficar perto de 1), gasto de orçamento versus planejado, distribuição de preços, frescor do modelo e alertas para quedas de receita. Campanhas novas são um fluxo constante de cold start: monitore o desempenho delas separadamente.
+
+<Callout type="tip" title="Mencione calibração antes de ser perguntado">
+Em anúncios, AUC alta não basta: a probabilidade prevista multiplica o lance. Citar log loss, entropia normalizada e correção da amostragem negativa mostra domínio do problema.
+</Callout>
+
+## Trade-offs
+
+| Decisão | Opção A | Opção B |
+| --- | --- | --- |
+| Frescor | Treino diário: simples | Contínuo: acompanha campanhas novas, mais infraestrutura |
+| Carga de anúncios | Mais anúncios: receita imediata | Menos: melhor experiência e retenção |
+| Exploração | Nenhuma: maximiza o curto prazo | Algum tráfego para anúncios novos: aprende CTR real |
+
+## Follow-ups comuns
+
+- **Anúncio novo sem histórico?** Prior a partir do anunciante e da categoria, mais um bônus de exploração limitado.
+- **Conversões atrasadas?** Modelos que tratam o atraso explicitamente ou rótulos corrigidos quando a conversão chega.
+- **Privacidade?** Menos dados de terceiros; mais peso a contexto e a sinais próprios da plataforma.
+- **Fraude de cliques?** Filtros de tráfego inválido antes de gerar rótulos e de cobrar.
+
+<QuizSet>
+<Quiz question="Por que a calibração é crítica em ranqueamento de anúncios?" options={["Porque melhora a AUC", "Porque a probabilidade prevista multiplica o lance e define vencedor e preço", "Porque reduz a latência", "Porque substitui o pacing"]} answer={1} explanation="Um pCTR inflado vale como um lance inflado: muda quem ganha e quanto paga." />
+<Quiz question="Você manteve 10% dos negativos no treino. O que fazer com as probabilidades?" options={["Nada", "Corrigi-las para a taxa real, porque o modelo superestima a taxa de cliques", "Multiplicá-las por 10", "Usar só a AUC"]} answer={1} explanation="A amostragem muda a proporção de classes; a correção p / (p + (1 - p) / w) devolve a escala original." />
+<Quiz question="Qual métrica offline é sensível à calibração?" options={["AUC", "Log loss", "Recall@k", "Precisão no top-1"]} answer={1} explanation="AUC só olha a ordem; log loss penaliza probabilidades na escala errada." />
+</QuizSet>

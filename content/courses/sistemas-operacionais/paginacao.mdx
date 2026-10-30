@@ -1,0 +1,125 @@
+---
+title: Paginação
+kind: lesson
+---
+
+Se cada processo usasse endereços físicos diretamente, dois programas compilados para o endereço 0x1000 colidiriam, um bug poderia sobrescrever a memória de outro processo e você precisaria de um bloco contíguo de RAM para cada programa. A **paginação** resolve tudo isso de uma vez: cada processo enxerga um espaço de **endereços virtuais** próprio, dividido em **páginas** de tamanho fixo, e o hardware traduz cada página para um **quadro** (frame) qualquer da memória física.
+
+## A tradução
+
+Com páginas de 4 KB (2¹² bytes), os 12 bits menos significativos de um endereço são o **deslocamento** dentro da página, e o resto é o **número da página virtual** (VPN). A tabela de páginas do processo diz em qual quadro físico está cada VPN.
+
+```text
+ endereço virtual 0x3A7C  (páginas de 4 KB)
+
+ ┌─────────────── VPN ───────────────┬──── deslocamento ────┐
+ │               0x3                 │        0xA7C         │
+ └───────────────────────────────────┴──────────────────────┘
+                  │
+                  ▼  tabela de páginas: VPN 3 → quadro 0x51
+ ┌────────────── quadro ─────────────┬──── deslocamento ────┐
+ │              0x51                 │        0xA7C         │   = 0x51A7C físico
+ └───────────────────────────────────┴──────────────────────┘
+```
+
+O deslocamento atravessa a tradução intacto; só o número da página muda. Cada entrada da tabela (PTE) também guarda bits de controle: **presente**, **escrita permitida**, **usuário/kernel**, **acessada** e **modificada (dirty)**, além de **NX** (não executável).
+
+A função abaixo faz a tradução como a MMU faria, incluindo as verificações que geram falhas:
+
+```python
+TAM_PAGINA = 4096
+
+tabela = {
+    0: {"quadro": 0x10, "presente": True, "escrita": False},   # codigo
+    1: {"quadro": 0x2B, "presente": True, "escrita": True},    # dados
+    3: {"quadro": 0x51, "presente": True, "escrita": True},    # heap
+    7: {"quadro": None, "presente": False, "escrita": True},   # em swap
+}
+
+def traduzir(endereco, escrita=False):
+    vpn, desloc = divmod(endereco, TAM_PAGINA)
+    pte = tabela.get(vpn)
+    if pte is None:
+        return f"0x{endereco:05X} -> segfault (pagina {vpn} nao mapeada)"
+    if not pte["presente"]:
+        return f"0x{endereco:05X} -> page fault (pagina {vpn} fora da RAM)"
+    if escrita and not pte["escrita"]:
+        return f"0x{endereco:05X} -> violacao de protecao (escrita em pagina somente leitura)"
+    fisico = pte["quadro"] * TAM_PAGINA + desloc
+    return f"0x{endereco:05X} -> vpn={vpn} desloc=0x{desloc:03X} -> fisico 0x{fisico:05X}"
+
+print(traduzir(0x3A7C))
+print(traduzir(0x1004, escrita=True))
+print(traduzir(0x0010, escrita=True))
+print(traduzir(0x7123))
+print(traduzir(0x5000))
+```
+
+```text
+Saída:
+0x03A7C -> vpn=3 desloc=0xA7C -> fisico 0x51A7C
+0x01004 -> vpn=1 desloc=0x004 -> fisico 0x2B004
+0x00010 -> violacao de protecao (escrita em pagina somente leitura)
+0x07123 -> page fault (pagina 7 fora da RAM)
+0x05000 -> segfault (pagina 5 nao mapeada)
+```
+
+Cada um desses casos é tratado de forma diferente pelo kernel: o page fault de uma página em swap é normal e transparente; o acesso a uma página não mapeada vira `SIGSEGV`; a escrita em página somente leitura pode ser copy-on-write legítimo ou um bug.
+
+## O tamanho da tabela é um problema
+
+Num espaço de 48 bits com páginas de 4 KB, existem 2³⁶ páginas virtuais. Uma tabela plana com entradas de 8 bytes ocuparia 512 GB por processo. A solução é a **tabela de páginas multinível**: o VPN é dividido em pedaços, cada um indexando uma tabela de um nível, e níveis inteiros que não são usados simplesmente não existem. O x86-64 usa 4 níveis de 9 bits (e 5 níveis em máquinas recentes).
+
+```python
+BITS_DESLOC = 12
+BITS_NIVEL = 9
+NIVEIS = 4
+
+def indices(endereco):
+    vpn = endereco >> BITS_DESLOC
+    partes = []
+    for _ in range(NIVEIS):
+        partes.append(vpn & ((1 << BITS_NIVEL) - 1))
+        vpn >>= BITS_NIVEL
+    return list(reversed(partes)), endereco & 0xFFF
+
+for end in [0x0000_7F12_3456_7ABC, 0x0000_0000_0040_1000]:
+    idx, desloc = indices(end)
+    print(f"0x{end:016X} -> PML4={idx[0]} PDPT={idx[1]} PD={idx[2]} PT={idx[3]} desloc=0x{desloc:03X}")
+
+plana = (2 ** (48 - BITS_DESLOC)) * 8
+um_processo_pequeno = 4 * 4096   # um caminho de 4 tabelas de 4 KB
+print(f"tabela plana: {plana / 2**30:.0f} GiB; multinivel minima: {um_processo_pequeno // 1024} KiB")
+```
+
+```text
+Saída:
+0x00007F1234567ABC -> PML4=254 PDPT=72 PD=418 PT=359 desloc=0xABC
+0x0000000000401000 -> PML4=0 PDPT=0 PD=2 PT=1 desloc=0x000
+tabela plana: 512 GiB; multinivel minima: 16 KiB
+```
+
+O preço da economia é tempo: sem cache, cada acesso à memória vira cinco (quatro níveis de tabela mais o dado). É por isso que existe a TLB, tema do próximo capítulo.
+
+## Trade-offs do tamanho de página
+
+| Página | Vantagem | Desvantagem |
+| --- | --- | --- |
+| 4 KB (padrão) | Pouca fragmentação interna, granularidade fina | Tabelas maiores, mais falhas de TLB |
+| 2 MB / 1 GB (huge pages) | Muito menos entradas na TLB | Desperdício interno, alocação mais difícil |
+
+Bancos de dados e JVMs com heaps grandes costumam ganhar com huge pages. Já o recurso **Transparent Huge Pages** do Linux, que promove páginas automaticamente, causa picos de latência em alguns workloads (Redis e MongoDB recomendam desativá-lo).
+
+<Callout type="note" title="Paginação também é proteção">
+Como cada processo tem sua tabela, ele simplesmente não tem como nomear a memória de outro processo. Bibliotecas compartilhadas e o copy-on-write funcionam apontando entradas de tabelas diferentes para o mesmo quadro físico.
+</Callout>
+
+## Na entrevista
+
+Faça a tradução à mão: divida o endereço em VPN e deslocamento, consulte a tabela, recombine. Explique por que tabelas multinível existem e o custo em acessos à memória. Follow-ups comuns: "quantos bits de deslocamento com páginas de 8 KB?" (13) e "o que acontece quando o bit presente é zero?" (page fault, que o kernel trata trazendo a página ou matando o processo).
+
+<QuizSet>
+<Quiz question="Com páginas de 4 KB, qual o número da página virtual e o deslocamento do endereço 0x5123?" options={["VPN 0x5, deslocamento 0x123", "VPN 0x51, deslocamento 0x23", "VPN 0x512, deslocamento 0x3", "VPN 0x0, deslocamento 0x5123"]} answer={0} explanation="4 KB são 12 bits, ou três dígitos hexadecimais de deslocamento: 0x123. O restante, 0x5, é o VPN." />
+<Quiz question="Por que tabelas de páginas multinível economizam memória?" options={["Porque comprimem as entradas", "Porque tabelas de níveis inferiores só existem para regiões do espaço de endereços realmente usadas", "Porque usam páginas maiores", "Porque ficam no disco"]} answer={1} explanation="Um processo típico usa poucas regiões; os ramos da árvore correspondentes a regiões vazias não são alocados." />
+<Quiz question="Qual a desvantagem de tabelas de 4 níveis sem nenhum cache?" options={["Não suportam 64 bits", "Cada acesso à memória exige até quatro leituras extras para percorrer as tabelas", "Impedem compartilhamento de páginas", "Causam fragmentação externa"]} answer={1} explanation="O page walk custa vários acessos à memória; a TLB existe para evitar repeti-lo a cada instrução." />
+</QuizSet>

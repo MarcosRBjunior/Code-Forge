@@ -1,0 +1,159 @@
+---
+title: Funções de janela
+kind: lesson
+---
+
+`GROUP BY` responde "qual o total por departamento?", mas devolve uma linha por departamento e joga fora o detalhe. E se você quiser cada funcionário **ao lado** do total do departamento dele, ou a porcentagem que ele representa? Antes das funções de janela, isso exigia uma subconsulta e um join. Com elas, é uma expressão. Em entrevistas de SQL para dados, funções de janela são o divisor de águas entre candidatos medianos e fortes.
+
+## Como funciona
+
+Uma função de janela calcula um valor para cada linha usando um conjunto de linhas relacionadas, a **janela**, sem colapsar o resultado. A sintaxe é sempre a função seguida de `OVER (...)`:
+
+```text
+funcao(args) OVER (
+  PARTITION BY colunas   -- divide as linhas em grupos independentes
+  ORDER BY colunas       -- ordena dentro de cada grupo
+  ROWS/RANGE ...         -- recorta quais linhas do grupo entram no cálculo
+)
+```
+
+Todas as partes são opcionais. `OVER ()` vazio significa "a tabela inteira é uma janela só".
+
+```sql
+CREATE TABLE funcionarios (
+  id      integer PRIMARY KEY,
+  nome    text NOT NULL,
+  depto   text NOT NULL,
+  salario numeric(10, 2) NOT NULL
+);
+
+INSERT INTO funcionarios VALUES
+  (1, 'Ana',    'dados',  9000),
+  (2, 'Bruno',  'dados',  7000),
+  (3, 'Carla',  'dados',  8000),
+  (4, 'Diego',  'vendas', 5000),
+  (5, 'Elisa',  'vendas', 6500),
+  (6, 'Fabio',  'vendas', 5000),
+  (7, 'Gabi',   'infra',  9500);
+
+SELECT nome, depto, salario,
+       sum(salario) OVER (PARTITION BY depto) AS total_depto,
+       round(100 * salario / sum(salario) OVER (PARTITION BY depto), 1) AS pct_depto
+FROM funcionarios
+ORDER BY depto, salario DESC;
+```
+
+```text
+Saída:
+nome | depto | salario | total_depto | pct_depto
+Ana | dados | 9000.00 | 24000.00 | 37.5
+Carla | dados | 8000.00 | 24000.00 | 33.3
+Bruno | dados | 7000.00 | 24000.00 | 29.2
+Gabi | infra | 9500.00 | 9500.00 | 100.0
+Elisa | vendas | 6500.00 | 16500.00 | 39.4
+Diego | vendas | 5000.00 | 16500.00 | 30.3
+Fabio | vendas | 5000.00 | 16500.00 | 30.3
+```
+
+Cada funcionário continua sendo uma linha, e ganhou duas colunas calculadas sobre o seu departamento. Qualquer agregação comum (`sum`, `avg`, `count`, `min`, `max`) vira função de janela quando recebe `OVER`.
+
+## Ordem de avaliação
+
+Funções de janela são calculadas **depois** de `WHERE`, `GROUP BY` e `HAVING`, e **antes** do `ORDER BY` final e do `LIMIT`. Duas consequências que caem em entrevista:
+
+1. Você **não pode** usar uma função de janela no `WHERE`. Para filtrar por ela, calcule numa subconsulta ou CTE e filtre fora.
+2. Você **pode** aplicar uma janela sobre o resultado de um `GROUP BY`, inclusive sobre agregações.
+
+O exemplo abaixo usa as duas ideias: agrega por departamento e depois calcula a participação de cada departamento na folha total.
+
+```sql
+SELECT depto,
+       sum(salario) AS folha,
+       round(100 * sum(salario) / sum(sum(salario)) OVER (), 1) AS pct_empresa
+FROM funcionarios
+GROUP BY depto
+ORDER BY folha DESC;
+```
+
+```text
+Saída:
+depto | folha | pct_empresa
+dados | 24000.00 | 48.0
+vendas | 16500.00 | 33.0
+infra | 9500.00 | 19.0
+```
+
+O `sum(sum(salario)) OVER ()` parece estranho, mas lê-se de dentro para fora: o `sum` interno é do `GROUP BY`; o externo soma esses totais sobre a janela inteira.
+
+## ORDER BY dentro da janela e o frame
+
+Quando você coloca `ORDER BY` dentro do `OVER`, a janela de cada linha deixa de ser a partição inteira e passa a ser, por padrão, **do início da partição até a linha atual** (incluindo empates). É assim que se faz soma acumulada:
+
+```sql
+SELECT nome, depto, salario,
+       sum(salario) OVER (PARTITION BY depto ORDER BY salario) AS acumulado_padrao,
+       sum(salario) OVER (PARTITION BY depto ORDER BY salario, id
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS acumulado_rows
+FROM funcionarios
+WHERE depto = 'vendas'
+ORDER BY salario, nome;
+```
+
+```text
+Saída:
+nome | depto | salario | acumulado_padrao | acumulado_rows
+Diego | vendas | 5000.00 | 10000.00 | 5000.00
+Fabio | vendas | 5000.00 | 10000.00 | 10000.00
+Elisa | vendas | 6500.00 | 16500.00 | 16500.00
+```
+
+Veja Diego e Fabio, que empatam em 5000. O frame padrão é `RANGE`, que trata linhas empatadas como uma só posição: as duas recebem 10000. Com `ROWS`, cada linha física é uma posição e o acumulado cresce linha a linha; como a ordem entre empatados seria arbitrária, o `id` entra como desempate. Essa sutileza é uma pergunta de follow-up frequente.
+
+<Callout type="warning" title="Empates e determinismo">
+Se a ordem da janela pode empatar, adicione uma coluna de desempate (como o id) no ORDER BY do OVER. Sem isso, ROWS e funções como ROW_NUMBER podem dar resultados diferentes a cada execução.
+</Callout>
+
+## A cláusula WINDOW
+
+Quando várias expressões usam a mesma janela, o Postgres e o MySQL 8 permitem nomeá-la:
+
+```sql
+SELECT nome, depto, salario,
+       round(avg(salario) OVER w, 2) AS media_depto,
+       max(salario) OVER w AS teto_depto
+FROM funcionarios
+WINDOW w AS (PARTITION BY depto)
+ORDER BY depto, nome;
+```
+
+```text
+Saída:
+nome | depto | salario | media_depto | teto_depto
+Ana | dados | 9000.00 | 8000.00 | 9000.00
+Bruno | dados | 7000.00 | 8000.00 | 9000.00
+Carla | dados | 8000.00 | 8000.00 | 9000.00
+Gabi | infra | 9500.00 | 9500.00 | 9500.00
+Diego | vendas | 5000.00 | 5500.00 | 6500.00
+Elisa | vendas | 6500.00 | 5500.00 | 6500.00
+Fabio | vendas | 5000.00 | 5500.00 | 6500.00
+```
+
+## Postgres e MySQL
+
+O Postgres tem funções de janela desde a versão 8.4. O MySQL só a partir do 8.0; em MySQL 5.7 você teria de emular com variáveis de sessão ou subconsultas correlacionadas, algo que vale mencionar se o entrevistador perguntar sobre versões antigas. O Postgres também aceita `FILTER (WHERE ...)` em agregações de janela, que o MySQL não suporta.
+
+## Armadilhas
+
+- **Usar no WHERE.** Erro de sintaxe. Envolva numa subconsulta.
+- **Esquecer o frame padrão.** `avg(x) OVER (ORDER BY dia)` não é a média do grupo, é a média acumulada até o dia.
+- **Confundir com GROUP BY.** Janela não reduz linhas; se você quer uma linha por grupo, use `GROUP BY` ou filtre depois.
+
+## Na entrevista
+
+Quando o enunciado pedir "cada linha junto com algo do seu grupo" (total, média, posição, valor anterior), pense em janela. Explique em voz alta a partição, a ordem e o frame. Follow-ups comuns: "como filtrar só o maior salário de cada departamento?" (calcule a posição numa CTE e filtre fora, assunto do próximo capítulo) e "qual a diferença entre ROWS e RANGE?" (posições físicas contra grupos de valores empatados).
+
+<QuizSet>
+<Quiz question="Qual a diferença essencial entre sum(x) com GROUP BY e sum(x) OVER (PARTITION BY ...)?" options={["Não há diferença", "A versão de janela mantém todas as linhas e repete o total em cada uma", "A versão de janela é sempre mais rápida", "GROUP BY não aceita sum"]} answer={1} explanation="Funções de janela não colapsam as linhas; cada linha ganha o valor calculado sobre sua partição." />
+<Quiz question="Você escreveu WHERE row_number() OVER (ORDER BY x) = 1 e recebeu erro. Por quê?" options={["row_number não existe no Postgres", "Funções de janela são avaliadas depois do WHERE", "Faltou PARTITION BY", "Precisa de GROUP BY"]} answer={1} explanation="O WHERE é avaliado antes das janelas. Calcule numa subconsulta ou CTE e filtre na consulta externa." />
+<Quiz question="Com sum(v) OVER (ORDER BY v) e o frame padrão, duas linhas com o mesmo v recebem:" options={["Valores diferentes", "O mesmo acumulado, incluindo as duas", "NULL", "Erro"]} answer={1} explanation="O frame padrão é RANGE, que trata linhas empatadas na ordenação como pares e as inclui juntas." />
+</QuizSet>

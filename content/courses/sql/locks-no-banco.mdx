@@ -1,0 +1,169 @@
+---
+title: Locks e deadlocks no banco
+kind: lesson
+---
+
+Isolamento diz o que cada transação pode ver; locks dizem quem pode mexer em quê ao mesmo tempo. Em entrevistas de backend, o tema aparece em perguntas como "dois usuários compram o último ingresso no mesmo instante; como você evita vender duas vezes?" ou "seu job de fila processa o mesmo item em dois workers; o que mudou?". Você precisa saber quais locks o banco pega sozinho, quando pedir um explicitamente e como nasce um deadlock.
+
+## Os locks que você ganha de graça
+
+No Postgres e no InnoDB do MySQL, leituras comuns não bloqueiam escritas e escritas não bloqueiam leituras: isso é o MVCC, em que cada transação lê uma versão consistente dos dados. O que bloqueia é **escrita contra escrita na mesma linha**. Um `UPDATE` ou `DELETE` pega um lock exclusivo de linha que dura até o `COMMIT` ou `ROLLBACK`. Se outra transação tentar alterar a mesma linha, ela espera.
+
+Comandos de DDL são outra história: `ALTER TABLE` costuma pegar um lock forte na tabela inteira e, enquanto espera, enfileira todo mundo atrás dele. Esse é um clássico de incidente em produção.
+
+Vamos usar um estoque de ingressos e uma fila de tarefas:
+
+```sql
+CREATE TABLE ingressos (
+  id         integer PRIMARY KEY,
+  evento     text NOT NULL,
+  disponivel integer NOT NULL CHECK (disponivel >= 0)
+);
+
+CREATE TABLE tarefas (
+  id     integer PRIMARY KEY,
+  tipo   text NOT NULL,
+  status text NOT NULL DEFAULT 'pendente'
+);
+
+INSERT INTO ingressos VALUES
+  (1, 'Show A', 1),
+  (2, 'Show B', 40),
+  (3, 'Peça C', 5);
+
+INSERT INTO tarefas (id, tipo) VALUES
+  (1, 'email'), (2, 'email'), (3, 'relatorio'),
+  (4, 'email'), (5, 'thumbnail'), (6, 'relatorio');
+
+SELECT id, evento, disponivel FROM ingressos ORDER BY id;
+```
+
+```text
+Saída:
+id | evento | disponivel
+1 | Show A | 1
+2 | Show B | 40
+3 | Peça C | 5
+```
+
+## O problema do ler e depois escrever
+
+O padrão perigoso é: ler o saldo, decidir no código da aplicação e gravar. Entre a leitura e a escrita, outra transação pode ter lido o mesmo saldo. A solução mais simples é deixar o banco decidir numa única instrução atômica:
+
+```sql
+UPDATE ingressos
+SET disponivel = disponivel - 1
+WHERE id = 1 AND disponivel > 0
+RETURNING id, disponivel;
+```
+
+```text
+Saída:
+id | disponivel
+1 | 0
+```
+
+Se duas transações rodarem isso ao mesmo tempo, a segunda espera o lock da linha, relê o valor atualizado e a condição `disponivel > 0` falha: zero linhas afetadas, nenhuma venda dupla. Quando a lógica não cabe num `UPDATE`, use `SELECT ... FOR UPDATE` para travar a linha já na leitura:
+
+```sql
+BEGIN;
+SELECT id, disponivel FROM ingressos WHERE id = 3 FOR UPDATE;
+UPDATE ingressos SET disponivel = disponivel - 2 WHERE id = 3;
+COMMIT;
+
+SELECT id, evento, disponivel FROM ingressos ORDER BY id;
+```
+
+```text
+Saída:
+id | evento | disponivel
+1 | Show A | 0
+2 | Show B | 40
+3 | Peça C | 3
+```
+
+Existe ainda `FOR SHARE`, que impede alterações mas deixa outras transações lerem com `FOR SHARE` também. A alternativa sem lock é o **controle otimista**: uma coluna `versao` e um `UPDATE ... WHERE versao = 7`; se nenhuma linha mudou, alguém chegou antes e você tenta de novo.
+
+## Filas com SKIP LOCKED
+
+Vários workers pegando tarefas da mesma tabela é um padrão comum. Com `FOR UPDATE` simples, todos tentam a mesma primeira linha e fazem fila. `SKIP LOCKED` faz cada worker pular as linhas já travadas por outro:
+
+```sql
+WITH proxima AS (
+  SELECT id FROM tarefas
+  WHERE status = 'pendente'
+  ORDER BY id
+  LIMIT 2
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE tarefas t
+SET status = 'processando'
+FROM proxima
+WHERE t.id = proxima.id;
+
+SELECT id, tipo, status FROM tarefas ORDER BY id;
+```
+
+```text
+Saída:
+id | tipo | status
+1 | email | processando
+2 | email | processando
+3 | relatorio | pendente
+4 | email | pendente
+5 | thumbnail | pendente
+6 | relatorio | pendente
+```
+
+O MySQL 8 também suporta `FOR UPDATE SKIP LOCKED` e `NOWAIT`; versões anteriores não, e muita fila antiga em MySQL era feita com `UPDATE ... LIMIT 1` e um marcador de dono.
+
+## Deadlock
+
+Um deadlock acontece quando duas transações esperam uma pela outra. O exemplo típico é uma transferência feita em ordens opostas:
+
+```text
+Sessão 1                                Sessão 2
+BEGIN;                                  BEGIN;
+UPDATE contas ... WHERE id = 1;         UPDATE contas ... WHERE id = 2;
+UPDATE contas ... WHERE id = 2;  -- espera a sessão 2
+                                        UPDATE contas ... WHERE id = 1;  -- espera a sessão 1
+ERROR:  deadlock detected
+```
+
+Os bancos detectam o ciclo e abortam uma das transações (o Postgres verifica depois de `deadlock_timeout`, 1 segundo por padrão; o InnoDB detecta na hora). A transação abortada precisa ser repetida pela aplicação. A prevenção mais eficaz é **travar sempre na mesma ordem**, por exemplo por id crescente, e manter transações curtas.
+
+<Callout type="warning" title="Lock esperando lock">
+Um `ALTER TABLE` que espera um lock longo bloqueia também as consultas que chegam depois dele. Em produção, rode DDL com `SET lock_timeout = '2s'` e tente de novo, em vez de deixar a fila crescer.
+</Callout>
+
+## Locks consultivos
+
+Para coordenar algo que não é uma linha (um job agendado que deve rodar uma vez só), o Postgres oferece advisory locks, identificados por um número:
+
+```sql
+SELECT pg_try_advisory_lock(42) AS peguei, pg_advisory_unlock(42) AS soltei;
+```
+
+```text
+Saída:
+peguei | soltei
+true | true
+```
+
+O MySQL tem o equivalente com `GET_LOCK('nome', timeout)` e `RELEASE_LOCK('nome')`.
+
+## Armadilhas
+
+- Abrir uma transação, chamar uma API externa e só depois dar `COMMIT`: os locks ficam presos durante toda a chamada.
+- Esquecer que o InnoDB, em `REPEATABLE READ`, trava também intervalos do índice (gap locks) em buscas por faixa, o que gera bloqueios inesperados em inserções.
+- Tratar deadlock como bug raro em vez de prever retry na aplicação.
+
+## Na entrevista
+
+Diante de um problema de concorrência, comece pela solução atômica (`UPDATE` condicional), depois ofereça `SELECT ... FOR UPDATE` ou controle otimista e explique o trade-off: lock pessimista serializa e pode gerar espera; otimista escala melhor quando o conflito é raro, mas exige retry. Follow-ups comuns: "como você evitaria o deadlock da transferência?" (ordem fixa de travamento) e "como montar uma fila no próprio banco?" (`SKIP LOCKED`).
+
+<QuizSet>
+<Quiz question="Dois workers rodam SELECT ... FOR UPDATE na mesma tarefa pendente e um fica parado esperando. Que mudança faz cada worker pegar uma tarefa diferente?" options={["Trocar para FOR SHARE", "Adicionar SKIP LOCKED", "Usar READ UNCOMMITTED", "Remover o ORDER BY"]} answer={1} explanation="SKIP LOCKED faz a consulta ignorar linhas travadas por outra transação, então cada worker pega a próxima livre." />
+<Quiz question="Qual é a forma mais comum de prevenir o deadlock de duas transferências entre as mesmas contas?" options={["Aumentar o deadlock_timeout", "Travar as contas sempre na mesma ordem, como id crescente", "Usar índices nas contas", "Fazer as transferências fora de transação"]} answer={1} explanation="Deadlock exige espera circular. Com uma ordem global de travamento, o ciclo não se forma." />
+<Quiz question="Por que UPDATE ingressos SET disponivel = disponivel - 1 WHERE id = 1 AND disponivel > 0 evita venda dupla?" options={["Porque UPDATE nunca roda em paralelo", "Porque a segunda transação espera o lock da linha e reavalia a condição com o valor novo", "Porque o CHECK impede qualquer concorrência", "Porque RETURNING trava a tabela"]} answer={1} explanation="A escrita trava a linha; quem chega depois reavalia o WHERE sobre a versão confirmada e não encontra saldo." />
+</QuizSet>

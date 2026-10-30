@@ -1,0 +1,159 @@
+---
+title: Transações e ACID
+kind: lesson
+---
+
+Uma transferência bancária tem dois passos: debitar a conta de origem e creditar a de destino. Se o servidor cair entre os dois, o dinheiro some. Se duas transferências da mesma conta rodarem ao mesmo tempo, o saldo pode ficar negativo. A **transação** é a ferramenta do banco para tratar um grupo de comandos como uma unidade, e as propriedades **ACID** descrevem o que essa unidade garante.
+
+## O esquema
+
+```sql
+CREATE TABLE contas (
+  id    integer PRIMARY KEY,
+  dono  text NOT NULL,
+  saldo integer NOT NULL CHECK (saldo >= 0)
+);
+
+CREATE TABLE extrato (
+  id       serial PRIMARY KEY,
+  conta_id integer NOT NULL REFERENCES contas (id),
+  valor    integer NOT NULL
+);
+
+INSERT INTO contas VALUES (1, 'Ana', 500), (2, 'Bruno', 100), (3, 'Carla', 0);
+
+SELECT id, dono, saldo FROM contas ORDER BY id;
+```
+
+```text
+Saída:
+id | dono | saldo
+1 | Ana | 500
+2 | Bruno | 100
+3 | Carla | 0
+```
+
+## ACID, uma letra por vez
+
+- **Atomicidade:** ou todos os comandos da transação valem, ou nenhum vale. Não existe "metade da transferência".
+- **Consistência:** a transação leva o banco de um estado válido a outro estado válido, respeitando restrições (`CHECK`, FK, `UNIQUE`). Se alguma for violada, a transação inteira é rejeitada. As regras de negócio que não estão no banco continuam sendo responsabilidade sua.
+- **Isolamento:** transações concorrentes não enxergam o trabalho pela metade umas das outras. O quanto elas se isolam depende do nível de isolamento, assunto do próximo capítulo.
+- **Durabilidade:** depois do `COMMIT` confirmado, os dados sobrevivem a uma queda. O Postgres consegue isso gravando primeiro no WAL (write-ahead log) e sincronizando-o com o disco antes de responder; o InnoDB do MySQL usa o redo log com a mesma ideia.
+
+## Uma transferência atômica
+
+```sql
+BEGIN;
+UPDATE contas SET saldo = saldo - 200 WHERE id = 1;
+UPDATE contas SET saldo = saldo + 200 WHERE id = 2;
+INSERT INTO extrato (conta_id, valor) VALUES (1, -200), (2, 200);
+COMMIT;
+
+SELECT id, dono, saldo FROM contas ORDER BY id;
+```
+
+```text
+Saída:
+id | dono | saldo
+1 | Ana | 300
+2 | Bruno | 300
+3 | Carla | 0
+```
+
+Entre o `BEGIN` e o `COMMIT`, outras sessões continuam vendo os saldos antigos. Só no `COMMIT` as quatro mudanças aparecem juntas.
+
+## Desistindo com ROLLBACK
+
+`ROLLBACK` descarta tudo o que a transação fez:
+
+```sql
+BEGIN;
+UPDATE contas SET saldo = saldo + 1000 WHERE id = 3;
+DELETE FROM extrato;
+ROLLBACK;
+
+SELECT
+  (SELECT saldo FROM contas WHERE id = 3) AS saldo_carla,
+  (SELECT count(*) FROM extrato) AS linhas_extrato;
+```
+
+```text
+Saída:
+saldo_carla | linhas_extrato
+0 | 2
+```
+
+## Quando um comando falha no meio
+
+Suponha que Bruno tente transferir 400, mas só tem 300. O débito viola o `CHECK`:
+
+```text
+BEGIN;
+UPDATE contas SET saldo = saldo + 400 WHERE id = 3;
+UPDATE contas SET saldo = saldo - 400 WHERE id = 2;
+ERROR:  new row for relation "contas" violates check constraint "contas_saldo_check"
+COMMIT;
+ROLLBACK
+```
+
+Aqui está uma diferença importante entre bancos. No **Postgres**, depois de um erro a transação fica abortada: qualquer comando seguinte responde `current transaction is aborted`, e o `COMMIT` vira `ROLLBACK`. O crédito para a Carla também é desfeito. No **MySQL**, por padrão, só o comando que falhou é desfeito; a transação continua aberta, e se a aplicação mandar `COMMIT`, o crédito da Carla é gravado sem o débito correspondente. Por isso, em MySQL, a aplicação precisa tratar o erro e chamar `ROLLBACK` explicitamente.
+
+O estado continua íntegro:
+
+```sql
+SELECT id, dono, saldo FROM contas ORDER BY id;
+```
+
+```text
+Saída:
+id | dono | saldo
+1 | Ana | 300
+2 | Bruno | 300
+3 | Carla | 0
+```
+
+## Savepoints
+
+Um `SAVEPOINT` marca um ponto dentro da transação para onde você pode voltar sem perder tudo. É útil em processamento em lote, quando um item inválido não deve derrubar os outros:
+
+```sql
+BEGIN;
+INSERT INTO extrato (conta_id, valor) VALUES (1, -10);
+SAVEPOINT antes_do_bonus;
+UPDATE contas SET saldo = saldo + 999 WHERE id = 3;
+ROLLBACK TO SAVEPOINT antes_do_bonus;
+UPDATE contas SET saldo = saldo - 10 WHERE id = 1;
+COMMIT;
+
+SELECT id, saldo FROM contas ORDER BY id;
+```
+
+```text
+Saída:
+id | saldo
+1 | 290
+2 | 300
+3 | 0
+```
+
+O bônus foi desfeito, mas o débito e o lançamento no extrato, feitos fora do trecho revertido, foram confirmados.
+
+<Callout type="note" title="Autocommit">
+Sem `BEGIN`, cada comando é uma transação própria, confirmada assim que termina. Esse é o padrão no Postgres e no MySQL. Frameworks e ORMs costumam abrir transações por você, então confira o que o seu código realmente faz.
+</Callout>
+
+## Armadilhas
+
+- **Transações longas.** Segurar uma transação aberta enquanto chama uma API externa mantém locks e impede a limpeza de versões antigas (o `VACUUM` do Postgres não remove linhas que uma transação ativa ainda pode ver).
+- **Ler e escrever sem proteção.** Ler o saldo, decidir na aplicação e depois escrever, em comandos separados, abre espaço para condição de corrida mesmo dentro de uma transação. Prefira `UPDATE ... SET saldo = saldo - x WHERE saldo >= x` ou `SELECT ... FOR UPDATE`.
+- **DDL no MySQL.** No MySQL, `CREATE` e `ALTER` fazem commit implícito. No Postgres, DDL é transacional e pode ser desfeito com `ROLLBACK`.
+
+## Na entrevista
+
+Ao falar de qualquer operação com vários passos (pedido e estoque, transferência, reserva), diga onde começa e termina a transação e o que acontece se falhar no meio. Follow-ups comuns: "o que garante a durabilidade?" (WAL ou redo log sincronizado antes do commit) e "como garantir atomicidade entre dois serviços com bancos diferentes?" (não há transação ACID única: use saga, outbox ou two-phase commit, cada um com seus custos).
+
+<QuizSet>
+<Quiz question="No Postgres, um UPDATE falha dentro de uma transação e a aplicação envia COMMIT em seguida. O que acontece?" options={["Os comandos anteriores ao erro são gravados", "A transação inteira é desfeita; o COMMIT vira ROLLBACK", "O banco repete o comando que falhou", "O COMMIT dá erro e a transação fica aberta para sempre"]} answer={1} explanation="Depois de um erro, a transação do Postgres fica abortada e só pode ser encerrada com ROLLBACK; COMMIT tem esse efeito." />
+<Quiz question="Qual propriedade ACID garante que um COMMIT confirmado sobrevive a uma queda de energia?" options={["Atomicidade", "Consistência", "Isolamento", "Durabilidade"]} answer={3} explanation="Durabilidade, obtida gravando o log de transações em disco antes de confirmar o commit." />
+<Quiz question="Num lote de 1.000 inserções, você quer descartar apenas o item que violou uma restrição e manter os demais na mesma transação. O que usar?" options={["Um ROLLBACK geral", "SAVEPOINT antes de cada item e ROLLBACK TO SAVEPOINT em caso de erro", "Autocommit desligado", "SERIALIZABLE"]} answer={1} explanation="Savepoints permitem desfazer uma parte da transação sem perder o resto." />
+</QuizSet>

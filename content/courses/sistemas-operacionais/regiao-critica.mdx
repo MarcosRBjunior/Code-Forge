@@ -1,0 +1,136 @@
+---
+title: Região crítica
+kind: lesson
+---
+
+Duas threads incrementam o mesmo contador um milhão de vezes cada. O resultado esperado é dois milhões; o obtido, em muitas linguagens, é um número menor e diferente a cada execução. Isso é uma **condição de corrida** (race condition): o resultado depende da ordem exata em que as instruções de threads diferentes se intercalam. O trecho de código que acessa o dado compartilhado é a **região crítica**, e o problema central da sincronização é garantir que só uma thread esteja nela por vez.
+
+## Por que `contador += 1` não é atômico
+
+No nível da máquina, um incremento são três passos: ler da memória para um registrador, somar e escrever de volta. Se a troca de contexto acontece entre a leitura e a escrita, uma atualização se perde:
+
+```text
+ thread A                 thread B              memória
+ lê contador (0)                                 0
+                          lê contador (0)        0
+ soma → 1                                        0
+                          soma → 1               0
+ escreve 1                                       1
+                          escreve 1              1   ← um incremento sumiu
+```
+
+Dá para enumerar todas as intercalações possíveis de duas threads que fazem um incremento cada e ver quantas produzem o resultado errado:
+
+```python
+from itertools import combinations
+
+PASSOS = ["ler", "somar", "escrever"]
+
+def executar(ordem):
+    memoria = 0
+    reg = {"A": 0, "B": 0}
+    pc = {"A": 0, "B": 0}
+    for t in ordem:
+        passo = PASSOS[pc[t]]
+        if passo == "ler":
+            reg[t] = memoria
+        elif passo == "somar":
+            reg[t] += 1
+        else:
+            memoria = reg[t]
+        pc[t] += 1
+    return memoria
+
+resultados = {}
+for posicoes_a in combinations(range(6), 3):
+    ordem = ["A" if i in posicoes_a else "B" for i in range(6)]
+    final = executar(ordem)
+    resultados[final] = resultados.get(final, 0) + 1
+
+print("intercalacoes possiveis:", sum(resultados.values()))
+for valor, qtd in sorted(resultados.items()):
+    print(f"contador final = {valor}: {qtd} intercalacoes")
+```
+
+```text
+Saída:
+intercalacoes possiveis: 20
+contador final = 1: 18 intercalacoes
+contador final = 2: 2 intercalacoes
+```
+
+Das 20 ordens possíveis, só 2 dão o resultado correto: aquelas em que uma thread faz os três passos inteiros antes da outra começar. Um bug que aparece na maioria das intercalações pode, ainda assim, ficar escondido por semanas, porque na prática as trocas no meio do incremento são raras.
+
+## Requisitos de uma boa solução
+
+Qualquer mecanismo de exclusão mútua precisa garantir:
+
+1. **Exclusão mútua:** no máximo uma thread na região crítica.
+2. **Progresso:** se ninguém está na região, quem quer entrar não pode ser impedido para sempre.
+3. **Espera limitada:** existe um limite para quantas vezes os outros entram antes de você.
+
+E, de preferência, não depender de suposições sobre velocidade relativa das threads.
+
+## Como o hardware ajuda
+
+Soluções puramente em software (como o algoritmo de Peterson) funcionam no papel, mas quebram em CPUs modernas que reordenam leituras e escritas. Na prática, tudo se apoia em **instruções atômicas** do hardware:
+
+- **test-and-set:** lê um valor e escreve 1 numa única operação indivisível.
+- **compare-and-swap (CAS):** "se o valor ainda é X, troque por Y" de forma atômica; devolve se conseguiu.
+- **fetch-and-add:** soma e devolve o valor anterior, atomicamente.
+
+Com elas se constroem os **locks**. Um **spinlock** fica tentando em laço até conseguir; é bom quando a espera é curtíssima e há vários núcleos. Um **mutex** coloca a thread para dormir se o lock estiver ocupado e a acorda depois; é melhor para esperas longas. No Linux, mutexes são implementados sobre **futex**: o caminho sem disputa é resolvido com CAS em modo usuário, e o kernel só entra quando é preciso dormir.
+
+## Protegendo a região crítica em Python
+
+Aqui quatro threads incrementam um contador compartilhado. Com o `Lock`, o resultado é sempre o esperado, independentemente do escalonamento:
+
+```python
+import threading
+
+contador = 0
+trava = threading.Lock()
+
+def trabalhar(n):
+    global contador
+    for _ in range(n):
+        with trava:          # entra na regiao critica
+            contador += 1    # ler, somar, escrever sem interrupcao de outra thread
+
+threads = [threading.Thread(target=trabalhar, args=(25_000,)) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("contador:", contador, "esperado:", 4 * 25_000)
+```
+
+```text
+Saída:
+contador: 100000 esperado: 100000
+```
+
+<Callout type="warning" title="O GIL não te protege">
+O GIL do CPython garante que só uma thread executa bytecode por vez, mas a troca pode acontecer entre as instruções de bytecode que compõem `contador += 1`. Em Python 3.13 sem GIL (free-threaded), a corrida fica ainda mais frequente. Use locks para qualquer leitura-modificação-escrita compartilhada.
+</Callout>
+
+## Trade-offs
+
+| Escolha | Vantagem | Custo |
+| --- | --- | --- |
+| Lock grosso (um para tudo) | Simples, difícil errar | Serializa o programa, vira gargalo |
+| Locks finos (um por estrutura) | Mais paralelismo | Risco de deadlock, mais complexidade |
+| Operações atômicas / lock-free | Sem bloqueio | Difícil de acertar, problema ABA |
+| Não compartilhar (mensagens, cópias) | Elimina a corrida | Cópias, outro modelo de programação |
+
+A região crítica deve ser a menor possível: não faça E/S nem chamadas de rede segurando um lock.
+
+## Na entrevista
+
+Mostre a decomposição ler-somar-escrever, explique por que a intercalação perde atualizações e cite os três requisitos. Depois fale de instruções atômicas e da diferença entre spinlock e mutex. Follow-ups comuns: "quando um spinlock é melhor que um mutex?" (esperas muito curtas em multicore, ou dentro do kernel onde não se pode dormir) e "o que é o problema ABA no CAS?" (o valor volta a ser A depois de mudar, e o CAS não percebe; resolve-se com contador de versão).
+
+<QuizSet>
+<Quiz question="Por que contador += 1 em duas threads sem lock pode perder incrementos?" options={["Porque inteiros têm limite", "Porque o incremento é ler, somar e escrever, e outra thread pode intercalar entre esses passos", "Porque o compilador remove a operação", "Porque a memória é lenta"]} answer={1} explanation="Duas threads podem ler o mesmo valor antigo e ambas escrever o mesmo novo valor, perdendo uma atualização." />
+<Quiz question="Em que situação um spinlock tende a ser melhor que um mutex que dorme?" options={["Quando o lock é segurado por segundos", "Quando a espera é muito curta e há vários núcleos, de modo que dormir e acordar custaria mais", "Quando só existe um núcleo", "Quando a região crítica faz E/S"]} answer={1} explanation="Girar por poucos ciclos é mais barato do que duas trocas de contexto; com um núcleo só, girar apenas desperdiça a CPU do dono do lock." />
+<Quiz question="Qual instrução de hardware permite implementar um lock sem que duas threads o adquiram ao mesmo tempo?" options={["NOP", "Compare-and-swap atômico", "Uma leitura comum seguida de escrita comum", "Interrupção do timer"]} answer={1} explanation="O CAS lê, compara e escreve numa única operação indivisível, então só uma thread vence a disputa." />
+</QuizSet>

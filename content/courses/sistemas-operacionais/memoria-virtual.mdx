@@ -1,0 +1,129 @@
+---
+title: Memória virtual e page faults
+kind: lesson
+---
+
+Abra o monitor de recursos e some a memória virtual de todos os processos: o total passa com folga da RAM instalada. Um processo Java pode reservar 10 GB de heap numa máquina de 8 GB e funcionar bem. Isso só é possível porque a **memória virtual** desacopla o que o processo acha que tem do que realmente está na RAM. Páginas são trazidas para a memória física **sob demanda**, quando são tocadas pela primeira vez, e podem ser devolvidas ao disco quando falta espaço. O mecanismo que liga essas duas pontas é o **page fault**.
+
+## Paginação sob demanda
+
+Quando um processo pede memória (`malloc` grande, `mmap`), o kernel só anota a região como válida. Nenhum quadro físico é alocado. No primeiro acesso, a entrada da tabela está marcada como não presente, a MMU gera uma exceção e o kernel resolve:
+
+```text
+ instrução acessa endereço virtual
+        │
+        ▼
+ MMU: PTE não presente → exceção de page fault
+        │
+        ▼
+ kernel: o endereço pertence a uma região válida?
+   não → SIGSEGV (segmentation fault)
+   sim → de onde vem o conteúdo?
+          ├─ página nova (heap/pilha) → zera um quadro          [minor fault]
+          ├─ arquivo já no page cache → só mapeia o quadro       [minor fault]
+          └─ arquivo ou swap no disco → lê do disco, bloqueia    [major fault]
+        │
+        ▼
+ atualiza a PTE (presente = 1), reexecuta a instrução
+```
+
+Um **minor fault** custa da ordem de microssegundos. Um **major fault** exige E/S de disco: dezenas de microssegundos num SSD, milissegundos num HD. É por isso que uma latência p99 ruim às vezes vem de páginas sendo lidas do disco, e não do seu código.
+
+## O impacto de uma taxa de falhas
+
+O tempo efetivo de acesso à memória depende brutalmente da fração de acessos que viram major fault:
+
+```python
+MEM_NS = 100
+FAULT_NS = 8_000_000   # 8 ms: leitura de um HD
+
+print("prob_fault        tempo_efetivo   desaceleracao")
+for p in [0, 1e-7, 1e-6, 1e-5, 1e-3]:
+    efetivo = (1 - p) * MEM_NS + p * FAULT_NS
+    print(f"{p:<12g}  {efetivo:>12,.1f} ns   {efetivo / MEM_NS:>10.1f}x")
+```
+
+```text
+Saída:
+prob_fault        tempo_efetivo   desaceleracao
+0                    100.0 ns          1.0x
+1e-07                100.8 ns          1.0x
+1e-06                108.0 ns          1.1x
+1e-05                180.0 ns          1.8x
+0.001              8,099.9 ns         81.0x
+```
+
+Uma falha a cada cem mil acessos já deixa a memória quase duas vezes mais lenta. Uma em mil e o sistema fica praticamente parado.
+
+## mmap: arquivos como memória
+
+`mmap` usa o mesmo mecanismo para arquivos. Mapear um arquivo não lê nada; cada página é carregada no primeiro toque e, se modificada, escrita de volta mais tarde. O exemplo mapeia um arquivo de 1 MB e toca só algumas posições. O kernel só precisa trazer as páginas tocadas:
+
+```python
+import mmap
+import os
+import tempfile
+
+TAM_PAGINA = 4096
+with tempfile.TemporaryDirectory() as pasta:
+    caminho = os.path.join(pasta, "grande.bin")
+    with open(caminho, "wb") as f:
+        f.truncate(256 * TAM_PAGINA)      # arquivo de 1 MiB (esparso)
+
+    with open(caminho, "r+b") as f:
+        m = mmap.mmap(f.fileno(), 0)
+        paginas_tocadas = set()
+        for desloc in [0, 10, 4096 * 7 + 3, 4096 * 200, 4096 * 200 + 99]:
+            m[desloc] = 65                # escreve 'A'
+            paginas_tocadas.add(desloc // TAM_PAGINA)
+        m.flush()
+        print("tamanho mapeado:", len(m), "bytes")
+        print("paginas tocadas:", sorted(paginas_tocadas))
+        print(f"fracao que precisou ir para a RAM: {len(paginas_tocadas) / 256:.1%}")
+        m.close()
+
+    with open(caminho, "rb") as f:
+        dados = f.read()
+    print("bytes 'A' gravados no arquivo:", dados.count(b"A"))
+```
+
+```text
+Saída:
+tamanho mapeado: 1048576 bytes
+paginas tocadas: [0, 7, 200]
+fracao que precisou ir para a RAM: 1.2%
+bytes 'A' gravados no arquivo: 5
+```
+
+É assim que bancos como LMDB e o antigo motor do MongoDB funcionavam, e é por isso que executáveis grandes abrem rápido: o código é mapeado e só as páginas executadas são lidas.
+
+## Swap, overcommit e thrashing
+
+Quando a RAM acaba, o kernel escolhe páginas para expulsar. Páginas de arquivo limpas são só descartadas (dá para ler de novo); páginas anônimas modificadas precisam ir para o **swap**. Se o conjunto de páginas que os processos usam ativamente, o **working set**, não cabe na RAM, o sistema entra em **thrashing**: passa mais tempo trocando páginas do que executando.
+
+O Linux também faz **overcommit**: aceita reservas maiores que a memória disponível, apostando que nem tudo será tocado. Quando a aposta falha, o **OOM killer** escolhe um processo (normalmente o maior) e o mata.
+
+| Situação | Sintoma | O que olhar |
+| --- | --- | --- |
+| Muitos major faults | Latência alta, CPU em iowait | `vmstat` colunas si/so, `sar -B` |
+| Thrashing | Máquina quase parada, disco a 100% | Working set maior que a RAM |
+| OOM kill | Processo some, exit 137 | `dmesg`, eventos do Kubernetes |
+
+<Callout type="warning" title="Swap e serviços de baixa latência">
+Para serviços sensíveis a latência, ir para o swap costuma ser pior que morrer: o processo fica vivo, mas cada requisição leva segundos. Por isso Kubernetes desativa swap por padrão e muitos times preferem limites de memória claros e reinício rápido. `vm.swappiness` controla quão cedo o kernel recorre ao swap.
+</Callout>
+
+```bash
+/usr/bin/time -v ./programa     # mostra major e minor page faults
+ps -o min_flt,maj_flt,rss -p 1234
+```
+
+## Na entrevista
+
+Explique a paginação sob demanda, diferencie minor de major fault e segfault, e mostre com números por que major faults destroem desempenho. Conecte com mmap, swap e OOM killer. Follow-ups comuns: "por que um processo pode ter VSZ enorme e RSS pequeno?" (reservou, mas não tocou) e "o que é thrashing e como resolver?" (working set maior que a RAM; reduza o consumo, adicione memória ou rode menos processos).
+
+<QuizSet>
+<Quiz question="Um processo faz malloc de 2 GB e o RSS quase não muda. Por quê?" options={["O malloc falhou silenciosamente", "O kernel só aloca quadros físicos quando as páginas são tocadas pela primeira vez", "A memória foi para o swap", "O RSS só é atualizado a cada minuto"]} answer={1} explanation="Com paginação sob demanda, reservar é barato; cada página só ocupa RAM após o primeiro acesso, via page fault." />
+<Quiz question="Qual a diferença entre um minor e um major page fault?" options={["Minor é em modo usuário e major em modo kernel", "Minor é resolvido sem ler do disco; major precisa de E/S para trazer a página", "Minor mata o processo e major não", "Não há diferença de custo"]} answer={1} explanation="Minor faults mapeiam um quadro já disponível (página zerada ou no page cache); major faults esperam o disco." />
+<Quiz question="Um pod é encerrado com código 137 e o evento mostra OOMKilled. O que aconteceu?" options={["Erro de segmentação no código", "O processo excedeu o limite de memória e o kernel o matou com SIGKILL", "O Kubernetes reiniciou por falta de CPU", "O disco encheu"]} answer={1} explanation="137 é 128 mais 9 (SIGKILL); ultrapassar o limite de memória do cgroup aciona o OOM killer." />
+</QuizSet>

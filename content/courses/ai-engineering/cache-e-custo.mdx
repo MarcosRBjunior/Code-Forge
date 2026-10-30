@@ -1,0 +1,122 @@
+---
+title: Cache, custo e latência
+kind: lesson
+---
+
+Um protótipo com LLM custa centavos por dia. O mesmo produto com 100 mil usuários pode custar mais que a equipe que o mantém, e responder em 8 segundos quando o usuário tolera 2. Custo e latência em sistemas com LLM seguem regras próprias: você paga por token de entrada e de saída, a latência é dominada pela geração e cada chamada extra no pipeline soma tempo. As alavancas principais são: enviar menos tokens, gerar menos tokens, usar modelos menores quando possível e não recalcular o que já foi calculado.
+
+## A conta
+
+```text
+custo por requisição = tokens_entrada × preço_entrada + tokens_saída × preço_saída
+latência ≈ fila + tempo até o primeiro token (TTFT) + tokens_saída × tempo por token
+```
+
+Tokens de saída costumam ser bem mais caros e mais lentos que os de entrada. Um RAG que envia 6 mil tokens de contexto e gera 300 tem o custo dominado pela entrada; um agente que escreve relatórios longos, pela saída. Meça antes de otimizar. O programa usa preços **hipotéticos** para comparar estratégias.
+
+```python
+# preços HIPOTÉTICOS por milhão de tokens, só para comparar ordens de grandeza
+MODELOS = {
+    "grande": {"entrada": 3.00, "saida": 15.00, "entrada_cache": 0.30},
+    "pequeno": {"entrada": 0.25, "saida": 1.25, "entrada_cache": 0.03},
+}
+
+def custo(modelo, entrada, saida, prefixo_em_cache=0):
+    p = MODELOS[modelo]
+    normal = entrada - prefixo_em_cache
+    total = normal * p["entrada"] + prefixo_em_cache * p["entrada_cache"] + saida * p["saida"]
+    return total / 1_000_000
+
+req_por_dia = 100_000
+cenarios = {
+    "grande, sem cache": custo("grande", 6000, 400),
+    "grande, 5000 tokens de prefixo em cache": custo("grande", 6000, 400, prefixo_em_cache=5000),
+    "pequeno, com cache": custo("pequeno", 6000, 400, prefixo_em_cache=5000),
+}
+for nome, c in cenarios.items():
+    print(f"{nome:42s} ${c:.5f}/req  ${c * req_por_dia:,.0f}/dia")
+```
+
+```text
+Saída:
+grande, sem cache                          $0.02400/req  $2,400/dia
+grande, 5000 tokens de prefixo em cache    $0.01050/req  $1,050/dia
+pequeno, com cache                         $0.00090/req  $90/dia
+```
+
+## Três tipos de cache
+
+**1. Cache exato.** Chave = hash do prompt normalizado (modelo, parâmetros, mensagens). Se a mesma requisição chegar de novo, devolve a resposta salva. Ótimo para perguntas repetidas idênticas, classificações de textos já vistos e testes. Cuidado com dados por usuário na chave.
+
+**2. Cache de prompt (do provedor).** Muitos provedores reaproveitam o processamento de um **prefixo** idêntico entre chamadas (system prompt longo, definições de ferramentas, documentos fixos). O prefixo em cache é cobrado com desconto e reduz o tempo até o primeiro token. Para aproveitar, deixe as partes estáveis no início e as variáveis (pergunta, data, nome do usuário) no fim. Um timestamp no começo do system prompt invalida o cache em toda chamada.
+
+**3. Cache semântico.** Embeda a pergunta e procura perguntas anteriores **parecidas**; acima de um limiar de similaridade, devolve a resposta salva. Aumenta muito a taxa de acerto, mas pode devolver a resposta de uma pergunta que só parecia igual.
+
+```python
+import math, re
+from collections import Counter
+
+def emb(t):
+    return Counter(re.findall(r"\w+", t.lower()))
+
+def cos(a, b):
+    num = sum(a[k] * b[k] for k in a)
+    den = math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values()))
+    return num / den if den else 0.0
+
+class CacheSemantico:
+    def __init__(self, limiar):
+        self.limiar, self.itens = limiar, []
+
+    def buscar(self, pergunta):
+        e = emb(pergunta)
+        melhor = max(self.itens, key=lambda it: cos(e, it[0]), default=None)
+        if melhor and cos(e, melhor[0]) >= self.limiar:
+            return melhor[1], round(cos(e, melhor[0]), 2)
+        return None, None
+
+    def guardar(self, pergunta, resposta):
+        self.itens.append((emb(pergunta), resposta))
+
+cache = CacheSemantico(limiar=0.7)
+cache.guardar("qual o horário de atendimento da loja", "Das 9h às 18h.")
+cache.guardar("como cancelar minha assinatura", "Em Configurações > Assinatura.")
+
+for p in ["qual o horário de atendimento da loja?",
+          "qual o horário de atendimento da loja no domingo",
+          "como cancelar meu pedido"]:
+    resp, score = cache.buscar(p)
+    print(f"{p!r}: {'HIT ' + str(score) + ' -> ' + resp if resp else 'MISS'}")
+```
+
+```text
+Saída:
+'qual o horário de atendimento da loja?': HIT 1.0 -> Das 9h às 18h.
+'qual o horário de atendimento da loja no domingo': HIT 0.88 -> Das 9h às 18h.
+'como cancelar meu pedido': MISS
+```
+
+Repare no segundo caso: "no domingo" muda a resposta, mas a similaridade alta faz o cache devolver o horário de dias úteis. Esse é o risco central do cache semântico. Calibre o limiar com pares rotulados, restrinja-o a perguntas sem contexto pessoal e defina expiração para respostas que envelhecem.
+
+<Callout type="warning" title="Cache e isolamento">
+Uma resposta gerada com dados do usuário A nunca pode ser servida ao usuário B. Inclua tenant, usuário ou nível de permissão na chave do cache, ou só use cache compartilhado em respostas que não dependem de dados privados.
+</Callout>
+
+## Outras alavancas
+
+- **Roteamento por dificuldade:** um modelo pequeno (ou um classificador) atende as perguntas fáceis e escala as difíceis para o grande.
+- **Menos contexto:** menos trechos recuperados, histórico resumido, resultados de ferramentas enxutos.
+- **Menos saída:** peça respostas concisas e use limite de tokens de saída.
+- **Streaming:** não reduz o tempo total, mas o usuário começa a ler após o primeiro token, o que melhora muito a percepção.
+- **Paralelismo:** chamadas independentes (busca lexical e vetorial, várias ferramentas) ao mesmo tempo.
+- **APIs em lote:** para trabalho que pode esperar (classificar um backlog), processamento assíncrono costuma ter desconto.
+
+## Na entrevista
+
+Faça a conta de custo em voz alta com números hipotéticos e mostre onde está o peso (entrada ou saída). Depois proponha as alavancas em ordem de impacto: cache de prompt com prefixo estável, roteamento para modelo menor, redução de contexto, cache exato e semântico com limiar calibrado, streaming para a latência percebida. Follow-ups: "quais os riscos do cache semântico?" (falsos positivos, respostas desatualizadas, vazamento entre usuários) e "como reduzir o TTFT?" (prompt menor, cache de prefixo, modelo menor, região mais próxima).
+
+<QuizSet>
+<Quiz question="Seu system prompt de 4 mil tokens começa com 'Data e hora atual: ...' e o cache de prompt do provedor quase nunca acerta. Por quê?" options={["O cache só funciona com prompts curtos", "O prefixo muda a cada chamada por causa do horário no início, invalidando a correspondência", "O provedor não suporta system prompts", "A temperatura impede o cache"]} answer={1} explanation="Cache de prompt depende de prefixo idêntico. Conteúdo variável deve ir para o fim do prompt." />
+<Quiz question="Qual o principal risco de um cache semântico com limiar baixo demais?" options={["Latência maior", "Devolver respostas de perguntas parecidas, mas com significado diferente", "Gastar mais tokens", "Impedir o streaming"]} answer={1} explanation="Similaridade alta não garante mesma resposta ('horário de atendimento' versus 'horário no domingo'). O limiar precisa ser calibrado com exemplos rotulados." />
+<Quiz question="70% das perguntas do seu assistente são simples e repetitivas. Qual alavanca tende a reduzir mais o custo sem perder qualidade nas difíceis?" options={["Usar o modelo maior para tudo", "Rotear perguntas simples para um modelo menor e escalar as difíceis", "Aumentar o top-k da recuperação", "Desligar o streaming"]} answer={1} explanation="Roteamento por dificuldade paga o preço do modelo grande só quando ele é necessário." />
+</QuizSet>

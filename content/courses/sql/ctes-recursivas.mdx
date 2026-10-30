@@ -1,0 +1,194 @@
+---
+title: CTEs recursivas
+kind: lesson
+---
+
+Algumas perguntas não têm profundidade fixa: "liste todos os subordinados, diretos e indiretos, da diretora", "monte o caminho completo de uma categoria até a raiz", "gere todas as datas entre duas datas". Um número fixo de self joins resolve só até a profundidade que você escreveu. A **CTE recursiva** resolve para qualquer profundidade, e é o jeito padrão de percorrer hierarquias e grafos em SQL.
+
+## O esquema
+
+Um organograma em que cada funcionário aponta para o gestor:
+
+```sql
+CREATE TABLE funcionarios (
+  id        integer PRIMARY KEY,
+  nome      text NOT NULL,
+  gestor_id integer REFERENCES funcionarios (id)
+);
+
+INSERT INTO funcionarios (id, nome, gestor_id) VALUES
+  (1, 'Helena', NULL),
+  (2, 'Igor', 1),
+  (3, 'Júlia', 1),
+  (4, 'Kaio', 2),
+  (5, 'Laura', 2),
+  (6, 'Mateus', 4),
+  (7, 'Nara', 3),
+  (8, 'Olga', 6);
+
+SELECT id, nome, gestor_id FROM funcionarios ORDER BY id;
+```
+
+```text
+Saída:
+id | nome | gestor_id
+1 | Helena | NULL
+2 | Igor | 1
+3 | Júlia | 1
+4 | Kaio | 2
+5 | Laura | 2
+6 | Mateus | 4
+7 | Nara | 3
+8 | Olga | 6
+```
+
+Essa estrutura (a tabela aponta para ela mesma) se chama **lista de adjacência**. É simples de manter, mas consultar "todos os descendentes" exige recursão.
+
+## Anatomia
+
+Uma CTE recursiva tem duas partes unidas por `UNION ALL`:
+
+1. **Âncora**: uma consulta comum que produz as linhas iniciais.
+2. **Passo recursivo**: uma consulta que referencia a própria CTE e produz as próximas linhas a partir das que acabaram de ser geradas.
+
+O banco executa a âncora, depois aplica o passo às linhas novas, depois aplica de novo às linhas que esse passo gerou, e para quando uma rodada não produz nada. Não é recursão de verdade, é iteração até o ponto fixo.
+
+```sql
+WITH RECURSIVE equipe AS (
+  SELECT id, nome, 0 AS nivel
+  FROM funcionarios
+  WHERE id = 2
+
+  UNION ALL
+
+  SELECT f.id, f.nome, e.nivel + 1
+  FROM funcionarios f
+  JOIN equipe e ON f.gestor_id = e.id
+)
+SELECT nome, nivel
+FROM equipe
+ORDER BY nivel, nome;
+```
+
+```text
+Saída:
+nome | nivel
+Igor | 0
+Kaio | 1
+Laura | 1
+Mateus | 2
+Olga | 3
+```
+
+A âncora pega o Igor. A primeira rodada encontra quem tem Igor como gestor (Kaio e Laura). A seguinte encontra os subordinados de Kaio e Laura (Mateus), e assim por diante até Olga, que não tem ninguém abaixo.
+
+## Subindo a árvore e montando caminhos
+
+A direção inverte trocando a condição do join. Para o caminho de Olga até a raiz, você parte dela e segue `gestor_id`. Acumular o caminho como texto é um truque útil:
+
+```sql
+WITH RECURSIVE cadeia AS (
+  SELECT id, gestor_id, nome::text AS caminho
+  FROM funcionarios
+  WHERE id = 8
+
+  UNION ALL
+
+  SELECT f.id, f.gestor_id, c.caminho || ' > ' || f.nome
+  FROM funcionarios f
+  JOIN cadeia c ON f.id = c.gestor_id
+)
+SELECT caminho
+FROM cadeia
+WHERE gestor_id IS NULL;
+```
+
+```text
+Saída:
+caminho
+Olga > Mateus > Kaio > Igor > Helena
+```
+
+O cast `nome::text` importa: a coluna recursiva precisa ter o mesmo tipo na âncora e no passo. No MySQL, o tipo da coluna é decidido pela âncora, e uma string que cresce pode ser truncada; lá você escreveria `CAST(nome AS CHAR(500))` na âncora.
+
+## Gerando séries
+
+Recursão também gera linhas do nada, o que ajuda a preencher datas sem dados:
+
+```sql
+WITH RECURSIVE dias AS (
+  SELECT DATE '2024-02-27' AS dia
+  UNION ALL
+  SELECT (dia + 1)::date FROM dias WHERE dia < DATE '2024-03-02'
+)
+SELECT dia FROM dias ORDER BY dia;
+```
+
+```text
+Saída:
+dia
+2024-02-27
+2024-02-28
+2024-02-29
+2024-03-01
+2024-03-02
+```
+
+No Postgres, `generate_series` faz o mesmo de forma mais direta. O MySQL não tem `generate_series`, então a CTE recursiva é a resposta portátil.
+
+## Ciclos e limites
+
+Se os dados tiverem um ciclo (A gerencia B, que gerencia A), o passo recursivo nunca para de produzir linhas. Há três defesas:
+
+- **Limite de profundidade**: adicione `WHERE nivel < 20` no passo recursivo.
+- **Caminho visitado**: guarde um array de ids e pare quando o próximo já estiver nele (`NOT f.id = ANY(caminho)`).
+- **Cláusula CYCLE**: o Postgres 14+ aceita `CYCLE id SET tem_ciclo USING caminho`, que faz o controle por você.
+
+O MySQL interrompe a recursão em 1000 rodadas por padrão (`cte_max_recursion_depth`) e dá erro. O Postgres não tem limite: a consulta roda até esgotar recursos.
+
+<Callout type="warning" title="UNION ou UNION ALL">
+`UNION` (sem ALL) descarta linhas que já apareceram, o que pode encerrar alguns ciclos, mas tem custo de deduplicação e não salva você quando as linhas carregam um contador de nível, que muda a cada volta. Prefira `UNION ALL` com uma proteção explícita.
+</Callout>
+
+## Contando o tamanho de cada equipe
+
+Combinar recursão com agregação responde "quantas pessoas cada gestor tem abaixo de si, direta ou indiretamente". A âncora gera cada par (gestor, subordinado direto) e o passo desce mais um nível mantendo o gestor original:
+
+```sql
+WITH RECURSIVE abaixo AS (
+  SELECT gestor_id AS chefe, id AS subordinado
+  FROM funcionarios
+  WHERE gestor_id IS NOT NULL
+
+  UNION ALL
+
+  SELECT a.chefe, f.id
+  FROM abaixo a
+  JOIN funcionarios f ON f.gestor_id = a.subordinado
+)
+SELECT g.nome, count(*) AS total_abaixo
+FROM abaixo a
+JOIN funcionarios g ON g.id = a.chefe
+GROUP BY g.nome
+ORDER BY total_abaixo DESC, g.nome;
+```
+
+```text
+Saída:
+nome | total_abaixo
+Helena | 7
+Igor | 4
+Kaio | 2
+Júlia | 1
+Mateus | 1
+```
+
+## Na entrevista
+
+Diga primeiro a âncora e o passo em português ("começo pela diretora; a cada rodada pego quem tem como gestor alguém que já está no conjunto"), depois escreva. Mencione a proteção contra ciclos mesmo que o enunciado garanta uma árvore. Follow-ups comuns: "como evitar loop infinito?" (limite de nível ou array de visitados) e "e se essa consulta for muito frequente numa árvore enorme?" (modelos alternativos como closure table ou o tipo `ltree` do Postgres, que trocam escrita mais cara por leitura direta).
+
+<QuizSet>
+<Quiz question="Quando a execução de uma CTE recursiva termina?" options={["Depois de 100 rodadas", "Quando o passo recursivo não produz nenhuma linha nova", "Quando a âncora devolve NULL", "Quando a tabela acaba"]} answer={1} explanation="O banco repete o passo sobre as linhas da rodada anterior até uma rodada vir vazia." />
+<Quiz question="Uma hierarquia corrompida tem um ciclo. O que acontece com a CTE recursiva sem proteção no Postgres?" options={["O Postgres detecta e para sozinho", "Ela roda indefinidamente até esgotar recursos ou ser cancelada", "Ela devolve só a âncora", "Dá erro de sintaxe"]} answer={1} explanation="O Postgres não limita a profundidade; use contador de nível, array de visitados ou a cláusula CYCLE. O MySQL para em cte_max_recursion_depth." />
+<Quiz question="Por que o exemplo de caminho usa nome::text na âncora?" options={["Para ordenar alfabeticamente", "Porque a coluna precisa ter o mesmo tipo na âncora e no passo recursivo", "Porque text é mais rápido", "Para evitar NULL"]} answer={1} explanation="O tipo da coluna recursiva é fixado e precisa casar com o que o passo produz; a concatenação gera text." />
+</QuizSet>

@@ -1,0 +1,82 @@
+---
+title: O que muda no system design com IA
+kind: lesson
+---
+
+Numa entrevista clássica de system design, a requisição típica custa milissegundos de CPU, devolve sempre a mesma resposta para a mesma entrada e cabe aos milhares num único servidor. Quando o produto gira em torno de um modelo de linguagem, essas três premissas caem ao mesmo tempo. Uma única resposta pode levar segundos, ocupar uma fração cara de uma GPU e sair diferente a cada chamada. Quem tenta resolver um "projete um assistente de chat" com o roteiro de um encurtador de URL costuma travar justamente aí.
+
+## As quatro diferenças que importam
+
+### 1. A unidade de trabalho é o token
+
+Em vez de "requisições por segundo", você passa a pensar em **tokens de entrada** (o prompt, que é processado de uma vez, na fase de *prefill*) e **tokens de saída** (gerados um a um, na fase de *decode*). O custo, a latência e a capacidade da frota dependem dessas duas contagens, não do número de chamadas. Duas requisições "iguais" podem diferir por um fator de cem em trabalho.
+
+### 2. O gargalo é a GPU, não a CPU
+
+Servidores de inferência são caros e escassos. A pergunta deixa de ser "quantas instâncias stateless eu sobo atrás do load balancer" e vira "quanto trabalho consigo espremer de cada acelerador". Batching, reaproveitamento de memória e escolha do modelo certo para cada tarefa passam a ser decisões de arquitetura, não detalhes de implementação.
+
+### 3. A latência é longa e progressiva
+
+Uma resposta de 500 tokens gerada a algumas dezenas de tokens por segundo leva vários segundos. Por isso a métrica que o usuário sente é o **tempo até o primeiro token** (TTFT), e o produto quase sempre faz streaming. Timeouts, conexões longas e cancelamento viram assuntos centrais.
+
+### 4. A saída não é determinística nem confiável
+
+O modelo pode responder diferente para a mesma pergunta, inventar fatos ou seguir instruções maliciosas escondidas no texto de entrada. Você precisa de avaliação contínua, guardrails na entrada e na saída e um jeito de versionar prompts como se fossem código.
+
+## Comparando as duas requisições
+
+O programa abaixo usa números hipotéticos para contrastar uma chamada de API tradicional com uma chamada a um modelo. A ideia é perceber a ordem de grandeza, não decorar valores.
+
+```python
+# Números hipotéticos, só para comparar ordens de grandeza
+crud = {"latencia_ms": 15, "custo_usd": 0.000002, "req_por_servidor": 2000}
+
+prompt_tokens = 1500
+saida_tokens = 400
+prefill_tok_s = 5000      # tokens de entrada processados por segundo (uma requisição)
+decode_tok_s = 40         # tokens de saída por segundo vistos pelo usuário
+preco_entrada = 1.0       # USD por milhão de tokens (hipotético)
+preco_saida = 4.0         # USD por milhão de tokens (hipotético)
+
+ttft_ms = prompt_tokens / prefill_tok_s * 1000
+total_ms = ttft_ms + saida_tokens / decode_tok_s * 1000
+custo = (prompt_tokens * preco_entrada + saida_tokens * preco_saida) / 1e6
+
+print(f"CRUD: {crud['latencia_ms']} ms, US$ {crud['custo_usd']:.6f} por chamada")
+print(f"LLM:  TTFT {ttft_ms:.0f} ms, total {total_ms / 1000:.1f} s, US$ {custo:.4f} por chamada")
+print(f"LLM fica {total_ms / crud['latencia_ms']:.0f}x mais lento e {custo / crud['custo_usd']:.0f}x mais caro")
+```
+
+```text
+Saída:
+CRUD: 15 ms, US$ 0.000002 por chamada
+LLM:  TTFT 300 ms, total 10.3 s, US$ 0.0031 por chamada
+LLM fica 687x mais lento e 1550x mais caro
+```
+
+Duas conclusões saem direto dos números. Primeiro, sem streaming o usuário ficaria mais de dez segundos olhando para uma tela vazia. Segundo, uma diferença de três ordens de grandeza no custo por chamada transforma o custo em requisito de primeira classe: cache, roteamento para modelos menores e limites por usuário deixam de ser otimizações opcionais.
+
+## O que continua igual
+
+Nem tudo muda. Você ainda vai precisar de load balancer, filas, banco para histórico de conversas, cache, rate limiting, observabilidade e um plano para falhas. O que muda é que, ao redor desses blocos conhecidos, aparece uma camada nova: o **gateway de modelos** (roteamento, cotas, fallback entre provedores), a **orquestração de prompts** (templates, recuperação de contexto, ferramentas) e a **avaliação** (como saber se uma mudança piorou as respostas).
+
+| Dimensão | Sistema tradicional | Sistema com LLM |
+| --- | --- | --- |
+| Unidade de carga | Requisições por segundo | Tokens de entrada e de saída por segundo |
+| Recurso escasso | CPU, I/O de banco | Memória e computação de GPU |
+| Latência típica | Dezenas de ms | Segundos, com streaming |
+| Correção | Teste determinístico | Avaliação estatística |
+| Custo marginal | Quase zero | Relevante a cada chamada |
+
+<Callout type="tip" title="Mostre que você sabe onde mora a complexidade">
+Logo no início da entrevista, diga explicitamente que vai tratar o modelo como um recurso caro, lento e falível. Isso sinaliza maturidade e justifica as decisões que vêm depois: streaming, cache, fallback e avaliação.
+</Callout>
+
+## Na entrevista
+
+Comece separando o que é "infraestrutura de sempre" do que é específico de IA. Faça perguntas que só um engenheiro de GenAI faria: qual o tamanho típico do prompt e da resposta, se usamos um provedor externo ou modelos próprios, qual a tolerância a respostas erradas e se há dados sensíveis no contexto. Follow-ups comuns: "por que não basta escalar horizontalmente?" (GPU é escassa e cara; o ganho vem de batching e de usar menos computação por pedido) e "como você testa um sistema que não é determinístico?" (conjuntos de avaliação, métricas agregadas e liberação gradual).
+
+<QuizSet>
+<Quiz question="Qual métrica de latência melhor reflete a experiência do usuário num chat com streaming?" options={["Tempo total da resposta", "Tempo até o primeiro token (TTFT)", "Requisições por segundo", "Uso de CPU do gateway"]} answer={1} explanation="Com streaming, o usuário percebe o sistema como rápido quando o primeiro token chega cedo, mesmo que a resposta completa leve alguns segundos." />
+<Quiz question="Duas requisições ao mesmo modelo chegam no mesmo segundo. Por que elas podem ter custos muito diferentes?" options={["Porque o provedor cobra por horário", "Porque custo e tempo dependem do número de tokens de entrada e de saída de cada uma", "Porque a segunda sempre usa cache", "Não podem: o custo é por chamada"]} answer={1} explanation="O trabalho de inferência escala com tokens processados e gerados, então um prompt longo com resposta longa custa muito mais que uma pergunta curta." />
+</QuizSet>

@@ -1,0 +1,149 @@
+---
+title: Tipos e restrições
+kind: lesson
+---
+
+Um esquema bem tipado é a primeira linha de defesa contra dados ruins. Em entrevistas de backend, é comum receber a tarefa "modele a tabela de usuários" ou "por que esse valor monetário está errado?". A resposta passa por escolher o tipo certo para cada coluna e declarar restrições que o banco faz cumprir sozinho, em vez de confiar que toda aplicação vai validar tudo.
+
+## Tipos que você usa o tempo todo
+
+| Necessidade | Postgres | MySQL | Observação |
+| --- | --- | --- | --- |
+| Inteiro | `integer`, `bigint` | `INT`, `BIGINT` | Use `bigint` para IDs de tabelas que podem crescer muito |
+| Dinheiro | `numeric(12,2)` | `DECIMAL(12,2)` | Nunca `float`: ponto flutuante não representa 0.1 exatamente |
+| Texto | `text`, `varchar(n)` | `VARCHAR(n)`, `TEXT` | No Postgres, `text` e `varchar` têm o mesmo desempenho |
+| Data | `date` | `DATE` | Sem hora |
+| Instante | `timestamptz` | `TIMESTAMP`, `DATETIME` | Prefira guardar em UTC |
+| Booleano | `boolean` | `TINYINT(1)` | O MySQL trata `BOOLEAN` como sinônimo de `TINYINT(1)` |
+
+O motivo para nunca usar `float` com dinheiro aparece numa consulta simples:
+
+```sql
+CREATE TABLE produtos (
+  id        integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  sku       text NOT NULL UNIQUE,
+  nome      text NOT NULL,
+  preco     numeric(10, 2) NOT NULL CHECK (preco >= 0),
+  estoque   integer NOT NULL DEFAULT 0 CHECK (estoque >= 0),
+  ativo     boolean NOT NULL DEFAULT true,
+  criado_em date NOT NULL DEFAULT '2024-01-01'
+);
+
+INSERT INTO produtos (sku, nome, preco, estoque) VALUES
+  ('TEC-01', 'Teclado', 199.90, 12),
+  ('MOU-01', 'Mouse', 89.90, 30),
+  ('MON-27', 'Monitor 27', 1499.00, 4),
+  ('CAB-HD', 'Cabo HDMI', 29.90, 0);
+
+SELECT 0.1::float8 + 0.2::float8 = 0.3::float8 AS float_igual,
+       0.1::numeric + 0.2::numeric = 0.3::numeric AS numeric_igual;
+```
+
+```text
+Saída:
+float_igual | numeric_igual
+false | true
+```
+
+Com `numeric`, a soma é exata. Com `float8`, a soma vira 0.30000000000000004 e a comparação falha. Em relatórios financeiros, esse erro acumula centavos.
+
+## Restrições: o banco como guardião
+
+Restrições declaram regras que valem para qualquer escrita, venha de onde vier:
+
+- `NOT NULL`: a coluna sempre tem valor.
+- `UNIQUE`: nenhum valor se repete (no Postgres, vários `NULL` são permitidos numa coluna `UNIQUE`, porque `NULL` não é igual a `NULL`).
+- `PRIMARY KEY`: `UNIQUE` mais `NOT NULL`.
+- `CHECK (expressão)`: a expressão precisa ser verdadeira ou nula.
+- `REFERENCES`: chave estrangeira.
+- `DEFAULT`: valor usado quando a coluna é omitida no `INSERT`.
+
+Note como o `INSERT` acima omitiu `id`, `ativo` e `criado_em`. O banco preencheu tudo:
+
+```sql
+SELECT id, sku, estoque, ativo, criado_em
+FROM produtos
+ORDER BY id;
+```
+
+```text
+Saída:
+id | sku | estoque | ativo | criado_em
+1 | TEC-01 | 12 | true | 2024-01-01
+2 | MOU-01 | 30 | true | 2024-01-01
+3 | MON-27 | 4 | true | 2024-01-01
+4 | CAB-HD | 0 | true | 2024-01-01
+```
+
+`GENERATED ALWAYS AS IDENTITY` é a forma padrão SQL de gerar IDs no Postgres moderno. O equivalente antigo é `serial`; no MySQL, é `AUTO_INCREMENT`.
+
+Quando uma escrita viola uma restrição, o comando inteiro é rejeitado:
+
+```text
+INSERT INTO produtos (sku, nome, preco) VALUES ('TEC-01', 'Teclado 2', 150);
+ERROR:  duplicate key value violates unique constraint "produtos_sku_key"
+
+UPDATE produtos SET estoque = estoque - 5 WHERE sku = 'MON-27';
+ERROR:  new row for relation "produtos" violates check constraint "produtos_estoque_check"
+```
+
+O segundo erro é o mais interessante: o `CHECK` impede vender um monitor que não está em estoque, mesmo que duas requisições concorrentes tentem ao mesmo tempo.
+
+## Restrições com nome e várias colunas
+
+Dê nomes às restrições para que as mensagens de erro digam algo útil e para facilitar removê-las depois. Restrições também podem envolver mais de uma coluna:
+
+```sql
+CREATE TABLE promocoes (
+  produto_id integer NOT NULL REFERENCES produtos (id),
+  inicio     date NOT NULL,
+  fim        date NOT NULL,
+  desconto   numeric(4, 2) NOT NULL,
+  CONSTRAINT promocao_periodo_valido CHECK (fim > inicio),
+  CONSTRAINT promocao_desconto_valido CHECK (desconto > 0 AND desconto <= 0.5),
+  CONSTRAINT promocao_unica UNIQUE (produto_id, inicio)
+);
+
+INSERT INTO promocoes VALUES
+  (1, '2024-02-01', '2024-02-10', 0.10),
+  (2, '2024-02-01', '2024-02-05', 0.25),
+  (1, '2024-03-01', '2024-03-03', 0.15);
+
+SELECT conname AS restricao, contype AS tipo
+FROM pg_constraint
+WHERE conrelid = 'promocoes'::regclass
+  AND contype IN ('c', 'u', 'f')
+ORDER BY conname;
+```
+
+```text
+Saída:
+restricao | tipo
+promocao_desconto_valido | c
+promocao_periodo_valido | c
+promocao_unica | u
+promocoes_produto_id_fkey | f
+```
+
+O catálogo `pg_constraint` lista as restrições: `c` é `CHECK`, `u` é `UNIQUE` e `f` é chave estrangeira.
+
+## Armadilhas
+
+- **`CHECK` no MySQL antigo.** Até a versão 8.0.16, o MySQL aceitava a sintaxe de `CHECK` e simplesmente a ignorava. Hoje ele valida, mas sistemas legados podem ter dados que violam regras declaradas.
+- **`varchar(255)` por reflexo.** No Postgres, o limite não melhora desempenho; use-o só quando o limite for uma regra de negócio.
+- **`timestamp` sem fuso.** Guardar horários locais sem fuso gera bugs em horário de verão e entre regiões. Prefira `timestamptz` no Postgres.
+- **Validar só na aplicação.** Basta um script de migração ou um segundo serviço para os dados ficarem inconsistentes.
+
+<Callout type="warning" title="CHECK aceita NULL">
+Uma restrição `CHECK (preco >= 0)` passa quando `preco` é `NULL`, porque o resultado é desconhecido, não falso. Combine com `NOT NULL` quando o valor for obrigatório.
+</Callout>
+
+## Na entrevista
+
+Ao modelar uma tabela, justifique cada tipo em uma frase ("dinheiro em `numeric` para ser exato", "IDs em `bigint` porque a tabela de eventos cresce rápido") e liste as restrições que protegem as regras do enunciado. Follow-ups comuns: "como garantir que o estoque nunca fique negativo sob concorrência?" (um `CHECK` resolve a regra; o `UPDATE` com condição evita a corrida) e "como gerar IDs em um sistema distribuído?" (UUID ou IDs ordenáveis por tempo, em vez de sequência central).
+
+<QuizSet>
+<Quiz question="Qual tipo usar para armazenar o saldo de uma conta bancária?" options={["float8", "real", "numeric(14,2)", "text"]} answer={2} explanation="numeric é exato em base decimal; tipos de ponto flutuante acumulam erros de arredondamento." />
+<Quiz question="Uma coluna tem CHECK (idade >= 18) e aceita NULL. Inserir idade NULL..." options={["Falha, porque NULL não é maior que 18", "Funciona, porque o CHECK só rejeita resultado falso", "Converte NULL em 0", "Depende do índice"]} answer={1} explanation="NULL >= 18 é desconhecido, e um CHECK só rejeita quando a expressão é falsa. Use NOT NULL junto." />
+<Quiz question="No Postgres, uma coluna UNIQUE pode ter várias linhas com NULL?" options={["Não, nunca", "Sim, porque NULL não é considerado igual a NULL", "Só se for chave primária", "Só em tabelas temporárias"]} answer={1} explanation="Por padrão, NULLs são distintos entre si. O Postgres 15+ permite UNIQUE NULLS NOT DISTINCT para mudar isso." />
+</QuizSet>

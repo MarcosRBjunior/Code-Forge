@@ -1,0 +1,165 @@
+---
+title: Imprimir em ordem com threads
+kind: lesson
+---
+
+Uma família inteira de perguntas de entrevista tem o mesmo esqueleto: várias threads, cada uma responsável por imprimir um pedaço, e a saída precisa sair numa ordem exata. "Três threads chamam `primeiro`, `segundo` e `terceiro` em ordem aleatória; garanta que imprimam na ordem certa." "Duas threads alternam `ping` e `pong` n vezes." "Três threads imprimem 1, 2, 3, 1, 2, 3..." O entrevistador não quer saber se você decorou a resposta, e sim se escolhe a primitiva certa para expressar **quem pode rodar agora** e se evita espera ativa.
+
+## O raciocínio
+
+Toda solução responde a duas perguntas:
+
+1. **Qual é o estado compartilhado** que diz de quem é a vez? Pode ser implícito (um sinal disparado) ou explícito (uma variável `vez`).
+2. **Como uma thread espera** pela sua vez sem gastar CPU, e como avisa a próxima?
+
+```text
+ ordem fixa, uma vez só      alternância repetida        rodízio entre N threads
+ T1 ─set(e1)─► T2            T_ping ─release(pong)─►     vez = 0, 1, 2, 0, 1...
+ T2 ─set(e2)─► T3            T_pong ─release(ping)─►     cada thread espera
+ Event / CountDownLatch      Semáforos em pingue-pongue  vez == meu_id (Condition)
+```
+
+| Cenário | Primitiva natural | Em Java | Em Go |
+| --- | --- | --- | --- |
+| Dependência única (A antes de B) | Evento / latch | `CountDownLatch(1)` | fechar um canal |
+| Alternância entre 2 | Dois semáforos | `Semaphore` | dois canais sem buffer |
+| Rodízio entre N | Lock + condição com `vez` | `ReentrantLock` + `Condition` | um canal por thread |
+
+## Exemplo 1: ordem fixa com eventos
+
+As threads são iniciadas na ordem inversa de propósito. Cada uma espera o evento da anterior antes de imprimir e então libera a seguinte. A saída é determinística porque a sincronização força a sequência, não a sorte do escalonador.
+
+```python
+import threading
+
+feito_1 = threading.Event()
+feito_2 = threading.Event()
+
+def primeiro():
+    print("primeiro")
+    feito_1.set()
+
+def segundo():
+    feito_1.wait()          # dorme até o primeiro terminar
+    print("segundo")
+    feito_2.set()
+
+def terceiro():
+    feito_2.wait()
+    print("terceiro")
+
+threads = [threading.Thread(target=f) for f in (terceiro, segundo, primeiro)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+```text
+Saída:
+primeiro
+segundo
+terceiro
+```
+
+## Exemplo 2: alternância com semáforos
+
+Para alternar `ping` e `pong`, cada thread tem seu semáforo. O de `ping` começa com 1 (ele vai primeiro) e o de `pong` com 0. Cada thread adquire o seu, imprime e libera o da outra: é um bastão passado de mão em mão.
+
+```python
+import threading
+
+N = 3
+vez_ping = threading.Semaphore(1)
+vez_pong = threading.Semaphore(0)
+
+def ping():
+    for _ in range(N):
+        vez_ping.acquire()
+        print("ping")
+        vez_pong.release()
+
+def pong():
+    for _ in range(N):
+        vez_pong.acquire()
+        print("pong")
+        vez_ping.release()
+
+a = threading.Thread(target=pong)
+b = threading.Thread(target=ping)
+a.start()
+b.start()
+a.join()
+b.join()
+```
+
+```text
+Saída:
+ping
+pong
+ping
+pong
+ping
+pong
+```
+
+## Exemplo 3: rodízio entre N threads com Condition
+
+Quando há mais de duas threads, uma variável `vez` protegida por uma `Condition` generaliza a ideia. Cada thread espera em laço até `vez` ser o seu índice, imprime, avança `vez` e acorda todas com `notify_all`, porque não há como acordar só a próxima numa condição compartilhada.
+
+```python
+import threading
+
+N_THREADS = 3
+RODADAS = 2
+cond = threading.Condition()
+vez = 0
+
+def trabalhador(meu_id):
+    global vez
+    for rodada in range(RODADAS):
+        with cond:
+            while vez != meu_id:        # sempre em laço: wakeups espúrios existem
+                cond.wait()
+            print(f"thread {meu_id + 1} (rodada {rodada + 1})")
+            vez = (vez + 1) % N_THREADS
+            cond.notify_all()
+
+threads = [threading.Thread(target=trabalhador, args=(i,)) for i in reversed(range(N_THREADS))]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+```text
+Saída:
+thread 1 (rodada 1)
+thread 2 (rodada 1)
+thread 3 (rodada 1)
+thread 1 (rodada 2)
+thread 2 (rodada 2)
+thread 3 (rodada 2)
+```
+
+## Armadilhas
+
+- **Espera ativa**: `while vez != meu_id: pass` funciona, mas queima CPU e, sem barreira de memória, pode nem enxergar a mudança em Java ou C++. Use primitivas que bloqueiam.
+- **`if` em vez de `while`** em volta de `wait`: após acordar, a condição pode não valer mais (wakeup espúrio ou outra thread passou antes).
+- **`notify` em vez de `notify_all`** numa condição compartilhada por N threads: você pode acordar a thread errada, que volta a dormir, e ninguém acorda a certa. Resultado: travamento.
+- **`sleep` para ordenar**: dormir 100 ms "para dar tempo" não é sincronização; falha sob carga.
+- **Estado inicial errado** dos semáforos causa deadlock imediato (os dois em 0) ou ordem errada (os dois em 1).
+
+<Callout type="tip" title="Uma condição por thread">
+Com `ReentrantLock` em Java você pode criar uma `Condition` por thread e chamar `signal` só na próxima, evitando acordar todas. Em Go, o equivalente é um canal por thread passando o bastão em anel.
+</Callout>
+
+## Na entrevista
+
+Comece dizendo qual é o estado que define a vez e qual primitiva vai bloquear cada thread. Para dependência única, eventos ou latches; para alternância, semáforos; para rodízio, condição com variável `vez`. Escreva a versão com semáforos se for curta, e mencione por que evitou espera ativa e `sleep`. Follow-ups comuns: "e se forem N threads em vez de 2?" (generalize com `vez` e `notify_all`, ou um semáforo por thread em anel) e "como garantir que o programa termina?" (cada thread faz um número fixo de iterações e a última libera quem estiver esperando).
+
+<QuizSet>
+<Quiz question="Na alternância ping/pong com dois semáforos, qual configuração inicial faz 'ping' imprimir primeiro?" options={["ping = 0, pong = 0", "ping = 1, pong = 0", "ping = 1, pong = 1", "ping = 0, pong = 1"]} answer={1} explanation="Ping precisa de uma permissão para começar; pong só começa quando ping libera a dele. Com os dois em 0 há deadlock; com os dois em 1 a ordem não é garantida." />
+<Quiz question="No rodízio entre 3 threads com uma única Condition, por que usar notify_all em vez de notify?" options={["notify_all é mais rápido", "notify pode acordar uma thread que não é a da vez, que volta a dormir, e a certa nunca acorda", "notify não existe em Python", "notify_all libera o lock automaticamente"]} answer={1} explanation="Com várias threads esperando a mesma condição por motivos diferentes, notify pode acordar a errada e o sistema trava." />
+<Quiz question="Um colega resolveu o problema colocando time.sleep(0.1) antes da segunda impressão. Qual a crítica correta?" options={["Está correto, apenas lento", "sleep não garante ordem: sob carga, a outra thread pode ainda não ter rodado", "sleep libera o GIL e causa deadlock", "sleep impede a thread de imprimir"]} answer={1} explanation="Sono é um palpite sobre tempo, não uma garantia de ordem. A sincronização correta usa eventos, semáforos ou condições." />
+</QuizSet>

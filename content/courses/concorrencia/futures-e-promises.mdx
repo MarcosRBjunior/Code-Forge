@@ -1,0 +1,155 @@
+---
+title: Futures e promises
+kind: lesson
+---
+
+Quando você submete uma tarefa a outra thread, surge uma pergunta: como receber o resultado? Variáveis globais e listas compartilhadas funcionam, mas obrigam você a criar locks, saber quando o valor ficou pronto e decidir o que fazer se a tarefa falhar. Um **future** encapsula tudo isso num objeto: é uma promessa de valor que estará disponível depois. Quem pede trabalho recebe o future na hora e decide quando esperar por ele.
+
+## Future e promise: dois lados da mesma caixa
+
+Os nomes variam entre linguagens, mas a ideia é uma caixa de uso único com dois lados:
+
+```text
+   lado de quem produz                    lado de quem consome
+  ┌───────────────────┐   mesma caixa   ┌────────────────────┐
+  │ promise           │ ──────────────> │ future             │
+  │ set_result(valor) │                 │ result()  (espera) │
+  │ set_exception(e)  │                 │ done()    (consulta)│
+  └───────────────────┘                 └────────────────────┘
+  estados: pendente -> concluído com valor | concluído com erro | cancelado
+```
+
+- **Promise**: o lado que escreve, completado uma única vez.
+- **Future**: o lado que lê, que bloqueia em `result()` ou registra callbacks.
+
+Em Java, `Future` vem do `ExecutorService` e `CompletableFuture` reúne os dois lados (`complete`, `thenApply`, `thenCompose`, `allOf`). Em C++, `std::promise` e `std::future` são classes separadas, e `std::async` devolve um future. Em JavaScript, `Promise` é o modelo central. Em Go não há future nativo: o idiom é um canal com buffer 1 que recebe o resultado. Em Python, `concurrent.futures.Future` serve aos dois papéis.
+
+## Usando futures de um executor
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
+def consultar_preco(produto):
+    time.sleep(0.05)
+    if produto == "inexistente":
+        raise KeyError(produto)
+    return len(produto) * 10
+
+produtos = ["teclado", "mouse", "inexistente", "monitor"]
+with ThreadPoolExecutor(max_workers=4) as ex:
+    futures = {ex.submit(consultar_preco, p): p for p in produtos}
+    print("todos pendentes logo apos submit:", not all(f.done() for f in futures))
+
+    resultados, erros = {}, []
+    for f in as_completed(futures):       # entrega na ordem em que terminam
+        produto = futures[f]
+        try:
+            resultados[produto] = f.result()   # repropaga a exceção da tarefa
+        except KeyError as e:
+            erros.append(str(e))
+
+for p in sorted(resultados):
+    print(p, resultados[p])
+print("erros:", erros)
+```
+
+```text
+Saída:
+todos pendentes logo apos submit: True
+monitor 70
+mouse 50
+teclado 70
+erros: ["'inexistente'"]
+```
+
+Três detalhes importam. Primeiro, `result()` bloqueia até a tarefa terminar e, se ela falhou, **relança a exceção** na thread que chamou; o erro não some, mas só aparece se você pedir o resultado. Segundo, `as_completed` entrega na ordem de conclusão, então ordene antes de imprimir se a ordem importa. Terceiro, `result(timeout=...)` evita esperar para sempre por uma tarefa travada.
+
+## Construindo uma promise
+
+Para entender o mecanismo, vale implementar uma versão mínima: um `Event` para sinalizar conclusão, o valor guardado e uma lista de callbacks. O método `then` encadeia transformações sem bloquear, que é o que `thenApply` faz em Java.
+
+```python
+import threading
+
+class Promessa:
+    def __init__(self):
+        self._pronto = threading.Event()
+        self._lock = threading.Lock()
+        self._valor = None
+        self._callbacks = []
+
+    def resolver(self, valor):
+        with self._lock:
+            if self._pronto.is_set():
+                raise RuntimeError("promessa ja resolvida")
+            self._valor = valor
+            self._pronto.set()
+            callbacks = list(self._callbacks)
+        for cb in callbacks:
+            cb(valor)
+
+    def resultado(self, timeout=None):
+        if not self._pronto.wait(timeout):
+            raise TimeoutError("ainda pendente")
+        return self._valor
+
+    def then(self, func):
+        proxima = Promessa()
+        def ao_concluir(valor):
+            proxima.resolver(func(valor))
+        with self._lock:
+            if not self._pronto.is_set():
+                self._callbacks.append(ao_concluir)
+                return proxima
+        ao_concluir(self._valor)  # já estava pronta: executa agora
+        return proxima
+
+p = Promessa()
+dobro_mais_um = p.then(lambda x: x * 2).then(lambda x: x + 1)
+
+try:
+    p.resultado(timeout=0.01)
+except TimeoutError as e:
+    print("antes:", e)
+
+threading.Thread(target=p.resolver, args=(20,)).start()
+print("valor original:", p.resultado(timeout=1))
+print("depois do encadeamento:", dobro_mais_um.resultado(timeout=1))
+
+try:
+    p.resolver(99)
+except RuntimeError as e:
+    print("segunda resolucao:", e)
+```
+
+```text
+Saída:
+antes: ainda pendente
+valor original: 20
+depois do encadeamento: 41
+segunda resolucao: promessa ja resolvida
+```
+
+O lock em `then` evita uma corrida sutil: sem ele, o callback poderia ser registrado logo depois de `resolver` copiar a lista, e ninguém o chamaria.
+
+## Armadilhas
+
+- **Bloquear cedo demais**: chamar `submit(...).result()` em seguida transforma código concorrente em sequencial. Submeta tudo primeiro e espere depois.
+- **Exceções esquecidas**: futures que ninguém consulta escondem falhas. Sempre chame `result()` ou verifique `exception()`.
+- **Callbacks pesados**: em muitas implementações o callback roda na thread que completou o future, roubando tempo do worker.
+- **Cancelamento limitado**: `cancel()` só funciona se a tarefa ainda não começou; uma tarefa em execução precisa checar uma flag por conta própria.
+- **Esperar dentro do mesmo pool**: um future que espera outro future do mesmo pool lotado causa deadlock.
+
+<Callout type="tip" title="Componha, não bloqueie">
+Em código com muitas etapas, prefira composição (`thenCompose`, `allOf`, `asyncio.gather`) a chamadas `get()` espalhadas. O fluxo fica declarativo e as threads ficam livres.
+</Callout>
+
+## Na entrevista
+
+Defina future como o lado leitor e promise como o lado escritor de um resultado de uso único, cite os estados (pendente, concluído, falho, cancelado) e mostre o padrão "submeta tudo, depois colete". Se pedirem implementação, use lock mais condição ou evento, garanta que só se resolve uma vez e trate callbacks registrados antes e depois da conclusão. Follow-ups comuns: "como esperar o primeiro de vários resultados?" (`as_completed`, `anyOf`, `wait(FIRST_COMPLETED)`) e "como aplicar timeout a uma chamada lenta?" (`result(timeout)` e cancelamento cooperativo).
+
+<QuizSet>
+<Quiz question="Uma tarefa submetida a um executor lança ValueError. Quando você descobre isso?" options={["Nunca, a exceção é descartada", "Imediatamente, na chamada submit", "Quando chama result() no future, que relança a exceção", "Só ao desligar o executor"]} answer={2} explanation="O future guarda a exceção e a relança em result(); por isso futures não consultados escondem erros." />
+<Quiz question="Qual código aproveita a concorrência ao buscar 10 URLs com um executor?" options={["Para cada URL: submit(...).result()", "Submeter as 10 tarefas, guardar os futures e só então coletar os resultados", "Chamar result() antes de submit", "Usar um único worker"]} answer={1} explanation="Chamar result() logo após cada submit espera uma tarefa antes de iniciar a próxima, tornando tudo sequencial." />
+</QuizSet>

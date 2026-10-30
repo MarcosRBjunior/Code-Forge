@@ -1,0 +1,125 @@
+---
+title: Tokens e janela de contexto
+kind: lesson
+---
+
+Um LLM não lê caracteres nem palavras: lê **tokens**. Tudo o que importa na operação de um produto (preço, limite de entrada, latência, até a qualidade em idiomas diferentes do inglês) é medido nessa unidade. Se você estima custo contando palavras, vai errar; se ignora o limite de contexto, sua aplicação quebra justamente nas conversas mais longas, que costumam ser as dos melhores clientes.
+
+## O que é um token
+
+Um tokenizador quebra o texto em pedaços de um vocabulário fixo, normalmente com dezenas a centenas de milhares de entradas. Palavras comuns viram um token só; palavras raras, nomes próprios e código são quebrados em vários pedaços. A técnica mais usada é a **BPE** (byte pair encoding): começa com caracteres (ou bytes) e, repetidamente, funde o par adjacente mais frequente num símbolo novo.
+
+```python
+from collections import Counter
+
+palavras = ["banana", "bandana", "cabana", "banda"]
+seqs = [list(p) for p in palavras]
+
+def par_mais_frequente(seqs):
+    pares = Counter()
+    for s in seqs:
+        pares.update(zip(s, s[1:]))
+    return pares.most_common(1)[0]
+
+def fundir(seqs, par):
+    novo = par[0] + par[1]
+    resultado = []
+    for s in seqs:
+        i, out = 0, []
+        while i < len(s):
+            if i + 1 < len(s) and (s[i], s[i + 1]) == par:
+                out.append(novo)
+                i += 2
+            else:
+                out.append(s[i])
+                i += 1
+        resultado.append(out)
+    return resultado
+
+for passo in range(1, 5):
+    par, freq = par_mais_frequente(seqs)
+    seqs = fundir(seqs, par)
+    print(f"fusao {passo}: {par[0]}+{par[1]} (freq {freq}) -> {seqs[0]}")
+print("tokens por palavra:", [len(s) for s in seqs])
+```
+
+```text
+Saída:
+fusao 1: a+n (freq 6) -> ['b', 'an', 'an', 'a']
+fusao 2: b+an (freq 4) -> ['ban', 'an', 'a']
+fusao 3: an+a (freq 2) -> ['ban', 'ana']
+fusao 4: ban+d (freq 2) -> ['ban', 'ana']
+tokens por palavra: [2, 2, 4, 2]
+```
+
+Depois de milhares de fusões num corpus gigante, sobra um vocabulário em que "banana" provavelmente é um token só. A consequência prática: a mesma frase pode custar mais tokens em português do que em inglês, porque os tokenizadores costumam ser treinados com mais texto em inglês. Como regra grosseira, em inglês um token fica perto de três quartos de uma palavra; em português e em código a razão é pior. Para números exatos, use o tokenizador do próprio modelo.
+
+Tokenização também explica erros clássicos: o modelo tem dificuldade para contar letras ou inverter strings porque não "vê" letras, vê pedaços.
+
+## A janela de contexto
+
+A **janela de contexto** é o número máximo de tokens que o modelo processa numa chamada, somando tudo:
+
+```text
+┌────────────────────── janela de contexto ──────────────────────┐
+│ system prompt │ ferramentas │ histórico │ documentos │ pergunta │ saída │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+A saída também ocupa espaço: se você reservar pouco, a resposta é cortada no meio. Janelas atuais vão de alguns milhares a centenas de milhares de tokens, mas caber não significa funcionar bem. Três problemas aparecem com contexto grande:
+
+- **Custo e latência** crescem com cada token enviado, em toda chamada.
+- **Perda no meio:** modelos tendem a usar melhor o que está no começo e no fim do contexto; um detalhe enterrado no meio de 100 páginas pode ser ignorado.
+- **Distração:** informação irrelevante compete com a relevante e piora a resposta.
+
+## Gerenciando o orçamento
+
+Em um chat, o histórico cresce até estourar. As estratégias comuns são: janela deslizante (manter as últimas N mensagens), resumir as antigas numa mensagem curta, ou recuperar só os trechos relevantes (RAG). Sempre preserve o system prompt e reserve espaço para a resposta.
+
+```python
+def contar_tokens(texto):
+    # aproximação didática: 1 token a cada 4 caracteres, no mínimo 1
+    return max(1, len(texto) // 4)
+
+def montar_contexto(system, historico, limite, reserva_saida):
+    orcamento = limite - reserva_saida - contar_tokens(system)
+    escolhidas = []
+    for msg in reversed(historico):          # das mais recentes para as antigas
+        custo = contar_tokens(msg)
+        if custo > orcamento:
+            break
+        escolhidas.append(msg)
+        orcamento -= custo
+    return [system] + list(reversed(escolhidas)), orcamento
+
+system = "Voce e um assistente de suporte."
+historico = [f"mensagem {i}: " + "x" * 40 for i in range(1, 9)]
+contexto, sobra = montar_contexto(system, historico, limite=80, reserva_saida=20)
+print("mensagens mantidas:", [m.split(":")[0] for m in contexto[1:]])
+print("tokens sobrando:", sobra)
+```
+
+```text
+Saída:
+mensagens mantidas: ['mensagem 5', 'mensagem 6', 'mensagem 7', 'mensagem 8']
+tokens sobrando: 0
+```
+
+<Callout type="warning" title="Conte com o tokenizador certo">
+A aproximação por caracteres serve para estimativas. Para decidir o que cabe na janela em produção, use o tokenizador do modelo (ou o campo de uso que a API devolve), e trate o limite como rígido: passar dele gera erro, não truncamento gentil.
+</Callout>
+
+## Armadilhas
+
+- Esquecer que definições de ferramentas, exemplos few-shot e documentos recuperados também consomem a janela.
+- Cortar o histórico no meio de uma troca de ferramenta (chamada sem o resultado correspondente), o que muitas APIs rejeitam.
+- Calcular custo só pela entrada: tokens de saída costumam ser mais caros por unidade.
+
+## Na entrevista
+
+Mostre que você pensa em tokens como a unidade de custo, latência e limite. Ao desenhar um chat ou um RAG, diga como o contexto é montado e como ele é limitado: system prompt fixo, últimos turnos, resumo dos antigos, trechos recuperados com teto, reserva para a saída. Follow-ups: "por que não colocar o manual inteiro no contexto se ele cabe?" (custo por chamada, latência, perda no meio) e "por que o modelo erra ao contar os 'r' de uma palavra?" (tokenização em subpalavras).
+
+<QuizSet>
+<Quiz question="Sua aplicação estima custo dividindo o número de palavras por 0,75. Em produção, com usuários brasileiros e muito código colado, a conta sai bem abaixo do real. Por quê?" options={["A API cobra por caractere", "Português e código geram mais tokens por palavra do que o inglês usado na estimativa", "Tokens de saída não são cobrados", "O cache dobra a contagem"]} answer={1} explanation="A razão tokens por palavra depende do idioma e do tipo de texto; tokenizadores treinados majoritariamente em inglês quebram português e código em mais pedaços." />
+<Quiz question="Um contexto de 200 mil tokens comporta todos os seus documentos. Qual é o principal argumento para ainda assim recuperar só os trechos relevantes?" options={["O modelo não aceita documentos longos", "Custo e latência por chamada e pior uso de informação enterrada no meio do contexto", "Embeddings exigem trechos curtos", "Contextos longos desativam a temperatura"]} answer={1} explanation="Caber não é o mesmo que funcionar bem: cada chamada paga por todos os tokens, demora mais, e detalhes no meio de contextos enormes tendem a ser ignorados." />
+</QuizSet>

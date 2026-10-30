@@ -1,0 +1,121 @@
+---
+title: Temperatura e amostragem
+kind: lesson
+---
+
+O modelo não devolve uma resposta: devolve, a cada passo, uma distribuição de probabilidade sobre o vocabulário. Quem escolhe o token é o **decodificador**, e os parâmetros dele (temperatura, top-k, top-p, semente) mudam bastante o comportamento do sistema. Uma extração de dados que às vezes inventa um campo e um gerador de slogans que sempre repete a mesma frase são, muitas vezes, o mesmo problema com sinais trocados: amostragem mal configurada.
+
+## Greedy versus amostragem
+
+A estratégia mais simples é **greedy**: pegar sempre o token mais provável. Ela é previsível, mas tende a respostas repetitivas e pode entrar em laços. A alternativa é **amostrar** da distribuição, o que traz variedade ao custo de, às vezes, escolher um token ruim de baixa probabilidade.
+
+## Temperatura
+
+Antes da softmax, os logits são divididos pela temperatura `T`:
+
+- `T` menor que 1 deixa a distribuição mais "pontuda": o favorito ganha ainda mais peso. Com `T` perto de 0, o resultado se aproxima do greedy.
+- `T` igual a 1 mantém a distribuição original.
+- `T` maior que 1 achata a distribuição e dá chance a tokens improváveis.
+
+```python
+import math
+
+def softmax(logits, t):
+    escalados = [x / t for x in logits]
+    m = max(escalados)
+    exps = [math.exp(x - m) for x in escalados]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+tokens = ["Paris", "Lyon", "Roma", "banana"]
+logits = [5.0, 3.0, 2.0, 0.5]
+
+for t in (0.2, 1.0, 2.0):
+    probs = softmax(logits, t)
+    linha = "  ".join(f"{tok}={p:.2f}" for tok, p in zip(tokens, probs))
+    print(f"T={t}: {linha}")
+```
+
+```text
+Saída:
+T=0.2: Paris=1.00  Lyon=0.00  Roma=0.00  banana=0.00
+T=1.0: Paris=0.84  Lyon=0.11  Roma=0.04  banana=0.01
+T=2.0: Paris=0.59  Lyon=0.22  Roma=0.13  banana=0.06
+```
+
+Repare como "banana", irrelevante, sai de praticamente zero para uma chance real quando a temperatura sobe.
+
+## Top-k e top-p
+
+Mesmo com temperatura moderada, a cauda longa do vocabulário soma muita probabilidade. Dois filtros cortam essa cauda antes do sorteio:
+
+- **Top-k:** mantém só os k tokens mais prováveis e renormaliza.
+- **Top-p (nucleus):** mantém o menor conjunto de tokens cuja probabilidade acumulada chega a p. Em distribuições confiantes, sobra um ou dois tokens; em distribuições incertas, sobram vários. Por isso se adapta melhor do que um k fixo.
+
+```python
+import random
+
+def top_k(probs, k):
+    ordem = sorted(probs.items(), key=lambda kv: -kv[1])[:k]
+    total = sum(p for _, p in ordem)
+    return {tok: p / total for tok, p in ordem}
+
+def top_p(probs, p):
+    ordem = sorted(probs.items(), key=lambda kv: -kv[1])
+    mantidos, acumulado = [], 0.0
+    for tok, prob in ordem:
+        mantidos.append((tok, prob))
+        acumulado += prob
+        if acumulado >= p:
+            break
+    total = sum(pr for _, pr in mantidos)
+    return {tok: pr / total for tok, pr in mantidos}
+
+probs = {"Paris": 0.55, "Lyon": 0.25, "Roma": 0.12, "Nice": 0.05, "banana": 0.03}
+print("top-k=2:", {t: round(p, 2) for t, p in top_k(probs, 2).items()})
+print("top-p=0.9:", {t: round(p, 2) for t, p in top_p(probs, 0.9).items()})
+
+filtrado = top_p(probs, 0.9)
+rng = random.Random(42)  # semente fixa: mesma sequencia em toda execucao
+amostras = rng.choices(list(filtrado), weights=list(filtrado.values()), k=10)
+print("10 sorteios:", amostras)
+```
+
+```text
+Saída:
+top-k=2: {'Paris': 0.69, 'Lyon': 0.31}
+top-p=0.9: {'Paris': 0.6, 'Lyon': 0.27, 'Roma': 0.13}
+10 sorteios: ['Lyon', 'Paris', 'Paris', 'Paris', 'Lyon', 'Lyon', 'Roma', 'Paris', 'Paris', 'Paris']
+```
+
+Repare que "banana" nunca pode aparecer depois do top-p: ele foi cortado antes do sorteio.
+
+## Que valores usar
+
+| Tarefa | Configuração típica | Por quê |
+| --- | --- | --- |
+| Extração, classificação, SQL | Temperatura baixa (0 a 0,3) | Você quer a resposta mais provável, sempre igual |
+| Assistente geral, resumo | Temperatura média (perto de 0,7) | Texto natural sem desviar |
+| Brainstorm, variações criativas | Temperatura alta, top-p alto | Diversidade importa mais que precisão |
+| Gerar N candidatos e escolher | Temperatura média ou alta | Precisa de candidatos diferentes entre si |
+
+Ajuste temperatura **ou** top-p, de preferência não os dois ao mesmo tempo, e meça com avaliação em vez de chutar.
+
+<Callout type="warning" title="Temperatura 0 não garante determinismo">
+Mesmo no greedy, provedores podem devolver respostas levemente diferentes para a mesma entrada, por causa de lotes no servidor, paralelismo em ponto flutuante ou atualizações silenciosas do modelo. Se o seu sistema precisa de reprodutibilidade, registre entradas e saídas e use cache, em vez de confiar na API.
+</Callout>
+
+## Outras alavancas
+
+- **Penalidades de repetição/frequência:** reduzem a probabilidade de tokens já usados, úteis contra laços.
+- **Sequências de parada:** encerram a geração ao ver um marcador.
+- **Limite de tokens de saída:** controla custo, mas corta a resposta se for baixo demais (verifique o motivo de término devolvido pela API).
+
+## Na entrevista
+
+Explique a cadeia logits → temperatura → filtro (top-k/top-p) → sorteio e associe cada configuração a um tipo de tarefa. Um bom sinal de senioridade é lembrar que temperatura baixa não é garantia de determinismo e que a forma certa de escolher valores é testar com um conjunto de avaliação. Follow-ups: "por que top-p é preferível a top-k?" (adapta o tamanho do corte à confiança do modelo) e "como gerar 5 títulos diferentes?" (temperatura mais alta ou várias amostras, depois deduplicar).
+
+<QuizSet>
+<Quiz question="Seu pipeline extrai CPF e valor de notas fiscais e, de vez em quando, retorna um valor com dígitos trocados. A temperatura está em 1,0. Qual a primeira mudança?" options={["Aumentar a temperatura para 1,5", "Baixar a temperatura para perto de 0", "Aumentar o top-k", "Remover o limite de tokens de saída"]} answer={1} explanation="Extração quer o token mais provável em cada passo. Temperatura alta dá chance a dígitos de baixa probabilidade." />
+<Quiz question="Qual a diferença essencial entre top-k e top-p?" options={["Top-p corta por quantidade fixa de tokens; top-k por probabilidade acumulada", "Top-k mantém k tokens fixos; top-p mantém tokens até somar a probabilidade p, adaptando o tamanho do corte", "Os dois são idênticos", "Top-p só funciona com temperatura 0"]} answer={1} explanation="Top-p adapta o conjunto à forma da distribuição: poucos tokens quando o modelo está confiante, mais quando está incerto." />
+</QuizSet>

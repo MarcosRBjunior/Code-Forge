@@ -1,0 +1,137 @@
+---
+title: "Roteamento: OSPF e BGP"
+kind: lesson
+---
+
+Um roteador recebe um pacote, olha o destino e precisa decidir por qual interface ele sai. Essa decisão é rápida e local: consultar a tabela de rotas com longest prefix match. A parte difícil é **construir** a tabela. Dentro de uma organização, o objetivo é achar o caminho mais curto e reagir rápido a falhas; entre organizações, o que manda são contratos e política. Daí dois mundos: protocolos internos como o **OSPF** e o protocolo da internet, o **BGP**.
+
+## Plano de dados e plano de controle
+
+```text
+           plano de controle (lento, software)
+   OSPF / BGP / rotas estáticas  -->  RIB (todas as rotas conhecidas)
+                                         |  escolhe a melhor por destino
+                                         v
+           plano de dados (rápido, hardware)
+   pacote chega --> FIB (longest prefix match) --> interface de saída
+```
+
+Os protocolos de roteamento trocam informações e preenchem a tabela; o encaminhamento em si nem sabe que eles existem. Quando um enlace cai, há um intervalo até o plano de controle convergir. Nesse intervalo, pacotes podem ser descartados ou andar em laço até o TTL acabar.
+
+## OSPF: cada roteador conhece o mapa
+
+O OSPF é um protocolo de **estado de enlace**. Cada roteador anuncia aos vizinhos seus enlaces e o custo de cada um (normalmente derivado da banda). Esses anúncios se espalham por inundação até que todos tenham o mesmo mapa da área. Então cada roteador roda Dijkstra sozinho e calcula a árvore de caminhos mínimos a partir de si.
+
+```python
+import heapq
+
+enlaces = {
+    "R1": {"R2": 10, "R3": 1},
+    "R2": {"R1": 10, "R4": 1},
+    "R3": {"R1": 1, "R4": 5, "R5": 2},
+    "R4": {"R2": 1, "R3": 5, "R5": 1},
+    "R5": {"R3": 2, "R4": 1},
+}
+
+def spf(grafo, origem):
+    dist, prox_salto = {origem: 0}, {}
+    fila = [(0, origem, None)]
+    while fila:
+        d, no, primeiro = heapq.heappop(fila)
+        if d > dist.get(no, float("inf")):
+            continue
+        for viz, custo in sorted(grafo[no].items()):
+            nd = d + custo
+            if nd < dist.get(viz, float("inf")):
+                dist[viz] = nd
+                prox_salto[viz] = primeiro or viz
+                heapq.heappush(fila, (nd, viz, primeiro or viz))
+    return dist, prox_salto
+
+def tabela(grafo):
+    dist, salto = spf(grafo, "R1")
+    for destino in sorted(dist):
+        if destino != "R1":
+            print(f"  {destino}: custo {dist[destino]:2} via {salto[destino]}")
+
+print("R1 com todos os enlaces:")
+tabela(enlaces)
+del enlaces["R3"]["R5"], enlaces["R5"]["R3"]
+print("R1 depois que R3-R5 cai:")
+tabela(enlaces)
+```
+
+```text
+Saída:
+R1 com todos os enlaces:
+  R2: custo  5 via R3
+  R3: custo  1 via R3
+  R4: custo  4 via R3
+  R5: custo  3 via R3
+R1 depois que R3-R5 cai:
+  R2: custo  7 via R3
+  R3: custo  1 via R3
+  R4: custo  6 via R3
+  R5: custo  7 via R3
+```
+
+Repare que, com todos os enlaces de pé, R1 chega a R2 por R3 (custo 5) e não pelo enlace direto de custo 10: o caminho com mais saltos ganhou porque é mais barato. Depois da falha, o próximo salto continua sendo R3, mas o caminho por trás dele muda: tudo passa a cruzar o enlace R3-R4 e os custos para R2, R4 e R5 sobem. O OSPF converge em segundos ou menos, e redes grandes são divididas em **áreas** para limitar o tamanho do mapa e o raio de cada inundação.
+
+## BGP: política entre sistemas autônomos
+
+A internet é formada por dezenas de milhares de **sistemas autônomos** (AS), cada um com um número (ASN): provedores, nuvens, grandes empresas. O BGP troca rotas entre eles, mas não compartilha mapa algum. Cada AS anuncia prefixos com um **AS_PATH**, a lista de ASes pelos quais o anúncio passou. Isso serve para detectar laços (se meu ASN já está no caminho, descarto) e como critério de escolha. Por isso se diz que o BGP é de **vetor de caminho**.
+
+A escolha da melhor rota segue uma sequência de desempates. Os primeiros passos, simplificados:
+
+1. Maior **LOCAL_PREF**: preferência configurada pelo próprio AS (por exemplo, preferir enlaces de peering gratuitos a trânsito pago).
+2. Menor **AS_PATH**.
+3. Menor **MED**, uma sugestão do vizinho sobre por onde entrar.
+4. Rotas aprendidas de fora (eBGP) antes das internas, depois menor custo interno até a saída.
+
+```python
+rotas = [
+    {"via": "Transito-A", "local_pref": 100, "as_path": [64500, 15169], "med": 0},
+    {"via": "Transito-B", "local_pref": 100, "as_path": [64501, 3356, 15169], "med": 0},
+    {"via": "Peering-IX", "local_pref": 200, "as_path": [64510, 64511, 3356, 15169], "med": 50},
+]
+
+def melhor(rotas):
+    return min(rotas, key=lambda r: (-r["local_pref"], len(r["as_path"]), r["med"]))
+
+print("escolhida:", melhor(rotas)["via"])
+sem_peering = [r for r in rotas if r["via"] != "Peering-IX"]
+print("sem o peering:", melhor(sem_peering)["via"])
+```
+
+```text
+Saída:
+escolhida: Peering-IX
+sem o peering: Transito-A
+```
+
+O peering vence mesmo com o caminho mais longo, porque política vem antes de distância. É assim que o BGP funciona: o "melhor" caminho é o que o dono da rede quer, não o mais rápido.
+
+## Comparação
+
+| Aspecto | OSPF | BGP |
+| --- | --- | --- |
+| Escopo | Dentro de um AS | Entre ASes (e dentro, com iBGP) |
+| Tipo | Estado de enlace | Vetor de caminho |
+| Critério | Menor custo | Política, depois AS_PATH |
+| Escala | Centenas a milhares de roteadores | Mais de um milhão de prefixos |
+| Convergência | Rápida | Lenta, de segundos a minutos |
+| Transporte | IP direto (protocolo 89) | TCP, porta 179 |
+
+## Quando dá errado
+
+O BGP confia nos anúncios dos vizinhos. Um AS que anuncia por engano um prefixo que não é seu, ou um prefixo mais específico, atrai o tráfego do mundo (lembre do longest prefix match). Vazamentos e sequestros de rotas já derrubaram grandes serviços, e um erro de configuração que retira os anúncios de um provedor faz ele simplesmente sumir da internet, inclusive seus servidores de DNS. RPKI, que assina quais ASes podem originar cada prefixo, mitiga parte disso.
+
+## Na entrevista
+
+Separe encaminhamento (consulta à tabela) de roteamento (construção da tabela). Diga que OSPF calcula caminhos mínimos com o mapa completo e BGP escolhe por política com vetor de caminho. Follow-ups: "como o anycast usa BGP?" (vários locais anunciam o mesmo prefixo e cada cliente chega ao mais próximo em termos de roteamento) e "por que um incidente de BGP derruba um site inteiro?" (rotas retiradas tornam os IPs inalcançáveis, inclusive os do DNS).
+
+<QuizSet>
+<Quiz question="No OSPF, o que cada roteador faz depois de receber os anúncios de estado de enlace?" options={["Repassa a tabela pronta aos vizinhos", "Roda Dijkstra sobre o mapa completo para calcular os caminhos mínimos", "Escolhe a rota com menor AS_PATH", "Pergunta ao servidor central"]} answer={1} explanation="Cada roteador tem o mesmo mapa da área e calcula sozinho a árvore de caminhos mínimos." />
+<Quiz question="Um AS tem duas rotas para um prefixo: AS_PATH de 2 saltos com LOCAL_PREF 100 e AS_PATH de 4 saltos com LOCAL_PREF 300. Qual é escolhida?" options={["A de 2 saltos", "A de 4 saltos", "As duas, balanceando", "Nenhuma, há conflito"]} answer={1} explanation="LOCAL_PREF é avaliado antes do tamanho do AS_PATH; política vence distância." />
+<Quiz question="Um AS anuncia por engano 203.0.113.0/25, que pertence a outra empresa que anuncia 203.0.113.0/24. O que acontece?" options={["Nada, a rota mais antiga vence", "Parte do tráfego vai para o AS errado, pois o prefixo mais específico vence", "O anúncio é rejeitado automaticamente sempre", "O tráfego é dividido igualmente"]} answer={1} explanation="Longest prefix match faz a /25 ganhar da /24 onde quer que seja aceita; é o mecanismo de sequestros de rota." />
+</QuizSet>

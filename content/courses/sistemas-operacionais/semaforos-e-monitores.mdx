@@ -1,0 +1,152 @@
+---
+title: Semáforos e monitores
+kind: lesson
+---
+
+Um lock resolve "só um de cada vez". Mas muitos problemas reais pedem outra coisa: "no máximo 10 conexões simultâneas ao banco", "o consumidor espera até haver item na fila", "o produtor espera até haver espaço". Para isso existem dois blocos de construção clássicos: o **semáforo**, um contador protegido, e o **monitor**, que junta lock e condições de espera numa abstração mais segura. Toda fila bloqueante, pool de conexões e rate limiter que você usa é construído com eles.
+
+## Semáforos
+
+Um semáforo é um inteiro não negativo com duas operações atômicas:
+
+- **wait** (também `P`, `acquire`, `down`): se o valor é maior que zero, decrementa e segue; se é zero, bloqueia até alguém incrementar.
+- **signal** (também `V`, `release`, `up`): incrementa e acorda uma thread bloqueada, se houver.
+
+Com valor inicial 1, ele funciona como um lock (**semáforo binário**). Com valor inicial N, ele limita a N o número de threads num trecho (**semáforo contador**). Diferente de um mutex, o semáforo não tem dono: uma thread pode fazer `wait` e outra o `signal`, o que o torna útil para sinalização entre threads.
+
+O exemplo limita a 3 o número de "consultas ao banco" simultâneas, mesmo com 8 threads querendo entrar, e registra o pico de concorrência observado:
+
+```python
+import threading
+
+vagas = threading.Semaphore(3)
+trava = threading.Lock()
+ativas = 0
+pico = 0
+atendidas = 0
+
+def consultar():
+    global ativas, pico, atendidas
+    with vagas:
+        with trava:
+            ativas += 1
+            pico = max(pico, ativas)
+        for _ in range(20_000):   # simula trabalho
+            pass
+        with trava:
+            ativas -= 1
+            atendidas += 1
+
+threads = [threading.Thread(target=consultar) for _ in range(8)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("atendidas:", atendidas)
+print("pico de concorrencia <= 3:", pico <= 3)
+```
+
+```text
+Saída:
+atendidas: 8
+pico de concorrencia <= 3: True
+```
+
+## Produtor e consumidor
+
+O problema clássico: produtores colocam itens num buffer de capacidade limitada, consumidores retiram. Precisamos de três coisas: exclusão mútua no buffer, consumidor esperar quando vazio e produtor esperar quando cheio. Com semáforos, a receita usa três deles:
+
+```text
+ mutex  = 1          protege o buffer
+ vazios = N          vagas livres
+ cheios = 0          itens disponíveis
+
+ produtor:  wait(vazios); wait(mutex); coloca; signal(mutex); signal(cheios)
+ consumidor: wait(cheios); wait(mutex); retira; signal(mutex); signal(vazios)
+```
+
+A ordem importa. Se o produtor fizer `wait(mutex)` antes de `wait(vazios)` com o buffer cheio, ele dorme segurando o mutex, e o consumidor nunca consegue entrar para liberar espaço: deadlock. É o tipo de erro sutil que levou à criação dos monitores.
+
+## Monitores e variáveis de condição
+
+Um **monitor** é um objeto cujos métodos executam com exclusão mútua automática e que oferece **variáveis de condição** para esperar por um predicado. `wait` na condição solta o lock e dorme atomicamente; ao acordar, readquire o lock. `notify` acorda quem espera. Em Java, todo objeto é um monitor (`synchronized`, `wait`, `notify`); em Python, você monta um com `threading.Condition`.
+
+```python
+import threading
+from collections import deque
+
+class BufferLimitado:
+    def __init__(self, capacidade):
+        self.itens = deque()
+        self.capacidade = capacidade
+        self.cond = threading.Condition()
+        self.maior_ocupacao = 0
+
+    def colocar(self, item):
+        with self.cond:
+            while len(self.itens) == self.capacidade:   # while, nunca if
+                self.cond.wait()
+            self.itens.append(item)
+            self.maior_ocupacao = max(self.maior_ocupacao, len(self.itens))
+            self.cond.notify_all()
+
+    def retirar(self):
+        with self.cond:
+            while not self.itens:
+                self.cond.wait()
+            item = self.itens.popleft()
+            self.cond.notify_all()
+            return item
+
+buf = BufferLimitado(capacidade=4)
+consumidos = []
+
+def produtor(base):
+    for i in range(50):
+        buf.colocar(base + i)
+
+def consumidor():
+    for _ in range(50):
+        consumidos.append(buf.retirar())
+
+ts = [threading.Thread(target=produtor, args=(b,)) for b in (0, 1000)]
+ts += [threading.Thread(target=consumidor) for _ in range(2)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+print("itens consumidos:", len(consumidos), "soma:", sum(consumidos))
+print("ocupacao nunca passou da capacidade:", buf.maior_ocupacao <= 4)
+```
+
+```text
+Saída:
+itens consumidos: 100 soma: 52450
+ocupacao nunca passou da capacidade: True
+```
+
+Repare no `while` em volta do `wait`. Uma thread acordada não tem garantia de que a condição ainda é verdadeira: outra pode ter chegado antes, e existem **despertares espúrios**, em que `wait` retorna sem ninguém ter notificado. Por isso a condição sempre é testada de novo.
+
+## Comparação
+
+| Primitiva | Ideal para | Armadilha comum |
+| --- | --- | --- |
+| Mutex | Exclusão mútua simples | Esquecer de liberar em caso de exceção |
+| Semáforo contador | Limitar concorrência, pools | Ordem errada de `wait` gera deadlock |
+| Variável de condição | Esperar por um predicado | Usar `if` em vez de `while` |
+| Monitor | Encapsular estado e sincronização juntos | Chamar código externo segurando o lock |
+| Fila bloqueante pronta | Produtor e consumidor | Fila sem limite cresce até estourar a memória |
+
+<Callout type="tip" title="Use a abstração mais alta disponível">
+Em código de produção, prefira `queue.Queue`, `BlockingQueue` do Java, canais do Go ou pools de conexão prontos. Eles já resolvem as ordens corretas de espera. Escrever com semáforos crus é ótimo para entender e para entrevistas, não para o dia a dia.
+</Callout>
+
+## Na entrevista
+
+Saiba escrever o produtor-consumidor com semáforos e com variável de condição, explicando cada `wait` e por que a ordem importa. Diferencie semáforo binário de mutex (dono e propósito). Follow-ups comuns: "por que `while` e não `if`?" (despertares espúrios e concorrência entre quem acorda) e "notify ou notifyAll?" (notify é mais eficiente, mas só é seguro quando todas as threads esperam pelo mesmo predicado).
+
+<QuizSet>
+<Quiz question="Você precisa garantir que no máximo 20 threads usem uma API externa ao mesmo tempo. Qual primitiva é mais natural?" options={["Mutex", "Semáforo contador iniciado em 20", "Variável de condição sem lock", "Spinlock"]} answer={1} explanation="Cada thread faz acquire antes de chamar a API e release depois; a 21ª bloqueia até alguém sair." />
+<Quiz question="No produtor-consumidor com semáforos, o que acontece se o produtor fizer wait(mutex) antes de wait(vazios) e o buffer estiver cheio?" options={["Nada, a ordem não importa", "Deadlock: o produtor dorme segurando o mutex e o consumidor não consegue liberar espaço", "O buffer cresce além da capacidade", "O consumidor lê itens duplicados"]} answer={1} explanation="O consumidor precisa do mutex para retirar um item, mas o produtor bloqueado o está segurando." />
+<Quiz question="Por que o wait de uma variável de condição deve ficar dentro de um laço while?" options={["Para economizar CPU", "Porque a condição pode não ser mais verdadeira ao acordar, por concorrência ou despertar espúrio", "Porque o Python exige", "Para liberar o lock mais cedo"]} answer={1} explanation="Reavaliar o predicado após acordar é a única forma segura de garantir que ele vale antes de prosseguir." />
+</QuizSet>

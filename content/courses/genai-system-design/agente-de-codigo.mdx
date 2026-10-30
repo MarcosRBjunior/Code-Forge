@@ -1,0 +1,168 @@
+---
+title: Agente de código em sandbox
+kind: lesson
+---
+
+"Projete um agente que recebe uma tarefa ('corrija este bug', 'adicione este endpoint') e trabalha sozinho num repositório até abrir um pull request" junta duas coisas difíceis: um LLM que decide os próximos passos em um ciclo e a execução de código arbitrário gerado por esse LLM. O entrevistador quer ver se você entende o ciclo do agente, como o contexto cresce a cada passo e, principalmente, como **isolar** a execução para que um comando errado ou malicioso não cause dano.
+
+## Requisitos
+
+### Funcionais
+
+- O usuário descreve a tarefa e aponta um repositório; o agente clona, lê arquivos, edita, roda testes e comandos.
+- Progresso visível em tempo real (passos, comandos, diffs); o usuário pode interromper ou dar instruções no meio.
+- Ao final, o agente abre um pull request com resumo das mudanças. Nada é integrado sem revisão humana.
+
+### Não funcionais
+
+- Isolamento forte: o código executado não acessa outros clientes, a rede interna nem segredos de produção.
+- Tarefas de até 30 minutos; dezenas de milhares de tarefas por dia.
+- Custo por tarefa limitado e previsível.
+- Retomada após falha de máquina sem perder o trabalho feito.
+
+## Estimativas
+
+```python
+import math
+
+tarefas_dia = 60_000
+duracao_media_min = 12
+pico = 3
+sandbox_cpu, sandbox_mem_gb = 2, 4
+
+sandboxes = tarefas_dia / 1440 * duracao_media_min * pico
+print(f"sandboxes simultaneos no pico: {sandboxes:,.0f}")
+print(f"CPU: {sandboxes * sandbox_cpu:,.0f} vCPUs, memoria: {sandboxes * sandbox_mem_gb / 1024:.1f} TB")
+
+# Tokens: cada passo reenvia o contexto acumulado
+passos, base, por_passo = 25, 6_000, 1_800   # contexto inicial e crescimento por passo (hipotetico)
+entrada = sum(min(base + i * por_passo, 60_000) for i in range(passos))
+saida = passos * 300
+preco_in, preco_out = 3.0, 12.0              # USD por milhao, hipotetico
+custo = (entrada * preco_in + saida * preco_out) / 1e6
+print(f"tokens de entrada por tarefa: {entrada:,}; custo por tarefa: US$ {custo:.2f}")
+print(f"custo diario: US$ {custo * tarefas_dia:,.0f}")
+```
+
+```text
+Saída:
+sandboxes simultaneos no pico: 1,500
+CPU: 3,000 vCPUs, memoria: 5.9 TB
+tokens de entrada por tarefa: 690,000; custo por tarefa: US$ 2.16
+custo diario: US$ 129,600
+```
+
+O custo por tarefa é dominado pelos tokens de entrada, porque o contexto acumulado é reenviado a cada passo. Isso torna cache de prefixo, compactação de contexto e limites de passos decisões centrais, não detalhes.
+
+## API
+
+```text
+POST /tarefas                  corpo: repo, branch, descricao, limites opcionais
+GET  /tarefas/:id/eventos      SSE: passo, comando, saida, diff, status
+POST /tarefas/:id/mensagens    instrucao do usuario no meio da execucao
+POST /tarefas/:id/cancelar
+GET  /tarefas/:id              status, custo, link do PR
+```
+
+## Arquitetura
+
+```text
+cliente --> API --> fila de tarefas --> orquestrador do agente (stateless, estado em banco)
+                                          |   ciclo: pensar -> agir -> observar
+                                          |-- gateway de modelos
+                                          |-- motor de politicas (permite? pede aprovacao?)
+                                          '-- gerenciador de sandboxes
+                                                   |
+                                     pool de microVMs aquecidas (uma por tarefa)
+                                       |- repositorio clonado, sem segredos
+                                       |- rede de saida so via proxy com allowlist
+                                       '- limites de CPU, memoria, disco e tempo
+                                                   |
+                         armazenamento de eventos e snapshots (retomada, auditoria)
+                                                   |
+                                  servico de git (cria branch e PR com token restrito)
+```
+
+## Componentes em detalhe
+
+### O ciclo do agente
+
+Em cada passo, o orquestrador monta o contexto (tarefa, plano atual, arquivos relevantes, últimas observações), chama o modelo, recebe uma ação estruturada (ler arquivo, editar, rodar comando, finalizar), passa pelo motor de políticas e executa no sandbox. A saída volta como observação. O orquestrador é stateless: o estado de cada tarefa (passos, plano, custo acumulado) vive num banco, o que permite retomar em outra máquina.
+
+### Sandbox
+
+Contêineres comuns compartilham o kernel com o host, e código não confiável pede isolamento mais forte: **microVMs** ou contêineres com kernel em espaço de usuário. Cada tarefa ganha uma máquina nova, criada a partir de um pool pré-aquecido com imagens das linguagens comuns, o que reduz a partida para poucos segundos. A rede de saída passa por um proxy com allowlist (registros de pacotes, o próprio repositório); a rede interna é inacessível. Segredos nunca entram no sandbox: o push e a criação do PR são feitos pelo serviço de git, fora dele.
+
+### Políticas e limites
+
+O motor de políticas avalia cada ação antes da execução. Comandos destrutivos ou fora do escopo são negados ou pedem aprovação, e há orçamentos por tarefa.
+
+```python
+import fnmatch
+
+POLITICA = [("rm -rf /*", "negar"), ("curl *", "negar"), ("git push*", "negar"),
+            ("pip install *", "permitir"), ("pytest*", "permitir"), ("cat *", "permitir"),
+            ("*", "aprovar")]
+LIMITES = {"passos": 6, "tokens": 40_000}
+
+def decidir(cmd):
+    for padrao, acao in POLITICA:
+        if fnmatch.fnmatch(cmd, padrao):
+            return acao
+    return "negar"
+
+plano = ["cat app/rotas.py", "pytest -q", "pip install requests", "curl http://10.0.0.5/segredos",
+         "sed -i s/v1/v2/ app/rotas.py", "pytest -q", "pytest -q"]
+usados = {"passos": 0, "tokens": 0}
+for i, cmd in enumerate(plano):
+    contexto = 4_000 + i * 2_500
+    if usados["passos"] + 1 > LIMITES["passos"] or usados["tokens"] + contexto > LIMITES["tokens"]:
+        print(f"parado no passo {i + 1}: orcamento esgotado {usados}")
+        break
+    usados["passos"] += 1
+    usados["tokens"] += contexto
+    print(f"{i + 1}. {decidir(cmd):<9} {cmd}")
+```
+
+```text
+Saída:
+1. permitir  cat app/rotas.py
+2. permitir  pytest -q
+3. permitir  pip install requests
+4. negar     curl http://10.0.0.5/segredos
+parado no passo 5: orcamento esgotado {'passos': 4, 'tokens': 31000}
+```
+
+O limite de tokens interrompe o agente antes do limite de passos porque o contexto cresce. Ao parar, o agente deve entregar um relatório do que fez e do que falta, não simplesmente sumir.
+
+### Contexto do agente
+
+Repositórios não cabem no contexto. O agente usa ferramentas de busca (grep, índice de símbolos, busca semântica de código) e lê apenas trechos. Saídas longas de comandos são truncadas com resumo. Quando o histórico de passos fica grande, passos antigos são compactados num resumo, preservando decisões e arquivos alterados.
+
+<Callout type="warning" title="Trate a saída do sandbox como não confiável">
+Um arquivo do repositório ou a resposta de um pacote pode conter texto que tenta instruir o agente. O isolamento e as políticas precisam funcionar mesmo que o modelo seja convencido a tentar algo indevido.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Ponto | Opção A | Opção B |
+| --- | --- | --- |
+| Isolamento | Contêiner: partida rápida, isolamento fraco | MicroVM: isolamento forte, mais overhead |
+| Autonomia | Aprovação humana frequente: seguro, lento | Políticas automáticas: rápido, exige políticas boas |
+| Contexto | Arquivos inteiros: simples, caro | Busca e trechos: barato, pode perder contexto |
+| Modelo | Grande em todos os passos: qualidade | Pequeno em passos simples: custo menor |
+
+- **Partida a frio:** o pool aquecido precisa acompanhar a demanda; meça o tempo de espera por sandbox.
+- **Tarefas travadas:** timeouts por comando e por tarefa, e detecção de ciclos (mesma ação repetida).
+- **Retomada:** snapshots do sistema de arquivos em pontos de controle permitem continuar em outra máquina.
+
+## Follow-ups
+
+- **Como avaliar o agente?** Conjunto de tarefas reais com testes que precisam passar, medindo taxa de sucesso, custo e passos médios.
+- **Como evitar que o agente apague testes para fazê-los passar?** Testes protegidos fora da área editável e revisão do diff por um verificador.
+- **Como escalar para milhares de tarefas?** Fila com prioridade, orquestradores stateless, pool de sandboxes com autoscaling por profundidade da fila.
+
+<QuizSet>
+<Quiz question="Por que o push para o repositório é feito por um serviço fora do sandbox?" options={["Para ser mais rápido", "Para que nenhum segredo com permissão de escrita exista dentro do ambiente que executa código não confiável", "Porque o git não roda em microVMs", "Para economizar tokens"]} answer={1} explanation="Se o sandbox for comprometido ou o agente for manipulado, não há credencial para exfiltrar ou usar indevidamente." />
+<Quiz question="O custo médio por tarefa triplicou após permitir tarefas mais longas. Qual a causa mais provável?" options={["O preço do sandbox", "O contexto acumulado é reenviado a cada passo, então o custo cresce mais que linearmente com o número de passos", "O SSE ficou mais caro", "O pool aquecido"]} answer={1} explanation="Cada passo paga o contexto inteiro; compactação, cache de prefixo e limites de passos controlam esse crescimento." />
+</QuizSet>

@@ -1,0 +1,155 @@
+---
+title: E/S, buffers e page cache
+kind: lesson
+---
+
+Você escreve um arquivo de 1 GB e o `write` retorna em meio segundo, mais rápido do que o disco conseguiria gravar. Depois, a máquina cai e metade dos dados some. Ou então você lê o mesmo arquivo duas vezes e a segunda leitura é cem vezes mais rápida. Esses comportamentos vêm de camadas de **buffer** e **cache** entre o seu código e o disco. Elas são a razão de E/S ser rápida no caso comum, e a razão de dados se perderem quando você não entende onde eles realmente estão.
+
+## As camadas
+
+```text
+ seu código           f.write("linha\n")
+      │
+ buffer da linguagem   (BufferedWriter do Python, stdio do C, BufferedOutputStream)
+      │  flush → syscall write()
+ page cache do kernel  (páginas "sujas" em RAM)
+      │  writeback em segundo plano ou fsync()
+ cache do dispositivo  (RAM do controlador / SSD)
+      │  FUA / flush de cache
+ mídia persistente
+```
+
+Cada camada pode guardar dados que você acha que "já escreveu". Só depois do `fsync` (que pede ao kernel para gravar e ao dispositivo para descarregar o próprio cache) os dados sobrevivem a uma queda de energia.
+
+## Buffer em espaço de usuário
+
+A primeira camada existe para economizar syscalls. Escrever 10.000 linhas de 16 bytes com um `write` para cada uma faz 10.000 travessias para o kernel; com um buffer de 8 KB, menos de 30. O programa abaixo conta as chamadas de escrita que chegam a um "dispositivo" falso, com e sem buffer:
+
+```python
+import io
+
+class DispositivoContador(io.RawIOBase):
+    def __init__(self):
+        self.chamadas = 0
+        self.bytes = 0
+
+    def writable(self):
+        return True
+
+    def write(self, dados):
+        self.chamadas += 1
+        self.bytes += len(dados)
+        return len(dados)
+
+linhas = [f"evento {i:05d} ok\n".encode() for i in range(10_000)]
+
+cru = DispositivoContador()
+for linha in linhas:
+    cru.write(linha)
+
+disp = DispositivoContador()
+com_buffer = io.BufferedWriter(disp, buffer_size=8192)
+for linha in linhas:
+    com_buffer.write(linha)
+com_buffer.flush()
+
+print(f"sem buffer: {cru.chamadas:>6} chamadas, {cru.bytes} bytes")
+print(f"com buffer: {disp.chamadas:>6} chamadas, {disp.bytes} bytes")
+```
+
+```text
+Saída:
+sem buffer:  10000 chamadas, 160000 bytes
+com buffer:     20 chamadas, 160000 bytes
+```
+
+O contraponto: se o processo morrer antes do `flush`, o que estava no buffer se perde, mesmo sem nenhuma queda de máquina. Loggers costumam descarregar a cada linha ou a cada intervalo por isso.
+
+## Page cache
+
+O kernel usa toda a RAM que sobra como **page cache**: cópias de páginas de arquivos. Leituras que acertam o cache não tocam o disco; escritas vão para o cache, a página é marcada como suja e um processo do kernel a grava depois (por padrão, dados sujos ficam até cerca de 30 segundos). É por isso que o `free` mostra pouca memória "livre" num servidor saudável: ela está em `buff/cache` e é devolvida assim que alguém precisar.
+
+A simulação modela um page cache LRU de 4 páginas e mostra o efeito de ler o mesmo arquivo duas vezes, e o de uma varredura grande no meio:
+
+```python
+from collections import OrderedDict
+
+class PageCache:
+    def __init__(self, capacidade):
+        self.paginas = OrderedDict()
+        self.capacidade = capacidade
+        self.hits = self.misses = 0
+
+    def ler(self, arquivo, pagina):
+        chave = (arquivo, pagina)
+        if chave in self.paginas:
+            self.paginas.move_to_end(chave)
+            self.hits += 1
+        else:
+            self.misses += 1
+            if len(self.paginas) >= self.capacidade:
+                self.paginas.popitem(last=False)
+            self.paginas[chave] = True
+
+    def rodada(self, nome, leituras):
+        h0, m0 = self.hits, self.misses
+        for arq, pag in leituras:
+            self.ler(arq, pag)
+        print(f"{nome:<28} hits={self.hits - h0:>2} misses={self.misses - m0:>2}")
+
+cache = PageCache(capacidade=4)
+config = [("config", p) for p in range(3)]
+cache.rodada("1a leitura de config", config)
+cache.rodada("2a leitura de config", config)
+cache.rodada("varredura de backup (10 pag)", [("backup", p) for p in range(10)])
+cache.rodada("3a leitura de config", config)
+```
+
+```text
+Saída:
+1a leitura de config         hits= 0 misses= 3
+2a leitura de config         hits= 3 misses= 0
+varredura de backup (10 pag) hits= 0 misses=10
+3a leitura de config         hits= 0 misses= 3
+```
+
+A segunda leitura sai inteira do cache. Mas a varredura do backup, lida uma única vez, expulsou as páginas quentes de `config`, e a terceira leitura volta ao disco. Por isso ferramentas de backup usam `posix_fadvise` com `DONTNEED` ou `O_DIRECT` para não poluir o cache.
+
+## Garantindo durabilidade
+
+| Chamada | O que garante |
+| --- | --- |
+| `write` | Os dados estão no page cache; outros processos já os veem |
+| `fflush` / `flush()` | Saíram do buffer da linguagem para o kernel |
+| `fsync(fd)` | Dados e metadados do arquivo estão no disco |
+| `fdatasync(fd)` | Só os dados (e metadados essenciais), um pouco mais barato |
+| `fsync` do diretório | A entrada criada ou renomeada também persistiu |
+| `O_DIRECT` | Ignora o page cache; a aplicação gerencia o próprio cache |
+
+Bancos de dados fazem `fsync` do write-ahead log a cada commit (ou em grupos de commits, o **group commit**) e é por isso que a latência de commit está ligada à latência de `fsync` do disco. Muitos bancos (PostgreSQL é exceção notável) usam `O_DIRECT` para os dados, porque o próprio buffer pool já faz o papel de cache e não querem cópias duplicadas.
+
+<Callout type="warning" title="O incidente do fsyncgate">
+Em 2018 descobriu-se que, no Linux, se um `fsync` falhar por erro de disco, as páginas sujas podem ser descartadas e um segundo `fsync` retorna sucesso. O PostgreSQL passou a tratar falha de `fsync` como erro fatal e reiniciar a partir do WAL. Lição: erro de `fsync` não é algo para simplesmente tentar de novo.
+</Callout>
+
+## Modelos de E/S
+
+- **Bloqueante:** a thread dorme até a operação terminar. Simples; escala com muitas threads.
+- **Não bloqueante + multiplexação** (`select`, `poll`, `epoll`, `kqueue`): uma thread acompanha milhares de sockets e só age nos que estão prontos. É a base de Nginx, Node.js e Netty.
+- **Assíncrona de verdade** (`io_uring`, IOCP no Windows): você envia pedidos numa fila compartilhada com o kernel e colhe os resultados depois, com poucas syscalls.
+
+```bash
+free -h                     # coluna buff/cache
+vmtouch arquivo.db          # quanto do arquivo está no page cache
+echo 3 > /proc/sys/vm/drop_caches   # esvazia o cache (só para testes!)
+```
+
+## Na entrevista
+
+Desenhe as camadas e diga em qual delas o dado está depois de cada chamada. Explique por que o page cache acelera leituras e por que `write` não garante durabilidade. Follow-ups comuns: "como um banco garante que um commit não se perde?" (WAL com `fsync` antes de confirmar) e "por que uma varredura grande deixa o sistema lento depois?" (expulsa páginas quentes do cache).
+
+<QuizSet>
+<Quiz question="Logo depois de um write retornar com sucesso no Linux, onde os dados com certeza estão?" options={["No disco físico", "No page cache do kernel, ainda não necessariamente no disco", "Apenas no buffer da aplicação", "No cache do controlador do disco"]} answer={1} explanation="O write copia os dados para o page cache; a gravação no disco acontece depois, a menos que você chame fsync." />
+<Quiz question="Um servidor com 64 GB de RAM mostra só 2 GB livres no free, mas 40 GB em buff/cache. Há falta de memória?" options={["Sim, é preciso adicionar RAM", "Não necessariamente: o page cache usa memória ociosa e é liberado quando processos precisam", "Sim, há vazamento no kernel", "Não, porque o swap está vazio"]} answer={1} explanation="Cache é memória reaproveitável; olhe a coluna available para saber quanto pode ser usado de fato." />
+<Quiz question="Por que agrupar escritas num buffer em espaço de usuário acelera um programa que grava milhares de linhas pequenas?" options={["Porque comprime os dados", "Porque reduz o número de syscalls, cada uma com custo fixo de travessia para o kernel", "Porque grava direto no disco sem passar pelo kernel", "Porque usa mais núcleos"]} answer={1} explanation="Com buffer, milhares de escritas pequenas viram poucas escritas grandes, amortizando o custo de cada syscall." />
+</QuizSet>

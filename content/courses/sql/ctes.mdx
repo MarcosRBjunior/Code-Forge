@@ -1,0 +1,185 @@
+---
+title: CTEs
+kind: lesson
+---
+
+Respostas de entrevista costumam ter várias etapas: agregue por cliente, depois compare com a média, depois pegue os melhores. Escrever isso como subconsultas aninhadas produz um bloco que se lê de dentro para fora e que ninguém consegue revisar em voz alta. A **CTE** (common table expression), introduzida por `WITH`, resolve isso: você dá nome a cada etapa e lê a consulta de cima para baixo.
+
+## O esquema
+
+```sql
+CREATE TABLE vendedores (
+  id     integer PRIMARY KEY,
+  nome   text NOT NULL,
+  regiao text NOT NULL
+);
+
+CREATE TABLE vendas (
+  id          integer PRIMARY KEY,
+  vendedor_id integer NOT NULL REFERENCES vendedores (id),
+  valor       integer NOT NULL,
+  mes         date NOT NULL
+);
+
+INSERT INTO vendedores (id, nome, regiao) VALUES
+  (1, 'Lia', 'Sul'),
+  (2, 'Marcos', 'Sul'),
+  (3, 'Nina', 'Norte'),
+  (4, 'Otávio', 'Norte'),
+  (5, 'Paula', 'Sul');
+
+INSERT INTO vendas (id, vendedor_id, valor, mes) VALUES
+  (1, 1, 500, '2024-01-01'),
+  (2, 1, 700, '2024-02-01'),
+  (3, 2, 300, '2024-01-01'),
+  (4, 3, 900, '2024-01-01'),
+  (5, 3, 400, '2024-02-01'),
+  (6, 4, 200, '2024-02-01'),
+  (7, 5, 650, '2024-01-01'),
+  (8, 2, 250, '2024-02-01');
+
+SELECT count(*) AS vendas FROM vendas;
+```
+
+```text
+Saída:
+vendas
+8
+```
+
+## Como funciona
+
+Uma CTE é uma consulta nomeada que existe só durante o comando. Você pode declarar várias, separadas por vírgula, e cada uma pode usar as anteriores:
+
+```sql
+WITH total_por_vendedor AS (
+  SELECT vendedor_id, SUM(valor) AS total
+  FROM vendas
+  GROUP BY vendedor_id
+),
+media_geral AS (
+  SELECT AVG(total) AS media FROM total_por_vendedor
+)
+SELECT v.nome, t.total
+FROM total_por_vendedor t
+JOIN vendedores v ON v.id = t.vendedor_id
+CROSS JOIN media_geral m
+WHERE t.total > m.media
+ORDER BY t.total DESC;
+```
+
+```text
+Saída:
+nome | total
+Nina | 1300
+Lia | 1200
+```
+
+Leia como uma receita: primeiro some por vendedor, depois calcule a média desses totais, por fim filtre quem ficou acima. A média aqui é 780 (3.900 dividido por 5 vendedores), e só Nina e Lia passam.
+
+Comparar com a média **da própria região** é a mesma ideia com mais uma etapa:
+
+```sql
+WITH totais AS (
+  SELECT v.regiao, v.nome, SUM(s.valor) AS total
+  FROM vendas s
+  JOIN vendedores v ON v.id = s.vendedor_id
+  GROUP BY v.regiao, v.nome
+),
+medias AS (
+  SELECT regiao, AVG(total) AS media
+  FROM totais
+  GROUP BY regiao
+)
+SELECT t.regiao, t.nome, t.total, ROUND(m.media, 2) AS media_regiao
+FROM totais t
+JOIN medias m ON m.regiao = t.regiao
+WHERE t.total >= m.media
+ORDER BY t.regiao, t.nome;
+```
+
+```text
+Saída:
+regiao | nome | total | media_regiao
+Norte | Nina | 1300 | 750.00
+Sul | Lia | 1200 | 800.00
+```
+
+## CTE e funções de janela
+
+O uso mais frequente em entrevista é filtrar pelo resultado de uma função de janela, que não pode ir no `WHERE` da mesma consulta. A CTE calcula a janela; a consulta de fora filtra:
+
+```sql
+WITH ranqueado AS (
+  SELECT v.nome,
+         s.mes,
+         s.valor,
+         ROW_NUMBER() OVER (PARTITION BY s.mes ORDER BY s.valor DESC) AS pos
+  FROM vendas s
+  JOIN vendedores v ON v.id = s.vendedor_id
+)
+SELECT mes, nome, valor
+FROM ranqueado
+WHERE pos = 1
+ORDER BY mes;
+```
+
+```text
+Saída:
+mes | nome | valor
+2024-01-01 | Nina | 900
+2024-02-01 | Lia | 700
+```
+
+## Materialização: Postgres e MySQL
+
+Até o Postgres 11, toda CTE era uma **barreira de otimização**: o banco a calculava inteira e só depois aplicava os filtros externos. A partir do Postgres 12, uma CTE não recursiva, sem efeitos colaterais e referenciada uma única vez é incorporada à consulta principal, como uma subconsulta. Você pode forçar o comportamento com `WITH x AS MATERIALIZED (...)` ou `AS NOT MATERIALIZED (...)`.
+
+O MySQL só ganhou CTEs na versão 8.0, e o otimizador decide sozinho entre materializar e incorporar; não há a palavra-chave `MATERIALIZED`.
+
+<Callout type="note" title="CTE não é cache">
+Nomear uma etapa não significa que o resultado será guardado e reaproveitado. Se a performance depender disso, confira no `EXPLAIN` se houve um nó `CTE Scan` (materializado) ou se a CTE foi dissolvida no plano.
+</Callout>
+
+## CTEs que modificam dados
+
+O Postgres permite `INSERT`, `UPDATE` e `DELETE` dentro de um `WITH`, com `RETURNING`. Isso faz operações como "mover linhas para um arquivo morto" num único comando atômico:
+
+```sql
+CREATE TABLE vendas_arquivo (LIKE vendas);
+
+WITH movidas AS (
+  DELETE FROM vendas
+  WHERE mes < '2024-02-01'
+  RETURNING *
+)
+INSERT INTO vendas_arquivo
+SELECT * FROM movidas;
+
+SELECT
+  (SELECT count(*) FROM vendas) AS restantes,
+  (SELECT count(*) FROM vendas_arquivo) AS arquivadas;
+```
+
+```text
+Saída:
+restantes | arquivadas
+4 | 4
+```
+
+O MySQL não aceita comandos de escrita dentro de uma CTE; lá você faria `INSERT ... SELECT` e depois `DELETE` dentro de uma transação.
+
+## Armadilhas
+
+- **Achar que CTE é sempre mais rápida.** Ela é uma ferramenta de legibilidade. O plano pode ser idêntico ao de uma subconsulta, ou pior se materializar um conjunto grande.
+- **Nome repetido.** Uma CTE com o mesmo nome de uma tabela real esconde a tabela durante o comando.
+- **Escopo.** A CTE só existe no comando em que foi declarada. Para reaproveitar entre comandos, use uma view ou tabela temporária.
+
+## Na entrevista
+
+Para problemas de várias etapas, escreva as CTEs na ordem em que você explicaria a solução e dê nomes que contem a história (`totais`, `medias`, `ranqueado`). Isso permite ao entrevistador acompanhar e a você testar cada etapa isoladamente. Follow-ups comuns: "CTE ou subconsulta, qual é mais rápida?" (depende do plano; no Postgres 12+ costumam ser equivalentes) e "como reaproveitar esse resultado em outra consulta?" (view, view materializada ou tabela temporária).
+
+<QuizSet>
+<Quiz question="No Postgres 16, uma CTE simples referenciada uma só vez na consulta principal é...?" options={["Sempre materializada", "Normalmente incorporada à consulta, como uma subconsulta", "Proibida sem MATERIALIZED", "Executada duas vezes"]} answer={1} explanation="Desde o Postgres 12, CTEs não recursivas, sem efeitos colaterais e usadas uma vez são incorporadas; MATERIALIZED força o comportamento antigo." />
+<Quiz question="Por que filtrar ROW_NUMBER() = 1 exige uma CTE ou subconsulta?" options={["Porque ROW_NUMBER só existe em CTEs", "Porque funções de janela são calculadas depois do WHERE", "Porque o WHERE não aceita números", "Não exige; pode ir no WHERE"]} answer={1} explanation="A janela é avaliada depois de WHERE, GROUP BY e HAVING, então o filtro precisa ficar numa consulta externa." />
+</QuizSet>

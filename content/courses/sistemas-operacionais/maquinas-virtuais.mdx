@@ -1,0 +1,133 @@
+---
+title: Máquinas virtuais
+kind: lesson
+---
+
+Quando você sobe uma instância EC2, não ganha um servidor físico: ganha uma **máquina virtual**, uma fatia de um servidor que roda dezenas de outras. Cada VM tem o próprio kernel, acredita que controla CPU, memória e dispositivos, e mesmo assim não consegue enxergar nem derrubar as vizinhas. Quem cria essa ilusão é o **hipervisor** (ou VMM, virtual machine monitor). Entender como ele funciona explica o "steal time" na sua instância, a diferença de desempenho entre tipos de instância e por que containers são mais leves.
+
+## Tipos de hipervisor
+
+| Tipo | Onde roda | Exemplos |
+| --- | --- | --- |
+| Tipo 1 (bare metal) | Direto sobre o hardware | KVM, Xen, Hyper-V, VMware ESXi, Nitro (AWS) |
+| Tipo 2 (hospedado) | Como aplicação sobre um SO | VirtualBox, VMware Workstation, Parallels |
+
+O KVM é um caso interessante: é um módulo do kernel Linux que transforma o próprio Linux num hipervisor tipo 1, enquanto o QEMU, em modo usuário, emula os dispositivos.
+
+## Virtualizando a CPU: trap-and-emulate
+
+A ideia clássica: rodar o kernel convidado com **menos privilégio** do que ele pensa ter. Instruções comuns (somas, acessos à memória) executam direto no hardware, em velocidade nativa. Instruções privilegiadas (desligar interrupções, mudar a tabela de páginas, acessar portas de E/S) geram uma **trap** para o hipervisor, que as emula sobre o estado virtual daquela VM e devolve o controle.
+
+```text
+ VM convidada                hipervisor                 hardware
+ add, load, store  ───────────────────────────────────► executa direto
+ cli (desliga IRQs) ─── trap ──► emula: marca IRQs da
+                                 VM como desligadas
+                     ◄── retorna ─┘
+ out 0x3F8 (porta)  ─── trap ──► emula a porta serial virtual
+```
+
+O x86 original tinha instruções sensíveis que **não** geravam trap em modo menos privilegiado, o que obrigou a VMware a usar tradução binária e o Xen a usar **paravirtualização** (modificar o kernel convidado para chamar o hipervisor explicitamente). Desde 2005, Intel VT-x e AMD-V adicionaram um modo de CPU próprio para convidados, e as transições viram **VM exits** e **VM entries** feitas em hardware.
+
+A simulação mostra o modelo trap-and-emulate com um pequeno conjunto de instruções e conta quantas causaram saída para o hipervisor:
+
+```python
+PRIVILEGIADAS = {"cli", "sti", "out", "write_cr3", "hlt"}
+
+class VM:
+    def __init__(self, nome):
+        self.nome = nome
+        self.regs = {"acc": 0}
+        self.irqs_ligadas = True
+        self.porta_serial = []
+        self.saidas = 0
+
+def hipervisor_emular(vm, instr, arg):
+    vm.saidas += 1
+    if instr == "cli":
+        vm.irqs_ligadas = False
+    elif instr == "sti":
+        vm.irqs_ligadas = True
+    elif instr == "out":
+        vm.porta_serial.append(arg)
+    return f"trap -> hipervisor emulou {instr}"
+
+def executar(vm, programa):
+    for instr, arg in programa:
+        if instr in PRIVILEGIADAS:
+            msg = hipervisor_emular(vm, instr, arg)
+        else:
+            vm.regs["acc"] += arg
+            msg = "direto na CPU"
+        print(f"[{vm.nome}] {instr:<6} {msg}")
+
+vm = VM("web-01")
+executar(vm, [("add", 5), ("add", 7), ("cli", None), ("out", "A"), ("sti", None), ("add", 1)])
+print("acc:", vm.regs["acc"], "| serial:", vm.porta_serial, "| VM exits:", vm.saidas)
+```
+
+```text
+Saída:
+[web-01] add    direto na CPU
+[web-01] add    direto na CPU
+[web-01] cli    trap -> hipervisor emulou cli
+[web-01] out    trap -> hipervisor emulou out
+[web-01] sti    trap -> hipervisor emulou sti
+[web-01] add    direto na CPU
+acc: 13 | serial: ['A'] | VM exits: 3
+```
+
+Cada VM exit custa de centenas de nanossegundos a alguns microssegundos. Workloads com muita E/S ou muitas interrupções geram muitas saídas, e é ali que a virtualização mais pesa.
+
+## Virtualizando a memória
+
+O convidado acha que gerencia memória física, mas os "endereços físicos" dele são, na verdade, endereços de outra camada. Existem então duas traduções: virtual do convidado → físico do convidado → físico real. Com **EPT/NPT** (paginação aninhada em hardware), a MMU faz as duas. O custo aparece num miss de TLB: cada nível da tabela do convidado precisa, ele mesmo, ser traduzido pela tabela do hipervisor.
+
+```python
+def acessos_page_walk(niveis_convidado, niveis_host):
+    # cada um dos n niveis do convidado (mais o endereco final) precisa
+    # de um walk completo no host, alem da leitura da propria entrada
+    return (niveis_convidado + 1) * (niveis_host + 1) - 1
+
+print("nativo, 4 niveis:", 4, "acessos")
+print("aninhado 4x4:   ", acessos_page_walk(4, 4), "acessos")
+print("aninhado 5x5:   ", acessos_page_walk(5, 5), "acessos")
+```
+
+```text
+Saída:
+nativo, 4 niveis: 4 acessos
+aninhado 4x4:    24 acessos
+aninhado 5x5:    35 acessos
+```
+
+Por isso huge pages ajudam ainda mais dentro de VMs: menos misses de TLB significam menos desses walks caros.
+
+## E/S: emulação, virtio e passthrough
+
+- **Emulação completa:** o hipervisor finge ser uma placa de rede real conhecida. Funciona com qualquer SO, mas é lenta.
+- **Paravirtualização (virtio):** o convidado sabe que está virtualizado e usa filas compartilhadas com o host. É o padrão em nuvem.
+- **Passthrough e SR-IOV:** o dispositivo físico (ou uma fatia dele) é entregue direto à VM. Desempenho quase nativo; a AWS faz isso com as placas Nitro.
+
+<Callout type="tip" title="Steal time">
+Se o `top` dentro da sua VM mostra `st` alto, outra VM ou o próprio hipervisor está usando a CPU física que deveria ser sua. É comum em instâncias com CPU compartilhada (como as da família burstable) e explica lentidão sem nenhuma mudança no seu código.
+</Callout>
+
+## Trade-offs
+
+| Aspecto | VM | Processo comum |
+| --- | --- | --- |
+| Isolamento | Forte: kernel separado, fronteira de hardware | Mais fraco |
+| Tempo de boot | Segundos a minutos (microVMs como Firecracker: cerca de 125 ms) | Milissegundos |
+| Overhead de memória | Kernel e SO inteiros por VM | Pequeno |
+| SO diferente do host | Possível (Windows sobre Linux) | Não |
+
+## Na entrevista
+
+Explique trap-and-emulate, cite o suporte de hardware (VT-x, AMD-V, EPT) e onde o overhead aparece (VM exits, page walks aninhados, E/S). Compare com containers em isolamento e custo. Follow-ups comuns: "o que é paravirtualização?" (o convidado coopera com o hipervisor, como no virtio) e "por que a AWS criou o Firecracker?" (microVMs com isolamento de VM e inicialização rápida para Lambda e Fargate).
+
+<QuizSet>
+<Quiz question="No modelo trap-and-emulate, o que acontece quando o kernel convidado executa uma instrução privilegiada?" options={["A instrução é ignorada", "A CPU gera uma trap para o hipervisor, que emula o efeito sobre o estado virtual da VM", "A VM é desligada", "A instrução é executada direto no hardware real"]} answer={1} explanation="Instruções privilegiadas não podem afetar o hardware real; o hipervisor intercepta e simula seu efeito para aquela VM." />
+<Quiz question="Por que um miss de TLB é mais caro dentro de uma VM com paginação aninhada?" options={["Porque a TLB é desligada em VMs", "Porque cada nível da tabela do convidado também precisa ser traduzido pela tabela do host, multiplicando os acessos", "Porque as páginas são menores em VMs", "Porque o hipervisor emula a MMU em software sempre"]} answer={1} explanation="Com 4 níveis em cada camada, um page walk completo pode exigir até 24 acessos à memória." />
+<Quiz question="Sua instância de nuvem mostra st de 30% no top e a aplicação ficou lenta sem mudanças de código. Qual a interpretação?" options={["A aplicação tem um bug de concorrência", "O hipervisor está entregando a CPU física a outras VMs; você está recebendo menos CPU do que espera", "O disco está cheio", "O kernel está fazendo swap"]} answer={1} explanation="Steal time mede o tempo em que a vCPU estava pronta para rodar, mas o hipervisor não a escalonou." />
+</QuizSet>

@@ -1,0 +1,143 @@
+---
+title: Escalonamento de disco
+kind: lesson
+---
+
+Num disco rígido, ler um bloco envolve mover fisicamente um braço até a trilha certa (**seek**) e esperar o prato girar até o setor passar sob a cabeça (**latência rotacional**). Juntos, levam alguns milissegundos, uma eternidade comparada à RAM. Quando há várias requisições pendentes, a ordem em que são atendidas muda drasticamente o tempo total: atender na ordem de chegada pode fazer o braço ir e voltar de uma ponta à outra. Os **algoritmos de escalonamento de disco** reordenam a fila para reduzir o movimento.
+
+## O custo de um acesso
+
+| Componente | HD 7.200 rpm | SSD NVMe |
+| --- | --- | --- |
+| Seek | 4 a 10 ms | não existe |
+| Latência rotacional média | cerca de 4 ms | não existe |
+| Transferência de 4 KB | microssegundos | microssegundos |
+| Leituras aleatórias por segundo | cerca de 100 a 200 | centenas de milhares |
+
+O seek domina no HD, e é isso que os algoritmos clássicos atacam.
+
+## Os algoritmos
+
+- **FCFS:** atende na ordem de chegada. Justo, mas o braço viaja muito.
+- **SSTF** (Shortest Seek Time First): atende o pedido mais próximo da posição atual. Reduz o movimento, mas pedidos nas pontas podem passar fome.
+- **SCAN (elevador):** o braço varre numa direção atendendo tudo pelo caminho até o fim do disco, depois inverte.
+- **C-SCAN:** varre numa direção só; ao chegar ao fim, volta ao início sem atender e recomeça. Dá tempos de espera mais uniformes.
+- **LOOK / C-LOOK:** como SCAN e C-SCAN, mas inverte (ou volta) no último pedido, sem ir até a borda do disco.
+
+```text
+ cilindros:  0 ─────────────────────────────────────────── 199
+ cabeça em 53, subindo; fila: 98 183 37 122 14 124 65 67
+
+ SCAN:   53 → 65 → 67 → 98 → 122 → 124 → 183 → (199) → 37 → 14
+ C-SCAN: 53 → 65 → 67 → 98 → 122 → 124 → 183 → (199) ⇢ (0) → 14 → 37
+```
+
+## Simulando o movimento total
+
+```python
+def fcfs(cabeca, fila):
+    return list(fila)
+
+def sstf(cabeca, fila):
+    pendentes, ordem, pos = list(fila), [], cabeca
+    while pendentes:
+        prox = min(pendentes, key=lambda c: (abs(c - pos), c))
+        ordem.append(prox)
+        pendentes.remove(prox)
+        pos = prox
+    return ordem
+
+def scan(cabeca, fila, fim=199):
+    acima = sorted(c for c in fila if c >= cabeca)
+    abaixo = sorted((c for c in fila if c < cabeca), reverse=True)
+    return acima + ([fim] if abaixo else []) + abaixo
+
+def c_scan(cabeca, fila, fim=199):
+    acima = sorted(c for c in fila if c >= cabeca)
+    abaixo = sorted(c for c in fila if c < cabeca)
+    return acima + ([fim, 0] if abaixo else []) + abaixo
+
+def look(cabeca, fila):
+    acima = sorted(c for c in fila if c >= cabeca)
+    abaixo = sorted((c for c in fila if c < cabeca), reverse=True)
+    return acima + abaixo
+
+def movimento(cabeca, ordem):
+    total, pos = 0, cabeca
+    for c in ordem:
+        total += abs(c - pos)
+        pos = c
+    return total
+
+fila = [98, 183, 37, 122, 14, 124, 65, 67]
+cabeca = 53
+for nome, alg in [("FCFS", fcfs), ("SSTF", sstf), ("SCAN", scan), ("C-SCAN", c_scan), ("LOOK", look)]:
+    ordem = alg(cabeca, fila)
+    print(f"{nome:<7} movimento={movimento(cabeca, ordem):>4}  ordem={ordem}")
+```
+
+```text
+Saída:
+FCFS    movimento= 640  ordem=[98, 183, 37, 122, 14, 124, 65, 67]
+SSTF    movimento= 236  ordem=[65, 67, 37, 14, 98, 122, 124, 183]
+SCAN    movimento= 331  ordem=[65, 67, 98, 122, 124, 183, 199, 37, 14]
+C-SCAN  movimento= 382  ordem=[65, 67, 98, 122, 124, 183, 199, 0, 14, 37]
+LOOK    movimento= 299  ordem=[65, 67, 98, 122, 124, 183, 37, 14]
+```
+
+O C-SCAN conta o retorno de 199 a 0 como movimento; em discos reais esse retorno é rápido porque não para em nenhuma trilha, e é justamente essa regularidade que torna as esperas mais previsíveis.
+
+## Inanição no SSTF
+
+O SSTF parece ótimo, mas com pedidos chegando continuamente perto da cabeça, um pedido distante pode esperar indefinidamente:
+
+```python
+pos = 50
+distante = 190
+atendidos = []
+for t in range(8):
+    novos = [pos + 2, pos - 3]                 # chegam sempre pedidos perto
+    prox = min(novos + [distante], key=lambda c: abs(c - pos))
+    atendidos.append(prox)
+    pos = prox
+print("atendidos:", atendidos)
+print("pedido em 190 atendido?", distante in atendidos)
+```
+
+```text
+Saída:
+atendidos: [52, 54, 56, 58, 60, 62, 64, 66]
+pedido em 190 atendido? False
+```
+
+SCAN e suas variantes garantem que o braço passa por todas as trilhas a cada varredura, limitando a espera.
+
+## E nos SSDs?
+
+SSDs não têm braço: o tempo de acesso não depende da distância entre endereços. Reordenar por posição é inútil, e o que importa passa a ser **paralelismo** (vários chips e filas de comando, até 64 mil filas no NVMe) e **justiça entre processos**. Por isso os escalonadores de E/S do Linux mudaram:
+
+| Escalonador | Ideia | Bom para |
+| --- | --- | --- |
+| `none` | Sem reordenar, entrega direto ao dispositivo | NVMe rápido |
+| `mq-deadline` | Ordena, mas impõe prazo máximo por pedido | SSD SATA, HD |
+| `bfq` | Divide banda por processo, prioriza interativos | Desktops, HD |
+| `kyber` | Controla latência por filas de leitura e escrita | SSD rápido com mistura de cargas |
+
+<Callout type="tip" title="Sequencial ainda vence aleatório">
+Mesmo em SSD, ler sequencialmente é mais rápido que aleatório, por causa de prefetch e de páginas internas grandes. Estruturas como LSM-trees (RocksDB, Cassandra) e logs append-only existem justamente para transformar escritas aleatórias em sequenciais.
+</Callout>
+
+```bash
+cat /sys/block/nvme0n1/queue/scheduler   # [none] mq-deadline kyber bfq
+iostat -x 1                               # await, r/s, w/s, %util por dispositivo
+```
+
+## Na entrevista
+
+Se pedirem para calcular, desenhe a linha de cilindros e marque a ordem; deixe claro se SCAN vai até a borda ou não (LOOK). Discuta trade-offs: SSTF minimiza movimento, mas causa inanição; SCAN e C-SCAN limitam a espera. Mostre que sabe que em SSD o problema muda. Follow-ups comuns: "por que o C-SCAN é mais justo que o SCAN?" (as trilhas do meio não são visitadas duas vezes mais que as das bordas) e "qual escalonador você usaria num NVMe?" (`none` ou `kyber`).
+
+<QuizSet>
+<Quiz question="Qual algoritmo de disco pode causar inanição de pedidos distantes da cabeça?" options={["SCAN", "C-SCAN", "SSTF", "FCFS"]} answer={2} explanation="O SSTF sempre escolhe o mais próximo; se pedidos próximos continuam chegando, os distantes nunca são atendidos." />
+<Quiz question="Por que o escalonador none costuma ser a melhor escolha para SSDs NVMe?" options={["Porque SSDs não aceitam reordenação", "Porque não há custo de seek e o próprio dispositivo tem paralelismo interno, então reordenar só adiciona overhead de CPU", "Porque NVMe é mais lento", "Porque o kernel não suporta outros"]} answer={1} explanation="Sem braço mecânico, a distância entre endereços não importa; o melhor é entregar os pedidos rapidamente às filas do dispositivo." />
+<Quiz question="Qual a diferença entre SCAN e LOOK?" options={["LOOK atende em ordem de chegada", "LOOK inverte a direção no último pedido pendente, sem ir até a borda do disco", "LOOK só se move numa direção", "Não há diferença"]} answer={1} explanation="O LOOK evita percorrer trilhas vazias até a borda, economizando movimento em relação ao SCAN." />
+</QuizSet>

@@ -1,0 +1,130 @@
+---
+title: O loop de um agente
+kind: lesson
+---
+
+Tool calling resolve uma chamada. Mas "descubra por que o pedido do cliente atrasou e, se foi culpa nossa, gere um cupom" exige várias: consultar o pedido, depois a transportadora, decidir, criar o cupom, redigir a resposta. Você poderia programar essa sequência à mão, mas os caminhos mudam a cada caso. Um **agente** é um LLM que, num laço, escolhe a próxima ação com base no que observou até agora, até concluir a tarefa ou bater num limite.
+
+## O laço
+
+```text
+          ┌──────────────────────────────────────────────────┐
+          ▼                                                  │
+ contexto (objetivo + histórico) ──► LLM decide ──► tool call? ── sim ──► executa ──► observação
+                                          │
+                                          └── não: resposta final ──► fim
+```
+
+Em código, o núcleo cabe em poucas linhas: chame o modelo, se ele pediu ferramentas execute-as e anexe os resultados, repita. Todo o resto (limites, permissões, memória, observabilidade) é engenharia ao redor desse laço. Esse padrão de alternar raciocínio, ação e observação ficou conhecido como **ReAct**.
+
+```python
+import json
+
+ESTOQUE = {"teclado": 12, "mouse": 0}
+PRECOS = {"teclado": 199.9, "mouse": 89.9}
+
+def ver_estoque(produto):
+    return {"produto": produto, "quantidade": ESTOQUE.get(produto, 0)}
+
+def ver_preco(produto):
+    return {"produto": produto, "preco": PRECOS[produto]}
+
+FERRAMENTAS = {"ver_estoque": ver_estoque, "ver_preco": ver_preco}
+
+ROTEIRO = [  # o que um LLM real decidiria, passo a passo
+    {"tool": "ver_estoque", "args": {"produto": "mouse"}},
+    {"tool": "ver_estoque", "args": {"produto": "teclado"}},
+    {"tool": "ver_preco", "args": {"produto": "teclado"}},
+    {"final": "O mouse está sem estoque. O teclado tem 12 unidades por R$ 199.90."},
+]
+
+def llm_falso(historico):
+    passos_feitos = sum(1 for m in historico if m["role"] == "tool")
+    return ROTEIRO[passos_feitos]
+
+def rodar_agente(objetivo, max_passos=8):
+    historico = [{"role": "user", "content": objetivo}]
+    for passo in range(1, max_passos + 1):
+        decisao = llm_falso(historico)
+        if "final" in decisao:
+            return decisao["final"], passo
+        resultado = FERRAMENTAS[decisao["tool"]](**decisao["args"])
+        print(f"passo {passo}: {decisao['tool']}({decisao['args']}) -> {resultado}")
+        historico.append({"role": "assistant", "content": json.dumps(decisao)})
+        historico.append({"role": "tool", "content": json.dumps(resultado)})
+    return "limite de passos atingido", max_passos
+
+resposta, passos = rodar_agente("Tem mouse e teclado? Quanto custa o que tiver?")
+print(f"final ({passos} chamadas ao modelo): {resposta}")
+```
+
+```text
+Saída:
+passo 1: ver_estoque({'produto': 'mouse'}) -> {'produto': 'mouse', 'quantidade': 0}
+passo 2: ver_estoque({'produto': 'teclado'}) -> {'produto': 'teclado', 'quantidade': 12}
+passo 3: ver_preco({'produto': 'teclado'}) -> {'produto': 'teclado', 'preco': 199.9}
+final (4 chamadas ao modelo): O mouse está sem estoque. O teclado tem 12 unidades por R$ 199.90.
+```
+
+## Workflow ou agente?
+
+Nem todo sistema com LLM precisa ser um agente. Vale distinguir:
+
+- **Workflow:** você define a sequência de passos no código (classificar, buscar, responder). O LLM preenche cada etapa. É previsível, barato e fácil de testar.
+- **Agente:** o modelo decide quais passos dar e quantos. Flexível para tarefas abertas, mas mais caro, mais lento e mais difícil de garantir.
+
+Comece pelo mais simples que resolve. Use agente quando o caminho realmente varia por caso e não dá para enumerar os ramos.
+
+## Mantendo o laço sob controle
+
+Um agente em produção pode entrar em laço, gastar muito ou fazer algo indevido. As proteções essenciais:
+
+- **Limite de passos e de orçamento** (tokens, custo, tempo total).
+- **Detecção de repetição:** a mesma chamada com os mesmos argumentos várias vezes indica que ele travou.
+- **Permissões mínimas:** cada ferramenta com o escopo do usuário, e ações irreversíveis com confirmação humana.
+- **Gestão de contexto:** o histórico cresce a cada passo; resuma ou descarte resultados antigos e volumosos.
+
+```python
+def llm_teimoso(historico):
+    # simula um modelo travado, repetindo sempre a mesma busca
+    return {"tool": "buscar", "args": {"q": "politica de troca"}}
+
+def rodar(llm, max_passos=10, max_repeticoes=3, orcamento_tokens=1000):
+    vistos, gasto = {}, 0
+    for passo in range(1, max_passos + 1):
+        decisao = llm([])
+        gasto += 150  # custo estimado de cada chamada ao modelo
+        if gasto > orcamento_tokens:
+            return f"parado no passo {passo}: orçamento de tokens estourado"
+        chave = (decisao["tool"], tuple(sorted(decisao["args"].items())))
+        vistos[chave] = vistos.get(chave, 0) + 1
+        if vistos[chave] >= max_repeticoes:
+            return f"parado no passo {passo}: chamada repetida {vistos[chave]}x"
+    return "parado: limite de passos"
+
+print(rodar(llm_teimoso))
+print(rodar(llm_teimoso, max_repeticoes=99, orcamento_tokens=500))
+```
+
+```text
+Saída:
+parado no passo 3: chamada repetida 3x
+parado no passo 4: orçamento de tokens estourado
+```
+
+<Callout type="tip" title="Ferramentas e objetivo bem definidos valem mais que prompt esperto">
+A maior parte da qualidade de um agente vem do desenho das ferramentas (nomes claros, resultados enxutos, erros que orientam) e de uma condição de término explícita ("pare quando tiver respondido as duas perguntas"). Invista nisso antes de ajustar frases do system prompt.
+</Callout>
+
+## Planejamento e reflexão
+
+Variações comuns do laço básico: **plano primeiro** (o modelo escreve um plano, depois executa e o revisa se algo falhar) e **reflexão** (um passo que critica o resultado e decide se precisa refazer). Ambas melhoram tarefas longas, ao custo de mais chamadas. Modelos com raciocínio estendido já fazem parte disso internamente.
+
+## Na entrevista
+
+Desenhe o laço (modelo decide, aplicação executa, observação volta) e passe rápido para o que diferencia um agente de produção: condições de parada, orçamento, detecção de repetição, permissões, confirmação humana, contexto gerenciado e trace de cada passo. Diga quando preferiria um workflow fixo. Follow-ups: "como testar um agente?" (cenários com ferramentas simuladas e avaliação da trajetória e do resultado final) e "o agente apagou dados que não devia, o que faltou?" (permissões mínimas e aprovação humana para ações destrutivas).
+
+<QuizSet>
+<Quiz question="Um fluxo sempre segue as mesmas etapas: classificar o e-mail, buscar o pedido e redigir a resposta. O que é mais adequado?" options={["Um agente autônomo com todas as ferramentas", "Um workflow fixo em código, com o LLM em cada etapa", "Um sistema multiagente", "Fine-tuning"]} answer={1} explanation="Quando o caminho é conhecido, um workflow é mais barato, rápido e testável. Agentes compensam quando os passos variam por caso." />
+<Quiz question="Seu agente às vezes chama a mesma busca dezenas de vezes até estourar o tempo. Quais proteções você adiciona?" options={["Aumentar o limite de tempo", "Limite de passos, detecção de chamadas repetidas e orçamento de tokens", "Temperatura maior", "Remover a ferramenta de busca"]} answer={1} explanation="Agentes podem travar em laços. Limites explícitos e detecção de repetição encerram a execução de forma controlada." />
+</QuizSet>

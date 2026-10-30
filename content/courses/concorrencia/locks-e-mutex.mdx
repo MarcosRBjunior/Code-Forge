@@ -1,0 +1,132 @@
+---
+title: Locks e mutex
+kind: lesson
+---
+
+Quando várias threads precisam mexer no mesmo estado, você precisa garantir que só uma delas esteja dentro do trecho perigoso por vez. O **mutex** (de *mutual exclusion*) é a ferramenta para isso: um objeto com dois estados, livre ou ocupado, e duas operações, adquirir e liberar. Quem tenta adquirir um mutex ocupado fica bloqueado até o dono liberar. Em Python ele se chama `threading.Lock`; em Java você tem `synchronized` e `ReentrantLock`; em Go, `sync.Mutex`; em C++, `std::mutex`.
+
+## Como funciona
+
+```text
+         adquirir()                      liberar()
+livre  ------------->  ocupado (dono: T1)  ------------->  livre
+                          |
+          T2 adquirir()   |  T2 fica bloqueada na fila de espera
+                          v
+                 T2 acorda quando T1 libera
+```
+
+Por baixo, um mutex costuma combinar uma instrução atômica do processador (para tentar trocar o estado de livre para ocupado) com uma chamada ao sistema operacional para colocar a thread para dormir quando a tentativa falha. Por isso adquirir um lock livre é barato, enquanto disputar um lock concorrido custa trocas de contexto.
+
+Além da exclusão mútua, o lock também dá **visibilidade**: tudo que uma thread escreveu antes de liberar fica visível para a próxima que adquirir. Isso importa em Java, C++ e Go, onde sem sincronização o compilador e a CPU podem reordenar ou esconder escritas.
+
+## Usando corretamente
+
+A regra número um: libere sempre, mesmo se der exceção. Em Python, use `with`, que chama `release` na saída do bloco. Em Java, o padrão é `lock()` antes do `try` e `unlock()` no `finally`; em Go, `mu.Lock()` seguido de `defer mu.Unlock()`; em C++, `std::lock_guard` ou `std::scoped_lock` (RAII).
+
+```python
+import threading
+
+class Estoque:
+    def __init__(self):
+        self._itens = {}
+        self._lock = threading.Lock()
+
+    def adicionar(self, produto, qtd):
+        with self._lock:
+            self._itens[produto] = self._itens.get(produto, 0) + qtd
+
+    def retirar(self, produto, qtd):
+        with self._lock:
+            atual = self._itens.get(produto, 0)
+            if qtd > atual:
+                raise ValueError(f"estoque insuficiente de {produto}")
+            self._itens[produto] = atual - qtd
+
+    def snapshot(self):
+        with self._lock:
+            return dict(sorted(self._itens.items()))
+
+estoque = Estoque()
+
+def repor(produto):
+    for _ in range(1000):
+        estoque.adicionar(produto, 2)
+
+threads = [threading.Thread(target=repor, args=(p,)) for p in ["caneta", "lapis", "caneta"]]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+try:
+    estoque.retirar("lapis", 5000)
+except ValueError as e:
+    print("erro:", e)
+
+estoque.retirar("caneta", 1000)  # o lock foi liberado mesmo após a exceção
+print(estoque.snapshot())
+```
+
+```text
+Saída:
+erro: estoque insuficiente de lapis
+{'caneta': 3000, 'lapis': 2000}
+```
+
+Se o lock não fosse liberado no caminho da exceção, a chamada seguinte a `retirar` travaria para sempre. O `with` elimina essa classe de bug.
+
+## Tentar sem bloquear
+
+Às vezes você não quer esperar indefinidamente. Locks oferecem tentativa não bloqueante e espera com prazo: `tryLock()` em Java, `TryLock()` em Go, `try_lock()` em C++. Em Python:
+
+```python
+import threading
+
+lock = threading.Lock()
+lock.acquire()  # simulando que alguém já está com o lock
+
+print("tentativa sem bloquear:", lock.acquire(blocking=False))
+print("tentativa com prazo de 0.1 s:", lock.acquire(timeout=0.1))
+
+lock.release()
+print("depois de liberar:", lock.acquire(blocking=False))
+lock.release()
+print("travado agora?", lock.locked())
+```
+
+```text
+Saída:
+tentativa sem bloquear: False
+tentativa com prazo de 0.1 s: False
+depois de liberar: True
+travado agora? False
+```
+
+O prazo é útil para evitar deadlock (desistir, liberar o que tem e tentar de novo) e para dar resposta rápida ao usuário em vez de travar uma requisição.
+
+## Granularidade e armadilhas
+
+| Escolha | Vantagem | Custo |
+| --- | --- | --- |
+| Um lock global | Simples, difícil errar | Serializa tudo, vira gargalo |
+| Lock por objeto ou por chave | Mais paralelismo | Mais locks para gerenciar, risco de deadlock |
+| Lock striping (N locks por hash) | Bom meio-termo | Operações que tocam várias faixas ficam complexas |
+
+- **Seção crítica longa demais.** Nada de I/O, rede ou chamadas a código desconhecido segurando um lock. Copie o que precisa, libere e só então faça o trabalho lento.
+- **Esquecer de proteger a leitura.** Se a escrita usa lock e a leitura não, a leitura pode ver estado parcial.
+- **Lock não reentrante.** Um `threading.Lock` adquirido duas vezes pela mesma thread trava ela mesma. Isso é assunto do próximo capítulo.
+- **Vários locks em ordens diferentes** levam a deadlock. Defina uma ordem global de aquisição.
+
+<Callout type="tip" title="Proteja invariantes, não variáveis">
+Pense no lock como o guardião de uma regra (por exemplo, a soma de todas as contas é constante). Todo código que pode quebrar ou observar essa regra precisa estar sob o mesmo lock.
+</Callout>
+
+## Na entrevista
+
+Ao usar um lock, diga explicitamente qual estado ele protege e qual invariante mantém. Mostre que a liberação é garantida (`with`, `finally`, `defer`, RAII) e mantenha a seção crítica curta. Follow-ups comuns: "qual a diferença entre mutex e semáforo binário?" (o mutex tem dono, só quem adquiriu libera; o semáforo não tem dono e serve para sinalização) e "como reduzir contenção?" (locks mais finos, striping, estruturas lock-free ou eliminar o compartilhamento).
+
+<QuizSet>
+<Quiz question="Por que em Java o unlock() deve ficar no bloco finally?" options={["Para o código ficar mais rápido", "Para que o lock seja liberado mesmo se uma exceção for lançada na seção crítica", "Porque o compilador exige", "Para permitir reentrância"]} answer={1} explanation="Sem finally, uma exceção pularia o unlock e todas as outras threads ficariam bloqueadas para sempre. Em Python o with cumpre o mesmo papel." />
+<Quiz question="Um método segura um lock enquanto faz uma chamada HTTP de 2 segundos. Qual é o principal problema?" options={["Nenhum, o lock protege a chamada", "Todas as outras threads que precisam do lock ficam paradas durante a chamada, criando um gargalo", "A chamada HTTP fica mais lenta", "O lock é liberado automaticamente"]} answer={1} explanation="Seções críticas devem ser curtas. Copie os dados necessários, libere o lock e faça o I/O fora dele." />
+</QuizSet>

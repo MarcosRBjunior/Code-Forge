@@ -1,0 +1,178 @@
+---
+title: Níveis de isolamento e anomalias
+kind: lesson
+---
+
+Isolamento perfeito significaria que cada transação roda como se estivesse sozinha no banco. Isso custa caro: obriga o banco a esperar ou a abortar transações com frequência. Por isso o padrão SQL define **níveis de isolamento**, cada um permitindo certas **anomalias** em troca de mais concorrência. Em entrevistas de backend, saber qual anomalia cada nível deixa passar, e como o Postgres e o MySQL se comportam de fato, é uma das perguntas mais comuns sobre bancos.
+
+## O cenário
+
+Uma tabela de plantões de médicos, com a regra de negócio "sempre precisa haver pelo menos um médico de plantão":
+
+```sql
+CREATE TABLE plantao (
+  medico      text PRIMARY KEY,
+  de_plantao  boolean NOT NULL
+);
+
+CREATE TABLE estoque (
+  produto    text PRIMARY KEY,
+  quantidade integer NOT NULL
+);
+
+INSERT INTO plantao VALUES ('Alice', true), ('Bento', true), ('Cora', false);
+INSERT INTO estoque VALUES ('caneca', 10), ('boné', 3);
+
+SELECT medico, de_plantao FROM plantao ORDER BY medico;
+```
+
+```text
+Saída:
+medico | de_plantao
+Alice | true
+Bento | true
+Cora | false
+```
+
+## As anomalias
+
+- **Leitura suja (dirty read):** ler dados que outra transação escreveu e ainda não confirmou. Se ela fizer rollback, você leu algo que nunca existiu.
+- **Leitura não repetível (non-repeatable read):** ler a mesma linha duas vezes na mesma transação e obter valores diferentes, porque outra transação confirmou uma alteração no meio.
+- **Leitura fantasma (phantom read):** repetir uma consulta com filtro e ver linhas novas que passaram a satisfazer o filtro.
+- **Atualização perdida (lost update):** duas transações leem o mesmo valor, calculam em cima dele e gravam; a segunda escrita apaga a primeira.
+- **Write skew:** duas transações leem um conjunto, cada uma decide com base nele e altera linhas **diferentes**; juntas, quebram uma regra que nenhuma quebraria sozinha.
+
+## Os níveis
+
+| Nível | Leitura suja | Não repetível | Fantasma | Write skew |
+| --- | --- | --- | --- | --- |
+| READ UNCOMMITTED | possível* | possível | possível | possível |
+| READ COMMITTED | não | possível | possível | possível |
+| REPEATABLE READ | não | não | possível no padrão** | possível |
+| SERIALIZABLE | não | não | não | não |
+
+\* O Postgres trata READ UNCOMMITTED como READ COMMITTED: leitura suja nunca acontece.
+\*\* O REPEATABLE READ do Postgres usa snapshot e também impede fantasmas.
+
+Os padrões são diferentes: **Postgres usa READ COMMITTED**, **MySQL (InnoDB) usa REPEATABLE READ**. Você pode conferir o da sua sessão:
+
+```sql
+SHOW transaction_isolation;
+```
+
+```text
+Saída:
+transaction_isolation
+read committed
+```
+
+No MySQL, o equivalente é `SELECT @@transaction_isolation;`.
+
+## Como o Postgres implementa: snapshots
+
+O Postgres usa MVCC (controle de concorrência multiversão). Cada `UPDATE` cria uma nova versão da linha, e cada leitura enxerga um **snapshot**. Em READ COMMITTED, cada **comando** tira um snapshot novo; em REPEATABLE READ e SERIALIZABLE, o snapshot é tirado no primeiro comando da **transação** e vale até o fim. Leitores não bloqueiam escritores e vice-versa.
+
+Uma leitura não repetível em READ COMMITTED, com duas sessões:
+
+```text
+-- Sessão A                                  -- Sessão B
+BEGIN;
+SELECT quantidade FROM estoque
+ WHERE produto = 'boné';          -- 3
+                                             UPDATE estoque SET quantidade = 0
+                                              WHERE produto = 'boné';   -- autocommit
+SELECT quantidade FROM estoque
+ WHERE produto = 'boné';          -- 0 (mudou)
+COMMIT;
+```
+
+Em REPEATABLE READ, a segunda leitura da sessão A continuaria devolvendo 3.
+
+## Atualização perdida e como evitar
+
+O padrão perigoso é ler, calcular na aplicação e gravar o valor absoluto:
+
+```text
+-- Sessão A                         -- Sessão B
+SELECT quantidade ... -- 10         SELECT quantidade ... -- 10
+UPDATE ... SET quantidade = 9;      UPDATE ... SET quantidade = 9;
+-- vendemos 2 canecas, estoque diz 9
+```
+
+As correções, da mais simples para a mais geral:
+
+1. **Atualização atômica:** deixe o banco fazer a conta, `SET quantidade = quantidade - 1`.
+2. **Lock pessimista:** `SELECT ... FOR UPDATE` trava a linha até o fim da transação.
+3. **Lock otimista:** uma coluna `versao` e `UPDATE ... WHERE versao = 7`; se nenhuma linha for afetada, alguém mudou antes e você tenta de novo.
+4. **Isolamento mais alto:** em REPEATABLE READ, o Postgres aborta a segunda transação com erro de serialização; você precisa repetir.
+
+A atualização atômica com condição resolve estoque sem nenhum lock explícito:
+
+```sql
+UPDATE estoque
+SET quantidade = quantidade - 1
+WHERE produto = 'caneca' AND quantidade >= 1;
+
+UPDATE estoque
+SET quantidade = quantidade - 5
+WHERE produto = 'boné' AND quantidade >= 5;
+
+SELECT produto, quantidade FROM estoque ORDER BY produto;
+```
+
+```text
+Saída:
+produto | quantidade
+boné | 3
+caneca | 9
+```
+
+O segundo `UPDATE` não afetou nenhuma linha (só havia 3 bonés), e a aplicação usa a contagem de linhas afetadas para recusar a venda.
+
+<Callout type="warning" title="O REPEATABLE READ do MySQL é diferente">
+No InnoDB, leituras simples usam o snapshot, mas `UPDATE`, `DELETE` e `SELECT ... FOR UPDATE` leem a versão **mais recente** confirmada. Com isso, a atualização perdida não gera erro: a segunda transação simplesmente sobrescreve. O Postgres, no mesmo nível, aborta com `could not serialize access due to concurrent update`.
+</Callout>
+
+## Write skew e SERIALIZABLE
+
+Alice e Bento querem sair do plantão ao mesmo tempo. Cada transação conta quantos estão de plantão, vê 2, conclui que pode sair e atualiza a **própria** linha. Ninguém escreveu na mesma linha, então nenhum lock conflita, e o hospital fica sem médico.
+
+```text
+-- Sessão A (REPEATABLE READ)            -- Sessão B (REPEATABLE READ)
+SELECT count(*) ... de_plantao; -- 2     SELECT count(*) ... de_plantao; -- 2
+UPDATE plantao SET de_plantao = false    UPDATE plantao SET de_plantao = false
+ WHERE medico = 'Alice';                  WHERE medico = 'Bento';
+COMMIT;                                  COMMIT;   -- os dois saem
+```
+
+Em SERIALIZABLE, o Postgres (com SSI, serializable snapshot isolation) detecta a dependência e aborta uma delas com erro de serialização. O MySQL implementa SERIALIZABLE transformando leituras simples em leituras com lock compartilhado, o que bloqueia em vez de abortar. Sem SERIALIZABLE, você pode materializar o conflito: `SELECT ... FOR UPDATE` nas linhas lidas.
+
+Em uma única sessão, a regra pode ser verificada antes de cada saída:
+
+```sql
+UPDATE plantao SET de_plantao = false
+WHERE medico = 'Alice'
+  AND (SELECT count(*) FROM plantao WHERE de_plantao) > 1;
+
+SELECT medico, de_plantao FROM plantao ORDER BY medico;
+```
+
+```text
+Saída:
+medico | de_plantao
+Alice | false
+Bento | true
+Cora | false
+```
+
+Atenção: essa condição sozinha **não** resolve a concorrência em READ COMMITTED, porque as duas sessões podem avaliar a subconsulta antes de qualquer commit. Ela só é segura com SERIALIZABLE ou com lock nas linhas lidas.
+
+## Na entrevista
+
+Responda em camadas: nomeie a anomalia do cenário, diga qual nível a impede e mencione o comportamento real do banco usado. Lembre que níveis mais altos exigem que a aplicação **repita** transações abortadas. Follow-ups comuns: "qual o nível padrão do Postgres e do MySQL?" (READ COMMITTED e REPEATABLE READ) e "como evitar vender mais ingressos do que existem?" (atualização condicional atômica, `FOR UPDATE` ou SERIALIZABLE com retry).
+
+<QuizSet>
+<Quiz question="Qual anomalia o READ COMMITTED do Postgres permite?" options={["Leitura suja", "Leitura não repetível", "Nenhuma", "Só write skew"]} answer={1} explanation="Cada comando vê um snapshot novo, então a mesma linha pode mudar entre duas leituras da mesma transação." />
+<Quiz question="Dois médicos saem do plantão em transações concorrentes, cada um alterando a própria linha. Qual anomalia é essa e qual nível a impede?" options={["Leitura suja; READ COMMITTED", "Atualização perdida; READ COMMITTED", "Write skew; SERIALIZABLE", "Fantasma; REPEATABLE READ no MySQL"]} answer={2} explanation="Cada transação decide com base num conjunto lido e altera linhas diferentes. Só SERIALIZABLE (ou locks explícitos nas linhas lidas) impede." />
+<Quiz question="Qual é a forma mais simples de evitar atualização perdida ao decrementar estoque?" options={["Ler o valor e gravar o novo valor calculado na aplicação", "UPDATE estoque SET quantidade = quantidade - 1 WHERE produto = 'x' AND quantidade >= 1", "Aumentar o pool de conexões", "Usar READ UNCOMMITTED"]} answer={1} explanation="O banco faz a leitura e a escrita no mesmo comando, travando a linha, e a condição impede estoque negativo." />
+</QuizSet>

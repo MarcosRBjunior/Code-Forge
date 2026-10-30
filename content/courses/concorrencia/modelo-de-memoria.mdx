@@ -1,0 +1,142 @@
+---
+title: Modelo de memória e visibilidade
+kind: lesson
+---
+
+Imagine uma thread que escreve `pronto = True` e outra que fica num laço esperando ver essa mudança. Intuitivamente, a segunda thread verá o novo valor logo depois. Em Java, C++ ou Go, isso não é garantido: ela pode nunca ver, ou ver `pronto = True` antes de ver os dados que deveriam ter sido escritos antes. Entender por que isso acontece é o que separa quem "usa locks porque sim" de quem sabe o que eles garantem.
+
+## Por que a memória não é simples
+
+Três camadas reordenam ou atrasam leituras e escritas para ganhar desempenho:
+
+- **Compilador:** pode reordenar instruções independentes, ou manter uma variável num registrador em vez de reler da memória a cada volta do laço.
+- **CPU:** executa fora de ordem e usa buffers de escrita; uma escrita pode ficar visível para outros núcleos depois de uma escrita posterior.
+- **Caches:** cada núcleo tem seu cache. A coerência entre eles é garantida pelo hardware, mas a ordem em que as escritas aparecem para outro núcleo depende da arquitetura.
+
+```text
+Thread 1 (núcleo 0)          Thread 2 (núcleo 1)
+dados = 42                   while not pronto: pass
+pronto = True                print(dados)
+
+Sem sincronização, a Thread 2 pode:
+  - nunca sair do laço (pronto lido uma vez e guardado em registrador)
+  - sair do laço e imprimir o valor antigo de dados (escritas reordenadas)
+```
+
+Um programa de uma thread nunca percebe nada disso, porque as otimizações preservam o resultado sequencial. O problema só aparece quando outra thread observa.
+
+## O que é um modelo de memória
+
+O **modelo de memória** da linguagem é o contrato que diz quais valores uma leitura pode devolver em programas concorrentes. A peça central é a relação **happens-before**: se a ação A acontece-antes da ação B, tudo que A escreveu está visível para B.
+
+Você cria happens-before com sincronização:
+
+- Liberar um lock acontece-antes de alguém adquirir esse mesmo lock depois.
+- Escrever numa variável `volatile` (Java) ou atômica com ordem de liberação (C++ `std::memory_order_release`) acontece-antes de uma leitura que veja esse valor.
+- Iniciar uma thread acontece-antes de qualquer ação dela; o fim de uma thread acontece-antes do `join` retornar.
+- Em Go, enviar num canal acontece-antes do recebimento correspondente.
+
+Sem uma dessas arestas entre duas threads, você tem uma **data race** e, em C++ e Go, o comportamento é indefinido. Em Java, o programa não quebra a memória, mas pode ver valores velhos ou fora de ordem.
+
+## Publicação segura
+
+O padrão mais comum é preparar dados numa thread e entregá-los a outra. O programa abaixo usa `threading.Event`: o `set()` acontece depois de preencher o dicionário e o `wait()` só retorna depois do `set()`, então o consumidor sempre vê os dados completos.
+
+```python
+import threading
+
+config = {}
+publicado = threading.Event()
+lido = []
+
+def produtor():
+    config["host"] = "db.interno"
+    config["porta"] = 5432
+    publicado.set()            # publica: tudo escrito antes fica visível
+
+def consumidor():
+    publicado.wait()           # sincroniza com o set()
+    lido.append(f"{config['host']}:{config['porta']}")
+
+c = threading.Thread(target=consumidor)
+p = threading.Thread(target=produtor)
+c.start()
+p.start()
+p.join()
+c.join()
+print(lido[0])
+```
+
+```text
+Saída:
+db.interno:5432
+```
+
+Em Java, o mesmo efeito vem de um campo `volatile boolean pronto`, de um `CountDownLatch` ou de um `synchronized` em volta da escrita e da leitura. Em Go, do envio por um canal. Em C++, de um `std::atomic<bool>` com `store(true, std::memory_order_release)` e `load(std::memory_order_acquire)`.
+
+<Callout type="note" title="E em Python?">
+O GIL faz com que, na prática, threads CPython vejam escritas umas das outras. Mesmo assim, use primitivas de sincronização: elas documentam a intenção, evitam corridas de operações compostas e continuam corretas no build sem GIL.
+</Callout>
+
+## Inicialização preguiçosa e o double-checked locking
+
+Um clássico de entrevista: criar um singleton só quando for usado, uma única vez, mesmo com várias threads pedindo ao mesmo tempo. A versão com verificação dupla evita pegar o lock em toda chamada depois da criação.
+
+```python
+import threading
+
+class Conexao:
+    criadas = 0
+    def __init__(self):
+        Conexao.criadas += 1
+
+_instancia = None
+_lock = threading.Lock()
+
+def obter_conexao():
+    global _instancia
+    if _instancia is None:              # 1ª verificação, sem lock
+        with _lock:
+            if _instancia is None:      # 2ª verificação, com lock
+                _instancia = Conexao()
+    return _instancia
+
+barreira = threading.Barrier(8)
+vistas = []
+
+def worker():
+    barreira.wait()                     # todas pedem ao mesmo tempo
+    vistas.append(id(obter_conexao()))
+
+threads = [threading.Thread(target=worker) for _ in range(8)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("instancias criadas:", Conexao.criadas)
+print("todas viram a mesma:", len(set(vistas)) == 1)
+```
+
+```text
+Saída:
+instancias criadas: 1
+todas viram a mesma: True
+```
+
+Em Java, esse padrão só é correto se o campo for `volatile`. Sem isso, outra thread pode ver a referência publicada antes de o construtor terminar de preencher os campos, ou seja, um objeto parcialmente construído. Em C++ prefira `std::call_once` ou uma variável `static` local, cuja inicialização é thread-safe desde C++11; em Go, `sync.Once`.
+
+## Armadilhas
+
+- Achar que "a variável é só um booleano, não precisa de sincronização". Atomicidade da escrita não implica visibilidade nem ordem.
+- Usar `volatile` em C++ para comunicação entre threads. Lá ele não tem semântica de sincronização; use `std::atomic`.
+- Sincronizar a escrita mas não a leitura. Happens-before exige que os dois lados participem.
+
+## Na entrevista
+
+Explique visibilidade e reordenação com o exemplo da flag, nomeie a relação happens-before e diga quais primitivas a estabelecem na linguagem da vaga. Se aparecer singleton, mostre o double-checked locking e mencione o `volatile` (ou prefira `sync.Once`/`call_once`). Follow-ups comuns: "qual a diferença entre `volatile` e `synchronized` em Java?" (o primeiro dá visibilidade e ordem, o segundo também dá exclusão mútua) e "por que o laço `while (!pronto)` pode nunca terminar?" (o compilador pode manter o valor num registrador).
+
+<QuizSet>
+<Quiz question="Em Java, uma thread escreve dados e depois pronto = true; outra espera pronto e lê os dados. O que torna isso correto?" options={["Nada, booleanos são sempre atômicos", "Declarar pronto como volatile ou proteger ambos os acessos com o mesmo lock", "Chamar Thread.yield() no laço", "Usar um int em vez de boolean"]} answer={1} explanation="volatile ou o mesmo lock criam happens-before entre a escrita e a leitura, garantindo visibilidade e ordem." />
+<Quiz question="Por que o double-checked locking em Java precisa do campo volatile?" options={["Para o lock ser mais rápido", "Para impedir que outra thread veja a referência antes de o objeto estar totalmente construído", "Para permitir várias instâncias", "Porque static não funciona com locks"]} answer={1} explanation="Sem volatile, a escrita da referência pode ser reordenada antes das escritas do construtor." />
+<Quiz question="Em C++, qual ferramenta comunica uma flag entre threads com garantia de ordem?" options={["volatile bool", "std::atomic com release/acquire", "Uma variável global comum", "register bool"]} answer={1} explanation="std::atomic define a semântica de sincronização; volatile em C++ não estabelece happens-before." />
+</QuizSet>

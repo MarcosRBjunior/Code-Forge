@@ -1,0 +1,178 @@
+---
+title: Web crawler concorrente
+kind: lesson
+---
+
+O crawler concorrente é um dos problemas de concorrência mais pedidos em entrevistas (no LeetCode ele aparece como "Web Crawler Multithreaded"). O enunciado típico: dada uma URL inicial e uma função `obter_links(url)` lenta, visite todas as páginas do mesmo domínio alcançáveis a partir dela, **sem visitar nenhuma duas vezes**, usando várias threads. É uma busca em largura num grafo que você só descobre enquanto anda, e em que cada aresta custa uma chamada de rede.
+
+## Por que concorrência ajuda aqui
+
+Quase todo o tempo de um crawler é espera: DNS, conexão, download. Uma thread sequencial que gasta 200 ms por página processa 5 páginas por segundo; com 20 requisições em voo, 100. Como o trabalho é limitado por I/O, threads funcionam bem mesmo em Python com GIL, e `asyncio` funciona ainda melhor para milhares de conexões.
+
+## As três partes que precisam de cuidado
+
+```text
+            +-----------------+
+ semente -> |  fronteira      |  fila de URLs a visitar
+            |  (Queue)        |
+            +--------+--------+
+                     |  N trabalhadores
+                     v
+            obter_links(url)    <- lento, fora de qualquer lock
+                     |
+                     v
+       visitados (set + lock): "testar e marcar" atômico
+                     |
+           novas URLs voltam para a fronteira
+```
+
+1. **Conjunto de visitados.** Testar `url in visitados` e depois `visitados.add(url)` em passos separados é uma condição de corrida clássica: duas threads veem a URL como nova e as duas a baixam. O teste e a marcação precisam acontecer na mesma seção crítica.
+2. **Fronteira.** Uma fila thread-safe (`queue.Queue`, `LinkedBlockingQueue` em Java, um canal em Go) distribui trabalho entre as threads.
+3. **Término.** Esta é a parte que derruba candidatos. "Fila vazia" não significa fim: uma thread pode estar no meio de um download que vai gerar dez URLs novas. O critério correto é **fila vazia e nenhum trabalho em andamento**. `Queue.join()` resolve isso contando tarefas: cada `put` incrementa, cada `task_done` decrementa, e `join` só retorna quando o contador zera.
+
+## Versão com threads e fila
+
+A "internet" abaixo é um dicionário, e `obter_links` dorme um pouco para simular a rede.
+
+```python
+import queue
+import threading
+import time
+
+WEB = {
+    "http://loja.com/": ["http://loja.com/a", "http://loja.com/b", "http://blog.org/"],
+    "http://loja.com/a": ["http://loja.com/b", "http://loja.com/c"],
+    "http://loja.com/b": ["http://loja.com/", "http://loja.com/d"],
+    "http://loja.com/c": ["http://loja.com/d", "http://loja.com/a"],
+    "http://loja.com/d": [],
+    "http://blog.org/": ["http://blog.org/x"],
+}
+DOMINIO = "http://loja.com/"
+downloads = []
+lock_downloads = threading.Lock()
+
+def obter_links(url):
+    time.sleep(0.02)  # simula latência de rede
+    with lock_downloads:
+        downloads.append(url)
+    return WEB.get(url, [])
+
+def rastrear(semente, num_threads=4):
+    visitados = {semente}
+    lock = threading.Lock()
+    fronteira = queue.Queue()
+    fronteira.put(semente)
+
+    def trabalhador():
+        while True:
+            url = fronteira.get()
+            if url is None:
+                fronteira.task_done()
+                return
+            for link in obter_links(url):
+                if not link.startswith(DOMINIO):
+                    continue
+                with lock:  # testar e marcar na mesma seção crítica
+                    if link in visitados:
+                        continue
+                    visitados.add(link)
+                fronteira.put(link)
+            fronteira.task_done()
+
+    threads = [threading.Thread(target=trabalhador) for _ in range(num_threads)]
+    for t in threads:
+        t.start()
+    fronteira.join()          # espera fila vazia E nenhuma tarefa em andamento
+    for _ in threads:
+        fronteira.put(None)   # uma "pílula de veneno" por thread
+    for t in threads:
+        t.join()
+    return visitados
+
+resultado = rastrear("http://loja.com/")
+for url in sorted(resultado):
+    print(url)
+print("downloads:", len(downloads), "| repetidos:", len(downloads) - len(set(downloads)))
+```
+
+```text
+Saída:
+http://loja.com/
+http://loja.com/a
+http://loja.com/b
+http://loja.com/c
+http://loja.com/d
+downloads: 5 | repetidos: 0
+```
+
+A ordem de visita varia a cada execução, por isso o programa ordena antes de imprimir. O que nunca varia: cada página é baixada uma única vez, e o `blog.org` é ignorado por estar fora do domínio. Repare que `obter_links` roda **fora** do lock; se rodasse dentro, as quatro threads se revezariam e o crawler voltaria a ser sequencial.
+
+## Versão com asyncio e limite de concorrência
+
+Com `asyncio`, não há threads disputando o conjunto de visitados: entre dois `await` nenhuma outra corrotina roda, então testar e marcar já é atômico. O que você precisa controlar é **quantas requisições ficam em voo** ao mesmo tempo, para não derrubar o site nem esgotar sockets. Um `asyncio.Semaphore` faz isso.
+
+```python
+import asyncio
+
+WEB = {
+    "/": ["/a", "/b", "/c", "/d"],
+    "/a": ["/e", "/f"], "/b": ["/g", "/h"], "/c": ["/a", "/i"], "/d": ["/j"],
+    "/e": [], "/f": ["/"], "/g": [], "/h": [], "/i": [], "/j": ["/k"], "/k": [],
+}
+em_voo = 0
+pico = 0
+
+async def obter_links(url, limite):
+    global em_voo, pico
+    async with limite:
+        em_voo += 1
+        pico = max(pico, em_voo)
+        await asyncio.sleep(0.02)
+        em_voo -= 1
+        return WEB.get(url, [])
+
+async def rastrear(semente, max_simultaneas):
+    limite = asyncio.Semaphore(max_simultaneas)
+    visitados = {semente}
+    nivel = [semente]
+    while nivel:
+        respostas = await asyncio.gather(*(obter_links(u, limite) for u in nivel))
+        proximo = []
+        for links in respostas:
+            for link in links:
+                if link not in visitados:  # seguro: não há await entre teste e marcação
+                    visitados.add(link)
+                    proximo.append(link)
+        nivel = proximo
+    return visitados
+
+paginas = asyncio.run(rastrear("/", max_simultaneas=3))
+print("paginas:", len(paginas), sorted(paginas))
+print("respeitou o limite de 3:", pico <= 3)
+```
+
+```text
+Saída:
+paginas: 12 ['/', '/a', '/b', '/c', '/d', '/e', '/f', '/g', '/h', '/i', '/j', '/k']
+respeitou o limite de 3: True
+```
+
+<Callout type="warning" title="Contar 'fila vazia' não basta para terminar">
+Se o trabalhador sair quando `fronteira.empty()` for verdadeiro, ele pode encerrar enquanto outro ainda está baixando uma página que geraria mais URLs. Use `Queue.join()` com `task_done()`, ou um contador de tarefas pendentes protegido por lock.
+</Callout>
+
+## Armadilhas e extensões
+
+- **Visitados fora do lock:** gera downloads duplicados, às vezes muitos em sites com grafo denso.
+- **Normalização de URL:** `/a`, `/a/` e `/a#topo` são a mesma página; normalize antes de marcar.
+- **Politeness:** limite requisições por domínio, respeite `robots.txt` e use atraso entre acessos ao mesmo host.
+- **Escala distribuída:** a fronteira vira uma fila persistente particionada por domínio, e o conjunto de visitados vai para um armazenamento compartilhado ou um filtro de Bloom.
+
+## Na entrevista
+
+Diga logo que é um BFS e que o gargalo é I/O, então threads ou `asyncio` servem. Destaque as três decisões: testar e marcar atômico, fronteira thread-safe e critério de término com contagem de tarefas. Follow-ups comuns: "como saber que terminou?" (fila vazia e zero tarefas em andamento) e "como evitar sobrecarregar o servidor alvo?" (semáforo global, limite por domínio e backoff).
+
+<QuizSet>
+<Quiz question="Duas threads executam 'if url not in visitados' e depois 'visitados.add(url)' sem lock. O que pode acontecer?" options={["Nada, set em Python é thread-safe para essa sequência", "As duas veem a URL como nova e a mesma página é baixada duas vezes", "O programa entra em deadlock", "A URL nunca é visitada"]} answer={1} explanation="Cada operação isolada é segura, mas a sequência testar e depois marcar não é atômica. As duas threads podem passar no teste antes de qualquer uma marcar." />
+<Quiz question="Qual é o critério correto para o crawler com várias threads terminar?" options={["A fila de URLs está vazia", "Passaram 5 segundos sem novas URLs", "A fila está vazia e nenhuma thread está processando uma página", "Todas as threads chamaram sleep"]} answer={2} explanation="Uma thread no meio de um download ainda pode produzir URLs novas. Queue.join com task_done captura exatamente essa condição." />
+</QuizSet>

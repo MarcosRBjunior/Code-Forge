@@ -1,0 +1,106 @@
+---
+title: Contexto longo
+kind: lesson
+---
+
+Janelas de contexto cresceram muito, e a tentação é óbvia: colocar o manual inteiro, toda a conversa e todos os documentos no prompt e deixar o modelo se virar. Funciona em demonstrações e falha em produção por três motivos. Cada token de entrada custa dinheiro em toda chamada. O prefill de um prompt enorme aumenta o tempo até o primeiro token e ocupa memória de KV cache que limitaria o batch. E modelos tendem a aproveitar pior informações enterradas no meio de contextos muito longos. Contexto é um recurso escasso, e o sistema precisa decidir o que entra.
+
+## O orçamento de contexto
+
+Trate a janela como um orçamento com fatias:
+
+```text
+janela do modelo
+ |- reserva para a saida (max_tokens)
+ |- instrucoes de sistema e formato        fixo, candidato a cache de prefixo
+ |- memoria de longo prazo do usuario      poucos fatos relevantes
+ |- documentos recuperados (RAG)           os mais relevantes, ate o limite
+ |- historico recente                      ultimos turnos completos
+ |- resumo do historico antigo             compacto
+ '- mensagem atual                         nunca cortada
+```
+
+A regra de ouro é **montar o prompt por prioridade, não por ordem de chegada**. A mensagem atual e as instruções nunca saem; documentos e histórico disputam o resto conforme a relevância.
+
+## Um montador de contexto
+
+O programa abaixo implementa um orçamento simples com números hipotéticos. Ele reserva a saída, inclui instruções e mensagem atual, depois preenche com trechos recuperados em ordem de relevância (descartando os abaixo de um score mínimo) e por fim com os turnos mais recentes do histórico. O que sobra do histórico vira resumo.
+
+```python
+JANELA = 16_000
+RESERVA_SAIDA = 1_500
+SCORE_MIN = 0.55
+
+sistema, mensagem, resumo_antigo = 1_200, 150, 300
+trechos = [("politica-ferias", 0.91, 1_800), ("faq-rh", 0.84, 2_200), ("manual-ponto", 0.72, 3_000),
+           ("ata-2019", 0.58, 2_500), ("cardapio", 0.31, 900)]
+historico = [900, 1_100, 700, 1_300, 800, 600, 1_200, 1_000]   # tokens por turno, do mais antigo ao mais recente
+
+def montar(limite_docs_pct=0.6):
+    livre = JANELA - RESERVA_SAIDA - sistema - mensagem - resumo_antigo
+    teto_docs = int(livre * limite_docs_pct)
+    usados, docs = 0, []
+    for nome, score, tok in sorted(trechos, key=lambda t: -t[1]):
+        if score >= SCORE_MIN and usados + tok <= teto_docs:
+            docs.append(nome)
+            usados += tok
+    livre -= usados
+    turnos, hist = 0, 0
+    for tok in reversed(historico):
+        if hist + tok > livre:
+            break
+        hist += tok
+        turnos += 1
+    return docs, usados, turnos, hist, livre - hist
+
+docs, t_docs, turnos, t_hist, sobra = montar()
+print(f"documentos: {docs} ({t_docs} tokens)")
+print(f"historico: ultimos {turnos} de {len(historico)} turnos ({t_hist} tokens); resto resumido")
+total = sistema + mensagem + resumo_antigo + t_docs + t_hist
+print(f"prompt: {total} tokens, sobra {sobra}, reserva de saida {RESERVA_SAIDA}")
+
+# Custo de mandar tudo versus o orcamento (preco hipotetico de entrada por milhao)
+tudo = sistema + mensagem + sum(t[2] for t in trechos) + sum(historico) + 40_000  # + manual inteiro
+preco = 1.0
+for nome, tok in (("orcamento", total), ("tudo no prompt", tudo)):
+    print(f"{nome:<15} {tok:>6} tokens  US$ {tok * preco / 1e6 * 1_000_000:,.0f} por milhao de chamadas")
+```
+
+```text
+Saída:
+documentos: ['politica-ferias', 'faq-rh', 'manual-ponto'] (7000 tokens)
+historico: ultimos 6 de 8 turnos (5600 tokens); resto resumido
+prompt: 14250 tokens, sobra 250, reserva de saida 1500
+orcamento        14250 tokens  US$ 14,250 por milhao de chamadas
+tudo no prompt   59350 tokens  US$ 59,350 por milhao de chamadas
+```
+
+O resultado mostra a diferença: o prompt orçado fica em uma fração do "manda tudo" e custa proporcionalmente menos em cada chamada, além de ter prefill mais rápido. O teto de 60% para documentos impede que a recuperação expulse todo o histórico, e o score mínimo impede que trechos irrelevantes ocupem espaço só porque cabem.
+
+## Técnicas de gestão
+
+- **Janela deslizante com resumo.** Mantenha os últimos N turnos literais e um resumo cumulativo dos anteriores, atualizado de forma assíncrona depois de cada resposta, para não somar latência.
+- **Memória de longo prazo.** Fatos estáveis sobre o usuário (preferências, contexto do projeto) ficam num armazenamento à parte e entram só os relevantes, recuperados como qualquer documento.
+- **Recuperação em vez de inclusão.** Em vez de colar o manual inteiro, indexe-o e recupere os trechos necessários. Para perguntas que realmente exigem o documento todo (resumo de um contrato), use map-reduce: resuma partes em paralelo e combine.
+- **Posição importa.** Coloque as informações mais importantes no início ou no fim do contexto, e instruções críticas perto da pergunta.
+- **Cache de prefixo.** Mantenha a parte fixa do prompt sempre igual e no começo, para reaproveitar o KV cache entre chamadas.
+
+| Abordagem | Qualidade | Custo e latência | Complexidade |
+| --- | --- | --- | --- |
+| Tudo no prompt | Boa em textos curtos, cai em muito longos | Altos | Baixa |
+| Janela deslizante | Perde detalhes antigos | Baixos | Baixa |
+| Resumo cumulativo | Preserva o essencial | Baixos, mais uma chamada assíncrona | Média |
+| RAG sobre o histórico e documentos | Boa se a busca for boa | Baixos | Alta |
+
+<Callout type="warning" title="Truncar do jeito errado quebra a conversa">
+Cortar o prompt por caracteres a partir do fim pode remover a mensagem atual ou deixar um JSON pela metade. Corte por unidades lógicas (turnos, trechos) e sempre a partir das partes de menor prioridade.
+</Callout>
+
+## Na entrevista
+
+Quando surgir conversa longa ou documento grande, diga que o orquestrador monta o prompt com um orçamento explícito por fatias e explique as prioridades. Mencione custo, TTFT e qualidade como os três motivos para não encher a janela. Follow-ups comuns: "o usuário pergunta sobre algo dito há 200 turnos, e agora?" (memória de longo prazo ou busca sobre o histórico) e "como resumir um documento de 500 páginas?" (map-reduce em paralelo, com resumo hierárquico).
+
+<QuizSet>
+<Quiz question="Uma conversa chegou a 300 turnos e as respostas ficaram lentas e caras. Qual a abordagem mais equilibrada?" options={["Apagar a conversa", "Manter os últimos turnos literais e um resumo cumulativo dos antigos, com busca no histórico quando necessário", "Mandar os 300 turnos sempre", "Trocar para um modelo com janela maior e não mudar nada"]} answer={1} explanation="Janela deslizante com resumo e recuperação mantém o contexto relevante com custo e latência controlados." />
+<Quiz question="Por que o montador de contexto usa um score mínimo para os trechos recuperados?" options={["Para economizar disco", "Para não ocupar o orçamento com trechos irrelevantes que só confundem o modelo e custam tokens", "Porque o índice vetorial exige", "Para aumentar a temperatura"]} answer={1} explanation="Trechos pouco relevantes custam tokens, aumentam a latência e podem desviar a resposta." />
+</QuizSet>

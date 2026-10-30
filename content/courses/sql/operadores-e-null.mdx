@@ -1,0 +1,171 @@
+---
+title: Operadores e NULL
+kind: lesson
+---
+
+`NULL` é a fonte de bugs mais frequente em SQL e, por isso, um dos temas favoritos de entrevistadores. Ele não é zero, não é texto vazio e não é falso: significa "valor desconhecido" ou "não se aplica". Quase todo operador que recebe um `NULL` devolve `NULL`, e isso muda o resultado de filtros, contagens e junções de formas que parecem erradas até você entender a lógica de três valores.
+
+## Lógica de três valores
+
+Em SQL, uma condição pode ser **verdadeira**, **falsa** ou **desconhecida** (`NULL`). O `WHERE` só mantém as linhas em que a condição é verdadeira; desconhecido é descartado junto com falso.
+
+| Expressão | Resultado |
+| --- | --- |
+| `NULL = NULL` | `NULL` |
+| `NULL <> 1` | `NULL` |
+| `NULL AND false` | `false` |
+| `NULL AND true` | `NULL` |
+| `NULL OR true` | `true` |
+| `NOT NULL` | `NULL` |
+
+Veja na prática:
+
+```sql
+CREATE TABLE clientes (
+  id        integer PRIMARY KEY,
+  nome      text NOT NULL,
+  email     text,
+  telefone  text,
+  indicado_por integer,
+  desconto  numeric(4, 2)
+);
+
+INSERT INTO clientes VALUES
+  (1, 'Ana', 'ana@exemplo.com', '81 99999-0001', NULL, 0.10),
+  (2, 'Bruno', NULL, '11 98888-0002', 1, NULL),
+  (3, 'Carla', 'carla@exemplo.com', NULL, 1, 0.05),
+  (4, 'Diego', NULL, NULL, 2, 0.00),
+  (5, 'Elisa', 'elisa@exemplo.com', '41 97777-0005', NULL, NULL);
+
+SELECT NULL = NULL AS igual,
+       NULL IS NULL AS eh_nulo,
+       (NULL AND false) AS e_falso,
+       (NULL OR true) AS ou_verdadeiro;
+```
+
+```text
+Saída:
+igual | eh_nulo | e_falso | ou_verdadeiro
+NULL | true | false | true
+```
+
+`NULL = NULL` não é verdadeiro: é desconhecido. Para testar ausência de valor, use sempre `IS NULL` ou `IS NOT NULL`.
+
+## O filtro que some com linhas
+
+Pergunta típica: "liste os clientes cujo desconto não é 10%". A tentativa ingênua perde quem não tem desconto:
+
+```sql
+SELECT nome, desconto
+FROM clientes
+WHERE desconto <> 0.10
+ORDER BY id;
+```
+
+```text
+Saída:
+nome | desconto
+Carla | 0.05
+Diego | 0.00
+```
+
+Bruno e Elisa sumiram, porque `NULL <> 0.10` é desconhecido. Se eles devem aparecer, diga isso explicitamente. O Postgres tem o operador `IS DISTINCT FROM`, que trata `NULL` como um valor comparável; no MySQL, o equivalente é o operador `<=>` negado (`NOT (desconto <=> 0.10)`).
+
+```sql
+SELECT nome, desconto
+FROM clientes
+WHERE desconto IS DISTINCT FROM 0.10
+ORDER BY id;
+```
+
+```text
+Saída:
+nome | desconto
+Bruno | NULL
+Carla | 0.05
+Diego | 0.00
+Elisa | NULL
+```
+
+## NOT IN com NULL
+
+Esta é a armadilha mais cobrada. Quem nunca indicou ninguém? A ideia é pegar os clientes cujo `id` não aparece em `indicado_por`:
+
+```sql
+SELECT count(*) AS resultado_not_in
+FROM clientes
+WHERE id NOT IN (SELECT indicado_por FROM clientes);
+```
+
+```text
+Saída:
+resultado_not_in
+0
+```
+
+Zero linhas, embora Carla, Diego e Elisa nunca tenham indicado ninguém. O motivo: a subconsulta devolve `NULL` entre os valores. `3 NOT IN (NULL, 1, 1, 2, NULL)` equivale a `3 <> NULL AND 3 <> 1 AND ...`, e qualquer `AND` com um termo desconhecido e nenhum falso fica desconhecido. Use `NOT EXISTS`, que não sofre desse problema, ou filtre os nulos na subconsulta:
+
+```sql
+SELECT nome
+FROM clientes c
+WHERE NOT EXISTS (
+  SELECT 1 FROM clientes i WHERE i.indicado_por = c.id
+)
+ORDER BY nome;
+```
+
+```text
+Saída:
+nome
+Carla
+Diego
+Elisa
+```
+
+## Funções para lidar com NULL
+
+- `COALESCE(a, b, c)`: devolve o primeiro argumento não nulo. Funciona em Postgres e MySQL. O MySQL também tem `IFNULL(a, b)`, com dois argumentos.
+- `NULLIF(a, b)`: devolve `NULL` se `a = b`, senão `a`. O uso clássico é evitar divisão por zero: `total / NULLIF(qtd, 0)`.
+- Aritmética e concatenação com `NULL` resultam em `NULL`: `10 + NULL` é `NULL`, e `'a' || NULL` também. No Postgres, `concat()` ignora os nulos.
+
+```sql
+SELECT nome,
+       COALESCE(email, telefone, 'sem contato') AS contato,
+       COALESCE(desconto, 0) * 100 AS desconto_pct,
+       round(100 / NULLIF(desconto * 100, 0), 2) AS divisao_segura
+FROM clientes
+ORDER BY id;
+```
+
+```text
+Saída:
+nome | contato | desconto_pct | divisao_segura
+Ana | ana@exemplo.com | 10.00 | 10.00
+Bruno | 11 98888-0002 | 0 | NULL
+Carla | carla@exemplo.com | 5.00 | 20.00
+Diego | sem contato | 0.00 | NULL
+Elisa | elisa@exemplo.com | 0 | NULL
+```
+
+Diego tem desconto 0.00, então `NULLIF` o transformou em `NULL` e a divisão devolveu `NULL` em vez de um erro de divisão por zero.
+
+## Armadilhas
+
+- **`= NULL` no filtro**: nunca é verdadeiro. Use `IS NULL`.
+- **`NOT IN` com subconsulta que pode ter `NULL`**: resultado vazio. Prefira `NOT EXISTS`.
+- **`count(coluna)` vs. `count(*)`**: o primeiro ignora nulos (você verá isso em agregação).
+- **Texto vazio no Oracle**: lá, `''` é tratado como `NULL`. No Postgres e no MySQL são valores diferentes.
+
+<Callout type="warning" title="Pergunte sobre nulos antes de filtrar">
+Sempre que o enunciado usar "diferente de", "não está em" ou "não tem", pergunte se a coluna aceita `NULL` e o que fazer com essas linhas. Essa pergunta sozinha já mostra maturidade.
+</Callout>
+
+## Na entrevista
+
+Quando escrever um filtro negativo, diga em voz alta como ele trata os nulos. Se usar `NOT IN`, justifique que a coluna é `NOT NULL`; caso contrário, escreva `NOT EXISTS`. Follow-ups comuns: "por que esta consulta devolve zero linhas?" (quase sempre um `NOT IN` com `NULL`) e "qual a diferença entre `COALESCE` e `IFNULL`?" (número de argumentos e portabilidade).
+
+<QuizSet>
+<Quiz question="A subconsulta de um NOT IN devolve (1, 2, NULL). Quantas linhas o filtro x NOT IN (...) mantém?" options={["Todas em que x não é 1 nem 2", "Nenhuma", "Só as linhas com x nulo", "Depende do índice"]} answer={1} explanation="Para qualquer x fora de 1 e 2, a comparação com NULL fica desconhecida, então o NOT IN nunca é verdadeiro." />
+<Quiz question="Qual expressão evita erro de divisão por zero quando qtd pode ser 0?" options={["total / COALESCE(qtd, 0)", "total / NULLIF(qtd, 0)", "total / IFNULL(qtd, 1)", "total / (qtd IS NULL)"]} answer={1} explanation="NULLIF transforma 0 em NULL, e dividir por NULL resulta em NULL em vez de erro." />
+<Quiz question="WHERE desconto <> 0.10 em uma coluna com nulos devolve as linhas com desconto NULL?" options={["Sim", "Não, porque NULL <> 0.10 é desconhecido", "Só no MySQL", "Só se houver índice"]} answer={1} explanation="O WHERE descarta resultados desconhecidos. Use IS DISTINCT FROM ou adicione OR desconto IS NULL." />
+</QuizSet>

@@ -1,0 +1,171 @@
+---
+title: O que acontece quando você digita uma URL
+kind: lesson
+---
+
+É a pergunta de redes mais famosa das entrevistas porque não tem fundo: o entrevistador deixa você falar e vai cavando onde você parece seguro. O objetivo não é recitar tudo, e sim mostrar uma linha do tempo coerente, dizer quanto cada etapa custa em idas e voltas (RTT) e saber aprofundar qualquer uma delas. Este capítulo amarra o curso inteiro numa narrativa.
+
+## A linha do tempo
+
+Suponha `https://loja.exemplo.com/produtos?id=42`, primeira visita, RTT de 40 ms até o servidor.
+
+```text
+navegador          resolvedor DNS        servidor
+   |  parse da URL, HSTS, cache local       |
+   |---- consulta A/AAAA ---->|             |
+   |<--- 203.0.113.10 --------|             |   ~1 RTT até o resolvedor (ou 0 se em cache)
+   |------------------- SYN --------------->|
+   |<---------------- SYN-ACK --------------|   1 RTT
+   |----- ACK + ClientHello --------------->|
+   |<---- ServerHello, certificado, Finished|   1 RTT (TLS 1.3)
+   |----- Finished + GET /produtos?id=42 -->|
+   |<---- HTTP/2 200 + HTML ----------------|   1 RTT + tempo do servidor
+   |  parse do HTML, CSS, JS, imagens (reusa a conexão)
+```
+
+### 1. Antes da rede
+
+O navegador separa esquema, host, porta (443 implícita), caminho e query. Se o texto não parece URL, vira busca. Ele consulta a lista **HSTS**: se o domínio exige HTTPS, um `http://` é reescrito localmente, sem ir à rede. Também verifica o cache HTTP: um recurso fresco sai do disco com zero RTT, e um service worker pode responder antes de tudo.
+
+### 2. DNS
+
+Procura o IP no cache do navegador, depois no do sistema operacional (e no arquivo hosts), depois pergunta ao resolvedor recursivo configurado. Se ele também não tiver em cache, percorre raiz, TLD `.com` e servidor autoritativo do domínio. Navegadores modernos pedem também um registro HTTPS, que pode anunciar suporte a HTTP/3 e evitar uma tentativa a mais.
+
+### 3. Rota até o servidor
+
+O sistema compara o IP de destino com a tabela de rotas, percebe que não é da rede local e manda o quadro para o **gateway padrão**, cujo MAC descobre por ARP. Em casa, o roteador faz NAT e troca o IP privado pelo público. Daí em diante, cada roteador decide o próximo salto, e o BGP determina por quais redes o pacote atravessa a internet. Muitas vezes o destino é um ponto de presença de CDN perto de você, alcançado por anycast.
+
+### 4. TCP e TLS
+
+Handshake de três vias (1 RTT), depois TLS 1.3 (mais 1 RTT): o servidor apresenta o certificado, o navegador valida a cadeia até uma autoridade confiável, confere se o nome bate e se não expirou, e os dois derivam chaves de sessão por Diffie-Hellman. A negociação **ALPN** decide, dentro do próprio handshake, se a conversa será HTTP/2 ou HTTP/1.1.
+
+### 5. HTTP
+
+O navegador envia o GET com cabeçalhos (Host, cookies, Accept-Encoding). Do lado do servidor, um load balancer termina o TLS, roteia para uma instância, que consulta cache e banco. A resposta volta comprimida.
+
+### 6. Renderização
+
+O HTML é lido em fluxo: o navegador descobre CSS, JS e imagens e os pede, multiplexados na mesma conexão HTTP/2. CSS e scripts síncronos bloqueiam a primeira pintura, por isso o caminho crítico importa.
+
+## Quanto custa: RTTs, não bytes
+
+Para páginas pequenas, a latência é dominada pelo número de idas e voltas, não pela banda. O programa soma o tempo até o primeiro byte em cenários diferentes.
+
+```python
+RTT = 40          # ms até o servidor
+RTT_DNS = 20      # ms até o resolvedor
+SERVIDOR = 30     # ms de processamento
+
+def ttfb(dns_em_cache, conexao_reusada, tls, http3=False):
+    total = 0 if dns_em_cache else RTT_DNS
+    if not conexao_reusada:
+        if http3:
+            total += RTT              # QUIC junta transporte e TLS
+        else:
+            total += RTT              # TCP
+            total += {"1.2": 2, "1.3": 1}[tls] * RTT
+    return total + RTT + SERVIDOR     # requisição + resposta
+
+cenarios = [
+    ("primeira visita, TLS 1.2", ttfb(False, False, "1.2")),
+    ("primeira visita, TLS 1.3", ttfb(False, False, "1.3")),
+    ("primeira visita, HTTP/3", ttfb(False, False, "1.3", http3=True)),
+    ("DNS em cache, conexao nova", ttfb(True, False, "1.3")),
+    ("conexao keep-alive reusada", ttfb(True, True, "1.3")),
+]
+for nome, ms in cenarios:
+    print(f"{nome:<28} {ms:>4} ms")
+```
+
+```text
+Saída:
+primeira visita, TLS 1.2      210 ms
+primeira visita, TLS 1.3      170 ms
+primeira visita, HTTP/3       130 ms
+DNS em cache, conexao nova    150 ms
+conexao keep-alive reusada     70 ms
+```
+
+A diferença entre o pior e o melhor caso é de três vezes, e nenhuma delas tem a ver com o tamanho da página. É por isso que CDNs (RTT menor), reuso de conexão, TLS 1.3 e HTTP/3 são as alavancas de performance mais citadas.
+
+## Um ciclo completo em miniatura
+
+O programa abaixo encena as etapas sem internet: um "DNS" em memória com TTL, um servidor HTTP real em `127.0.0.1` numa porta livre e um cliente que conecta, envia o GET e lê a resposta.
+
+```python
+import http.client, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, parse_qs
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        q = parse_qs(urlsplit(self.path).query)
+        corpo = f"produto {q['id'][0]}".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(corpo)))
+        self.end_headers()
+        self.wfile.write(corpo)
+    def log_message(self, *args):
+        pass
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+porta = srv.server_address[1]
+t = threading.Thread(target=srv.serve_forever)
+t.start()
+
+url = urlsplit("http://loja.exemplo:8080/produtos?id=42")
+print("1. parse:", url.scheme, url.hostname, url.path, url.query)
+
+dns = {"loja.exemplo": ("127.0.0.1", 300)}   # nome -> (IP, TTL)
+ip, ttl = dns[url.hostname]
+print(f"2. DNS: {url.hostname} -> {ip} (TTL {ttl}s)")
+
+conn = http.client.HTTPConnection(ip, porta, timeout=5)
+conn.connect()
+print("3. TCP conectado:", conn.sock.getpeername()[0])
+conn.request("GET", f"{url.path}?{url.query}", headers={"Host": url.hostname})
+resp = conn.getresponse()
+print("4. HTTP:", resp.status, resp.reason, resp.getheader("Content-Type"))
+print("5. corpo:", resp.read().decode())
+conn.close()
+
+srv.shutdown()
+t.join()
+srv.server_close()
+```
+
+```text
+Saída:
+1. parse: http loja.exemplo /produtos id=42
+2. DNS: loja.exemplo -> 127.0.0.1 (TTL 300s)
+3. TCP conectado: 127.0.0.1
+4. HTTP: 200 OK text/plain
+5. corpo: produto 42
+```
+
+Repare que o cliente conecta no IP, mas manda `Host: loja.exemplo`. É esse cabeçalho (e o SNI, no TLS) que permite a um mesmo IP servir milhares de domínios.
+
+<Callout type="tip" title="Estruture pela profundidade">
+Comece com uma frase por etapa (URL, DNS, TCP, TLS, HTTP, renderização) em menos de um minuto. Depois pergunte onde o entrevistador quer aprofundar. Isso mostra visão do todo e evita que você gaste dez minutos em ARP quando ele queria falar de cache.
+</Callout>
+
+## Onde costuma dar errado
+
+| Sintoma | Etapa provável |
+| --- | --- |
+| "Não foi possível encontrar o servidor" | DNS (NXDOMAIN, resolvedor fora) |
+| Fica girando e dá timeout | Rota, firewall descartando SYN |
+| "Conexão recusada" | Nada escutando na porta (RST) |
+| Aviso de certificado | TLS: nome errado, expirado, cadeia incompleta |
+| 502 ou 504 | Load balancer não alcançou o backend |
+
+## Na entrevista
+
+Narre em camadas e com números de RTT; mencione caches em cada etapa (navegador, SO, resolvedor, CDN, HTTP). Follow-ups comuns: "como deixar o carregamento mais rápido?" (CDN, keep-alive, TLS 1.3 ou HTTP/3, preconnect, cache) e "o que muda se o site estiver atrás de um load balancer?" (o TLS termina nele; o backend vê o IP do LB, e o IP do cliente vai em `X-Forwarded-For`).
+
+<QuizSet>
+<Quiz question="Na primeira visita com TCP e TLS 1.3, quantos RTTs passam até a requisição HTTP poder ser enviada, sem contar DNS?" options={["0", "1", "2", "3"]} answer={2} explanation="Um RTT para o handshake TCP e outro para o TLS 1.3; a requisição segue junto com o Finished do cliente." />
+<Quiz question="Como um único IP de CDN sabe qual dos milhares de sites ele deve servir?" options={["Pela porta de destino", "Pelo SNI no TLS e pelo cabeçalho Host no HTTP", "Pelo endereço MAC do cliente", "Pelo TTL do DNS"]} answer={1} explanation="O nome do site viaja no SNI durante o handshake e no cabeçalho Host da requisição." />
+<Quiz question="Um usuário digita http://banco.exemplo e o navegador vai direto para HTTPS sem nenhuma requisição em HTTP. O que explica isso?" options={["Redirecionamento 301", "Lista HSTS do navegador", "DNSSEC", "ALPN"]} answer={1} explanation="Com HSTS, o navegador reescreve para HTTPS localmente, sem expor uma primeira requisição em texto aberto." />
+</QuizSet>

@@ -1,0 +1,96 @@
+---
+title: Monitoramento e drift
+kind: lesson
+---
+
+Um serviço web quebrado costuma avisar: erros 500, latência alta, alertas. Um modelo de ML quebrado frequentemente continua respondendo 200 com scores perfeitamente plausíveis, só que errados. A degradação é silenciosa, e por isso monitorar ML exige olhar além da saúde do serviço: você precisa vigiar **os dados que entram, as previsões que saem e, quando chegam, os rótulos**.
+
+## Tipos de mudança
+
+- **Data drift (covariate shift):** a distribuição das features muda. Exemplo: o app lança em outro país e a idade média dos usuários cai.
+- **Concept drift:** a relação entre features e rótulo muda. Os mesmos sinais que indicavam fraude deixam de indicar, porque os fraudadores se adaptaram.
+- **Prediction drift:** a distribuição dos scores muda. É barato de medir e funciona como alarme precoce para os dois tipos acima.
+- **Label drift:** a taxa base do rótulo muda (a fração de fraudes dobra numa Black Friday).
+- **Bugs de pipeline:** a causa mais comum na prática. Uma feature passa a vir nula, uma unidade muda de reais para centavos, um join para de casar.
+
+## O que monitorar, em camadas
+
+| Camada | Sinais | Latência do sinal |
+| --- | --- | --- |
+| Serviço | QPS, latência, erros, timeouts | Segundos |
+| Dados de entrada | Taxa de nulos, faixa de valores, categorias novas, drift por feature | Minutos |
+| Previsões | Média e distribuição do score, fração por classe | Minutos |
+| Qualidade | Precision, recall, calibração com rótulos reais | Horas a semanas |
+| Negócio | Receita, CTR, perdas com fraude | Dias |
+
+Quanto mais acima, mais rápido o sinal chega e menos ele diz sobre qualidade. Quando os rótulos demoram (fraude, churn), as camadas de dados e previsões são tudo o que você tem por semanas.
+
+## Medindo drift com PSI
+
+Uma métrica popular para comparar a distribuição de uma feature em produção com a de referência (o treino) é o **Population Stability Index**. Você divide os valores em faixas definidas pelos quantis da referência e soma, para cada faixa, `(atual - ref) * ln(atual / ref)`. Uma regra de bolso comum: abaixo de 0,1 é estável, entre 0,1 e 0,25 merece atenção, acima de 0,25 é mudança relevante.
+
+```python
+import math
+import random
+
+random.seed(11)
+
+def psi(ref, atual, faixas=10):
+    ordenados = sorted(ref)
+    cortes = [ordenados[int(len(ordenados) * i / faixas)] for i in range(1, faixas)]
+    def proporcoes(valores):
+        contagem = [0] * faixas
+        for v in valores:
+            contagem[sum(v > c for c in cortes)] += 1
+        return [max(c / len(valores), 1e-4) for c in contagem]
+    r, a = proporcoes(ref), proporcoes(atual)
+    return sum((x - y) * math.log(x / y) for x, y in zip(a, r))
+
+referencia = [random.gauss(100, 20) for _ in range(5000)]  # valor do pedido no treino
+cenarios = {
+    "mesma distribuicao": [random.gauss(100, 20) for _ in range(5000)],
+    "media +5": [random.gauss(105, 20) for _ in range(5000)],
+    "media +20": [random.gauss(120, 20) for _ in range(5000)],
+    "bug: valores em centavos (10%)": [random.gauss(100, 20) * (100 if random.random() < 0.1 else 1) for _ in range(5000)],
+}
+lo, hi = min(referencia), max(referencia)
+for nome, atual in cenarios.items():
+    valor = psi(referencia, atual)
+    nivel = "estavel" if valor < 0.1 else "atencao" if valor < 0.25 else "ALERTA"
+    fora = sum(not lo <= v <= hi for v in atual) / len(atual)
+    print(f"{nome:32s} PSI={valor:.3f} {nivel:8s} fora da faixa={fora:.1%}")
+```
+
+```text
+Saída:
+mesma distribuicao               PSI=0.002 estavel  fora da faixa=0.1%
+media +5                         PSI=0.069 estavel  fora da faixa=0.0%
+media +20                        PSI=0.907 ALERTA   fora da faixa=0.0%
+bug: valores em centavos (10%)   PSI=0.069 estavel  fora da faixa=10.9%
+```
+
+O deslocamento grande da média dispara o alerta, e o pequeno fica abaixo do limiar, como esperado. Mas repare no bug de unidade: 10% das linhas multiplicadas por 100 passam como "estável". Como a última faixa é aberta, um valor de 10.000 conta igual a um de 140, e o PSI só vê a faixa do topo ficar um pouco mais cheia. A verificação simples de "fora da faixa vista no treino" pega o bug na hora. Por isso, monitoramento de dados combina métricas de distribuição com validações de esquema e de limites (nulos, mínimo, máximo, categorias desconhecidas).
+
+## Armadilhas
+
+- **Alertas demais:** com centenas de features, alguma vai "driftar" todo dia. Priorize as features mais importantes para o modelo e alerte sobre o score, que resume tudo.
+- **Drift não é necessariamente problema:** se a distribuição muda mas a precisão se mantém, retreinar pode ser desperdício. Drift é motivo para investigar, não gatilho cego.
+- **Amostra pequena:** PSI com poucas centenas de pontos é ruidoso. Agregue por janela de tempo suficiente.
+- **Sazonalidade:** compare segunda com segunda, não segunda com domingo, ou o alarme vai tocar toda semana.
+
+## Do alerta à ação
+
+Um bom sistema define antes o que acontece quando o alerta dispara: verificar se é bug de dados (o caso mais comum), retreinar com dados recentes, reverter para a versão anterior ou acionar um fallback por regras. O retreino pode ser agendado (todo dia) ou disparado por drift; o agendado é mais previsível e mais simples de operar.
+
+<Callout type="tip" title="Rótulos atrasados pedem proxies">
+Se o rótulo de fraude chega em 60 dias, use sinais precoces como proxy: disputas abertas, revisões manuais, taxa de bloqueio. Eles não substituem o rótulo, mas encurtam o tempo até você perceber um problema.
+</Callout>
+
+## Na entrevista
+
+Separe claramente o monitoramento do serviço do monitoramento do modelo, cite data drift e concept drift com um exemplo do domínio e proponha uma métrica concreta (PSI, KS, divergência) por feature e sobre o score. Explique o que fazer quando os rótulos atrasam. Follow-ups comuns: como evitar fadiga de alertas, quando retreinar automaticamente e como diferenciar drift real de bug no pipeline.
+
+<QuizSet>
+<Quiz question="Num modelo de fraude, o rótulo só chega 45 dias depois. Qual sinal permite perceber um problema na primeira hora após um deploy?" options={["Precision com rótulos confirmados", "Distribuição dos scores e das features de entrada comparada à referência", "Receita trimestral", "AUC offline do conjunto de teste"]} answer={1} explanation="Sem rótulos, as camadas de entrada e saída do modelo são os sinais disponíveis rapidamente." />
+<Quiz question="O PSI da feature valor_compra saltou para 0,9 de um dia para o outro, sem nenhuma mudança de negócio. Qual a hipótese mais provável?" options={["Concept drift", "Mudança no comportamento dos clientes", "Bug no pipeline, como mudança de unidade ou de fonte", "O modelo precisa de mais camadas"]} answer={2} explanation="Mudanças abruptas e enormes sem causa de negócio costumam ser bugs de dados; verifique o pipeline antes de retreinar." />
+</QuizSet>

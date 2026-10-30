@@ -1,0 +1,103 @@
+---
+title: O que é ML system design
+kind: lesson
+---
+
+Numa entrevista de system design comum, você desenha serviços, bancos e filas. Numa entrevista de **ML system design**, o pedido parece parecido ("projete o feed de um app de vídeos", "detecte fraude em pagamentos"), mas o centro da conversa muda: como transformar um objetivo de negócio num problema de aprendizado, de onde vêm os dados e os rótulos, como treinar, servir e acompanhar um modelo que piora sozinho com o tempo. O modelo em si costuma ser a menor caixa do diagrama.
+
+## O problema que a disciplina resolve
+
+Um notebook com 0,92 de AUC não é um produto. Entre o experimento e o usuário existem perguntas que nenhum algoritmo responde:
+
+- **O que otimizar?** "Aumentar engajamento" vira cliques, tempo assistido, retenção em 7 dias? Cada escolha produz um sistema diferente.
+- **De onde vêm os rótulos?** Cliques chegam em segundos; um estorno de fraude pode levar 60 dias.
+- **Como a feature calculada no treino é a mesma do servimento?** Se não for, o modelo vê em produção um mundo que nunca viu.
+- **Quanto tempo você tem para responder?** Ranquear 500 itens em 100 ms é outro problema que pontuar 10 milhões de clientes numa madrugada.
+- **Como saber se piorou?** O mundo muda, os usuários mudam, e o modelo envelhece sem nenhum erro no log.
+
+ML system design é a engenharia em volta do modelo: dados, features, treino, servimento, avaliação e monitoramento, tratados como um sistema só.
+
+## As peças do sistema
+
+```text
+ eventos do produto ──> log / fila ──> data lake ──> pipeline de rótulos
+                                           │                 │
+                                           v                 v
+                                     feature store ──> treino (batch)
+                                       │       │             │
+                          features online      │        registro de modelos
+                                       │       │             │
+ requisição ──> serviço de predição <──┘       └──── avaliação offline
+                     │
+                     v
+               resposta + log da predição ──> monitoramento e testes A/B
+```
+
+Repare no ciclo: as predições viram eventos, que viram rótulos, que treinam o próximo modelo. Esse laço de realimentação é a fonte de boa parte dos bugs sutis, como o modelo que só aprende sobre os itens que ele mesmo escolheu mostrar.
+
+## Comece pelo baseline
+
+Antes de qualquer rede neural, pergunte qual é a regra mais simples que resolve parte do problema e como ela se sai na métrica certa. O programa abaixo simula 2.000 transações hipotéticas com 2% de fraude e compara três abordagens: dizer sempre "não é fraude", uma regra de valor alto e uma regra que combina valor e conta nova.
+
+```python
+import random
+
+random.seed(7)
+transacoes = []
+for _ in range(2000):
+    fraude = random.random() < 0.02
+    conta_nova = random.random() < (0.7 if fraude else 0.1)
+    valor = random.gauss(900 if fraude else 300, 250)
+    transacoes.append((valor, conta_nova, fraude))
+
+def avaliar(nome, regra):
+    tp = fp = fn = tn = 0
+    for valor, nova, fraude in transacoes:
+        alerta = regra(valor, nova)
+        if alerta and fraude: tp += 1
+        elif alerta: fp += 1
+        elif fraude: fn += 1
+        else: tn += 1
+    acuracia = (tp + tn) / len(transacoes)
+    precisao = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn)
+    print(f"{nome:<25} acuracia={acuracia:.3f} precisao={precisao:.2f} recall={recall:.2f}")
+
+avaliar("sempre legitima", lambda v, n: False)
+avaliar("valor > 700", lambda v, n: v > 700)
+avaliar("valor > 600 e conta nova", lambda v, n: v > 600 and n)
+```
+
+```text
+Saída:
+sempre legitima           acuracia=0.978 precisao=0.00 recall=0.00
+valor > 700               acuracia=0.937 precisao=0.22 recall=0.73
+valor > 600 e conta nova  acuracia=0.979 precisao=0.52 recall=0.57
+```
+
+A regra "sempre legítima" tem 97,8% de acurácia e não pega nenhuma fraude, enquanto a regra `valor > 700` pega 73% das fraudes com acurácia menor: com classes desbalanceadas, acurácia é a métrica errada. Combinar dois sinais simples já dobra a precisão. Esse é o patamar que um modelo precisa superar para justificar o custo de manter um pipeline de ML, e é também o fallback quando o modelo cair.
+
+## Trade-offs que aparecem em todo projeto
+
+| Decisão | Um extremo | Outro extremo |
+| --- | --- | --- |
+| Complexidade do modelo | Regra ou regressão: barata, explicável | Rede profunda: mais qualidade, mais custo e latência |
+| Frescor | Treino diário em batch | Atualização contínua com streaming |
+| Momento da predição | Pré-calculada em batch | Calculada na requisição |
+| Rótulo | Rápido e ruidoso (clique) | Lento e fiel (compra, estorno) |
+
+Nenhuma coluna é certa por padrão. O que decide é o requisito: latência, volume, custo de erro e quão rápido o mundo muda.
+
+<Callout type="tip" title="O modelo é a última coisa">
+Entrevistadores de ML system design reprovam com frequência quem pula direto para "uso um transformer". Mostre que você sabe enquadrar o problema, escolher a métrica e montar o baseline antes de falar de arquitetura de rede.
+</Callout>
+
+## Na entrevista
+
+Abra reformulando o pedido em termos de negócio e de ML: "o objetivo é aumentar o tempo assistido; vou modelar isso como prever a probabilidade de o usuário assistir mais de 50% do vídeo". Diga qual seria o baseline sem ML e por que ele não basta. Depois percorra dados, features, modelo, servimento, avaliação e monitoramento, nessa ordem. Perguntas de follow-up comuns: "precisa mesmo de ML aqui?", "o que acontece se o serviço de modelo cair?" (fallback para a regra ou para popularidade) e "como você saberia que o modelo piorou?".
+
+<QuizSet>
+<Quiz question="Num problema com 1% de positivos, um modelo que sempre prevê 'negativo' tem 99% de acurácia. O que isso indica?" options={["Que o modelo é excelente", "Que acurácia não serve como métrica principal nesse problema", "Que é preciso mais dados negativos", "Que o problema não tem solução"]} answer={1} explanation="Com classes desbalanceadas, a acurácia é dominada pela classe majoritária. Precisão, recall ou AUC refletem melhor o objetivo." />
+<Quiz question="Por que vale a pena construir um baseline simples antes do modelo?" options={["Porque entrevistadores proíbem redes neurais", "Para ter um patamar de comparação e um fallback se o modelo falhar", "Porque baselines sempre vencem modelos", "Para economizar armazenamento"]} answer={1} explanation="O baseline mostra quanto o modelo realmente agrega e serve de plano B em produção." />
+<Quiz question="Qual peça fecha o laço de realimentação de um sistema de ML?" options={["O balanceador de carga", "O log das predições e dos resultados, que vira dado de treino", "O registro de modelos", "A CDN"]} answer={1} explanation="As predições influenciam o que o usuário vê; o que ele faz vira rótulo para o próximo treino, criando o laço." />
+</QuizSet>

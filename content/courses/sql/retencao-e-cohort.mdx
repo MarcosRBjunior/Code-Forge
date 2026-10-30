@@ -1,0 +1,178 @@
+---
+title: Retenção e cohorts
+kind: lesson
+---
+
+Em rodadas de SQL para vagas de data, produto ou growth, uma pergunta aparece quase sempre: "dos usuários que se cadastraram em janeiro, quantos voltaram no mês seguinte?". Isso é **retenção**, e a forma de organizar a resposta é por **cohort**: um grupo de usuários que começou no mesmo período. A consulta junta várias peças que você já conhece (agregação, junções, `CASE`, janelas e aritmética de datas), e o entrevistador observa principalmente se você define bem o que conta como "ativo" e "voltou".
+
+## Definições antes do código
+
+Antes de escrever, combine três coisas com o entrevistador:
+
+- **Evento de entrada**: cadastro, primeira compra ou primeiro login. Define a cohort do usuário.
+- **Evento de atividade**: o que conta como ter voltado (login, compra, sessão com mais de um minuto).
+- **Granularidade**: dia, semana ou mês. Retenção do mês 1 significa "ativo no mês seguinte ao de entrada".
+
+Retenção do período N é: usuários da cohort ativos no período N divididos pelo tamanho da cohort.
+
+## O esquema
+
+```sql
+CREATE TABLE usuarios (
+  id            integer PRIMARY KEY,
+  cadastrado_em date NOT NULL
+);
+
+CREATE TABLE atividades (
+  usuario_id integer NOT NULL REFERENCES usuarios (id),
+  dia        date NOT NULL
+);
+
+INSERT INTO usuarios VALUES
+  (1, '2024-01-05'), (2, '2024-01-20'), (3, '2024-01-28'),
+  (4, '2024-02-03'), (5, '2024-02-14'),
+  (6, '2024-03-01');
+
+INSERT INTO atividades VALUES
+  (1, '2024-01-05'), (1, '2024-02-10'), (1, '2024-03-02'),
+  (2, '2024-01-21'), (2, '2024-02-25'), (2, '2024-02-26'),
+  (3, '2024-01-28'),
+  (4, '2024-02-03'), (4, '2024-03-15'),
+  (5, '2024-02-14'),
+  (6, '2024-03-01');
+
+SELECT date_trunc('month', cadastrado_em)::date AS cohort, count(*) AS usuarios
+FROM usuarios
+GROUP BY cohort
+ORDER BY cohort;
+```
+
+```text
+Saída:
+cohort | usuarios
+2024-01-01 | 3
+2024-02-01 | 2
+2024-03-01 | 1
+```
+
+`date_trunc` é do Postgres. No MySQL, o equivalente comum é `DATE_FORMAT(cadastrado_em, '%Y-%m-01')`.
+
+## Passo 1: o mês relativo de cada atividade
+
+Para cada atividade, calcule quantos meses se passaram desde a cohort do usuário. No Postgres, fazemos a conta com ano e mês extraídos:
+
+```sql
+SELECT a.usuario_id,
+       date_trunc('month', u.cadastrado_em)::date AS cohort,
+       (extract(year FROM a.dia) * 12 + extract(month FROM a.dia))::int
+     - (extract(year FROM u.cadastrado_em) * 12 + extract(month FROM u.cadastrado_em))::int AS mes
+FROM atividades a
+JOIN usuarios u ON u.id = a.usuario_id
+WHERE a.usuario_id IN (1, 2)
+ORDER BY a.usuario_id, a.dia;
+```
+
+```text
+Saída:
+usuario_id | cohort | mes
+1 | 2024-01-01 | 0
+1 | 2024-01-01 | 1
+1 | 2024-01-01 | 2
+2 | 2024-01-01 | 0
+2 | 2024-01-01 | 1
+2 | 2024-01-01 | 1
+```
+
+O usuário 2 aparece duas vezes no mês 1. Por isso a contagem a seguir usa `count(DISTINCT usuario_id)`: retenção conta **pessoas**, não eventos. No MySQL, `TIMESTAMPDIFF(MONTH, ...)` existe, mas conta meses completos entre datas, o que dá resultado diferente do "mês de calendário"; a conta com ano vezes 12 mais mês evita a ambiguidade nos dois bancos.
+
+## Passo 2: a tabela de cohorts
+
+```sql
+WITH base AS (
+  SELECT a.usuario_id,
+         date_trunc('month', u.cadastrado_em)::date AS cohort,
+         (extract(year FROM a.dia) * 12 + extract(month FROM a.dia))::int
+       - (extract(year FROM u.cadastrado_em) * 12 + extract(month FROM u.cadastrado_em))::int AS mes
+  FROM atividades a
+  JOIN usuarios u ON u.id = a.usuario_id
+)
+SELECT cohort, mes, count(DISTINCT usuario_id) AS ativos
+FROM base
+GROUP BY cohort, mes
+ORDER BY cohort, mes;
+```
+
+```text
+Saída:
+cohort | mes | ativos
+2024-01-01 | 0 | 3
+2024-01-01 | 1 | 2
+2024-01-01 | 2 | 1
+2024-02-01 | 0 | 2
+2024-02-01 | 1 | 1
+2024-03-01 | 0 | 1
+```
+
+## Passo 3: percentual e formato de matriz
+
+Divida pelo tamanho da cohort. Uma janela sobre a própria agregação pega o valor do mês 0, e a agregação condicional gira a tabela para o formato clássico de matriz:
+
+```sql
+WITH base AS (
+  SELECT a.usuario_id,
+         date_trunc('month', u.cadastrado_em)::date AS cohort,
+         (extract(year FROM a.dia) * 12 + extract(month FROM a.dia))::int
+       - (extract(year FROM u.cadastrado_em) * 12 + extract(month FROM u.cadastrado_em))::int AS mes
+  FROM atividades a
+  JOIN usuarios u ON u.id = a.usuario_id
+),
+contagem AS (
+  SELECT cohort, mes, count(DISTINCT usuario_id) AS ativos
+  FROM base
+  GROUP BY cohort, mes
+),
+taxas AS (
+  SELECT cohort, mes, ativos,
+         round(100.0 * ativos / max(ativos) FILTER (WHERE mes = 0) OVER (PARTITION BY cohort), 1) AS pct
+  FROM contagem
+)
+SELECT cohort,
+       max(ativos) FILTER (WHERE mes = 0) AS tamanho,
+       max(pct) FILTER (WHERE mes = 1) AS mes_1,
+       max(pct) FILTER (WHERE mes = 2) AS mes_2
+FROM taxas
+GROUP BY cohort
+ORDER BY cohort;
+```
+
+```text
+Saída:
+cohort | tamanho | mes_1 | mes_2
+2024-01-01 | 3 | 66.7 | 33.3
+2024-02-01 | 2 | 50.0 | NULL
+2024-03-01 | 1 | NULL | NULL
+```
+
+Os `NULL` têm significados diferentes: a cohort de março ainda não teve mês 1 (os dados acabam em março), enquanto uma cohort antiga sem ninguém ativo deveria mostrar 0. Num relatório real, você distinguiria os dois casos, por exemplo trocando por 0 só quando o período já terminou.
+
+`FILTER (WHERE ...)` é do Postgres. No MySQL, escreva `MAX(CASE WHEN mes = 1 THEN pct END)`, que funciona nos dois.
+
+<Callout type="warning" title="O tamanho da cohort vem de usuarios">
+Aqui o mês 0 tem todos porque cada usuário registra atividade no dia do cadastro. Se isso não for garantido, calcule o tamanho da cohort a partir da tabela `usuarios`, senão quem nunca voltou some do denominador e a retenção fica inflada.
+</Callout>
+
+## Armadilhas
+
+- Contar eventos em vez de usuários distintos.
+- Denominador errado, tirado das atividades em vez dos cadastros.
+- Misturar "mês de calendário" com "30 dias depois do cadastro": são métricas diferentes; diga qual está usando.
+- Fuso horário: um login às 23h em São Paulo pode cair no dia seguinte em UTC.
+
+## Na entrevista
+
+Comece pelas definições, depois construa em camadas: cohort de cada usuário, período relativo de cada atividade, contagem distinta por cohort e período, e só no fim a divisão e o pivô. Valide com um usuário específico. Follow-ups comuns: "e a retenção semanal?" (troque o truncamento e a conta de períodos) e "como calcular churn?" (o complemento: usuários ativos num período e ausentes no seguinte, via anti-join ou `LEAD`).
+
+<QuizSet>
+<Quiz question="Por que a contagem de ativos usa count(DISTINCT usuario_id)?" options={["Porque count(*) não funciona com GROUP BY", "Porque um usuário pode ter várias atividades no mesmo período e retenção conta pessoas", "Para ordenar o resultado", "Porque usuario_id pode ser NULL"]} answer={1} explanation="Sem DISTINCT, um usuário com três logins no mês contaria três vezes e a taxa passaria de 100%." />
+<Quiz question="Se nem todo usuário tem atividade no mês do cadastro, de onde deve vir o tamanho da cohort?" options={["Da contagem do mês 0 nas atividades", "Da tabela de cadastros, agrupada pelo mês de entrada", "Do maior valor entre os meses", "Do total de atividades"]} answer={1} explanation="O denominador é quem entrou na cohort, não quem foi ativo; tirar das atividades exclui quem nunca usou o produto." />
+</QuizSet>

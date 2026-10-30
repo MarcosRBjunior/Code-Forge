@@ -1,0 +1,131 @@
+---
+title: Troca de contexto
+kind: lesson
+---
+
+Para dar a ilusão de que centenas de processos rodam ao mesmo tempo, o kernel precisa parar um processo no meio, guardar tudo o que ele estava fazendo e retomar outro exatamente de onde tinha parado. Essa operação é a **troca de contexto** (context switch). Ela é invisível para o programa, mas não é de graça, e é uma das razões por que "mais threads" nem sempre significa "mais rápido".
+
+## O que é o contexto
+
+O contexto é o conjunto mínimo de informação que permite retomar a execução como se nada tivesse acontecido:
+
+- **Contador de programa (PC):** a próxima instrução.
+- **Ponteiro de pilha** e os demais registradores de uso geral.
+- **Registrador de flags** (resultado de comparações, modo da CPU).
+- **Estado de ponto flutuante e vetorial** (SSE/AVX), salvo às vezes de forma preguiçosa.
+- **Raiz da tabela de páginas** (CR3 em x86), se o próximo for de outro processo.
+
+## Passo a passo
+
+```text
+ processo A executando
+        │  interrupção do timer (ou A faz uma syscall que bloqueia)
+        ▼
+ kernel salva registradores de A no PCB de A
+        │
+ escalonador escolhe B na fila de prontos
+        │
+ kernel carrega registradores de B do PCB de B
+ troca a tabela de páginas (se B é outro processo)
+        │
+        ▼
+ retorna ao modo usuário: B continua de onde parou
+```
+
+A simulação abaixo faz isso com uma CPU de mentira que tem só dois registradores, `pc` e `acc`. Cada processo soma valores numa conta; a cada duas instruções o "timer" dispara, o contexto atual vai para o PCB e o próximo é restaurado.
+
+```python
+programas = {
+    "A": [("add", 5), ("add", 5), ("add", 5), ("add", 5)],
+    "B": [("add", 100), ("mul", 2), ("add", 1)],
+}
+pcb = {nome: {"pc": 0, "acc": 0} for nome in programas}
+cpu = {"pc": 0, "acc": 0}
+fila = ["A", "B"]
+QUANTUM = 2
+trocas = 0
+
+while fila:
+    atual = fila.pop(0)
+    cpu.update(pcb[atual])                      # restaura contexto
+    for _ in range(QUANTUM):
+        if cpu["pc"] >= len(programas[atual]):
+            break
+        op, valor = programas[atual][cpu["pc"]]
+        cpu["acc"] = cpu["acc"] + valor if op == "add" else cpu["acc"] * valor
+        cpu["pc"] += 1
+    pcb[atual] = dict(cpu)                      # salva contexto
+    trocas += 1
+    print(f"{atual}: pc={cpu['pc']} acc={cpu['acc']}")
+    if cpu["pc"] < len(programas[atual]):
+        fila.append(atual)
+
+print("resultado:", {n: c["acc"] for n, c in pcb.items()}, "trocas:", trocas)
+```
+
+```text
+Saída:
+A: pc=2 acc=10
+B: pc=2 acc=200
+A: pc=4 acc=20
+B: pc=3 acc=201
+resultado: {'A': 20, 'B': 201} trocas: 4
+```
+
+Mesmo interrompidos no meio, A termina com 20 e B com 201, exatamente o que dariam se rodassem sozinhos. Esse é o contrato da troca de contexto.
+
+## Custo direto e custo indireto
+
+O **custo direto** (salvar, escolher, restaurar) fica na casa de 1 a 5 microssegundos num Linux moderno. O **custo indireto** costuma ser maior: o processo que entra encontra caches L1/L2 e a TLB cheios de dados do anterior e passa um tempo rodando mais devagar até "esquentar" de novo. Trocar entre threads do mesmo processo é mais barato porque a tabela de páginas não muda e a TLB não precisa ser descartada.
+
+| Tipo de troca | Troca tabela de páginas? | Custo relativo |
+| --- | --- | --- |
+| Entre threads do mesmo processo | Não | Menor |
+| Entre processos | Sim | Maior (TLB, caches) |
+| Modo usuário ↔ kernel (syscall) | Não é troca de contexto completa | Menor ainda |
+| Corrotina/green thread em espaço de usuário | Não envolve o kernel | Dezenas de ns |
+
+## Quanto do tempo vai embora
+
+A fração da CPU gasta com trocas depende da relação entre o quantum e o custo de cada troca:
+
+```python
+CUSTO_TROCA_US = 5  # direto + parte do indireto
+
+print("quantum(us)  trocas/s  overhead")
+for quantum in [10, 100, 1_000, 10_000]:
+    trocas_por_segundo = 1_000_000 // (quantum + CUSTO_TROCA_US)
+    overhead = CUSTO_TROCA_US / (quantum + CUSTO_TROCA_US)
+    print(f"{quantum:>11}  {trocas_por_segundo:>8}  {overhead:>8.2%}")
+```
+
+```text
+Saída:
+quantum(us)  trocas/s  overhead
+         10     66666    33.33%
+        100      9523     4.76%
+       1000       995     0.50%
+      10000        99     0.05%
+```
+
+Quantum curto dá resposta rápida a processos interativos, mas joga uma fatia grande da CPU fora. Quantum longo é eficiente, mas um processo pode esperar muito pela sua vez. É o mesmo trade-off que você verá em Round Robin.
+
+<Callout type="tip" title="Onde isso aparece no dia a dia">
+Um servidor com milhares de threads bloqueantes passa boa parte do tempo trocando de contexto. Por isso servidores de alto desempenho usam poucos threads com E/S assíncrona (epoll, io_uring) ou corrotinas, e por isso pools de threads costumam ter tamanho próximo ao número de núcleos para trabalho de CPU.
+</Callout>
+
+```bash
+vmstat 1                  # coluna cs = trocas de contexto por segundo
+pidstat -w -p 1234 1      # voluntárias (bloqueou) vs involuntárias (preemptado)
+```
+
+Trocas **voluntárias** acontecem quando o processo bloqueia (E/S, lock). **Involuntárias** acontecem quando o timer o tira da CPU. Muitas involuntárias indicam CPU disputada; muitas voluntárias indicam muita espera.
+
+## Na entrevista
+
+Liste o que é salvo, diferencie custo direto de indireto (caches e TLB) e compare trocas entre threads e entre processos. Follow-ups comuns: "por que corrotinas são mais leves que threads?" (trocam em espaço de usuário, sem kernel e com pilha pequena) e "como você detectaria excesso de trocas de contexto?" (`vmstat`, `pidstat -w`).
+
+<QuizSet>
+<Quiz question="Por que a troca de contexto entre threads do mesmo processo é mais barata do que entre processos?" options={["Threads não têm registradores", "O espaço de endereçamento é o mesmo, então não é preciso trocar a tabela de páginas nem invalidar a TLB", "Threads rodam em modo kernel", "O kernel não participa da troca entre threads"]} answer={1} explanation="Threads compartilham memória; a troca só salva e restaura registradores, preservando TLB e boa parte dos caches." />
+<Quiz question="Um serviço Java com 2.000 threads tem CPU alta, mas pouco trabalho útil. O vmstat mostra centenas de milhares de cs por segundo. O que fazer?" options={["Aumentar o número de threads", "Reduzir o número de threads e usar E/S assíncrona ou um pool dimensionado", "Desligar o timer do kernel", "Aumentar a memória da JVM"]} answer={1} explanation="O excesso de threads gera trocas de contexto constantes; menos threads ou modelos assíncronos reduzem o overhead." />
+</QuizSet>

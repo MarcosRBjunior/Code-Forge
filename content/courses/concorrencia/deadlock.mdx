@@ -1,0 +1,176 @@
+---
+title: Deadlock e as condições de Coffman
+kind: lesson
+---
+
+Deadlock é quando um grupo de threads fica parado para sempre porque cada uma espera um recurso que outra do grupo segura. Não há erro, não há exceção, não há CPU alta: o processo simplesmente para de responder. É o bug de concorrência mais citado em entrevista porque é fácil de criar, difícil de reproduzir e tem uma teoria limpa por trás.
+
+## O exemplo clássico
+
+Duas contas, cada uma com seu lock. A thread 1 transfere de A para B e a thread 2, de B para A, ao mesmo tempo:
+
+```python
+def transferir(origem, destino, valor):
+    with origem.lock:          # T1 pega A          | T2 pega B
+        with destino.lock:     # T1 espera B (de T2) | T2 espera A (de T1)
+            origem.saldo -= valor
+            destino.saldo += valor
+```
+
+```text
+   T1 --segura--> [lock A]
+    ^                 |
+    |              espera
+  espera              v
+ [lock B] <--segura-- T2
+```
+
+O ciclo no grafo de espera é a assinatura do deadlock. O código parece correto, passa em testes e trava em produção sob carga, quando as duas transferências se cruzam na janela errada.
+
+## As quatro condições de Coffman
+
+Um deadlock só acontece quando **as quatro** valem ao mesmo tempo:
+
+| Condição | Significado | Como quebrar |
+| --- | --- | --- |
+| Exclusão mútua | O recurso é usado por uma thread por vez | Recursos compartilháveis, imutabilidade |
+| Segurar e esperar | Quem segura um recurso pede outro | Pegar tudo de uma vez, ou nada |
+| Sem preempção | Ninguém tira o recurso de quem o segura | `tryLock` com timeout e desistência |
+| Espera circular | Existe um ciclo de esperas | Ordem global de aquisição |
+
+Como basta quebrar uma, a prevenção é escolher qual delas atacar. Na prática, a mais usada é a última.
+
+## Prevenção por ordenação
+
+Se toda thread adquire os locks numa ordem global fixa (por id da conta, por endereço do objeto), um ciclo é impossível: ninguém segura um lock "maior" esperando um "menor".
+
+```python
+import threading
+
+class Conta:
+    def __init__(self, ident, saldo):
+        self.ident = ident
+        self.saldo = saldo
+        self.lock = threading.Lock()
+
+def transferir(origem, destino, valor):
+    primeiro, segundo = sorted((origem, destino), key=lambda c: c.ident)
+    with primeiro.lock:
+        with segundo.lock:
+            origem.saldo -= valor
+            destino.saldo += valor
+
+a = Conta(1, 1000)
+b = Conta(2, 1000)
+
+def ida():
+    for _ in range(5000):
+        transferir(a, b, 1)
+
+def volta():
+    for _ in range(5000):
+        transferir(b, a, 1)
+
+threads = [threading.Thread(target=ida), threading.Thread(target=volta)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("saldo A:", a.saldo)
+print("saldo B:", b.saldo)
+print("total preservado:", a.saldo + b.saldo == 2000)
+```
+
+```text
+Saída:
+saldo A: 1000
+saldo B: 1000
+total preservado: True
+```
+
+## Recuar com timeout
+
+Quando não dá para impor ordem (locks vêm de bibliotecas diferentes, a ordem só é conhecida em tempo de execução), quebre a condição de "sem preempção": tente o segundo lock com prazo e, se falhar, solte o que tem e tente de novo depois. O programa abaixo força as duas threads a pegarem o primeiro lock antes de tentarem o segundo, reproduzindo o cruzamento de forma determinística; com `acquire(timeout=...)`, ambas detectam o impasse em vez de travar.
+
+```python
+import threading
+
+lock_a = threading.Lock()
+lock_b = threading.Lock()
+pegaram_o_primeiro = threading.Barrier(2)
+tentaram_o_segundo = threading.Barrier(2)
+resultado = {}
+
+def tarefa(nome, primeiro, segundo):
+    with primeiro:
+        pegaram_o_primeiro.wait()
+        conseguiu = segundo.acquire(timeout=0.2)
+        if conseguiu:
+            segundo.release()
+        resultado[nome] = conseguiu
+        tentaram_o_segundo.wait()  # ninguém solta antes de os dois tentarem
+
+t1 = threading.Thread(target=tarefa, args=("T1", lock_a, lock_b))
+t2 = threading.Thread(target=tarefa, args=("T2", lock_b, lock_a))
+t1.start(); t2.start()
+t1.join(); t2.join()
+for nome in sorted(resultado):
+    print(nome, "conseguiu o segundo lock:", resultado[nome])
+print("impasse detectado; as duas soltam e tentam de novo")
+```
+
+```text
+Saída:
+T1 conseguiu o segundo lock: False
+T2 conseguiu o segundo lock: False
+impasse detectado; as duas soltam e tentam de novo
+```
+
+Em Java isso é `ReentrantLock.tryLock(tempo, unidade)`; em C++, `std::timed_mutex::try_lock_for`, e `std::scoped_lock` adquire vários mutexes com um algoritmo que evita deadlock. Cuidado: se as duas recuam e tentam de novo no mesmo ritmo, você troca deadlock por livelock. Adicione espera aleatória antes de retentar.
+
+## Detecção
+
+Bancos de dados não podem impor ordem às transações dos usuários, então detectam: mantêm o grafo "quem espera quem", procuram ciclos e abortam uma vítima.
+
+```python
+def tem_ciclo(espera):
+    visitando, feito = set(), set()
+    def dfs(n):
+        visitando.add(n)
+        for m in espera.get(n, []):
+            if m in visitando or (m not in feito and dfs(m)):
+                return True
+        visitando.discard(n)
+        feito.add(n)
+        return False
+    return any(dfs(n) for n in espera if n not in feito)
+
+print(tem_ciclo({"T1": ["T2"], "T2": ["T3"], "T3": []}))
+print(tem_ciclo({"T1": ["T2"], "T2": ["T3"], "T3": ["T1"]}))
+```
+
+```text
+Saída:
+False
+True
+```
+
+<Callout type="tip" title="Diagnóstico em produção">
+Um thread dump (`jstack` na JVM, `py-spy dump` em Python, o dump de goroutines do Go) mostra em qual lock cada thread está parada. A JVM até aponta "Found one Java-level deadlock".
+</Callout>
+
+## Armadilhas
+
+- **Chamar código desconhecido segurando um lock** (callbacks, listeners, métodos sobrescrevíveis): ele pode adquirir outros locks em ordem que você não controla.
+- **Deadlock com um lock só**: lock não reentrante adquirido duas vezes pela mesma thread, ou thread que faz `join` de outra que espera um lock que ela segura.
+- **Pools**: uma tarefa que espera o resultado de outra tarefa no mesmo pool cheio também trava, sem lock nenhum.
+
+## Na entrevista
+
+Defina deadlock, desenhe o ciclo e liste as quatro condições de Coffman. Depois escolha a estratégia: ordem global de locks como padrão, timeout com recuo quando a ordem não é viável, detecção quando há um coordenador (banco de dados). Follow-ups comuns: "como você descobriria um deadlock em produção?" (thread dump, métricas de requisições paradas) e "ordem por id funciona se as duas contas forem a mesma?" (trate origem igual a destino antes, senão um lock não reentrante trava).
+
+<QuizSet>
+<Quiz question="Qual técnica elimina a condição de espera circular?" options={["Usar locks reentrantes", "Definir uma ordem global e sempre adquirir os locks nessa ordem", "Aumentar o número de threads", "Usar volatile nas variáveis"]} answer={1} explanation="Com ordem total na aquisição, nenhuma thread segura um lock posterior esperando um anterior, então não forma ciclo." />
+<Quiz question="tryLock com timeout seguido de liberação dos locks já obtidos quebra qual condição de Coffman?" options={["Exclusão mútua", "Sem preempção, pois a thread abre mão do que segurava", "Espera circular diretamente", "Nenhuma"]} answer={1} explanation="A thread desiste voluntariamente dos recursos, o que equivale a permitir preempção. Combine com espera aleatória para evitar livelock." />
+<Quiz question="Como um banco de dados relacional costuma lidar com deadlock entre transações?" options={["Impede que duas transações usem a mesma tabela", "Monta o grafo de espera, detecta o ciclo e aborta uma das transações", "Espera indefinidamente", "Reinicia o servidor"]} answer={1} explanation="Como não controla a ordem em que o usuário acessa linhas, o banco detecta ciclos e escolhe uma vítima para rollback." />
+</QuizSet>

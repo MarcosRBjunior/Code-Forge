@@ -1,0 +1,132 @@
+---
+title: IPv4 e IPv6
+kind: lesson
+---
+
+O Ethernet entrega quadros dentro de um segmento. Para atravessar milhares de redes independentes, você precisa de um endereço que tenha estrutura global e de um formato de pacote que todo roteador entenda. Esse é o papel do IP. Ele faz uma promessa modesta: tentar entregar cada pacote, sem garantia de ordem, de chegada ou de não duplicação. Tudo o que for confiável vem de cima. Nesta aula você vai olhar o cabeçalho por dentro, entender por que o IPv4 acabou e o que o IPv6 muda de verdade.
+
+## O cabeçalho IPv4
+
+```text
+ 0               8               16              24            31
++-------+-------+---------------+-------------------------------+
+|Versão |  IHL  |   DSCP/ECN    |        Comprimento total      |
++-------+-------+---------------+-----+-------------------------+
+|        Identificação          |Flags|   Offset do fragmento   |
++---------------+---------------+-----+-------------------------+
+|      TTL      |   Protocolo   |     Checksum do cabeçalho     |
++---------------+---------------+-------------------------------+
+|                       Endereço de origem                      |
++---------------------------------------------------------------+
+|                       Endereço de destino                     |
++---------------------------------------------------------------+
+```
+
+Os campos que mais importam na prática:
+
+- **TTL:** cada roteador subtrai 1; ao chegar a zero, o pacote morre e a origem recebe um ICMP "time exceeded". É o que impede laços eternos e é exatamente o truque que o `traceroute` explora.
+- **Protocolo:** 6 é TCP, 17 é UDP, 1 é ICMP.
+- **Identificação, flags e offset:** controlam a fragmentação. A flag DF (don't fragment) pede que nenhum roteador fragmente; se o pacote não couber, ele é descartado e a origem recebe um ICMP "fragmentation needed". É a base do Path MTU Discovery.
+- **Checksum:** cobre só o cabeçalho e é recalculado a cada salto, porque o TTL muda.
+
+O programa abaixo monta um cabeçalho de 20 bytes, calcula o checksum (soma em complemento de um de palavras de 16 bits) e depois o decodifica.
+
+```python
+import struct, socket
+
+def checksum(dados):
+    soma = sum(struct.unpack(f"!{len(dados)//2}H", dados))
+    while soma >> 16:
+        soma = (soma & 0xFFFF) + (soma >> 16)
+    return ~soma & 0xFFFF
+
+def montar(origem, destino, ttl, proto, tam_payload):
+    cab = struct.pack("!BBHHHBBH4s4s",
+        (4 << 4) | 5, 0, 20 + tam_payload, 0x1c46, 0x4000,
+        ttl, proto, 0, socket.inet_aton(origem), socket.inet_aton(destino))
+    return cab[:10] + struct.pack("!H", checksum(cab)) + cab[12:]
+
+cab = montar("192.168.1.10", "93.184.216.34", 64, 6, 40)
+print(cab.hex(" "))
+v_ihl, _, total, ident, flags_off, ttl, proto, cks, src, dst = struct.unpack("!BBHHHBBH4s4s", cab)
+print("versao", v_ihl >> 4, "| cabecalho", (v_ihl & 0xF) * 4, "bytes | total", total)
+print("DF ligado:", bool(flags_off & 0x4000), "| TTL", ttl, "| protocolo", proto)
+print(socket.inet_ntoa(src), "->", socket.inet_ntoa(dst))
+print("checksum confere:", checksum(cab) == 0)
+```
+
+```text
+Saída:
+45 00 00 3c 1c 46 40 00 40 06 26 e9 c0 a8 01 0a 5d b8 d8 22
+versao 4 | cabecalho 20 bytes | total 60
+DF ligado: True | TTL 64 | protocolo 6
+192.168.1.10 -> 93.184.216.34
+checksum confere: True
+```
+
+A verificação é elegante: somando o cabeçalho inteiro, incluindo o próprio checksum, o resultado em complemento de um é zero.
+
+## Por que o IPv4 acabou
+
+São 32 bits, cerca de 4,3 bilhões de endereços, e boa parte reservada. Os registros regionais esgotaram seus estoques na década de 2010. A internet sobreviveu graças a NAT, que põe redes inteiras atrás de um único IP público, e a um mercado de compra de blocos. O custo disso é que conexões de entrada ficam difíceis e o modelo "todo host é endereçável" se perdeu.
+
+## O que muda no IPv6
+
+Os endereços têm 128 bits, escritos em oito grupos hexadecimais. Duas regras encurtam a escrita: zeros à esquerda de cada grupo podem sumir e uma única sequência de grupos zerados vira `::`.
+
+```python
+import ipaddress
+
+ULA = ipaddress.IPv6Network("fc00::/7")
+DOC = ipaddress.IPv6Network("2001:db8::/32")
+
+for txt in ["2001:0db8:0000:0000:0000:ff00:0042:8329", "2606:4700:4700:0000:0000:0000:0000:1111",
+            "::1", "fe80::1c2a:3bff:fe4d:5e6f", "fd12:3456::10"]:
+    ip = ipaddress.IPv6Address(txt)
+    tipo = ("loopback" if ip.is_loopback else "link-local" if ip.is_link_local
+            else "privado (ULA)" if ip in ULA else "documentacao" if ip in DOC else "global")
+    print(f"{ip.compressed:28} {tipo}")
+print(ipaddress.IPv6Address("2001:db8::ff00:42:8329").exploded)
+print("enderecos numa /64:", ipaddress.IPv6Network("2001:db8:1:2::/64").num_addresses)
+```
+
+```text
+Saída:
+2001:db8::ff00:42:8329       documentacao
+2606:4700:4700::1111         global
+::1                          loopback
+fe80::1c2a:3bff:fe4d:5e6f    link-local
+fd12:3456::10                privado (ULA)
+2001:0db8:0000:0000:0000:ff00:0042:8329
+enderecos numa /64: 18446744073709551616
+```
+
+Diferenças que importam:
+
+| Aspecto | IPv4 | IPv6 |
+| --- | --- | --- |
+| Tamanho do endereço | 32 bits | 128 bits |
+| Cabeçalho | 20 a 60 bytes, com opções | 40 bytes fixos, extensões encadeadas |
+| Checksum | No cabeçalho | Removido (o enlace e o transporte já verificam) |
+| Fragmentação | Roteadores podem fragmentar | Só a origem fragmenta |
+| Resolução de vizinhos | ARP (broadcast) | Neighbor Discovery (ICMPv6, multicast) |
+| Configuração | DHCP | SLAAC ou DHCPv6 |
+| NAT | Onipresente | Desnecessário em geral |
+
+Uma sub-rede IPv6 típica é uma `/64`, e cada interface ganha também um endereço **link-local** `fe80::/10`, válido só no enlace. O TTL mudou de nome para **Hop Limit**, mas faz o mesmo.
+
+## Armadilhas reais
+
+- **Endereços especiais:** `127.0.0.0/8` e `::1` são loopback; `0.0.0.0` num servidor significa "todas as interfaces"; `169.254.0.0/16` aparece quando o DHCP falhou.
+- **Dual stack:** clientes tentam IPv6 e IPv4 em paralelo (Happy Eyeballs). Uma rota IPv6 quebrada pode causar alguns centésimos de segundo de atraso antes do fallback.
+- **ICMP bloqueado:** firewalls que descartam todo ICMP quebram o Path MTU Discovery, e conexões travam em pacotes grandes. Em IPv6 isso é ainda pior, porque roteadores não fragmentam.
+- **Formato em texto:** o mesmo IPv6 tem várias grafias. Compare endereços já normalizados, nunca as strings.
+
+## Na entrevista
+
+Descreva o IP como entrega de melhor esforço, salto a salto, e cite os campos que explicam comportamentos observáveis: TTL (traceroute, laços), DF e fragmentação (problemas de MTU) e protocolo (multiplexação para TCP/UDP). Para IPv6, vá além de "tem mais endereços": cabeçalho fixo, sem fragmentação em roteadores, sem ARP e sem necessidade de NAT. Follow-ups: "como o traceroute funciona?" (TTL crescente e ICMP time exceeded) e "por que o checksum foi removido no IPv6?" (redundante com enlace e transporte, e evita recálculo a cada salto).
+
+<QuizSet>
+<Quiz question="Por que todo roteador precisa recalcular o checksum do cabeçalho IPv4?" options={["Porque o endereço de destino muda", "Porque o TTL é decrementado a cada salto", "Porque o payload é recomprimido", "Por exigência do TCP"]} answer={1} explanation="O checksum cobre o cabeçalho, e o TTL muda em cada roteador, então o valor precisa ser refeito." />
+<Quiz question="Um pacote IPv6 de 1600 bytes chega a um roteador cujo enlace de saída tem MTU 1500. O que acontece?" options={["O roteador fragmenta em dois pacotes", "O roteador descarta e envia ICMPv6 Packet Too Big à origem", "O roteador trunca o pacote", "O pacote é convertido para IPv4"]} answer={1} explanation="Em IPv6 só a origem fragmenta; o roteador avisa a origem, que ajusta o tamanho (Path MTU Discovery)." />
+</QuizSet>

@@ -1,0 +1,151 @@
+---
+title: Tool calling
+kind: lesson
+---
+
+Um LLM sozinho só produz texto. Ele não sabe o saldo do cliente, não consegue consultar o status de um pedido nem abrir um chamado. **Tool calling** (ou function calling) é o mecanismo que liga o modelo ao mundo: você descreve funções disponíveis, o modelo decide quando chamar uma delas e com quais argumentos, e **a sua aplicação** executa a chamada e devolve o resultado. O modelo nunca executa nada; ele só pede.
+
+## O protocolo
+
+```text
+app ──► LLM:  mensagens + lista de ferramentas (nome, descrição, JSON Schema dos argumentos)
+LLM ──► app:  "chame consultar_pedido com {"id": "A-981"}"     (uma tool call estruturada)
+app:          valida os argumentos, executa a função de verdade
+app ──► LLM:  mensagens + resultado da ferramenta (associado ao id da chamada)
+LLM ──► app:  resposta final em texto (ou outra tool call)
+```
+
+A definição de uma ferramenta tem três partes: um **nome**, uma **descrição** (que o modelo lê para decidir quando usá-la) e um **esquema** dos parâmetros:
+
+```json
+{
+  "name": "consultar_pedido",
+  "description": "Busca status e previsão de entrega de um pedido pelo id. Use quando o cliente perguntar sobre um pedido específico.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "pedido_id": { "type": "string", "description": "Id no formato A-123" }
+    },
+    "required": ["pedido_id"]
+  }
+}
+```
+
+Os nomes dos campos variam entre provedores, mas a ideia é a mesma em todos. A descrição é parte do prompt: escreva-a como escreveria documentação para um colega, dizendo quando usar e quando **não** usar a ferramenta.
+
+## Despachando chamadas
+
+Do lado da aplicação, tool calling é um despachante: um registro de funções, validação de argumentos e tratamento de erro. O programa implementa isso com JSON e a stdlib.
+
+```python
+import json
+
+PEDIDOS = {"A-981": {"status": "em transito", "previsao": "2026-11-03"}}
+
+def consultar_pedido(pedido_id):
+    if pedido_id not in PEDIDOS:
+        raise LookupError(f"pedido {pedido_id} não encontrado")
+    return PEDIDOS[pedido_id]
+
+def calcular_frete(cep, peso_kg):
+    return {"valor": round(15 + 2.5 * peso_kg, 2)}
+
+FERRAMENTAS = {
+    "consultar_pedido": (consultar_pedido, {"pedido_id": str}),
+    "calcular_frete": (calcular_frete, {"cep": str, "peso_kg": (int, float)}),
+}
+
+def despachar(chamada_json):
+    chamada = json.loads(chamada_json)
+    nome, args = chamada["name"], chamada["arguments"]
+    if nome not in FERRAMENTAS:
+        return {"erro": f"ferramenta desconhecida: {nome}"}
+    funcao, esquema = FERRAMENTAS[nome]
+    faltando = [p for p in esquema if p not in args]
+    errados = [p for p, t in esquema.items() if p in args and not isinstance(args[p], t)]
+    if faltando or errados:
+        return {"erro": f"argumentos inválidos: faltando={faltando} tipo_errado={errados}"}
+    try:
+        return {"resultado": funcao(**args)}
+    except Exception as e:  # o erro volta para o modelo, não derruba a aplicação
+        return {"erro": str(e)}
+
+chamadas = [
+    '{"name": "consultar_pedido", "arguments": {"pedido_id": "A-981"}}',
+    '{"name": "calcular_frete", "arguments": {"cep": "01310-000", "peso_kg": "2"}}',
+    '{"name": "consultar_pedido", "arguments": {"pedido_id": "Z-000"}}',
+    '{"name": "cancelar_tudo", "arguments": {}}',
+]
+for c in chamadas:
+    print(despachar(c))
+```
+
+```text
+Saída:
+{'resultado': {'status': 'em transito', 'previsao': '2026-11-03'}}
+{'erro': "argumentos inválidos: faltando=[] tipo_errado=['peso_kg']"}
+{'erro': 'pedido Z-000 não encontrado'}
+{'erro': 'ferramenta desconhecida: cancelar_tudo'}
+```
+
+Repare que nenhum erro derruba o programa: cada falha vira uma mensagem para o modelo, que pode corrigir os argumentos ou explicar ao usuário.
+
+## A volta completa
+
+Com um "LLM falso" roteirizado, dá para ver a conversa inteira: o modelo pede a ferramenta, a aplicação executa e devolve o resultado, e o modelo responde ao usuário usando o dado.
+
+```python
+import json
+
+def consultar_pedido(pedido_id):
+    return {"status": "em transito", "previsao": "3 de novembro"}
+
+def llm_falso(mensagens):
+    ultima = mensagens[-1]
+    if ultima["role"] == "user":
+        return {"tool_call": {"id": "call_1", "name": "consultar_pedido",
+                              "arguments": json.dumps({"pedido_id": "A-981"})}}
+    dado = json.loads(ultima["content"])
+    return {"text": f"Seu pedido está {dado['status']}, com previsão para {dado['previsao']}."}
+
+mensagens = [{"role": "user", "content": "Cadê meu pedido A-981?"}]
+resposta = llm_falso(mensagens)
+if "tool_call" in resposta:
+    call = resposta["tool_call"]
+    print("modelo pediu:", call["name"], call["arguments"])
+    resultado = consultar_pedido(**json.loads(call["arguments"]))
+    mensagens.append({"role": "assistant", "tool_call": call})
+    mensagens.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(resultado)})
+    resposta = llm_falso(mensagens)
+print("resposta final:", resposta["text"])
+```
+
+```text
+Saída:
+modelo pediu: consultar_pedido {"pedido_id": "A-981"}
+resposta final: Seu pedido está em transito, com previsão para 3 de novembro.
+```
+
+Quando o modelo pode pedir várias ferramentas e encadear chamadas até terminar, você tem um agente, assunto do próximo capítulo.
+
+## Boas práticas
+
+- **Poucas ferramentas, bem descritas.** Dezenas de ferramentas parecidas confundem a escolha e ocupam contexto. Agrupe ou carregue sob demanda.
+- **Argumentos validados sempre**, mesmo com esquema imposto pelo provedor. Trate o modelo como um cliente não confiável da sua API.
+- **Resultados enxutos:** devolva só os campos úteis, não o JSON inteiro de 5 mil tokens do backend.
+- **Erros acionáveis:** "pedido_id deve ter formato A-123" ajuda o modelo a se corrigir; um stack trace, não.
+- **Chamadas paralelas:** muitos provedores permitem várias tool calls numa resposta; execute-as em paralelo quando forem independentes.
+
+<Callout type="warning" title="Ações com efeito colateral">
+Ferramentas que escrevem (pagar, enviar e-mail, apagar) precisam de autorização com as permissões do usuário, idempotência e, para ações sensíveis, confirmação humana. O modelo pode ser induzido por prompt injection a chamar a ferramenta errada.
+</Callout>
+
+## Na entrevista
+
+Deixe claro que o modelo só gera uma chamada estruturada e que a execução, validação e autorização ficam na aplicação. Mostre o ciclo pedido → execução → resultado → resposta, e fale de descrições, validação, erros devolvidos ao modelo e cuidados com ações destrutivas. Follow-ups: "e se o modelo inventar um argumento?" (validação, enum no esquema, erro claro de volta) e "como lidar com 200 ferramentas?" (busca de ferramentas por relevância, agrupamento, subagentes especializados).
+
+<QuizSet>
+<Quiz question="Quem executa a função quando o modelo decide usar uma ferramenta?" options={["O próprio modelo, nos servidores do provedor", "A sua aplicação, que recebe a chamada estruturada, valida e executa", "O banco de dados diretamente", "O navegador do usuário"]} answer={1} explanation="O modelo apenas devolve nome e argumentos. Executar, validar e autorizar é responsabilidade do seu código." />
+<Quiz question="A ferramenta de consulta lança uma exceção porque o pedido não existe. Qual o melhor tratamento?" options={["Deixar a exceção derrubar a requisição", "Devolver ao modelo uma mensagem de erro clara como resultado da ferramenta", "Ignorar e não responder ao usuário", "Repetir a chamada indefinidamente"]} answer={1} explanation="Um erro legível permite que o modelo peça o id correto ao usuário ou explique o problema, em vez de a conversa quebrar." />
+<Quiz question="O modelo escolhe 'buscar_cliente' quando deveria usar 'buscar_fornecedor'. O que melhorar primeiro?" options={["A temperatura", "As descrições das ferramentas, explicando quando usar cada uma e diferenciando-as", "O tamanho da janela de contexto", "O formato da resposta final"]} answer={1} explanation="O modelo escolhe pela descrição. Descrições ambíguas ou parecidas são a causa mais comum de escolha errada." />
+</QuizSet>

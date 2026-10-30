@@ -1,0 +1,136 @@
+---
+title: Observabilidade de LLMs
+kind: lesson
+---
+
+Um usuário reclama: "o assistente me deu uma resposta errada ontem à tarde". Sem observabilidade, você não sabe qual prompt foi usado, que trechos o RAG recuperou, qual modelo respondeu (o principal ou o fallback?), quais ferramentas o agente chamou e com quais argumentos. Logs HTTP comuns mostram só "200 OK em 4,2 s". Sistemas com LLM precisam de observabilidade que capture **o conteúdo e a cadeia de decisões**, além de latência e erros, porque a falha mais comum não é uma exceção: é uma resposta ruim com status de sucesso.
+
+## Traces: a árvore de cada requisição
+
+A unidade central é o **trace**: o registro de uma requisição inteira, dividido em **spans** aninhados, um para cada etapa (reescrita da consulta, busca, re-ranking, chamada ao LLM, cada tool call, cada iteração do agente). Cada span guarda início, duração, entradas, saídas e atributos.
+
+```text
+trace 7f3a  "cadê meu pedido?"                         3.1 s   US$ 0.004
+├─ reescrever_consulta  (modelo pequeno)              0.4 s   210 tokens
+├─ buscar               (híbrida, top 20)              0.1 s
+├─ rerank                                              0.2 s
+└─ agente
+   ├─ llm  passo 1  → tool_call consultar_pedido       0.9 s   1.900 tokens
+   ├─ tool consultar_pedido(A-981)                     0.3 s
+   └─ llm  passo 2  → resposta final                   1.2 s   2.300 tokens
+```
+
+O padrão aberto mais usado para isso é o OpenTelemetry, que já tem convenções semânticas para chamadas de IA generativa; há também plataformas especializadas em observabilidade de LLM, abertas e comerciais. O programa mostra a ideia com um tracer mínimo e um relógio simulado.
+
+```python
+from contextlib import contextmanager
+
+class Tracer:
+    def __init__(self):
+        self.relogio, self.pilha, self.spans = 0.0, [], []
+
+    @contextmanager
+    def span(self, nome, **attrs):
+        registro = {"nome": nome, "nivel": len(self.pilha), "inicio": self.relogio, **attrs}
+        self.spans.append(registro)
+        self.pilha.append(registro)
+        try:
+            yield registro
+        finally:
+            registro["duracao"] = round(self.relogio - registro["inicio"], 2)
+            self.pilha.pop()
+
+    def avancar(self, segundos):   # simula o tempo gasto pela etapa
+        self.relogio += segundos
+
+t = Tracer()
+with t.span("requisicao", usuario="u-17"):
+    with t.span("buscar", top_k=20):
+        t.avancar(0.12)
+    with t.span("llm", modelo="principal", tokens_entrada=1900, tokens_saida=40) as s:
+        t.avancar(0.9)
+        s["finish_reason"] = "tool_use"
+    with t.span("tool", nome_tool="consultar_pedido"):
+        t.avancar(0.3)
+    with t.span("llm", modelo="principal", tokens_entrada=2300, tokens_saida=120) as s:
+        t.avancar(1.2)
+        s["finish_reason"] = "end"
+
+for s in t.spans:
+    extras = {k: v for k, v in s.items() if k not in ("nome", "nivel", "inicio", "duracao")}
+    print(f"{'  ' * s['nivel']}{s['nome']:12s} {s['duracao']:.2f}s {extras}")
+```
+
+```text
+Saída:
+requisicao   2.52s {'usuario': 'u-17'}
+  buscar       0.12s {'top_k': 20}
+  llm          0.90s {'modelo': 'principal', 'tokens_entrada': 1900, 'tokens_saida': 40, 'finish_reason': 'tool_use'}
+  tool         0.30s {'nome_tool': 'consultar_pedido'}
+  llm          1.20s {'modelo': 'principal', 'tokens_entrada': 2300, 'tokens_saida': 120, 'finish_reason': 'end'}
+```
+
+## O que registrar em cada chamada ao modelo
+
+- Modelo e versão, provedor, parâmetros (temperatura, limite de saída).
+- **Versão do prompt** (id do template, não só o texto final).
+- Tokens de entrada, de saída e em cache; custo calculado.
+- Latência total e **tempo até o primeiro token**.
+- **Motivo de término** (fim natural, limite de tokens, tool call, bloqueio por política). Muitas respostas cortadas indicam limite de saída baixo.
+- Tool calls com argumentos e resultados; ids dos trechos recuperados com seus scores.
+- Identificadores de usuário, sessão e funcionalidade, para agregar.
+
+## Métricas e alertas
+
+Dos traces saem as métricas operacionais: latência p50/p95/p99, taxa de erro e de fallback, custo por funcionalidade e por cliente, tokens por requisição, taxa de respostas cortadas, taxa de "não sei" e de escalonamento para humano.
+
+```python
+logs = [
+    {"feature": "chat", "lat": 1.2, "custo": 0.004, "fim": "end", "erro": False},
+    {"feature": "chat", "lat": 2.8, "custo": 0.006, "fim": "end", "erro": False},
+    {"feature": "chat", "lat": 9.5, "custo": 0.011, "fim": "length", "erro": False},
+    {"feature": "chat", "lat": 1.6, "custo": 0.004, "fim": "end", "erro": True},
+    {"feature": "resumo", "lat": 4.1, "custo": 0.020, "fim": "length", "erro": False},
+    {"feature": "resumo", "lat": 3.7, "custo": 0.018, "fim": "end", "erro": False},
+]
+
+def percentil(valores, p):
+    v = sorted(valores)
+    idx = min(len(v) - 1, round(p / 100 * (len(v) - 1)))
+    return v[idx]
+
+for feature in ("chat", "resumo"):
+    sel = [l for l in logs if l["feature"] == feature]
+    lat = [l["lat"] for l in sel]
+    print(f"{feature}: n={len(sel)} p50={percentil(lat, 50)}s p95={percentil(lat, 95)}s "
+          f"custo_total=${sum(l['custo'] for l in sel):.3f} "
+          f"cortadas={sum(l['fim'] == 'length' for l in sel) / len(sel):.0%} "
+          f"erros={sum(l['erro'] for l in sel) / len(sel):.0%}")
+```
+
+```text
+Saída:
+chat: n=4 p50=2.8s p95=9.5s custo_total=$0.025 cortadas=25% erros=25%
+resumo: n=2 p50=3.7s p95=4.1s custo_total=$0.038 cortadas=50% erros=0%
+```
+
+## Qualidade em produção
+
+Métricas operacionais não dizem se as respostas estão boas. Complete com:
+
+- **Feedback explícito** (polegar, nota) e implícito (usuário reformulou a pergunta, copiou a resposta, abriu um ticket depois).
+- **Avaliação online por amostragem:** um juiz LLM avalia uma fração dos traces (fidelidade, adequação), gerando tendências e alertas.
+- **Revisão humana** de amostras e de todos os casos com feedback negativo, alimentando o conjunto de avaliação offline.
+
+<Callout type="warning" title="Logs com prompts são dados sensíveis">
+Prompts e respostas contêm dados pessoais e segredos de negócio. Mascare PII antes de gravar, restrinja quem pode ler traces, defina retenção e respeite pedidos de exclusão. Observabilidade não pode virar o maior vazamento do sistema.
+</Callout>
+
+## Na entrevista
+
+Descreva traces com spans por etapa, liste os atributos que você registraria (prompt versionado, modelo, tokens, custo, TTFT, motivo de término, tool calls, trechos recuperados), as métricas e alertas, e como a qualidade é monitorada (feedback, juiz por amostragem, revisão humana que vira caso de teste). Follow-ups: "a latência p95 dobrou, como investigar?" (quebrar por span: busca, LLM, ferramenta; checar fallback, tamanho do contexto e tokens de saída) e "como ligar uma reclamação a um trace?" (id de trace exposto na interface ou vinculado à sessão).
+
+<QuizSet>
+<Quiz question="15% das respostas de um recurso de resumo terminam com motivo 'limite de tokens'. O que isso indica?" options={["O modelo está alucinando", "O limite de tokens de saída está baixo para a tarefa, e os resumos estão sendo cortados", "O cache está desligado", "A recuperação está ruim"]} answer={1} explanation="O motivo de término mostra que a geração parou pelo limite, não por ter concluído. Aumente o limite ou peça respostas mais curtas." />
+<Quiz question="Por que registrar o id da versão do prompt em cada chamada?" options={["Para reduzir custo", "Para correlacionar mudanças de qualidade ou custo com mudanças de prompt e permitir comparar versões", "Porque a API exige", "Para ativar o cache"]} answer={1} explanation="Sem a versão, uma piora após uma alteração de prompt fica indistinguível de outras causas, como mudança de modelo ou de dados." />
+</QuizSet>

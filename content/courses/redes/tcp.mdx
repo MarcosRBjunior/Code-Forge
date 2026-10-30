@@ -1,0 +1,118 @@
+---
+title: TCP
+kind: lesson
+---
+
+O IP entrega pacotes no melhor esforço: eles podem se perder, chegar duplicados, fora de ordem ou corrompidos, e nenhum roteador avisa ninguém. Quase toda aplicação, porém, quer outra coisa: mandar uma sequência de bytes e ter certeza de que o outro lado recebe exatamente a mesma sequência. O TCP é a camada que transforma o datagrama não confiável em um **fluxo de bytes confiável, ordenado e bidirecional** entre dois processos.
+
+## O que o TCP garante (e o que não garante)
+
+| Garante | Não garante |
+| --- | --- |
+| Bytes entregues na ordem em que foram enviados | Latência baixa ou previsível |
+| Sem perdas nem duplicatas enquanto a conexão vive | Que a aplicação do outro lado processou os dados |
+| Detecção de corrupção (checksum) | Fronteiras de mensagem |
+| Não afogar o receptor nem a rede | Entrega se a conexão cair no meio |
+
+A coluna da direita é onde mora a maior parte dos bugs. O TCP é um **stream**: se você chama `send` duas vezes com 100 bytes, o outro lado pode ler 200 bytes de uma vez, ou 37 e depois 163. Quem precisa de mensagens tem de delimitá-las, com um prefixo de tamanho ou um separador, como o HTTP faz com `Content-Length`.
+
+## Números de sequência e ACKs
+
+Cada byte do fluxo tem uma posição. O **número de sequência** de um segmento diz qual é a posição do seu primeiro byte, e o **ACK** que volta diz "recebi tudo até aqui, quero o byte N agora". Esse ACK é **cumulativo**: um único ACK 3001 confirma todos os bytes anteriores, mesmo que os ACKs intermediários tenham se perdido.
+
+```text
+cliente                                   servidor
+   | seq=1001 len=1000  ---------------->  |
+   | seq=2001 len=1000  ----X (perdido)    |
+   | seq=3001 len=1000  ---------------->  |  guarda fora de ordem
+   |  <----------------  ack=2001          |
+   |  <----------------  ack=2001 (dup)    |
+   | seq=2001 len=1000  ---------------->  |  retransmissão
+   |  <----------------  ack=4001          |  buraco tapado
+```
+
+O emissor mantém um **timer de retransmissão** (RTO) calculado a partir do RTT medido. Se o ACK não chega a tempo, ele reenvia. Há um atalho mais rápido: três ACKs duplicados seguidos indicam que um segmento sumiu mas os seguintes chegaram, e o emissor faz **fast retransmit** sem esperar o timer. O receptor ainda pode anunciar blocos que já tem com **SACK**, evitando reenvios desnecessários.
+
+O programa a seguir simula o lado receptor: segmentos chegam fora de ordem e com uma duplicata, e só os bytes contíguos são entregues à aplicação.
+
+```python
+def receptor(segmentos, isn):
+    esperado = isn
+    pendentes = {}
+    entregue = b""
+    for seq, dados in segmentos:
+        if seq < esperado:
+            print(f"seq={seq}: duplicado, ack={esperado}")
+            continue
+        pendentes[seq] = dados
+        while esperado in pendentes:
+            bloco = pendentes.pop(esperado)
+            entregue += bloco
+            esperado += len(bloco)
+        print(f"seq={seq}: ack={esperado} pendentes={sorted(pendentes)}")
+    return entregue
+
+chegada = [(100, b"Ola, "), (110, b"TCP!"), (105, b"mundo"), (100, b"Ola, ")]
+print("aplicacao leu:", receptor(chegada, 100).decode())
+```
+
+```text
+Saída:
+seq=100: ack=105 pendentes=[]
+seq=110: ack=105 pendentes=[110]
+seq=105: ack=114 pendentes=[]
+seq=100: duplicado, ack=114
+aplicacao leu: Ola, mundoTCP!
+```
+
+## O cabeçalho
+
+O cabeçalho tem 20 bytes fixos mais opções (até 60 no total). Os campos que mais aparecem em entrevista: portas de origem e destino, sequência, ACK, flags (SYN, ACK, FIN, RST, PSH), **janela** (controle de fluxo) e checksum. Montar e ler esse cabeçalho com `struct` deixa claro que ele é só um punhado de inteiros em ordem de rede (big-endian):
+
+```python
+import struct
+
+FLAGS = ["FIN", "SYN", "RST", "PSH", "ACK", "URG"]
+
+def monta(sport, dport, seq, ack, flags, janela):
+    off_flags = (5 << 12) | flags          # 5 palavras de 32 bits = 20 bytes
+    return struct.pack("!HHIIHHHH", sport, dport, seq, ack, off_flags, janela, 0, 0)
+
+def le(cab):
+    sport, dport, seq, ack, off_flags, janela, _, _ = struct.unpack("!HHIIHHHH", cab[:20])
+    nomes = [n for i, n in enumerate(FLAGS) if off_flags & (1 << i)]
+    return {"sport": sport, "dport": dport, "seq": seq, "ack": ack,
+            "hlen": (off_flags >> 12) * 4, "flags": nomes, "janela": janela}
+
+cab = monta(51514, 443, 1_000_000, 0, 0b000010, 64240)
+print(len(cab), "bytes:", cab.hex(" "))
+print(le(cab))
+```
+
+```text
+Saída:
+20 bytes: c9 3a 01 bb 00 0f 42 40 00 00 00 00 50 02 fa f0 00 00 00 00
+{'sport': 51514, 'dport': 443, 'seq': 1000000, 'ack': 0, 'hlen': 20, 'flags': ['SYN'], 'janela': 64240}
+```
+
+Repare que não há endereço IP no cabeçalho TCP: a conexão é identificada pela **quádrupla** IP de origem, porta de origem, IP de destino e porta de destino, juntando informação das duas camadas.
+
+## Trade-offs que explicam latência
+
+- **Head-of-line blocking:** como a entrega é ordenada, um segmento perdido segura todos os que vieram depois, mesmo que já estejam no buffer. Em links com perda, isso aparece como picos de latência.
+- **Nagle e ACK atrasado:** o algoritmo de Nagle junta escritas pequenas enquanto há dados sem ACK, e o receptor atrasa ACKs esperando ter algo para mandar junto. Combinados, podem somar dezenas de milissegundos em protocolos de pergunta e resposta. Por isso servidores interativos ligam `TCP_NODELAY`.
+- **Custo de abrir conexão:** o handshake consome um RTT antes do primeiro byte útil, o que motiva pools de conexão e keep-alive.
+
+<Callout type="tip" title="Stream não é mensagem">
+Se um entrevistador perguntar por que o seu protocolo sobre TCP às vezes recebe mensagens "coladas", a resposta é framing: o TCP não preserva as fronteiras dos `send`. Use prefixo de tamanho ou delimitador.
+</Callout>
+
+## Na entrevista
+
+Descreva o TCP pelo contrato (fluxo confiável e ordenado), depois pelos mecanismos: sequência, ACK cumulativo, retransmissão por timeout e por ACKs duplicados, controle de fluxo e de congestionamento. Ligue isso a sintomas reais: latência de cauda por retransmissão, head-of-line blocking e o custo do handshake. Follow-ups comuns: "por que o QUIC roda sobre UDP?" (evitar o head-of-line do TCP e evoluir fora do kernel) e "o que identifica uma conexão?" (a quádrupla).
+
+<QuizSet>
+<Quiz question="Uma aplicação envia duas mensagens com send() e o outro lado recebe as duas num único recv(). O que aconteceu?" options={["Um bug no kernel", "Comportamento normal: TCP é um fluxo de bytes sem fronteiras de mensagem", "Perda de pacote seguida de retransmissão", "O checksum falhou"]} answer={1} explanation="O TCP entrega bytes em ordem, não mensagens. A aplicação precisa de framing, como um prefixo de tamanho." />
+<Quiz question="O receptor manda três ACKs duplicados com ack=2001. O que o emissor costuma fazer?" options={["Fechar a conexão", "Esperar o RTO expirar", "Retransmitir o segmento que começa em 2001 imediatamente (fast retransmit)", "Dobrar a janela"]} answer={2} explanation="ACKs duplicados indicam que segmentos posteriores chegaram e um ficou faltando; o fast retransmit reenvia sem esperar o timer." />
+<Quiz question="O que identifica unicamente uma conexão TCP numa máquina?" options={["A porta de destino", "O número de sequência inicial", "A quádrupla IP e porta de origem, IP e porta de destino", "O endereço MAC"]} answer={2} explanation="Por isso um servidor na porta 443 aceita milhares de conexões: cada cliente tem um IP ou porta de origem diferente." />
+</QuizSet>

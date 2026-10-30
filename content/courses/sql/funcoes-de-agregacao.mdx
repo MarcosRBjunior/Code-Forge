@@ -1,0 +1,136 @@
+---
+title: Funções de agregação
+kind: lesson
+---
+
+Boa parte das perguntas de SQL em entrevistas de dados termina numa métrica: receita total, ticket médio, número de usuários ativos. Funções de agregação transformam várias linhas em um único valor. Elas são simples de usar e fáceis de errar, principalmente na forma como tratam `NULL`, duplicatas e divisão inteira.
+
+## As cinco básicas
+
+- `count(*)`: conta linhas.
+- `count(coluna)`: conta valores **não nulos** da coluna.
+- `count(DISTINCT coluna)`: conta valores distintos não nulos.
+- `sum`, `avg`: soma e média, ignorando nulos.
+- `min`, `max`: menor e maior valor; funcionam com números, textos e datas.
+
+Sem `GROUP BY`, a agregação colapsa a tabela inteira em uma linha.
+
+```sql
+CREATE TABLE pedidos (
+  id          integer PRIMARY KEY,
+  cliente_id  integer NOT NULL,
+  status      text NOT NULL,
+  valor       numeric(10, 2) NOT NULL,
+  cupom       text,
+  frete       numeric(8, 2),
+  criado_em   date NOT NULL
+);
+
+INSERT INTO pedidos VALUES
+  (1, 10, 'entregue', 150.00, 'BEMVINDO', 12.00, '2024-05-01'),
+  (2, 11, 'entregue', 89.90, NULL, NULL, '2024-05-01'),
+  (3, 10, 'cancelado', 230.00, NULL, 15.00, '2024-05-02'),
+  (4, 12, 'entregue', 45.00, 'FRETE0', 0.00, '2024-05-03'),
+  (5, 13, 'pendente', 310.50, NULL, 20.00, '2024-05-03'),
+  (6, 11, 'entregue', 99.90, 'BEMVINDO', NULL, '2024-05-04'),
+  (7, 14, 'entregue', 520.00, NULL, 25.00, '2024-05-05'),
+  (8, 10, 'pendente', 60.00, NULL, 10.00, '2024-05-06');
+
+SELECT count(*) AS pedidos,
+       count(cupom) AS com_cupom,
+       count(DISTINCT cupom) AS cupons_distintos,
+       count(DISTINCT cliente_id) AS clientes,
+       sum(valor) AS receita,
+       min(criado_em) AS primeiro,
+       max(criado_em) AS ultimo
+FROM pedidos;
+```
+
+```text
+Saída:
+pedidos | com_cupom | cupons_distintos | clientes | receita | primeiro | ultimo
+8 | 3 | 2 | 5 | 1505.30 | 2024-05-01 | 2024-05-06
+```
+
+`count(cupom)` deu 3, não 8: os pedidos sem cupom foram ignorados. Essa diferença entre `count(*)` e `count(coluna)` é usada de propósito em métricas como "percentual de pedidos com cupom".
+
+## AVG ignora nulos
+
+A média de frete parece fácil, mas a resposta depende do que `NULL` significa no negócio:
+
+```sql
+SELECT round(avg(frete), 2) AS media_sem_nulos,
+       round(sum(frete) / count(*), 2) AS media_nulo_como_zero,
+       round(avg(COALESCE(frete, 0)), 2) AS media_coalesce
+FROM pedidos;
+```
+
+```text
+Saída:
+media_sem_nulos | media_nulo_como_zero | media_coalesce
+13.67 | 10.25 | 10.25
+```
+
+`avg(frete)` divide por 6 (os pedidos com frete informado); as outras duas dividem por 8. Se `NULL` quer dizer "frete grátis", a resposta certa é a segunda. Se quer dizer "não sabemos", a primeira. Pergunte.
+
+## Agregação com filtro
+
+Você pode agregar só parte das linhas com `WHERE`, mas aí todas as métricas usam o mesmo filtro. Para calcular várias métricas com filtros diferentes numa única passada, o Postgres oferece a cláusula `FILTER`:
+
+```sql
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE status = 'entregue') AS entregues,
+       sum(valor) FILTER (WHERE status = 'entregue') AS receita_entregue,
+       round(100.0 * count(*) FILTER (WHERE status = 'cancelado') / count(*), 1) AS pct_cancelado
+FROM pedidos;
+```
+
+```text
+Saída:
+total | entregues | receita_entregue | pct_cancelado
+8 | 5 | 904.80 | 12.5
+```
+
+O MySQL não tem `FILTER`. Lá, e em qualquer banco, o equivalente portátil é `sum(CASE WHEN status = 'entregue' THEN valor END)`, que você verá no capítulo de `CASE`. No MySQL também existe o atalho `sum(status = 'entregue')`, porque comparações viram 0 ou 1.
+
+## Divisão inteira
+
+No Postgres, dividir dois inteiros dá um inteiro: `count(*) / 3` trunca a parte decimal. Por isso o exemplo acima multiplica por `100.0` antes de dividir. Veja a diferença:
+
+```sql
+SELECT count(*) FILTER (WHERE cupom IS NOT NULL) / count(*) AS divisao_inteira,
+       round(count(*) FILTER (WHERE cupom IS NOT NULL)::numeric / count(*), 3) AS taxa_cupom
+FROM pedidos;
+```
+
+```text
+Saída:
+divisao_inteira | taxa_cupom
+0 | 0.375
+```
+
+No MySQL, o operador `/` sempre devolve decimal, e a divisão inteira é `DIV`. Uma consulta portada do MySQL para o Postgres pode passar a devolver zero em silêncio.
+
+## Outras agregações úteis
+
+O Postgres tem agregações que economizam muito código em entrevistas: `string_agg(nome, ', ' ORDER BY nome)` concatena textos (no MySQL, `GROUP_CONCAT`), `array_agg` monta um array, `bool_and` e `bool_or` respondem "todos?" e "algum?", e `percentile_cont(0.5) WITHIN GROUP (ORDER BY valor)` calcula a mediana, que o MySQL não tem pronta.
+
+## Armadilhas
+
+- **Agregação sobre tabela vazia**: `count` devolve 0, mas `sum`, `avg`, `min` e `max` devolvem `NULL`. Use `COALESCE(sum(valor), 0)` quando a resposta deve ser zero.
+- **`count(DISTINCT a, b)`**: o Postgres não aceita várias colunas assim; use `count(DISTINCT (a, b))`.
+- **Misturar coluna comum com agregação sem `GROUP BY`**: `SELECT cliente_id, sum(valor)` dá erro no Postgres. O MySQL com `ONLY_FULL_GROUP_BY` desligado aceita e devolve um valor arbitrário.
+
+<Callout type="tip" title="Defina o denominador">
+Em toda taxa, diga em voz alta o numerador e o denominador: "pedidos com cupom sobre todos os pedidos, incluindo cancelados?". Metade dos erros em métricas vem de um denominador diferente do que o entrevistador imaginou.
+</Callout>
+
+## Na entrevista
+
+Antes de escrever, defina a métrica com precisão: o que entra, o que sai e como tratar nulos. Use `count(DISTINCT)` quando a pergunta for sobre entidades (clientes) e não sobre eventos (pedidos). Follow-ups comuns: "e se a tabela estiver vazia?" (`COALESCE`) e "como calcular a mediana?" (`percentile_cont` no Postgres; no MySQL, com funções de janela).
+
+<QuizSet>
+<Quiz question="Uma coluna tem os valores 10, NULL, 20. Quanto vale avg(coluna)?" options={["10", "15", "NULL", "Erro"]} answer={1} explanation="avg ignora nulos: soma 30 dividida por 2 valores." />
+<Quiz question="No Postgres, SELECT 7 / 2 devolve:" options={["3.5", "3", "4", "Erro"]} answer={1} explanation="Divisão entre inteiros trunca. Converta um dos lados para numeric ou multiplique por 1.0." />
+<Quiz question="Qual expressão conta quantos clientes diferentes fizeram pedidos?" options={["count(*)", "count(cliente_id)", "count(DISTINCT cliente_id)", "sum(cliente_id)"]} answer={2} explanation="count(cliente_id) conta pedidos com cliente; DISTINCT reduz a clientes únicos." />
+</QuizSet>

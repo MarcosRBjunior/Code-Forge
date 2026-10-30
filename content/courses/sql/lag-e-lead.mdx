@@ -1,0 +1,170 @@
+---
+title: LAG, LEAD e totais acumulados
+kind: lesson
+---
+
+Muitas perguntas de SQL comparam uma linha com a vizinha: "quanto a receita cresceu em relação ao dia anterior?", "quantos dias se passaram entre dois pedidos do mesmo cliente?", "qual o saldo acumulado da conta depois de cada lançamento?". Sem funções de janela, isso vira um self join com condições de desigualdade, difícil de ler e caro de executar. Com `LAG`, `LEAD` e agregações com moldura, vira uma linha de código.
+
+## O esquema
+
+Vamos usar a receita diária de uma loja e os lançamentos de duas contas:
+
+```sql
+CREATE TABLE receita_diaria (
+  dia   date PRIMARY KEY,
+  valor integer NOT NULL
+);
+
+INSERT INTO receita_diaria (dia, valor) VALUES
+  ('2024-05-01', 100),
+  ('2024-05-02', 140),
+  ('2024-05-03', 90),
+  ('2024-05-04', 90),
+  ('2024-05-05', 160),
+  ('2024-05-06', 200);
+
+CREATE TABLE lancamentos (
+  id     integer PRIMARY KEY,
+  conta  text NOT NULL,
+  dia    date NOT NULL,
+  valor  integer NOT NULL
+);
+
+INSERT INTO lancamentos (id, conta, dia, valor) VALUES
+  (1, 'A', '2024-05-01', 500),
+  (2, 'A', '2024-05-03', -120),
+  (3, 'B', '2024-05-02', 300),
+  (4, 'A', '2024-05-04', 80),
+  (5, 'B', '2024-05-05', -50),
+  (6, 'B', '2024-05-06', 20);
+
+SELECT count(*) AS dias FROM receita_diaria;
+```
+
+```text
+Saída:
+dias
+6
+```
+
+## LAG e LEAD
+
+`LAG(expr, n, padrao)` devolve o valor de `expr` na linha que está `n` posições **antes** da atual, dentro da ordem definida no `OVER`. `LEAD` faz o mesmo olhando **para frente**. O `n` vale 1 por padrão e o terceiro argumento substitui o `NULL` que aparece quando não existe vizinho.
+
+```sql
+SELECT dia,
+       valor,
+       LAG(valor) OVER (ORDER BY dia) AS anterior,
+       valor - LAG(valor) OVER (ORDER BY dia) AS variacao,
+       LEAD(valor) OVER (ORDER BY dia) AS seguinte
+FROM receita_diaria
+ORDER BY dia;
+```
+
+```text
+Saída:
+dia | valor | anterior | variacao | seguinte
+2024-05-01 | 100 | NULL | NULL | 140
+2024-05-02 | 140 | 100 | 40 | 90
+2024-05-03 | 90 | 140 | -50 | 90
+2024-05-04 | 90 | 90 | 0 | 160
+2024-05-05 | 160 | 90 | 70 | 200
+2024-05-06 | 200 | 160 | 40 | NULL
+```
+
+A primeira linha não tem anterior, e a última não tem seguinte: o resultado é `NULL`, e qualquer conta com `NULL` também vira `NULL`. Decida conscientemente se isso é o que o enunciado quer ou se cabe um padrão como `LAG(valor, 1, 0)`.
+
+Uma variação clássica é a variação percentual. Cuidado com a divisão inteira: converta para `numeric` antes de dividir.
+
+```sql
+SELECT dia,
+       ROUND(100.0 * (valor - LAG(valor) OVER w) / LAG(valor) OVER w, 1) AS pct
+FROM receita_diaria
+WINDOW w AS (ORDER BY dia)
+ORDER BY dia;
+```
+
+```text
+Saída:
+dia | pct
+2024-05-01 | NULL
+2024-05-02 | 40.0
+2024-05-03 | -35.7
+2024-05-04 | 0.0
+2024-05-05 | 77.8
+2024-05-06 | 25.0
+```
+
+A cláusula `WINDOW` dá nome a uma janela reaproveitada. Ela existe no Postgres e no MySQL 8; evita repetir o mesmo `OVER (...)` três vezes.
+
+## Totais acumulados
+
+Um `SUM` com `OVER (ORDER BY ...)` soma da primeira linha da partição até a atual. Com `PARTITION BY`, o acumulado recomeça em cada grupo, o que dá o saldo por conta:
+
+```sql
+SELECT conta,
+       dia,
+       valor,
+       SUM(valor) OVER (PARTITION BY conta ORDER BY dia) AS saldo
+FROM lancamentos
+ORDER BY conta, dia;
+```
+
+```text
+Saída:
+conta | dia | valor | saldo
+A | 2024-05-01 | 500 | 500
+A | 2024-05-03 | -120 | 380
+A | 2024-05-04 | 80 | 460
+B | 2024-05-02 | 300 | 300
+B | 2024-05-05 | -50 | 250
+B | 2024-05-06 | 20 | 270
+```
+
+## Molduras: ROWS e RANGE
+
+Quando você escreve `ORDER BY` dentro do `OVER` e não diz mais nada, a moldura padrão é `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. O detalhe perigoso é o `RANGE`: linhas **empatadas** no critério de ordenação entram juntas no acumulado. Se dois lançamentos tivessem a mesma data, os dois mostrariam o mesmo saldo final do dia, não um saldo intermediário. Para acumular linha a linha, use `ROWS`.
+
+A moldura também serve para médias móveis. Média dos últimos três dias, incluindo o atual:
+
+```sql
+SELECT dia,
+       valor,
+       ROUND(AVG(valor) OVER (ORDER BY dia ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS media_3d
+FROM receita_diaria
+ORDER BY dia;
+```
+
+```text
+Saída:
+dia | valor | media_3d
+2024-05-01 | 100 | 100.00
+2024-05-02 | 140 | 120.00
+2024-05-03 | 90 | 110.00
+2024-05-04 | 90 | 106.67
+2024-05-05 | 160 | 113.33
+2024-05-06 | 200 | 150.00
+```
+
+Os dois primeiros dias têm menos de três valores na moldura, e a média usa o que existe. Se o enunciado exigir janela completa, filtre depois com um `COUNT(*) OVER (mesma moldura) = 3`.
+
+<Callout type="warning" title="Dias faltando">
+`LAG` olha a linha anterior, não o dia anterior. Se a tabela não tem linha para um dia sem vendas, o "dia anterior" de uma segunda-feira pode ser a sexta. Quando a pergunta fala em calendário, gere a série de datas (no Postgres, `generate_series`) e faça `LEFT JOIN` antes de aplicar a janela.
+</Callout>
+
+## Armadilhas
+
+- **Filtrar no WHERE.** Funções de janela são calculadas depois do `WHERE`. Para filtrar pelo resultado de `LAG`, use uma subconsulta ou CTE.
+- **Esquecer o PARTITION BY.** Sem ele, o `LAG` do primeiro lançamento da conta B pega o último da conta A.
+- **Ordem não determinística.** Se o `ORDER BY` da janela tem empates, `LAG` pode escolher vizinhos diferentes a cada execução. Desempate por uma chave única.
+- **MySQL antigo.** Funções de janela só chegaram no MySQL 8.0. Em 5.7 era preciso usar variáveis de sessão, uma técnica frágil que você não deve propor hoje.
+
+## Na entrevista
+
+Diga em voz alta a partição e a ordem antes de escrever: "por conta, ordenado por data". Depois pense no que acontece na primeira linha de cada partição e em empates. Follow-ups comuns: "como calcular o intervalo médio entre pedidos de cada cliente?" (`dia - LAG(dia)` por cliente e depois `AVG`) e "qual a diferença entre ROWS e RANGE?" (empates entram juntos em `RANGE`).
+
+<QuizSet>
+<Quiz question="Qual moldura o Postgres usa num SUM(...) OVER (ORDER BY dia) sem moldura explícita?" options={["ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW", "A partição inteira", "Apenas a linha atual"]} answer={1} explanation="Com ORDER BY, o padrão é RANGE até a linha atual, e linhas empatadas na ordenação entram juntas." />
+<Quiz question="Você precisa dos clientes cuja compra atual foi maior que a anterior. Onde filtrar valor > LAG(valor)?" options={["No WHERE da mesma consulta", "No HAVING", "Numa consulta externa (subconsulta ou CTE)", "No ORDER BY da janela"]} answer={2} explanation="Funções de janela são avaliadas depois de WHERE e HAVING, então o filtro precisa ficar num nível acima." />
+<Quiz question="O que LAG(valor, 1, 0) OVER (ORDER BY dia) devolve na primeira linha?" options={["NULL", "0", "O próprio valor", "Erro"]} answer={1} explanation="O terceiro argumento é o valor padrão usado quando não existe linha anterior." />
+</QuizSet>

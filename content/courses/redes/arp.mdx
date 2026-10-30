@@ -1,0 +1,140 @@
+---
+title: ARP
+kind: lesson
+---
+
+Sua aplicação sabe o IP de destino, mas a placa de rede só sabe entregar quadros para endereços MAC. Alguém precisa traduzir "quero falar com 192.168.1.1" em "mande o quadro para a4:bb:6d:11:22:33". Em IPv4 esse papel é do **ARP** (Address Resolution Protocol). Ele é pequeno, antigo e confia em todo mundo, o que o torna fonte de latência na primeira conexão e de ataques clássicos em redes locais.
+
+## Primeiro: quem é o destino do quadro?
+
+Antes de resolver qualquer coisa, o host decide se o destino está na mesma sub-rede. Se estiver, ele resolve o MAC do próprio destino. Se não estiver, resolve o MAC do **gateway padrão** e entrega o pacote a ele, ainda com o IP de destino final. Você nunca faz ARP para um IP da internet.
+
+```python
+import ipaddress
+
+minha_iface = ipaddress.ip_interface("192.168.1.10/24")
+gateway = ipaddress.ip_address("192.168.1.1")
+
+for destino in ["192.168.1.42", "8.8.8.8", "192.168.2.5"]:
+    ip = ipaddress.ip_address(destino)
+    if ip in minha_iface.network:
+        print(f"{destino}: mesma rede, ARP pergunta por {destino}")
+    else:
+        print(f"{destino}: fora da rede, ARP pergunta pelo gateway {gateway}")
+```
+
+```text
+Saída:
+192.168.1.42: mesma rede, ARP pergunta por 192.168.1.42
+8.8.8.8: fora da rede, ARP pergunta pelo gateway 192.168.1.1
+192.168.2.5: fora da rede, ARP pergunta pelo gateway 192.168.1.1
+```
+
+## Como funciona a troca
+
+```text
+ Host A 192.168.1.10                        Host B 192.168.1.42
+   |                                                  |
+   |-- broadcast ff:ff:ff:ff:ff:ff ------------------>|  (todos recebem)
+   |   "quem tem 192.168.1.42? responda a .10"        |
+   |                                                  |
+   |<-------------------------- unicast para A -------|
+   |   "192.168.1.42 está em 08:00:27:aa:bb:cc"       |
+   |                                                  |
+   [A guarda no cache e envia o pacote IP]
+```
+
+A requisição vai em broadcast porque A ainda não sabe a quem mandar. A resposta vai direto para A. Os dois lados aproveitam: B também anota o MAC de A, já que provavelmente vai responder em seguida.
+
+O resultado fica num **cache ARP** com validade curta (de segundos a poucos minutos, dependendo do sistema). Enquanto a resolução não volta, o kernel segura o pacote numa fila pequena; se ninguém responde, os pacotes são descartados e você vê "host unreachable".
+
+## O pacote ARP por dentro
+
+O ARP viaja direto sobre Ethernet (EtherType `0x0806`), sem IP. São 28 bytes com campos fixos, fáceis de montar com `struct`:
+
+```python
+import struct, socket
+
+def arp_request(mac_orig, ip_orig, ip_alvo):
+    return struct.pack(
+        "!HHBBH6s4s6s4s",
+        1,           # hardware: Ethernet
+        0x0800,      # protocolo: IPv4
+        6, 4,        # tamanhos: MAC 6, IP 4
+        1,           # operação: 1 = request, 2 = reply
+        bytes.fromhex(mac_orig.replace(":", "")),
+        socket.inet_aton(ip_orig),
+        b"\x00" * 6, # MAC alvo desconhecido
+        socket.inet_aton(ip_alvo),
+    )
+
+pkt = arp_request("3c:22:fb:9a:10:7e", "192.168.1.10", "192.168.1.42")
+print(len(pkt), "bytes")
+print(pkt.hex(" "))
+hw, proto, hl, pl, op, sha, spa, tha, tpa = struct.unpack("!HHBBH6s4s6s4s", pkt)
+print("op", op, "quem tem", socket.inet_ntoa(tpa), "? diga a", socket.inet_ntoa(spa))
+```
+
+```text
+Saída:
+28 bytes
+00 01 08 00 06 04 00 01 3c 22 fb 9a 10 7e c0 a8 01 0a 00 00 00 00 00 00 c0 a8 01 2a
+op 1 quem tem 192.168.1.42 ? diga a 192.168.1.10
+```
+
+## Simulando o cache
+
+O cache é o que evita um broadcast por pacote. A simulação abaixo usa um relógio fictício para mostrar acerto, expiração e nova consulta.
+
+```python
+class CacheArp:
+    def __init__(self, ttl):
+        self.ttl, self.entradas = ttl, {}
+
+    def resolver(self, ip, agora, rede):
+        e = self.entradas.get(ip)
+        if e and agora - e[1] < self.ttl:
+            return f"t={agora}: {ip} -> {e[0]} (cache)"
+        mac = rede[ip]  # simula a resposta ao broadcast
+        self.entradas[ip] = (mac, agora)
+        return f"t={agora}: {ip} -> {mac} (broadcast ARP)"
+
+rede = {"192.168.1.1": "a4:bb:6d:11:22:33"}
+c = CacheArp(ttl=60)
+for t in [0, 5, 59, 61]:
+    print(c.resolver("192.168.1.1", t, rede))
+```
+
+```text
+Saída:
+t=0: 192.168.1.1 -> a4:bb:6d:11:22:33 (broadcast ARP)
+t=5: 192.168.1.1 -> a4:bb:6d:11:22:33 (cache)
+t=59: 192.168.1.1 -> a4:bb:6d:11:22:33 (cache)
+t=61: 192.168.1.1 -> a4:bb:6d:11:22:33 (broadcast ARP)
+```
+
+## Armadilhas e segurança
+
+- **ARP spoofing:** qualquer máquina pode mandar respostas não solicitadas dizendo "o gateway sou eu". Os outros atualizam o cache e passam a enviar o tráfego para o atacante (man-in-the-middle). Defesas: inspeção dinâmica de ARP no switch, entradas estáticas para o gateway e, acima de tudo, criptografia fim a fim (TLS), que torna a interceptação inútil.
+- **Gratuitous ARP:** um host anuncia o próprio IP sem ninguém perguntar. É usado para detectar IP duplicado e, em failover, para um IP virtual "mudar de máquina" (keepalived, VRRP): os vizinhos atualizam o cache na hora.
+- **Cache velho:** após trocar um servidor mantendo o IP, clientes podem continuar mandando quadros para o MAC antigo até a entrada expirar. Daí o gratuitous ARP em migrações.
+- **IPv6 não usa ARP:** usa o Neighbor Discovery, com mensagens ICMPv6 enviadas a grupos multicast em vez de broadcast.
+
+```bash
+ip neigh show
+arp -a
+```
+
+```text
+192.168.1.1 dev wlan0 lladdr a4:bb:6d:11:22:33 REACHABLE
+192.168.1.42 dev wlan0 lladdr 08:00:27:aa:bb:cc STALE
+```
+
+## Na entrevista
+
+ARP aparece quase sempre dentro de "o que acontece quando você digita uma URL": diga que o host compara o destino com a própria máscara, resolve o MAC do gateway via ARP (ou usa o cache) e só então envia o primeiro quadro. Se a conversa for de segurança, cite ARP spoofing e por que TLS protege mesmo numa rede local comprometida. Follow-ups: "por que a requisição é broadcast e a resposta unicast?" e "como um IP flutuante troca de máquina no failover?" (gratuitous ARP).
+
+<QuizSet>
+<Quiz question="Seu notebook em 10.0.0.15/24 vai abrir uma conexão com 151.101.1.69. Por qual IP ele pergunta no ARP?" options={["151.101.1.69", "O IP do gateway padrão", "O IP do servidor DNS", "Nenhum, ARP não é usado"]} answer={1} explanation="O destino está fora da sub-rede, então o quadro vai para o gateway; o ARP resolve o MAC do gateway." />
+<Quiz question="Por que um ataque de ARP spoofing funciona?" options={["ARP usa criptografia fraca", "Hosts aceitam respostas ARP sem autenticação, mesmo não solicitadas", "O switch repassa todo o tráfego para todos", "O DNS é desviado"]} answer={1} explanation="ARP não tem autenticação; o atacante anuncia o próprio MAC para o IP do gateway e as vítimas atualizam o cache." />
+</QuizSet>

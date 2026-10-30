@@ -1,0 +1,120 @@
+---
+title: Sub-redes e CIDR
+kind: lesson
+---
+
+Um endereço IP sozinho não diz onde termina "a minha rede" e começa "o resto do mundo". Essa fronteira vem do **prefixo**: quantos bits iniciais identificam a rede. Com ele o host decide se entrega direto ou manda ao gateway, o roteador escolhe a rota e você, como engenheiro, desenha uma VPC sem sobreposição com a rede do escritório. Perguntas de entrevista sobre CIDR costumam ser cálculos rápidos, e errar uma potência de dois pega mal.
+
+## Notação CIDR
+
+`10.20.0.0/16` significa: os primeiros 16 bits são a rede, os 16 restantes identificam hosts dentro dela. A **máscara** é o mesmo dado em outro formato: 16 bits ligados viram `255.255.0.0`. Antes do CIDR existiam classes fixas (A, B, C), que desperdiçavam endereços; hoje o prefixo pode ter qualquer tamanho.
+
+Contas que você deve saber de cabeça:
+
+| Prefixo | Endereços | Hosts utilizáveis (IPv4) | Uso típico |
+| --- | --- | --- | --- |
+| /32 | 1 | 1 | um host específico em rota ou regra |
+| /30 | 4 | 2 | enlace ponto a ponto |
+| /24 | 256 | 254 | LAN clássica |
+| /20 | 4.096 | 4.094 | sub-rede de VPC |
+| /16 | 65.536 | 65.534 | VPC inteira |
+
+A regra é `2^(32 - prefixo)` endereços. Em uma sub-rede IPv4 tradicional, o primeiro endereço identifica a rede e o último é o broadcast, por isso sobram dois a menos. Provedores de nuvem reservam mais alguns (a AWS separa cinco por sub-rede).
+
+## A conta bit a bit
+
+Saber se um IP pertence a uma rede é um `AND` com a máscara:
+
+```python
+import socket, struct
+
+def para_int(ip):
+    return struct.unpack("!I", socket.inet_aton(ip))[0]
+
+def para_ip(n):
+    return socket.inet_ntoa(struct.pack("!I", n))
+
+ip, prefixo = "172.16.37.200", 20
+mascara = (0xFFFFFFFF << (32 - prefixo)) & 0xFFFFFFFF
+rede = para_int(ip) & mascara
+broadcast = rede | (~mascara & 0xFFFFFFFF)
+print("mascara  ", para_ip(mascara))
+print("rede     ", para_ip(rede))
+print("broadcast", para_ip(broadcast))
+print("primeiro ", para_ip(rede + 1), "| ultimo", para_ip(broadcast - 1))
+print("172.16.47.9 na mesma rede?", para_int("172.16.47.9") & mascara == rede)
+print("172.16.48.1 na mesma rede?", para_int("172.16.48.1") & mascara == rede)
+```
+
+```text
+Saída:
+mascara   255.255.240.0
+rede      172.16.32.0
+broadcast 172.16.47.255
+primeiro  172.16.32.1 | ultimo 172.16.47.254
+172.16.47.9 na mesma rede? True
+172.16.48.1 na mesma rede? False
+```
+
+Com /20, o terceiro octeto anda em blocos de 16 (32, 48, 64...). Por isso 172.16.47.9 ainda está na rede de 172.16.32.0 e 172.16.48.1 já não está.
+
+## Dividindo uma VPC
+
+Na prática você usa o módulo `ipaddress`, que faz essas contas e evita erros. Um desenho comum: uma `/16` para a VPC, sub-redes `/20` para cada zona de disponibilidade, separando públicas e privadas.
+
+```python
+import ipaddress
+
+vpc = ipaddress.ip_network("10.0.0.0/16")
+subs = list(vpc.subnets(new_prefix=20))
+print("sub-redes /20 possiveis:", len(subs))
+nomes = ["publica-a", "publica-b", "privada-a", "privada-b"]
+for nome, s in zip(nomes, subs):
+    print(f"{nome:10} {str(s):15} {s.num_addresses} enderecos")
+
+escritorio = ipaddress.ip_network("10.0.32.0/19")
+print("conflito com o escritorio:", [str(s) for s in subs[:4] if s.overlaps(escritorio)])
+print("resumo de 4 sub-redes:", list(ipaddress.collapse_addresses(subs[:4])))
+```
+
+```text
+Saída:
+sub-redes /20 possiveis: 16
+publica-a  10.0.0.0/20     4096 enderecos
+publica-b  10.0.16.0/20    4096 enderecos
+privada-a  10.0.32.0/20    4096 enderecos
+privada-b  10.0.48.0/20    4096 enderecos
+conflito com o escritorio: ['10.0.32.0/20', '10.0.48.0/20']
+resumo de 4 sub-redes: [IPv4Network('10.0.0.0/18')]
+```
+
+A última linha mostra a **agregação** (summarization): quatro `/20` contíguas viram uma única `/18`. Roteadores anunciam blocos agregados para manter as tabelas pequenas, e é isso que permite à internet ter "só" algumas centenas de milhares de rotas BGP em vez de bilhões.
+
+## Maior prefixo vence
+
+Quando várias rotas cobrem o mesmo destino, o roteador escolhe a mais **específica** (longest prefix match). A rota `0.0.0.0/0` é a padrão: casa com tudo, mas perde para qualquer outra.
+
+```text
+Tabela                         Destino 10.1.2.3
+10.0.0.0/8      -> link A      casa (8 bits)
+10.1.0.0/16     -> link B      casa (16 bits)
+10.1.2.0/24     -> link C      casa (24 bits)  <- escolhida
+0.0.0.0/0       -> internet    casa (0 bits)
+```
+
+## Armadilhas
+
+- **Sobreposição de faixas** entre VPCs, escritórios e VPNs é o erro mais caro: o peering simplesmente não funciona e renumerar depois é doloroso. Planeje faixas privadas distintas (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) desde o início.
+- **Sub-redes pequenas demais**: Kubernetes atribui um IP por pod, e uma `/24` se esgota rápido.
+- **Máscara errada num host** faz ele achar que um vizinho é remoto (ou o contrário), causando tráfego assimétrico difícil de diagnosticar.
+- Em IPv6, use `/64` por sub-rede: recursos como SLAAC dependem disso.
+
+## Na entrevista
+
+Faça as contas em voz alta usando potências de dois e mencione os endereços reservados. Num desenho de sistema, mostre que pensou em faixas que não colidem e em espaço para crescer. Follow-ups: "quantos hosts cabem numa /27?" (32 endereços, 30 utilizáveis) e "duas rotas cobrem o destino, qual vale?" (a de prefixo mais longo).
+
+<QuizSet>
+<Quiz question="Quantos endereços IPv4 utilizáveis por hosts existem numa /27 tradicional?" options={["32", "30", "27", "62"]} answer={1} explanation="2^(32-27) = 32 endereços, menos o de rede e o de broadcast: 30." />
+<Quiz question="O roteador tem rotas para 10.0.0.0/8, 10.4.0.0/14 e 0.0.0.0/0. Para onde vai 10.5.9.9?" options={["10.0.0.0/8", "10.4.0.0/14", "0.0.0.0/0", "É descartado"]} answer={1} explanation="10.4.0.0/14 cobre de 10.4.0.0 a 10.7.255.255, inclui o destino e é o prefixo mais longo." />
+<Quiz question="Você precisa conectar sua VPC 10.0.0.0/16 a outra VPC por peering. Qual faixa a nova VPC deve evitar?" options={["10.1.0.0/16", "172.16.0.0/16", "10.0.128.0/17", "192.168.0.0/16"]} answer={2} explanation="10.0.128.0/17 está contida em 10.0.0.0/16; faixas sobrepostas impedem o roteamento entre as VPCs." />
+</QuizSet>

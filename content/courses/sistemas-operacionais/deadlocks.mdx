@@ -1,0 +1,131 @@
+---
+title: "Deadlocks: prevenção e detecção"
+kind: lesson
+---
+
+A thread 1 pega o lock da conta A e tenta pegar o da conta B. Ao mesmo tempo, a thread 2 pega o lock de B e tenta pegar o de A. Cada uma espera pela outra, para sempre. Nenhuma usa CPU, nenhum erro aparece no log, e as requisições simplesmente param de responder. Isso é um **deadlock**: um conjunto de processos em que cada um espera por um recurso segurado por outro do mesmo conjunto.
+
+## As quatro condições de Coffman
+
+Um deadlock só pode acontecer se as quatro condições valerem ao mesmo tempo:
+
+| Condição | Significado | Como quebrar |
+| --- | --- | --- |
+| Exclusão mútua | O recurso só pode ser usado por um de cada vez | Recursos compartilháveis (leitura, cópias) |
+| Posse e espera | Quem segura um recurso pede outro | Pedir tudo de uma vez no início |
+| Sem preempção | Ninguém tira o recurso à força | Liberar o que tem se não conseguir o próximo (`tryLock` com timeout) |
+| Espera circular | Existe um ciclo de esperas | **Ordem global de aquisição de locks** |
+
+Quebrar qualquer uma impede o deadlock. Na prática, a técnica mais usada é eliminar a espera circular: todo código adquire locks numa ordem fixa, por exemplo pelo id da conta. Se todo mundo pega A antes de B, nunca existe alguém com B esperando A.
+
+```python
+def transferir(origem, destino, valor, locks):
+    primeiro, segundo = sorted([origem, destino])   # ordem global por id
+    with locks[primeiro], locks[segundo]:
+        ...
+```
+
+## Quatro estratégias
+
+1. **Prevenção:** projetar para que uma das condições nunca valha (ordem de locks).
+2. **Evitação:** antes de conceder um recurso, verificar se o sistema continua num estado seguro (algoritmo do banqueiro).
+3. **Detecção e recuperação:** deixar acontecer, procurar ciclos periodicamente e matar ou reverter uma vítima. É o que bancos de dados fazem.
+4. **Ignorar:** o "algoritmo do avestruz". A maioria dos SOs de uso geral não trata deadlocks de aplicação; isso é problema do seu código.
+
+## Detecção: ciclo no grafo de espera
+
+Monte um grafo em que uma aresta T1 → T2 significa "T1 espera um recurso que T2 segura". Existe deadlock se e somente se o grafo tem ciclo (com uma instância por recurso). O PostgreSQL e o InnoDB fazem exatamente isso e abortam uma das transações com erro de deadlock.
+
+```python
+def achar_ciclo(espera):
+    visitando, visitados = set(), set()
+    caminho = []
+
+    def dfs(no):
+        visitando.add(no)
+        caminho.append(no)
+        for prox in espera.get(no, []):
+            if prox in visitando:
+                return caminho[caminho.index(prox):] + [prox]
+            if prox not in visitados:
+                ciclo = dfs(prox)
+                if ciclo:
+                    return ciclo
+        visitando.discard(no)
+        visitados.add(no)
+        caminho.pop()
+        return None
+
+    for no in sorted(espera):
+        if no not in visitados:
+            ciclo = dfs(no)
+            if ciclo:
+                return ciclo
+    return None
+
+sem_ciclo = {"T1": ["T2"], "T2": ["T3"], "T3": []}
+com_ciclo = {"T1": ["T2"], "T2": ["T4"], "T3": ["T1"], "T4": ["T3"]}
+print("sem_ciclo:", achar_ciclo(sem_ciclo))
+print("com_ciclo:", " -> ".join(achar_ciclo(com_ciclo)))
+```
+
+```text
+Saída:
+sem_ciclo: None
+com_ciclo: T1 -> T2 -> T4 -> T3 -> T1
+```
+
+## Evitação: o algoritmo do banqueiro
+
+O banqueiro exige que cada processo declare antecipadamente o máximo de cada recurso que pode pedir. Um estado é **seguro** se existe alguma ordem em que todos os processos conseguem terminar: alguém cujas necessidades restantes cabem no que está disponível termina, devolve tudo, e isso libera recursos para o próximo. Um pedido só é atendido se o estado resultante continua seguro.
+
+```python
+def estado_seguro(disponivel, alocado, maximo):
+    trabalho = list(disponivel)
+    falta = {p: [m - a for m, a in zip(maximo[p], alocado[p])] for p in alocado}
+    terminou, ordem = set(), []
+    progrediu = True
+    while progrediu:
+        progrediu = False
+        for p in sorted(alocado):
+            if p not in terminou and all(f <= t for f, t in zip(falta[p], trabalho)):
+                trabalho = [t + a for t, a in zip(trabalho, alocado[p])]
+                terminou.add(p)
+                ordem.append(p)
+                progrediu = True
+    return len(terminou) == len(alocado), ordem
+
+alocado = {"P0": [0, 1, 0], "P1": [2, 0, 0], "P2": [3, 0, 2], "P3": [2, 1, 1], "P4": [0, 0, 2]}
+maximo = {"P0": [7, 5, 3], "P1": [3, 2, 2], "P2": [9, 0, 2], "P3": [2, 2, 2], "P4": [4, 3, 3]}
+print("disponivel [3,3,2]:", estado_seguro([3, 3, 2], alocado, maximo))
+
+# P4 pede [3,3,0]: simulamos a concessao e testamos
+alocado_teste = dict(alocado, P4=[3, 3, 2])
+print("se conceder a P4:", estado_seguro([0, 0, 2], alocado_teste, maximo))
+```
+
+```text
+Saída:
+disponivel [3,3,2]: (True, ['P1', 'P3', 'P4', 'P0', 'P2'])
+se conceder a P4: (False, [])
+```
+
+O pedido de P4 cabe no disponível, mas deixaria o sistema num estado em que nenhuma ordem garante o término de todos. O banqueiro o recusa e P4 espera.
+
+O banqueiro é elegante, mas raramente usado em SOs reais: exige saber o máximo de antemão, assume número fixo de processos e custa O(n² · m) a cada pedido. Ele aparece mais em entrevistas e em sistemas de reserva de recursos especializados.
+
+<Callout type="tip" title="Deadlocks no seu dia a dia">
+Os mais comuns em produção são: duas transações atualizando as mesmas linhas em ordens diferentes; um pool de conexões esgotado por requisições que precisam de duas conexões ao mesmo tempo; e uma thread que segura um lock enquanto espera uma tarefa no mesmo pool de threads em que ela própria roda. Ordem consistente e timeouts resolvem a maioria.
+</Callout>
+
+**Livelock** é o primo do deadlock: as threads não estão bloqueadas, mas ficam reagindo umas às outras sem progredir, como duas pessoas desviando para o mesmo lado no corredor. Recuo com tempo aleatório (backoff com jitter) resolve.
+
+## Na entrevista
+
+Cite as quatro condições, diga qual você quebraria e por que (quase sempre a espera circular, com ordem global de locks). Saiba explicar detecção por ciclo no grafo de espera e, se pedirem, rodar o banqueiro à mão. Follow-ups comuns: "como o banco de dados lida com deadlock?" (detecta ciclo e aborta uma transação, que deve ser repetida) e "qual a diferença entre deadlock e inanição?" (no deadlock ninguém do ciclo progride; na inanição o sistema progride, mas alguém fica sempre de fora).
+
+<QuizSet>
+<Quiz question="Qual técnica prática elimina a condição de espera circular?" options={["Usar mais memória", "Adquirir sempre os locks numa ordem global fixa", "Aumentar a prioridade das threads", "Usar spinlocks"]} answer={1} explanation="Com ordem global, nenhuma thread segura um lock maior esperando um menor, então não há como fechar um ciclo." />
+<Quiz question="Duas transações no banco ficam presas e uma delas recebe erro de deadlock. O que o banco fez?" options={["Prevenção pelo banqueiro", "Detecção de ciclo no grafo de espera e aborto de uma vítima", "Ignorou o problema", "Aumentou o timeout"]} answer={1} explanation="Bancos como PostgreSQL e InnoDB procuram ciclos e abortam uma transação; a aplicação deve tentar de novo." />
+<Quiz question="No algoritmo do banqueiro, o que significa um estado seguro?" options={["Nenhum processo está bloqueado agora", "Existe pelo menos uma ordem em que todos os processos conseguem obter o que falta e terminar", "Todos os recursos estão livres", "Nenhum processo pediu recursos"]} answer={1} explanation="Estado inseguro não é deadlock garantido, mas pode levar a um; o banqueiro só concede pedidos que mantêm o estado seguro." />
+</QuizSet>

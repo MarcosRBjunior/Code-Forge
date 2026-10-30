@@ -1,0 +1,155 @@
+---
+title: TLS e certificados
+kind: lesson
+---
+
+TLS resolve três problemas ao mesmo tempo sobre um canal em que qualquer roteador no caminho pode ler e alterar pacotes: **confidencialidade** (ninguém lê), **integridade** (ninguém altera sem ser detectado) e **autenticação** (você está falando com o dono de `api.loja.com`, não com um impostor). Os dois primeiros são criptografia simétrica, barata. O difícil é o terceiro e a combinação de uma chave simétrica entre dois lados que nunca se viram. É disso que o handshake trata, e é nele que moram a latência e os incidentes mais comuns.
+
+## O handshake do TLS 1.3
+
+```text
+cliente                                            servidor
+  | ClientHello                                        |
+  |  versões, cifras, key_share (parte pública ECDHE), |
+  |  SNI = api.loja.com, ALPN = h2, http/1.1           |
+  |--------------------------------------------------->|
+  |                                        ServerHello |
+  |                    key_share do servidor, cifra    |
+  |      --- a partir daqui tudo vai cifrado ---       |
+  |                 EncryptedExtensions (ALPN = h2)    |
+  |                 Certificate (cadeia)               |
+  |                 CertificateVerify (assinatura)     |
+  |                 Finished                           |
+  |<---------------------------------------------------|
+  | Finished + primeira requisição HTTP                |
+  |--------------------------------------------------->|
+```
+
+Uma ida e volta e o cliente já manda dados. O TLS 1.2 precisava de duas, porque negociava a cifra antes de trocar chaves; o 1.3 corta isso fazendo o cliente **adivinhar** o grupo de curva elíptica e mandar sua parte da troca de chaves já no ClientHello.
+
+Três campos do ClientHello aparecem em problemas reais:
+
+- **SNI** (Server Name Indication): o nome do site, em claro, para que um IP com muitos certificados escolha o certo. Sem SNI, o servidor devolve o certificado padrão e o cliente reclama de nome errado.
+- **ALPN**: negocia HTTP/2 ou HTTP/1.1 dentro do próprio handshake.
+- **key_share**: a metade pública da troca de chaves efêmera.
+
+## Troca de chaves e forward secrecy
+
+O segredo compartilhado nasce de uma troca Diffie-Hellman efêmera: cada lado sorteia um número privado, publica um valor derivado dele e combina o valor do outro com o seu privado. Quem só observa os valores públicos não consegue calcular o segredo. A versão abaixo usa aritmética modular com números pequenos para caber na tela; o TLS real usa curvas elípticas (X25519), com a mesma ideia.
+
+```python
+import hashlib
+
+p, g = 4294967291, 5          # primo e gerador públicos (minúsculos, só para ilustrar)
+priv_cliente, priv_servidor = 123456789, 987654321   # sorteados a cada conexão
+
+pub_cliente = pow(g, priv_cliente, p)    # vai no ClientHello
+pub_servidor = pow(g, priv_servidor, p)  # vai no ServerHello
+print("no fio:", pub_cliente, pub_servidor)
+
+segredo_cliente = pow(pub_servidor, priv_cliente, p)
+segredo_servidor = pow(pub_cliente, priv_servidor, p)
+print("segredos iguais:", segredo_cliente == segredo_servidor)
+
+chave = hashlib.sha256(str(segredo_cliente).encode() + b"tls13 key").hexdigest()[:32]
+print("chave de sessao derivada:", chave)
+```
+
+```text
+Saída:
+no fio: 3029794219 976978928
+segredos iguais: True
+chave de sessao derivada: a8041edd4bd75256af0efed6817c8aa4
+```
+
+Como as chaves privadas são descartadas no fim da conexão, roubar a chave privada do **certificado** amanhã não decifra o tráfego gravado hoje. Isso é **forward secrecy**, obrigatório no TLS 1.3. A chave do certificado só serve para **assinar** o handshake (CertificateVerify), provando que o servidor possui o certificado que apresentou.
+
+## Cadeia de certificados
+
+O certificado diz "a chave pública X pertence a `api.loja.com`" e vem assinado por uma autoridade certificadora (CA). Normalmente quem assina é uma CA **intermediária**, cujo certificado é assinado por uma **raiz** que já vem instalada no sistema operacional ou no navegador. O servidor deve enviar a folha e as intermediárias; a raiz o cliente já tem.
+
+O cliente verifica: a cadeia fecha numa raiz confiável, cada assinatura confere, nenhum certificado está vencido e o nome pedido aparece no campo **SAN** (Subject Alternative Name). O programa simula essas checagens.
+
+```python
+from datetime import date
+
+RAIZES = {"Raiz Confiavel"}
+certs = {
+    "folha": {"sujeito": "api.loja.com", "emissor": "Intermediaria R3",
+              "san": ["api.loja.com", "*.loja.com"], "validade": date(2026, 12, 1)},
+    "inter": {"sujeito": "Intermediaria R3", "emissor": "Raiz Confiavel",
+              "san": [], "validade": date(2030, 1, 1)},
+}
+
+def nome_confere(host, padrao):
+    if padrao.startswith("*."):  # curinga cobre um único rótulo
+        return host.count(".") == padrao.count(".") and host.endswith(padrao[1:])
+    return host == padrao
+
+def validar(host, cadeia, hoje):
+    folha = cadeia[0]
+    if not any(nome_confere(host, s) for s in folha["san"]):
+        return "ERRO: nome nao confere com o SAN"
+    for i, cert in enumerate(cadeia):
+        if cert["validade"] < hoje:
+            return f"ERRO: {cert['sujeito']} expirado"
+        proximo = cadeia[i + 1]["sujeito"] if i + 1 < len(cadeia) else None
+        if cert["emissor"] in RAIZES:
+            return "OK"
+        if cert["emissor"] != proximo:
+            return f"ERRO: falta o emissor de {cert['sujeito']}"
+    return "ERRO: cadeia nao chega a uma raiz"
+
+hoje = date(2026, 10, 30)
+casos = [("api.loja.com", ["folha", "inter"], hoje),
+         ("www.loja.com", ["folha", "inter"], hoje),
+         ("a.b.loja.com", ["folha", "inter"], hoje),
+         ("api.loja.com", ["folha"], hoje),
+         ("api.loja.com", ["folha", "inter"], date(2027, 1, 5))]
+for host, nomes, dia in casos:
+    print(f"{host:13} {'+'.join(nomes):11} {dia} -> {validar(host, [certs[n] for n in nomes], dia)}")
+```
+
+```text
+Saída:
+api.loja.com  folha+inter 2026-10-30 -> OK
+www.loja.com  folha+inter 2026-10-30 -> OK
+a.b.loja.com  folha+inter 2026-10-30 -> ERRO: nome nao confere com o SAN
+api.loja.com  folha       2026-10-30 -> ERRO: falta o emissor de api.loja.com
+api.loja.com  folha+inter 2027-01-05 -> ERRO: api.loja.com expirado
+```
+
+O quarto caso é o clássico "funciona no navegador e falha no curl ou no Java": o servidor esqueceu de enviar a intermediária, e alguns navegadores a buscam ou têm em cache, enquanto clientes de linha de comando não.
+
+```bash
+openssl s_client -connect api.loja.com:443 -servername api.loja.com </dev/null 2>/dev/null | grep -E "s:|i:|Verify"
+```
+
+```text
+ 0 s:CN = api.loja.com
+   i:CN = Intermediaria R3
+ 1 s:CN = Intermediaria R3
+   i:CN = Raiz Confiavel
+Verify return code: 0 (ok)
+```
+
+## Falhas e trade-offs
+
+<Callout type="warning" title="Certificado expirado é incidente de disponibilidade">
+Para o usuário, um certificado vencido é indistinguível de um site fora do ar. Automatize a renovação (ACME, gerenciadores de certificado do provedor) e alerte com semanas de antecedência, inclusive para certificados de mTLS internos.
+</Callout>
+
+- **Revogação** é o elo fraco: listas (CRL) e consultas OCSP adicionam latência e muitos clientes ignoram falhas. OCSP stapling (o servidor anexa a resposta ao handshake) e certificados de vida curta são as respostas práticas.
+- **Retomada de sessão** evita refazer a troca de chaves completa em reconexões, ao custo de manter tickets ou estado no servidor; com 0-RTT, aparece o risco de replay.
+- **mTLS**: o servidor também pede certificado ao cliente. É a base de identidade entre serviços em service meshes, com o custo de emitir e girar milhares de certificados.
+- **Terminação no load balancer** centraliza certificados e alivia CPU dos serviços, mas o tráfego interno fica em claro, a menos que você recriptografe.
+
+## Na entrevista
+
+Descreva o handshake do 1.3 em uma ida e volta, explique que ECDHE gera a chave de sessão e que o certificado só autentica (assinando), e cite a validação da cadeia com SAN e validade. Follow-ups: "o que o SNI vaza e como esconder?" (o nome do site vai em claro; ECH cifra o ClientHello) e "por que o curl falha e o navegador não?" (intermediária faltando na cadeia).
+
+<QuizSet>
+<Quiz question="Um atacante gravou o tráfego TLS 1.3 de ontem e hoje roubou a chave privada do certificado do servidor. Ele consegue decifrar o tráfego gravado?" options={["Sim, a chave do certificado cifra a sessão", "Não, as chaves de sessão vieram de ECDHE efêmero e foram descartadas", "Sim, se o certificado ainda for válido", "Só se a sessão usou HTTP/2"]} answer={1} explanation="Forward secrecy: a chave do certificado só assina o handshake. O segredo de sessão veio de chaves efêmeras que não existem mais." />
+<Quiz question="O certificado tem SAN *.loja.com. Qual nome ele NÃO cobre?" options={["api.loja.com", "www.loja.com", "a.b.loja.com", "pagamentos.loja.com"]} answer={2} explanation="O curinga cobre exatamente um rótulo. a.b.loja.com tem dois rótulos antes de loja.com." />
+<Quiz question="Seu serviço funciona no navegador, mas o cliente Java de um parceiro falha com erro de cadeia incompleta. O que verificar primeiro?" options={["Se o TTL do DNS está alto", "Se o servidor está enviando o certificado intermediário junto com a folha", "Se o ALPN oferece h2", "Se a porta 443 está aberta"]} answer={1} explanation="Navegadores às vezes completam a cadeia sozinhos; muitos clientes não. O servidor deve enviar folha e intermediárias." />
+</QuizSet>

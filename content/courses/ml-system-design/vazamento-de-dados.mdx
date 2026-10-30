@@ -1,0 +1,105 @@
+---
+title: Vazamento de dados
+kind: lesson
+---
+
+Vazamento de dados (*data leakage*) acontece quando o modelo, durante o treino ou a avaliação, tem acesso a uma informação que não estará disponível no momento real da predição. O resultado é sempre o mesmo: métricas offline lindas, modelo decepcionante em produção. É o bug mais traiçoeiro de ML porque nada quebra; ao contrário, tudo parece funcionar melhor do que deveria.
+
+## As formas mais comuns
+
+- **Feature do futuro**: usar "número de compras em 30 dias" calculado hoje para um exemplo de dois meses atrás. O join point-in-time do feature store existe para evitar isso.
+- **Feature que é consequência do rótulo**: num modelo de churn, a feature "abriu chamado de cancelamento" praticamente é o rótulo. Num modelo de fraude, "transação foi revisada manualmente" só existe porque alguém já suspeitou.
+- **Divisão aleatória em dados temporais**: o treino passa a conter eventos posteriores aos do teste, e o modelo "lembra" de um comportamento que, na vida real, ainda não teria acontecido.
+- **Mesma entidade dos dois lados**: o mesmo usuário, sessão ou documento quase duplicado no treino e no teste. O modelo memoriza a entidade em vez de generalizar.
+- **Pré-processamento com o conjunto inteiro**: calcular média para normalização, vocabulário ou target encoding usando também os dados de teste.
+- **Rótulo vazando pela fonte**: imagens de exames positivos vindas de um hospital específico, com uma marca d'água própria; o modelo aprende a marca, não a doença.
+
+## Divisão temporal contra divisão aleatória
+
+Em quase todo sistema de produção, o modelo é treinado com o passado e usado no futuro. A avaliação precisa imitar isso: treine até a data T, valide e teste depois de T. O programa simula usuários cujo comportamento muda ao longo de 100 dias e usa um modelo simples, a taxa de cliques histórica do usuário, para prever cliques.
+
+```python
+import random
+
+random.seed(3)
+DIAS, USUARIOS = 100, 300
+eventos = []
+for u in range(USUARIOS):
+    inicio = random.uniform(0.02, 0.8)
+    fim = random.uniform(0.02, 0.8)
+    for dia in range(DIAS):
+        p = inicio + (fim - inicio) * dia / DIAS
+        eventos.append((dia, u, 1 if random.random() < p else 0))
+
+def auc(pares):
+    pares = sorted(pares)
+    soma_rank, n_pos, i = 0.0, 0, 0
+    while i < len(pares):
+        j = i
+        while j < len(pares) and pares[j][0] == pares[i][0]:
+            j += 1
+        rank_medio = (i + 1 + j) / 2
+        pos = sum(y for _, y in pares[i:j])
+        soma_rank += rank_medio * pos
+        n_pos += pos
+        i = j
+    n_neg = len(pares) - n_pos
+    return (soma_rank - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+
+def avaliar(treino, teste):
+    soma, cont = {}, {}
+    for _, u, y in treino:
+        soma[u] = soma.get(u, 0) + y
+        cont[u] = cont.get(u, 0) + 1
+    media = sum(y for *_, y in treino) / len(treino)
+    def prever(u):
+        return (soma.get(u, 0) + 5 * media) / (cont.get(u, 0) + 5)
+    return auc([(prever(u), y) for _, u, y in teste])
+
+embaralhados = eventos[:]
+random.shuffle(embaralhados)
+corte = int(0.8 * len(eventos))
+print(f"divisao aleatoria: AUC = {avaliar(embaralhados[:corte], embaralhados[corte:]):.3f}")
+
+treino_t = [e for e in eventos if e[0] < 80]
+teste_t = [e for e in eventos if e[0] >= 80]
+print(f"divisao temporal:  AUC = {avaliar(treino_t, teste_t):.3f}")
+
+recente = [e for e in eventos if 60 <= e[0] < 80]
+print(f"temporal, so os 20 dias mais recentes no treino: AUC = {avaliar(recente, teste_t):.3f}")
+```
+
+```text
+Saída:
+divisao aleatoria: AUC = 0.687
+divisao temporal:  AUC = 0.649
+temporal, so os 20 dias mais recentes no treino: AUC = 0.696
+```
+
+A divisão aleatória promete 0,687 de AUC, mas o modelo só entrega 0,649 quando avaliado como será usado: o treino inclui dias 81 a 99 de cada usuário, então a taxa estimada já reflete o comportamento futuro. A divisão temporal mostra o número honesto. A terceira linha traz uma lição extra: treinando só com os 20 dias mais recentes, a AUC sobe para 0,696. Quando o mundo muda, dados mais recentes podem valer mais que dados abundantes, o que motiva retreinos frequentes ou janelas de treino com peso para o recente.
+
+## Como prevenir
+
+| Fonte de vazamento | Defesa |
+| --- | --- |
+| Feature do futuro | Join point-in-time; logar features no momento da predição |
+| Feature consequência do rótulo | Para cada feature, perguntar: "eu teria isso no instante da decisão?" |
+| Divisão aleatória | Divisão por tempo, com intervalo entre treino e teste se o rótulo demora |
+| Entidade repetida | Divisão por grupo (usuário, sessão, documento) |
+| Pré-processamento global | Ajustar normalizadores e encoders só no treino |
+
+<Callout type="tip" title="Desconfie de resultados bons demais">
+Se uma feature sozinha dá AUC de 0,99, ou se o modelo novo melhora 20 pontos sobre o anterior, procure vazamento antes de comemorar. Olhe a importância das features: a campeã costuma ser a culpada.
+</Callout>
+
+Um cuidado adicional com rótulos atrasados: se o rótulo de fraude só fecha em 60 dias, deixe um intervalo entre o fim do treino e o começo do teste, e garanta que os exemplos do treino já tenham rótulo maduro.
+
+## Na entrevista
+
+Ao descrever a avaliação offline, diga "vou dividir por tempo, treinando até a semana T e testando na seguinte" e explique por quê. Ao listar features, comente quais poderiam vazar. Follow-ups comuns: "sua AUC offline é 0,95 e o teste A/B não mostrou ganho, o que investigar?", "como você divide os dados num problema de recomendação?" (por tempo e, às vezes, por usuário) e "como evitar que o mesmo produto apareça no treino e no teste com outra foto?".
+
+<QuizSet>
+<Quiz question="Num modelo de churn, a feature mais importante é 'visitou a página de cancelamento nos últimos 7 dias', calculada até a data do rótulo. Qual o problema?" options={["Nenhum, é um ótimo sinal", "Ela pode ser quase o próprio rótulo e, dependendo da janela, não estar disponível quando a decisão precisa ser tomada", "Ela tem cardinalidade alta", "Ela gera cold start"]} answer={1} explanation="Se a intervenção precisa acontecer antes da visita, essa informação não existe no momento da predição; é vazamento do rótulo." />
+<Quiz question="Por que uma divisão aleatória infla as métricas quando o comportamento muda com o tempo?" options={["Porque o teste fica menor", "Porque o treino passa a conter eventos posteriores aos do teste, revelando o comportamento futuro", "Porque embaralhar remove features", "Porque a AUC não funciona com dados embaralhados"]} answer={1} explanation="O modelo aprende com o futuro de cada entidade e é avaliado no passado, situação impossível em produção." />
+<Quiz question="Você normalizou as features usando média e desvio do dataset inteiro antes de dividir. O que deveria ter feito?" options={["Normalizar só o teste", "Calcular média e desvio só no treino e aplicar os mesmos valores no teste", "Não normalizar nunca", "Normalizar cada exemplo separadamente"]} answer={1} explanation="Estatísticas do teste não podem influenciar o treino; ajuste os transformadores apenas com dados de treino." />
+</QuizSet>

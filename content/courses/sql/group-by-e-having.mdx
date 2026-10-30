@@ -1,0 +1,150 @@
+---
+title: GROUP BY e HAVING
+kind: lesson
+---
+
+"Receita por categoria", "clientes com mais de três pedidos", "dias em que o número de cadastros caiu". Quase toda pergunta de SQL analítico passa por `GROUP BY`. A ideia é dividir as linhas em grupos e aplicar as funções de agregação a cada grupo, produzindo uma linha por grupo. O `HAVING` filtra esses grupos depois de agregados.
+
+## Como funciona
+
+O `GROUP BY` junta as linhas que têm os mesmos valores nas colunas listadas. Depois disso, cada coluna do `SELECT` precisa ser uma das colunas do agrupamento ou estar dentro de uma função de agregação. Faz sentido: dentro do grupo "Eletrônicos" há várias linhas, e o banco não teria como escolher um único `nome` de produto para mostrar.
+
+```sql
+CREATE TABLE vendas (
+  id         integer PRIMARY KEY,
+  vendedor   text NOT NULL,
+  regiao     text NOT NULL,
+  categoria  text NOT NULL,
+  valor      numeric(10, 2) NOT NULL,
+  vendido_em date NOT NULL
+);
+
+INSERT INTO vendas VALUES
+  (1, 'Ana', 'Sul', 'Eletrônicos', 1200.00, '2024-04-01'),
+  (2, 'Ana', 'Sul', 'Livros', 80.00, '2024-04-02'),
+  (3, 'Bruno', 'Sudeste', 'Eletrônicos', 950.00, '2024-04-02'),
+  (4, 'Bruno', 'Sudeste', 'Eletrônicos', 400.00, '2024-04-05'),
+  (5, 'Carla', 'Nordeste', 'Casa', 310.00, '2024-04-03'),
+  (6, 'Carla', 'Nordeste', 'Livros', 45.00, '2024-04-07'),
+  (7, 'Carla', 'Nordeste', 'Eletrônicos', 2100.00, '2024-05-01'),
+  (8, 'Diego', 'Sul', 'Casa', 150.00, '2024-05-02'),
+  (9, 'Ana', 'Sul', 'Casa', 620.00, '2024-05-03'),
+  (10, 'Bruno', 'Sudeste', 'Livros', 60.00, '2024-05-04');
+
+SELECT categoria,
+       count(*) AS vendas,
+       sum(valor) AS receita,
+       round(avg(valor), 2) AS ticket_medio
+FROM vendas
+GROUP BY categoria
+ORDER BY receita DESC;
+```
+
+```text
+Saída:
+categoria | vendas | receita | ticket_medio
+Eletrônicos | 4 | 4650.00 | 1162.50
+Casa | 3 | 1080.00 | 360.00
+Livros | 3 | 185.00 | 61.67
+```
+
+## Agrupando por várias colunas e por expressões
+
+Cada combinação distinta das colunas vira um grupo. Você também pode agrupar por uma expressão, como o mês de uma data:
+
+```sql
+SELECT date_trunc('month', vendido_em)::date AS mes,
+       regiao,
+       sum(valor) AS receita
+FROM vendas
+GROUP BY 1, 2
+ORDER BY mes, regiao;
+```
+
+```text
+Saída:
+mes | regiao | receita
+2024-04-01 | Nordeste | 355.00
+2024-04-01 | Sudeste | 1350.00
+2024-04-01 | Sul | 1280.00
+2024-05-01 | Nordeste | 2100.00
+2024-05-01 | Sudeste | 60.00
+2024-05-01 | Sul | 770.00
+```
+
+`GROUP BY 1, 2` refere-se à primeira e à segunda colunas do `SELECT`. É prático em entrevista, mas em código de produção prefira repetir as expressões, que sobrevivem a mudanças na ordem das colunas. No MySQL, a função equivalente para truncar ao mês é `DATE_FORMAT(vendido_em, '%Y-%m-01')`.
+
+## HAVING: filtro depois da agregação
+
+O `WHERE` filtra linhas antes do agrupamento; o `HAVING` filtra grupos depois. Se a condição usa uma agregação, ela precisa ir no `HAVING`. Quais vendedores fizeram mais de uma venda de valor acima de 100?
+
+```sql
+SELECT vendedor,
+       count(*) AS vendas_grandes,
+       sum(valor) AS total
+FROM vendas
+WHERE valor > 100
+GROUP BY vendedor
+HAVING count(*) > 1
+ORDER BY total DESC;
+```
+
+```text
+Saída:
+vendedor | vendas_grandes | total
+Carla | 2 | 2410.00
+Ana | 2 | 1820.00
+Bruno | 2 | 1350.00
+```
+
+Diego ficou de fora porque tem só uma venda acima de 100. O `WHERE valor > 100` descartou as vendas pequenas antes de contar; trocar isso por `HAVING valor > 100` daria erro, porque `valor` não é uma coluna do grupo.
+
+Por que não colocar tudo no `HAVING`? Funciona para condições sobre colunas do grupo, mas filtrar cedo no `WHERE` reduz as linhas que o banco precisa agrupar, e deixa claro o que é filtro de linha e o que é filtro de grupo.
+
+## Grupos que não existem
+
+O `GROUP BY` só produz grupos para valores que aparecem nos dados. Se nenhum vendedor da região Norte vendeu em maio, não haverá linha "Norte, maio, 0". Para mostrar zeros, você precisa de uma tabela (ou série) com todos os valores esperados e um `LEFT JOIN`. No Postgres, `generate_series` cria a lista de datas:
+
+```sql
+SELECT d::date AS dia,
+       COALESCE(sum(v.valor), 0) AS receita
+FROM generate_series('2024-04-01'::date, '2024-04-07'::date, interval '1 day') AS d
+LEFT JOIN vendas v ON v.vendido_em = d::date
+GROUP BY d
+ORDER BY dia;
+```
+
+```text
+Saída:
+dia | receita
+2024-04-01 | 1200.00
+2024-04-02 | 1030.00
+2024-04-03 | 310.00
+2024-04-04 | 0
+2024-04-05 | 400.00
+2024-04-06 | 0
+2024-04-07 | 45.00
+```
+
+Os dias 4 e 6 aparecem com zero. Esse padrão é cobrado em perguntas de série temporal ("receita diária, incluindo dias sem vendas"). O MySQL não tem `generate_series`; lá se usa uma CTE recursiva ou uma tabela calendário.
+
+## Armadilhas
+
+- **Coluna fora do grupo**: `SELECT vendedor, regiao, sum(valor) ... GROUP BY vendedor` dá erro no Postgres. O Postgres aceita a coluna extra só quando você agrupa pela chave primária da tabela (dependência funcional). O MySQL com `ONLY_FULL_GROUP_BY` desligado devolve um valor arbitrário, o que esconde bugs.
+- **Agregação no `WHERE`**: `WHERE count(*) > 1` é erro. Use `HAVING`.
+- **Apelido no `HAVING`**: o Postgres não aceita `HAVING total > 1000` com `total` vindo do `SELECT`; repita `sum(valor)`. O MySQL aceita.
+- **Contagem inflada por join**: agrupar depois de juntar com uma tabela um-para-muitos multiplica as linhas. Agregue antes de juntar, ou use `count(DISTINCT)`.
+
+<Callout type="tip" title="Uma linha por quê?">
+Antes de escrever o `GROUP BY`, complete a frase "a resposta tem uma linha por...". As colunas dessa frase são exatamente as colunas do agrupamento.
+</Callout>
+
+## Na entrevista
+
+Diga a granularidade da resposta, escreva o `GROUP BY` com essas colunas, coloque os filtros de linha no `WHERE` e os de grupo no `HAVING`. Se a pergunta pede períodos ou categorias "inclusive sem vendas", lembre do `LEFT JOIN` com uma série. Follow-ups comuns: "qual a diferença entre `WHERE` e `HAVING`?" e "como mostrar também o total geral?" (no Postgres, `GROUP BY ROLLUP (categoria)`; no MySQL, `WITH ROLLUP`).
+
+<QuizSet>
+<Quiz question="Você quer clientes com receita total acima de 1000. Onde fica a condição sum(valor) > 1000?" options={["No WHERE", "No HAVING", "No ORDER BY", "No GROUP BY"]} answer={1} explanation="Condições sobre agregações só podem ser avaliadas depois do agrupamento, no HAVING." />
+<Quiz question="SELECT regiao, vendedor, sum(valor) FROM vendas GROUP BY regiao, no Postgres:" options={["Mostra um vendedor qualquer por região", "Dá erro: vendedor não está no GROUP BY nem em agregação", "Agrupa automaticamente por vendedor", "Ignora a coluna vendedor"]} answer={1} explanation="Cada região tem vários vendedores, e o Postgres exige que a coluna esteja no grupo ou dentro de uma agregação." />
+<Quiz question="Uma consulta de receita diária não mostra os dias sem vendas. Como corrigir?" options={["Usar HAVING count(*) >= 0", "Gerar a lista de dias e fazer LEFT JOIN com as vendas", "Usar DISTINCT", "Trocar sum por count"]} answer={1} explanation="GROUP BY só cria grupos para valores existentes. É preciso uma série de datas como lado esquerdo." />
+</QuizSet>

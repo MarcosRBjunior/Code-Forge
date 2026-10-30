@@ -1,0 +1,126 @@
+---
+title: Processos e threads
+kind: lesson
+---
+
+Quase toda pergunta de concorrência começa por aqui: qual a diferença entre um processo e uma thread, e quando usar cada um? A resposta curta é que ambos são unidades de execução, mas diferem no que compartilham. Essa diferença decide custo, isolamento e o tipo de bug que você vai enfrentar.
+
+## Processo: um programa isolado
+
+Um **processo** é um programa em execução com seus próprios recursos: espaço de endereçamento (memória virtual), descritores de arquivo abertos, variáveis de ambiente, identificador (PID). O sistema operacional garante que um processo não leia nem escreva na memória de outro. Se um processo trava ou corrompe a memória, os outros continuam vivos.
+
+Esse isolamento tem preço. Criar um processo é relativamente caro, e trocar dados entre processos exige **comunicação entre processos** (IPC): pipes, sockets, filas, memória compartilhada explícita. Tudo que atravessa a fronteira precisa ser serializado.
+
+## Thread: um fluxo dentro do processo
+
+Uma **thread** é um fluxo de execução dentro de um processo. Todas as threads de um processo compartilham a mesma memória heap, as variáveis globais e os arquivos abertos. Cada thread tem só o que é estritamente dela: a pilha de chamadas, os registradores e o contador de programa.
+
+```text
++----------------------- Processo (PID 4210) -----------------------+
+|  Heap, variáveis globais, arquivos abertos  (compartilhados)      |
+|                                                                   |
+|  +-- Thread 1 --+   +-- Thread 2 --+   +-- Thread 3 --+           |
+|  | pilha        |   | pilha        |   | pilha        |           |
+|  | registradores|   | registradores|   | registradores|           |
+|  +--------------+   +--------------+   +--------------+           |
++-------------------------------------------------------------------+
+```
+
+Compartilhar memória torna a comunicação trivial: uma thread escreve num objeto e a outra lê. Também é a origem de condições de corrida, porque nada impede que duas threads mexam no mesmo objeto ao mesmo tempo.
+
+## Threads compartilham memória
+
+No programa abaixo, quatro threads escrevem no mesmo dicionário global. Todas enxergam o mesmo objeto e o mesmo PID. Cada uma escreve numa chave diferente, então não há disputa.
+
+```python
+import os
+import threading
+
+resultado = {}
+pids = []
+
+def trabalho(nome):
+    resultado[nome] = len(nome)
+    pids.append(os.getpid())
+
+threads = [threading.Thread(target=trabalho, args=(n,)) for n in ["ana", "bruno", "carla", "di"]]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print(sorted(resultado.items()))
+print("todas no mesmo processo:", len(set(pids)) == 1 and pids[0] == os.getpid())
+```
+
+```text
+Saída:
+[('ana', 3), ('bruno', 5), ('carla', 5), ('di', 2)]
+todas no mesmo processo: True
+```
+
+## Processos não compartilham
+
+Agora o contraste. Um processo filho recebe uma cópia (ou recarrega o módulo, no modo `spawn`), e alterações feitas nele não aparecem no pai. Para devolver um resultado, você precisa de um canal explícito, como uma `multiprocessing.Queue`.
+
+```python
+import multiprocessing as mp
+import os
+
+contador = 0
+
+def filho(fila):
+    global contador
+    contador += 100
+    fila.put(("filho", contador, os.getpid() != os.getppid()))
+
+if __name__ == "__main__":
+    fila = mp.Queue()
+    p = mp.Process(target=filho, args=(fila,))
+    p.start()
+    quem, valor, pid_diferente = fila.get()
+    p.join()
+    print(f"{quem} viu contador = {valor}")
+    print("filho tinha outro PID:", pid_diferente)
+    print(f"pai continua com contador = {contador}")
+```
+
+```text
+Saída:
+filho viu contador = 100
+filho tinha outro PID: True
+pai continua com contador = 0
+```
+
+## Comparando
+
+| Aspecto | Processo | Thread |
+| --- | --- | --- |
+| Memória | Isolada | Compartilhada com o processo |
+| Custo de criação | Alto | Baixo |
+| Troca de contexto | Mais cara (troca tabela de páginas) | Mais barata |
+| Comunicação | IPC, serialização | Variáveis compartilhadas |
+| Falha | Isolada | Uma thread pode derrubar o processo |
+| Bug típico | Overhead de IPC | Condição de corrida |
+
+Em Java, `new Thread(...)` e `ProcessBuilder` mapeiam bem esses dois mundos. Em Go, goroutines são threads leves gerenciadas pelo runtime, multiplexadas sobre poucas threads do sistema. Em C++, `std::thread` cria uma thread do sistema operacional e `fork()` (POSIX) cria um processo.
+
+<Callout type="note" title="Threads verdes e virtuais">
+Goroutines, virtual threads do Java 21 e corrotinas são agendadas pelo runtime, não pelo kernel. Custam alguns KB em vez de MB de pilha, permitindo centenas de milhares delas. O modelo de memória compartilhada continua o mesmo.
+</Callout>
+
+## Armadilhas
+
+- Achar que mais threads sempre significa mais velocidade. Cada thread do sistema reserva pilha (frequentemente 1 MB ou mais) e o escalonador gasta tempo trocando entre elas.
+- Usar processos para tarefas muito pequenas: o custo de serializar a entrada e a saída pode superar o ganho.
+- Esquecer que uma exceção não tratada numa thread pode passar despercebida, enquanto o processo continua rodando sem o trabalho feito.
+
+## Na entrevista
+
+Responda com a frase-chave ("processos isolam memória; threads compartilham a memória do processo") e emende os trade-offs: isolamento e robustez contra custo e facilidade de comunicação. Dê um exemplo: navegadores usam um processo por aba para que uma página travada não derrube as outras; um servidor web usa threads ou event loop para atender conexões com pouco overhead. Follow-ups comuns: "o que uma thread tem de exclusivo?" (pilha, registradores, contador de programa) e "como processos se comunicam?" (pipes, sockets, filas, memória compartilhada).
+
+<QuizSet>
+<Quiz question="O que cada thread de um processo possui exclusivamente?" options={["O heap", "As variáveis globais", "A pilha de chamadas e os registradores", "Os descritores de arquivo"]} answer={2} explanation="Heap, globais e arquivos são do processo e compartilhados; pilha, registradores e contador de programa são de cada thread." />
+<Quiz question="Um navegador quer que uma aba travada não derrube as demais. Qual modelo atende melhor?" options={["Uma thread por aba", "Um processo por aba", "Uma única thread com event loop", "Corrotinas por aba"]} answer={1} explanation="Processos têm memória isolada; a falha de um não corrompe nem derruba os outros." />
+<Quiz question="Por que trocar dados entre processos costuma ser mais caro do que entre threads?" options={["Processos rodam em núcleos mais lentos", "Os dados precisam atravessar um canal de IPC, geralmente com serialização", "Threads não precisam de sincronização", "O sistema operacional proíbe IPC"]} answer={1} explanation="Sem memória compartilhada, os dados são copiados e serializados por pipes, sockets ou filas." />
+</QuizSet>

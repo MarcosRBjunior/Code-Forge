@@ -1,0 +1,130 @@
+---
+title: Ciclo de vida de uma thread
+kind: lesson
+---
+
+Para raciocinar sobre um programa concorrente, você precisa saber em que estado cada thread pode estar e o que a faz mudar de estado. Entrevistadores gostam de perguntar isso diretamente ("quais são os estados de uma thread em Java?") e indiretamente, quando você explica por que uma thread "sumiu" ou por que o programa não termina.
+
+## Os estados
+
+Os nomes variam por linguagem, mas o modelo é o mesmo:
+
+```text
+          start()
+  NOVA ------------> PRONTA <----------------------+
+                       |   ^                       |
+     escalonador escolhe|   | perde a CPU          | lock liberado,
+                       v   | (fatia de tempo)      | sinal recebido,
+                    EXECUTANDO                     | sleep terminou
+                       |       \                   |
+     fim da função     |        \ espera lock, I/O, |
+     ou exceção        |         \ sleep, wait()   |
+                       v          v                |
+                  TERMINADA     BLOQUEADA ---------+
+```
+
+- **Nova:** o objeto thread existe, mas ainda não foi iniciado.
+- **Pronta (runnable):** pode rodar e está esperando o escalonador lhe dar um núcleo.
+- **Executando:** está de fato usando a CPU.
+- **Bloqueada ou em espera:** não pode avançar até algo acontecer (um lock ser liberado, um I/O terminar, um `sleep` acabar, um sinal chegar).
+- **Terminada:** a função da thread retornou ou lançou exceção. Não volta mais.
+
+Em Java, `Thread.getState()` devolve `NEW`, `RUNNABLE`, `BLOCKED`, `WAITING`, `TIMED_WAITING` e `TERMINATED`. Note que Java junta "pronta" e "executando" em `RUNNABLE` e separa três tipos de espera: `BLOCKED` (esperando um monitor `synchronized`), `WAITING` (`wait()`, `join()` sem prazo) e `TIMED_WAITING` (com prazo). Python não expõe o estado, mas oferece `is_alive()`.
+
+## Observando o ciclo em Python
+
+O programa abaixo usa um `Event` para segurar a thread em espera, de modo que conseguimos observá-la viva antes de liberá-la.
+
+```python
+import threading
+
+liberar = threading.Event()
+log = []
+
+def tarefa():
+    log.append("comecou")
+    liberar.wait()          # fica bloqueada até o evento ser sinalizado
+    log.append("terminou")
+
+t = threading.Thread(target=tarefa, name="trabalhadora")
+print("antes do start, viva?", t.is_alive())
+
+t.start()
+while not log:              # espera a thread registrar que começou
+    pass
+print("depois do start, viva?", t.is_alive())
+
+liberar.set()
+t.join()
+print("depois do join, viva?", t.is_alive())
+print("log:", log)
+```
+
+```text
+Saída:
+antes do start, viva? False
+depois do start, viva? True
+depois do join, viva? False
+log: ['comecou', 'terminou']
+```
+
+O laço `while not log` é uma espera ativa usada só para fins didáticos; em código real você usaria outro `Event` para saber que a thread começou.
+
+## Transições que pegam gente desprevenida
+
+**Uma thread só pode ser iniciada uma vez.** Depois de terminada, não há como reiniciá-la; crie outra. Java lança `IllegalThreadStateException` e Python lança `RuntimeError`.
+
+**`join` com timeout não mata a thread.** Ele apenas para de esperar. Se a thread continuar viva depois do prazo, ela segue rodando em segundo plano.
+
+**Threads daemon morrem com o processo.** Quando só restam threads daemon, o interpretador (ou a JVM) encerra sem esperá-las. Threads não daemon mantêm o processo vivo: esquecer uma delas rodando em laço infinito faz o programa nunca terminar.
+
+```python
+import threading
+
+parar = threading.Event()
+
+def laço():
+    parar.wait()            # simula trabalho longo
+
+t = threading.Thread(target=laço, daemon=True)
+t.start()
+
+t.join(timeout=0.1)
+print("join com timeout voltou; ainda viva?", t.is_alive())
+
+try:
+    t.start()
+except RuntimeError as e:
+    print("segundo start:", e)
+
+parar.set()
+t.join()
+print("terminada; viva?", t.is_alive())
+print("era daemon?", t.daemon)
+```
+
+```text
+Saída:
+join com timeout voltou; ainda viva? True
+segundo start: threads can only be started once
+terminada; viva? False
+era daemon? True
+```
+
+<Callout type="warning" title="Não existe 'matar' uma thread com segurança">
+Java depreciou `Thread.stop()` porque interromper uma thread no meio de uma seção crítica deixa objetos em estado inconsistente. O padrão correto é cooperativo: a thread checa periodicamente uma flag, um `Event` ou o status de interrupção (`Thread.interrupted()` em Java, `ctx.Done()` em Go) e encerra sozinha.
+</Callout>
+
+## Bloqueada não é o mesmo que ocupada
+
+Uma thread bloqueada não consome CPU: o sistema a tira da fila de execução até o evento acontecer. Já uma espera ativa (laço checando uma variável) fica em "executando" e queima um núcleo inteiro. Isso aparece em entrevista quando você implementa uma fila ou um semáforo: use primitivas que bloqueiam (`Condition`, `Event`, `Queue`) em vez de laços com `sleep` curto.
+
+## Na entrevista
+
+Desenhe o diagrama de estados, cite as transições principais e associe cada espera à primitiva que a causa (lock, `wait`, `sleep`, I/O). Se a pergunta for sobre Java, mencione a distinção entre `BLOCKED` e `WAITING`. Follow-ups comuns: "como encerrar uma thread com segurança?" (sinal cooperativo, nunca forçar) e "o que acontece com threads daemon quando o `main` termina?" (são encerradas abruptamente, sem rodar limpeza).
+
+<QuizSet>
+<Quiz question="Uma thread chamou join(timeout=1) em outra e o prazo expirou. O que acontece com a thread esperada?" options={["É encerrada automaticamente", "Continua rodando normalmente", "Volta ao estado NOVA", "Lança uma exceção"]} answer={1} explanation="O timeout só limita quanto tempo quem chamou espera; a outra thread segue viva." />
+<Quiz question="Em Java, uma thread esperando para entrar num bloco synchronized ocupado está em qual estado?" options={["WAITING", "TIMED_WAITING", "BLOCKED", "RUNNABLE"]} answer={2} explanation="BLOCKED é específico de espera por monitor; WAITING é para wait(), join() e park sem prazo." />
+<Quiz question="Qual é a forma recomendada de pedir que uma thread pare?" options={["Chamar um método stop() que a interrompe na hora", "Sinalizar cooperativamente com uma flag ou evento que ela verifica", "Iniciar a thread de novo", "Deixar a exceção do processo encerrá-la"]} answer={1} explanation="Parada cooperativa permite que a thread libere locks e deixe os dados consistentes antes de sair." />
+</QuizSet>

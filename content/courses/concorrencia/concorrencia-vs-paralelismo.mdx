@@ -1,0 +1,116 @@
+---
+title: Concorrência vs. paralelismo e o GIL
+kind: lesson
+---
+
+"Concorrência e paralelismo são a mesma coisa?" é uma pergunta de aquecimento comum, e a resposta errada passa a impressão de que você usa os termos sem pensar. Em Python, ela vem acompanhada de outra: "threads em Python rodam em paralelo?". Vamos às duas.
+
+## Duas ideias diferentes
+
+**Concorrência** é sobre estrutura: o programa é organizado em várias tarefas que podem progredir de forma independente, intercalando-se no tempo. **Paralelismo** é sobre execução: duas ou mais tarefas rodam literalmente no mesmo instante, em núcleos diferentes.
+
+```text
+Concorrência num núcleo (intercalação):
+núcleo 0: [A][B][A][C][B][A][C]
+
+Paralelismo em três núcleos:
+núcleo 0: [A][A][A][A]
+núcleo 1: [B][B][B][B]
+núcleo 2: [C][C][C][C]
+```
+
+Você pode ter concorrência sem paralelismo (um event loop numa única thread atendendo milhares de conexões) e paralelismo sem muita concorrência (uma operação vetorial SIMD que soma oito números de uma vez). Um programa concorrente bem escrito ganha paralelismo de graça quando há núcleos disponíveis, se o runtime permitir.
+
+## Concorrência sem paralelismo: um único thread
+
+Com `asyncio`, duas corrotinas intercalam seus passos dentro de uma só thread. Cada `await asyncio.sleep(0)` devolve o controle ao event loop, que passa a vez para a outra. Como tudo roda numa thread com escalonamento determinístico, a ordem da saída é sempre a mesma.
+
+```python
+import asyncio
+import threading
+
+async def tarefa(nome, passos, log):
+    for i in range(passos):
+        log.append(f"{nome}{i}")
+        await asyncio.sleep(0)   # cede a vez ao event loop
+    return threading.get_ident()
+
+async def main():
+    log = []
+    ids = await asyncio.gather(tarefa("A", 3, log), tarefa("B", 3, log))
+    print(" ".join(log))
+    print("mesma thread para as duas:", ids[0] == ids[1])
+
+asyncio.run(main())
+```
+
+```text
+Saída:
+A0 B0 A1 B1 A2 B2
+mesma thread para as duas: True
+```
+
+As duas tarefas progrediram "ao mesmo tempo" do ponto de vista de quem observa, mas nunca rodaram simultaneamente.
+
+## O GIL
+
+O CPython, a implementação padrão de Python, tem o **Global Interpreter Lock**: um lock que só permite a uma thread por vez executar bytecode Python. Ele simplifica o gerenciamento de memória (contagem de referências) e a integração com extensões em C.
+
+Consequências práticas:
+
+- **I/O:** a thread solta o GIL enquanto espera rede, disco ou `sleep`. Threads funcionam bem para trabalho limitado por I/O.
+- **CPU em Python puro:** só uma thread avança por vez. Quatro threads calculando não ficam quatro vezes mais rápidas; às vezes ficam mais lentas pelo overhead de disputa.
+- **Extensões nativas:** NumPy, compressão e criptografia costumam soltar o GIL dentro do código C, então podem paralelizar com threads.
+- **Não substitui sincronização:** o GIL protege o interpretador, não o seu código. `contador += 1` ainda pode perder atualizações entre threads.
+
+O Python 3.13 trouxe um build experimental "free-threaded" sem GIL (PEP 703), mas o padrão ainda é com GIL. Java, Go e C++ não têm nada parecido: threads rodam em paralelo de verdade, e por isso o cuidado com memória compartilhada é ainda mais visível.
+
+## Paralelismo real em Python: processos
+
+Para trabalho de CPU em Python puro, a saída clássica é usar processos, cada um com o seu interpretador e o seu GIL.
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+def soma_de_quadrados(intervalo):
+    inicio, fim = intervalo
+    return sum(i * i for i in range(inicio, fim))
+
+if __name__ == "__main__":
+    n = 200_000
+    partes = [(i, min(i + 50_000, n)) for i in range(0, n, 50_000)]
+    with ProcessPoolExecutor(max_workers=4) as pool:
+        parciais = list(pool.map(soma_de_quadrados, partes))
+    print("partes:", len(parciais))
+    print("total paralelo:", sum(parciais))
+    print("confere com o sequencial:", sum(parciais) == soma_de_quadrados((0, n)))
+```
+
+```text
+Saída:
+partes: 4
+total paralelo: 2666646666700000
+confere com o sequencial: True
+```
+
+O preço é o de sempre entre processos: criar workers custa caro e argumentos e resultados são serializados com `pickle`. Divida o trabalho em pedaços grandes o suficiente para compensar.
+
+<Callout type="tip" title="Escolhendo a ferramenta em Python">
+I/O com poucas centenas de tarefas: `ThreadPoolExecutor`. I/O com milhares de conexões: `asyncio`. CPU em Python puro: `ProcessPoolExecutor` ou `multiprocessing`. CPU em biblioteca nativa que solta o GIL: threads podem bastar.
+</Callout>
+
+## Armadilhas
+
+- Dizer que "Python não tem threads de verdade". Tem: são threads do sistema operacional. O que o GIL impede é executar bytecode em paralelo.
+- Concluir que o GIL torna o código thread-safe. Operações compostas (ler, somar, escrever) continuam sujeitas a corrida.
+- Usar processos para tarefas minúsculas e ver o programa ficar mais lento por causa da serialização.
+
+## Na entrevista
+
+Defina os dois termos em uma frase cada, dê o exemplo do event loop (concorrente, não paralelo) e, se a linguagem for Python, explique o GIL e como contorná-lo. Em linguagens como Java e Go, deixe claro que threads usam vários núcleos e que isso torna obrigatória a sincronização de dados compartilhados. Follow-ups comuns: "por que o GIL existe?" (simplifica a contagem de referências e as extensões C) e "como paralelizar CPU em Python?" (processos, extensões nativas ou o build free-threaded).
+
+<QuizSet>
+<Quiz question="Um servidor asyncio atende 10 mil conexões numa única thread. Ele é:" options={["Paralelo, mas não concorrente", "Concorrente, mas não paralelo", "Concorrente e paralelo", "Nem concorrente nem paralelo"]} answer={1} explanation="As tarefas se intercalam (concorrência), mas uma única thread nunca executa duas ao mesmo tempo." />
+<Quiz question="Você tem um cálculo pesado em Python puro e 8 núcleos. Qual abordagem aproveita os núcleos no CPython padrão?" options={["ThreadPoolExecutor com 8 threads", "asyncio.gather com 8 corrotinas", "ProcessPoolExecutor com 8 processos", "Um único laço otimizado"]} answer={2} explanation="Cada processo tem seu próprio GIL, então os cálculos rodam em paralelo." />
+<Quiz question="Com o GIL, `contador += 1` executado por várias threads é seguro?" options={["Sim, o GIL garante atomicidade de qualquer linha", "Não, a operação tem várias etapas e a thread pode ser trocada no meio", "Sim, desde que o contador seja global", "Só se houver menos de 4 threads"]} answer={1} explanation="O GIL protege o interpretador, não sequências de leitura-modificação-escrita do seu código." />
+</QuizSet>

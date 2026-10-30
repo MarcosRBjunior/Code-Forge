@@ -1,0 +1,126 @@
+---
+title: NAT
+kind: lesson
+---
+
+Sua casa tem dezenas de dispositivos e um único IPv4 público. Uma VPC tem centenas de instâncias em sub-redes privadas que precisam baixar pacotes da internet. Em ambos os casos alguém reescreve endereços no caminho: o **NAT** (Network Address Translation). Ele foi o remendo que adiou o fim do IPv4 por décadas, e entendê-lo explica por que conexões de entrada "não chegam", por que conexões ociosas morrem misteriosamente e por que um NAT gateway pode virar gargalo de portas.
+
+## Como funciona
+
+A forma mais comum é o NAT com tradução de portas (PAT, ou NAPT, ou "masquerade" no Linux). Quando um pacote sai da rede privada, o roteador troca o IP e a porta de origem pelos seus, e anota a troca numa tabela. Quando a resposta volta, ele consulta a tabela e desfaz a troca.
+
+```text
+ Rede privada                    Roteador NAT                    Internet
+ 10.0.0.5:51000 ----------> [ 203.0.113.7:40001 ] ----------> 93.184.216.34:443
+                            tabela:
+                            40001 <-> 10.0.0.5:51000, destino 93.184.216.34:443
+
+ 10.0.0.5:51000 <---------- [ desfaz a troca ]   <---------- 93.184.216.34:443
+                                                           (para 203.0.113.7:40001)
+```
+
+Cada entrada identifica um fluxo pela tupla (protocolo, IP e porta internos, IP e porta externos). Como o roteador muda os endereços, ele também precisa recalcular os checksums do IP e do TCP/UDP.
+
+## Simulando a tabela
+
+A simulação abaixo mostra alocação de portas, tradução da resposta, descarte de pacote não solicitado e expiração por inatividade.
+
+```python
+class Nat:
+    def __init__(self, ip_publico, porta_inicial, timeout):
+        self.ip, self.prox, self.timeout = ip_publico, porta_inicial, timeout
+        self.saida = {}    # (ip_int, porta_int, destino) -> porta_pub
+        self.entrada = {}  # porta_pub -> [ip_int, porta_int, destino, ultimo_uso]
+
+    def sair(self, ip, porta, destino, agora):
+        chave = (ip, porta, destino)
+        if chave not in self.saida:
+            self.saida[chave] = self.prox
+            self.entrada[self.prox] = [ip, porta, destino, agora]
+            self.prox += 1
+        p = self.saida[chave]
+        self.entrada[p][3] = agora
+        return f"t={agora:3} saida {ip}:{porta} -> {self.ip}:{p} para {destino}"
+
+    def chegar(self, porta_pub, origem, agora):
+        e = self.entrada.get(porta_pub)
+        if e is None or e[2] != origem:
+            return f"t={agora:3} entrada em :{porta_pub} de {origem}: DESCARTADO (sem entrada)"
+        if agora - e[3] > self.timeout:
+            del self.entrada[porta_pub]
+            del self.saida[(e[0], e[1], e[2])]
+            return f"t={agora:3} entrada em :{porta_pub} de {origem}: DESCARTADO (expirou)"
+        e[3] = agora
+        return f"t={agora:3} entrada em :{porta_pub} -> {e[0]}:{e[1]}"
+
+nat = Nat("203.0.113.7", 40000, timeout=300)
+web = "93.184.216.34:443"
+print(nat.sair("10.0.0.5", 51000, web, 0))
+print(nat.sair("10.0.0.6", 51000, web, 1))
+print(nat.chegar(40000, web, 2))
+print(nat.chegar(40001, web, 3))
+print(nat.chegar(40000, "198.51.100.9:22", 4))
+print(nat.chegar(40001, web, 400))
+```
+
+```text
+Saída:
+t=  0 saida 10.0.0.5:51000 -> 203.0.113.7:40000 para 93.184.216.34:443
+t=  1 saida 10.0.0.6:51000 -> 203.0.113.7:40001 para 93.184.216.34:443
+t=  2 entrada em :40000 -> 10.0.0.5:51000
+t=  3 entrada em :40001 -> 10.0.0.6:51000
+t=  4 entrada em :40000 de 198.51.100.9:22: DESCARTADO (sem entrada)
+t=400 entrada em :40001 de 93.184.216.34:443: DESCARTADO (expirou)
+```
+
+Note que duas máquinas usaram a mesma porta interna 51000 e o NAT as diferenciou pela porta pública. Também note as duas formas de descarte: um pacote de alguém que nunca foi contatado e uma resposta que chegou depois de a entrada expirar.
+
+## Limites de portas
+
+Para um único destino (mesmo IP e porta), um IP público tem cerca de 64 mil portas de origem. Um NAT gateway que concentra milhares de conexões curtas para a mesma API pode esgotá-las, e o sintoma são erros de conexão intermitentes. Conexões em `TIME_WAIT` seguram a porta por mais tempo do que você imagina.
+
+```python
+portas_por_ip = 65535 - 1024
+conexoes_por_segundo = 2000
+vida_util_s = 60 + 4  # TIME_WAIT de 60 s mais a requisição
+em_uso = conexoes_por_segundo * vida_util_s
+print("portas necessarias:", em_uso)
+print("IPs publicos minimos:", -(-em_uso // portas_por_ip))
+```
+
+```text
+Saída:
+portas necessarias: 128000
+IPs publicos minimos: 2
+```
+
+As saídas reais: reutilizar conexões (keep-alive, pools), adicionar IPs ao NAT gateway ou usar endpoints privados que nem passam pelo NAT.
+
+## Tipos e consequências
+
+| Tipo | O que faz | Onde aparece |
+| --- | --- | --- |
+| SNAT / masquerade | Troca a origem na saída | Casa, NAT gateway de nuvem |
+| DNAT / port forwarding | Troca o destino na entrada | Expor um serviço interno, load balancers L4 |
+| NAT 1:1 | Um IP público fixo para um privado | IP elástico associado a instância |
+| CGNAT | NAT do provedor em cima do seu NAT | Operadoras móveis e de banda larga |
+
+Consequências que causam bugs reais:
+
+- **Conexões de entrada não chegam** sem DNAT explícito. Aplicações P2P (chamadas de vídeo, jogos) usam STUN para descobrir o endereço público e "furar" o NAT, e TURN como relay quando isso falha.
+- **Timeout de inatividade:** uma conexão TCP parada por alguns minutos perde a entrada; o próximo pacote é descartado e o cliente só percebe com um timeout longo. Keepalives curtos resolvem.
+- **IP de origem compartilhado:** rate limiting por IP pune todos os usuários atrás do mesmo CGNAT.
+- **Logs:** o servidor vê o IP do NAT, não o do cliente. Atrás de proxies HTTP, use `X-Forwarded-For`; em L4, o protocolo PROXY.
+
+<Callout type="tip" title="NAT não é firewall">
+O descarte de pacotes não solicitados parece proteção, mas é efeito colateral. Use regras de firewall explícitas; em IPv6, onde não há NAT, elas são obrigatórias.
+</Callout>
+
+## Na entrevista
+
+Explique o PAT com a tabela de tradução e diga que a resposta só volta porque a entrada existe. Em system design, cite o NAT gateway como caminho de saída de sub-redes privadas e seus limites: custo por GB, esgotamento de portas e timeouts de inatividade. Follow-ups: "por que uma conexão WebSocket ociosa cai depois de alguns minutos?" (timeout no NAT ou no load balancer; use ping periódico) e "como dois clientes atrás de NAT se conectam diretamente?" (STUN e hole punching, com TURN como fallback).
+
+<QuizSet>
+<Quiz question="Duas máquinas privadas abrem conexões com a mesma porta de origem para o mesmo servidor. Como o NAT diferencia as respostas?" options={["Pelo MAC das máquinas", "Atribuindo portas públicas diferentes a cada fluxo", "Pelo TTL", "Não diferencia; uma conexão falha"]} answer={1} explanation="O PAT mapeia cada fluxo interno para uma porta pública distinta e usa essa porta para desfazer a tradução." />
+<Quiz question="Conexões TCP ociosas por 10 minutos falham no primeiro envio, mas as ativas funcionam. Qual a causa provável?" options={["Perda de pacotes no enlace", "A entrada do NAT ou firewall expirou por inatividade", "O DNS expirou", "Esgotamento de memória do servidor"]} answer={1} explanation="Middleboxes removem fluxos ociosos; keepalives em intervalo menor que o timeout mantêm a entrada viva." />
+</QuizSet>

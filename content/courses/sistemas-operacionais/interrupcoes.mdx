@@ -1,0 +1,122 @@
+---
+title: Interrupções
+kind: lesson
+---
+
+A CPU está executando seu laço quando um pacote chega na placa de rede. Como ela fica sabendo? Uma opção seria perguntar à placa o tempo todo ("chegou algo?"), o chamado **polling**. A outra é deixar a placa avisar: ela levanta um sinal elétrico, a CPU suspende o que estava fazendo e executa um tratador. Isso é uma **interrupção**, e é ela que permite ao SO reagir a eventos sem desperdiçar ciclos esperando.
+
+## Três tipos de evento
+
+| Tipo | Origem | Exemplo | Síncrono? |
+| --- | --- | --- | --- |
+| Interrupção de hardware | Dispositivo externo | Timer, disco terminou, pacote chegou | Não |
+| Exceção (trap/fault) | A própria instrução | Divisão por zero, page fault | Sim |
+| Interrupção de software | Instrução explícita | `syscall`, `int 0x80` | Sim |
+
+O **timer** merece destaque: ele interrompe a CPU periodicamente (por exemplo, a cada 1 a 4 ms). É isso que devolve o controle ao kernel mesmo quando um processo entra num laço infinito, e é a base da preempção que você verá em escalonamento.
+
+## O que acontece quando chega uma interrupção
+
+```text
+ executando instrução i do processo
+          │
+          ▼
+ fim da instrução: há interrupção pendente e habilitada?
+          │ sim
+          ▼
+ CPU salva PC e flags, muda para modo kernel
+          │
+          ▼
+ consulta a tabela de vetores (IDT) pelo número da interrupção
+          │
+          ▼
+ tratador roda: parte rápida (top half) reconhece o dispositivo
+          │
+          ▼
+ trabalho pesado agendado para depois (bottom half / softirq)
+          │
+          ▼
+ retorna: restaura PC e continua — ou escalona outro processo
+```
+
+A CPU só verifica interrupções entre instruções, então a interrupção nunca corta uma instrução ao meio. O tratador precisa ser curto, porque enquanto ele roda outras interrupções do mesmo tipo podem ficar bloqueadas. Por isso o Linux divide o trabalho: a parte urgente responde ao hardware e o resto (processar o pacote TCP, por exemplo) roda depois, em contexto mais tranquilo.
+
+A simulação abaixo mostra uma CPU que executa instruções de um programa e, entre elas, atende interrupções pendentes em ordem de prioridade (número menor é mais urgente):
+
+```python
+import heapq
+
+programa = ["load", "add", "store", "jump", "load", "mul"]
+eventos = {1: [(2, "disco")], 3: [(0, "timer"), (1, "rede")], 4: [(2, "disco")]}
+
+pendentes = []
+for ciclo, instr in enumerate(programa):
+    print(f"ciclo {ciclo}: executa {instr}")
+    for evento in eventos.get(ciclo, []):
+        heapq.heappush(pendentes, evento)
+    while pendentes:
+        prioridade, origem = heapq.heappop(pendentes)
+        print(f"   -> interrupcao {origem} (prio {prioridade}): salva PC={ciclo + 1}, trata, volta")
+```
+
+```text
+Saída:
+ciclo 0: executa load
+ciclo 1: executa add
+   -> interrupcao disco (prio 2): salva PC=2, trata, volta
+ciclo 2: executa store
+ciclo 3: executa jump
+   -> interrupcao timer (prio 0): salva PC=4, trata, volta
+   -> interrupcao rede (prio 1): salva PC=4, trata, volta
+ciclo 4: executa load
+   -> interrupcao disco (prio 2): salva PC=5, trata, volta
+ciclo 5: executa mul
+```
+
+O kernel pode **mascarar** interrupções temporariamente, por exemplo enquanto atualiza uma estrutura que o próprio tratador também usa. Esse período precisa ser curtíssimo, senão eventos se acumulam e a latência do sistema inteiro sobe. Existe ainda a **NMI** (interrupção não mascarável), reservada para situações graves como erros de hardware e para detectores de travamento do kernel, o watchdog.
+
+## Polling ou interrupção?
+
+Interrupção parece sempre melhor, mas tem custo fixo: salvar estado, poluir caches, trocar de modo. Com eventos raros, ela ganha de longe. Com eventos muito frequentes, o custo por evento domina e o polling passa a compensar. Essa conta, simplificada:
+
+```python
+CUSTO_INTERRUPCAO = 2.0   # microssegundos por evento
+CUSTO_CONSULTA = 0.1      # microssegundos por verificacao
+CONSULTAS_POR_SEG = 100_000
+
+print("eventos/s   interrupcao(us)   polling(us)   melhor")
+for eventos in [100, 1_000, 5_000, 100_000]:
+    custo_irq = eventos * CUSTO_INTERRUPCAO
+    custo_poll = CONSULTAS_POR_SEG * CUSTO_CONSULTA + eventos * CUSTO_CONSULTA
+    melhor = "interrupcao" if custo_irq < custo_poll else "polling"
+    print(f"{eventos:>9}   {custo_irq:>15.0f}   {custo_poll:>11.0f}   {melhor}")
+```
+
+```text
+Saída:
+eventos/s   interrupcao(us)   polling(us)   melhor
+      100               200         10010   interrupcao
+     1000              2000         10100   interrupcao
+     5000             10000         10500   interrupcao
+   100000            200000         20000   polling
+```
+
+É exatamente o que sistemas reais fazem. O **NAPI** do Linux começa com interrupções e, sob carga alta de rede, desliga a interrupção da placa e passa a consultar em lote. Frameworks como DPDK vão além e fazem polling o tempo todo num núcleo dedicado, trocando um núcleo inteiro por latência mínima. Placas modernas também fazem **coalescência**: agrupam vários pacotes numa só interrupção.
+
+<Callout type="tip" title="Efeito em latência">
+Interrupções em excesso aparecem como tempo alto de `si` (softirq) e `hi` no `top`. Num servidor de rede com muitos pacotes pequenos, distribuir as filas da placa entre núcleos (RSS, `irqbalance`) evita que um único núcleo vire gargalo.
+</Callout>
+
+```bash
+cat /proc/interrupts        # contagem por interrupção e por CPU
+watch -n1 'grep eth0 /proc/interrupts'
+```
+
+## Na entrevista
+
+Diferencie interrupção de hardware, exceção e syscall; explique que o timer garante a preempção; e mostre o trade-off com polling usando o exemplo de placas de rede de alta vazão. Follow-ups comuns: "por que o tratador de interrupção precisa ser curto?" (bloqueia outras interrupções e atrasa todo o sistema) e "um page fault é uma interrupção?" (é uma exceção síncrona, causada pela própria instrução).
+
+<QuizSet>
+<Quiz question="O que garante que um processo em laço infinito não monopolize a CPU para sempre?" options={["O compilador insere pausas", "A interrupção periódica do timer devolve o controle ao kernel", "O processo é obrigado a chamar yield", "A CPU desliga sozinha após 1 segundo"]} answer={1} explanation="O timer interrompe a CPU periodicamente; o kernel retoma o controle e pode escalonar outro processo." />
+<Quiz question="Uma placa de rede recebe milhões de pacotes por segundo. Por que o Linux passa a usar polling nesse cenário?" options={["Polling é sempre mais seguro", "Com eventos muito frequentes, o custo fixo de cada interrupção supera o de consultar a placa em lote", "Interrupções não funcionam com TCP", "Para economizar energia"]} answer={1} explanation="O NAPI desativa interrupções sob carga e processa pacotes em lote, amortizando o custo." />
+</QuizSet>

@@ -1,0 +1,140 @@
+---
+title: ORDER BY, LIMIT e OFFSET
+kind: lesson
+---
+
+"Mostre os 3 produtos mais vendidos", "liste a segunda página de resultados", "qual o segundo maior salário?". Todas essas perguntas dependem de ordenar e cortar o resultado. Parece simples, mas há três detalhes que o entrevistador costuma testar: empates, posição dos `NULL` e o custo de paginar com `OFFSET` em tabelas grandes.
+
+## ORDER BY
+
+`ORDER BY` é a única forma de garantir a ordem das linhas. Você pode ordenar por várias colunas, cada uma com sua direção, e por expressões ou apelidos do `SELECT`:
+
+```sql
+CREATE TABLE produtos (
+  id        integer PRIMARY KEY,
+  nome      text NOT NULL,
+  categoria text NOT NULL,
+  preco     numeric(10, 2) NOT NULL,
+  vendidos  integer NOT NULL,
+  avaliacao numeric(2, 1)
+);
+
+INSERT INTO produtos VALUES
+  (1, 'Fone Bluetooth', 'Áudio', 249.90, 540, 4.5),
+  (2, 'Caixa de Som', 'Áudio', 399.00, 210, 4.7),
+  (3, 'Teclado Mecânico', 'Periféricos', 459.00, 320, NULL),
+  (4, 'Mouse Sem Fio', 'Periféricos', 129.90, 540, 4.2),
+  (5, 'Webcam HD', 'Periféricos', 289.00, 95, 3.9),
+  (6, 'Microfone USB', 'Áudio', 529.00, 130, NULL),
+  (7, 'Hub USB-C', 'Acessórios', 179.00, 410, 4.4),
+  (8, 'Suporte Notebook', 'Acessórios', 149.00, 410, 4.6);
+
+SELECT nome, categoria, preco
+FROM produtos
+ORDER BY categoria, preco DESC;
+```
+
+```text
+Saída:
+nome | categoria | preco
+Hub USB-C | Acessórios | 179.00
+Suporte Notebook | Acessórios | 149.00
+Teclado Mecânico | Periféricos | 459.00
+Webcam HD | Periféricos | 289.00
+Mouse Sem Fio | Periféricos | 129.90
+Microfone USB | Áudio | 529.00
+Caixa de Som | Áudio | 399.00
+Fone Bluetooth | Áudio | 249.90
+```
+
+Cada coluna do `ORDER BY` tem a própria direção: aqui a categoria está em ordem crescente e, dentro de cada categoria, o preço em ordem decrescente. O `DESC` vale só para a coluna logo antes dele. Repare também que 'Áudio' veio depois de 'Periféricos'; o motivo está na seção sobre collation, mais abaixo.
+
+## LIMIT e OFFSET
+
+`LIMIT n` devolve no máximo `n` linhas e `OFFSET k` pula as `k` primeiras. Juntos, fazem paginação. O padrão SQL usa `FETCH FIRST n ROWS ONLY`, que o Postgres também aceita; o MySQL aceita `LIMIT k, n` como atalho, e o SQL Server usa `TOP`.
+
+O problema dos empates: o Fone e o Mouse venderam 540 unidades cada. Um "top 1" por vendas fica ambíguo:
+
+```sql
+SELECT nome, vendidos
+FROM produtos
+ORDER BY vendidos DESC, id
+LIMIT 3;
+```
+
+```text
+Saída:
+nome | vendidos
+Fone Bluetooth | 540
+Mouse Sem Fio | 540
+Hub USB-C | 410
+```
+
+Sem o desempate por `id`, o banco pode devolver Hub ou Suporte na terceira posição, e a escolha pode mudar entre execuções. Sempre adicione uma coluna única ao final do `ORDER BY` quando usar `LIMIT`. Se a pergunta for "todos os produtos empatados no topo", `LIMIT` não serve; o Postgres oferece `FETCH FIRST 1 ROWS WITH TIES`, e funções de janela como `RANK` resolvem em qualquer banco.
+
+## NULL na ordenação
+
+No Postgres, `NULL` é tratado como maior que qualquer valor: aparece no fim em `ASC` e no começo em `DESC`. No MySQL é o contrário: `NULL` é o menor valor. Para não depender disso, declare explicitamente:
+
+```sql
+SELECT nome, avaliacao
+FROM produtos
+ORDER BY avaliacao DESC NULLS LAST, nome
+LIMIT 4;
+```
+
+```text
+Saída:
+nome | avaliacao
+Caixa de Som | 4.7
+Suporte Notebook | 4.6
+Fone Bluetooth | 4.5
+Hub USB-C | 4.4
+```
+
+Sem `NULLS LAST`, o Teclado e o Microfone, que não têm avaliação, ocupariam o topo do ranking. O MySQL não tem `NULLS LAST`; o truque é `ORDER BY avaliacao IS NULL, avaliacao DESC`.
+
+## Paginação por OFFSET vs. por chave
+
+Com `OFFSET 100000`, o banco precisa ler e descartar 100 mil linhas antes de devolver a página. Além de lento, o resultado fica instável: se alguém inserir uma linha durante a navegação, itens se repetem ou somem entre páginas.
+
+A alternativa é a **paginação por chave** (keyset ou seek): você guarda o último valor visto e pede o que vem depois dele.
+
+```sql
+SELECT id, nome, vendidos
+FROM produtos
+WHERE (vendidos, id) < (410, 8)
+ORDER BY vendidos DESC, id DESC
+LIMIT 3;
+```
+
+```text
+Saída:
+id | nome | vendidos
+7 | Hub USB-C | 410
+3 | Teclado Mecânico | 320
+2 | Caixa de Som | 210
+```
+
+A comparação de linha `(vendidos, id) < (410, 8)` significa "vendidos menor que 410, ou igual a 410 com id menor que 8". Com um índice em `(vendidos, id)`, o banco salta direto para o ponto certo, e o custo não cresce com o número da página. A desvantagem: não dá para pular para a página 50 diretamente.
+
+## Collation e ordem de texto
+
+Voltando à primeira consulta: a ordem de textos depende da collation. O banco que roda estes exemplos usa a collation `C`, que compara bytes; como o Á acentuado ocupa bytes maiores que qualquer letra sem acento, 'Áudio' foi parar depois de 'Periféricos'. Num Postgres criado com collation `pt_BR.UTF-8`, a ordem seria a do dicionário: Acessórios, Áudio, Periféricos. No MySQL, a collation padrão `utf8mb4_0900_ai_ci` também ignora acentos e maiúsculas ao ordenar. Se a ordem alfabética importa para o enunciado, mencione a collation; se precisar de uma ordem específica no Postgres, use `ORDER BY categoria COLLATE "pt-BR-x-icu"` quando o ICU estiver disponível.
+
+## Armadilhas
+
+- **`LIMIT` sem `ORDER BY`**: devolve linhas arbitrárias.
+- **Empates sem desempate**: páginas que repetem ou perdem itens.
+- **`NULL` no topo de um ranking decrescente** no Postgres.
+- **`OFFSET` grande**: custo linear e resultados instáveis.
+
+## Na entrevista
+
+Sempre que a resposta envolver "top N", pergunte o que fazer com empates e se `NULL` deve entrar. Escreva o desempate explicitamente. Follow-ups comuns: "como paginar uma tabela de 100 milhões de linhas?" (keyset com índice composto) e "como encontrar o segundo maior salário?" (`ORDER BY salario DESC LIMIT 1 OFFSET 1` sobre valores distintos, ou `DENSE_RANK`).
+
+<QuizSet>
+<Quiz question="No Postgres, ORDER BY avaliacao DESC coloca os NULL onde?" options={["No fim", "No começo", "Remove as linhas com NULL", "Em posição aleatória"]} answer={1} explanation="O Postgres trata NULL como maior que qualquer valor, então em DESC eles aparecem primeiro. Use NULLS LAST." />
+<Quiz question="Por que a paginação por chave é mais rápida que OFFSET em páginas profundas?" options={["Porque usa menos colunas", "Porque o banco salta pelo índice direto ao ponto, sem ler e descartar as linhas anteriores", "Porque desliga o ORDER BY", "Porque usa cache do cliente"]} answer={1} explanation="Com OFFSET k, o banco produz e descarta k linhas. O filtro pela última chave usa o índice para começar no lugar certo." />
+<Quiz question="Dois produtos empatam em vendas e você usa LIMIT 1. O que acontece?" options={["Erro", "O banco devolve os dois", "Um deles, sem garantia de qual", "Nenhum"]} answer={2} explanation="Sem desempate, a escolha é arbitrária. Adicione uma coluna única ao ORDER BY ou use WITH TIES / RANK." />
+</QuizSet>

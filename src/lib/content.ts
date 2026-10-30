@@ -2,6 +2,7 @@ import "server-only";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { cache } from "react";
+import type { CourseGroup } from "@/lib/course-groups";
 import matter from "gray-matter";
 import GithubSlugger from "github-slugger";
 
@@ -56,6 +57,8 @@ export interface Course {
   description: string;
   level: string;
   order: number;
+  /** Seção do menu "Cursos": entrevistas, fundamentos, ia ou linguagens. */
+  group: CourseGroup;
   modules: CourseModule[];
   chapterCount: number;
   availableCount: number;
@@ -82,6 +85,7 @@ export interface Chapter extends ChapterMeta {
 interface CourseFile {
   slug: string;
   order?: number;
+  group?: CourseGroup;
   title: string;
   description: string;
   level: string;
@@ -142,6 +146,7 @@ async function loadCourse(slug: string): Promise<{ course: Course; contents: Map
     description: file.description,
     level: file.level,
     order: file.order ?? 99,
+    group: file.group ?? "entrevistas",
     modules,
     chapterCount: modules.reduce((n, m) => n + m.chapters.length, 0),
     availableCount: modules.reduce((n, m) => n + m.chapters.filter((c) => c.available).length, 0),

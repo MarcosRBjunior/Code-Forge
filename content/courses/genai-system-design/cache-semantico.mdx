@@ -1,0 +1,113 @@
+---
+title: Cache semântico
+kind: lesson
+---
+
+Um cache tradicional usa a requisição exata como chave. Para LLMs isso rende pouco: "como troco minha senha?" e "como faço para mudar a senha?" são textos diferentes com a mesma resposta. O **cache semântico** troca a igualdade de strings por similaridade de significado: transforma a pergunta num vetor (embedding), procura perguntas já respondidas com vetor próximo e, se a similaridade passar de um limiar, devolve a resposta guardada sem chamar o modelo. Quando funciona, a resposta sai em milissegundos e custa quase nada.
+
+## Como funciona
+
+```text
+pergunta -> normaliza -> cache exato (hash) --acerto--> resposta
+                              | erro
+                              v
+                      embedding da pergunta
+                              v
+                indice vetorial (vizinho mais proximo)
+                 similaridade >= limiar? --sim--> resposta guardada
+                              | nao
+                              v
+                    chama o modelo -> grava (vetor, resposta, metadados, TTL)
+```
+
+Algumas decisões aparecem em qualquer implementação:
+
+- **Duas camadas.** Um cache exato por hash na frente é barato e pega repetições literais (comuns em botões e sugestões prontas). O semântico vem depois.
+- **Escopo da chave.** A mesma pergunta pode ter respostas diferentes por idioma, cliente, versão de prompt ou permissões do usuário. Esses atributos entram como filtro obrigatório na busca, nunca só a similaridade.
+- **Limiar.** É o parâmetro mais delicado. Baixo demais devolve respostas para perguntas que só parecem iguais; alto demais quase nunca acerta.
+- **Validade.** Respostas que dependem de dados que mudam (preço, estoque, status de pedido) precisam de TTL curto ou nem devem entrar no cache.
+
+## O limiar na prática
+
+O programa abaixo usa um embedding de brinquedo (contagem de palavras com sinônimos normalizados) só para ilustrar o mecanismo, sem bibliotecas externas. O que importa é o efeito do limiar: com valores diferentes, mudam os acertos e os **falsos positivos**, isto é, respostas devolvidas para perguntas que pediam outra coisa.
+
+```python
+import math
+from collections import Counter
+
+SINONIMOS = {"troco": "trocar", "cancelo": "cancelar", "mudar": "trocar", "alterar": "trocar", "redefinir": "trocar", "faco": "", "para": "",
+             "como": "", "eu": "", "o": "", "a": "", "minha": "", "meu": "", "de": "", "posso": ""}
+
+def emb(texto):
+    palavras = [SINONIMOS.get(p, p) for p in texto.lower().replace("?", "").split()]
+    return Counter(p for p in palavras if p)
+
+def cos(a, b):
+    num = sum(a[k] * b[k] for k in a)
+    return num / (math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values())))
+
+cache = {"como troco minha senha?": "Acesse Perfil > Seguranca > Trocar senha.",
+         "como cancelo meu plano?": "Acesse Assinatura > Cancelar plano."}
+vetores = {q: emb(q) for q in cache}
+
+consultas = [  # (pergunta, pergunta do cache que seria a resposta certa ou None)
+    ("como faco para mudar a senha?", "como troco minha senha?"),
+    ("posso alterar minha senha agora", "como troco minha senha?"),
+    ("como troco meu email?", None),
+    ("como cancelo meu pedido?", None),
+    ("quero redefinir a senha do app", "como troco minha senha?"),
+]
+
+for limiar in (0.45, 0.7, 0.9):
+    acertos = falsos = 0
+    for q, certo in consultas:
+        melhor = max(vetores, key=lambda k: cos(emb(q), vetores[k]))
+        if cos(emb(q), vetores[melhor]) >= limiar:
+            if melhor == certo:
+                acertos += 1
+            else:
+                falsos += 1
+    print(f"limiar {limiar}: acertos={acertos} falsos positivos={falsos} chamadas ao modelo={len(consultas) - acertos - falsos}")
+
+# Economia mensal hipotetica com 30% de acertos
+req_mes, custo_llm, custo_cache = 50_000_000, 0.002, 0.00005
+taxa = 0.30
+economia = req_mes * taxa * (custo_llm - custo_cache) - req_mes * (1 - taxa) * custo_cache
+print(f"economia mensal estimada: US$ {economia:,.0f}")
+```
+
+```text
+Saída:
+limiar 0.45: acertos=3 falsos positivos=2 chamadas ao modelo=0
+limiar 0.7: acertos=2 falsos positivos=0 chamadas ao modelo=3
+limiar 0.9: acertos=1 falsos positivos=0 chamadas ao modelo=4
+economia mensal estimada: US$ 27,500
+```
+
+Com limiar baixo, "como troco meu email?" e "como cancelo meu pedido?" recebem respostas de outras perguntas: falsos positivos, que são o pior tipo de erro, porque a resposta sai confiante e errada. Com limiar alto, quase nada acerta e o cache só custa. O valor certo sai de um conjunto rotulado de pares de perguntas do seu domínio, medindo precisão e taxa de acerto para vários limiares, exatamente como no programa. Repare também que o cálculo de economia desconta o custo de calcular o embedding e buscar no índice nas requisições que erram o cache.
+
+## Trade-offs
+
+| Decisão | A favor | Contra |
+| --- | --- | --- |
+| Limiar alto | Poucas respostas erradas | Taxa de acerto baixa |
+| Limiar baixo | Mais economia | Respostas confiantes para a pergunta errada |
+| Cache por usuário | Seguro para dados pessoais | Quase nenhum reaproveitamento |
+| Cache global | Máximo reaproveitamento | Risco de vazar dados entre usuários |
+
+<Callout type="warning" title="Cache semântico pode vazar dados">
+Se uma resposta contém informação de um usuário ("seu pedido 123 chega amanhã") e vai para um cache global, outro usuário pode recebê-la. Só coloque no cache global respostas genéricas, ou particione pelo escopo de permissão.
+</Callout>
+
+## Onde ele rende e onde não rende
+
+Rende em suporte ao cliente, FAQs e assistentes internos, onde muitas pessoas fazem as mesmas perguntas. Rende pouco em conversas longas, porque a resposta depende do histórico, e em tarefas criativas, em que o usuário espera variedade. Uma variação útil é cachear **etapas intermediárias** em vez da resposta final: resultados de recuperação de documentos, embeddings de documentos e o prefixo do prompt (cache de prefixo no servidor de inferência), que reduzem custo mesmo quando a resposta final precisa ser nova.
+
+## Na entrevista
+
+Proponha o cache semântico quando os requisitos indicarem perguntas repetidas, e mostre que você conhece os riscos: escolha do limiar com dados rotulados, filtros por escopo (idioma, versão de prompt, permissões), TTL para conteúdo volátil e invalidação ao mudar o prompt ou a base de conhecimento. Follow-ups comuns: "como você mede se o cache está ajudando?" (taxa de acerto, falsos positivos em amostras auditadas, economia líquida) e "o que acontece ao atualizar a documentação?" (invalidar entradas ligadas aos documentos alterados ou versionar a chave pela versão da base).
+
+<QuizSet>
+<Quiz question="Após baixar o limiar de similaridade de 0,92 para 0,80, a taxa de acerto do cache dobrou e as reclamações de respostas erradas também subiram. O que aconteceu?" options={["O índice vetorial ficou lento", "Aumentaram os falsos positivos: perguntas diferentes passaram a receber respostas de perguntas parecidas", "O TTL expirou", "O modelo piorou"]} answer={1} explanation="Limiar mais baixo troca precisão por cobertura; o ajuste deve ser feito com pares rotulados medindo os dois lados." />
+<Quiz question="Uma resposta do assistente inclui o saldo da conta do usuário. Como tratá-la no cache semântico?" options={["Cache global com TTL longo", "Não colocar no cache global; no máximo cache por usuário com TTL curto", "Cache global sem TTL", "Guardar só o embedding"]} answer={1} explanation="Conteúdo pessoal e volátil num cache compartilhado vaza dados e fica desatualizado." />
+</QuizSet>

@@ -1,0 +1,116 @@
+---
+title: Orquestração e versionamento de prompts
+kind: lesson
+---
+
+No começo de um produto com IA, o prompt mora numa string dentro do código. Funciona até o dia em que alguém ajusta uma frase para corrigir um caso, a qualidade cai em outros dez casos e ninguém sabe qual versão estava em produção quando o cliente reclamou. Em escala, prompts são **configuração de comportamento** do sistema: mudam com frequência, afetam a qualidade de forma difícil de prever e precisam do mesmo rigor que código. Este capítulo trata de dois problemas ligados: como montar o prompt de cada requisição (orquestração) e como mudar prompts com segurança (versionamento).
+
+## Orquestração: montando a requisição
+
+Um prompt real é composto de várias partes, montadas em tempo de execução:
+
+```text
+[instrucoes de sistema]      versao fixa do template
+[exemplos (few-shot)]        opcionais, escolhidos por similaridade
+[contexto recuperado]        trechos de documentos (RAG), resultados de ferramentas
+[historico da conversa]      ultimos turnos, ou resumo dos antigos
+[mensagem do usuario]        texto atual
+[formato de saida]           esquema JSON, regras de citacao
+```
+
+O **orquestrador** é o serviço que executa esse fluxo: busca o template certo, chama a recuperação, decide quanto histórico cabe, chama o modelo, valida a saída e, em fluxos com ferramentas, repete o ciclo. Em produtos mais complexos, ele vira um pequeno grafo de passos (classificar intenção, buscar, gerar, verificar) com timeouts e retries por passo. Mantenha a lógica de cada passo explícita e observável; frameworks ajudam, mas o importante é que cada passo registre entradas, saídas, tokens e latência.
+
+## Versionamento: o registro de prompts
+
+Tire os prompts do código e coloque-os num **registro de prompts**: um repositório (pode ser o próprio Git, com um serviço que publica versões) em que cada prompt tem nome, versão imutável, modelo-alvo, parâmetros (temperatura, máximo de tokens) e o esquema de saída esperado.
+
+```json
+{
+  "nome": "resumo-chamado",
+  "versao": 7,
+  "modelo": "medio",
+  "temperatura": 0.2,
+  "max_tokens": 400,
+  "template": "Resuma o chamado abaixo em até 5 tópicos...",
+  "avaliacao": {"conjunto": "chamados-v3", "nota_minima": 0.85}
+}
+```
+
+O fluxo de mudança fica parecido com o de código:
+
+1. Alguém cria a versão 8 e roda o **conjunto de avaliação** offline: centenas de entradas representativas com critérios de qualidade.
+2. Se passar do limiar e não piorar casos críticos, a versão 8 entra em **canário** para uma fração dos usuários.
+3. Métricas online (feedback, taxa de reformulação, erros de formato, custo por resposta) comparam 7 e 8.
+4. Se tudo estiver bem, a porcentagem sobe até 100%. Se não, o rollback é trocar um ponteiro, sem deploy.
+
+Cada resposta gravada no log carrega nome e versão do prompt, modelo e parâmetros. Sem isso, você não consegue reproduzir nem investigar uma reclamação.
+
+## Canário determinístico
+
+A atribuição de versão deve ser **estável por usuário**: alguém que caiu na versão nova continua nela, para não ver comportamentos alternados na mesma conversa. Um hash do ID do usuário resolve.
+
+```python
+import hashlib
+
+REGISTRO = {
+    "resumo-chamado": {
+        7: "Resuma o chamado em ate 5 topicos.\nChamado: $texto",
+        8: "Voce e um analista de suporte. Resuma em ate 5 topicos objetivos.\nChamado: $texto",
+    }
+}
+ROLLOUT = {"resumo-chamado": {"estavel": 7, "canario": 8, "pct_canario": 10}}
+
+def balde(usuario, nome):
+    h = hashlib.sha256(f"{nome}:{usuario}".encode()).hexdigest()
+    return int(h[:8], 16) % 100
+
+def versao_para(usuario, nome):
+    cfg = ROLLOUT[nome]
+    return cfg["canario"] if balde(usuario, nome) < cfg["pct_canario"] else cfg["estavel"]
+
+def montar(usuario, nome, texto):
+    from string import Template
+    v = versao_para(usuario, nome)
+    return v, Template(REGISTRO[nome][v]).substitute(texto=texto)
+
+contagem = {7: 0, 8: 0}
+for i in range(10_000):
+    contagem[versao_para(f"u{i}", "resumo-chamado")] += 1
+print("distribuicao:", {v: f"{n / 100:.1f}%" for v, n in contagem.items()})
+print("estavel por usuario:", versao_para("u42", "resumo-chamado") == versao_para("u42", "resumo-chamado"))
+
+v, prompt = montar("u7", "resumo-chamado", "impressora nao imprime desde ontem")
+print(f"u7 recebe v{v}:")
+print(prompt)
+```
+
+```text
+Saída:
+distribuicao: {7: '90.1%', 8: '9.9%'}
+estavel por usuario: True
+u7 recebe v7:
+Resuma o chamado em ate 5 topicos.
+Chamado: impressora nao imprime desde ontem
+```
+
+Note que o nome do prompt entra no hash. Assim, os usuários que estão no canário de um prompt não são sempre os mesmos do canário de outro, o que evita que uma pequena parcela da base absorva todo o risco.
+
+## Trade-offs e armadilhas
+
+- **Prompt acoplado ao modelo.** Um prompt otimizado para um modelo pode piorar em outro. Versione o par prompt e modelo, e reavalie ao trocar qualquer um.
+- **Mudança silenciosa do provedor.** Se o provedor atualiza o modelo por trás do mesmo nome, sua avaliação de ontem não vale. Fixe versões de modelo quando possível e rode a avaliação periodicamente.
+- **Interpolação perigosa.** Texto do usuário e de documentos entra no prompt; delimite claramente essas partes e nunca as trate como instruções confiáveis.
+- **Excesso de abstração.** Grafos de orquestração muito genéricos escondem o que acontece. Prefira passos explícitos e logs completos.
+
+<Callout type="tip" title="Prompt é código, avaliação é teste">
+Uma frase que funciona bem na entrevista: "trato prompts como código, com revisão, versão imutável, testes de regressão no conjunto de avaliação e liberação gradual com rollback instantâneo".
+</Callout>
+
+## Na entrevista
+
+Mostre o orquestrador como um serviço próprio entre a aplicação e o gateway de modelos, e o registro de prompts como fonte de verdade. Mencione que cada resposta registra a versão do prompt e o modelo. Follow-ups comuns: "como você testa uma mudança de prompt?" (avaliação offline, depois canário com métricas online) e "como faz rollback?" (o registro aponta para a versão anterior; sem deploy de código).
+
+<QuizSet>
+<Quiz question="Um cliente reclama de uma resposta ruim de três dias atrás. O que é indispensável para investigar?" options={["O código-fonte atual", "Log da requisição com versão do prompt, modelo, parâmetros e contexto usados", "O tamanho do banco de dados", "A temperatura padrão do provedor"]} answer={1} explanation="Prompts e modelos mudam com o tempo; sem registrar exatamente o que foi usado, você não reproduz o problema." />
+<Quiz question="Por que a atribuição ao canário usa hash do ID do usuário e não sorteio por requisição?" options={["Porque hash é mais rápido que sorteio", "Para que cada usuário veja sempre a mesma versão, evitando comportamento alternado na mesma conversa", "Porque o sorteio é proibido em produção", "Para economizar tokens"]} answer={1} explanation="Atribuição estável deixa a experiência consistente e torna as métricas por versão comparáveis." />
+</QuizSet>

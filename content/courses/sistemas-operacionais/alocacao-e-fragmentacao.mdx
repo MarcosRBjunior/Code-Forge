@@ -1,0 +1,133 @@
+---
+title: Alocação e fragmentação
+kind: lesson
+---
+
+Seu serviço mostra 2 GB livres no total, mas uma alocação de 64 MB falha. Ou o RSS de um processo Python cresce durante horas e nunca volta, mesmo depois que os objetos foram liberados. Os dois sintomas têm a mesma raiz: **fragmentação**. Sempre que memória é dividida em pedaços que nascem e morrem em momentos diferentes, buracos aparecem, e o jeito de escolher onde colocar cada pedido determina quanto espaço se perde.
+
+## Dois tipos de fragmentação
+
+- **Externa:** há memória livre suficiente no total, mas espalhada em buracos não contíguos, nenhum grande o bastante para o pedido.
+- **Interna:** o bloco entregue é maior que o pedido, e a sobra dentro dele fica desperdiçada. Acontece quando a memória é dividida em tamanhos fixos (páginas de 4 KB, classes de tamanho de um alocador).
+
+```text
+ externa: 30 KB livres no total, mas o maior buraco tem 12 KB
+ ┌──────┬────────┬──────┬────────┬──────┬────────┐
+ │ usado│ livre 8│ usado│livre 12│ usado│ livre10│   pedido de 20 KB falha
+ └──────┴────────┴──────┴────────┴──────┴────────┘
+
+ interna: pediu 5 KB, recebeu um bloco de 8 KB
+ ┌──────────────────┬──────────┐
+ │ 5 KB em uso      │ 3 KB perdidos │
+ └──────────────────┴──────────┘
+```
+
+## Estratégias de posicionamento
+
+Quando a memória é alocada em pedaços de tamanho variável, o alocador mantém uma lista de buracos livres e precisa escolher um:
+
+| Estratégia | Regra | Característica |
+| --- | --- | --- |
+| First fit | Primeiro buraco que serve | Rápida; acumula lascas no começo |
+| Next fit | Como first fit, mas continua de onde parou | Espalha alocações |
+| Best fit | Menor buraco que serve | Deixa sobras minúsculas e inúteis |
+| Worst fit | Maior buraco disponível | Mantém sobras grandes, mas some com os buracos grandes |
+
+O simulador aplica a mesma sequência de alocações e liberações a uma memória de 100 unidades com cada estratégia, e registra quais pedidos não couberam:
+
+```python
+def simular(estrategia):
+    livres = [(0, 100)]            # (inicio, tamanho)
+    blocos = {}
+
+    def alocar(nome, tam):
+        candidatos = [b for b in livres if b[1] >= tam]
+        if not candidatos:
+            return False
+        if estrategia == "first":
+            escolhido = candidatos[0]
+        elif estrategia == "best":
+            escolhido = min(candidatos, key=lambda b: (b[1], b[0]))
+        else:
+            escolhido = max(candidatos, key=lambda b: (b[1], -b[0]))
+        livres.remove(escolhido)
+        inicio, tamanho = escolhido
+        if tamanho > tam:
+            livres.append((inicio + tam, tamanho - tam))
+            livres.sort()
+        blocos[nome] = (inicio, tam)
+        return True
+
+    def liberar(nome):
+        livres.append(blocos.pop(nome))
+        livres.sort()
+        fundidos = []
+        for ini, tam in livres:      # junta buracos vizinhos
+            if fundidos and fundidos[-1][0] + fundidos[-1][1] == ini:
+                fundidos[-1] = (fundidos[-1][0], fundidos[-1][1] + tam)
+            else:
+                fundidos.append((ini, tam))
+        livres[:] = fundidos
+
+    for nome, tam in [("a", 20), ("b", 10), ("c", 25), ("d", 15), ("e", 20)]:
+        alocar(nome, tam)
+    liberar("b")
+    liberar("d")
+    falhas = [n for n, t in [("f", 8), ("g", 12), ("h", 10)] if not alocar(n, t)]
+    return livres, falhas
+
+for e in ["first", "best", "worst"]:
+    livres, falhas = simular(e)
+    print(f"{e:<6} buracos_restantes={[t for _, t in livres]} falharam={falhas}")
+```
+
+```text
+Saída:
+first  buracos_restantes=[2, 3] falharam=[]
+best   buracos_restantes=[2, 3] falharam=[]
+worst  buracos_restantes=[7, 10] falharam=['g']
+```
+
+Depois de liberar `b` e `d`, sobram três buracos (10, 15 e 10). First e best fit atendem os três pedidos seguintes, mas deixam lascas de 2 e 3 unidades que dificilmente servirão para alguém. Worst fit gasta o buraco de 15 com um pedido de 8 e, quando chega `g` com 12, nenhum buraco serve, embora haja 27 unidades livres. Com outra sequência de pedidos o resultado pode se inverter: nenhuma estratégia vence sempre, e por isso alocadores reais combinam várias técnicas.
+
+## Como os alocadores reais atacam o problema
+
+- **Paginação** (próximo capítulo) elimina a fragmentação externa da memória física: qualquer quadro livre serve para qualquer página. Em troca, aceita fragmentação interna de até uma página por região.
+- **Buddy system:** o kernel Linux aloca páginas físicas em blocos de potências de 2. Dividir e reunir "irmãos" é rápido, mas um pedido de 33 páginas consome 64.
+- **Slab/classes de tamanho:** o kernel e alocadores como jemalloc, tcmalloc e o próprio `pymalloc` mantêm caixas separadas para objetos de cada tamanho. Objetos parecidos ficam juntos, o que reduz fragmentação e acelera a alocação.
+- **Compactação:** mover blocos para juntar os buracos. Só é viável quando dá para atualizar todos os ponteiros, como num coletor de lixo com compactação (JVM, .NET).
+
+```python
+def buddy(paginas):
+    bloco = 1
+    while bloco < paginas:
+        bloco *= 2
+    return bloco
+
+for pedido in [1, 3, 8, 33, 100]:
+    b = buddy(pedido)
+    print(f"pedido={pedido:>3} paginas  bloco={b:>3}  desperdicio_interno={(b - pedido) / b:.0%}")
+```
+
+```text
+Saída:
+pedido=  1 paginas  bloco=  1  desperdicio_interno=0%
+pedido=  3 paginas  bloco=  4  desperdicio_interno=25%
+pedido=  8 paginas  bloco=  8  desperdicio_interno=0%
+pedido= 33 paginas  bloco= 64  desperdicio_interno=48%
+pedido=100 paginas  bloco=128  desperdicio_interno=22%
+```
+
+<Callout type="tip" title="Por que o RSS não volta">
+Um alocador só devolve memória ao SO quando uma página (ou arena) inteira fica vazia. Se um único objeto vivo sobra em cada página, nada é devolvido, e o RSS fica alto mesmo com pouca memória "em uso". Trocar o malloc por jemalloc, reduzir `MALLOC_ARENA_MAX` em serviços com muitas threads ou reciclar workers periodicamente são correções comuns.
+</Callout>
+
+## Na entrevista
+
+Defina as duas fragmentações com um exemplo de cada, compare first, best e worst fit sem prometer que um é sempre melhor e conecte com paginação e alocadores modernos. Follow-ups comuns: "por que a paginação não tem fragmentação externa?" (qualquer quadro serve para qualquer página) e "como o buddy system junta blocos livres?" (o endereço do irmão difere em um bit, então é fácil checar se ele também está livre e fundir).
+
+<QuizSet>
+<Quiz question="Um sistema tem 300 MB livres no total, mas não consegue alocar 50 MB contíguos. Que tipo de fragmentação é essa?" options={["Interna", "Externa", "De disco", "Lógica"]} answer={1} explanation="A memória livre existe, mas está em buracos menores que o pedido: fragmentação externa." />
+<Quiz question="No buddy system, um pedido de 65 páginas recebe quantas páginas?" options={["65", "64", "128", "130"]} answer={2} explanation="O buddy arredonda para a próxima potência de 2, que é 128, desperdiçando quase metade em fragmentação interna." />
+<Quiz question="Por que best fit pode acabar com muitos buracos inúteis?" options={["Porque escolhe sempre o maior buraco", "Porque deixa sobras muito pequenas depois de cada alocação, que raramente servem para alguém", "Porque nunca junta buracos vizinhos", "Porque é lento"]} answer={1} explanation="Escolher o buraco mais justo produz restos minúsculos, que se acumulam como fragmentação externa." />
+</QuizSet>

@@ -1,0 +1,149 @@
+---
+title: O que é RAG
+kind: lesson
+---
+
+Seu cliente quer um assistente que responda sobre os manuais internos da empresa, a política de férias atualizada ontem e o histórico de tickets. Nada disso está nos pesos do modelo, e mesmo que estivesse, mudaria toda semana. **RAG** (Retrieval-Augmented Generation, geração aumentada por recuperação) resolve isso com uma ideia simples: antes de chamar o LLM, busque os trechos relevantes nos seus dados e coloque-os no prompt. O modelo deixa de responder "de memória" e passa a responder com base em evidências que você controla.
+
+## As duas fases
+
+```text
+INGESTÃO (offline)
+documentos ──► limpeza ──► chunking ──► embeddings ──► índice (vetorial + lexical)
+                                                       + metadados (fonte, data, permissão)
+
+CONSULTA (online)
+pergunta ──► (reescrita) ──► busca no índice ──► re-ranking ──► top-k trechos
+                                                                    │
+            resposta com citações ◄── LLM ◄── prompt: instruções + trechos + pergunta
+```
+
+A ingestão roda quando os documentos mudam. A consulta roda a cada pergunta e precisa ser rápida. Os próximos capítulos detalham chunking, recuperação e re-ranking; aqui está o esqueleto inteiro em miniatura.
+
+```python
+import math, re
+from collections import Counter
+
+DOCS = {
+    "ferias.md#1": "Ferias podem ser divididas em ate tres periodos, um deles com pelo menos 14 dias.",
+    "ferias.md#2": "O pedido de ferias deve ser feito no portal com 30 dias de antecedencia.",
+    "reembolso.md#1": "Despesas de viagem sao reembolsadas em ate 10 dias uteis apos a aprovacao.",
+    "vpn.md#1": "Para acessar a VPN instale o cliente corporativo e use o token do celular.",
+}
+
+def vetor(texto):
+    return Counter(re.findall(r"\w+", texto.lower()))
+
+def cosseno(a, b):
+    num = sum(a[t] * b[t] for t in a)
+    den = math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values()))
+    return num / den if den else 0.0
+
+INDICE = {doc_id: vetor(texto) for doc_id, texto in DOCS.items()}
+
+def recuperar(pergunta, k=2):
+    q = vetor(pergunta)
+    ranking = sorted(INDICE, key=lambda d: -cosseno(q, INDICE[d]))
+    return [(d, round(cosseno(q, INDICE[d]), 2)) for d in ranking[:k]]
+
+def montar_prompt(pergunta, trechos):
+    contexto = "\n".join(f"[{d}] {DOCS[d]}" for d, _ in trechos)
+    return (
+        "Responda usando apenas os trechos abaixo e cite a fonte entre colchetes.\n"
+        "Se a resposta nao estiver nos trechos, diga que nao sabe.\n\n"
+        f"{contexto}\n\nPergunta: {pergunta}"
+    )
+
+pergunta = "Com quantos dias de antecedencia peco ferias?"
+trechos = recuperar(pergunta)
+print(trechos)
+print(montar_prompt(pergunta, trechos))
+```
+
+```text
+Saída:
+[('ferias.md#2', 0.57), ('ferias.md#1', 0.29)]
+Responda usando apenas os trechos abaixo e cite a fonte entre colchetes.
+Se a resposta nao estiver nos trechos, diga que nao sabe.
+
+[ferias.md#2] O pedido de ferias deve ser feito no portal com 30 dias de antecedencia.
+[ferias.md#1] Ferias podem ser divididas em ate tres periodos, um deles com pelo menos 14 dias.
+
+Pergunta: Com quantos dias de antecedencia peco ferias?
+```
+
+## Respostas fundamentadas e o direito de dizer "não sei"
+
+RAG reduz alucinação, mas não a elimina. Três práticas fazem diferença:
+
+- **Instruir a usar só o contexto** e a admitir quando a informação não está lá.
+- **Citações:** pedir que cada afirmação aponte o id do trecho permite ao usuário conferir e a você avaliar automaticamente.
+- **Limiar de relevância:** se nem o melhor trecho é parecido com a pergunta, nem chame o modelo para responder; devolva uma mensagem de "não encontrei".
+
+O modelo falso abaixo é extrativo: devolve a frase do contexto que mais se parece com a pergunta, com a fonte, ou recusa quando a recuperação é fraca.
+
+```python
+import math, re
+from collections import Counter
+
+DOCS = {
+    "ferias.md#2": "O pedido de ferias deve ser feito no portal com 30 dias de antecedencia.",
+    "vpn.md#1": "Para acessar a VPN instale o cliente corporativo e use o token do celular.",
+}
+
+STOP = {"o", "a", "de", "do", "da", "com", "e", "qual", "como", "para", "deve", "ser"}
+
+def vetor(texto):
+    return Counter(t for t in re.findall(r"\w+", texto.lower()) if t not in STOP)
+
+def cosseno(a, b):
+    num = sum(a[t] * b[t] for t in a)
+    den = math.sqrt(sum(v * v for v in a.values())) * math.sqrt(sum(v * v for v in b.values()))
+    return num / den if den else 0.0
+
+def responder(pergunta, limiar=0.25):
+    q = vetor(pergunta)
+    melhor = max(DOCS, key=lambda d: cosseno(q, vetor(DOCS[d])))
+    score = cosseno(q, vetor(DOCS[melhor]))
+    if score < limiar:
+        return f"Nao encontrei isso na base (melhor score {score:.2f})."
+    return f"{DOCS[melhor]} [{melhor}]"
+
+print(responder("como acessar a VPN de casa?"))
+print(responder("qual o valor do vale refeicao?"))
+```
+
+```text
+Saída:
+Para acessar a VPN instale o cliente corporativo e use o token do celular. [vpn.md#1]
+Nao encontrei isso na base (melhor score 0.00).
+```
+
+## RAG, contexto longo ou fine-tuning?
+
+| Abordagem | Quando usar | Limitações |
+| --- | --- | --- |
+| RAG | Conhecimento que muda, grande, privado, com controle de acesso e necessidade de citar fonte | Qualidade depende da recuperação; mais componentes para operar |
+| Contexto longo (tudo no prompt) | Poucos documentos, consultas raras, protótipos | Custo e latência por chamada; perda no meio |
+| Fine-tuning | Ensinar formato, estilo, vocabulário ou tarefa específica | Ruim para injetar fatos que mudam; difícil atualizar e citar |
+
+As abordagens se combinam: um modelo ajustado para seguir seu formato pode responder com base em trechos recuperados.
+
+<Callout type="warning" title="A maioria das falhas é de recuperação">
+Quando um RAG responde errado, o culpado mais frequente não é o LLM: o trecho certo não foi recuperado, foi cortado no chunking ou ficou abaixo de trechos parecidos. Avalie a recuperação separadamente da geração antes de trocar de modelo.
+</Callout>
+
+## Armadilhas
+
+- **Permissões:** filtre por quem pode ver cada documento **na busca**, não depois da resposta. Um trecho que entra no prompt pode vazar.
+- **Dados desatualizados:** sem reindexação incremental, o assistente cita a política antiga.
+- **Documentos sujos:** cabeçalhos repetidos, tabelas quebradas e PDFs mal extraídos poluem o índice.
+
+## Na entrevista
+
+Desenhe as duas fases (ingestão e consulta), nomeie cada componente e diga onde você mediria qualidade: recall da recuperação e fidelidade da resposta ao contexto. Defenda RAG contra fine-tuning para conhecimento que muda. Follow-ups: "como evitar que o usuário veja documentos de outro departamento?" (filtro de permissão por metadados na consulta) e "o que fazer quando nada relevante é encontrado?" (limiar e resposta de não sei, em vez de deixar o modelo improvisar).
+
+<QuizSet>
+<Quiz question="Uma empresa quer que o assistente responda sobre políticas internas que mudam todo mês e mostre de onde tirou a resposta. O que você propõe?" options={["Fine-tuning mensal do modelo com as políticas", "RAG com citação dos trechos usados", "Aumentar a temperatura", "Colocar as políticas no system prompt e nunca mais mexer"]} answer={1} explanation="RAG permite atualizar o conhecimento só reindexando documentos e devolve as fontes, algo que fine-tuning não oferece." />
+<Quiz question="O RAG está respondendo errado sobre prazos de reembolso. Qual o primeiro diagnóstico?" options={["Trocar o LLM por um maior", "Verificar se o trecho correto aparece entre os trechos recuperados para essas perguntas", "Aumentar o número de tokens de saída", "Remover as citações"]} answer={1} explanation="A maior parte das falhas de RAG vem da recuperação. Se o trecho certo não chegou ao prompt, nenhum modelo vai acertar." />
+</QuizSet>

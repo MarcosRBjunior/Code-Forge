@@ -1,0 +1,96 @@
+---
+title: Latência de inferência
+kind: lesson
+---
+
+"O assistente está lento" pode significar três coisas diferentes: demora para começar a responder, escreve devagar ou leva muito tempo no total. Cada uma tem causas e remédios distintos, e um bom candidato separa as três antes de propor qualquer otimização. Neste capítulo você vai decompor a latência de uma requisição a um LLM, montar um orçamento e ver quais técnicas atacam cada parcela.
+
+## As três métricas
+
+- **TTFT (tempo até o primeiro token):** fila, rede, guardrails de entrada, recuperação de contexto e prefill do prompt. É o que define se o produto "parece rápido".
+- **TPOT ou ITL (tempo por token de saída, ou entre tokens):** velocidade do decode. Abaixo da velocidade de leitura humana, o usuário percebe a resposta "travando".
+- **Latência total:** TTFT mais o número de tokens de saída vezes o TPOT. Importa para chamadas sem streaming, como agentes que encadeiam várias chamadas e pipelines em lote.
+
+Meça sempre percentis (p50, p95, p99), não médias. Um prompt de 50 mil tokens no meio do lote pode estourar o p99 de todos.
+
+## Montando o orçamento
+
+O programa abaixo decompõe uma requisição típica de chat com RAG usando valores hipotéticos e testa três otimizações: cache de prefixo (o prompt de sistema e os exemplos fixos já têm KV cache pronto), modelo menor e decodificação especulativa.
+
+```python
+def latencia(prompt_tok, prefixo_cache=0, saida_tok=350, prefill_tok_ms=0.08, tpot_ms=30):
+    etapas = {
+        "rede e gateway": 40,
+        "guardrail entrada": 15,
+        "recuperacao (RAG)": 120,
+        "fila no servidor": 50,
+        "prefill": (prompt_tok - prefixo_cache) * prefill_tok_ms,
+    }
+    ttft = sum(etapas.values())
+    total = ttft + saida_tok * tpot_ms
+    return etapas, ttft, total
+
+etapas, ttft, total = latencia(6000)
+for nome, ms in etapas.items():
+    print(f"  {nome:<18}{ms:7.0f} ms")
+print(f"base:              TTFT {ttft:5.0f} ms  total {total / 1000:5.1f} s")
+
+_, t, tot = latencia(6000, prefixo_cache=4000)
+print(f"cache de prefixo:  TTFT {t:5.0f} ms  total {tot / 1000:5.1f} s")
+_, t, tot = latencia(6000, prefill_tok_ms=0.03, tpot_ms=12)
+print(f"modelo menor:      TTFT {t:5.0f} ms  total {tot / 1000:5.1f} s")
+
+# Decodificacao especulativa: rascunho propoe k tokens, o modelo grande verifica em 1 passo
+a, k = 0.7, 4                      # taxa de aceitacao por token e tokens propostos (hipoteticos)
+tokens_por_passo = (1 - a ** (k + 1)) / (1 - a)
+custo_passo = 30 + k * 3           # passo do grande + k passos do rascunho (ms)
+tpot_esp = custo_passo / tokens_por_passo
+_, t, tot = latencia(6000, tpot_ms=tpot_esp)
+print(f"especulativa:      TTFT {t:5.0f} ms  total {tot / 1000:5.1f} s  ({tokens_por_passo:.2f} tok/passo)")
+```
+
+```text
+Saída:
+  rede e gateway         40 ms
+  guardrail entrada      15 ms
+  recuperacao (RAG)     120 ms
+  fila no servidor       50 ms
+  prefill               480 ms
+base:              TTFT   705 ms  total  11.2 s
+cache de prefixo:  TTFT   385 ms  total  10.9 s
+modelo menor:      TTFT   405 ms  total   4.6 s
+especulativa:      TTFT   705 ms  total   6.0 s  (2.77 tok/passo)
+```
+
+A leitura dos números orienta a conversa. Com um prompt de 6 mil tokens, o prefill é a maior parcela do TTFT, então o cache de prefixo ajuda muito no início e nada no decode. O total, por outro lado, é dominado pelos 350 tokens de saída: para ele, o que funciona é gerar menos tokens, usar um modelo mais rápido ou acelerar o decode.
+
+## Técnicas por parcela
+
+| Parcela | Técnicas |
+| --- | --- |
+| Rede, gateway, guardrails | Regiões próximas do usuário, conexões reaproveitadas, guardrails em paralelo |
+| Recuperação | Índices em memória, menos etapas sequenciais, reranker pequeno, cache de buscas |
+| Fila | Mais capacidade, prioridade para tráfego interativo, separar lotes offline |
+| Prefill | Cache de prefixo, prompts mais curtos, prefill em pedaços para não travar outros |
+| Decode | Modelo menor ou quantizado, decodificação especulativa, limitar tokens de saída |
+
+Algumas observações que valem pontos:
+
+- **Menos tokens de saída é a otimização mais barata.** Instruir respostas concisas e cortar preâmbulos reduz latência e custo ao mesmo tempo.
+- **Paralelize o que for independente.** Guardrail de entrada, busca de histórico e recuperação de documentos podem rodar ao mesmo tempo.
+- **Throughput e latência brigam.** Batches maiores melhoram o custo por token e pioram o TPOT de cada usuário. Muitos times mantêm pools diferentes: um interativo, com batches menores, e um de lote, com batches grandes.
+- **Decodificação especulativa** usa um modelo rascunho pequeno para propor alguns tokens que o modelo grande verifica de uma vez. Quando a taxa de aceitação é alta (texto previsível, como código ou formatos fixos), o ganho é grande; quando é baixa, o rascunho vira custo extra.
+
+<Callout type="tip" title="Pergunte qual latência importa">
+Antes de otimizar, pergunte se o produto tem streaming. Com streaming, TTFT e TPOT importam mais que o total. Num agente que encadeia dez chamadas sem streaming, a latência total de cada chamada se multiplica e vira o problema principal.
+</Callout>
+
+## Na entrevista
+
+Separe TTFT, TPOT e total logo que o tema surgir e monte um orçamento rápido em voz alta ("200 ms de recuperação, 400 ms de prefill, 30 ms por token"). Depois proponha técnicas por parcela, começando pelas baratas: paralelizar etapas, encurtar prompt e saída, cache de prefixo. Follow-ups comuns: "o p99 está alto mas o p50 está bom, o que você investiga?" (prompts muito longos, fila em picos, interferência de prefill no decode, retries) e "como reduzir latência de um agente com várias chamadas?" (menos passos, chamadas paralelas, modelo menor nos passos simples).
+
+<QuizSet>
+<Quiz question="O TTFT está ótimo, mas os usuários dizem que o texto aparece travando. Qual métrica você olha e o que pode estar errado?" options={["TTFT; fila no gateway", "Tempo por token de saída; batches grandes demais ou interferência de prefills longos no decode", "Latência do banco de histórico", "Tamanho do índice vetorial"]} answer={1} explanation="A fluidez depende do tempo entre tokens, que piora com batches grandes e com prefills pesados intercalados no decode." />
+<Quiz question="Todos os prompts começam com as mesmas 4 mil palavras de instruções e exemplos. Qual técnica reduz o TTFT?" options={["Decodificação especulativa", "Cache de prefixo, reaproveitando o KV cache do trecho comum", "Aumentar a temperatura", "Remover o streaming"]} answer={1} explanation="O prefixo comum é processado uma vez; as requisições seguintes só pagam o prefill da parte nova." />
+<Quiz question="Em qual cenário a decodificação especulativa tende a render menos?" options={["Geração de código com padrões repetitivos", "Texto criativo e imprevisível, em que o rascunho erra muito e quase nada é aceito", "Preenchimento de formulários JSON", "Respostas com formato fixo"]} answer={1} explanation="O ganho depende da taxa de aceitação dos tokens propostos; texto imprevisível derruba essa taxa." />
+</QuizSet>

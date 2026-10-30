@@ -1,0 +1,151 @@
+---
+title: Semáforos
+kind: lesson
+---
+
+Um mutex responde à pergunta "alguém está usando isto?". Muitas vezes a pergunta real é outra: "quantos podem usar isto ao mesmo tempo?". Um pool com 10 conexões de banco, uma API externa que aceita 5 chamadas simultâneas, uma máquina que aguenta 4 conversões de vídeo em paralelo. Para limitar a concorrência a N, você usa um **semáforo**: um contador de permissões com duas operações atômicas.
+
+## Como funciona
+
+- **acquire** (também chamado de `P`, `wait` ou `down`): se o contador é maior que zero, decrementa e segue; se é zero, bloqueia até alguém devolver uma permissão.
+- **release** (`V`, `signal` ou `up`): incrementa o contador e acorda uma thread que esteja esperando.
+
+```text
+Semáforo com 3 permissões
+
+contador: 3   T1 acquire -> 2
+contador: 2   T2 acquire -> 1
+contador: 1   T3 acquire -> 0
+contador: 0   T4 acquire -> bloqueia
+              T1 release -> T4 acorda e entra (contador continua 0)
+```
+
+Diferente do mutex, o semáforo **não tem dono**: qualquer thread pode chamar `release`, mesmo uma que nunca chamou `acquire`. Isso é um defeito quando você queria exclusão mútua e uma qualidade quando você quer sinalizar entre threads.
+
+Em Python: `threading.Semaphore` e `threading.BoundedSemaphore`, além de `asyncio.Semaphore`. Em Java: `java.util.concurrent.Semaphore`. Em C++20: `std::counting_semaphore` e `std::binary_semaphore`. Em Go não há tipo dedicado; o idioma é um canal com buffer (`sem := make(chan struct{}, 3)`), em que enviar é adquirir e receber é liberar, ou o pacote `golang.org/x/sync/semaphore`.
+
+## Limitando a concorrência
+
+```python
+import threading
+import time
+
+limite = threading.BoundedSemaphore(3)
+estado = threading.Lock()
+ativos = 0
+maximo = 0
+concluidas = []
+
+def chamar_api(i):
+    global ativos, maximo
+    with limite:  # no máximo 3 threads passam daqui ao mesmo tempo
+        with estado:
+            ativos += 1
+            maximo = max(maximo, ativos)
+        time.sleep(0.02)  # simula a chamada externa
+        with estado:
+            ativos -= 1
+            concluidas.append(i)
+
+threads = [threading.Thread(target=chamar_api, args=(i,)) for i in range(10)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("limite respeitado:", maximo <= 3)
+print("chamadas concluidas:", sorted(concluidas))
+```
+
+```text
+Saída:
+limite respeitado: True
+chamadas concluidas: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+```
+
+Dez threads foram criadas, mas nunca mais de três estiveram dentro do trecho protegido. O `with` garante que a permissão volta mesmo que a chamada lance exceção.
+
+## Semáforo como sinal
+
+Com contador inicial **zero**, o semáforo vira um mecanismo de aviso: quem chama `acquire` espera até outra thread chamar `release`. Isso força uma ordem entre threads sem depender de `sleep`.
+
+```python
+import threading
+
+pronto = threading.Semaphore(0)
+log = []
+
+def usuario():
+    pronto.acquire()  # espera o aviso
+    log.append("usuario: usando a conexao")
+
+def preparador():
+    log.append("preparador: conexao aberta")
+    pronto.release()  # avisa
+
+u = threading.Thread(target=usuario)
+p = threading.Thread(target=preparador)
+u.start()  # mesmo iniciando primeiro, o usuário espera
+p.start()
+u.join()
+p.join()
+
+for linha in log:
+    print(linha)
+```
+
+```text
+Saída:
+preparador: conexao aberta
+usuario: usando a conexao
+```
+
+Esse padrão aparece direto em problemas de entrevista como "imprima foo e bar alternados com duas threads".
+
+## Semaphore vs. BoundedSemaphore
+
+Como não há dono, um `release` a mais passa despercebido e o limite cresce silenciosamente. A versão limitada detecta o erro:
+
+```python
+import threading
+
+comum = threading.Semaphore(2)
+comum.release()  # bug: release sem acquire
+livres = 0
+while comum.acquire(blocking=False):
+    livres += 1
+print("Semaphore(2) depois de um release extra:", livres, "permissoes")
+
+limitado = threading.BoundedSemaphore(2)
+try:
+    limitado.release()
+except ValueError:
+    print("BoundedSemaphore(2): release extra gera ValueError")
+```
+
+```text
+Saída:
+Semaphore(2) depois de um release extra: 3 permissoes
+BoundedSemaphore(2): release extra gera ValueError
+```
+
+<Callout type="warning" title="Semáforo binário não é mutex">
+Um semáforo com 1 permissão parece um lock, mas qualquer thread pode liberá-lo e ele não é reentrante. Para exclusão mútua, use um mutex: ele expressa a intenção e algumas implementações detectam liberação pela thread errada.
+</Callout>
+
+## Armadilhas
+
+- **Esquecer o release** num caminho de erro vaza permissões até o sistema travar com contador zero. Use `with`, `try/finally` ou o equivalente da linguagem.
+- **Semáforo não protege dados.** Ele limita quantos entram; se três threads entram e mexem na mesma estrutura, você ainda precisa de um lock para ela.
+- **Adquirir vários semáforos** em ordens diferentes causa deadlock, assim como com locks.
+- **Justiça.** Por padrão, não há garantia de que quem espera há mais tempo entra primeiro. Em Java, `new Semaphore(n, true)` dá ordem de chegada, com custo de throughput.
+
+## Na entrevista
+
+Use semáforo quando o requisito falar em "no máximo N ao mesmo tempo" (pool de conexões, limite de chamadas simultâneas, vagas num estacionamento) ou quando precisar de sinalização entre threads. Explique a diferença para o mutex (dono e reentrância) e mencione o idioma do canal com buffer em Go. Follow-ups comuns: "implemente um semáforo com lock e variável de condição" (um contador, `wait` enquanto for zero, `notify` no release) e "como resolver produtor-consumidor com semáforos?" (um semáforo de vagas livres, um de itens disponíveis e um mutex para o buffer).
+
+<QuizSet>
+<Quiz question="Seu serviço chama uma API de terceiros que recusa mais de 5 requisições simultâneas. Qual primitiva encaixa melhor?" options={["Um mutex", "Um semáforo com 5 permissões", "Um lock reentrante", "Uma barreira com 5 partes"]} answer={1} explanation="O semáforo limita a concorrência a N: cada chamada adquire uma permissão e devolve ao terminar." />
+<Quiz question="Qual a diferença essencial entre um semáforo binário e um mutex?" options={["O semáforo é mais rápido", "O mutex tem dono: só quem adquiriu libera; o semáforo pode ser liberado por qualquer thread", "O mutex permite 2 threads", "Não há diferença"]} answer={1} explanation="A ausência de dono torna o semáforo útil para sinalização entre threads, mas inadequado como substituto de mutex." />
+<Quiz question="Como garantir com um semáforo que a thread B só execute depois que a thread A terminar uma etapa?" options={["Semáforo iniciado em 1; B libera e A adquire", "Semáforo iniciado em 0; A libera ao terminar e B adquire antes de começar", "Usar sleep em B", "Semáforo iniciado em 2"]} answer={1} explanation="Com contador zero, o acquire de B bloqueia até o release de A, independentemente de qual thread começa primeiro." />
+</QuizSet>

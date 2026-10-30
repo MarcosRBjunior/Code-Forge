@@ -1,0 +1,158 @@
+---
+title: Gateways e fallbacks entre modelos
+kind: lesson
+---
+
+APIs de LLM falham mais do que as APIs a que você está acostumado: limites de taxa (HTTP 429) em horário de pico, sobrecarga do provedor, timeouts em respostas longas, indisponibilidades regionais e modelos descontinuados. Se cada serviço da empresa chama o provedor direto, cada um reimplementa retry, guarda sua própria chave e ninguém sabe quanto se gasta no total. Um **gateway de LLM** centraliza isso: é um proxy entre suas aplicações e os provedores, com uma API única e as políticas de resiliência, custo e segurança num só lugar.
+
+## O que o gateway faz
+
+```text
+apps ──► GATEWAY ──┬──► provedor A (modelo principal)
+                   ├──► provedor B (fallback)
+                   └──► modelo próprio (fallback barato / dados sensíveis)
+         │
+         ├─ API unificada e tradução de formatos
+         ├─ chaves e credenciais centralizadas
+         ├─ rate limit e cotas por equipe/cliente
+         ├─ retry, timeout, fallback, circuit breaker
+         ├─ roteamento (custo, latência, tipo de tarefa)
+         ├─ cache, guardrails
+         └─ logs, métricas de custo e latência por app
+```
+
+Existem gateways de código aberto e gerenciados, e muitas empresas constroem o seu. O importante é saber quais responsabilidades ele concentra.
+
+## Retry com backoff
+
+Nem todo erro merece nova tentativa. Repita em erros transitórios (429, 5xx, timeout), nunca em erros do cliente (400 por requisição inválida, 401 de autenticação, conteúdo bloqueado por política). Use **backoff exponencial com jitter** para não sincronizar milhares de clientes batendo de novo ao mesmo tempo, e respeite o cabeçalho de espera quando o provedor enviar um. Limite tentativas e o tempo total: um usuário esperando não aguenta cinco retries de 30 segundos.
+
+## Fallback entre modelos
+
+Quando o principal continua falhando, o gateway tenta o próximo da lista. Fallbacks podem ser o mesmo modelo em outra região ou provedor, ou um modelo diferente. Nesse caso, o prompt e o formato da saída precisam funcionar nos dois, e isso deve estar coberto pela avaliação.
+
+O programa simula provedores com falhas roteirizadas e usa tempo simulado (sem dormir de verdade).
+
+```python
+import random
+
+class ErroTransitorio(Exception): pass
+class ErroCliente(Exception): pass
+
+class ProvedorFalso:
+    def __init__(self, nome, roteiro):
+        self.nome, self.roteiro, self.chamadas = nome, list(roteiro), 0
+
+    def gerar(self, prompt):
+        self.chamadas += 1
+        resultado = self.roteiro.pop(0) if self.roteiro else "ok"
+        if resultado == "429":
+            raise ErroTransitorio("429 rate limit")
+        if resultado == "400":
+            raise ErroCliente("400 requisição inválida")
+        return f"[{self.nome}] resposta para: {prompt}"
+
+def chamar_com_resiliencia(provedores, prompt, max_tentativas=3, base=0.5, seed=1):
+    rng = random.Random(seed)
+    espera_total = 0.0
+    for prov in provedores:
+        for tentativa in range(1, max_tentativas + 1):
+            try:
+                resp = prov.gerar(prompt)
+                return resp, round(espera_total, 2)
+            except ErroCliente as e:
+                print(f"  {prov.nome}: {e} -> não adianta repetir")
+                raise
+            except ErroTransitorio as e:
+                if tentativa == max_tentativas:
+                    print(f"  {prov.nome} tentativa {tentativa}: {e}")
+                    break
+                espera = base * 2 ** (tentativa - 1) * rng.uniform(0.5, 1.0)
+                espera_total += espera
+                print(f"  {prov.nome} tentativa {tentativa}: {e}, espera {espera:.2f}s")
+        print(f"  {prov.nome} esgotou as tentativas, indo para o fallback")
+    raise RuntimeError("todos os provedores falharam")
+
+principal = ProvedorFalso("principal", ["429", "429", "429"])
+reserva = ProvedorFalso("reserva", ["429"])
+print(chamar_com_resiliencia([principal, reserva], "resuma o contrato"))
+```
+
+```text
+Saída:
+  principal tentativa 1: 429 rate limit, espera 0.28s
+  principal tentativa 2: 429 rate limit, espera 0.92s
+  principal tentativa 3: 429 rate limit
+  principal esgotou as tentativas, indo para o fallback
+  reserva tentativa 1: 429 rate limit, espera 0.44s
+('[reserva] resposta para: resuma o contrato', 1.65)
+```
+
+## Circuit breaker
+
+Se o principal está fora do ar, gastar três tentativas com backoff em **cada** requisição desperdiça segundos. O **circuit breaker** conta falhas recentes por provedor; acima de um limite, "abre" e manda tudo direto para o fallback durante um tempo. Depois, deixa passar uma requisição de teste ("meio aberto"); se der certo, fecha de novo.
+
+```python
+class CircuitBreaker:
+    def __init__(self, limite_falhas=3, tempo_aberto=30):
+        self.limite, self.tempo_aberto = limite_falhas, tempo_aberto
+        self.falhas, self.aberto_desde = 0, None
+
+    def permite(self, agora):
+        if self.aberto_desde is None:
+            return True
+        if agora - self.aberto_desde >= self.tempo_aberto:
+            return True                     # meio aberto: deixa uma passar
+        return False
+
+    def registrar(self, sucesso, agora):
+        if sucesso:
+            self.falhas, self.aberto_desde = 0, None
+        else:
+            self.falhas += 1
+            if self.falhas >= self.limite:
+                self.aberto_desde = agora
+
+cb = CircuitBreaker()
+eventos = [(0, False), (1, False), (2, False), (5, None), (20, None), (33, True), (34, None)]
+for t, sucesso in eventos:
+    if not cb.permite(t):
+        print(f"t={t:2d}s: circuito ABERTO -> fallback direto")
+        continue
+    if sucesso is None:
+        sucesso = True
+    cb.registrar(sucesso, t)
+    estado = "aberto" if cb.aberto_desde is not None else "fechado"
+    print(f"t={t:2d}s: chamou principal, sucesso={sucesso}, circuito {estado}")
+```
+
+```text
+Saída:
+t= 0s: chamou principal, sucesso=False, circuito fechado
+t= 1s: chamou principal, sucesso=False, circuito fechado
+t= 2s: chamou principal, sucesso=False, circuito aberto
+t= 5s: circuito ABERTO -> fallback direto
+t=20s: circuito ABERTO -> fallback direto
+t=33s: chamou principal, sucesso=True, circuito fechado
+t=34s: chamou principal, sucesso=True, circuito fechado
+```
+
+<Callout type="warning" title="Fallback muda o comportamento">
+Trocar de modelo no meio do tráfego muda tom, formato e qualidade. Tenha prompts testados para cada modelo da cadeia, valide a saída estruturada também no fallback e registre qual modelo respondeu cada requisição, para não confundir uma queda de qualidade com um bug.
+</Callout>
+
+## Outras decisões
+
+- **Timeouts:** separe o timeout até o primeiro token (detecta provedor travado) do tempo total (respostas longas são legítimas).
+- **Streaming e retry:** se a falha acontece no meio de uma resposta em streaming, você não pode simplesmente repetir sem descartar o que o usuário já viu.
+- **Cotas por equipe:** evitam que um job em lote consuma todo o limite de taxa e derrube o produto principal.
+- **Dados sensíveis:** o gateway pode impedir que certas requisições saiam para provedores externos.
+
+## Na entrevista
+
+Desenhe o gateway com suas responsabilidades e detalhe a política de resiliência: quais erros repetir, backoff com jitter, limites de tempo, cadeia de fallback, circuit breaker e observabilidade de qual modelo respondeu. Follow-ups: "por que jitter?" (evita ondas sincronizadas de retry) e "o fallback é outro modelo, o que pode dar errado?" (formato e qualidade diferentes; avalie o prompt nos dois e valide a saída).
+
+<QuizSet>
+<Quiz question="Quais erros devem disparar retry automático?" options={["Todos, inclusive 400 e 401", "Transitórios, como 429, 5xx e timeout; erros do cliente como 400 e 401 não", "Só timeouts", "Nenhum, sempre falhe rápido"]} answer={1} explanation="Repetir uma requisição inválida ou sem autenticação dá o mesmo erro. Só falhas transitórias têm chance de sucesso numa nova tentativa." />
+<Quiz question="O provedor principal está fora do ar há 10 minutos e cada requisição gasta 6 segundos em retries antes de ir ao fallback. O que resolve?" options={["Aumentar o número de tentativas", "Um circuit breaker que, após falhas seguidas, envia direto ao fallback por um período", "Remover o fallback", "Aumentar o timeout"]} answer={1} explanation="O circuit breaker evita pagar o custo das tentativas enquanto o provedor está sabidamente indisponível, e testa periodicamente a volta." />
+</QuizSet>

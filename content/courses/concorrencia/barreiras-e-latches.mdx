@@ -1,0 +1,143 @@
+---
+title: Barreiras e latches
+kind: lesson
+---
+
+Muitos problemas concorrentes não giram em torno de proteger um dado, e sim de **coordenar momentos**: "só comece a atender requisições depois que cache, banco e configuração estiverem prontos" ou "nenhuma thread passa para a etapa 2 da simulação antes de todas terminarem a etapa 1". Dá para montar isso com locks e variáveis de condição, mas duas primitivas prontas expressam a intenção de forma direta: o **latch** e a **barreira**.
+
+## Latch: esperar N eventos uma vez
+
+Um latch de contagem (o `CountDownLatch` do Java) começa com um número N. Threads chamam `count_down()` quando terminam sua parte; quem chama `wait()` fica bloqueado até a contagem chegar a zero. Depois disso, ele fica aberto para sempre: é de uso único.
+
+```text
+N = 3       servico A --count_down--> 2
+            servico B --count_down--> 1
+            servico C --count_down--> 0  ==> main acorda
+main: wait() .........................|---> segue
+```
+
+O papel típico é "a thread principal espera os trabalhadores", mas o inverso também é comum: um latch com N = 1 funcionando como **sinal de largada**, em que vários trabalhadores esperam e a principal faz um único `count_down()` para soltar todos ao mesmo tempo, algo útil em testes de carga.
+
+Python não tem `CountDownLatch`, mas ele cabe em poucas linhas com `threading.Condition`:
+
+```python
+import threading
+
+class CountDownLatch:
+    def __init__(self, contagem):
+        self.contagem = contagem
+        self.cond = threading.Condition()
+
+    def count_down(self):
+        with self.cond:
+            if self.contagem > 0:
+                self.contagem -= 1
+                if self.contagem == 0:
+                    self.cond.notify_all()
+
+    def wait(self):
+        with self.cond:
+            self.cond.wait_for(lambda: self.contagem == 0)
+
+servicos = ["banco", "cache", "config"]
+latch = CountDownLatch(len(servicos))
+prontos = []
+trava = threading.Lock()
+
+def iniciar(nome):
+    with trava:
+        prontos.append(nome)
+    latch.count_down()
+
+for nome in servicos:
+    threading.Thread(target=iniciar, args=(nome,)).start()
+
+latch.wait()
+print("prontos:", sorted(prontos))
+print("contagem final:", latch.contagem)
+print("servidor aceitando requisicoes")
+```
+
+```text
+Saída:
+prontos: ['banco', 'cache', 'config']
+contagem final: 0
+servidor aceitando requisicoes
+```
+
+Em Go, o equivalente é `sync.WaitGroup` (`Add`, `Done`, `Wait`). Em C++20 existe `std::latch`. Em Python, se as tarefas estão num executor, esperar os futures (`concurrent.futures.wait`) ou simplesmente fazer `join` nas threads costuma bastar; o latch brilha quando quem sinaliza não é quem termina, por exemplo uma thread que continua viva depois de avisar que inicializou.
+
+## Barreira: ponto de encontro reutilizável
+
+A barreira é simétrica: N threads chamam `wait()` e **todas** ficam presas até a última chegar. Aí todas são liberadas juntas e a barreira se rearma para a próxima rodada. Isso a torna natural para algoritmos em fases, como simulações em grade, processamento em lotes ou cálculo paralelo iterativo, em que cada fase lê o que todas produziram na anterior.
+
+`threading.Barrier(n, action=f)` aceita uma ação que roda uma vez por rodada, numa das threads, depois que todas chegam e antes de qualquer uma ser liberada. É o lugar certo para consolidar resultados da fase.
+
+```python
+import threading
+
+N = 3
+parciais = [0] * N
+totais = [None] * N
+log = []
+
+def fim_de_fase():
+    log.append(f"fase {len(log) + 1} concluida, parciais={parciais}")
+
+barreira = threading.Barrier(N, action=fim_de_fase)
+
+def trabalhador(i):
+    # fase 1: cada thread calcula sua parte
+    parciais[i] = (i + 1) * 10
+    barreira.wait()
+    # fase 2: todas leem o resultado de todas
+    totais[i] = sum(parciais)
+    barreira.wait()
+
+threads = [threading.Thread(target=trabalhador, args=(i,)) for i in range(N)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+for linha in log:
+    print(linha)
+print("totais vistos por cada thread:", totais)
+```
+
+```text
+Saída:
+fase 1 concluida, parciais=[10, 20, 30]
+fase 2 concluida, parciais=[10, 20, 30]
+totais vistos por cada thread: [60, 60, 60]
+```
+
+Sem a barreira, uma thread rápida poderia somar `parciais` antes de as outras escreverem e cada uma veria um total diferente. Em Java a classe é `CyclicBarrier`; `Phaser` generaliza para um número de participantes que muda entre fases.
+
+## Comparando
+
+| | Latch | Barreira |
+| --- | --- | --- |
+| Quem espera | Um ou mais observadores | Os próprios participantes |
+| Quem sinaliza | Qualquer thread, N vezes | Cada participante, ao chegar |
+| Reuso | Uso único | Rearma a cada rodada |
+| Uso típico | Inicialização, sinal de largada | Algoritmos em fases |
+
+## Armadilhas
+
+- **Participante que nunca chega.** Se uma thread lança exceção antes do `wait()` da barreira, as outras ficam presas para sempre. Em Python, `Barrier.abort()` e o parâmetro `timeout` fazem as demais receberem `BrokenBarrierError`; em Java o comportamento é análogo. Sempre trate esse caminho.
+- **Contagem errada.** Um latch com N maior que o número de `count_down()` reais nunca abre. Prefira derivar N da lista de tarefas, não de uma constante.
+- **Reusar latch.** Ele não volta ao valor inicial. Se precisa de rodadas, é barreira.
+
+<Callout type="tip" title="Escolha pela pergunta">
+"Alguém espera que N coisas aconteçam?" é latch. "N threads precisam se esperar mutuamente, repetidas vezes?" é barreira.
+</Callout>
+
+## Na entrevista
+
+Essas primitivas aparecem como peça de problemas maiores: "inicie o servidor só depois de carregar tudo", "dispare 100 requisições ao mesmo tempo para testar concorrência", "simule o jogo da vida com várias threads". Nomeie a primitiva, diga se precisa de reuso e trate a falha de um participante. Follow-ups comuns: "como implementar um latch com o que a linguagem oferece?" (contador mais variável de condição, como acima) e "o que acontece se uma das threads morrer antes da barreira?" (barreira quebrada, timeout ou abort).
+
+<QuizSet>
+<Quiz question="A aplicação só pode aceitar tráfego depois que 4 componentes independentes terminarem de inicializar. Qual primitiva expressa isso melhor?" options={["Uma barreira cíclica com 4 participantes", "Um latch de contagem iniciado em 4, com a thread principal esperando", "Um semáforo binário", "Um lock reentrante"]} answer={1} explanation="É um evento de uso único observado por quem não participa do trabalho: exatamente o papel do latch." />
+<Quiz question="Qual a principal diferença entre CyclicBarrier e CountDownLatch?" options={["A barreira é mais rápida", "A barreira é reutilizável e faz os próprios participantes esperarem uns pelos outros; o latch é de uso único", "O latch só funciona com duas threads", "Não há diferença prática"]} answer={1} explanation="O latch abre uma vez e fica aberto; a barreira se rearma a cada rodada." />
+<Quiz question="Numa simulação em fases com barreira, uma thread lança exceção antes de chegar ao ponto de encontro. O que acontece se nada for tratado?" options={["As outras seguem normalmente", "As outras ficam bloqueadas indefinidamente esperando o participante que nunca chega", "A barreira reduz N automaticamente", "O programa reinicia a fase"]} answer={1} explanation="Use timeout ou abort para quebrar a barreira e propagar o erro às demais threads." />
+</QuizSet>

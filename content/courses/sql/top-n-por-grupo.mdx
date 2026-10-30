@@ -1,0 +1,191 @@
+---
+title: Top N por grupo
+kind: lesson
+---
+
+"Liste os 3 produtos mais vendidos de cada categoria." "Mostre o último login de cada usuário." "Traga os 2 maiores salários por departamento." Todas são a mesma pergunta: **top N por grupo**. É provavelmente o padrão mais cobrado em rodadas de SQL de data e backend, porque não sai com um `GROUP BY` simples: a agregação devolve o valor máximo, mas não a linha inteira que o contém, e não sabe pegar mais de um por grupo.
+
+## O esquema
+
+```sql
+CREATE TABLE produtos (
+  id        integer PRIMARY KEY,
+  nome      text NOT NULL,
+  categoria text NOT NULL
+);
+
+CREATE TABLE itens_venda (
+  id         integer PRIMARY KEY,
+  produto_id integer NOT NULL REFERENCES produtos (id),
+  quantidade integer NOT NULL
+);
+
+INSERT INTO produtos VALUES
+  (1, 'Café 500g',      'Mercearia'),
+  (2, 'Arroz 5kg',      'Mercearia'),
+  (3, 'Feijão 1kg',     'Mercearia'),
+  (4, 'Azeite 500ml',   'Mercearia'),
+  (5, 'Detergente',     'Limpeza'),
+  (6, 'Sabão em pó',    'Limpeza'),
+  (7, 'Desinfetante',   'Limpeza'),
+  (8, 'Água sanitária', 'Limpeza');
+
+INSERT INTO itens_venda VALUES
+  (1, 1, 30), (2, 2, 25), (3, 3, 25), (4, 4, 8),
+  (5, 1, 10), (6, 5, 40), (7, 6, 15), (8, 7, 15),
+  (9, 8, 5), (10, 2, 5);
+
+SELECT p.categoria, p.nome, sum(i.quantidade) AS vendidos
+FROM itens_venda i
+JOIN produtos p ON p.id = i.produto_id
+GROUP BY p.categoria, p.nome
+ORDER BY p.categoria, vendidos DESC, p.nome;
+```
+
+```text
+Saída:
+categoria | nome | vendidos
+Limpeza | Detergente | 40
+Limpeza | Desinfetante | 15
+Limpeza | Sabão em pó | 15
+Limpeza | Água sanitária | 5
+Mercearia | Café 500g | 40
+Mercearia | Arroz 5kg | 30
+Mercearia | Feijão 1kg | 25
+Mercearia | Azeite 500ml | 8
+```
+
+Repare nos empates de propósito: Desinfetante e Sabão em pó vendem 15 cada. É neles que a escolha da função faz diferença.
+
+## A solução padrão: função de janela
+
+Calcule a posição de cada linha dentro do seu grupo e filtre por ela numa camada externa. O filtro precisa ficar fora, porque funções de janela são avaliadas depois do `WHERE`.
+
+```sql
+WITH totais AS (
+  SELECT p.categoria, p.nome, sum(i.quantidade) AS vendidos
+  FROM itens_venda i
+  JOIN produtos p ON p.id = i.produto_id
+  GROUP BY p.categoria, p.nome
+),
+posicoes AS (
+  SELECT categoria, nome, vendidos,
+         ROW_NUMBER() OVER (PARTITION BY categoria ORDER BY vendidos DESC, nome) AS rn
+  FROM totais
+)
+SELECT categoria, nome, vendidos
+FROM posicoes
+WHERE rn <= 2
+ORDER BY categoria, rn;
+```
+
+```text
+Saída:
+categoria | nome | vendidos
+Limpeza | Detergente | 40
+Limpeza | Desinfetante | 15
+Mercearia | Café 500g | 40
+Mercearia | Arroz 5kg | 30
+```
+
+Com `ROW_NUMBER`, exatamente 2 linhas por grupo. O critério de desempate (`nome`) está explícito no `ORDER BY` da janela; sem ele, qual dos empatados entra seria arbitrário.
+
+## Empates mudam a resposta
+
+Se o enunciado disser "inclua empatados", troque por `RANK` ou `DENSE_RANK`:
+
+```sql
+WITH totais AS (
+  SELECT p.categoria, p.nome, sum(i.quantidade) AS vendidos
+  FROM itens_venda i
+  JOIN produtos p ON p.id = i.produto_id
+  GROUP BY p.categoria, p.nome
+)
+SELECT categoria, nome, vendidos, pos
+FROM (
+  SELECT categoria, nome, vendidos,
+         RANK() OVER (PARTITION BY categoria ORDER BY vendidos DESC) AS pos
+  FROM totais
+) t
+WHERE pos <= 2
+ORDER BY categoria, pos, nome;
+```
+
+```text
+Saída:
+categoria | nome | vendidos | pos
+Limpeza | Detergente | 40 | 1
+Limpeza | Desinfetante | 15 | 2
+Limpeza | Sabão em pó | 15 | 2
+Mercearia | Café 500g | 40 | 1
+Mercearia | Arroz 5kg | 30 | 2
+```
+
+| Função | Empate em 2º lugar com top 2 | Uso típico |
+| --- | --- | --- |
+| `ROW_NUMBER` | Escolhe um; sempre N linhas | "Exatamente N", deduplicação |
+| `RANK` | Inclui os dois; o próximo seria 4º | "Top N com empates" |
+| `DENSE_RANK` | Inclui os dois; o próximo seria 3º | "N valores distintos" |
+
+## Top 1: o caso especial do Postgres
+
+Para um registro por grupo, o Postgres tem `DISTINCT ON`, curto e eficiente: ele mantém a primeira linha de cada grupo segundo o `ORDER BY`.
+
+```sql
+SELECT DISTINCT ON (p.categoria) p.categoria, p.nome, i.quantidade
+FROM itens_venda i
+JOIN produtos p ON p.id = i.produto_id
+ORDER BY p.categoria, i.quantidade DESC, i.id;
+```
+
+```text
+Saída:
+categoria | nome | quantidade
+Limpeza | Detergente | 40
+Mercearia | Café 500g | 30
+```
+
+Esse resultado é o maior **item de venda** individual de cada categoria, não o total por produto: leia sempre a granularidade que a pergunta pede. `DISTINCT ON` não existe no MySQL; lá você usa `ROW_NUMBER` (disponível a partir do MySQL 8.0). Em MySQL 5.7, a saída era uma subconsulta correlacionada ou uma junção com o máximo do grupo.
+
+## Alternativa com LATERAL
+
+Quando a tabela de grupos é pequena e existe índice em `(grupo, métrica)`, um `JOIN LATERAL` com `LIMIT` faz uma busca curta por grupo, em vez de numerar todas as linhas:
+
+```sql
+SELECT c.categoria, top.nome, top.quantidade
+FROM (SELECT DISTINCT categoria FROM produtos) c
+CROSS JOIN LATERAL (
+  SELECT p.nome, i.quantidade
+  FROM itens_venda i
+  JOIN produtos p ON p.id = i.produto_id
+  WHERE p.categoria = c.categoria
+  ORDER BY i.quantidade DESC, i.id
+  LIMIT 2
+) top
+ORDER BY c.categoria, top.quantidade DESC, top.nome;
+```
+
+```text
+Saída:
+categoria | nome | quantidade
+Limpeza | Detergente | 40
+Limpeza | Sabão em pó | 15
+Mercearia | Café 500g | 30
+Mercearia | Arroz 5kg | 25
+```
+
+O MySQL 8.0.14+ também aceita `LATERAL`.
+
+<Callout type="warning" title="Filtro na janela não vai no WHERE">
+`WHERE ROW_NUMBER() OVER (...) <= 3` é erro em qualquer banco. Calcule a posição numa subconsulta ou CTE e filtre fora. Alguns bancos analíticos têm `QUALIFY` para isso, mas Postgres e MySQL não.
+</Callout>
+
+## Na entrevista
+
+Diga o padrão pelo nome ("isto é top N por grupo"), pergunte como tratar empates e escolha a função de acordo. Escreva com CTE para ficar legível. Follow-ups comuns: "e se a tabela tiver 1 bilhão de linhas?" (índice em `(categoria, vendidos)` e `LATERAL` com `LIMIT`, ou pré-agregação) e "como manter só a linha mais recente de cada usuário e apagar o resto?" (`ROW_NUMBER` e `DELETE` onde `rn > 1`).
+
+<QuizSet>
+<Quiz question="O enunciado pede os 3 maiores salários de cada departamento, incluindo todos os empatados. Qual função usar?" options={["ROW_NUMBER", "RANK ou DENSE_RANK, dependendo de como contar as posições", "NTILE", "LAG"]} answer={1} explanation="ROW_NUMBER corta empates arbitrariamente. RANK e DENSE_RANK dão a mesma posição a valores iguais." />
+<Quiz question="Por que é preciso uma subconsulta ou CTE para filtrar rn menor ou igual a 2?" options={["Por estilo", "Porque funções de janela são calculadas depois do WHERE", "Porque ROW_NUMBER só existe em CTEs", "Porque o Postgres não aceita WHERE com números"]} answer={1} explanation="Na ordem lógica, WHERE vem antes das janelas; o resultado da janela só pode ser filtrado numa camada externa." />
+<Quiz question="Qual recurso do Postgres resolve top 1 por grupo sem função de janela, mas não existe no MySQL?" options={["QUALIFY", "DISTINCT ON", "GROUP_CONCAT", "LIMIT BY"]} answer={1} explanation="DISTINCT ON (grupo) mantém a primeira linha de cada grupo segundo o ORDER BY." />
+</QuizSet>

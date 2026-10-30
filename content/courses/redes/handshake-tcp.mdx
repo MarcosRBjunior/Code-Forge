@@ -1,0 +1,141 @@
+---
+title: Abertura e encerramento de conexão
+kind: lesson
+---
+
+Antes de trocar um único byte de aplicação, os dois lados do TCP precisam concordar em duas coisas: que ambos estão vivos e dispostos a conversar, e em que número de sequência cada direção começa. No fim, precisam garantir que nenhum byte ficou para trás e que segmentos atrasados da conexão antiga não vão contaminar uma nova. Abertura e encerramento parecem burocracia, mas explicam boa parte da latência do primeiro request e de problemas clássicos de produção, como esgotamento de portas e conexões presas.
+
+## O three-way handshake
+
+```text
+cliente (SYN_SENT)                          servidor (LISTEN)
+   | --- SYN seq=x ---------------------------> |
+   |                                            | SYN_RCVD
+   | <-- SYN+ACK seq=y ack=x+1 ---------------- |
+   | ESTABLISHED                                |
+   | --- ACK seq=x+1 ack=y+1 -----------------> |
+   |                                            | ESTABLISHED
+```
+
+Cada lado escolhe um **número de sequência inicial** (ISN) e o outro confirma com ACK igual a ISN + 1, porque o SYN ocupa uma posição no espaço de sequência. São três segmentos porque cada direção precisa de um SYN e de um ACK, e o servidor junta os dois do meio num só.
+
+O ISN não é zero nem previsível. Se fosse, um atacante fora do caminho conseguiria forjar segmentos que caberiam na janela de uma conexão alheia. Ele também evita que um segmento perdido de uma encarnação anterior da mesma quádrupla seja aceito como novo.
+
+Em termos de custo, o cliente só pode mandar dados depois de receber o SYN+ACK: **um RTT inteiro de espera**. Com TLS por cima, somam-se mais um ou dois. É por isso que reutilizar conexões (keep-alive, pools) é a otimização de latência mais barata que existe.
+
+## SYN flood e backlog
+
+Quando o SYN chega, o servidor guarda uma entrada meio aberta e responde. Se o ACK final nunca vem, a entrada fica ocupando a fila. Um **SYN flood** manda milhares de SYNs com IPs forjados e enche essa fila. A defesa padrão são os **SYN cookies**: o servidor codifica o estado no próprio número de sequência que devolve e não guarda nada até o ACK provar que o cliente é real.
+
+Há duas filas no Linux: a de conexões meio abertas e a de conexões completas esperando `accept()`. Esta última tem o tamanho do `backlog` de `listen()`. Se a aplicação demora a chamar `accept`, a fila enche e novos clientes veem timeouts de conexão, mesmo com CPU sobrando.
+
+## Encerramento em quatro tempos
+
+Como o TCP é bidirecional, cada direção é fechada separadamente com um FIN, e cada FIN recebe seu ACK:
+
+```text
+ativo                                        passivo
+   | --- FIN -------------------------------> | CLOSE_WAIT
+   | FIN_WAIT_1                               |
+   | <-- ACK -------------------------------- |
+   | FIN_WAIT_2           (passivo ainda pode enviar dados)
+   | <-- FIN -------------------------------- | LAST_ACK
+   | --- ACK -------------------------------> | CLOSED
+   | TIME_WAIT (2 x MSL)                      |
+```
+
+Entre o primeiro ACK e o segundo FIN a conexão fica **meio fechada**: quem mandou FIN não envia mais, mas continua recebendo. Em código, isso é `shutdown(SHUT_WR)`. O programa abaixo usa esse recurso em localhost: o cliente manda o pedido e fecha a escrita, o servidor lê até o fim do fluxo (`recv` devolvendo vazio é o FIN chegando) e ainda consegue responder.
+
+```python
+import socket
+import threading
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.bind(("127.0.0.1", 0))
+srv.listen(1)
+porta = srv.getsockname()[1]
+log = []
+
+def servidor():
+    conn, _ = srv.accept()
+    recebido = b""
+    while True:
+        parte = conn.recv(1024)
+        if not parte:              # FIN do cliente: fim do fluxo
+            break
+        recebido += parte
+    log.append(f"servidor leu {len(recebido)} bytes e viu o FIN")
+    conn.sendall(recebido.upper())  # a direção servidor -> cliente segue aberta
+    conn.close()
+
+t = threading.Thread(target=servidor)
+t.start()
+
+cli = socket.create_connection(("127.0.0.1", porta))
+cli.sendall(b"pedido completo")
+cli.shutdown(socket.SHUT_WR)       # meio fechamento: manda FIN
+resposta = b""
+while parte := cli.recv(1024):
+    resposta += parte
+cli.close()
+t.join()
+srv.close()
+
+print(log[0])
+print("cliente recebeu:", resposta.decode())
+```
+
+```text
+Saída:
+servidor leu 15 bytes e viu o FIN
+cliente recebeu: PEDIDO COMPLETO
+```
+
+## TIME_WAIT, CLOSE_WAIT e RST
+
+| Estado | Quem fica nele | Por que importa |
+| --- | --- | --- |
+| TIME_WAIT | Quem fechou primeiro, por 2 x MSL (tipicamente 60 s no Linux) | Garante o reenvio do último ACK e deixa morrer segmentos atrasados. Muitos fechamentos ativos em sequência esgotam portas efêmeras |
+| CLOSE_WAIT | Quem recebeu o FIN e ainda não chamou `close()` | Acúmulo indica bug: a aplicação esqueceu de fechar sockets |
+| RST | Qualquer lado, a qualquer momento | Aborta sem cerimônia: porta fechada, timeout de proxy ou `SO_LINGER` com zero |
+
+O caso de entrevista mais comum: um serviço que abre uma conexão HTTP nova para cada chamada a outro serviço e a fecha em seguida acumula dezenas de milhares de sockets em TIME_WAIT e começa a falhar com "cannot assign requested address". A correção é reaproveitar conexões, não desligar o TIME_WAIT.
+
+Para fixar a máquina de estados, uma simulação do lado que fecha primeiro:
+
+```python
+TRANSICOES = {
+    ("ESTABLISHED", "app close / envia FIN"): "FIN_WAIT_1",
+    ("FIN_WAIT_1", "recebe ACK"): "FIN_WAIT_2",
+    ("FIN_WAIT_2", "recebe FIN / envia ACK"): "TIME_WAIT",
+    ("TIME_WAIT", "2*MSL expira"): "CLOSED",
+}
+
+estado = "ESTABLISHED"
+for evento in ["app close / envia FIN", "recebe ACK", "recebe FIN / envia ACK", "2*MSL expira"]:
+    novo = TRANSICOES[(estado, evento)]
+    print(f"{estado:12} --[{evento}]--> {novo}")
+    estado = novo
+```
+
+```text
+Saída:
+ESTABLISHED  --[app close / envia FIN]--> FIN_WAIT_1
+FIN_WAIT_1   --[recebe ACK]--> FIN_WAIT_2
+FIN_WAIT_2   --[recebe FIN / envia ACK]--> TIME_WAIT
+TIME_WAIT    --[2*MSL expira]--> CLOSED
+```
+
+<Callout type="warning" title="Não mate o TIME_WAIT">
+Opções como `tcp_tw_recycle` já causaram falhas com clientes atrás de NAT e foram removidas do Linux. Prefira conexões persistentes, `SO_REUSEADDR` no servidor para reiniciar rápido e, se preciso, mais IPs ou portas de origem.
+</Callout>
+
+## Na entrevista
+
+Desenhe o handshake com os números de sequência, explique por que são três segmentos e quanto ele custa (um RTT). No encerramento, destaque o meio fechamento e os estados que viram incidente: TIME_WAIT esgotando portas no cliente e CLOSE_WAIT indicando vazamento de sockets. Follow-ups: "o que é um SYN flood e como mitigar?" (SYN cookies, backlog maior, proteção na borda) e "o que é TCP Fast Open?" (enviar dados já no SYN usando um cookie de uma conexão anterior).
+
+<QuizSet>
+<Quiz question="Um servidor tem milhares de sockets em CLOSE_WAIT. Qual a causa mais provável?" options={["Ataque de SYN flood", "A aplicação recebeu o FIN do cliente mas não está chamando close() nos sockets", "TIME_WAIT curto demais", "Perda de pacotes na rede"]} answer={1} explanation="CLOSE_WAIT significa que o outro lado fechou e o processo local ainda não fechou o seu. É quase sempre vazamento na aplicação." />
+<Quiz question="Por que o cliente não pode enviar dados de aplicação no primeiro segmento de um handshake TCP comum?" options={["O SYN não tem campo de dados", "Ele ainda não sabe se o servidor está ouvindo nem o número de sequência dele; só após o SYN+ACK a conexão existe", "O MTU não permite", "O checksum seria inválido"]} answer={1} explanation="No TCP tradicional, dados só fluem depois do SYN+ACK, o que custa um RTT. TCP Fast Open contorna isso com um cookie." />
+<Quiz question="Quem fica em TIME_WAIT ao fim de uma conexão?" options={["Sempre o servidor", "Sempre o cliente", "O lado que enviou o primeiro FIN", "O lado que enviou o último FIN"]} answer={2} explanation="Quem inicia o encerramento passa por FIN_WAIT e termina em TIME_WAIT, independente de ser cliente ou servidor." />
+</QuizSet>

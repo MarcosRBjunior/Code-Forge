@@ -1,0 +1,167 @@
+---
+title: Coleções thread-safe
+kind: lesson
+---
+
+Um `HashMap` comum compartilhado entre threads pode perder escritas, ficar inconsistente durante um redimensionamento ou, em versões antigas do Java, entrar em laço infinito. A solução ingênua é colocar um lock global em volta de tudo, mas isso transforma a coleção num gargalo: só uma thread lê ou escreve por vez. As **coleções thread-safe** existem para dar segurança com o mínimo de contenção, e entender como elas fazem isso é tema frequente de entrevista.
+
+## As três estratégias
+
+| Estratégia | Ideia | Exemplos | Bom quando |
+| --- | --- | --- | --- |
+| Lock único | Toda operação adquire o mesmo lock | `Collections.synchronizedMap`, `Hashtable` | Pouca contenção, simplicidade |
+| Lock striping / granular | Várias partes, cada uma com seu lock ou CAS | `ConcurrentHashMap`, `sync.Map` (parcialmente) | Muitas threads, muitas chaves |
+| Copy-on-write | Escrita cria uma cópia nova; leitura não trava | `CopyOnWriteArrayList` | Muita leitura, escrita rara |
+
+Além dessas, existem estruturas **lock-free** baseadas em CAS, como `ConcurrentLinkedQueue` e `ConcurrentSkipListMap` em Java.
+
+```text
+ lock striping com 4 listras
+ chave ─hash─► listra = hash % 4
+   listra 0: [lock0] k3, k7
+   listra 1: [lock1] k1
+   listra 2: [lock2] k2, k6, k9
+   listra 3: [lock3] k4
+ threads em listras diferentes não disputam o mesmo lock
+```
+
+No `ConcurrentHashMap` do Java 8+, leituras não usam lock; escritas usam CAS quando o balde está vazio e `synchronized` só no primeiro nó do balde quando não está. Em Go, o `map` nativo não é seguro para escrita concorrente (o runtime aborta com "concurrent map writes"); você usa `sync.Mutex`/`sync.RWMutex` em volta dele ou `sync.Map`, otimizado para chaves escritas uma vez e lidas muitas. Em C++, os contêineres da STL não são thread-safe para escrita; você protege com `std::mutex` ou `std::shared_mutex`.
+
+## O problema que nenhuma coleção resolve sozinha
+
+Mesmo com cada operação atômica, a **composição** de operações não é. O padrão clássico é o check-then-act:
+
+```python
+# Cada chamada é segura, mas o conjunto não:
+if chave not in mapa:          # thread A e thread B veem "não está"
+    mapa[chave] = criar()      # as duas criam e uma sobrescreve a outra
+
+# Ler, modificar e escrever também quebra:
+mapa[chave] = mapa.get(chave, 0) + 1   # incrementos podem se perder
+```
+
+Por isso coleções concorrentes oferecem **operações compostas atômicas**: `putIfAbsent`, `computeIfAbsent`, `merge` e `compute` em Java; `LoadOrStore` em Go. Em Python, o GIL torna atômicas operações individuais de `dict` e `list` no CPython (como `setdefault` e `append`), mas isso é detalhe de implementação e não vale para sequências de operações. A versão segura usa um lock em volta da operação composta:
+
+```python
+import threading
+
+class ContadorSeguro:
+    def __init__(self):
+        self._dados = {}
+        self._lock = threading.Lock()
+
+    def incrementar(self, chave, n=1):
+        with self._lock:                       # ler + somar + escrever juntos
+            self._dados[chave] = self._dados.get(chave, 0) + n
+
+    def instantaneo(self):
+        with self._lock:
+            return dict(self._dados)           # cópia para iterar sem lock
+
+contador = ContadorSeguro()
+palavras = ["get", "put", "get", "del", "get", "put"]
+
+def trabalhador():
+    for _ in range(1000):
+        for p in palavras:
+            contador.incrementar(p)
+
+threads = [threading.Thread(target=trabalhador) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+for chave, valor in sorted(contador.instantaneo().items()):
+    print(chave, valor)
+```
+
+```text
+Saída:
+del 4000
+get 12000
+put 8000
+```
+
+Note que `instantaneo` devolve uma cópia: iterar sobre um `dict` enquanto outra thread o modifica lança `RuntimeError` em Python e `ConcurrentModificationException` no `HashMap` do Java.
+
+## Lock striping na prática
+
+Para reduzir contenção, você divide o mapa em várias partes, cada uma com seu próprio lock. Duas threads só disputam o lock quando suas chaves caem na mesma listra.
+
+```python
+import threading
+
+class MapaListrado:
+    def __init__(self, listras=8):
+        self._partes = [dict() for _ in range(listras)]
+        self._locks = [threading.Lock() for _ in range(listras)]
+
+    def _indice(self, chave):
+        return hash(chave) % len(self._partes)
+
+    def compute_if_absent(self, chave, fabrica):
+        i = self._indice(chave)
+        with self._locks[i]:
+            if chave not in self._partes[i]:
+                self._partes[i][chave] = fabrica(chave)
+            return self._partes[i][chave]
+
+    def tamanho(self):
+        total = 0
+        for lock, parte in zip(self._locks, self._partes):
+            with lock:
+                total += len(parte)
+        return total
+
+mapa = MapaListrado()
+criacoes = []
+registro = threading.Lock()
+
+def fabrica(chave):
+    with registro:
+        criacoes.append(chave)
+    return chave * 2
+
+def trabalhador(base):
+    for i in range(100):
+        mapa.compute_if_absent((base + i) % 50, fabrica)
+
+threads = [threading.Thread(target=trabalhador, args=(k * 7,)) for k in range(6)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("chaves:", mapa.tamanho())
+print("cada chave criada uma vez:", len(criacoes) == len(set(criacoes)) == 50)
+print("valor de 21:", mapa.compute_if_absent(21, fabrica))
+```
+
+```text
+Saída:
+chaves: 50
+cada chave criada uma vez: True
+valor de 21: 42
+```
+
+## Armadilhas e trade-offs
+
+- **`size()` aproximado**: em mapas listrados, somar as partes sem travar todas dá um valor que pode estar desatualizado. O `ConcurrentHashMap` documenta isso.
+- **Iteradores fracamente consistentes**: iterar um `ConcurrentHashMap` não lança exceção, mas pode ou não refletir escritas feitas durante a iteração.
+- **Copy-on-write** cobra caro em cada escrita (cópia inteira); use só para listas pequenas e quase imutáveis, como listas de listeners.
+- **Fábrica cara dentro do lock** bloqueia a listra inteira enquanto roda; em Java, `computeIfAbsent` com função lenta trava outras chaves do mesmo balde.
+
+<Callout type="tip" title="Segurança é da operação, não da estrutura">
+Diga ao entrevistador quais operações precisam ser atômicas juntas. Uma coleção thread-safe garante cada chamada isolada; invariantes que envolvem várias chamadas continuam sendo sua responsabilidade.
+</Callout>
+
+## Na entrevista
+
+Ao ver estado compartilhado, diga qual coleção usaria e por quê: lock único se a contenção é baixa, `ConcurrentHashMap` ou listras para muitas threads, copy-on-write para leitura dominante. Aponte o check-then-act e resolva com `computeIfAbsent`, `putIfAbsent` ou um lock na operação composta. Follow-ups comuns: "como o `ConcurrentHashMap` evita travar o mapa inteiro?" (CAS e lock por balde, leituras sem lock) e "por que `Collections.synchronizedMap` não basta para um contador?" (`get` e `put` separados permitem perder incrementos).
+
+<QuizSet>
+<Quiz question="Duas threads executam 'if k not in m: m[k] = carregar(k)' sobre um mapa thread-safe. Qual o problema?" options={["Nenhum, o mapa é thread-safe", "As duas podem ver a chave ausente e carregar duas vezes, uma sobrescrevendo a outra", "O mapa lança exceção", "O GIL impede que isso aconteça"]} answer={1} explanation="Cada operação é atômica, mas a combinação checar-e-inserir não é. Use computeIfAbsent ou um lock em volta das duas." />
+<Quiz question="Uma lista de listeners é lida em cada evento (milhares por segundo) e alterada uma vez por hora. Qual estrutura é mais adequada?" options={["Lista com lock global", "CopyOnWriteArrayList", "LinkedList sem sincronização", "Uma fila bloqueante"]} answer={1} explanation="Copy-on-write deixa leituras sem lock e paga o custo apenas nas escritas, que são raras." />
+<Quiz question="Qual a principal vantagem do lock striping sobre um lock único?" options={["Usa menos memória", "Threads que acessam chaves em listras diferentes não disputam o mesmo lock", "Torna as operações compostas atômicas automaticamente", "Garante ordem de inserção"]} answer={1} explanation="Dividir o mapa em partes com locks próprios reduz contenção, permitindo escritas paralelas em listras diferentes." />
+</QuizSet>

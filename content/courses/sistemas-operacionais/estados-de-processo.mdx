@@ -1,0 +1,149 @@
+---
+title: Estados de um processo
+kind: lesson
+---
+
+Numa máquina com 8 núcleos e 400 processos, no máximo 8 estão de fato executando. Os outros estão esperando alguma coisa: a vez na CPU, um disco, um pacote de rede, um lock. O kernel organiza essa espera atribuindo a cada processo um **estado** e mantendo filas por estado. Saber ler esses estados é o que permite interpretar o `top`, a load average e um processo "travado" em produção.
+
+## O modelo de cinco estados
+
+```text
+             admitido                 escalonado
+   ┌──────┐ ─────────► ┌────────┐ ───────────────► ┌────────────┐  exit   ┌───────────┐
+   │ novo │            │ pronto │                  │ executando │ ──────► │ terminado │
+   └──────┘            └────────┘ ◄─────────────── └────────────┘         └───────────┘
+                           ▲        preempção (timer)      │
+                           │                               │ espera E/S, lock, sleep
+                           │       evento concluído        ▼
+                           └──────────────────────── ┌────────────┐
+                                                     │ bloqueado  │
+                                                     └────────────┘
+```
+
+- **Novo:** o PCB está sendo criado.
+- **Pronto:** pode rodar, só falta CPU. Fica na fila do escalonador.
+- **Executando:** está num núcleo agora.
+- **Bloqueado (ou esperando):** não adianta dar CPU, ele está esperando um evento.
+- **Terminado:** acabou, mas o PCB ainda existe até o pai recolher o código de saída.
+
+Repare nas setas que **não existem**. Um processo bloqueado nunca vai direto para executando: quando o disco responde, ele volta para pronto e espera sua vez. E um processo pronto não fica bloqueado sem antes executar, porque é a própria execução que pede a E/S.
+
+Muitos livros acrescentam dois estados **suspensos**: pronto-suspenso e bloqueado-suspenso, para processos cuja memória foi inteiramente levada ao disco. No Linux moderno isso praticamente não aparece como estado separado, porque a memória é devolvida página a página, mas a ideia ajuda a entender por que um processo que ficou muito tempo parado demora a responder quando volta: as páginas dele precisam ser trazidas de novo.
+
+## Simulando a máquina de estados
+
+O código abaixo implementa as transições válidas e rejeita as inválidas. A trilha de eventos descreve um processo que lê um arquivo, é preemptado pelo timer e termina.
+
+```python
+TRANSICOES = {
+    ("novo", "admitir"): "pronto",
+    ("pronto", "escalonar"): "executando",
+    ("executando", "preempcao"): "pronto",
+    ("executando", "esperar_io"): "bloqueado",
+    ("bloqueado", "io_concluida"): "pronto",
+    ("executando", "sair"): "terminado",
+}
+
+def executar(eventos):
+    estado = "novo"
+    for evento in eventos:
+        proximo = TRANSICOES.get((estado, evento))
+        if proximo is None:
+            print(f"{estado:>10} --{evento}--> INVALIDO")
+            return
+        print(f"{estado:>10} --{evento}--> {proximo}")
+        estado = proximo
+
+executar(["admitir", "escalonar", "esperar_io", "io_concluida",
+          "escalonar", "preempcao", "escalonar", "sair"])
+print()
+executar(["admitir", "escalonar", "esperar_io", "escalonar"])
+```
+
+```text
+Saída:
+      novo --admitir--> pronto
+    pronto --escalonar--> executando
+executando --esperar_io--> bloqueado
+ bloqueado --io_concluida--> pronto
+    pronto --escalonar--> executando
+executando --preempcao--> pronto
+    pronto --escalonar--> executando
+executando --sair--> terminado
+
+      novo --admitir--> pronto
+    pronto --escalonar--> executando
+executando --esperar_io--> bloqueado
+ bloqueado --escalonar--> INVALIDO
+```
+
+## Filas e contagem por estado
+
+Na prática, o kernel não percorre todos os processos para achar quem está pronto: ele mantém uma fila de prontos (no Linux, uma árvore por núcleo) e filas de espera por evento. A próxima simulação avança um relógio com dois processos e uma única CPU, registrando quanto tempo cada um passou em cada estado.
+
+```python
+from collections import Counter
+
+# (nome, rajadas): rajadas alternam CPU e E/S
+procs = {"A": ["cpu", "cpu", "io", "io", "io", "cpu"],
+         "B": ["cpu", "io", "cpu", "cpu"]}
+pos = {n: 0 for n in procs}
+tempo = {n: Counter() for n in procs}
+
+for t in range(10):
+    cpu_livre = True
+    for nome in sorted(procs):
+        rajadas = procs[nome]
+        if pos[nome] >= len(rajadas):
+            tempo[nome]["terminado"] += 1
+            continue
+        tipo = rajadas[pos[nome]]
+        if tipo == "io":
+            tempo[nome]["bloqueado"] += 1
+            pos[nome] += 1
+        elif cpu_livre:
+            tempo[nome]["executando"] += 1
+            pos[nome] += 1
+            cpu_livre = False
+        else:
+            tempo[nome]["pronto"] += 1
+
+for nome in sorted(tempo):
+    print(nome, dict(sorted(tempo[nome].items())))
+```
+
+```text
+Saída:
+A {'bloqueado': 3, 'executando': 3, 'terminado': 4}
+B {'bloqueado': 1, 'executando': 3, 'pronto': 3, 'terminado': 3}
+```
+
+O processo B passou ciclos **pronto**, esperando CPU, porque A estava executando. Esse tempo é o que você percebe como latência de fila numa máquina saturada.
+
+## Como isso aparece no Linux
+
+| Letra no `ps` | Estado | Interpretação |
+| --- | --- | --- |
+| R | Running/runnable | Executando ou pronto na fila |
+| S | Sleeping interrompível | Esperando evento, aceita sinais |
+| D | Sleeping não interrompível | Esperando E/S de disco ou NFS, ignora até `kill -9` |
+| T | Stopped | Pausado por sinal (Ctrl+Z) ou debugger |
+| Z | Zombie | Terminou e o pai não chamou `wait` |
+
+<Callout type="tip" title="Load average não é uso de CPU">
+No Linux, a load average conta processos em R **e** em D. Uma máquina com CPU ociosa e load 40 geralmente tem processos presos em E/S lenta, como um disco saturado ou um NFS travado. Olhe `vmstat 1` (colunas r e b) antes de concluir que falta CPU.
+</Callout>
+
+```bash
+ps -eo pid,stat,wchan:20,cmd | awk '$2 ~ /D/'   # quem está preso em E/S
+vmstat 1                                         # r = prontos, b = bloqueados
+```
+
+## Na entrevista
+
+Desenhe o diagrama de cinco estados e justifique as transições, especialmente por que bloqueado volta para pronto e não para executando. Relacione com algo prático, como load average ou um processo em D. Follow-ups comuns: "qual a diferença entre S e D?" e "o que causa a transição executando → pronto?" (preempção por timer ou por um processo de maior prioridade que ficou pronto).
+
+<QuizSet>
+<Quiz question="Um processo bloqueado esperando o disco recebe a resposta. Para qual estado ele vai?" options={["Executando, imediatamente", "Pronto, aguardando o escalonador", "Novo", "Terminado"]} answer={1} explanation="O evento só torna o processo elegível; ele entra na fila de prontos e espera sua vez de CPU." />
+<Quiz question="Um servidor mostra load average 30 com CPU 90% ociosa. Qual a hipótese mais provável?" options={["Muitos processos prontos esperando CPU", "Muitos processos em estado D, presos em E/S lenta", "O relógio do sistema está errado", "A memória está sobrando"]} answer={1} explanation="A load average do Linux soma processos executáveis e em espera não interrompível; CPU ociosa indica que o gargalo é E/S." />
+</QuizSet>

@@ -1,0 +1,156 @@
+---
+title: Quando desnormalizar
+kind: lesson
+---
+
+Um esquema normalizado guarda cada fato uma vez, e isso é ótimo para escrever. Para ler, às vezes é ruim: a página de produto precisa da média de avaliações, o feed precisa do número de comentários, o painel precisa do faturamento do mês. Calcular isso a cada requisição com joins e agregações sobre milhões de linhas fica caro. **Desnormalizar** é guardar de propósito um dado derivado ou repetido para acelerar a leitura, aceitando o custo de mantê-lo coerente.
+
+## O ponto de partida
+
+```sql
+CREATE TABLE posts (
+  id     integer PRIMARY KEY,
+  titulo text NOT NULL
+);
+
+CREATE TABLE comentarios (
+  id      integer PRIMARY KEY,
+  post_id integer NOT NULL REFERENCES posts (id),
+  autor   text NOT NULL
+);
+
+INSERT INTO posts VALUES (1, 'Índices na prática'), (2, 'CTEs sem medo'), (3, 'Locks');
+INSERT INTO comentarios VALUES
+  (1, 1, 'ana'), (2, 1, 'beto'), (3, 1, 'caio'),
+  (4, 2, 'ana'), (5, 2, 'dani');
+
+SELECT p.titulo, count(c.id) AS comentarios
+FROM posts p
+LEFT JOIN comentarios c ON c.post_id = p.id
+GROUP BY p.id, p.titulo
+ORDER BY p.id;
+```
+
+```text
+Saída:
+titulo | comentarios
+Índices na prática | 3
+CTEs sem medo | 2
+Locks | 0
+```
+
+Para três posts isso é instantâneo. Para uma listagem que aparece milhares de vezes por segundo sobre uma tabela de comentários gigante, a contagem vira gargalo.
+
+## Técnica 1: coluna derivada
+
+Guarde o contador na própria tabela de posts e mantenha-o junto com cada escrita. No Postgres, um trigger faz isso dentro da mesma transação do `INSERT`:
+
+```sql
+ALTER TABLE posts ADD COLUMN total_comentarios integer NOT NULL DEFAULT 0;
+
+UPDATE posts p
+SET total_comentarios = (SELECT count(*) FROM comentarios c WHERE c.post_id = p.id);
+
+CREATE FUNCTION conta_comentario() RETURNS trigger AS $$
+BEGIN
+  UPDATE posts SET total_comentarios = total_comentarios + 1 WHERE id = NEW.post_id;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_conta_comentario
+AFTER INSERT ON comentarios
+FOR EACH ROW EXECUTE FUNCTION conta_comentario();
+
+INSERT INTO comentarios VALUES (6, 3, 'eva');
+
+SELECT titulo, total_comentarios FROM posts ORDER BY id;
+```
+
+```text
+Saída:
+titulo | total_comentarios
+Índices na prática | 3
+CTEs sem medo | 2
+Locks | 1
+```
+
+A leitura virou um `SELECT` simples. O custo foi para a escrita: cada comentário agora atualiza a linha do post, e posts muito populares viram ponto de contenção (todas as transações disputam o lock da mesma linha). Faltaria ainda tratar `DELETE` e a troca de post. Muitos times preferem atualizar contadores na aplicação ou em lote, aceitando alguns segundos de atraso.
+
+## Técnica 2: copiar colunas
+
+Repetir o nome do autor em cada comentário evita um join com `usuarios`. Faz sentido quando o valor quase nunca muda ou quando você **quer** congelar o valor do momento (o endereço de entrega no pedido, o preço pago no item). No segundo caso nem é desnormalização: é outro fato.
+
+## Técnica 3: visão materializada
+
+Uma **view materializada** guarda o resultado de uma consulta e só o recalcula quando você manda. É ótima para relatórios que toleram dados de alguns minutos atrás:
+
+```sql
+CREATE MATERIALIZED VIEW resumo_autores AS
+SELECT autor, count(*) AS comentarios
+FROM comentarios
+GROUP BY autor;
+
+INSERT INTO comentarios VALUES (7, 3, 'ana');
+
+SELECT autor, comentarios FROM resumo_autores ORDER BY autor;
+```
+
+```text
+Saída:
+autor | comentarios
+ana | 2
+beto | 1
+caio | 1
+dani | 1
+eva | 1
+```
+
+A Ana já tem três comentários, mas a view mostra dois: ela é uma fotografia. Depois do refresh, o número se corrige:
+
+```sql
+REFRESH MATERIALIZED VIEW resumo_autores;
+
+SELECT autor, comentarios FROM resumo_autores ORDER BY autor;
+```
+
+```text
+Saída:
+autor | comentarios
+ana | 3
+beto | 1
+caio | 1
+dani | 1
+eva | 1
+```
+
+`REFRESH ... CONCURRENTLY` deixa a view legível durante o recálculo, mas exige um índice único nela. O MySQL não tem views materializadas: lá você cria uma tabela de resumo e a atualiza com um job agendado ou com eventos.
+
+## Como decidir
+
+| Pergunte | Se sim |
+| --- | --- |
+| A leitura é muito mais frequente que a escrita? | Desnormalizar tende a compensar |
+| O dado pode ficar alguns segundos ou minutos desatualizado? | View materializada, job em lote, cache |
+| Precisa estar exato a cada transação? | Trigger ou atualização na mesma transação |
+| Um índice ou uma consulta melhor resolve? | Faça isso antes de desnormalizar |
+
+<Callout type="tip" title="Meça antes">
+Desnormalização é otimização. Mostre o `EXPLAIN` lento, tente índice e reescrita, e só então proponha duplicar dados, explicando como a cópia continua correta.
+</Callout>
+
+## Armadilhas
+
+- **Fonte da verdade ambígua.** Defina qual dado é o original e qual é derivado; o derivado deve poder ser reconstruído a qualquer momento.
+- **Contador sem reconciliação.** Bugs e falhas parciais fazem contadores divergirem. Um job periódico que recalcula a partir da origem corrige o drift.
+- **Hot row.** Um único contador global atualizado por todas as transações serializa a escrita. Particione o contador (várias linhas somadas na leitura) ou agregue em lote.
+
+## Na entrevista
+
+Apresente primeiro o modelo normalizado, depois identifique a leitura cara e proponha a desnormalização como trade-off explícito: o que fica mais rápido, o que fica mais caro, e como a cópia se mantém coerente. Follow-ups comuns: "como você mantém o contador correto se o processo cair no meio?" (mesma transação, ou reconciliação periódica) e "por que não usar um cache?" (cache é desnormalização fora do banco, com os mesmos problemas de invalidação).
+
+<QuizSet>
+<Quiz question="Uma view materializada no Postgres reflete automaticamente novas linhas das tabelas de origem?" options={["Sim, sempre", "Não; só depois de REFRESH MATERIALIZED VIEW", "Só se tiver índice único", "Só em transações serializáveis"]} answer={1} explanation="Ela guarda uma fotografia do resultado. É preciso rodar REFRESH para recalcular." />
+<Quiz question="Um contador de curtidas numa única linha recebe milhares de atualizações por segundo e as transações começam a esperar umas pelas outras. Qual a solução mais adequada?" options={["Aumentar o isolamento para SERIALIZABLE", "Distribuir o contador em várias linhas ou agregar os eventos em lote", "Remover a chave primária", "Usar uma view comum"]} answer={1} explanation="Todas as transações disputam o lock da mesma linha; dividir o contador ou acumular em lote elimina o ponto de contenção." />
+<Quiz question="Guardar o preço pago em itens_pedido, mesmo existindo produtos.preco, é...?" options={["Uma violação grave de 3FN", "Correto, porque o preço pago é um fato da venda e não muda com reajustes", "Desnecessário", "Só aceitável no MySQL"]} answer={1} explanation="O preço do catálogo muda; o valor cobrado naquela compra é outro fato e precisa ser preservado." />
+</QuizSet>

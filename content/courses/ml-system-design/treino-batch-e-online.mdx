@@ -1,0 +1,104 @@
+---
+title: Treino batch e online
+kind: lesson
+---
+
+Todo modelo em produção envelhece. O comportamento dos usuários muda, novos itens entram no catálogo, uma campanha de marketing traz um público diferente. A pergunta de design não é "como treinar o modelo", e sim **com que frequência e de que forma ele aprende de novo**. Há dois extremos: treino batch, em que você retreina do zero (ou a partir de um checkpoint) com um lote grande de dados históricos, e treino online, em que o modelo é atualizado continuamente, exemplo a exemplo ou em pequenos lotes, conforme os eventos chegam.
+
+## Treino batch
+
+No treino batch, um job agendado (diário, semanal) lê uma janela de dados do data warehouse, gera features, treina, avalia contra um conjunto de validação e, se passar nos critérios, publica o artefato no registro de modelos. O servimento troca a versão antiga pela nova.
+
+Vantagens: é reprodutível (mesmos dados, mesmo modelo), fácil de depurar, permite validação completa antes do deploy e funciona com qualquer família de modelo, inclusive árvores de gradiente e redes grandes. Desvantagem: entre um treino e outro o modelo está congelado. Se o mundo muda na terça e o job roda no domingo, você perde quase uma semana.
+
+## Treino online
+
+No treino online, um consumidor lê o stream de eventos rotulados (clique ou não clique, fraude confirmada ou não) e aplica passos de gradiente no modelo que está servindo, ou numa cópia que é publicada a cada poucos minutos. Modelos lineares, fatorização e as camadas finais de redes neurais se prestam bem a isso; árvores de gradiente não, porque não há atualização incremental natural.
+
+O ganho é a **frescura**: o modelo reage a tendências em minutos. O custo é operacional: um bug no pipeline de rótulos ou um ataque de spam envenena o modelo em tempo real, sem portão de validação. Você precisa de proteções como taxa de aprendizado limitada, checkpoints frequentes para rollback e monitoramento das métricas do próprio modelo.
+
+## Um experimento de brinquedo
+
+O programa abaixo simula um stream em que a relação entre a feature e o rótulo **se inverte na metade** (pense num item que deixou de ser popular). Um modelo treinado em batch só com a primeira metade fica congelado; outro continua aprendendo online.
+
+```python
+import math
+import random
+
+random.seed(7)
+
+def sigmoid(z):
+    return 1 / (1 + math.exp(-z))
+
+def gerar(n, sinal):
+    dados = []
+    for _ in range(n):
+        x = random.uniform(-2, 2)
+        p = sigmoid(3 * sinal * x)
+        dados.append((x, 1 if random.random() < p else 0))
+    return dados
+
+antes = gerar(2000, +1)   # comportamento antigo
+depois = gerar(2000, -1)  # o mundo mudou
+
+def passo(w, b, x, y, lr):
+    erro = sigmoid(w * x + b) - y
+    return w - lr * erro * x, b - lr * erro
+
+# treino batch: varias epocas so com os dados antigos
+w_batch, b_batch = 0.0, 0.0
+for _ in range(5):
+    for x, y in antes:
+        w_batch, b_batch = passo(w_batch, b_batch, x, y, 0.05)
+
+# treino online: comeca igual e continua aprendendo no stream novo
+w_on, b_on = w_batch, b_batch
+acertos_batch = acertos_on = 0
+for x, y in depois:
+    acertos_batch += (sigmoid(w_batch * x + b_batch) >= 0.5) == y
+    acertos_on += (sigmoid(w_on * x + b_on) >= 0.5) == y  # avalia antes de aprender
+    w_on, b_on = passo(w_on, b_on, x, y, 0.05)
+
+print(f"peso do modelo batch:  {w_batch:+.2f}")
+print(f"peso do modelo online: {w_on:+.2f}")
+print(f"acuracia no periodo novo, batch:  {acertos_batch / len(depois):.3f}")
+print(f"acuracia no periodo novo, online: {acertos_on / len(depois):.3f}")
+```
+
+```text
+Saída:
+peso do modelo batch:  +2.78
+peso do modelo online: -3.17
+acuracia no periodo novo, batch:  0.108
+acuracia no periodo novo, online: 0.860
+```
+
+O modelo batch continua com peso positivo e acerta só cerca de 11% no período novo, pior que chutar. O online inverte o sinal do peso em poucas centenas de exemplos e chega a 86%, mesmo contando os erros cometidos enquanto se adaptava. Note o detalhe da avaliação: cada exemplo é usado para medir o modelo **antes** de ser usado para treiná-lo (avaliação prequencial). Avaliar depois de aprender com o próprio exemplo inflaria a métrica.
+
+## O meio-termo que quase todo mundo usa
+
+Na prática, a escolha raramente é binária:
+
+| Estratégia | Frescura | Risco | Quando usar |
+| --- | --- | --- | --- |
+| Batch semanal ou diário | Horas a dias | Baixo | Fraude com rótulo atrasado, churn, preço |
+| Fine-tuning incremental (a cada hora, a partir do último checkpoint) | Minutos a horas | Médio | Recomendação, anúncios |
+| Online contínuo | Segundos a minutos | Alto | Tendências, notícias, CTR de itens novos |
+
+Um padrão comum é combinar: um modelo base pesado retreinado em batch e uma camada leve (bias por item, pesos de features de popularidade) atualizada online. Outro é o **treino com janela deslizante**, em que cada execução batch usa só os últimos N dias, para esquecer comportamento antigo.
+
+<Callout type="warning" title="Rótulos atrasados">
+Em fraude, o chargeback chega semanas depois. Treino online com rótulo atrasado exige juntar o evento original com o rótulo quando ele chega, e decidir o que fazer com exemplos ainda sem rótulo. Tratá-los como negativos ensina o modelo errado.
+</Callout>
+
+Outros pontos de atenção: retreinar do zero versus continuar do checkpoint (continuar é mais barato, mas acumula vieses antigos); a ordem dos dados no online importa, porque o modelo vê os eventos em sequência temporal e não embaralhados; e treino distribuído em batch exige versionar o snapshot de dados para que o treino seja reprodutível.
+
+## Na entrevista
+
+Diga explicitamente a cadência de treino e justifique pela velocidade com que os dados mudam e pelo atraso dos rótulos. Uma boa frase: "começo com retreino diário em batch, que é simples e auditável; se a análise mostrar que a métrica degrada em horas, adiciono fine-tuning incremental com validação automática antes de publicar". Follow-ups comuns: como evitar que um modelo online seja envenenado, como fazer rollback, como avaliar um modelo que muda o tempo todo (prequencial e testes A/B contínuos) e como lidar com rótulos que chegam atrasados.
+
+<QuizSet>
+<Quiz question="Seu modelo de CTR para notícias perde muita qualidade poucas horas depois de cada retreino diário. Qual é a melhor evolução?" options={["Treinar com mais épocas no batch diário", "Adicionar atualização incremental frequente a partir do último checkpoint, com validação automática", "Trocar para árvores de gradiente", "Retreinar uma vez por semana com mais dados"]} answer={1} explanation="O problema é frescura. Atualizações incrementais frequentes reduzem a defasagem sem abrir mão de um portão de validação." />
+<Quiz question="Por que, na avaliação prequencial, o exemplo é usado para medir o modelo antes de ser usado para treiná-lo?" options={["Para economizar memória", "Porque avaliar depois de aprender com o próprio exemplo inflaria a métrica", "Porque o gradiente não existe antes da previsão", "Por exigência do formato de log"]} answer={1} explanation="O modelo já teria visto o rótulo, o que é um vazamento: a métrica deixaria de estimar o desempenho em dados novos." />
+<Quiz question="Qual é o principal risco operacional do treino online contínuo?" options={["Custo de GPU muito maior", "Não suportar modelos lineares", "Dados ruins ou ataques afetam o modelo em produção imediatamente, sem portão de validação", "Precisar de rótulos manuais"]} answer={2} explanation="Sem um passo de validação entre o treino e o servimento, um pipeline quebrado ou spam degrada o modelo em tempo real; daí a necessidade de checkpoints e rollback." />
+</QuizSet>

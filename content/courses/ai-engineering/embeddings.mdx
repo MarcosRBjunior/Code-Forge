@@ -1,0 +1,141 @@
+---
+title: Embeddings
+kind: lesson
+---
+
+Busca por palavra-chave falha quando o usuário escreve "não consigo entrar na conta" e o artigo de ajuda se chama "Recuperação de acesso". Nenhuma palavra em comum, mesmo significado. **Embeddings** resolvem isso transformando texto (ou imagem, áudio, código) em vetores de números, de modo que coisas com significado parecido fiquem próximas no espaço. Com isso, "buscar por significado" vira "buscar vetores vizinhos", uma operação geométrica que computador faz bem.
+
+## Como funciona
+
+Um **modelo de embedding** é uma rede neural (normalmente um transformer menor que um LLM de chat) que lê o texto inteiro e devolve um vetor de tamanho fixo, tipicamente com centenas a alguns milhares de dimensões. Ele é treinado de forma **contrastiva**: pares que deveriam ser parecidos (pergunta e resposta, título e corpo, frases parafraseadas) são puxados para perto, e pares aleatórios são empurrados para longe.
+
+```text
+"esqueci minha senha"        ──► [0.12, -0.80, 0.33, ...]  ┐ perto
+"recuperação de acesso"      ──► [0.10, -0.75, 0.41, ...]  ┘
+"receita de bolo de cenoura" ──► [-0.66, 0.21, -0.05, ...]   longe
+```
+
+Cada dimensão isolada não tem um significado legível; o que importa são as distâncias entre vetores. E vetores de modelos diferentes **não são comparáveis**: se trocar o modelo, você precisa recalcular todos os embeddings da base.
+
+## Lexical versus semântico
+
+Para ver a diferença, compare duas representações de brinquedo. A primeira usa o "truque do hash": cada palavra cai numa posição fixa do vetor. Ela só captura palavras em comum, como a busca por palavra-chave. A segunda usa vetores de palavra definidos à mão (num modelo real, aprendidos), em que sinônimos ficam próximos.
+
+```python
+import math, zlib
+
+def normalizar(v):
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+def cos(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+def emb_hash(texto, dim=128):
+    v = [0.0] * dim
+    for palavra in texto.lower().split():
+        v[zlib.crc32(palavra.encode()) % dim] += 1.0
+    return normalizar(v)
+
+# eixos: [veiculo, comida, conta/acesso]
+VETORES = {
+    "carro": [0.9, 0.0, 0.1], "automovel": [0.95, 0.0, 0.05],
+    "senha": [0.0, 0.0, 1.0], "login": [0.05, 0.0, 0.9], "acesso": [0.0, 0.1, 0.9],
+    "bolo": [0.0, 1.0, 0.0], "receita": [0.0, 0.9, 0.2],
+}
+
+def emb_semantico(texto):
+    vs = [VETORES[p] for p in texto.lower().split() if p in VETORES]
+    soma = [sum(col) for col in zip(*vs)] if vs else [0.0, 0.0, 0.0]
+    return normalizar(soma)
+
+consulta = "esqueci a senha"
+docs = ["problema de login e acesso", "vendo carro usado", "receita de bolo"]
+for d in docs:
+    lex = cos(emb_hash(consulta), emb_hash(d))
+    sem = cos(emb_semantico(consulta), emb_semantico(d))
+    print(f"{d:28s} lexical={lex:.2f} semantico={sem:.2f}")
+```
+
+```text
+Saída:
+problema de login e acesso   lexical=0.00 semantico=1.00
+vendo carro usado            lexical=0.00 semantico=0.11
+receita de bolo              lexical=0.00 semantico=0.10
+```
+
+A busca lexical dá zero para o documento certo (nenhuma palavra em comum), enquanto a semântica o coloca no topo. Na prática, você usa as duas juntas, como mostra o capítulo de busca híbrida.
+
+## Onde embeddings aparecem
+
+- **Busca semântica e RAG:** indexar documentos e recuperar os mais próximos da pergunta.
+- **Classificação e roteamento:** comparar a mensagem com exemplos de cada intenção ou treinar um classificador leve sobre os vetores.
+- **Deduplicação e agrupamento:** achar tickets ou produtos quase iguais.
+- **Cache semântico:** reaproveitar respostas para perguntas parecidas.
+- **Recomendação:** "itens parecidos com este".
+
+Um roteador de intenções simples, por exemplo, calcula o centróide (a média) dos vetores de exemplo de cada intenção e manda a mensagem para o centróide mais próximo:
+
+```python
+import math
+
+def normalizar(v):
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+def centroide(vetores):
+    return normalizar([sum(col) / len(vetores) for col in zip(*vetores)])
+
+# vetores de brinquedo: [financeiro, logistica, tecnico]
+exemplos = {
+    "cobranca": [[0.9, 0.1, 0.0], [0.8, 0.0, 0.2]],
+    "entrega": [[0.1, 0.9, 0.0], [0.0, 0.8, 0.1]],
+    "suporte_tecnico": [[0.0, 0.1, 0.9], [0.2, 0.0, 0.8]],
+}
+centros = {k: centroide(v) for k, v in exemplos.items()}
+
+def rotear(vetor):
+    v = normalizar(vetor)
+    scores = {k: sum(a * b for a, b in zip(v, c)) for k, c in centros.items()}
+    melhor = max(scores, key=scores.get)
+    return melhor, round(scores[melhor], 2)
+
+print(rotear([0.7, 0.3, 0.1]))   # "fui cobrado duas vezes pelo frete"
+print(rotear([0.1, 0.2, 0.95]))  # "o app fecha sozinho"
+```
+
+```text
+Saída:
+('cobranca', 0.94)
+('suporte_tecnico', 0.99)
+```
+
+## Na prática
+
+Você chama um modelo de embedding (de um provedor ou um modelo aberto rodando localmente), guarda o vetor junto com o id e o texto do trecho, e na consulta embeda a pergunta com **o mesmo modelo**. Alguns modelos pedem prefixos diferentes para consulta e documento, ou oferecem tipos de entrada distintos; siga a documentação, porque isso muda a qualidade.
+
+```python
+# ilustração (não executada): o formato muda por provedor
+vetores = cliente.embeddings.criar(modelo="modelo-de-embedding", entradas=["texto 1", "texto 2"])
+```
+
+Fatores de escolha: qualidade no seu domínio e idioma (teste com suas consultas, não só com rankings públicos), dimensão (afeta memória e velocidade do índice), tamanho máximo de entrada, custo e possibilidade de rodar localmente por privacidade. Alguns modelos permitem truncar o vetor para menos dimensões com pouca perda, uma forma de economizar armazenamento.
+
+<Callout type="warning" title="Troca de modelo é migração">
+Mudar o modelo de embedding (ou até a versão dele) invalida o índice inteiro. Guarde o nome e a versão do modelo junto com cada vetor e planeje reindexação em paralelo, com troca atômica, como numa migração de banco.
+</Callout>
+
+## Armadilhas
+
+- Textos longos demais são truncados silenciosamente ou viram uma "média" sem foco; por isso se faz chunking.
+- Embeddings capturam tema, não lógica: "aceita cartão" e "não aceita cartão" podem ficar muito próximos.
+- Números, códigos de produto e nomes raros são mal representados; a busca lexical ajuda nesses casos.
+
+## Na entrevista
+
+Defina embedding como um vetor em que proximidade representa similaridade de significado, explique que vem de um modelo treinado de forma contrastiva e cite usos (busca, RAG, classificação, deduplicação). Mostre maturidade operacional: mesmo modelo para consulta e documentos, versão guardada, reindexação planejada. Follow-ups: "por que a busca semântica erra códigos de produto?" (tokens raros, sem semântica; combine com BM25) e "como escolher o modelo?" (avaliar recall nas suas consultas, custo, dimensão, idioma).
+
+<QuizSet>
+<Quiz question="Você trocou o modelo de embedding das consultas, mas manteve os vetores antigos dos documentos. O que acontece?" options={["A busca melhora, porque o modelo novo é melhor", "Os resultados viram praticamente aleatórios, porque os espaços vetoriais não são comparáveis", "Nada muda se a dimensão for a mesma", "Só a latência muda"]} answer={1} explanation="Cada modelo define seu próprio espaço. Mesmo com a mesma dimensão, vetores de modelos diferentes não têm correspondência; é preciso reindexar." />
+<Quiz question="Por que embeddings sozinhos podem falhar ao buscar o SKU 'XJ-4471-B'?" options={["SKUs são longos demais", "Identificadores raros não têm significado aprendido e são mal representados; busca lexical acerta melhor", "Embeddings não aceitam hífen", "A similaridade de cosseno não funciona com números"]} answer={1} explanation="O modelo aprende significado de padrões frequentes. Códigos exatos são casos em que correspondência de termos (BM25) é mais confiável." />
+</QuizSet>

@@ -1,0 +1,194 @@
+---
+title: Rate limiter thread-safe
+kind: lesson
+---
+
+"Implemente um rate limiter que permita no máximo N requisições por segundo e que funcione com várias threads chamando ao mesmo tempo" é uma pergunta que mistura algoritmo e concorrência. A parte algorítmica (token bucket, janela deslizante) você talvez já conheça de system design. Aqui o foco é o que muda quando dezenas de threads chamam `permitir()` simultaneamente: sem cuidado, duas threads leem "resta 1 token", ambas o consomem e o limite é furado.
+
+## Escolhendo o algoritmo
+
+| Algoritmo | Estado | Rajadas | Precisão |
+| --- | --- | --- | --- |
+| Janela fixa | contador + início da janela | permite 2N na virada da janela | baixa |
+| Janela deslizante (log) | timestamps recentes | não | exata, memória O(N) |
+| Token bucket | tokens + último reabastecimento | sim, até a capacidade | boa, memória O(1) |
+
+O **token bucket** é a escolha mais comum: um balde com capacidade `C` se enche a uma taxa `r` tokens por segundo; cada requisição consome um token e é recusada se o balde estiver vazio. Ele permite rajadas curtas até `C` e mantém a média em `r`.
+
+```text
+ reabastece r/s ──►  ┌───────┐
+                     │ ● ● ● │  capacidade C
+                     └───┬───┘
+ requisição ─► pega 1 token? ─ sim ─► permitida
+                         └─ não ─► recusada (ou espera)
+```
+
+## A seção crítica
+
+O reabastecimento preguiçoso (calcular quantos tokens entraram desde a última chamada) e o consumo precisam acontecer **juntos**, sob o mesmo lock. Separar as duas coisas reabre a condição de corrida:
+
+```python
+# ERRADO: ler e decrementar fora do lock
+if self.tokens >= 1:        # duas threads veem 1 token
+    with self.lock:
+        self.tokens -= 1    # as duas decrementam: tokens = -1
+```
+
+Para os testes serem determinísticos, a implementação recebe um **relógio injetável**. Em produção você passaria `time.monotonic` (nunca `time.time`, que pode voltar no tempo com ajustes de NTP); no teste, um relógio falso que você avança à mão.
+
+```python
+import threading
+
+class RelogioFalso:
+    def __init__(self):
+        self.agora = 0.0
+    def __call__(self):
+        return self.agora
+    def avancar(self, s):
+        self.agora += s
+
+class TokenBucket:
+    def __init__(self, capacidade, taxa, relogio):
+        self.capacidade = capacidade
+        self.taxa = taxa                 # tokens por segundo
+        self.relogio = relogio
+        self.tokens = float(capacidade)
+        self.ultimo = relogio()
+        self.lock = threading.Lock()
+
+    def permitir(self):
+        with self.lock:                  # reabastecer e consumir juntos
+            agora = self.relogio()
+            self.tokens = min(self.capacidade, self.tokens + (agora - self.ultimo) * self.taxa)
+            self.ultimo = agora
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
+
+relogio = RelogioFalso()
+balde = TokenBucket(capacidade=3, taxa=2, relogio=relogio)
+
+print("rajada:", [balde.permitir() for _ in range(5)])
+relogio.avancar(0.5)                     # entra 1 token
+print("apos 0,5 s:", [balde.permitir() for _ in range(2)])
+relogio.avancar(10)                      # enche, mas limita à capacidade
+print("apos 10 s:", [balde.permitir() for _ in range(4)])
+
+# 50 threads disputando o mesmo instante: só a capacidade passa
+relogio.avancar(10)
+resultados = []
+guarda = threading.Lock()
+
+def cliente():
+    ok = balde.permitir()
+    with guarda:
+        resultados.append(ok)
+
+threads = [threading.Thread(target=cliente) for _ in range(50)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("concorrentes permitidas:", resultados.count(True), "de", len(resultados))
+```
+
+```text
+Saída:
+rajada: [True, True, True, False, False]
+apos 0,5 s: [True, False]
+apos 10 s: [True, True, True, False]
+concorrentes permitidas: 3 de 50
+```
+
+## Limite por cliente
+
+Em geral o limite é por usuário ou por chave de API. Agora há dois níveis de concorrência: o mapa de clientes e o estado de cada cliente. Um lock global para tudo funciona, mas serializa clientes independentes. A versão abaixo usa um lock curto só para criar o limitador de cada cliente (evitando o check-then-act) e um lock por cliente para a janela deslizante.
+
+```python
+import threading
+from collections import deque
+
+class RelogioFalso:
+    def __init__(self):
+        self.agora = 0.0
+    def __call__(self):
+        return self.agora
+
+class JanelaDeslizante:
+    def __init__(self, limite, janela, relogio):
+        self.limite, self.janela, self.relogio = limite, janela, relogio
+        self.eventos = deque()
+        self.lock = threading.Lock()
+
+    def permitir(self):
+        with self.lock:
+            agora = self.relogio()
+            while self.eventos and self.eventos[0] <= agora - self.janela:
+                self.eventos.popleft()           # descarta o que saiu da janela
+            if len(self.eventos) < self.limite:
+                self.eventos.append(agora)
+                return True
+            return False
+
+class LimitadorPorCliente:
+    def __init__(self, limite, janela, relogio):
+        self.args = (limite, janela, relogio)
+        self.clientes = {}
+        self.lock_mapa = threading.Lock()
+
+    def permitir(self, cliente):
+        with self.lock_mapa:                     # só para obter/criar
+            lim = self.clientes.get(cliente)
+            if lim is None:
+                lim = self.clientes[cliente] = JanelaDeslizante(*self.args)
+        return lim.permitir()                    # fora do lock global
+
+relogio = RelogioFalso()
+limitador = LimitadorPorCliente(limite=4, janela=1.0, relogio=relogio)
+contagem = {}
+guarda = threading.Lock()
+
+def rajada(cliente, n):
+    aceitas = sum(limitador.permitir(cliente) for _ in range(n))
+    with guarda:
+        contagem[cliente] = contagem.get(cliente, 0) + aceitas
+
+threads = [threading.Thread(target=rajada, args=(c, 5)) for c in ("ana", "bia", "caio") for _ in range(3)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print("t=0,0:", sorted(contagem.items()))
+
+relogio.agora = 1.0                              # a janela anterior expirou
+print("ana em t=1,0:", [limitador.permitir("ana") for _ in range(5)])
+```
+
+```text
+Saída:
+t=0,0: [('ana', 4), ('bia', 4), ('caio', 4)]
+ana em t=1,0: [True, True, True, True, False]
+```
+
+## Armadilhas e trade-offs
+
+- **Relógio de parede**: use um relógio monotônico; `time.time` pode retroceder e gerar tokens negativos ou infinitos.
+- **Dormir com o lock**: uma versão bloqueante ("espere até ter token") deve calcular o tempo de espera, soltar o lock e só então dormir.
+- **Memória por cliente**: o mapa cresce para sempre; remova clientes inativos (TTL) ou use um cache com limite.
+- **Vários servidores**: um lock local não vale entre máquinas. Aí o estado vai para um Redis com operação atômica (script Lua) ou você aceita limites aproximados por nó.
+- **Alternativa sem lock**: em Java, dá para guardar o estado num `AtomicLong` e atualizar com CAS em laço; em Go, `sync.Mutex` é o caminho idiomático, e `golang.org/x/time/rate` já implementa token bucket.
+
+<Callout type="warning" title="Teste com relógio falso">
+Testes que usam `sleep` real para verificar um rate limiter são lentos e instáveis. Injete o relógio e controle o tempo no teste: é também um ótimo ponto para citar na entrevista.
+</Callout>
+
+## Na entrevista
+
+Esclareça o requisito (limite global ou por cliente, recusar ou esperar, um processo ou vários), escolha token bucket ou janela deslizante justificando, e mostre que reabastecimento e consumo ficam na mesma seção crítica. Mencione lock por cliente para reduzir contenção e o relógio monotônico injetável. Follow-ups comuns: "como fazer isso em vários servidores?" (estado central no Redis com operação atômica, ou cota local por nó) e "como tornar `permitir` bloqueante sem segurar o lock enquanto dorme?" (calcular o tempo de espera, reservar o token e dormir fora do lock).
+
+<QuizSet>
+<Quiz question="Num token bucket concorrente, por que o reabastecimento e o consumo devem ficar sob o mesmo lock?" options={["Para economizar memória", "Porque, separados, duas threads podem ver o mesmo token disponível e ambas consumi-lo", "Porque o lock acelera o cálculo de tokens", "Porque o reabastecimento é uma operação de I/O"]} answer={1} explanation="Ler o saldo e decrementá-lo é um read-modify-write; fora de uma única seção crítica, o limite pode ser excedido." />
+<Quiz question="Por que preferir time.monotonic a time.time num rate limiter?" options={["É mais preciso em microssegundos", "Não retrocede com ajustes do relógio do sistema", "Retorna inteiros", "É thread-safe e time.time não é"]} answer={1} explanation="O relógio de parede pode voltar com NTP ou mudanças manuais, gerando intervalos negativos; o monotônico só avança." />
+<Quiz question="Seu limitador por cliente usa um único lock global e a latência subiu com muitos clientes. O que fazer?" options={["Remover todos os locks", "Usar o lock global só para obter ou criar o limitador do cliente e um lock por cliente para a contagem", "Trocar por sleep entre requisições", "Aumentar o limite de requisições"]} answer={1} explanation="Clientes diferentes passam a não disputar o mesmo lock, e a criação continua protegida contra check-then-act." />
+</QuizSet>

@@ -1,0 +1,139 @@
+---
+title: Técnicas avançadas de RAG
+kind: lesson
+---
+
+O RAG básico (embeda a pergunta, pega o top-k, gera) funciona bem quando a pergunta do usuário se parece com o texto do documento e a resposta está num trecho só. Na prática, usuários escrevem perguntas vagas, com gírias ou siglas, e fazem perguntas que exigem juntar informações de lugares diferentes. As técnicas avançadas atacam essas falhas em três pontos: **antes** da busca (a consulta), **durante** a indexação (os chunks) e **depois** da busca (verificação e iteração).
+
+## Melhorando a consulta
+
+- **Reescrita:** um LLM transforma a mensagem do usuário numa consulta autocontida. Em chat, isso resolve referências ("e para o plano anual?" vira "política de reembolso do plano anual").
+- **Multi-query:** gera várias formulações da mesma pergunta, busca cada uma e funde os resultados (por RRF). Aumenta o recall quando o vocabulário do usuário difere do da documentação.
+- **HyDE:** pede ao LLM uma resposta hipotética e busca com o embedding dela, já que uma resposta se parece mais com um documento do que uma pergunta. Cuidado: se o modelo inventar algo muito errado, a busca vai junto.
+- **Roteamento:** decide em qual índice ou fonte buscar (manual técnico, base de tickets, banco SQL) antes da recuperação.
+
+O programa mostra multi-query: a pergunta original usa "grana de volta", que não aparece nos documentos; as reformulações (que aqui vêm de uma tabela fixa, no lugar de um LLM) trazem o vocabulário certo.
+
+```python
+import re
+
+DOCS = {
+    "d1": "Reembolso é feito em até 10 dias úteis após aprovação.",
+    "d2": "Estorno no cartão aparece na fatura seguinte.",
+    "d3": "Cancelamento pode ser feito pelo aplicativo.",
+    "d4": "Frete grátis para compras acima de 200 reais.",
+}
+REFORMULACOES = {  # num sistema real, um LLM gera estas variações
+    "quando recebo minha grana de volta": [
+        "prazo do reembolso ou estorno",
+        "quando o estorno do reembolso aparece no cartão",
+    ],
+}
+
+def buscar(consulta, k=2):
+    q = set(re.findall(r"\w+", consulta.lower()))
+    scores = {d: len(q & set(re.findall(r"\w+", t.lower()))) for d, t in DOCS.items()}
+    return [d for d, s in sorted(scores.items(), key=lambda kv: -kv[1]) if s > 0][:k]
+
+def rrf(listas, k=60):
+    pontos = {}
+    for lista in listas:
+        for pos, d in enumerate(lista, start=1):
+            pontos[d] = pontos.get(d, 0) + 1 / (k + pos)
+    return sorted(pontos, key=lambda d: -pontos[d])
+
+pergunta = "quando recebo minha grana de volta"
+print("só a original:", buscar(pergunta))
+consultas = [pergunta] + REFORMULACOES[pergunta]
+for c in consultas:
+    print(f"  {c!r} -> {buscar(c)}")
+print("multi-query + RRF:", rrf([buscar(c) for c in consultas]))
+```
+
+```text
+Saída:
+só a original: ['d4']
+  'quando recebo minha grana de volta' -> ['d4']
+  'prazo do reembolso ou estorno' -> ['d1', 'd2']
+  'quando o estorno do reembolso aparece no cartão' -> ['d2', 'd1']
+multi-query + RRF: ['d1', 'd2', 'd4']
+```
+
+A pergunta original só casou com um documento irrelevante, por causa da palavra "de". As variações encontraram os dois relevantes, e a fusão os coloca acima do ruído.
+
+## Melhorando os chunks
+
+- **Contexto no chunk:** antes de embedar, gere (com um LLM) uma ou duas frases situando o trecho no documento ("Este trecho é da seção de reembolso do contrato do plano empresarial") e prefixe ao chunk. Resolve chunks que, sozinhos, são ambíguos.
+- **Recuperar pequeno, entregar grande:** indexe chunks pequenos, mas entregue ao LLM a seção ou os vizinhos.
+- **Índices de resumos e perguntas:** indexe também um resumo de cada documento ou perguntas que o trecho responde, apontando para o original.
+- **Grafo de conhecimento (GraphRAG):** extraia entidades e relações e combine busca no grafo com busca vetorial. Ajuda em perguntas sobre relações e em perguntas globais ("quais os temas principais destes relatórios?"), com custo de ingestão bem maior.
+
+## Iterando: multi-hop e RAG agêntico
+
+Algumas perguntas exigem encadear buscas: "quem é o gestor do time que mantém o serviço de pagamentos?" Primeiro você descobre o time, depois o gestor do time. Nenhuma busca única encontra a resposta. A solução é **decompor** a pergunta e usar a resposta de um passo na consulta do próximo, deixando um LLM (ou um agente) decidir quando já tem informação suficiente.
+
+```python
+BASE = [
+    "O serviço de pagamentos é mantido pelo time Atlas.",
+    "O serviço de busca é mantido pelo time Orion.",
+    "O time Atlas tem como gestora a Marina Souza.",
+    "O time Orion tem como gestor o Paulo Lima.",
+]
+
+def buscar(termo):
+    return [t for t in BASE if termo.lower() in t.lower()]
+
+def llm_falso_planejar(pergunta, fatos):
+    # roteiro fixo: no lugar de um LLM que decide o próximo passo
+    if not fatos:
+        return ("buscar", "serviço de pagamentos")
+    if len(fatos) == 1:
+        time = fatos[0].split("time ")[1].rstrip(".")
+        return ("buscar", f"time {time} tem")
+    return ("responder", fatos[-1].split("gestora a ")[1].rstrip("."))
+
+pergunta = "Quem é a gestora do time que mantém o serviço de pagamentos?"
+fatos = []
+for passo in range(1, 4):
+    acao, arg = llm_falso_planejar(pergunta, fatos)
+    if acao == "responder":
+        print(f"resposta: {arg}")
+        break
+    achados = buscar(arg)
+    print(f"passo {passo}: buscar({arg!r}) -> {achados}")
+    fatos.extend(achados)
+```
+
+```text
+Saída:
+passo 1: buscar('serviço de pagamentos') -> ['O serviço de pagamentos é mantido pelo time Atlas.']
+passo 2: buscar('time Atlas tem') -> ['O time Atlas tem como gestora a Marina Souza.']
+resposta: Marina Souza
+```
+
+Variações desse padrão incluem o **RAG corretivo** (avaliar se os trechos são relevantes e, se não forem, reformular ou buscar em outra fonte) e a **autoverificação** (checar se cada afirmação da resposta tem suporte nos trechos antes de devolvê-la).
+
+<Callout type="warning" title="Cada técnica custa latência">
+Reescrita, multi-query, HyDE e verificação adicionam chamadas de LLM em série. Um pipeline com quatro etapas extras pode multiplicar a latência. Adicione técnicas uma a uma, medindo ganho de qualidade contra custo, e use modelos pequenos nas etapas auxiliares.
+</Callout>
+
+## Como escolher
+
+| Sintoma | Técnica |
+| --- | --- |
+| Usuário escreve diferente da documentação | Reescrita, multi-query, busca híbrida |
+| Perguntas de acompanhamento em chat | Reescrita com o histórico |
+| Chunk certo, mas ambíguo sozinho | Contexto no chunk, título prefixado |
+| Resposta depende de várias fontes encadeadas | Decomposição, multi-hop, RAG agêntico |
+| Perguntas globais sobre o corpus inteiro | Resumos hierárquicos, GraphRAG |
+| Respostas com afirmações sem suporte | Verificação de fidelidade, citações obrigatórias |
+
+## Na entrevista
+
+Não liste técnicas aleatoriamente: diagnostique primeiro (a falha é de consulta, de chunk ou de raciocínio entre fontes?) e associe a técnica ao sintoma, com o custo de latência. Follow-ups: "como você sabe que o multi-query ajudou?" (recall@k no conjunto de avaliação, antes e depois) e "quando usar um agente em vez de um pipeline fixo?" (quando o número de buscas e as fontes variam por pergunta; caso contrário, pipeline fixo é mais barato e previsível).
+
+<QuizSet>
+<Quiz question="Num chat, o usuário pergunta 'qual o prazo de entrega?' e depois 'e para o Nordeste?'. A segunda busca não encontra nada útil. Qual técnica resolve?" options={["HyDE", "Reescrever a consulta com o histórico para uma pergunta autocontida", "Aumentar o tamanho dos chunks", "GraphRAG"]} answer={1} explanation="'E para o Nordeste?' sozinho não tem o assunto. A reescrita gera 'prazo de entrega para o Nordeste', que a busca consegue atender." />
+<Quiz question="Qual é o risco principal do HyDE?" options={["Ele não funciona com embeddings", "Se a resposta hipotética gerada estiver muito errada, a busca é guiada para documentos errados", "Ele aumenta o tamanho do índice", "Ele elimina a necessidade de re-ranking"]} answer={1} explanation="HyDE busca pelo embedding de uma resposta inventada; quando o modelo erra o assunto, a recuperação herda o erro." />
+<Quiz question="A pergunta 'quem aprovou o orçamento do projeto que atrasou a entrega X?' falha no RAG simples. Por quê, e o que fazer?" options={["Os chunks são pequenos; aumente-os", "Exige encadear buscas (descobrir o projeto, depois quem aprovou); use decomposição ou um laço multi-hop", "O modelo é pequeno; troque de modelo", "Falta re-ranking"]} answer={1} explanation="A informação está em trechos diferentes ligados por uma entidade intermediária. Só uma sequência de buscas, usando o resultado anterior, chega à resposta." />
+</QuizSet>

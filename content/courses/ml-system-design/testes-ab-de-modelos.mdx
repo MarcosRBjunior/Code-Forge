@@ -1,0 +1,99 @@
+---
+title: Testes A/B de modelos
+kind: lesson
+---
+
+O modelo novo tem AUC offline melhor. Isso não garante que ele melhore a métrica de negócio: a avaliação offline usa dados gerados pelo modelo antigo, ignora efeitos de interface e não captura como os usuários reagem a recomendações diferentes. A única forma confiável de saber é **colocar os dois modelos lado a lado com usuários reais** e medir. É isso que um teste A/B faz.
+
+## Como funciona
+
+1. **Hipótese e métrica primária**, definidas antes de começar: "o modelo B aumenta a taxa de cliques por sessão". Escolha também métricas de guarda (latência, receita, reclamações) que não podem piorar.
+2. **Unidade de randomização:** quase sempre o usuário, não a requisição. Se a mesma pessoa vê ora o modelo A, ora o B, a experiência fica incoerente e as observações deixam de ser independentes.
+3. **Atribuição determinística:** `hash(id_usuario + nome_do_experimento) mod 100` decide o grupo. O mesmo usuário cai sempre no mesmo braço, sem precisar guardar estado.
+4. **Tamanho de amostra** calculado antes, a partir do efeito mínimo que vale a pena detectar.
+5. **Análise** só ao fim do período planejado, com teste estatístico e intervalo de confiança.
+
+## Quanto tráfego você precisa
+
+O tamanho da amostra depende da taxa base, do menor efeito que você quer detectar (MDE), do nível de significância e do poder. Efeitos pequenos exigem amostras enormes, e isso define quanto tempo o teste dura.
+
+```python
+import math
+import random
+from statistics import NormalDist
+
+random.seed(3)
+z = NormalDist().inv_cdf
+
+def amostra_por_braco(p_base, mde_relativo, alfa=0.05, poder=0.8):
+    p2 = p_base * (1 + mde_relativo)
+    p_medio = (p_base + p2) / 2
+    num = (z(1 - alfa / 2) * math.sqrt(2 * p_medio * (1 - p_medio))
+           + z(poder) * math.sqrt(p_base * (1 - p_base) + p2 * (1 - p2))) ** 2
+    return math.ceil(num / (p2 - p_base) ** 2)
+
+print("CTR base de 4%:")
+for mde in (0.10, 0.05, 0.02):
+    print(f"  detectar +{mde:.0%} relativo: {amostra_por_braco(0.04, mde):>9} usuarios por braco")
+
+# simula um teste com efeito real de +5%
+n = amostra_por_braco(0.04, 0.05)
+cliques_a = sum(random.random() < 0.040 for _ in range(n))
+cliques_b = sum(random.random() < 0.042 for _ in range(n))
+pa, pb = cliques_a / n, cliques_b / n
+p = (cliques_a + cliques_b) / (2 * n)
+erro = math.sqrt(p * (1 - p) * 2 / n)
+estat = (pb - pa) / erro
+p_valor = 2 * (1 - NormalDist().cdf(abs(estat)))
+print(f"simulacao com n={n}: A={pa:.4f} B={pb:.4f}")
+print(f"lift={pb / pa - 1:+.1%} z={estat:.2f} p-valor={p_valor:.4f}")
+```
+
+```text
+Saída:
+CTR base de 4%:
+  detectar +10% relativo:     39475 usuarios por braco
+  detectar +5% relativo:    154304 usuarios por braco
+  detectar +2% relativo:    950887 usuarios por braco
+simulacao com n=154304: A=0.0399 B=0.0424
+lift=+6.1% z=3.42 p-valor=0.0006
+```
+
+Reduzir o MDE pela metade multiplica a amostra por cerca de quatro: de uns 40 mil para uns 154 mil por braço, e quase um milhão para 2%. Na simulação, com o tamanho planejado, o efeito real de 5% aparece como significativo (o lift observado de 6,1% inclui ruído, por isso reporte sempre o intervalo de confiança). Se o seu produto tem 50 mil usuários ativos por dia, detectar 2% de melhora numa taxa de 4% levaria meses; nesse caso você precisa de uma métrica mais sensível ou aceitar detectar só efeitos maiores.
+
+## Armadilhas clássicas
+
+- **Espiar o resultado e parar cedo** quando o p-valor cruza 0,05. Com olhadas repetidas, a chance de falso positivo dispara. Ou você fixa a duração, ou usa métodos sequenciais feitos para isso.
+- **Efeito novidade:** usuários clicam mais em qualquer coisa nova nos primeiros dias. Rode pelo menos um ou dois ciclos semanais completos.
+- **Sample ratio mismatch:** se você planejou 50/50 e observou 50,8/49,2 com milhões de usuários, a atribuição ou o log tem bug, e o resultado não vale.
+- **Muitas métricas:** testar 20 métricas a 5% produz em média um "sucesso" por acaso. Defina a primária antes.
+- **Interferência entre braços:** em marketplaces e redes sociais, o tratamento de um usuário afeta o outro (o modelo B esgota o estoque que o A recomendaria). Randomizar por região ou por tempo ajuda.
+- **Loop de feedback:** cada modelo gera os dados que alimentam o próprio treino. Se o B treina com dados majoritariamente do A, a comparação fica enviesada.
+
+## Antes do A/B
+
+Nem todo modelo precisa ir direto para usuários:
+
+| Etapa | O que valida | Exposição |
+| --- | --- | --- |
+| Avaliação offline | Qualidade nos dados históricos | Nenhuma |
+| Shadow (sombra) | Latência, erros, distribuição dos scores | Nenhuma: roda em paralelo sem servir |
+| Canário | Estabilidade em produção | 1% a 5% |
+| Teste A/B | Impacto na métrica de negócio | 10% a 50% |
+| Interleaving | Preferência entre rankings, com menos tráfego | Mistura dois rankings na mesma lista |
+
+Interleaving é especialmente útil em busca e recomendação: mescla os resultados de A e B numa única lista e conta de qual modelo vieram os cliques. Precisa de bem menos tráfego que um A/B, embora meça preferência, não impacto em receita.
+
+<Callout type="note" title="Offline e online discordam">
+É comum o modelo melhor offline empatar ou perder online. Quando isso acontece, investigue o desalinhamento entre a métrica offline e a de negócio antes de culpar o teste.
+</Callout>
+
+## Na entrevista
+
+Descreva o plano de lançamento como uma escada: offline, shadow, canário, A/B. Nomeie a métrica primária, as de guarda, a unidade de randomização e uma estimativa grosseira de duração a partir do tráfego. Follow-ups comuns: o que fazer se a métrica primária sobe e a de guarda cai, como lidar com efeito de rede, por que não parar quando o p-valor fica significativo e como testar vários modelos ao mesmo tempo (camadas de experimentos ortogonais ou multi-armed bandits).
+
+<QuizSet>
+<Quiz question="Você quer detectar uma melhora relativa de 1% numa CTR de 3%, mas o teste exigiria quatro meses. O que é mais razoável?" options={["Rodar uma semana e aceitar o resultado", "Usar uma métrica mais sensível, aumentar a fração de tráfego ou aceitar detectar só efeitos maiores", "Randomizar por requisição em vez de usuário", "Parar assim que o p-valor ficar abaixo de 0,05"]} answer={1} explanation="Rodar curto demais dá poder insuficiente e parar ao cruzar 0,05 infla falsos positivos; é preciso mudar a métrica, o tráfego ou o MDE." />
+<Quiz question="Num teste planejado 50/50 com 2 milhões de usuários, o grupo B recebeu 1,5% a mais de usuários que o A. O que isso indica?" options={["O modelo B é mais atraente", "Variação normal", "Provável sample ratio mismatch, um bug de atribuição ou de log que invalida o teste", "Que o teste precisa de mais tempo"]} answer={2} explanation="Com amostras desse tamanho, um desvio assim é praticamente impossível por acaso; algo enviesa quem entra ou quem é registrado em cada braço." />
+<Quiz question="Por que a unidade de randomização costuma ser o usuário e não a requisição?" options={["Porque é mais barato de calcular", "Para manter a experiência consistente e as observações independentes por usuário", "Porque requisições não têm ID", "Para aumentar o efeito novidade"]} answer={1} explanation="Alternar modelos entre requisições da mesma pessoa mistura os efeitos e viola a independência que o teste estatístico assume." />
+</QuizSet>

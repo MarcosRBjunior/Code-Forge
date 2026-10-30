@@ -1,0 +1,115 @@
+---
+title: "Servimento: batch e tempo real"
+kind: lesson
+---
+
+Um modelo treinado só gera valor quando suas previsões chegam a quem decide: uma tela do app, um serviço de pagamentos, uma fila de moderação. **Servimento** é a parte do sistema que transforma o artefato do modelo em previsões, e a primeira decisão é **quando** a previsão é calculada: antes de alguém pedir (batch) ou no momento do pedido (tempo real).
+
+## Predição em batch
+
+Um job periódico roda o modelo sobre todas as entidades relevantes e grava o resultado numa tabela ou num key-value store: "para cada usuário, os 50 itens recomendados" ou "para cada cliente, a probabilidade de churn". Na hora da requisição, o serviço só faz uma consulta por chave.
+
+- **Prós:** latência de leitura mínima, modelo pode ser pesado e lento, falhas no job não derrubam o produto (você serve o resultado de ontem), custo previsível.
+- **Contras:** as previsões envelhecem, você calcula para muitas entidades que nem vão aparecer e não consegue usar contexto da sessão (o que o usuário acabou de buscar).
+
+## Predição em tempo real
+
+O serviço recebe a requisição, busca features (do feature store online e do próprio request), roda o modelo e responde em dezenas de milissegundos.
+
+- **Prós:** usa contexto fresco, só calcula o que é pedido, reage na hora a mudanças.
+- **Contras:** orçamento de latência apertado, exige infraestrutura sempre disponível e escalável para o pico, e o modelo precisa ser rápido o bastante.
+
+## Comparando com números
+
+O programa compara as duas abordagens num cenário hipotético de 200 mil usuários, dos quais cerca de 8% abrem o app num dia, e simula a latência de cada etapa do caminho em tempo real.
+
+```python
+import random
+
+random.seed(42)
+
+USUARIOS = 200_000
+TAXA_ATIVOS = 0.08
+ativos = sum(1 for _ in range(USUARIOS) if random.random() < TAXA_ATIVOS)
+
+print("== custo diario de inferencia ==")
+print(f"batch (todos os usuarios): {USUARIOS} previsoes")
+print(f"tempo real (so ativos):    {ativos} previsoes")
+print(f"previsoes batch nunca lidas: {1 - ativos / USUARIOS:.0%}")
+
+def latencia_ms():
+    rede = random.uniform(1, 3)
+    features = random.expovariate(1 / 4)  # media 4 ms, cauda longa
+    if random.random() < 0.02:            # 2% das buscas caem num shard lento
+        features += random.uniform(30, 60)
+    modelo = random.gauss(12, 2)
+    return rede + features + modelo
+
+amostras = sorted(latencia_ms() for _ in range(20_000))
+def pct(p):
+    return amostras[int(p / 100 * (len(amostras) - 1))]
+
+print("== latencia em tempo real ==")
+for p in (50, 95, 99):
+    print(f"p{p}: {pct(p):.1f} ms")
+orcamento = 50
+estouro = sum(1 for a in amostras if a > orcamento) / len(amostras)
+print(f"acima do orcamento de {orcamento} ms: {estouro:.1%}")
+```
+
+```text
+Saída:
+== custo diario de inferencia ==
+batch (todos os usuarios): 200000 previsoes
+tempo real (so ativos):    16020 previsoes
+previsoes batch nunca lidas: 92%
+== latencia em tempo real ==
+p50: 17.2 ms
+p95: 28.1 ms
+p99: 60.8 ms
+acima do orcamento de 50 ms: 1.6%
+```
+
+No batch, 92% das previsões nunca são lidas. No tempo real, a mediana de cerca de 17 ms fica confortável, mas o p99 passa de 60 ms e a cauda é dominada pelas buscas lentas de features, não pelo modelo. Isso é típico: em servimento real, otimizar o p99 quase sempre significa mexer em I/O (cache local, timeouts com valor padrão, menos chamadas remotas), não em FLOPs.
+
+## Arquitetura típica
+
+```text
+  requisicao
+      |
++-----v------+    features     +----------------+
+| servico de |---------------->| feature store  |
+| predicao   |<----------------| online (KV)    |
++-----+------+                 +----------------+
+      |  tensor
++-----v------+       carrega   +----------------+
+| servidor   |<----------------| registro de    |
+| de modelo  |                 | modelos        |
++-----+------+                 +----------------+
+      |  score
+      v
+ resposta + log (features, score, versao) -> stream -> treino
+```
+
+Registrar as features **exatamente como foram usadas** no momento da previsão é o que permite treinar o próximo modelo sem skew entre treino e servimento.
+
+## Técnicas para caber no orçamento
+
+- **Híbrido:** pré-calcule a parte cara em batch (embeddings de itens, candidatos) e faça em tempo real só o ranqueamento final com contexto.
+- **Cache de previsões** para chaves repetidas, com TTL coerente com a velocidade de mudança.
+- **Modelos menores:** destilação, quantização, poda. Um modelo 4 vezes menor com 1% a menos de qualidade costuma ser a escolha certa.
+- **Batching dinâmico** no servidor de modelos para aproveitar GPU sem estourar latência.
+- **Fallback:** se o modelo não responder a tempo, sirva a lista batch de ontem ou uma heurística de popularidade.
+
+<Callout type="tip" title="Comece pelo mais simples">
+Se o produto tolera previsões de algumas horas atrás, comece com batch. Mude para tempo real quando houver evidência de que contexto fresco melhora a métrica de negócio.
+</Callout>
+
+## Na entrevista
+
+Declare logo o orçamento de latência e o volume (QPS) e escolha batch, tempo real ou híbrido justificando com frescura, custo e contexto. Desenhe o caminho da requisição com o feature store e o log de features. Follow-ups prováveis: como reduzir o p99, o que acontece se o feature store cair, como fazer deploy de um modelo novo sem downtime (shadow, canário, blue-green) e como garantir que a feature calculada no servimento é igual à do treino.
+
+<QuizSet>
+<Quiz question="Um app de e-mail marketing envia uma recomendação por dia para cada cliente. Qual forma de servimento é mais adequada?" options={["Tempo real com GPU", "Predição em batch gravada numa tabela", "Treino online", "Servimento na borda do dispositivo"]} answer={1} explanation="Não há requisição interativa nem contexto de sessão; calcular tudo de uma vez no batch é mais barato e simples." />
+<Quiz question="O p99 do seu serviço de predição está em 120 ms, e a inferência do modelo leva 10 ms. Onde investigar primeiro?" options={["Trocar o modelo por um menor", "Nas chamadas de busca de features e outras operações de I/O", "Aumentar a taxa de aprendizado", "Aumentar o tamanho do batch de treino"]} answer={1} explanation="Se o modelo leva 10 ms, a cauda vem de outro lugar, normalmente de I/O remoto como o feature store." />
+</QuizSet>

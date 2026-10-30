@@ -1,0 +1,155 @@
+---
+title: WebSockets
+kind: lesson
+---
+
+HTTP foi desenhado para o cliente perguntar e o servidor responder. Chat, placar ao vivo, editor colaborativo e cotações precisam do contrário também: o servidor avisar no momento em que algo muda. As gambiarras antigas (polling a cada segundo, long polling segurando a requisição aberta) desperdiçam requisições e cabeçalhos ou somam latência a cada mensagem. O WebSocket resolve criando um canal **bidirecional e persistente** sobre uma única conexão TCP, com quadros pequenos e baratos.
+
+## O upgrade: começa como HTTP
+
+A conexão nasce como uma requisição HTTP/1.1 comum, o que permite passar pela porta 443, por proxies e pelo mesmo load balancer do resto do site. O cliente pede para trocar de protocolo:
+
+```text
+GET /chat HTTP/1.1
+Host: app.exemplo.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Version: 13
+Sec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==
+Origin: https://app.exemplo.com
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: <hash calculado pelo servidor>
+```
+
+Depois do `101`, ninguém fala HTTP naquela conexão: os dois lados trocam quadros WebSocket até alguém fechar. A chave serve para provar que o servidor entende WebSocket de verdade (e não é um cache HTTP devolvendo uma resposta antiga): ele concatena a chave com um GUID fixo da especificação, aplica SHA-1 e codifica em base64.
+
+```python
+import base64, hashlib
+
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def accept(chave: str) -> str:
+    return base64.b64encode(hashlib.sha1((chave + GUID).encode()).digest()).decode()
+
+chave = base64.b64encode(bytes(range(16))).decode()
+print("Sec-WebSocket-Key:   ", chave)
+print("Sec-WebSocket-Accept:", accept(chave))
+```
+
+```text
+Saída:
+Sec-WebSocket-Key:    AAECAwQFBgcICQoLDA0ODw==
+Sec-WebSocket-Accept: Bz3qJYTGdOe8gUSpLosEdiLKDrk=
+```
+
+Isso não é segurança, só uma verificação de que os dois lados falam o mesmo protocolo. Segurança vem do TLS (`wss://`) e da checagem do cabeçalho `Origin` no servidor, que impede uma página maliciosa de abrir uma conexão autenticada com os cookies do usuário (o chamado cross-site WebSocket hijacking).
+
+## O quadro
+
+```text
+ byte 0: FIN(1) RSV(3) opcode(4)     1 = texto, 2 = binário, 8 = close, 9 = ping, 10 = pong
+ byte 1: MASK(1) tamanho(7)          126 -> +2 bytes de tamanho, 127 -> +8 bytes
+ [chave de máscara 4 bytes se MASK]  obrigatória do cliente para o servidor
+ payload (XOR com a máscara)
+```
+
+Uma mensagem curta do servidor custa só 2 bytes de cabeçalho, contra centenas de bytes de cabeçalhos HTTP por requisição no polling. Quadros do cliente são mascarados com uma chave aleatória para que proxies antigos não interpretem o conteúdo como uma requisição HTTP e envenenem o cache.
+
+## Handshake e quadros num socket local
+
+O programa sobe um servidor em `127.0.0.1`, faz o upgrade, recebe um quadro de texto mascarado do cliente e devolve a mensagem sem máscara, como faria um servidor real.
+
+```python
+import base64, hashlib, socket, struct, threading
+
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def quadro(texto: bytes, mascara: bytes | None = None) -> bytes:
+    cab = bytes([0x81])                        # FIN + opcode 1 (texto)
+    if mascara is None:
+        return cab + bytes([len(texto)]) + texto
+    corpo = bytes(b ^ mascara[i % 4] for i, b in enumerate(texto))
+    return cab + bytes([0x80 | len(texto)]) + mascara + corpo
+
+def ler_quadro(sock) -> bytes:
+    b0, b1 = sock.recv(2)
+    n = b1 & 0x7F
+    mascara = sock.recv(4) if b1 & 0x80 else None
+    dados = b""
+    while len(dados) < n:
+        dados += sock.recv(n - len(dados))
+    if mascara:
+        dados = bytes(b ^ mascara[i % 4] for i, b in enumerate(dados))
+    return dados
+
+def servidor(srv):
+    conn, _ = srv.accept()
+    with conn:
+        req = b""
+        while b"\r\n\r\n" not in req:
+            req += conn.recv(1024)
+        linhas = req.decode().split("\r\n")
+        chave = next(l.split(": ")[1] for l in linhas if l.startswith("Sec-WebSocket-Key"))
+        aceite = base64.b64encode(hashlib.sha1((chave + GUID).encode()).digest()).decode()
+        conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Accept: {aceite}\r\n\r\n").encode())
+        msg = ler_quadro(conn)
+        conn.sendall(quadro(b"eco: " + msg))
+
+srv = socket.socket()
+srv.bind(("127.0.0.1", 0))
+srv.listen(1)
+t = threading.Thread(target=servidor, args=(srv,))
+t.start()
+
+cli = socket.create_connection(srv.getsockname(), timeout=5)
+cli.sendall(b"GET /chat HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nSec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\n"
+            b"Sec-WebSocket-Version: 13\r\n\r\n")
+resp = b""
+while b"\r\n\r\n" not in resp:
+    resp += cli.recv(1024)
+print(resp.decode().split("\r\n")[0])
+
+enviado = quadro(b"oi servidor", mascara=b"\x01\x02\x03\x04")
+print("quadro do cliente:", enviado.hex(" "))
+cli.sendall(enviado)
+print("servidor respondeu:", ler_quadro(cli).decode())
+cli.close()
+t.join()
+srv.close()
+```
+
+```text
+Saída:
+HTTP/1.1 101 Switching Protocols
+quadro do cliente: 81 8b 01 02 03 04 6e 6b 23 77 64 70 75 6d 65 6d 71
+servidor respondeu: eco: oi servidor
+```
+
+## Operando em produção
+
+| Desafio | Por que acontece | O que fazer |
+| --- | --- | --- |
+| Conexões com estado | Cada cliente fica preso a uma instância | Pub/sub (Redis, Kafka) para entregar mensagens entre instâncias |
+| Proxies e LBs fecham conexões ociosas | Timeouts de 60 s são comuns | Ping/pong periódico como heartbeat |
+| Deploy derruba todos os clientes | Reiniciar a instância fecha milhares de sockets | Drenagem gradual e reconexão com backoff e jitter |
+| Muitas conexões por máquina | Memória por conexão e descritores de arquivo | I/O orientado a eventos, ajustar `ulimit` |
+| Mensagens perdidas na reconexão | O canal não guarda histórico | Números de sequência e reenvio a partir do último recebido |
+
+<Callout type="tip" title="Nem sempre é WebSocket">
+Se só o servidor envia (notificações, feed de preços, tokens de um LLM), Server-Sent Events basta: é HTTP comum, reconecta sozinho e funciona sobre HTTP/2 sem conexão dedicada. Use WebSocket quando o cliente também envia com frequência e baixa latência importa, como em chat, jogos e edição colaborativa.
+</Callout>
+
+## Na entrevista
+
+Ao desenhar um chat ou sistema de notificações, justifique WebSocket comparando com polling, long polling e SSE, e logo trate da escala: conexões presas a instâncias, um barramento pub/sub entre elas, um serviço que sabe em qual gateway cada usuário está, heartbeats e reconexão. Follow-ups: "como enviar uma mensagem para um usuário conectado em outro servidor?" (registro de presença mais pub/sub) e "o que acontece com o load balancer?" (precisa suportar o upgrade e timeouts longos; balanceamento de camada 4 ou 7 com afinidade é comum).
+
+<QuizSet>
+<Quiz question="Qual resposta HTTP indica que o servidor aceitou trocar para WebSocket?" options={["200 OK", "101 Switching Protocols", "204 No Content", "426 Upgrade Required"]} answer={1} explanation="O 101 confirma o upgrade; a partir dele a conexão passa a carregar quadros WebSocket." />
+<Quiz question="Um chat tem 10 instâncias atrás de um load balancer. Alice está conectada na instância 2 e Bob na 7. Como a mensagem de Alice chega a Bob?" options={["O load balancer copia a mensagem para todas as conexões", "A instância 2 publica num pub/sub e a instância 7, que mantém a conexão de Bob, entrega", "Bob faz polling na instância 2", "Não é possível sem colocar todos na mesma instância"]} answer={1} explanation="Conexões são locais a cada instância; um barramento pub/sub (ou roteamento por presença) leva a mensagem até quem segura o socket do destinatário." />
+<Quiz question="Para um painel que só recebe atualizações do servidor, qual opção costuma ser mais simples que WebSocket?" options={["Server-Sent Events", "UDP direto", "FTP", "DNS TXT"]} answer={0} explanation="SSE é unidirecional sobre HTTP comum, com reconexão automática, e cobre bem o caso servidor para cliente." />
+</QuizSet>

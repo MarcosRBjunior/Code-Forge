@@ -1,0 +1,204 @@
+---
+title: Locks de leitura e escrita
+kind: lesson
+---
+
+Muitos dados compartilhados são lidos o tempo todo e alterados raramente: configuração carregada em memória, tabela de roteamento, catálogo de produtos, cache de permissões. Proteger isso com um mutex comum funciona, mas desperdiça paralelismo, porque duas leituras simultâneas nunca se atrapalham. O **lock de leitura e escrita** (read-write lock) explora essa assimetria: vários leitores podem entrar ao mesmo tempo, mas um escritor precisa de acesso exclusivo.
+
+## As regras
+
+```text
+                    já tem leitores    já tem escritor
+novo leitor         entra              espera
+novo escritor       espera             espera
+```
+
+Em Java você usa `ReentrantReadWriteLock` (com `readLock()` e `writeLock()`) ou `StampedLock`, que acrescenta leitura otimista. Em Go, `sync.RWMutex` com `RLock`/`RUnlock` e `Lock`/`Unlock`. Em C++, `std::shared_mutex` com `std::shared_lock` para leitura e `std::unique_lock` para escrita. Python não traz um na biblioteca padrão, então ele é uma ótima oportunidade de mostrar que você sabe construir um a partir de uma variável de condição.
+
+## Implementação com preferência para escritores
+
+A versão abaixo conta leitores ativos, marca se há escritor e também conta escritores **esperando**. Novos leitores não entram enquanto houver escritor na fila, o que evita que um fluxo contínuo de leituras deixe a escrita esperando para sempre.
+
+```python
+import threading
+
+class RWLock:
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._leitores = 0
+        self._escrevendo = False
+        self._escritores_esperando = 0
+
+    def adquirir_leitura(self):
+        with self._cond:
+            while self._escrevendo or self._escritores_esperando > 0:
+                self._cond.wait()
+            self._leitores += 1
+
+    def liberar_leitura(self):
+        with self._cond:
+            self._leitores -= 1
+            if self._leitores == 0:
+                self._cond.notify_all()
+
+    def adquirir_escrita(self):
+        with self._cond:
+            self._escritores_esperando += 1
+            while self._escrevendo or self._leitores > 0:
+                self._cond.wait()
+            self._escritores_esperando -= 1
+            self._escrevendo = True
+
+    def liberar_escrita(self):
+        with self._cond:
+            self._escrevendo = False
+            self._cond.notify_all()
+
+rw = RWLock()
+
+# 1) Três leitores dentro ao mesmo tempo: a barreira só abre se os três estiverem lá
+barreira = threading.Barrier(3)
+passaram = []
+
+def leitor_simultaneo(i):
+    rw.adquirir_leitura()
+    try:
+        barreira.wait(timeout=2)
+        passaram.append(i)
+    finally:
+        rw.liberar_leitura()
+
+ts = [threading.Thread(target=leitor_simultaneo, args=(i,)) for i in range(3)]
+for t in ts:
+    t.start()
+for t in ts:
+    t.join()
+print("leitores simultaneos:", len(passaram))
+
+# 2) Com um escritor dentro, o leitor precisa esperar
+eventos = []
+rw.adquirir_escrita()
+leitor = threading.Thread(target=lambda: (rw.adquirir_leitura(), eventos.append("leitor entrou"), rw.liberar_leitura()))
+leitor.start()
+eventos.append("escritor terminou")
+rw.liberar_escrita()
+leitor.join()
+print(eventos)
+```
+
+```text
+Saída:
+leitores simultaneos: 3
+['escritor terminou', 'leitor entrou']
+```
+
+Se o lock fosse um mutex comum, os três leitores nunca estariam dentro juntos e a barreira estouraria o prazo. Na segunda parte, a ordem é garantida pelo próprio lock: o leitor só consegue entrar depois que o escritor libera.
+
+## Uso típico: configuração lida o tempo todo
+
+```python
+import threading
+
+class RWLock:
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._leitores = 0
+        self._escrevendo = False
+        self._escritores_esperando = 0
+
+    def adquirir_leitura(self):
+        with self._cond:
+            while self._escrevendo or self._escritores_esperando > 0:
+                self._cond.wait()
+            self._leitores += 1
+
+    def liberar_leitura(self):
+        with self._cond:
+            self._leitores -= 1
+            if self._leitores == 0:
+                self._cond.notify_all()
+
+    def adquirir_escrita(self):
+        with self._cond:
+            self._escritores_esperando += 1
+            while self._escrevendo or self._leitores > 0:
+                self._cond.wait()
+            self._escritores_esperando -= 1
+            self._escrevendo = True
+
+    def liberar_escrita(self):
+        with self._cond:
+            self._escrevendo = False
+            self._cond.notify_all()
+
+class Config:
+    def __init__(self):
+        self._rw = RWLock()
+        self.versao = 0
+        self.timeout = 0  # invariante: timeout == versao * 10
+
+    def ler(self):
+        self._rw.adquirir_leitura()
+        try:
+            return self.versao, self.timeout
+        finally:
+            self._rw.liberar_leitura()
+
+    def atualizar(self):
+        self._rw.adquirir_escrita()
+        try:
+            self.versao += 1
+            self.timeout = self.versao * 10
+        finally:
+            self._rw.liberar_escrita()
+
+cfg = Config()
+inconsistencias = [0] * 4
+
+def leitor(i):
+    for _ in range(2000):
+        v, t = cfg.ler()
+        if t != v * 10:
+            inconsistencias[i] += 1
+
+def escritor():
+    for _ in range(300):
+        cfg.atualizar()
+
+threads = [threading.Thread(target=leitor, args=(i,)) for i in range(4)]
+threads.append(threading.Thread(target=escritor))
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+print("inconsistencias vistas:", sum(inconsistencias))
+print("versao final:", cfg.ler())
+```
+
+```text
+Saída:
+inconsistencias vistas: 0
+versao final: (300, 3000)
+```
+
+## Trade-offs e armadilhas
+
+- **Não é sempre mais rápido.** Um RW lock tem mais estado para manter que um mutex. Se a seção crítica é curtíssima ou as escritas são frequentes, o mutex simples costuma ganhar. Meça.
+- **Starvation.** Com preferência para leitores, um fluxo constante de leituras pode impedir a escrita para sempre. Com preferência para escritores, o inverso pode acontecer. Implementações justas (como `ReentrantReadWriteLock(true)` em Java) atendem em ordem de chegada, com algum custo.
+- **Upgrade de leitura para escrita.** Segurar o lock de leitura e tentar pegar o de escrita trava se dois leitores fizerem isso ao mesmo tempo: cada um espera o outro sair. Libere a leitura, pegue a escrita e **verifique de novo** a condição.
+- **Escrever com o lock de leitura** é um bug silencioso: o código compila e a corrupção aparece sob carga.
+
+<Callout type="tip" title="Alternativa sem lock para leitura">
+Se as escritas são raras, considere copy-on-write: o escritor monta um objeto novo e troca a referência de uma vez. Leitores apenas leem a referência atual, sem lock. É o que `CopyOnWriteArrayList` faz em Java.
+</Callout>
+
+## Na entrevista
+
+Quando o enunciado disser "muitas leituras, poucas escritas", proponha um RW lock e explique por que ele melhora o throughput. Em seguida, levante você mesmo a questão da starvation e diga qual preferência escolheu. Follow-ups comuns: "implemente um RW lock" (contadores protegidos por um mutex e uma variável de condição, como acima) e "como fazer upgrade de leitura para escrita com segurança?" (soltar a leitura, pegar a escrita e revalidar, ou usar `StampedLock.tryConvertToWriteLock` em Java).
+
+<QuizSet>
+<Quiz question="Um RW lock tem dois leitores ativos. Chega um terceiro leitor e não há escritores esperando. O que acontece?" options={["O terceiro espera os dois saírem", "O terceiro entra imediatamente", "Os dois primeiros são interrompidos", "Ocorre deadlock"]} answer={1} explanation="Leituras são compatíveis entre si. Só um escritor ativo ou, com preferência para escritores, um escritor na fila faria o leitor esperar." />
+<Quiz question="Duas threads seguram o lock de leitura e ambas tentam adquirir o de escrita sem soltar o de leitura. O que acontece?" options={["A primeira consegue o upgrade", "Deadlock: cada uma espera a outra soltar a leitura", "As duas escrevem ao mesmo tempo", "O lock rebaixa as duas para leitura"]} answer={1} explanation="O escritor precisa que não haja leitores. Cada thread é leitora e espera que a outra saia, o que nunca acontece." />
+<Quiz question="Num serviço em que metade das operações é escrita, qual escolha tende a ser melhor?" options={["RW lock sempre", "Um mutex simples, já que o ganho de leituras paralelas é pequeno e o RW lock tem mais custo", "Nenhum lock", "Um semáforo com 100 permissões"]} answer={1} explanation="O RW lock compensa quando leituras dominam. Com muitas escritas, o paralelismo é raro e o custo extra de manter contadores pesa." />
+</QuizSet>

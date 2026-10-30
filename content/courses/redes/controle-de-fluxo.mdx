@@ -1,0 +1,120 @@
+---
+title: Controle de fluxo
+kind: lesson
+---
+
+O kernel do receptor guarda os bytes que chegam num **buffer de recepção** até a aplicação chamar `recv`. Se o emissor manda mais rápido do que a aplicação consome, esse buffer enche, e tudo que chegar depois seria descartado e retransmitido à toa. O controle de fluxo resolve isso deixando o receptor dizer, em cada segmento, quanto espaço ainda tem. É uma conversa entre os dois extremos, e não tem nada a ver com o estado da rede no meio (isso é o controle de congestionamento, assunto do próximo capítulo).
+
+## A janela anunciada
+
+Todo segmento TCP carrega o campo **janela** (rwnd): o número de bytes que o receptor aceita além do último byte confirmado. O emissor mantém a regra:
+
+```text
+bytes em voo = último byte enviado - último byte confirmado  <=  rwnd
+```
+
+Visualmente, o emissor enxerga o fluxo dividido em quatro faixas:
+
+```text
+ confirmados | enviados, sem ACK | podem ser enviados | fora da janela
+ ------------+-------------------+--------------------+---------------
+             ^ base              ^ próximo            ^ base + rwnd
+             |<-------------- janela (rwnd) --------->|
+```
+
+Cada ACK que chega empurra a base para a direita e traz uma nova rwnd. Por isso o nome **janela deslizante**: ela anda conforme o receptor confirma e libera espaço.
+
+## Simulando um receptor lento
+
+No programa, o emissor quer mandar 6.000 bytes em segmentos de 1.000. O buffer do receptor tem 3.000 bytes, e a aplicação lê de forma irregular: um pouco, depois trava por duas rodadas (pense numa pausa de GC), depois lê tudo de uma vez. Observe a janela encolher até zero e o emissor ficar parado.
+
+```python
+BUF = 3000
+MSS = 1000
+TOTAL = 6000
+LEITURAS_APP = [1000, 0, 0, 3000, 1000]   # bytes lidos pela aplicação em cada rodada
+
+enviado = confirmado = 0
+no_buffer = 0
+rwnd = BUF
+rodada = 0
+while confirmado < TOTAL:
+    rodada += 1
+    # emissor manda o que a janela permite
+    lote = 0
+    while enviado < TOTAL and (enviado - confirmado) + MSS <= rwnd:
+        enviado += MSS
+        lote += MSS
+    # receptor coloca no buffer e confirma
+    no_buffer += lote
+    confirmado = enviado
+    # aplicação lê um pedaço
+    lido = min(LEITURAS_APP[rodada - 1], no_buffer)
+    no_buffer -= lido
+    rwnd = BUF - no_buffer
+    status = "  <- janela zero, emissor parado" if lote == 0 else ""
+    print(f"r{rodada}: enviou {lote:4} | buffer {no_buffer:4} | rwnd {rwnd:4}{status}")
+```
+
+```text
+Saída:
+r1: enviou 3000 | buffer 2000 | rwnd 1000
+r2: enviou 1000 | buffer 3000 | rwnd    0
+r3: enviou    0 | buffer 3000 | rwnd    0  <- janela zero, emissor parado
+r4: enviou    0 | buffer    0 | rwnd 3000  <- janela zero, emissor parado
+r5: enviou 2000 | buffer 1000 | rwnd 2000
+```
+
+Ao fim da rodada 2 a janela chega a zero e o emissor passa as rodadas 3 e 4 ocioso, mesmo com a rede livre. Só quando a aplicação volta a ler a janela reabre e o envio recomeça na rodada 5. Não adianta o emissor ser rápido; o gargalo é quem lê. Isso é exatamente o que você vê em produção quando um consumidor lento (um worker travado em GC, um banco sobrecarregado) faz o produtor bloquear em `send`.
+
+## Janela zero e sondas
+
+Se a aplicação para de ler, o receptor anuncia **rwnd = 0** e o emissor para. Mas e se o ACK que reabre a janela se perder? Os dois esperariam para sempre. Para evitar o impasse, o emissor dispara periodicamente uma **sonda de janela zero** (um segmento minúsculo) até receber uma rwnd positiva. Em capturas, `TCP ZeroWindow` e `TCP ZeroWindowProbe` são o sinal clássico de que o problema está na aplicação receptora, não na rede.
+
+Outra armadilha é a **síndrome da janela boba**: o receptor libera 10 bytes, anuncia janela 10, o emissor manda 10 bytes com 40 de cabeçalho, e o fluxo vira migalha. Os dois lados se protegem: o receptor só reabre quando há espaço razoável (um MSS ou metade do buffer) e o emissor, com Nagle, prefere juntar dados.
+
+## Janela e vazão: o produto banda-atraso
+
+O campo janela tem 16 bits, ou seja, no máximo 65.535 bytes. Como o emissor só pode ter uma janela em voo por RTT, a vazão máxima é **janela dividida pelo RTT**, não importa quão larga seja a fibra.
+
+```python
+def vazao_mbps(janela_bytes, rtt_ms):
+    return janela_bytes * 8 / (rtt_ms / 1000) / 1e6
+
+def bdp_bytes(banda_mbps, rtt_ms):
+    return int(banda_mbps * 1e6 / 8 * rtt_ms / 1000)
+
+for rtt in (1, 20, 80, 200):
+    print(f"RTT {rtt:3} ms: janela 64 KiB rende {vazao_mbps(65535, rtt):7.1f} Mbit/s")
+print("para 1 Gbit/s a 80 ms o buffer precisa de", bdp_bytes(1000, 80), "bytes")
+```
+
+```text
+Saída:
+RTT   1 ms: janela 64 KiB rende   524.3 Mbit/s
+RTT  20 ms: janela 64 KiB rende    26.2 Mbit/s
+RTT  80 ms: janela 64 KiB rende     6.6 Mbit/s
+RTT 200 ms: janela 64 KiB rende     2.6 Mbit/s
+para 1 Gbit/s a 80 ms o buffer precisa de 10000000 bytes
+```
+
+A solução é a opção **window scale**, negociada no handshake, que multiplica a janela por uma potência de 2 (até 2 elevado a 14). Ela só funciona se ambos os lados a anunciarem no SYN; um middlebox antigo que remove a opção derruba a vazão de transferências entre continentes para poucos megabits. Kernels modernos também fazem **autotuning** do buffer, mas um `SO_RCVBUF` fixo e pequeno configurado na aplicação desliga esse ajuste.
+
+| Sintoma | Causa provável |
+| --- | --- |
+| Captura mostra ZeroWindow repetido | Aplicação receptora não lê rápido o bastante |
+| Vazão baixa só em links de RTT alto | Janela ou buffer menor que o produto banda-atraso |
+| Muitos segmentos minúsculos | Janela boba ou Nagle desligado com escritas pequenas |
+
+<Callout type="note" title="Fluxo versus congestionamento">
+O emissor respeita o menor de dois limites: a rwnd, que protege o receptor, e a janela de congestionamento, que protege a rede. Em entrevista, deixar essa distinção clara já separa uma resposta boa de uma confusa.
+</Callout>
+
+## Na entrevista
+
+Explique a janela deslizante com o desenho das quatro faixas e diga quem decide o tamanho: o receptor, pelo espaço livre no buffer. Use a fórmula vazão = janela / RTT para mostrar por que transferências de longa distância precisam de window scaling. Follow-ups: "como você diagnostica um consumidor lento numa captura?" (ZeroWindow) e "por que backpressure em filas de mensagens lembra controle de fluxo?" (ambos param o produtor quando o consumidor não acompanha).
+
+<QuizSet>
+<Quiz question="Uma captura mostra o servidor anunciando janela zero repetidamente enquanto o cliente envia sondas. Onde está o gargalo?" options={["Na rede, por congestionamento", "Na aplicação do servidor, que não está lendo o buffer de recepção", "No DNS", "No handshake TLS"]} answer={1} explanation="Janela zero significa buffer de recepção cheio; a rede pode estar ótima. Quem não consome é a aplicação." />
+<Quiz question="Com janela de 64 KiB e RTT de 100 ms, qual é aproximadamente a vazão máxima de uma conexão TCP?" options={["64 Mbit/s", "5,2 Mbit/s", "640 Mbit/s", "Depende só da largura do link"]} answer={1} explanation="65.535 bytes x 8 / 0,1 s dá cerca de 5,2 Mbit/s. Só window scaling (ou RTT menor) aumenta esse teto." />
+</QuizSet>

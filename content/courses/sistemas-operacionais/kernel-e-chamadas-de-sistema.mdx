@@ -1,0 +1,139 @@
+---
+title: Kernel e chamadas de sistema
+kind: lesson
+---
+
+Se qualquer programa pudesse escrever direto no controlador de disco ou mudar a tabela de páginas, um bug num script derrubaria a máquina inteira. Por isso a CPU tem pelo menos dois **modos de execução**: o **modo usuário**, em que instruções perigosas são proibidas, e o **modo kernel** (ou supervisor), em que tudo é permitido. Seu código roda em modo usuário. Quando precisa de algo que só o kernel pode fazer, ele faz uma **chamada de sistema** (syscall).
+
+## Como uma syscall acontece
+
+Uma syscall não é uma chamada de função comum. O programa coloca o número da chamada e os argumentos em registradores e executa uma instrução especial (`syscall` em x86-64, `svc` em ARM). A CPU muda para modo kernel e salta para um ponto de entrada fixo, definido pelo próprio kernel. O programa não escolhe para onde pular: isso é o que torna a fronteira segura.
+
+```text
+ modo usuário                          modo kernel
+ ------------                          -----------
+ read(fd, buf, 4096)
+   libc: rax = 0 (número do read)
+         rdi, rsi, rdx = argumentos
+   instrução syscall  ───────────────►  entrada de syscall
+                                        valida fd e ponteiro buf
+                                        tabela[0] → sys_read
+                                        copia dados para buf
+   continua com rax = bytes lidos ◄────  retorno ao modo usuário
+```
+
+O kernel trata os argumentos como hostis: confere se o descritor existe e se o ponteiro aponta para memória do próprio processo. Se algo estiver errado, devolve um código de erro (`errno`) em vez de travar.
+
+A simulação a seguir modela essa despachante: uma tabela de números para funções, validação de argumentos e contagem de trocas de modo.
+
+```python
+class Kernel:
+    def __init__(self):
+        self.arquivos = {3: b"config=prod"}
+        self.trocas_de_modo = 0
+        self.tabela = {0: self.sys_read, 1: self.sys_write, 39: self.sys_getpid}
+        self.saida = []
+
+    def syscall(self, numero, *args):
+        self.trocas_de_modo += 2  # entrar e sair do modo kernel
+        handler = self.tabela.get(numero)
+        if handler is None:
+            return "ENOSYS"
+        return handler(*args)
+
+    def sys_read(self, fd, n):
+        if fd not in self.arquivos:
+            return "EBADF"
+        return self.arquivos[fd][:n]
+
+    def sys_write(self, fd, dados):
+        if fd != 1:
+            return "EBADF"
+        self.saida.append(dados)
+        return len(dados)
+
+    def sys_getpid(self):
+        return 4242
+
+k = Kernel()
+print("read(3, 6)  ->", k.syscall(0, 3, 6))
+print("read(7, 6)  ->", k.syscall(0, 7, 6))
+print("write(1)    ->", k.syscall(1, 1, b"ola"))
+print("getpid()    ->", k.syscall(39))
+print("syscall 999 ->", k.syscall(999))
+print("trocas de modo:", k.trocas_de_modo)
+```
+
+```text
+Saída:
+read(3, 6)  -> b'config'
+read(7, 6)  -> EBADF
+write(1)    -> 3
+getpid()    -> 4242
+syscall 999 -> ENOSYS
+trocas de modo: 10
+```
+
+## O erro chega como errno
+
+No mundo real, o mesmo acontece. Pedir ao kernel para ler um descritor que não existe não derruba nada: a syscall volta com `EBADF`, e o Python transforma isso em `OSError`.
+
+```python
+import errno
+import os
+
+try:
+    os.read(987654, 10)
+except OSError as e:
+    print("errno:", e.errno, errno.errorcode[e.errno])
+
+r, w = os.pipe()
+print("escrito:", os.write(w, b"ping"))
+print("lido:", os.read(r, 4))
+os.close(r)
+os.close(w)
+```
+
+```text
+Saída:
+errno: 9 EBADF
+escrito: 4
+lido: b'ping'
+```
+
+Repare que quase nada do que você escreve no dia a dia é syscall direta. Um `print` em Python passa pelo objeto de arquivo, pelo buffer de texto e só no fim chama `write`. Um `socket.recv` vira `recvfrom`. Um `time.sleep` vira `clock_nanosleep`. A biblioteca padrão é uma camada fina e conveniente sobre a interface do kernel, e ferramentas como `strace` deixam essa camada visível.
+
+## Quanto custa atravessar a fronteira
+
+Uma syscall simples custa da ordem de 100 nanossegundos a alguns microssegundos, bem mais que uma chamada de função (cerca de 1 ns). Além da troca de modo, há salvamento de registradores, verificações de segurança e, desde as mitigações para Meltdown, às vezes troca de tabelas de páginas. Isso explica várias decisões que você vê em bibliotecas:
+
+| Técnica | Ideia | Onde aparece |
+| --- | --- | --- |
+| Buffer em espaço de usuário | Juntar muitas escritas pequenas numa syscall | `BufferedWriter`, `stdio`, loggers |
+| vDSO | Executar certas chamadas sem entrar no kernel | `clock_gettime`, `gettimeofday` |
+| Chamadas em lote | Uma syscall para muitas operações | `writev`, `sendmmsg`, `io_uring` |
+| Mapear em vez de copiar | Evitar cópias entre kernel e usuário | `mmap`, `sendfile` |
+
+<Callout type="note" title="Kernel monolítico ou microkernel">
+Linux é monolítico: drivers, sistema de arquivos e rede rodam todos em modo kernel, o que é rápido, mas um driver com bug pode derrubar o sistema. Microkernels (seL4, QNX) movem esses serviços para processos em modo usuário, ganhando isolamento ao custo de mais trocas de mensagem.
+</Callout>
+
+## Ferramentas para observar
+
+```bash
+strace -c python3 script.py      # conta syscalls por tipo
+strace -e trace=openat,read ls   # mostra só algumas chamadas
+ltrace ./programa                # chamadas de biblioteca, não do kernel
+```
+
+Rodar `strace -c` num serviço lento costuma revelar milhares de `write` minúsculos ou `futex` em excesso, pistas diretas do gargalo.
+
+## Na entrevista
+
+Explique a separação de modos, o que dispara a troca (instrução de syscall, interrupção ou exceção) e por que o kernel valida tudo. Mostre que entende o custo citando buffers e vDSO. Follow-ups prováveis: "o que acontece, passo a passo, quando você chama `read`?" e "por que `printf` não chama `write` a cada caractere?" (buffer da libc, descarregado por quebra de linha ou por cheio).
+
+<QuizSet>
+<Quiz question="Por que o programa não pode escolher o endereço do kernel para onde saltar ao fazer uma syscall?" options={["Porque seria lento demais", "Porque assim o kernel controla o ponto de entrada e pode validar tudo antes de agir", "Porque o endereço muda a cada boot", "Porque a libc não permite"]} answer={1} explanation="O salto vai para um ponto de entrada fixo registrado pelo kernel; isso impede que código de usuário execute trechos arbitrários com privilégio." />
+<Quiz question="Um serviço faz um write para cada linha de log, com milhares de linhas por segundo, e o strace mostra a maior parte do tempo em syscalls. Qual a melhoria mais direta?" options={["Aumentar a prioridade do processo", "Bufferizar as linhas em memória e escrever em blocos maiores", "Trocar o disco por um SSD", "Usar mais threads chamando write"]} answer={1} explanation="O custo fixo por syscall domina com escritas pequenas; agrupar em blocos reduz drasticamente o número de travessias." />
+<Quiz question="Para que serve o vDSO no Linux?" options={["Carregar drivers em modo usuário", "Permitir que chamadas como clock_gettime rodem sem entrar no kernel", "Virtualizar dispositivos de disco", "Compactar a memória do kernel"]} answer={1} explanation="O kernel mapeia uma pequena biblioteca em cada processo com dados que podem ser lidos sem troca de modo, como o relógio." />
+</QuizSet>

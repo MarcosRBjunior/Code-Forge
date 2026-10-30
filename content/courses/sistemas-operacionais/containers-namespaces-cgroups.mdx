@@ -1,0 +1,150 @@
+---
+title: "Containers: namespaces e cgroups"
+kind: lesson
+---
+
+Um container não é uma VM pequena. Não existe "kernel do container": ele é um **processo comum** do host, rodando no mesmo kernel que todos os outros, só que com uma visão restrita do sistema e limites de consumo. Duas funcionalidades do kernel Linux fazem esse truque: **namespaces** controlam o que o processo **enxerga**, e **cgroups** controlam quanto ele pode **usar**. Somando um sistema de arquivos em camadas e algumas restrições de segurança, você tem o Docker.
+
+## Namespaces: o que o processo vê
+
+Cada namespace isola uma categoria de recurso. Processos no mesmo namespace compartilham a visão; processos em namespaces diferentes têm visões independentes.
+
+| Namespace | Isola | Efeito no container |
+| --- | --- | --- |
+| PID | Árvore de processos | Seu app é o PID 1 e não vê processos do host |
+| Mount | Pontos de montagem | Tem o próprio sistema de arquivos raiz |
+| Network | Interfaces, rotas, portas | Tem o próprio `eth0` e `localhost` |
+| UTS | Hostname | `hostname` devolve o id do container |
+| IPC | Memória compartilhada System V, filas | Não enxerga IPC do host |
+| User | UIDs e GIDs | root dentro pode ser usuário comum fora |
+| Cgroup | Visão da hierarquia de cgroups | Vê só o próprio cgroup |
+
+O mesmo processo tem um PID em cada nível. A simulação abaixo modela um namespace de PID aninhado no do host: o processo do container se chama 1 lá dentro, mas é 48213 para o host, e o container não consegue nem nomear processos de fora.
+
+```python
+class NamespacePID:
+    def __init__(self, nome, pai=None):
+        self.nome, self.pai = nome, pai
+        self.proximo = 1
+        self.tabela = {}          # pid local -> processo
+
+    def registrar(self, proc):
+        pid = self.proximo
+        self.proximo += 1
+        self.tabela[pid] = proc
+        return pid
+
+def criar_processo(nome, ns, inicio_host=None):
+    proc = {"nome": nome, "pids": {}}
+    atual = ns
+    while atual:                      # recebe um PID em cada namespace ancestral
+        if atual.pai is None and inicio_host is not None:
+            atual.proximo = max(atual.proximo, inicio_host)
+        proc["pids"][atual.nome] = atual.registrar(proc)
+        atual = atual.pai
+    return proc
+
+host = NamespacePID("host")
+for nome in ["systemd", "sshd", "dockerd"]:
+    criar_processo(nome, host)
+ctr = NamespacePID("container", pai=host)
+app = criar_processo("python app.py", ctr, inicio_host=48213)
+worker = criar_processo("gunicorn worker", ctr)
+
+for p in [app, worker]:
+    print(f"{p['nome']:<16} pids={p['pids']}")
+print("container ve:", sorted((pid, p["nome"]) for pid, p in ctr.tabela.items()))
+print("host ve:     ", sorted((pid, p["nome"]) for pid, p in host.tabela.items()))
+```
+
+```text
+Saída:
+python app.py    pids={'container': 1, 'host': 48213}
+gunicorn worker  pids={'container': 2, 'host': 48214}
+container ve: [(1, 'python app.py'), (2, 'gunicorn worker')]
+host ve:      [(1, 'systemd'), (2, 'sshd'), (3, 'dockerd'), (48213, 'python app.py'), (48214, 'gunicorn worker')]
+```
+
+```bash
+unshare --pid --fork --mount-proc bash   # cria namespaces na mão
+ps aux                                    # dentro: só bash e ps
+lsns                                      # lista namespaces do host
+nsenter -t 48213 -n ip addr               # entra na rede do container
+```
+
+## cgroups: quanto o processo usa
+
+Os **control groups** organizam processos numa hierarquia e aplicam limites e contabilidade a cada grupo. No cgroup v2, os mais importantes para quem roda serviços são:
+
+- **`memory.max`:** limite de memória. Passou, o OOM killer age **dentro do cgroup** e o container morre com código 137.
+- **`cpu.max`:** cota de CPU no formato "quota período", por exemplo `50000 100000` = meio núcleo.
+- **`cpu.weight`:** peso relativo quando há disputa (equivale aos `requests` do Kubernetes).
+- **`io.max`** e **`pids.max`:** limitam E/S e número de processos (protege contra fork bomb).
+
+## O throttling que derruba a latência
+
+A cota de CPU é medida por período (100 ms por padrão), somando o uso de **todas** as threads. Um serviço com limite de 2 núcleos e 8 threads ocupadas consome os 200 ms de cota em 25 ms de relógio, e fica **congelado** pelos 75 ms restantes do período, mesmo com a máquina ociosa. A simulação mostra uma requisição que precisa de 300 ms de CPU, paralelizada em várias threads:
+
+```python
+PERIODO_MS = 100
+
+def latencia(trabalho_ms, threads, limite_nucleos):
+    quota = limite_nucleos * PERIODO_MS
+    relogio, restante, throttled = 0.0, float(trabalho_ms), 0
+    while restante > 0:
+        capacidade = min(quota, threads * PERIODO_MS)   # cota ou paralelismo
+        uso = min(capacidade, restante)
+        restante -= uso
+        if restante > 0:
+            if quota < threads * PERIODO_MS:
+                throttled += 1                       # cota acabou antes do periodo
+            relogio += PERIODO_MS
+        else:
+            relogio += uso / threads
+    return relogio, throttled
+
+for threads, limite in [(1, 2), (4, 2), (8, 2), (8, 8)]:
+    ms, n = latencia(300, threads, limite)
+    print(f"threads={threads} limite={limite} nucleos -> latencia={ms:6.1f} ms, periodos throttled={n}")
+```
+
+```text
+Saída:
+threads=1 limite=2 nucleos -> latencia= 300.0 ms, periodos throttled=0
+threads=4 limite=2 nucleos -> latencia= 125.0 ms, periodos throttled=1
+threads=8 limite=2 nucleos -> latencia= 112.5 ms, periodos throttled=1
+threads=8 limite=8 nucleos -> latencia=  37.5 ms, periodos throttled=0
+```
+
+Com 8 threads e limite de 2 núcleos, a requisição gasta a cota inteira em 25 ms, fica congelada por 75 ms e só termina no período seguinte: 112,5 ms para um trabalho que, com 8 núcleos, levaria 37,5 ms. É o motivo por que muitos times removem `limits` de CPU no Kubernetes (mantendo `requests`) ou ajustam o número de threads do runtime ao limite. A métrica `nr_throttled` em `cpu.stat` denuncia o problema.
+
+<Callout type="warning" title="Runtimes que não enxergam o cgroup">
+Versões antigas da JVM, do Go e do Node liam o número de núcleos e a memória do **host**, criavam threads e heaps grandes demais e eram mortas ou estranguladas. Hoje a JVM respeita o cgroup (`-XX:+UseContainerSupport`), e no Go você pode usar `GOMAXPROCS` alinhado ao limite. Confira sempre o que o seu runtime enxerga dentro do container.
+</Callout>
+
+## Os outros ingredientes
+
+- **Sistema de arquivos em camadas (overlayfs):** a imagem é um conjunto de camadas somente leitura com uma camada gravável por cima. Dez containers da mesma imagem compartilham as camadas em disco e no page cache.
+- **Capabilities, seccomp e LSMs (AppArmor, SELinux):** reduzem o que o root do container pode fazer e quais syscalls ele pode chamar.
+
+## Container ou VM?
+
+| Aspecto | Container | VM |
+| --- | --- | --- |
+| Kernel | Compartilhado com o host | Próprio |
+| Inicialização | Milissegundos | Segundos (microVM: cerca de 100 ms) |
+| Densidade | Centenas por host | Dezenas |
+| Isolamento | Bom, mas um bug no kernel afeta todos | Forte, fronteira de hardware |
+| Uso típico | Microsserviços do mesmo dono | Multi-tenant hostil, SOs diferentes |
+
+Para código não confiável de vários clientes, provedores combinam os dois: gVisor (kernel em espaço de usuário), Kata Containers e Firecracker colocam cada container dentro de uma microVM.
+
+## Na entrevista
+
+Diga logo que container é processo com namespaces e cgroups sobre o kernel do host, liste os namespaces principais e explique os limites de memória e CPU com suas consequências reais: OOMKilled e throttling. Follow-ups comuns: "por que meu container é morto com 137?" (passou de `memory.max`) e "um container root é root no host?" (sem user namespace, o UID é o mesmo; capabilities e seccomp limitam, mas a superfície de ataque é o kernel compartilhado).
+
+<QuizSet>
+<Quiz question="Qual mecanismo do kernel faz um processo dentro do container se ver como PID 1 e não enxergar os processos do host?" options={["cgroups", "Namespace de PID", "seccomp", "overlayfs"]} answer={1} explanation="O namespace de PID dá ao container uma árvore de processos própria; no host, o mesmo processo tem outro PID." />
+<Quiz question="Um serviço Go com limite de 1 núcleo no Kubernetes roda num host de 32 núcleos e tem picos de latência com nr_throttled alto. Qual a causa provável?" options={["Falta de memória", "O runtime usa muitas threads em paralelo e consome a cota de CPU do período rapidamente, ficando congelado até o próximo período", "O disco está lento", "O namespace de rede está mal configurado"]} answer={1} explanation="A cota é somada entre threads; ajustar GOMAXPROCS ao limite ou remover o limite de CPU reduz o throttling." />
+<Quiz question="Por que containers inicializam muito mais rápido que VMs?" options={["Porque usam menos disco", "Porque são processos no kernel já em execução; não há boot de um kernel nem de hardware virtual", "Porque são escritos em Go", "Porque não têm sistema de arquivos"]} answer={1} explanation="Criar namespaces e cgroups e executar um processo leva milissegundos; uma VM precisa inicializar um SO inteiro." />
+</QuizSet>

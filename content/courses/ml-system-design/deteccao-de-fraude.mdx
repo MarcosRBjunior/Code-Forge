@@ -1,0 +1,167 @@
+---
+title: Detecção de fraude
+kind: lesson
+---
+
+"Projete um sistema que detecte transações de cartão fraudulentas em tempo real." Diferente de recomendação, aqui o erro tem custo financeiro direto nos dois sentidos: deixar passar uma fraude custa o valor da compra; bloquear um cliente legítimo custa a venda e, às vezes, o cliente. Além disso, os dados são muito desbalanceados e o adversário se adapta ao seu modelo.
+
+## Esclarecer o objetivo e a métrica
+
+Perguntas que você deve fazer logo no início:
+
+- **Qual decisão o sistema toma?** Aprovar, recusar ou mandar para revisão manual (ou pedir autenticação extra, como um código no celular).
+- **Qual a latência permitida?** A autorização de cartão costuma ter um orçamento total de algumas centenas de milissegundos; o modelo recebe uma fatia pequena disso, digamos 50 ms.
+- **Qual a taxa de fraude?** Tipicamente bem abaixo de 1% das transações. Use números hipotéticos e diga isso.
+
+A métrica de negócio é **perda total**: valor das fraudes aprovadas mais o custo de falsos positivos (venda perdida, atrito, revisão manual). Offline, como a classe positiva é rara, use **precision-recall** e não acurácia: um modelo que aprova tudo tem 99,8% de acurácia e é inútil.
+
+## Dados e rótulos
+
+- **Rótulo**: transação contestada pelo cliente (chargeback) ou confirmada como fraude pela equipe de análise.
+- **Atraso do rótulo**: um chargeback pode chegar semanas depois. Os dados das últimas semanas ainda têm fraudes não descobertas rotuladas como legítimas. Treine com uma janela que termine algumas semanas antes de hoje, ou modele explicitamente a maturação do rótulo.
+- **Viés de seleção**: transações recusadas pelo modelo atual nunca viram chargeback, então você não sabe se eram fraude. Reserve uma fração pequena de tráfego de baixo valor em que a decisão é aprovar para manter um conjunto de avaliação sem esse viés.
+
+## Features
+
+A maior parte do poder vem de **agregados de velocidade** e de comparação com o comportamento habitual:
+
+- Número de transações do cartão nos últimos 10 minutos, 1 hora, 24 horas.
+- Valor da compra dividido pela média dos últimos 90 dias do cliente.
+- Distância entre o local da compra e o da compra anterior, dividida pelo tempo entre elas.
+- Dispositivo ou e-mail visto pela primeira vez; quantos cartões diferentes usaram o mesmo dispositivo.
+- Taxa histórica de fraude do comerciante e da categoria.
+- Sinais de grafo: o cartão compartilha dispositivo ou endereço com contas já marcadas como fraude.
+
+Esses agregados exigem uma **feature store com streaming**: um processador de eventos atualiza janelas deslizantes por cartão, e o servimento lê o valor em poucos milissegundos. O treino precisa reconstruir o valor exato que existia no momento de cada transação (consulta ponto no tempo), senão há vazamento.
+
+## Modelo de base e evolução
+
+1. **Regras**: "mais de 5 compras em 10 minutos em comerciantes diferentes". Rápidas de entender e de mudar, mas frágeis.
+2. **Gradient boosting** sobre features tabulares: o padrão da indústria para esse problema, rápido no servimento e robusto a features heterogêneas.
+3. **Complementos**: modelos de sequência sobre o histórico do cartão, embeddings de grafo, detecção de anomalia não supervisionada para padrões novos.
+
+As regras continuam existindo ao lado do modelo, como camada de política e resposta rápida a um ataque em andamento.
+
+## Escolhendo o limiar por custo
+
+O modelo devolve uma pontuação; a decisão vem de um limiar. O programa abaixo gera transações hipotéticas com 2% de fraude, mostra que acurácia engana e escolhe o limiar que minimiza a perda total.
+
+```python
+import random
+
+random.seed(42)
+transacoes = []
+for _ in range(5000):
+    fraude = random.random() < 0.02
+    valor = random.uniform(20, 2000) if fraude else random.uniform(5, 400)
+    score = random.betavariate(5, 2) if fraude else random.betavariate(1.2, 6)
+    transacoes.append((score, fraude, valor))
+
+CUSTO_FALSO_POSITIVO = 15.0  # atrito, revisão e venda perdida (hipotético)
+
+def avaliar(limiar):
+    tp = fp = fn = tn = 0
+    perda = 0.0
+    for score, fraude, valor in transacoes:
+        bloqueia = score >= limiar
+        if fraude and bloqueia: tp += 1
+        elif fraude: fn += 1; perda += valor
+        elif bloqueia: fp += 1; perda += CUSTO_FALSO_POSITIVO
+        else: tn += 1
+    precisao = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn)
+    acuracia = (tp + tn) / len(transacoes)
+    return precisao, recall, acuracia, perda
+
+p, r, a, perda = avaliar(1.01)
+print(f"aprova tudo: acuracia {a:.3f}, recall {r:.2f}, perda {perda:.0f}")
+print("limiar  precisao  recall  perda")
+melhor = None
+for limiar in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
+    p, r, a, perda = avaliar(limiar)
+    print(f"{limiar:6.1f}  {p:8.2f}  {r:6.2f}  {perda:6.0f}")
+    if melhor is None or perda < melhor[1]:
+        melhor = (limiar, perda)
+print(f"melhor limiar: {melhor[0]} (perda {melhor[1]:.0f})")
+```
+
+```text
+Saída:
+aprova tudo: acuracia 0.979, recall 0.00, perda 108877
+limiar  precisao  recall  perda
+   0.3      0.12    1.00   11940
+   0.4      0.24    0.96    9367
+   0.5      0.46    0.92    9793
+   0.6      0.73    0.79   23072
+   0.7      0.89    0.60   43386
+   0.8      0.98    0.39   66370
+melhor limiar: 0.4 (perda 9367)
+```
+
+Aprovar tudo dá 97,9% de acurácia e a maior perda da tabela. O melhor limiar tem precisão de apenas 24%, mas corta a perda para menos de um décimo, porque bloquear um honesto custa pouco perto de uma fraude de valor alto. Note como a perda é uma curva em U: com limiar baixo você bloqueia muita gente honesta, com limiar alto deixa fraudes caras passarem. Na prática, o limiar pode depender do valor da compra: transações altas justificam mais atrito.
+
+## Arquitetura de treino e servimento
+
+```text
+  transação ---> +-------------------+   features    +------------------+
+  (gateway)      | serviço de        |<------------- | feature store    |
+                 | decisão de risco  |   < 10 ms     | online (janelas  |
+                 | regras + modelo   |               | por cartão)      |
+                 +----+---------+----+               +--------^---------+
+                      |         |                             |
+           aprovar / recusar / revisar               +--------+---------+
+                      |         |                    | processador de   |
+                      |         v                    | streaming        |
+                      |  +-------------+             +--------^---------+
+                      |  | fila de     |                      |
+                      |  | revisão     |---- rótulos ---+     |
+                      |  +-------------+                |     |
+                      v                                 v     |
+               +-------------+   eventos      +-----------------+
+               | log de      |--------------->| data lake       |
+               | decisões    |  chargebacks ->| (rótulos tardios)|
+               +-------------+                +--------+--------+
+                                                       |
+                                              +--------v--------+
+                                              | treino semanal  |
+                                              | ponto no tempo  |
+                                              +--------+--------+
+                                                       v
+                                             registro de modelos -> shadow -> produção
+```
+
+Antes de substituir o modelo de produção, rode o novo em **modo sombra**: ele pontua as transações reais sem decidir nada, e você compara as decisões que ele teria tomado.
+
+## Avaliação
+
+- **Offline**: área sob a curva precision-recall (mais informativa que ROC-AUC com classes raras), recall a uma taxa fixa de falsos positivos, e perda simulada em reais. Divisão estritamente temporal.
+- **Online**: perda total, taxa de aprovação, taxa de contestação e volume da fila de revisão. Testes A/B são delicados porque o rótulo demora semanas; use métricas antecipadas (como alertas confirmados pela revisão) e confirme depois.
+
+## Monitoramento
+
+Drift de features (PSI semanal), taxa de bloqueio por comerciante e região, latência, e principalmente **mudança de padrão do adversário**: queda súbita de recall em uma categoria indica um ataque novo. Tenha um caminho para publicar regras em minutos enquanto o próximo modelo treina.
+
+<Callout type="warning" title="O rótulo mais recente mente">
+Dados da última semana parecem limpos porque os chargebacks ainda não chegaram. Se você avaliar um modelo neles, a precisão vai parecer ótima e o recall vai parecer melhor do que é.
+</Callout>
+
+## Trade-offs
+
+| Decisão | Opção A | Opção B |
+| --- | --- | --- |
+| Lógica | Regras: transparentes, frágeis | Modelo: generaliza, precisa de explicação |
+| Limiar | Único: simples | Por valor ou segmento: menos perda, mais complexidade |
+| Atualização | Semanal: estável | Contínua: reage a ataques, risco de aprender ruído |
+
+## Follow-ups comuns
+
+- **Como explicar uma recusa?** Valores de contribuição das features (como SHAP) para a equipe de análise; códigos de motivo padronizados para o cliente.
+- **Cliente novo sem histórico?** Features de dispositivo e de rede pesam mais; limites conservadores no início.
+- **Fraudes coordenadas?** Features de grafo e detecção de comunidades entre contas.
+- **E se a feature store cair?** Valores padrão conservadores e regras de fallback; nunca aprovar tudo cegamente.
+
+<QuizSet>
+<Quiz question="Com 0,2% de fraude, por que acurácia é uma métrica ruim?" options={["Porque é difícil de calcular", "Porque um modelo que aprova tudo já tem 99,8% de acurácia", "Porque ignora a latência", "Porque só funciona com regressão"]} answer={1} explanation="Com classe rara, acurácia é dominada pelos negativos; use precision, recall e perda em dinheiro." />
+<Quiz question="Por que não avaliar o modelo nas transações da última semana?" options={["Há poucas transações", "Muitas fraudes ainda não foram contestadas e aparecem como legítimas", "Os dados estão em outro formato", "A última semana sempre tem drift"]} answer={1} explanation="Chargebacks chegam com atraso; use uma janela já madura para rotular." />
+<Quiz question="Como escolher o limiar de bloqueio?" options={["Sempre 0,5", "Minimizando a perda esperada, que combina fraudes aprovadas e custo de falsos positivos", "Maximizando a acurácia", "Pelo percentil 99 das pontuações"]} answer={1} explanation="O limiar é uma decisão de negócio: equilibra o valor das fraudes perdidas contra o atrito com clientes legítimos." />
+</QuizSet>

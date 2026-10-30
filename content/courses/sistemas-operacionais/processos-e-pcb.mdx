@@ -1,0 +1,133 @@
+---
+title: Processos e o PCB
+kind: lesson
+---
+
+Um **programa** é um arquivo parado no disco: instruções e dados iniciais. Um **processo** é esse programa em execução, com memória própria, arquivos abertos, registradores e um lugar na fila da CPU. O mesmo binário do Python pode virar dez processos diferentes ao mesmo tempo, cada um com seu estado. Entender o que compõe um processo explica por que criá-los custa caro, por que eles não enxergam a memória uns dos outros e o que exatamente o kernel guarda quando tira um processo da CPU.
+
+## O espaço de endereçamento
+
+Cada processo enxerga um espaço de endereços virtual só seu, organizado mais ou menos assim:
+
+```text
+ endereço alto  ┌──────────────────────┐
+                │ pilha (stack)        │  variáveis locais, retornos
+                │        ↓             │
+                │                      │
+                │        ↑             │
+                │ heap                 │  malloc, objetos do Python
+                ├──────────────────────┤
+                │ dados (globais)      │
+                ├──────────────────────┤
+                │ código (text)        │  somente leitura, compartilhável
+ endereço baixo └──────────────────────┘
+```
+
+A pilha cresce para baixo e o heap para cima. Bibliotecas compartilhadas e arquivos mapeados com `mmap` ficam numa região intermediária. Duas cópias do mesmo programa compartilham as páginas de código na memória física, mas cada uma tem pilha, heap e dados próprios.
+
+## O PCB
+
+Para gerenciar processos, o kernel mantém para cada um uma estrutura chamada **PCB** (Process Control Block). No Linux ela se chama `task_struct` e tem centenas de campos. Os essenciais:
+
+| Campo | Para que serve |
+| --- | --- |
+| PID e PPID | Identidade do processo e do pai |
+| Estado | Pronto, executando, bloqueado... |
+| Contexto da CPU | PC, ponteiro de pilha, registradores salvos |
+| Memória | Ponteiro para a tabela de páginas e regiões mapeadas |
+| Arquivos abertos | Tabela de descritores |
+| Escalonamento | Prioridade, tempo de CPU consumido |
+| Credenciais | UID, GID, capabilities |
+| Sinais | Pendentes e máscaras |
+
+A simulação abaixo cria uma tabela de processos com PCBs e reproduz o que `fork` faz: o filho recebe uma cópia do contexto e dos descritores, mas PID novo e PPID apontando para o pai.
+
+```python
+from dataclasses import dataclass, field, replace
+
+@dataclass
+class PCB:
+    pid: int
+    ppid: int
+    estado: str
+    pc: int
+    descritores: dict = field(default_factory=dict)
+
+tabela = {}
+proximo_pid = 100
+
+def criar(ppid, pc):
+    global proximo_pid
+    pcb = PCB(proximo_pid, ppid, "pronto", pc, {0: "stdin", 1: "stdout", 2: "stderr"})
+    tabela[pcb.pid] = pcb
+    proximo_pid += 1
+    return pcb
+
+def fork(pai):
+    global proximo_pid
+    filho = replace(pai, pid=proximo_pid, ppid=pai.pid, descritores=dict(pai.descritores))
+    tabela[filho.pid] = filho
+    proximo_pid += 1
+    return filho
+
+shell = criar(ppid=1, pc=0x400)
+shell.descritores[3] = "historico.txt"
+filho = fork(shell)
+filho.descritores[4] = "saida.log"
+
+for pcb in tabela.values():
+    print(pcb.pid, pcb.ppid, pcb.estado, hex(pcb.pc), sorted(pcb.descritores))
+```
+
+```text
+Saída:
+100 1 pronto 0x400 [0, 1, 2, 3]
+101 100 pronto 0x400 [0, 1, 2, 3, 4]
+```
+
+O filho herdou o descritor 3 do pai, mas abrir o 4 depois do fork não afeta o pai. No Linux real, a memória também é "copiada", só que de forma preguiçosa: com **copy-on-write**, pai e filho compartilham as páginas até que um deles escreva, e só então aquela página é duplicada.
+
+## Criando um processo de verdade
+
+No Unix, criar um processo novo é tipicamente `fork` seguido de `exec` (que troca o programa do filho). No Windows, `CreateProcess` faz as duas coisas de uma vez. O módulo `subprocess` esconde essa diferença:
+
+```python
+import subprocess
+import sys
+
+codigo = "import sys; print('filho calculou', sum(range(10))); sys.exit(3)"
+r = subprocess.run([sys.executable, "-c", codigo], capture_output=True, text=True)
+print("stdout do filho:", r.stdout.strip())
+print("codigo de saida:", r.returncode)
+```
+
+```text
+Saída:
+stdout do filho: filho calculou 45
+codigo de saida: 3
+```
+
+O pai espera o filho terminar e lê seu **código de saída**. No Unix, enquanto o pai não coleta esse código com `wait`, o filho morto continua na tabela como **zumbi**: não usa CPU nem memória, mas ocupa um PID. Se o pai morre antes, o filho vira **órfão** e é adotado pelo init (PID 1).
+
+<Callout type="warning" title="O problema do PID 1 em containers">
+Dentro de um container, seu processo costuma ser o PID 1. Ele herda a obrigação de recolher órfãos e de tratar sinais como SIGTERM. Uma aplicação que não faz isso acumula zumbis ou ignora o `docker stop`. Por isso existem inits mínimos como `tini` e a opção `--init`.
+</Callout>
+
+## Processo ou thread?
+
+Threads de um mesmo processo compartilham memória, descritores e código, mas cada uma tem pilha e registradores próprios. Criar thread é mais barato e a comunicação é direta, porém um bug de memória numa thread derruba todas. Processos isolam falhas e são a base de modelos como o do Chrome (um processo por aba) e do PostgreSQL (um processo por conexão).
+
+```bash
+ps -eo pid,ppid,stat,cmd | head   # PID, pai e estado
+ls /proc/self/fd                  # descritores do próprio processo
+```
+
+## Na entrevista
+
+Defina processo como programa em execução com recursos próprios, cite o PCB e seus campos principais e compare com threads. Follow-ups comuns: "o que é copy-on-write e por que fork é barato?" e "o que é um processo zumbi e como evitar?" (o pai precisa chamar `wait` ou ignorar SIGCHLD).
+
+<QuizSet>
+<Quiz question="Logo após um fork no Linux, o que acontece com a memória do pai e do filho?" options={["Toda a memória é copiada imediatamente", "Eles compartilham as páginas marcadas como copy-on-write até alguém escrever", "O filho começa sem memória nenhuma", "O filho usa a mesma memória e as escritas aparecem nos dois"]} answer={1} explanation="Com copy-on-write, só a página que for escrita é duplicada, o que torna o fork rápido mesmo para processos grandes." />
+<Quiz question="Um serviço cria subprocessos e nunca chama wait. Com o tempo, o que tende a acontecer?" options={["Vazamento de memória RAM gigante", "Acúmulo de processos zumbis ocupando entradas na tabela de processos e PIDs", "O kernel trava", "Os filhos continuam rodando para sempre"]} answer={1} explanation="Zumbis não usam CPU, mas ocupam PIDs; em quantidade, podem esgotar o limite de processos." />
+<Quiz question="Qual informação NÃO costuma ficar no PCB?" options={["Registradores salvos", "Tabela de descritores", "O código-fonte do programa", "Prioridade de escalonamento"]} answer={2} explanation="O PCB guarda estado de execução e recursos; o código executável fica nas páginas de memória do processo, e o código-fonte nem chega ao kernel." />
+</QuizSet>
