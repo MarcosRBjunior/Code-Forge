@@ -1,0 +1,223 @@
+---
+title: Projetar cobras e escadas
+kind: lesson
+---
+
+Cobras e escadas é um jogo sem decisões: o dado manda e o tabuleiro reage. Isso torna o problema ótimo para avaliar **modelagem pura**. Não há IA nem regra complicada de validação. O entrevistador quer ver se você trata cobras e escadas como o mesmo conceito, se o dado é injetável para testes e se a partida tem um laço de turnos limpo, com fim de jogo bem definido.
+
+## Requisitos
+
+Perguntas de esclarecimento:
+
+- **Tamanho do tabuleiro?** O clássico tem 100 casas, mas assuma configurável.
+- **Quantos jogadores?** De 2 a N, jogando em ordem fixa.
+- **Quantos dados?** Um dado de seis faces por padrão; deixe a quantidade e o número de faces configuráveis.
+- **Precisa cair exatamente na última casa?** Variante comum: se passar do fim, o jogador não se move. Pergunte qual regra usar.
+- **Tirar 6 dá jogada extra? Três seis seguidos perdem a vez?** Regras de casa variam muito. Deixe como extensão.
+- **A partida termina no primeiro vencedor ou continua até definir o ranking?** Assuma o primeiro.
+
+Escopo combinado: tabuleiro de N casas com cobras e escadas configuradas, 2 ou mais jogadores, dado injetável, regra de "precisa cair exatamente no fim", e a partida termina quando alguém chega à última casa.
+
+## Entidades e responsabilidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Atalho` | Liga uma casa de origem a uma de destino. Cobra se o destino é menor, escada se é maior. |
+| `Tabuleiro` | Tamanho, mapa de atalhos e a função "dado que caí em X, onde termino?". Valida a configuração. |
+| `Dado` | Interface `rolar()`. Uma implementação aleatória e outra com sequência fixa para testes. |
+| `Jogador` | Nome e posição atual. |
+| `Partida` | Fila de turnos, aplica a regra de movimento, registra eventos e define o vencedor. |
+
+O ponto que mais rende elogio é perceber que **cobra e escada são a mesma coisa**: um salto de uma casa para outra. Criar duas classes com o mesmo comportamento seria duplicação. Basta uma classe `Atalho` e uma propriedade que diz o tipo para fins de exibição.
+
+O segundo ponto é a validação do tabuleiro na construção: dois atalhos não podem começar na mesma casa, nenhum pode começar na última casa, e um atalho não pode terminar no início de outro (senão você cria cadeias ou ciclos confusos). Validar cedo evita bugs difíceis no meio do jogo.
+
+## Diagrama de classes
+
+```text
++-------------------+      +-----------------------+
+|  Partida          |----->|  Tabuleiro            |
+|-------------------|      |-----------------------|
+| - fila: deque     |      | - tamanho: int        |
+| - dado: Dado      |      | - atalhos: {int: At.} |
+| - eventos: [str]  |      | + destino_final(casa) |
+| + turno()         |      +-----------------------+
+| + jogar()         |                 | *
++-------------------+                 v
+   |         |              +-------------------+
+   |         v              |  Atalho           |
+   |  +-------------+       | - origem, destino |
+   |  | Dado (iface)|       | + tipo            |
+   |  | + rolar()   |       +-------------------+
+   |  +-------------+
+   |     ^       ^
+   |  Aleatorio  Viciado (testes)
+   v
++-----------------+
+| Jogador         |
+| - nome, posicao |
++-----------------+
+```
+
+## Padrões usados e por quê
+
+- **Strategy** no dado: a partida não sabe se o número veio de `random` ou de uma lista. Isso torna o jogo totalmente determinístico em testes, que é o follow-up mais previsível do problema.
+- **Injeção de dependência**: o dado e o tabuleiro entram pelo construtor da partida. Nada é criado escondido lá dentro.
+- **Fila (deque) para turnos**: o jogador da vez sai da frente e volta para o fim. Remover jogadores, ou dar jogada extra, vira uma operação natural na fila.
+- **Value object** no `Atalho`: imutável, com validação no construtor. Um atalho que liga uma casa a ela mesma nunca chega a existir.
+
+## Implementação
+
+```python
+import random
+from collections import deque
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional
+
+
+@dataclass(frozen=True)
+class Atalho:
+    origem: int
+    destino: int
+
+    def __post_init__(self):
+        if self.origem == self.destino:
+            raise ValueError("atalho precisa mudar de casa")
+
+    @property
+    def tipo(self) -> str:
+        return "escada" if self.destino > self.origem else "cobra"
+
+
+class Tabuleiro:
+    def __init__(self, tamanho: int, atalhos: Iterable[Atalho]):
+        self.tamanho = tamanho
+        self.atalhos: Dict[int, Atalho] = {}
+        for a in atalhos:
+            if not (1 < a.origem < tamanho and 1 <= a.destino <= tamanho):
+                raise ValueError(f"atalho fora do tabuleiro: {a}")
+            if a.origem in self.atalhos:
+                raise ValueError(f"duas saídas na casa {a.origem}")
+            self.atalhos[a.origem] = a
+        for a in self.atalhos.values():
+            if a.destino in self.atalhos:
+                raise ValueError(f"atalho termina no início de outro: {a}")
+
+    def destino_final(self, casa: int) -> (int, Optional[Atalho]):
+        atalho = self.atalhos.get(casa)
+        return (atalho.destino, atalho) if atalho else (casa, None)
+
+
+class Dado:
+    def rolar(self) -> int:
+        raise NotImplementedError
+
+
+class DadoAleatorio(Dado):
+    def __init__(self, faces: int = 6, semente: Optional[int] = None):
+        self.faces = faces
+        self.rng = random.Random(semente)
+
+    def rolar(self):
+        return self.rng.randint(1, self.faces)
+
+
+class DadoViciado(Dado):
+    def __init__(self, valores: List[int]):
+        self.valores = deque(valores)
+
+    def rolar(self):
+        v = self.valores.popleft()
+        self.valores.append(v)
+        return v
+
+
+class Jogador:
+    def __init__(self, nome: str):
+        self.nome = nome
+        self.posicao = 1
+
+
+class Partida:
+    def __init__(self, tabuleiro: Tabuleiro, jogadores: List[Jogador], dado: Dado):
+        if len(jogadores) < 2:
+            raise ValueError("mínimo de 2 jogadores")
+        self.tab = tabuleiro
+        self.fila = deque(jogadores)
+        self.dado = dado
+        self.vencedor: Optional[Jogador] = None
+        self.eventos: List[str] = []
+
+    def turno(self) -> None:
+        if self.vencedor:
+            raise RuntimeError("partida encerrada")
+        j = self.fila.popleft()
+        valor = self.dado.rolar()
+        alvo = j.posicao + valor
+        if alvo > self.tab.tamanho:
+            self.eventos.append(f"{j.nome} tirou {valor} e passaria do fim; fica em {j.posicao}")
+        else:
+            final, atalho = self.tab.destino_final(alvo)
+            msg = f"{j.nome} tirou {valor}: {j.posicao} -> {alvo}"
+            if atalho:
+                msg += f" ({atalho.tipo} até {final})"
+            j.posicao = final
+            self.eventos.append(msg)
+            if final == self.tab.tamanho:
+                self.vencedor = j
+                self.eventos.append(f"{j.nome} venceu!")
+                return
+        self.fila.append(j)
+
+    def jogar(self, limite: int = 10_000) -> Jogador:
+        for _ in range(limite):
+            if self.vencedor:
+                break
+            self.turno()
+        if not self.vencedor:
+            raise RuntimeError("limite de turnos atingido")
+        return self.vencedor
+
+
+tab = Tabuleiro(20, [Atalho(3, 11), Atalho(14, 4), Atalho(8, 17), Atalho(19, 2)])
+p = Partida(tab, [Jogador("Ana"), Jogador("Bia")], DadoViciado([2, 6, 6, 1, 3, 5, 1, 2]))
+print("vencedor:", p.jogar().nome)
+print("\n".join(p.eventos))
+
+aleatoria = Partida(tab, [Jogador("X"), Jogador("Y"), Jogador("Z")], DadoAleatorio(semente=7))
+print("partida aleatória:", aleatoria.jogar().nome, "em", len(aleatoria.eventos), "eventos")
+
+try:
+    Tabuleiro(10, [Atalho(2, 5), Atalho(5, 9)])
+except ValueError as e:
+    print("erro:", e)
+```
+
+Repare em `jogar(limite=...)`: com cobras bem posicionadas e a regra de cair exatamente no fim, uma partida pode, em teoria, durar muito. Ter um limite explícito evita laços infinitos em testes e simulações.
+
+## Concorrência e extensões
+
+Uma partida local é sequencial por natureza: só um jogador age por vez. Se você expuser o jogo como serviço com várias partidas simultâneas, cada partida é independente; basta isolar o estado por partida e serializar os comandos de cada uma (lock por partida ou um ator por partida). O dado aleatório deve ser por partida também, para que a semente de uma não afete a outra e você consiga reproduzir uma partida a partir da semente registrada.
+
+Extensões comuns:
+
+- **Jogada extra ao tirar 6**: em vez de devolver o jogador ao fim da fila, devolva-o à frente (`appendleft`). Com contador de seis seguidos, a regra "três seis perde a vez" cabe no mesmo ponto.
+- **Vários dados**: um `DadoComposto` que soma vários dados implementa a mesma interface (Composite).
+- **Casas especiais** (volte ao início, perca a vez): generalize `Atalho` para uma interface `EfeitoDeCasa` com `aplicar(jogador)`. O atalho vira só um tipo de efeito.
+- **Interface gráfica ou placar ao vivo**: a lista `eventos` já é um log; promova-a a Observer para notificar a UI a cada movimento.
+
+<Callout type="tip" title="Determinismo vende o design">
+Mostre o dado viciado logo no começo. Ele prova que você pensou em testabilidade e permite demonstrar cobra, escada e a regra do fim com uma sequência conhecida.
+</Callout>
+
+## Follow-ups comuns
+
+- **"Como garantir que o tabuleiro gerado aleatoriamente é jogável?"** Gere atalhos e valide com as mesmas regras do construtor; repita se falhar. Opcionalmente, rode uma busca em largura a partir da casa 1 para provar que a última casa é alcançável.
+- **"Qual o número mínimo de jogadas para vencer?"** É uma BFS clássica sobre as casas, com arestas de 1 a 6 e atalhos aplicados. Ótimo gancho para mostrar que o modelo serve para algoritmos também.
+- **"Por que não usar herança Cobra e Escada?"** Porque não há comportamento diferente. Herança sem comportamento distinto só aumenta o número de classes.
+- **"Onde fica a regra de passar do fim?"** Na partida, porque é uma regra de jogo, não uma propriedade do tabuleiro. Se a variante mudar ("rebate no fim"), só esse método muda.
+
+<QuizSet>
+<Quiz question="Por que modelar cobras e escadas com uma única classe Atalho?" options={["Porque Python não suporta herança", "Porque ambas têm exatamente o mesmo comportamento: mover de uma casa para outra", "Para economizar memória", "Porque escadas são raras"]} answer={1} explanation="A diferença é só a direção do salto, que pode ser derivada de origem e destino." />
+<Quiz question="Qual a principal vantagem de injetar o Dado na Partida?" options={["Deixar o jogo mais rápido", "Permitir testes determinísticos com sequências conhecidas", "Evitar o uso de deque", "Suportar mais jogadores"]} answer={1} explanation="Com um dado de sequência fixa, cada teste reproduz exatamente o mesmo jogo." />
+</QuizSet>

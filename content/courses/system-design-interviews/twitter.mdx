@@ -1,0 +1,149 @@
+---
+title: Projetar o Twitter
+kind: lesson
+---
+
+O Twitter é o exemplo clássico de sistema com **grafo social assimétrico**: você segue quem quiser, sem reciprocidade, e algumas contas têm centenas de milhões de seguidores. Isso torna a montagem da timeline um problema de fan-out muito desigual. Além da timeline, a questão costuma tocar em busca por texto e assuntos em alta.
+
+## Requisitos
+
+### Funcionais
+
+- Publicar posts curtos (até 280 caracteres), com mídia opcional.
+- Seguir e deixar de seguir contas.
+- Timeline inicial: posts recentes de quem você segue, em ordem cronológica reversa (ou ranqueada).
+- Timeline de perfil: posts de um usuário específico.
+- Curtir, repostar e responder.
+- Opcional: busca e assuntos do momento.
+
+### Não funcionais
+
+- Leitura da timeline rápida: p99 abaixo de 200 ms.
+- Um post pode levar alguns segundos para aparecer nas timelines dos seguidores (consistência eventual).
+- Altíssima disponibilidade; leituras dominam escritas.
+
+## Estimativas
+
+- 250 milhões de usuários ativos por dia.
+- Escrita: 500 milhões de posts por dia ≈ **6 mil por segundo**, pico de 20 mil.
+- Leitura de timeline: cada usuário abre 20 vezes por dia: 5 bilhões por dia ≈ **58 mil por segundo**, pico de 150 mil.
+- Fan-out: média de 200 seguidores por autor. 6 mil posts/s × 200 = **1,2 milhão de inserções em timelines por segundo**. Alto, mas paralelizável.
+- Armazenamento de posts: 500 M × 300 bytes = 150 GB por dia, cerca de **55 TB por ano**, sem contar mídia.
+- Cache de timelines: guardar os 800 IDs mais recentes por usuário ativo. 250 M × 800 × 8 bytes ≈ **1,6 TB** de Redis. Grande, mas viável distribuído.
+
+## API
+
+```text
+POST /posts                      { "texto": "...", "midiaIds": [], "respostaA": null }
+GET  /timeline?cursor=...&limite=20
+GET  /usuarios/:id/posts?cursor=...
+POST /usuarios/:id/seguir
+POST /posts/:id/curtir
+GET  /busca?q=eleicao&cursor=...
+```
+
+A paginação usa cursor (o ID do último post visto), nunca offset: a timeline muda o tempo todo, e offset faria itens se repetirem ou sumirem.
+
+## Modelo de dados
+
+```text
+posts (chave: post_id, ID ordenável por tempo, tipo Snowflake)
+  post_id | autor_id | texto | midia | resposta_a | criado_em
+
+seguidores (duas tabelas, uma para cada direção de consulta)
+  segue:      usuario_id -> [quem ele segue]
+  seguidores: usuario_id -> [quem segue ele]
+
+timeline_cache (Redis, lista por usuário)
+  timeline:{usuario_id} = [post_id, post_id, ...]  (até 800)
+```
+
+IDs ordenáveis por tempo permitem ordenar e paginar sem consultar o timestamp.
+
+## Arquitetura de alto nível
+
+```text
+                    +---------------+
+ cliente ---------> | API gateway   |
+                    +--+---------+--+
+                       |         |
+          escrita      |         |   leitura
+          +------------v--+   +--v--------------+
+          | Serviço de    |   | Serviço de      |
+          | posts         |   | timeline        |
+          +--+---------+--+   +--+-----------+--+
+             |         |         |           |
+     +-------v---+  +--v-----+   |     +-----v------+
+     | Banco de  |  | Kafka  |   |     | Redis      |
+     | posts     |  +--+-----+   |     | timelines  |
+     +-----------+     |         |     +-----^------+
+                 +-----v-------+ |           |
+                 | Workers de  |-+-----------+
+                 | fan-out     |   insere post_id nas timelines
+                 +-----+-------+
+                       |
+                 +-----v--------+     +-------------+
+                 | Grafo social |     | Indexador   |
+                 +--------------+     | de busca    |
+                                      +-------------+
+```
+
+## Aprofundamentos
+
+### 1. Fan-out híbrido
+
+Há duas estratégias puras:
+
+- **Fan-out na escrita (push)**: ao publicar, o post é inserido na timeline em cache de cada seguidor. A leitura vira um simples `LRANGE` no Redis.
+- **Fan-out na leitura (pull)**: ao abrir a timeline, busca-se os posts recentes de cada conta seguida e mescla-se.
+
+Push é ótimo para a maioria, mas uma conta com 100 milhões de seguidores geraria 100 milhões de escritas por post. A resposta esperada é o **modelo híbrido**: contas comuns fazem push; contas acima de um limite (digamos 500 mil seguidores) não fazem. Na leitura, o serviço de timeline pega a lista pré-montada e mescla com os posts recentes das poucas celebridades seguidas, que estão em cache por serem lidas o tempo todo.
+
+Outra otimização: só fazer push para seguidores que acessaram nos últimos 30 dias. Inativos têm a timeline reconstruída sob demanda quando voltam.
+
+### 2. Montando a timeline na leitura
+
+```text
+1. ids = LRANGE timeline:u_42 0 199
+2. celebs = celebridades seguidas por u_42 (cache)
+3. para cada celeb: últimos posts (cache quente)
+4. mescla por post_id decrescente, corta 20
+5. hidrata: busca posts em lote (multi-get no cache de posts)
+6. junta contadores e se eu curti (cache separado)
+```
+
+A hidratação em lote é essencial: 20 consultas individuais somariam latência. Contadores de curtidas mudam muito e vêm de outro cache, para não invalidar o post inteiro a cada curtida.
+
+### 3. Busca e assuntos do momento
+
+Cada post publicado também vai, via Kafka, para um indexador que mantém um índice invertido (Elasticsearch ou equivalente) particionado por tempo: índices recentes são pequenos e quentes, os antigos são compactados. Buscas costumam olhar primeiro os últimos dias.
+
+Assuntos do momento usam um pipeline de streaming: extrai hashtags e termos, conta em janelas de 5 minutos por região e compara com a média histórica do termo. Um termo está em alta quando cresce muito acima do normal, não apenas quando é frequente; senão "bom dia" ficaria sempre no topo.
+
+<Callout type="tip" title="Celebridades são o coração da questão">
+Se você só descrever fan-out na escrita, o entrevistador vai perguntar sobre uma conta com 100 milhões de seguidores. Antecipe-se e apresente o modelo híbrido com o limite explícito.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Ponto | Opção A | Opção B |
+| --- | --- | --- |
+| Timeline | Push: leitura barata, escrita cara | Pull: escrita barata, leitura cara |
+| Ordenação | Cronológica: simples e previsível | Ranqueada: mais engajamento, exige ML e mais latência |
+| Cache de timeline | Para todos: memória enorme | Só ativos: reconstrução quando o inativo volta |
+
+- **Exclusão de post**: com push, o post está em milhares de listas. Em vez de remover de todas, marque como apagado e filtre na hidratação.
+- **Deixar de seguir**: o mesmo princípio; filtre na leitura e deixe a lista se renovar.
+- **Picos** (final de campeonato): o Kafka absorve o atraso do fan-out; a timeline fica alguns segundos defasada, o que é aceitável.
+
+## Perguntas de follow-up comuns
+
+- **Como gerar IDs únicos ordenáveis?** Timestamp em milissegundos mais ID da máquina mais sequência local, em 64 bits.
+- **Como contar curtidas de um post viral?** Contadores particionados em memória, agregados periodicamente.
+- **Como ranquear a timeline?** Gere candidatos (os mesmos do modelo híbrido), extraia features e pontue com um modelo; mantenha fallback cronológico se o ranqueador cair.
+- **Como lidar com mídia?** Upload direto para object storage com URL pré-assinada e entrega por CDN; o post só guarda referências.
+
+<QuizSet>
+<Quiz question="Uma conta com 80 milhões de seguidores publica um post. O que o modelo híbrido faz?" options={["Insere o post nas 80 milhões de timelines", "Não faz push; os seguidores buscam os posts dela na leitura", "Envia e-mail aos seguidores", "Bloqueia a publicação até o fan-out terminar"]} answer={1} explanation="Contas acima do limite não fazem fan-out na escrita; seus posts são mesclados no momento da leitura." />
+<Quiz question="Por que a timeline usa paginação por cursor e não por offset?" options={["Cursor é mais curto", "Offset não funciona em Redis", "Como novos posts entram no topo, offset faria itens se repetirem ou sumirem entre páginas", "Por segurança"]} answer={2} explanation="O cursor ancora a página no último item visto, imune a inserções no início da lista." />
+</QuizSet>

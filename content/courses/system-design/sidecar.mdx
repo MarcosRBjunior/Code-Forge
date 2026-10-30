@@ -1,0 +1,84 @@
+---
+title: Sidecar
+kind: lesson
+---
+
+Toda aplicação em produção precisa de um monte de coisas que não têm nada a ver com o negócio: enviar logs, expor métricas, renovar certificados TLS, fazer retentativas, ler segredos, descobrir outros serviços. Se você tem serviços em Java, Go, Python e Node, precisa de quatro bibliotecas para cada uma dessas funções, mantidas em sincronia. E atualizar a política de retentativa exige redeploy de todos os serviços.
+
+O padrão **sidecar** tira essas responsabilidades do processo da aplicação e as coloca num **processo auxiliar separado, implantado ao lado dela**, com o mesmo ciclo de vida. O nome vem do carrinho lateral da motocicleta: anda junto, mas é outra peça.
+
+## Como funciona
+
+```text
++------------------- pod / host -------------------+
+|                                                  |
+|  [aplicação] <--localhost--> [sidecar: proxy]  <-+--> rede
+|       |                                          |
+|       +--> /var/log/app  <-- [sidecar: logs] ----+--> agregador
+|                                                  |
++--------------------------------------------------+
+```
+
+A aplicação e os sidecars compartilham recursos locais: a interface de rede (falam por `localhost`), volumes de disco e o ciclo de vida. No Kubernetes, isso é natural: um **pod** pode ter vários containers, que sobem e morrem juntos e são agendados sempre no mesmo nó. Desde a versão 1.29, o Kubernetes tem suporte nativo a sidecars como init containers com `restartPolicy: Always`, que iniciam antes e terminam depois do container principal.
+
+## Usos comuns
+
+- **Proxy de rede:** Envoy interceptando todo tráfego de entrada e saída para aplicar mTLS, retentativas, timeouts, circuit breaking e métricas. É a base do service mesh.
+- **Coleta de logs:** Fluent Bit lendo arquivos de log do volume compartilhado e enviando para o agregador.
+- **Segredos e certificados:** um agente que busca segredos no cofre e os escreve num arquivo, renovando antes de expirar.
+- **Adaptador:** expõe métricas de uma aplicação legada no formato que o Prometheus entende.
+- **Ambassador:** a aplicação fala com `localhost:6379` e o sidecar cuida de encontrar e conectar ao cluster Redis correto, com sharding e retentativa.
+
+## Exemplo
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pedidos
+spec:
+  initContainers:
+    - name: log-shipper
+      image: fluent/fluent-bit:3.0
+      restartPolicy: Always        # sidecar nativo
+      volumeMounts:
+        - { name: logs, mountPath: /var/log/app }
+  containers:
+    - name: app
+      image: exemplo/pedidos:1.4.2
+      volumeMounts:
+        - { name: logs, mountPath: /var/log/app }
+  volumes:
+    - name: logs
+      emptyDir: {}
+```
+
+A aplicação apenas escreve em `/var/log/app`. Trocar Fluent Bit por outro coletor não exige tocar no código do serviço.
+
+## Trade-offs
+
+| Vantagem | Custo |
+| --- | --- |
+| Independente de linguagem | CPU e memória extras em **cada** instância |
+| Atualiza infraestrutura sem redeploy da app | Latência extra quando o sidecar está no caminho das requisições |
+| Separação clara entre negócio e plataforma | Mais containers para depurar e versionar |
+| Isolamento de falhas do processo auxiliar | Ordem de inicialização e desligamento delicada |
+
+### Armadilhas
+
+- **Custo multiplicado:** 2 mil pods com um proxy de 50 MB cada são 100 GB de memória só em sidecars. Por isso surgiram alternativas como o modo *ambient* do Istio (proxy por nó, não por pod) e soluções baseadas em eBPF.
+- **Ordem de inicialização:** se a aplicação começa a fazer chamadas antes do proxy estar pronto, as primeiras requisições falham. No desligamento, o proxy não pode morrer antes da aplicação terminar de drenar.
+- **Depuração:** uma requisição lenta pode ser culpa da aplicação ou do sidecar. Métricas dos dois lados são essenciais.
+
+<Callout type="note" title="Sidecar vs biblioteca">
+Bibliotecas (como Resilience4j ou Polly) rodam no mesmo processo, sem salto extra e com mais contexto do domínio, mas exigem uma implementação por linguagem. Sidecars são uniformes, mas genéricos. Times com uma única linguagem às vezes preferem a biblioteca.
+</Callout>
+
+## Na entrevista
+
+Mencione o sidecar quando falar de service mesh, de coleta de logs ou de padronizar mTLS e retentativas em uma frota poliglota. Follow-ups comuns: "qual o custo de rodar um proxy por pod?", "como garantir que o sidecar esteja pronto antes da aplicação?", "quando uma biblioteca é melhor que um sidecar?".
+
+<QuizSet>
+<Quiz question="Qual a principal vantagem do sidecar sobre uma biblioteca compartilhada?" options={["Latência menor", "Funciona igual para qualquer linguagem e pode ser atualizado sem mudar a aplicação", "Consome menos memória", "Elimina a necessidade de rede"]} answer={1} explanation="O sidecar é um processo separado, então serve aplicações em qualquer linguagem e evolui independentemente. O custo é recurso extra por instância e um salto local." />
+<Quiz question="Por que, no Kubernetes, sidecars ficam no mesmo pod que a aplicação?" options={["Para compartilhar rede local, volumes e ciclo de vida", "Porque pods não podem ter um só container", "Para usar outro nó do cluster", "Para ter IP público próprio"]} answer={0} explanation="Containers do mesmo pod compartilham namespace de rede (localhost) e volumes, e são agendados juntos no mesmo nó." />
+</QuizSet>

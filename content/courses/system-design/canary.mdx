@@ -1,0 +1,78 @@
+---
+title: Canary
+kind: lesson
+---
+
+Testes automatizados pegam muitos bugs, mas não todos. Alguns só aparecem com tráfego real: um tipo de usuário específico, um volume que o staging nunca viu, uma interação com um serviço externo. O **canary deploy** aceita esse fato e limita o estrago: a versão nova recebe primeiro uma pequena fração do tráfego de produção, e só ganha mais quando as métricas mostram que está saudável. O nome vem dos canários que mineiros levavam para detectar gás antes que afetasse as pessoas.
+
+## Como funciona
+
+```text
+etapa 1:  95% -> [v1 x 19]    5% -> [v2 x 1]    observar 15 min
+etapa 2:  75% -> [v1]        25% -> [v2]        observar 15 min
+etapa 3:  50% -> [v1]        50% -> [v2]        observar 15 min
+etapa 4:   0% -> [v1]       100% -> [v2]        concluído
+a qualquer momento: métricas ruins -> 100% de volta para v1
+```
+
+A divisão de tráfego pode ser feita de dois jeitos:
+
+- **Por número de instâncias:** uma réplica canary entre vinte recebe cerca de 5% via round robin. Simples, mas grosseiro: a fração mínima depende do número de réplicas.
+- **Por peso no roteador:** um service mesh, API gateway ou load balancer L7 envia exatamente X% para a v2, independentemente de quantas instâncias ela tem. Permite também rotear por critério: funcionários primeiro, depois um país, depois todos.
+
+## Análise do canary
+
+A parte que dá valor ao canary é a **comparação**. Você não pergunta só "a v2 tem erros?", e sim "a v2 está pior que a v1, sob o mesmo tráfego e no mesmo momento?".
+
+Métricas típicas:
+
+- Taxa de erros (5xx, exceções) e latência p50, p95 e p99.
+- Saturação: CPU, memória, conexões com o banco.
+- **Métricas de negócio:** conversão do checkout, logins bem-sucedidos, pedidos por minuto. Muitas regressões não geram erro HTTP algum.
+
+Uma boa prática é comparar o canary com um **baseline** criado junto com ele, com a mesma idade e o mesmo número de instâncias da versão antiga, em vez de compará-lo com a frota antiga inteira. Instâncias recém-iniciadas têm cache frio e JIT não aquecido, e isso distorce a comparação.
+
+```yaml
+# Esboço de política de análise automática
+etapas: [5, 25, 50, 100]
+intervalo: 15m
+abortar_se:
+  - metrica: taxa_erro_5xx
+    canary_maior_que_baseline_em: 0.5%
+  - metrica: latencia_p99_ms
+    canary_maior_que_baseline_em: 20%
+  - metrica: pedidos_concluidos_por_min
+    canary_menor_que_baseline_em: 3%
+```
+
+Ferramentas como Argo Rollouts, Flagger e Spinnaker (com Kayenta) automatizam promoção e abortamento.
+
+## Afinidade de sessão
+
+Se cada requisição sorteia a versão, o mesmo usuário pode ver a interface nova num clique e a antiga no seguinte, o que confunde e pode quebrar fluxos com estado. Use **roteamento consistente**: um hash do ID do usuário ou um cookie decide a versão, e o usuário permanece nela durante o canary.
+
+<Callout type="note" title="Pouco tráfego, pouca estatística">
+Com 1% de um serviço que recebe 100 requisições por minuto, o canary vê uma requisição por minuto. Nenhuma métrica é confiável com isso. Em serviços de baixo volume, use frações maiores, janelas mais longas ou tráfego sintético para ter amostra suficiente.
+</Callout>
+
+## Trade-offs
+
+| Ponto | Canary |
+| --- | --- |
+| Raio de impacto de um bug | Limitado à fração atual |
+| Rollback | Rápido: zera o peso da v2 |
+| Infra extra | Pequena (algumas instâncias) |
+| Duração do deploy | Longa (etapas com observação) |
+| Complexidade | Alta: roteamento por peso, métricas confiáveis, automação |
+| Convivência de versões | Prolongada; compatibilidade é obrigatória |
+
+Canary versus feature flag: o canary expõe uma **versão do binário** a uma fração do tráfego; a flag expõe uma **funcionalidade** a uma fração dos usuários, dentro do mesmo binário. Times maduros usam os dois: canary para pegar regressões de infraestrutura e código, flags para controlar lançamentos de produto.
+
+## Na entrevista
+
+Para sistemas de grande escala, canary com análise automática é a resposta esperada para "como você lança mudanças com segurança?". Diga quais métricas decidem a promoção, inclua pelo menos uma de negócio e explique o rollback automático. Follow-ups: como evitar que o mesmo usuário alterne entre versões, o que fazer com serviços de pouco tráfego e como fazer canary de um consumidor de fila (resposta: uma fração dos consumidores do grupo roda a versão nova).
+
+<QuizSet>
+<Quiz question="Por que se compara o canary com um baseline novo em vez da frota antiga inteira?" options={["Porque a frota antiga não tem métricas", "Para neutralizar efeitos de instâncias recém-iniciadas, como cache frio, e comparar condições equivalentes", "Porque o baseline usa outra região", "Para gastar menos memória"]} answer={1} explanation="Instâncias novas se comportam diferente de instâncias com horas de uptime. O baseline com a versão antiga e a mesma idade isola o efeito do código novo." />
+<Quiz question="O canary com 5% do tráfego não mostra aumento de erros HTTP, mas a conversão do checkout caiu 4% nesse grupo. O que fazer?" options={["Promover, pois não há erros", "Abortar o canary: regressões de negócio também são falhas", "Aumentar para 100% para ter mais dados", "Ignorar, pois é ruído sempre"]} answer={1} explanation="Métricas de negócio pegam bugs silenciosos, como um botão que não aparece. Uma queda significativa justifica abortar e investigar." />
+</QuizSet>

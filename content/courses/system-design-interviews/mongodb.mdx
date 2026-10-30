@@ -1,0 +1,86 @@
+---
+title: MongoDB
+kind: lesson
+---
+
+MongoDB é um banco de documentos: em vez de linhas em tabelas, você guarda objetos aninhados (BSON, uma variante binária de JSON) em coleções. Ele é popular porque o modelo se parece com os objetos da aplicação e porque oferece sharding nativo. Na entrevista, aparece quando os dados têm formato variável ou quando cada leitura busca um "agregado" inteiro de uma vez.
+
+## Modelo de dados
+
+Um documento pode conter arrays e subdocumentos. A pergunta de modelagem central é **embutir ou referenciar**.
+
+```json
+{
+  "_id": "pedido_981",
+  "cliente": { "id": "u_12", "nome": "Lia" },
+  "itens": [
+    { "sku": "CAN-01", "qtd": 2, "preco": 4.5 },
+    { "sku": "CAD-07", "qtd": 1, "preco": 19.9 }
+  ],
+  "status": "pago",
+  "criado_em": "2026-03-10T14:22:00Z"
+}
+```
+
+- **Embutir** quando os dados são lidos juntos e têm tamanho limitado (itens de um pedido). Uma leitura traz tudo, sem join.
+- **Referenciar** quando o filho cresce sem limite (comentários de um post viral) ou é compartilhado por muitos pais. O documento tem limite de 16 MB, e arrays enormes degradam atualizações.
+
+Há suporte a índices secundários, índices compostos, índices em campos de arrays, índices geoespaciais, TTL e um pipeline de agregação razoavelmente poderoso, incluindo `$lookup` para junções simples.
+
+## Arquitetura
+
+**Replica set.** Um primário e normalmente dois secundários. Escritas vão ao primário, que registra num log de operações (oplog); secundários replicam esse log. Se o primário cai, os membros elegem outro em poucos segundos via um protocolo de consenso parecido com Raft.
+
+**Sharding.** Um cluster fatiado tem vários replica sets (shards), roteadores `mongos` e um replica set de configuração. Os dados são divididos por uma **shard key** em faixas (chunks) ou por hash. Um balanceador move chunks entre shards conforme o volume.
+
+```text
+  [app] -> [mongos] -> consulta tem a shard key?
+                          | sim: vai a 1 shard
+                          | não: scatter-gather em todos
+           +--------------+--------------+
+       [shard A: P S S] [shard B: P S S] [shard C: P S S]
+                     [config servers: P S S]
+```
+
+## Garantias
+
+O comportamento depende de dois parâmetros que você deve citar:
+
+- **Write concern:** `w:1` confirma quando o primário gravou (rápido, mas pode perder a escrita no failover). `w:"majority"` espera a maioria dos nós, garantindo que a escrita sobrevive à eleição de novo primário.
+- **Read concern e read preference:** ler do primário com `majority` dá leituras consistentes; ler de secundários escala leitura e aceita dados atrasados.
+
+Desde a versão 4, há **transações multidocumento** ACID, inclusive entre shards. Funcionam, mas têm custo; se o seu design depende delas o tempo todo, talvez o modelo relacional seja mais natural.
+
+## Escolhendo a shard key
+
+É a decisão mais importante e difícil de mudar.
+
+| Shard key | Problema |
+| --- | --- |
+| Timestamp crescente | Todas as inserções vão para o último chunk: hot shard |
+| Campo de baixa cardinalidade (país) | Poucos chunks grandes que não se dividem |
+| Hash de `user_id` | Distribui bem; consultas por intervalo viram scatter-gather |
+| `user_id` + data | Bom equilíbrio: consultas de um usuário vão a um shard |
+
+## Números típicos
+
+Um replica set bem dimensionado faz dezenas de milhares de operações por segundo; clusters fatiados chegam a centenas de milhares ou milhões. Leituras por `_id` ou por índice com dados no cache do WiredTiger ficam em 1 ms ou menos. Documento máximo: 16 MB.
+
+## Quando escolher e quando não
+
+Escolha MongoDB para catálogos com atributos variáveis por categoria, perfis e configurações, conteúdo de CMS, dados de eventos com esquema em evolução e qualquer caso em que a leitura dominante é "traga o documento X inteiro".
+
+Evite quando há muitos relacionamentos muitos-para-muitos consultados de várias direções, quando transações entre várias entidades são o coração do sistema (contabilidade) ou quando o volume de escrita é extremo e simples, onde Cassandra tende a ser mais barato. Lembre também que "esquema flexível" não elimina esquema: ele só migra da base para o código.
+
+<Callout type="warning" title="Flexível não é desculpa para não modelar">
+Documentos que crescem sem limite, como um array com todos os seguidores de um usuário, são o erro clássico. Se algo pode passar de alguns milhares de elementos, guarde em coleção separada.
+</Callout>
+
+## Na entrevista
+
+"Uso MongoDB para o catálogo, porque cada categoria tem atributos diferentes e a página do produto lê o documento inteiro. A shard key é o hash do `product_id`; escritas usam `majority` para não perder alterações no failover." Follow-ups comuns: o que acontece numa consulta sem shard key (vai a todos os shards), como lidar com um documento que cresce demais e por que não usar Postgres com JSONB, uma alternativa honesta quando o volume é moderado.
+
+<QuizSet>
+<Quiz question="Quando faz sentido referenciar em vez de embutir no MongoDB?" options={["Quando o filho é sempre lido junto e pequeno", "Quando o filho pode crescer sem limite ou é compartilhado por muitos documentos", "Sempre; embutir é antipadrão", "Nunca; referência não existe no MongoDB"]} answer={1} explanation="Embutir é ótimo para dados limitados e lidos juntos; listas ilimitadas estouram o limite de 16 MB e pesam nas atualizações." />
+<Quiz question="Qual write concern evita perder uma escrita confirmada quando o primário cai?" options={["w:0", "w:1", "w:'majority'", "Nenhum, o MongoDB sempre perde"]} answer={2} explanation="Com majority, a escrita está na maioria dos nós e sobrevive à eleição do novo primário." />
+</QuizSet>

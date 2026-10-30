@@ -1,0 +1,89 @@
+---
+title: Service mesh
+kind: lesson
+---
+
+Com dezenas ou centenas de microsserviços conversando entre si, surgem perguntas que nenhum serviço isolado consegue responder bem: o tráfego interno está criptografado? Quem pode chamar quem? Qual chamada está lenta? Como fazer 5% do tráfego ir para a versão nova? Como aplicar retentativas e timeouts de forma consistente em serviços escritos em cinco linguagens? Um **service mesh** é uma camada de infraestrutura dedicada à comunicação **entre serviços** (tráfego leste-oeste) que resolve isso de forma transparente para a aplicação.
+
+## Arquitetura: plano de dados e plano de controle
+
+```text
+                 +------------------------------+
+                 |      plano de controle       |  (istiod, Linkerd control plane)
+                 |  config, certificados, rotas |
+                 +------------------------------+
+                    | xDS             | xDS
+                    v                 v
+   +-------------------+       +-------------------+
+   | [svc pedidos]     |       | [svc pagamentos]  |
+   |      |  localhost |       |  localhost  |     |
+   | [proxy sidecar] <=+=mTLS==+=> [proxy sidecar] |
+   +-------------------+       +-------------------+
+                 plano de dados (Envoy, linkerd2-proxy)
+```
+
+- **Plano de dados:** proxies que interceptam todo o tráfego de entrada e saída de cada serviço, normalmente como sidecars. Eles aplicam as políticas e coletam telemetria de cada requisição.
+- **Plano de controle:** não toca no tráfego. Ele distribui configuração para os proxies (rotas, políticas, endpoints descobertos), emite e rotaciona certificados, e expõe uma API para os operadores. O Envoy recebe essa configuração dinamicamente pela família de APIs xDS.
+
+A aplicação continua fazendo uma chamada HTTP simples para `http://pagamentos`; o proxy local captura a conexão (via regras de iptables ou eBPF) e cuida do resto.
+
+## O que o mesh entrega
+
+**Segurança**
+- **mTLS automático:** cada serviço recebe uma identidade criptográfica (no padrão SPIFFE, algo como `spiffe://cluster/ns/prod/sa/pedidos`) e todo tráfego interno é cifrado e autenticado nos dois sentidos.
+- **Autorização:** políticas como "só o serviço de pedidos pode chamar POST em pagamentos".
+
+**Confiabilidade**
+- Timeouts, retentativas com orçamento, circuit breaking e outlier detection (tirar do balanceamento instâncias que estão retornando erros).
+- Balanceamento sofisticado: menor número de requisições pendentes, preferência por zona.
+
+**Controle de tráfego**
+- Divisão por peso (canary: 95% v1, 5% v2), roteamento por cabeçalho, espelhamento de tráfego e injeção de falhas para testes de caos.
+
+**Observabilidade**
+- Métricas uniformes de taxa, erros e latência para cada par de serviços, mapa de dependências e propagação de spans para tracing (a aplicação ainda precisa repassar os cabeçalhos de contexto).
+
+## Exemplo: canary com Istio
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: pagamentos
+spec:
+  hosts: [pagamentos]
+  http:
+    - route:
+        - destination: { host: pagamentos, subset: v1 }
+          weight: 95
+        - destination: { host: pagamentos, subset: v2 }
+          weight: 5
+      timeout: 2s
+      retries: { attempts: 2, perTryTimeout: 500ms, retryOn: 5xx }
+```
+
+Nenhuma linha de código da aplicação mudou para ganhar canary, timeout e retentativa.
+
+## Custos e armadilhas
+
+| Benefício | Custo |
+| --- | --- |
+| Políticas uniformes em qualquer linguagem | Proxy extra por pod: CPU, memória, latência (tipicamente 1 ms ou menos por salto) |
+| mTLS sem tocar no código | Complexidade operacional alta, mais um sistema para atualizar |
+| Telemetria rica de graça | Depuração fica mais difícil: o problema está no app ou no proxy? |
+| Deploys progressivos fáceis | Retentativas em camadas (app + mesh) podem multiplicar carga |
+
+Para reduzir o custo dos sidecars, surgiram modelos **sem sidecar**: o modo ambient do Istio usa um proxy de camada 4 por nó para mTLS e proxies de camada 7 opcionais por namespace; o Cilium usa eBPF no kernel.
+
+<Callout type="tip" title="Você precisa de um mesh?">
+Com poucos serviços, bibliotecas de resiliência, um API gateway e TLS interno simples resolvem. O mesh se paga quando a frota é grande e poliglota, há exigência de zero trust ou muitos times precisam de deploys progressivos padronizados.
+</Callout>
+
+## Na entrevista
+
+Diferencie claramente: API gateway trata tráfego norte-sul (de fora para dentro), service mesh trata tráfego leste-oeste (entre serviços). Explique plano de dados e plano de controle, e cite mTLS, retentativas, canary e observabilidade como ganhos. Follow-ups comuns: "qual o overhead?", "o que acontece se o plano de controle cair?" (os proxies continuam com a última configuração; só mudanças novas param), "como evitar tempestade de retentativas?".
+
+<QuizSet>
+<Quiz question="O plano de controle de um service mesh fica indisponível. O que acontece com o tráfego entre serviços?" options={["Todo tráfego para imediatamente", "Os proxies continuam operando com a última configuração recebida", "O tráfego passa a ir sem criptografia", "Os serviços passam a se chamar diretamente sem proxy"]} answer={1} explanation="O plano de controle não está no caminho das requisições. Os proxies mantêm a configuração em memória; o que para são atualizações e, se demorar muito, a rotação de certificados." />
+<Quiz question="Qual a diferença entre o tráfego tratado por um API gateway e por um service mesh?" options={["Nenhuma", "Gateway: norte-sul (clientes externos); mesh: leste-oeste (entre serviços)", "Gateway: entre serviços; mesh: clientes externos", "Gateway só para gRPC; mesh só para HTTP"]} answer={1} explanation="O gateway é a porta de entrada para clientes externos; o mesh governa a comunicação interna entre serviços." />
+</QuizSet>

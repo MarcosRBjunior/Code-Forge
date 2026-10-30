@@ -1,0 +1,98 @@
+---
+title: Circuit breaker
+kind: lesson
+---
+
+O serviço de recomendações ficou lento: em vez de responder em 50 ms, leva 30 segundos até dar timeout. O serviço de catálogo, que o chama a cada página, começa a acumular threads esperando. Em poucos minutos, o pool de threads do catálogo se esgota, e ele também para de responder, inclusive para requisições que nem precisavam de recomendações. Em seguida, quem depende do catálogo cai. Isso é uma **falha em cascata**, e retentar só piora: cada retentativa joga mais carga num serviço que já está afogado.
+
+O **circuit breaker** (disjuntor) imita o disjuntor elétrico: quando detecta que uma dependência está falhando demais, ele **abre o circuito** e passa a falhar imediatamente, sem nem tentar chamar, por um tempo. Isso protege quem chama (não desperdiça threads) e dá fôlego para a dependência se recuperar.
+
+## A máquina de estados
+
+```text
+            falhas acima do limite
+  +--------+ -------------------> +--------+
+  | CLOSED |                      |  OPEN  |  falha rápido, sem chamar
+  +--------+ <---+                +--------+
+      ^          |                    |
+      |   teste  |                    | após o tempo de espera
+      |   passou |                    v
+      |          +--------------- +-----------+
+      +-------------------------- | HALF-OPEN | deixa passar poucas chamadas
+              (sucesso)           +-----------+
+                                      | teste falhou: volta a OPEN
+```
+
+- **Closed (fechado):** estado normal. Chamadas passam, e o breaker conta sucessos e falhas numa janela (por exemplo, as últimas 100 chamadas ou os últimos 10 segundos).
+- **Open (aberto):** a taxa de falha passou do limite (digamos, 50% com no mínimo 20 chamadas). Toda chamada falha na hora com um erro do tipo "circuito aberto", ou cai num fallback.
+- **Half-open (meio aberto):** depois de um tempo de espera, o breaker deixa passar algumas chamadas de teste. Se elas funcionarem, volta a fechado; se falharem, volta a aberto e reinicia a espera.
+
+Contam como falha: exceções, erros 5xx, timeouts e, muitas vezes, **chamadas lentas** acima de um limite. Erros do cliente (4xx) normalmente **não** contam: um pedido inválido não diz nada sobre a saúde da dependência.
+
+## Implementação simplificada
+
+```python
+import time
+
+class CircuitoAberto(Exception):
+    pass
+
+class CircuitBreaker:
+    def __init__(self, limite_falhas=5, espera_seg=30):
+        self.limite = limite_falhas
+        self.espera = espera_seg
+        self.falhas = 0
+        self.estado = "closed"
+        self.aberto_em = 0.0
+
+    def chamar(self, func, *args):
+        if self.estado == "open":
+            if time.time() - self.aberto_em < self.espera:
+                raise CircuitoAberto()
+            self.estado = "half_open"
+        try:
+            resultado = func(*args)
+        except Exception:
+            self._registrar_falha()
+            raise
+        self.falhas = 0
+        self.estado = "closed"
+        return resultado
+
+    def _registrar_falha(self):
+        self.falhas += 1
+        if self.estado == "half_open" or self.falhas >= self.limite:
+            self.estado = "open"
+            self.aberto_em = time.time()
+```
+
+Bibliotecas reais (Resilience4j, Polly, o outlier detection do Envoy) usam janelas deslizantes por taxa de falha, limitam quantas chamadas passam em half-open e expõem métricas de cada transição.
+
+## Fallbacks
+
+Com o circuito aberto, o que devolver? Depende do caso:
+
+- **Valor padrão ou degradado:** sem recomendações personalizadas, mostre os mais vendidos.
+- **Cache:** a última resposta boa conhecida.
+- **Falha explícita e rápida:** para pagamentos, melhor dizer "tente novamente em instantes" do que inventar resposta.
+- **Enfileirar:** guardar a operação para processar quando a dependência voltar.
+
+## Trade-offs e armadilhas
+
+- **Limites mal calibrados:** sensível demais, abre por ruído; tolerante demais, só abre quando o estrago já aconteceu. Exija um volume mínimo de chamadas antes de avaliar a taxa.
+- **Breaker por dependência, não global:** se um breaker único cobre todas as chamadas externas, uma dependência ruim derruba as outras. Use um por dependência (e às vezes por endpoint).
+- **Com várias instâncias:** cada instância do cliente tem seu próprio breaker com visão local. Isso costuma ser aceitável, mas significa que algumas instâncias abrem antes de outras.
+- **Retentativas:** combine com cuidado. Retente com backoff e jitter **dentro** do circuito fechado, e nunca retente quando ele estiver aberto.
+
+<Callout type="tip" title="A trinca da resiliência">
+Circuit breaker raramente vem sozinho. Timeouts impedem esperas infinitas, bulkheads limitam quantos recursos uma dependência pode consumir, e o breaker evita insistir no que está quebrado. Os três juntos contêm a cascata.
+</Callout>
+
+## Na entrevista
+
+Sempre que um serviço depender de outro de forma síncrona, mencione timeout, retentativa com backoff e circuit breaker com fallback. Descreva os três estados. Follow-ups comuns: "o que o usuário vê com o circuito aberto?", "como escolher o limite?", "o que conta como falha?", "onde fica o breaker: na aplicação ou no sidecar?".
+
+<QuizSet>
+<Quiz question="O que acontece no estado half-open?" options={["Todas as chamadas passam normalmente", "Todas as chamadas falham imediatamente", "Algumas chamadas de teste passam para verificar se a dependência se recuperou", "O breaker é reiniciado manualmente"]} answer={2} explanation="Half-open é a sondagem: poucas chamadas passam. Se forem bem-sucedidas, o circuito fecha; se falharem, volta a abrir." />
+<Quiz question="Um cliente envia dados inválidos e recebe 400 várias vezes. Isso deve abrir o circuito?" options={["Sim, qualquer erro conta", "Não, erros do cliente não indicam que a dependência está doente", "Sim, mas só após 1000 erros", "Depende do horário"]} answer={1} explanation="Erros 4xx refletem problema na requisição, não na saúde do serviço chamado. Contá-los abriria o circuito indevidamente." />
+</QuizSet>

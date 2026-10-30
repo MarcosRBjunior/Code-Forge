@@ -1,0 +1,86 @@
+---
+title: Cassandra
+kind: lesson
+---
+
+Cassandra é um banco wide-column distribuído, sem nó mestre, projetado para escritas massivas e alta disponibilidade em vários data centers. Quando a entrevista fala em bilhões de mensagens, eventos ou leituras de sensores por dia, ele é um dos primeiros nomes a considerar.
+
+## Modelo de dados
+
+Você declara tabelas com CQL, que parece SQL, mas o que manda é a **chave primária**, dividida em duas partes:
+
+```sql
+CREATE TABLE mensagens (
+  conversa_id  uuid,
+  enviada_em   timeuuid,
+  autor_id     uuid,
+  texto        text,
+  PRIMARY KEY ((conversa_id), enviada_em)
+) WITH CLUSTERING ORDER BY (enviada_em DESC);
+```
+
+- **Partition key** (`conversa_id`): define o nó onde os dados moram. Todas as linhas com a mesma partition key ficam juntas.
+- **Clustering columns** (`enviada_em`): ordenam as linhas dentro da partição em disco.
+
+A consulta eficiente é "dada uma partição, me dê um intervalo ordenado": as 50 mensagens mais recentes da conversa X. Não há joins, e filtrar por coluna fora da chave exige outra tabela. A regra é **uma tabela por consulta**, com dados duplicados (desnormalização) de propósito.
+
+## Arquitetura
+
+**Anel com hash consistente.** Cada nó é dono de faixas de tokens (com vnodes, muitas faixas pequenas). O hash da partition key aponta para um token e, a partir dele, para os N nós que guardam réplicas (fator de replicação, geralmente 3).
+
+**Qualquer nó é coordenador.** O cliente fala com qualquer nó, que encaminha às réplicas. Não existe primário, então não existe failover: se um nó cai, os outros continuam aceitando.
+
+**Caminho de escrita (LSM).** A escrita vai para o commit log (sequencial) e para uma tabela em memória (memtable). Quando a memtable enche, vira um arquivo imutável em disco (SSTable). Compactação em segundo plano junta SSTables. Por isso escrever é baratíssimo: nada de buscar e atualizar páginas no lugar.
+
+```text
+ escrita -> [commit log] + [memtable] --flush--> [SSTable 1] [SSTable 2] ...
+                                                      \_____ compactação ___/
+ leitura -> memtable + bloom filters -> SSTables candidatas -> mescla por timestamp
+```
+
+## Garantias: consistência ajustável
+
+Cada operação escolhe um **nível de consistência**:
+
+| Nível | Significado com RF = 3 |
+| --- | --- |
+| `ONE` | Basta uma réplica responder; mais rápido, pode ler dado velho |
+| `QUORUM` | Maioria (2 de 3) |
+| `LOCAL_QUORUM` | Maioria dentro do data center local |
+| `ALL` | Todas; qualquer falha derruba a operação |
+
+Se leitura + escrita > RF (por exemplo, QUORUM e QUORUM), toda leitura enxerga a escrita mais recente confirmada. Conflitos se resolvem por **última escrita vence**, comparando timestamps, o que exige relógios razoavelmente sincronizados. Réplicas divergentes são corrigidas por **hinted handoff**, **read repair** e reparos periódicos.
+
+Existem **lightweight transactions** (`IF NOT EXISTS`) com Paxos para compare-and-set, mas elas custam várias idas e voltas; use com parcimônia.
+
+## Números típicos
+
+- Dezenas de milhares de escritas por segundo por nó; clusters com centenas de nós somam milhões.
+- Escala linear: dobrar nós dobra o throughput aproximadamente.
+- Partição saudável: até cerca de 100 MB e algumas centenas de milhares de linhas. Partições maiores degradam leitura e compactação.
+- Latência de escrita de 1 a poucos ms; leitura depende de quantas SSTables precisam ser consultadas.
+
+## Armadilhas
+
+- **Partição sem limite:** `PRIMARY KEY ((sensor_id), ts)` cresce para sempre. Adicione um bucket de tempo: `((sensor_id, dia), ts)`.
+- **Tombstones:** deletes viram marcadores que só somem depois da compactação e de um prazo de segurança. Usar Cassandra como fila, com muitas exclusões, deixa leituras lentíssimas.
+- **Consultas não planejadas:** `ALLOW FILTERING` varre o cluster. Se precisa, faltou uma tabela.
+
+## Quando escolher e quando não
+
+Escolha Cassandra para escrita pesada com leitura por chave conhecida: mensagens de chat, histórico de atividades, séries temporais, eventos de IoT, feeds pré-computados. Também para disponibilidade multirregião ativa-ativa.
+
+Evite quando precisar de transações entre entidades, consultas ad hoc, agregações, contagens exatas consistentes ou quando o volume é pequeno o suficiente para um Postgres resolver com menos operação.
+
+<Callout type="note" title="ScyllaDB e afins">
+Há implementações compatíveis com o protocolo do Cassandra, reescritas para usar melhor o hardware. Na entrevista, o raciocínio de modelagem é o mesmo.
+</Callout>
+
+## Na entrevista
+
+"As mensagens ficam em Cassandra, partição `(conversa_id, mes)` e clustering por `timeuuid` decrescente, então abrir uma conversa é uma leitura sequencial de uma partição. Escrevo e leio com `LOCAL_QUORUM` e RF 3 por região." Follow-ups esperados: o que acontece com uma conversa enorme (bucket por tempo), como buscar mensagens por palavra (outro sistema, como Elasticsearch) e o que significa última escrita vence quando dois dispositivos editam ao mesmo tempo.
+
+<QuizSet>
+<Quiz question="Com fator de replicação 3, qual combinação garante que a leitura veja a última escrita confirmada?" options={["Escrita ONE, leitura ONE", "Escrita QUORUM, leitura QUORUM", "Escrita ONE, leitura QUORUM", "Escrita ANY, leitura ONE"]} answer={1} explanation="2 + 2 é maior que 3, então os conjuntos de réplicas de escrita e leitura sempre se sobrepõem." />
+<Quiz question="Uma tabela de leituras de sensores usa PRIMARY KEY ((sensor_id), ts). Qual o problema?" options={["Não há problema", "A partição de cada sensor cresce indefinidamente; falta um bucket de tempo", "Cassandra não aceita timestamps", "ts deveria ser partition key sozinho"]} answer={1} explanation="Partições sem limite degradam leitura e compactação; inclua dia ou mês na partition key." />
+</QuizSet>

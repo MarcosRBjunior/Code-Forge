@@ -1,0 +1,81 @@
+---
+title: Memcached
+kind: lesson
+---
+
+Memcached é um cache distribuído em memória, propositalmente simples: guarda pares chave-valor opacos, com expiração, e nada mais. Ele existe há mais tempo que o Redis e ainda roda em escala enorme em grandes redes sociais. Em entrevistas, citá-lo mostra que você sabe separar "preciso de cache" de "preciso de estruturas de dados".
+
+## Modelo de dados
+
+A interface cabe num parágrafo: `get`, `set`, `add` (só se não existir), `replace`, `delete`, `incr`/`decr`, `cas` (compare-and-swap com um token de versão) e operações multi-get. As chaves têm até 250 bytes e os valores, por padrão, até 1 MB. O valor é um blob; o servidor não sabe se é JSON, HTML ou um objeto serializado.
+
+## Arquitetura interna
+
+**Multithread.** Diferente do Redis, um único processo Memcached usa vários núcleos. Num servidor grande isso dá muito throughput por nó sem precisar de vários processos.
+
+**Alocação em slabs.** A memória é dividida em classes de tamanho (slabs). Um item de 900 bytes vai para a classe de, digamos, 1 KB. Isso evita fragmentação, mas desperdiça um pouco de espaço e pode causar **calcificação**: se o perfil de tamanhos muda, uma classe fica cheia enquanto outra sobra. Versões modernas rebalanceiam automaticamente.
+
+**LRU por classe.** Quando a memória enche, itens menos usados recentemente são despejados. Não há persistência: reiniciou, esvaziou.
+
+**Servidores não se conhecem.** Não há replicação nem cluster no servidor. Quem distribui é o **cliente**, usando hash consistente sobre a lista de servidores.
+
+```text
+   [app + cliente memcached]
+          |  hash consistente da chave
+    +-----+------+------+
+    |            |      |
+  [mc 1]      [mc 2]  [mc 3]     (nós independentes, sem replicação)
+
+  nó 2 cai -> só as chaves dele viram miss e vão para o banco
+```
+
+## Garantias
+
+Nenhuma de durabilidade. Um item pode sumir a qualquer momento por despejo, expiração, reinício ou falha do nó. A operação `cas` dá atomicidade de leitura-modifica-grava numa chave, o que ajuda a evitar que duas escritas concorrentes se sobrescrevam com dados antigos. Fora isso, trate tudo como "talvez esteja lá".
+
+## Números típicos
+
+- Latência abaixo de 1 ms na mesma zona.
+- Centenas de milhares a mais de 1 milhão de operações por segundo por servidor multinúcleo.
+- Valores até 1 MB por padrão (configurável, mas valores grandes são má ideia).
+- Frotas de milhares de servidores são viáveis justamente porque cada nó é independente.
+
+## Problemas clássicos em escala
+
+**Thundering herd.** Uma chave popular expira e milhares de requisições vão ao banco ao mesmo tempo. Soluções: **leases** (o primeiro que erra recebe um token para repopular; os demais esperam ou recebem valor velho), expiração antecipada probabilística ou repopulação em segundo plano.
+
+**Inconsistência entre cache e banco.** Se a aplicação atualiza o banco e depois apaga a chave, uma leitura concorrente pode regravar o valor antigo. Ordem recomendada: escrever no banco e **invalidar** (não atualizar) a chave; leases ajudam a impedir a regravação de dado velho.
+
+**Múltiplas regiões.** Cada região tem sua frota. Invalidações precisam ser propagadas, por exemplo por um processo que lê o log de replicação do banco e envia `delete` aos caches de cada região.
+
+**Perda de um nó.** Com hash consistente só uma fração das chaves é afetada, mas essa fração vai direto ao banco. Um pool de "gutter" (servidores reserva que recebem temporariamente o tráfego do nó caído, com TTL curto) evita sobrecarga.
+
+## Memcached ou Redis?
+
+| Critério | Memcached | Redis |
+| --- | --- | --- |
+| Estruturas de dados | Só blobs | Listas, sets, sorted sets, streams |
+| Threads | Multithread | Execução single-thread |
+| Persistência | Nenhuma | RDB e AOF opcionais |
+| Replicação | Não tem | Primário-réplica e cluster |
+| Eficiência para cache puro | Muito alta | Alta |
+| Simplicidade operacional | Muito alta | Média |
+
+Se o problema é apenas guardar resultados caros de calcular, ambos servem e o Memcached é mais simples. Se você precisa de ranking, filas, locks ou geo, vá de Redis.
+
+## Quando escolher e quando não
+
+Escolha Memcached para caches de leitura de grande volume com objetos pequenos e médios: fragmentos de página, resultados de consulta, objetos de perfil serializados. Não use quando precisar que o dado sobreviva a reinício, quando precisar de operações sobre estruturas ou quando um item for maior que alguns centenas de KB.
+
+<Callout type="note" title="Cache é otimização, não armazenamento">
+Todo design com Memcached precisa funcionar, ainda que mais lento, com o cache completamente vazio. Se não funcionar, você escondeu um requisito de durabilidade dentro de algo que não oferece nenhuma.
+</Callout>
+
+## Na entrevista
+
+"Para o cache de perfis uso Memcached com hash consistente no cliente; é cache puro, não preciso das estruturas do Redis. Escritas vão para o banco e invalidam a chave; uso leases para evitar que uma chave quente expirada derrube o banco." Follow-ups: o que acontece quando um nó cai, como manter regiões coerentes e qual taxa de acerto você espera (algo como 95% ou mais é comum em leitura dominante).
+
+<QuizSet>
+<Quiz question="Quem decide em qual servidor Memcached uma chave fica?" options={["Um nó coordenador eleito", "O próprio cliente, via hash consistente", "Um ZooKeeper externo obrigatório", "O banco de dados"]} answer={1} explanation="Os servidores são independentes; a biblioteca cliente distribui as chaves." />
+<Quiz question="Uma chave muito acessada expira e o banco recebe uma rajada de consultas iguais. Qual técnica ajuda?" options={["Aumentar o limite de 1 MB", "Leases ou repopulação antecipada para que só uma requisição recalcule", "Desligar o LRU", "Usar UUID na chave"]} answer={1} explanation="Leases garantem que um único cliente repopula enquanto os outros esperam ou usam valor antigo." />
+</QuizSet>

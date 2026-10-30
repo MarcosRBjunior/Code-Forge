@@ -1,0 +1,75 @@
+---
+title: DynamoDB
+kind: lesson
+---
+
+DynamoDB é o banco chave-valor e de documentos totalmente gerenciado da AWS. Você não escolhe máquinas, não aplica patches e não faz sharding manual: declara a tabela, a chave e a capacidade (ou paga por requisição). Em troca, aceita um modelo de consulta restrito, em que você precisa conhecer os padrões de acesso antes de modelar.
+
+## Modelo de dados
+
+Cada item é identificado por uma **chave primária** que tem uma ou duas partes:
+
+- **Partition key (PK):** passa por hash e determina em qual partição física o item mora.
+- **Sort key (SK), opcional:** ordena os itens que compartilham a mesma PK dentro da partição.
+
+Com PK e SK você faz `GetItem` por chave exata e `Query` por intervalo da sort key dentro de uma partição. Qualquer outra busca exige um índice ou um `Scan`, que lê a tabela inteira e é caro.
+
+```text
+ PK = "user#42"
+   SK = "pedido#2026-01-03#981"  -> { total: 120, status: "pago" }
+   SK = "pedido#2026-02-11#1033" -> { total: 45,  status: "enviado" }
+   SK = "perfil"                  -> { nome: "Ana", plano: "pro" }
+
+ Query PK = "user#42" AND begins_with(SK, "pedido#2026-02")
+```
+
+Esse exemplo ilustra o **design de tabela única**: entidades diferentes compartilham uma tabela, e o prefixo da SK diferencia os tipos. Assim uma única `Query` traz o perfil e os pedidos recentes de um usuário.
+
+**Índices secundários:**
+
+- **GSI (global):** outra PK e SK sobre os mesmos dados, em partições próprias. Atualizado de forma assíncrona, portanto com leitura eventualmente consistente.
+- **LSI (local):** mesma PK, outra SK. Precisa ser criado junto com a tabela e limita a coleção de cada PK a 10 GB.
+
+## Arquitetura e garantias
+
+Cada partição é replicada em três zonas de disponibilidade com um protocolo baseado em Paxos; um líder por partição aceita escritas.
+
+- **Durabilidade:** a escrita é confirmada depois de persistida em mais de uma zona.
+- **Leituras:** eventualmente consistentes por padrão (metade do custo); fortemente consistentes sob demanda, lidas do líder.
+- **Transações:** `TransactWriteItems` agrupa até 100 itens com ACID, inclusive em tabelas diferentes, a cerca de duas vezes o custo.
+- **Escrita condicional:** `ConditionExpression` permite "grave só se `versao = 7`" ou "só se não existir", base de controle otimista de concorrência e idempotência.
+- **Streams:** um log ordenado por chave das mudanças, consumível por Lambda, ótimo para CDC.
+- **Global Tables:** replicação multirregião ativa-ativa, com resolução "última escrita vence".
+
+## Limites e números
+
+| Item | Valor |
+| --- | --- |
+| Tamanho máximo de item | 400 KB |
+| Throughput por partição física | cerca de 3.000 RCU e 1.000 WCU por segundo |
+| Latência típica | um dígito de milissegundos |
+| Resultado por página de Query | 1 MB |
+| Itens por transação | 100 |
+
+O limite por partição é o que mais importa na entrevista: uma PK muito popular (uma celebridade, um produto em promoção) satura a partição mesmo que a tabela tenha capacidade sobrando. O sistema tem capacidade adaptativa que redistribui partições quentes, mas uma única chave continua limitada.
+
+**Mitigações para hot keys:** sufixo aleatório na PK (`produto#77#3`) e agregação na leitura, cache com DAX ou Redis na frente, ou buffer de escritas.
+
+## Quando escolher e quando não
+
+Escolha DynamoDB quando você está na AWS, conhece os padrões de acesso, precisa de latência previsível em qualquer escala e quer zero operação: carrinhos, sessões, perfis, metadados de arquivos, estados de pedidos, dados de IoT por dispositivo.
+
+Evite quando as consultas são imprevisíveis ou analíticas, quando precisa de joins e agregações ricas, quando itens passam de 400 KB (guarde o blob no S3 e o ponteiro no Dynamo) ou quando o custo por requisição em volume altíssimo e constante ficar caro comparado a um cluster próprio de Cassandra.
+
+<Callout type="tip" title="Comece pelos padrões de acesso">
+Liste as consultas ("pedidos do usuário por data", "pedido por id", "pedidos pendentes de uma loja") e só então desenhe PK, SK e GSIs. Esse é exatamente o raciocínio que o entrevistador quer ver.
+</Callout>
+
+## Na entrevista
+
+"Guardo os pedidos no DynamoDB com PK `user_id` e SK `data#pedido_id`, o que atende à listagem do usuário com uma Query. Um GSI por `loja_id` atende o painel do lojista, aceitando atraso de alguns segundos. A transição de status usa escrita condicional para evitar duas confirmações." Follow-ups esperados: como lidar com hot partition, como fazer a busca por texto (DynamoDB não faz; replique via Streams para um índice de busca) e qual o custo de usar leituras fortes.
+
+<QuizSet>
+<Quiz question="Você precisa listar os pedidos de um usuário ordenados por data. Qual modelagem atende com uma Query?" options={["PK = data, SK = user_id", "PK = user_id, SK = data#pedido_id", "Scan com filtro por usuário", "PK aleatória e GSI por data"]} answer={1} explanation="Com PK por usuário, os pedidos ficam na mesma partição ordenados pela sort key." />
+<Quiz question="Leituras em um GSI do DynamoDB são:" options={["Sempre fortemente consistentes", "Eventualmente consistentes", "Transacionais", "Impossíveis"]} answer={1} explanation="GSIs são atualizados de forma assíncrona e só oferecem leitura eventualmente consistente." />
+</QuizSet>

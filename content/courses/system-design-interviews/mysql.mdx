@@ -1,0 +1,79 @@
+---
+title: MySQL
+kind: lesson
+---
+
+MySQL é o outro grande banco relacional de código aberto. Ele sustentou boa parte da web de grande porte e ainda é a base de sistemas com centenas de milhares de shards. Em entrevistas, ele aparece como alternativa equivalente ao PostgreSQL ou quando a empresa já o usa. Saber o que o diferencia mostra maturidade.
+
+## Arquitetura interna essencial
+
+O MySQL separa a camada de SQL (parser, otimizador, conexões) dos **storage engines**. Na prática só um importa hoje: **InnoDB**.
+
+**Índice clusterizado.** No InnoDB, a tabela *é* uma B+tree ordenada pela chave primária. As linhas moram nas folhas dessa árvore. Índices secundários guardam o valor da chave primária, não um ponteiro físico. Consequências:
+
+- Buscas por chave primária são muito rápidas, e varreduras por intervalo de PK são sequenciais.
+- Uma consulta por índice secundário faz duas buscas: acha a PK no índice e depois vai à árvore principal.
+- Chaves primárias aleatórias (UUID v4) causam divisões de página e fragmentação. Prefira inteiros crescentes ou IDs ordenados no tempo.
+
+```text
+   índice secundário (email)          índice clusterizado (id)
+   +-----------------------+          +-----------------------------+
+   | ana@x  -> id 42       |  ---->   | id 42 | ana | ana@x | ...   |
+   | bia@y  -> id 7        |          | id 43 | ... linha completa  |
+   +-----------------------+          +-----------------------------+
+```
+
+**Redo log e undo log.** O redo log garante durabilidade (parecido com o WAL do Postgres). O undo log guarda versões anteriores para MVCC e rollback. Diferente do Postgres, o InnoDB atualiza a linha no lugar e mantém a versão antiga no undo, então não precisa de vacuum, mas transações longas fazem o undo crescer.
+
+**Binlog.** Um log lógico separado, no nível do servidor, usado para replicação e para captura de mudanças (CDC). Ferramentas como Debezium leem o binlog para publicar eventos em Kafka.
+
+## Garantias
+
+- ACID com InnoDB. O isolamento padrão é **Repeatable Read**, mais forte que o padrão do Postgres; usa gap locks para evitar fantasmas em certas consultas, o que pode gerar deadlocks inesperados.
+- Durabilidade completa exige `innodb_flush_log_at_trx_commit=1` e `sync_binlog=1`. Valores mais frouxos aumentam o throughput e arriscam perder o último segundo de transações.
+- Replicação assíncrona por padrão; semissíncrona espera que ao menos uma réplica receba o evento antes de confirmar. **Group Replication** e InnoDB Cluster oferecem consenso entre nós.
+
+## Ecossistema de escala
+
+| Ferramenta | O que faz |
+| --- | --- |
+| Réplicas de leitura | Escalam leitura, como em qualquer relacional |
+| ProxySQL | Pool, roteamento de leitura e escrita, failover |
+| Vitess | Sharding transparente de MySQL, nascido no YouTube |
+| gh-ost / pt-online-schema-change | Migrações de esquema sem bloquear a tabela |
+| Orchestrator | Detecção de falha e promoção de réplica |
+
+Vitess é o ponto que vale citar: ele divide os dados em shards por uma chave (keyspace id), roteia consultas e permite re-sharding online. É o motivo pelo qual empresas com tráfego gigantesco continuam usando MySQL.
+
+## Números típicos
+
+Parecidos com Postgres: dezenas de milhares de consultas simples por segundo num nó forte, latência abaixo de 1 ms para busca por PK em memória. O MySQL lida melhor com muitas conexões porque usa threads, não processos, mas ainda se beneficia de pool. Tabelas de bilhões de linhas são viáveis se as consultas usarem índices; alterar o esquema delas é o que dói.
+
+## MySQL ou PostgreSQL?
+
+| Critério | MySQL | PostgreSQL |
+| --- | --- | --- |
+| Leitura por PK e intervalos da PK | Excelente (clusterizado) | Muito bom |
+| Recursos avançados (tipos, extensões, GIS) | Mais limitado | Muito rico |
+| Sharding maduro | Vitess | Citus |
+| Custo de atualizações frequentes | Sem vacuum | Exige vacuum ajustado |
+| Isolamento padrão | Repeatable Read | Read Committed |
+
+Na entrevista, a diferença raramente decide o design. Escolha o que você conhece melhor e justifique pelo requisito: transações, integridade e consultas flexíveis.
+
+## Quando não usar
+
+Os mesmos casos de qualquer relacional: escrita massiva de eventos simples, necessidade de escrita multirregião ativa-ativa, padrões puramente chave-valor em escala de petabytes ou busca textual relevante (o full-text do MySQL é básico).
+
+<Callout type="tip" title="Detalhe que impressiona">
+Comentar que, no InnoDB, a escolha da chave primária afeta o layout físico da tabela, e por isso você usaria um ID ordenado no tempo em vez de UUID aleatório, mostra que você entende o que acontece abaixo do SQL.
+</Callout>
+
+## Na entrevista
+
+"Uso MySQL com InnoDB; a chave primária é um ID de 64 bits ordenado no tempo, então inserções vão sempre para o fim da árvore. Para escalar além de um primário, uso Vitess particionando por `user_id`." Follow-ups esperados: como fazer `ALTER TABLE` numa tabela de 2 bilhões de linhas (ferramenta online que copia em sombra e troca), como o binlog alimenta outros sistemas e como você evitaria perda de dados no failover (semissíncrona).
+
+<QuizSet>
+<Quiz question="Por que UUIDs aleatórios como chave primária prejudicam o InnoDB?" options={["Ocupam menos espaço", "Inserções caem em posições aleatórias da B+tree clusterizada, causando divisões de página", "InnoDB não aceita UUID", "Impedem replicação"]} answer={1} explanation="A tabela é ordenada pela PK; chaves aleatórias espalham inserções e fragmentam as páginas." />
+<Quiz question="Qual ferramenta é associada a sharding de MySQL em grande escala?" options={["Vitess", "PgBouncer", "PostGIS", "ZooKeeper"]} answer={0} explanation="Vitess roteia consultas entre shards de MySQL e permite re-sharding online." />
+</QuizSet>

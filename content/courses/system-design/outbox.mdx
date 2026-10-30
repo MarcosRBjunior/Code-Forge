@@ -1,0 +1,87 @@
+---
+title: Padrão outbox
+kind: lesson
+---
+
+Um caso extremamente comum em microsserviços: ao criar um pedido, o serviço precisa gravar o pedido no banco **e** publicar um evento `PedidoCriado` no Kafka ou RabbitMQ. Parece simples, mas são dois sistemas sem transação em comum. É o chamado problema da **escrita dupla** (dual write).
+
+## Por que a escrita dupla falha
+
+```python
+def criar_pedido(pedido):
+    db.inserir(pedido)            # 1
+    broker.publicar("PedidoCriado", pedido)   # 2
+```
+
+- Se o processo cai entre 1 e 2, o pedido existe mas ninguém fica sabendo. Estoque não é reservado, e-mail não é enviado.
+- Se você inverte a ordem e publica primeiro, o evento pode sair e o `INSERT` falhar. Consumidores reagem a um pedido que não existe.
+- Colocar a publicação dentro da transação também não resolve: o broker não participa do rollback, e se o `COMMIT` falhar depois da publicação o evento já saiu.
+
+## A solução
+
+Grave o evento numa tabela do **próprio banco** do serviço, a outbox, **na mesma transação** que altera os dados. Um processo separado, o *relay*, lê essa tabela e publica no broker.
+
+```sql
+BEGIN;
+INSERT INTO pedidos (id, cliente_id, total) VALUES ('p-981', 'c-7', 250.00);
+INSERT INTO outbox (id, agregado, tipo, payload, criado_em)
+VALUES ('e-5501', 'p-981', 'PedidoCriado', '{"total": 250.00}', now());
+COMMIT;
+```
+
+Agora a atomicidade é local: ou o pedido e o evento existem, ou nenhum dos dois existe.
+
+```text
+ Serviço de Pedidos                         Relay                 Broker
+ +-------------------------+
+ | transação local         |
+ |   pedidos  <- INSERT    |   lê pendentes   +--------+  publica  +-------+
+ |   outbox   <- INSERT    | ---------------> | relay  | --------> | Kafka |
+ +-------------------------+   marca enviado  +--------+           +-------+
+```
+
+## Duas formas de fazer o relay
+
+### Polling
+
+O relay consulta periodicamente os eventos não publicados, publica em ordem e marca como enviados (ou apaga).
+
+```python
+def ciclo_do_relay(db, broker):
+    eventos = db.query(
+        "SELECT id, tipo, payload FROM outbox "
+        "WHERE publicado_em IS NULL ORDER BY criado_em LIMIT 100"
+    )
+    for ev in eventos:
+        broker.publicar(ev.tipo, ev.payload, chave=ev.id)
+        db.execute("UPDATE outbox SET publicado_em = now() WHERE id = %s", ev.id)
+```
+
+É fácil de implementar, mas adiciona latência (o intervalo de polling) e carga no banco. Com várias instâncias do relay, use `SELECT ... FOR UPDATE SKIP LOCKED` ou um único relay ativo por eleição de líder.
+
+### Log tailing com CDC
+
+Uma ferramenta de change data capture, como o Debezium, lê o log de replicação do banco (WAL do Postgres, binlog do MySQL) e transforma cada inserção na outbox em uma mensagem. Não há polling, a latência é baixa e a ordem segue a do log. O custo é operar mais uma peça de infraestrutura.
+
+## Entrega pelo menos uma vez
+
+O relay pode publicar o evento e cair antes de marcá-lo como enviado. Ao voltar, publica de novo. Portanto a outbox garante entrega **at-least-once**, nunca exactly-once por si só. Os consumidores precisam ser idempotentes, e o jeito mais comum é o padrão **inbox**: o consumidor grava o id do evento numa tabela de processados, na mesma transação do efeito, e ignora ids repetidos.
+
+<Callout type="tip" title="Ordem por agregado">
+Use o id do agregado (o pedido) como chave de partição ao publicar. Assim todos os eventos do mesmo pedido caem na mesma partição do Kafka e são consumidos em ordem, sem exigir ordem global.
+</Callout>
+
+## Cuidados operacionais
+
+- **Limpeza:** a tabela cresce sem parar. Apague ou arquive eventos publicados há mais de alguns dias.
+- **Monitoramento:** alerte quando a idade do evento pendente mais antigo passar de um limite; isso indica relay parado.
+- **Esquema do payload:** trate eventos como contrato público e versione-os, porque consumidores de outros times dependem deles.
+
+## Na entrevista
+
+Sempre que seu desenho disser "salva no banco e publica um evento", alguém vai perguntar o que acontece se o processo cair no meio. Responda com outbox: mesma transação, relay por polling ou CDC, entrega at-least-once e consumidores idempotentes. Ele também é a peça que torna sagas orquestradas confiáveis, já que cada comando do orquestrador sai por uma outbox.
+
+<QuizSet>
+<Quiz question="Que garantia de entrega o padrão outbox oferece sozinho?" options={["At-most-once", "At-least-once", "Exactly-once", "Nenhuma"]} answer={1} explanation="O relay pode publicar e cair antes de marcar o evento, gerando republicação. Por isso consumidores devem ser idempotentes." />
+<Quiz question="Qual problema o padrão outbox resolve diretamente?" options={["Escrita dupla em banco e broker sem atomicidade", "Leituras lentas no banco", "Balanceamento de carga entre consumidores", "Criptografia das mensagens"]} answer={0} explanation="Ao gravar o evento na mesma transação dos dados, a outbox elimina a janela em que um existe sem o outro." />
+</QuizSet>

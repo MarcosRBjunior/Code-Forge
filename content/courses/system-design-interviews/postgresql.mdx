@@ -1,0 +1,73 @@
+---
+title: PostgreSQL
+kind: lesson
+---
+
+PostgreSQL é o banco relacional de código aberto que você deve tratar como escolha padrão na maioria das entrevistas. Ele combina transações ACID, SQL completo, índices variados e extensões que cobrem casos que antes exigiam outro sistema, como busca geoespacial e documentos JSON.
+
+## Arquitetura interna essencial
+
+Você não precisa conhecer o código-fonte, mas três mecanismos explicam quase todo o comportamento do Postgres.
+
+**Processos e memória compartilhada.** Cada conexão vira um processo no servidor. Isso é robusto, mas caro: alguns milhares de conexões simultâneas já pesam. Por isso quase todo deploy sério coloca um pool como PgBouncer na frente.
+
+**MVCC (controle de concorrência multiversão).** Um `UPDATE` não sobrescreve a linha; cria uma nova versão e marca a antiga como morta para transações futuras. Leitores nunca bloqueiam escritores e vice-versa. O preço é lixo acumulado, que o processo de `VACUUM` limpa. Tabelas com muitas atualizações e vacuum mal ajustado incham e ficam lentas.
+
+**WAL (write-ahead log).** Toda mudança é escrita primeiro num log sequencial em disco. No `COMMIT`, o log é sincronizado (fsync), e só depois as páginas de dados são gravadas em segundo plano. O mesmo WAL alimenta a replicação: réplicas recebem o fluxo do log e o reaplicam.
+
+```text
+  cliente --COMMIT--> [backend] --grava--> [WAL em disco] --fsync--> ok
+                          |                      |
+                     buffer de páginas      streaming do WAL
+                          |                      v
+                 checkpoint grava dados     [réplica 1] [réplica 2]
+```
+
+## Garantias
+
+- **Atomicidade e durabilidade:** com `synchronous_commit` ligado (padrão), uma transação confirmada sobrevive a queda do servidor.
+- **Isolamento:** o padrão é Read Committed. Repeatable Read e Serializable estão disponíveis; Serializable no Postgres usa SSI e aborta transações conflitantes em vez de bloquear, então o cliente precisa repetir.
+- **Replicação:** assíncrona por padrão, o que significa que a réplica pode estar alguns milissegundos ou segundos atrasada. Replicação síncrona é possível para não perder dados no failover, ao custo de latência de escrita.
+
+## Recursos que aparecem em entrevistas
+
+| Recurso | Para quê |
+| --- | --- |
+| Índices B-tree | Igualdade e intervalo, o caso comum |
+| GIN | Arrays, JSONB e busca textual com `tsvector` |
+| GiST / PostGIS | Consultas geoespaciais, "restaurantes num raio de 2 km" |
+| `SELECT ... FOR UPDATE` | Lock pessimista de linha para evitar reserva dupla |
+| `SKIP LOCKED` | Fila de jobs simples sobre uma tabela |
+| Particionamento declarativo | Dividir uma tabela grande por data ou por hash |
+| `LISTEN/NOTIFY` | Notificações leves entre processos |
+
+## Números típicos
+
+Um nó bem dimensionado (dezenas de núcleos, SSD NVMe) sustenta de 10 mil a 50 mil transações simples por segundo e armazena confortavelmente alguns terabytes. Leituras por chave primária com dados em memória levam menos de 1 ms. O gargalo costuma aparecer primeiro nas escritas, porque só o primário as aceita, e no número de conexões.
+
+## Como escalar
+
+1. **Índices certos e consultas revisadas.** Resolvem mais problemas do que qualquer arquitetura.
+2. **Pool de conexões** para não esgotar processos.
+3. **Réplicas de leitura** para tráfego predominantemente de leitura, aceitando atraso de replicação.
+4. **Particionamento de tabela** para dados históricos volumosos.
+5. **Sharding na aplicação** ou com Citus quando as escritas excedem um primário. Aqui a complexidade sobe: transações e joins entre shards ficam difíceis.
+
+## Quando escolher e quando não
+
+Escolha Postgres quando houver relacionamentos, regras de integridade, necessidade de transações (pedidos, pagamentos, estoque, reservas) ou quando você ainda não sabe todas as consultas que vão surgir. SQL dá flexibilidade para perguntas futuras.
+
+Evite como armazenamento principal quando a carga de escrita for massiva e simples (bilhões de eventos por dia, telemetria), quando precisar de escrita ativa em várias regiões com baixa latência ou quando o padrão de acesso é só chave-valor em escala enorme. Nesses casos Cassandra, DynamoDB ou um banco de séries temporais encaixam melhor.
+
+<Callout type="warning" title="Réplica atrasada é bug esperando acontecer">
+Se o usuário grava um comentário e o recarregamento lê de uma réplica, o comentário pode sumir por um instante. Uma solução comum é ler do primário por alguns segundos após uma escrita do mesmo usuário.
+</Callout>
+
+## Na entrevista
+
+Diga algo como: "Vou usar Postgres como fonte da verdade, porque preciso de transação entre o pedido e a baixa de estoque. Leituras vão para réplicas com cache na frente; se as escritas passarem de algumas dezenas de milhares por segundo, particiono por `tenant_id`." Follow-ups comuns: como evitar que dois usuários reservem o mesmo assento (lock de linha ou restrição única), o que acontece no failover (perda das transações não replicadas se a replicação for assíncrona) e como você faria uma migração de esquema sem downtime.
+
+<QuizSet>
+<Quiz question="O que permite que leitores e escritores não se bloqueiem no PostgreSQL?" options={["Sharding automático", "MVCC, que mantém versões das linhas", "Replicação síncrona", "Índices GIN"]} answer={1} explanation="Com MVCC cada transação enxerga um snapshot, e atualizações criam novas versões em vez de sobrescrever." />
+<Quiz question="Seu Postgres está saturado em escritas, mas as leituras estão tranquilas. Adicionar réplicas resolve?" options={["Sim, réplicas aceitam escritas", "Não, réplicas só aliviam leitura; é preciso reduzir escritas, agrupar ou particionar", "Sim, se forem síncronas", "Sim, desde que use PgBouncer"]} answer={1} explanation="Só o primário aceita escrita. Escalar escrita exige batching, particionamento ou outro armazenamento." />
+</QuizSet>

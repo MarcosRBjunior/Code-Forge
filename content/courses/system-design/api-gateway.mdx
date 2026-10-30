@@ -1,0 +1,76 @@
+---
+title: API gateway
+kind: lesson
+---
+
+Imagine um app de delivery com vinte microsserviços: usuários, restaurantes, cardápio, pedidos, pagamentos, entregas. Se o app mobile chamar cada um diretamente, ele precisa conhecer vinte endereços, implementar autenticação vinte vezes, e cada mudança interna (dividir um serviço em dois, por exemplo) quebra o cliente. Além disso, você expõe toda a sua topologia interna para a internet. O **API gateway** é a porta de entrada única: o cliente fala só com ele, e ele encaminha cada requisição para o serviço certo.
+
+## O que um gateway faz
+
+```text
+                         +--------------------+     /usuarios/*  --> [svc usuarios]
+[app mobile] --HTTPS-->  |    API gateway     | --> /pedidos/*   --> [svc pedidos]
+[navegador]  --HTTPS-->  | auth, rate limit,  | --> /cardapio/*  --> [svc cardapio]
+[parceiros]  --HTTPS-->  | roteamento, logs   |
+                         +--------------------+
+```
+
+As responsabilidades típicas, todas **transversais** (iguais para qualquer serviço):
+
+- **Roteamento:** por caminho, host, cabeçalho ou versão (`/v2/pedidos` vai para a nova versão).
+- **Autenticação:** valida o token (por exemplo, a assinatura e a expiração de um JWT) uma vez, na borda, e repassa a identidade aos serviços internos num cabeçalho confiável.
+- **Rate limiting e quotas:** por usuário, por chave de API, por plano.
+- **Terminação TLS:** o tráfego interno pode seguir por mTLS ou rede privada.
+- **Transformação de protocolo:** recebe REST/JSON do cliente e fala gRPC com o backend.
+- **Agregação:** uma chamada `GET /tela-inicial` dispara três chamadas internas e devolve uma resposta combinada, poupando idas e voltas na rede móvel.
+- **Observabilidade:** gera o trace ID, registra logs de acesso e métricas de latência por rota.
+- **Cache de respostas** e **compressão**.
+
+## Gateway vs load balancer vs reverse proxy
+
+Um reverse proxy encaminha requisições para backends. Um load balancer distribui carga entre instâncias **do mesmo** serviço. Um API gateway é um reverse proxy de camada 7 que conhece a **API**: rotas, consumidores, planos, autenticação. Na prática, Kong e o Envoy Gateway são construídos sobre proxies (NGINX e Envoy), e os serviços gerenciados (AWS API Gateway, Apigee, Azure API Management) acrescentam portal de desenvolvedores e cobrança.
+
+## Exemplo de configuração
+
+```yaml
+routes:
+  - path: /pedidos/*
+    service: http://pedidos.internal:8080
+    plugins:
+      - jwt: { issuer: https://auth.exemplo.com }
+      - rate-limit: { por: usuario, limite: 100, janela: 1m }
+      - timeout: 2s
+  - path: /cardapio/*
+    service: http://cardapio.internal:8080
+    plugins:
+      - cache: { ttl: 30s }
+```
+
+Note como cada serviço deixa de se preocupar com JWT ou limite de taxa: ele recebe a requisição já filtrada.
+
+## Trade-offs e armadilhas
+
+| Benefício | Custo |
+| --- | --- |
+| Clientes simples, um só endereço | Um salto de rede a mais (normalmente poucos ms) |
+| Políticas centralizadas | Mais um componente para operar e escalar |
+| Esconde a topologia interna | Pode virar ponto único de falha |
+| Facilita versionamento e migrações | Risco de virar um "monólito de borda" |
+
+- **Ponto único de falha:** rode várias instâncias sem estado atrás de um load balancer, em várias zonas.
+- **Lógica de negócio no gateway:** é tentador colocar regras ("se o pedido for acima de X, chame o antifraude"). Resista. O gateway deve ser burro em relação ao domínio; regra de negócio no gateway vira um gargalo de deploy compartilhado por todos os times.
+- **Agregação excessiva:** quando cada cliente precisa de composições diferentes, o gateway único incha. É aí que entra o padrão Backend for Frontend.
+- **Timeouts:** o gateway deve ter timeout por rota menor que o do cliente e não deve retentar operações não idempotentes.
+
+<Callout type="note" title="Gateway não substitui segurança interna">
+Validar o token na borda não significa que serviços internos podem confiar em qualquer chamada. Em arquiteturas zero trust, a comunicação interna também é autenticada (mTLS) e autorizada.
+</Callout>
+
+## Na entrevista
+
+Em quase todo desenho com microsserviços, coloque um gateway entre clientes e serviços e diga explicitamente o que ele faz: autenticação, rate limiting, roteamento e TLS. Follow-ups comuns: "o gateway não vira gargalo?" (é stateless e escala horizontalmente), "onde fica o rate limit distribuído?" (contadores num Redis compartilhado), "qual a diferença para um service mesh?" (gateway cuida do tráfego norte-sul, de fora para dentro; o mesh cuida do leste-oeste, entre serviços).
+
+<QuizSet>
+<Quiz question="Qual destas responsabilidades NÃO deveria ficar no API gateway?" options={["Validar a assinatura de um JWT", "Aplicar rate limiting por chave de API", "Calcular o frete conforme regras de negócio", "Rotear /v2 para a nova versão do serviço"]} answer={2} explanation="Regras de domínio no gateway criam acoplamento entre times e transformam a borda num monólito. O gateway deve cuidar só de preocupações transversais." />
+<Quiz question="Como evitar que o API gateway seja um ponto único de falha?" options={["Usar uma única instância grande", "Rodar várias instâncias sem estado atrás de um load balancer, em zonas diferentes", "Fazer os clientes chamarem os serviços diretamente quando quiserem", "Guardar sessões dentro do gateway"]} answer={1} explanation="Gateways stateless escalam horizontalmente; redundância em várias zonas elimina o ponto único." />
+</QuizSet>

@@ -1,0 +1,79 @@
+---
+title: Bulkhead
+kind: lesson
+---
+
+Navios são divididos em compartimentos estanques, as anteparas (bulkheads, em inglês). Se o casco é furado, só um compartimento alaga e o navio continua flutuando. Em software, a ideia é a mesma: **isolar recursos em compartimentos** para que a falha ou a sobrecarga de uma parte não afunde o sistema inteiro.
+
+## O problema
+
+Seu serviço de checkout usa um único pool de 200 threads para atender requisições e chamar três dependências: estoque, pagamentos e cupons. O serviço de cupons fica lento. Cada requisição que precisa de cupom segura uma thread por 30 segundos. Em pouco tempo, as 200 threads estão todas esperando cupons, e o checkout não consegue mais processar **nada**, nem as compras sem cupom. Uma dependência secundária derrubou a função principal.
+
+Repare que um circuit breaker ajuda, mas só depois de detectar a falha. O bulkhead limita o estrago **desde o primeiro segundo**.
+
+## Como aplicar
+
+```text
+Sem bulkhead                          Com bulkhead
+
++---------------------------+         +---------+ +---------+ +---------+
+| pool único: 200 threads   |         | estoque | | pagam.  | | cupons  |
+| (cupons lento consome     |         | 80      | | 80      | | 20      |
+|  todas)                   |         | threads | | threads | | threads |
++---------------------------+         +---------+ +---------+ +---------+
+                                       cupons lento esgota só os 20 dele
+```
+
+O isolamento pode acontecer em vários níveis:
+
+- **Pools de threads separados** por dependência. Cada chamada externa roda no pool dela; se o pool encher, a chamada é rejeitada na hora.
+- **Semáforos:** em vez de threads dedicadas, um contador limita quantas chamadas simultâneas podem estar em andamento para aquela dependência. Mais leve, ideal para código assíncrono.
+- **Pools de conexões separados:** um pool de conexões ao banco para leituras de relatório e outro para transações, assim um relatório pesado não esgota as conexões do checkout.
+- **Instâncias separadas por tipo de cliente:** um cluster para tráfego de clientes pagantes e outro para o tráfego gratuito ou para jobs em lote.
+- **Isolamento por inquilino ou célula:** arquitetura celular, em que cada célula atende um subconjunto de clientes com infraestrutura própria. Um bug acionado por um cliente afeta só a célula dele.
+
+## Exemplo com semáforo
+
+```python
+import asyncio
+
+class Bulkhead:
+    def __init__(self, max_concorrentes):
+        self.sem = asyncio.Semaphore(max_concorrentes)
+
+    async def executar(self, coro_func, *args):
+        if self.sem.locked():
+            raise RuntimeError("bulkhead cheio, rejeitando")
+        async with self.sem:
+            return await coro_func(*args)
+
+bulkhead_cupons = Bulkhead(max_concorrentes=20)
+bulkhead_pagamentos = Bulkhead(max_concorrentes=80)
+```
+
+Quando os 20 slots de cupons estão ocupados, a chamada seguinte falha imediatamente, e o checkout pode seguir sem aplicar o cupom, ou pedir que o usuário tente de novo. Os slots de pagamentos continuam livres.
+
+## Dimensionamento
+
+Uma referência útil é a lei de Little: concorrência necessária ≈ taxa de chegada × latência. Se a dependência recebe 100 req/s com latência normal de 100 ms, você precisa de cerca de 10 chamadas simultâneas. Dê uma folga (por exemplo, 2 a 3 vezes) e pronto. Se a latência explodir para 30 s, a concorrência necessária iria a 3 mil, e o bulkhead corta isso em 20 ou 30, que é exatamente o objetivo.
+
+## Trade-offs
+
+| Vantagem | Custo |
+| --- | --- |
+| Falhas ficam contidas | Recursos ociosos em compartimentos pouco usados |
+| Funções críticas protegidas | Mais parâmetros para calibrar |
+| Comportamento previsível sob carga | Rejeições quando o compartimento enche |
+
+<Callout type="warning" title="Compartimentos pequenos demais">
+Um bulkhead subdimensionado rejeita tráfego legítimo em horário de pico, causando falhas que não existiriam sem ele. Monitore a taxa de rejeição de cada compartimento e ajuste com dados reais.
+</Callout>
+
+## Na entrevista
+
+Ao falar de resiliência, apresente bulkhead junto com timeout e circuit breaker: o timeout limita quanto tempo você espera, o bulkhead limita quantos recursos você arrisca, e o breaker decide quando parar de tentar. Mencione também isolamento em nível de infraestrutura, como clusters separados para tráfego crítico e não crítico. Follow-ups comuns: "como dimensionar os pools?", "o que fazer quando o compartimento enche?", "o que é arquitetura celular?".
+
+<QuizSet>
+<Quiz question="Qual problema o bulkhead resolve que o circuit breaker sozinho não resolve tão cedo?" options={["Detectar que a dependência voltou", "Impedir que uma dependência lenta consuma todos os recursos antes mesmo de a falha ser detectada", "Criptografar chamadas", "Balancear carga entre instâncias"]} answer={1} explanation="O bulkhead impõe um teto de recursos por dependência desde o início. O breaker precisa acumular falhas antes de agir." />
+<Quiz question="Uma dependência recebe 50 req/s com latência típica de 200 ms. Qual concorrência mínima o compartimento precisa, pela lei de Little?" options={["5", "10", "50", "250"]} answer={1} explanation="Concorrência ≈ taxa × latência = 50 × 0,2 = 10. Na prática você adiciona uma folga sobre esse valor." />
+</QuizSet>

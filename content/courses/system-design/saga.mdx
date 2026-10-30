@@ -1,0 +1,100 @@
+---
+title: Saga
+kind: lesson
+---
+
+Uma saga troca uma grande transação distribuída por uma **sequência de transações locais**, cada uma confirmada no banco do próprio serviço. Se algum passo falhar, a saga executa **transações de compensação** que desfazem, em termos de negócio, o que os passos anteriores fizeram. O termo vem de um artigo de 1987 sobre transações longas em bancos de dados e virou o padrão de fato para consistência entre microsserviços.
+
+## Exemplo: reservar uma viagem
+
+| Passo | Ação | Compensação |
+| --- | --- | --- |
+| T1 | Criar pedido como PENDENTE | Marcar pedido como CANCELADO |
+| T2 | Reservar voo | Cancelar reserva do voo |
+| T3 | Reservar hotel | Cancelar reserva do hotel |
+| T4 | Cobrar cartão | Estornar cobrança |
+| T5 | Marcar pedido como CONFIRMADO | (último passo, não precisa) |
+
+Se T4 falhar, a saga executa C3, C2 e C1, nessa ordem inversa. Repare que a compensação não apaga o histórico: um estorno é um novo lançamento, não a remoção do anterior.
+
+## Coreografia versus orquestração
+
+### Coreografia
+
+Não há um controlador central. Cada serviço reage a eventos e publica os seus:
+
+```text
+Pedidos  --PedidoCriado-->  Voos  --VooReservado-->  Hotéis  --HotelReservado-->  Pagamentos
+                                                                                     |
+Hotéis <--PagamentoRecusado--------------------------------------------------------- |
+  (cancela hotel e publica HotelCancelado, que Voos escuta, e assim por diante)
+```
+
+É simples para fluxos curtos e mantém os serviços desacoplados. Mas o fluxo fica espalhado: para entender a saga inteira você precisa ler o código de todos os serviços, e ciclos de eventos são fáceis de criar sem querer.
+
+### Orquestração
+
+Um **orquestrador** (um serviço ou um motor de workflow como Temporal ou AWS Step Functions) conhece a sequência, envia comandos a cada serviço e decide quando compensar.
+
+```python
+class Saga:
+    def __init__(self):
+        self.passos = []   # pares (acao, compensacao)
+
+    def passo(self, acao, compensacao):
+        self.passos.append((acao, compensacao))
+        return self
+
+    def executar(self, ctx):
+        feitos = []
+        for acao, compensacao in self.passos:
+            try:
+                acao(ctx)
+                feitos.append(compensacao)
+            except Exception as erro:
+                print(f"falhou: {erro}; compensando")
+                for comp in reversed(feitos):
+                    comp(ctx)   # em produção: com retry até dar certo
+                return False
+        return True
+
+
+def cobrar(ctx):
+    raise RuntimeError("cartão recusado")
+
+saga = (
+    Saga()
+    .passo(lambda c: print("pedido criado"), lambda c: print("pedido cancelado"))
+    .passo(lambda c: print("voo reservado"), lambda c: print("voo cancelado"))
+    .passo(cobrar, lambda c: print("estorno"))
+)
+print(saga.executar({"pedido": 42}))
+```
+
+Num orquestrador real, o estado da saga (quais passos foram feitos) é persistido a cada transição, para que ela continue de onde parou depois de uma queda.
+
+| Critério | Coreografia | Orquestração |
+| --- | --- | --- |
+| Visibilidade do fluxo | Espalhada | Centralizada |
+| Acoplamento | Baixo, via eventos | Serviços conhecem o orquestrador |
+| Fluxos longos ou com ramificações | Difícil | Natural |
+| Ponto central | Não há | Orquestrador (precisa ser resiliente) |
+
+## Regras para não se machucar
+
+- **Compensações devem ser idempotentes e sempre possíveis.** Elas podem rodar mais de uma vez por causa de retries, e não podem "falhar por regra de negócio". Se uma compensação nunca pode ser rejeitada, a saga sempre termina.
+- **Ordene os passos pelo risco.** Coloque cedo os passos que mais falham (validação, reserva) e tarde os que não têm desfazer, como enviar um e-mail. Um passo sem compensação depois do qual nada mais falha é chamado de *pivot*.
+- **Falta isolamento.** Outro usuário pode ver o voo reservado de uma viagem que vai ser cancelada. Mitigue com estados semânticos (PENDENTE), *semantic locks* (marcar o registro como em uso por uma saga) ou relendo valores antes de confirmar.
+
+<Callout type="warning" title="Compensar não é voltar no tempo">
+Se o cliente recebeu uma notificação de "voo reservado", o estorno não apaga a notificação. Desenhe as compensações pensando no que o mundo externo já viu, e adie efeitos visíveis para depois do pivot.
+</Callout>
+
+## Na entrevista
+
+Para qualquer fluxo multi-serviço com dinheiro ou reservas, descreva a saga em uma tabela de passos e compensações, diga se é orquestrada ou coreografada e por quê, e mencione idempotência. Follow-ups: "e se a compensação falhar?" (retry com backoff; ela precisa ser desenhada para eventualmente dar certo, com alerta e fila de tratamento manual como último recurso), "como o orquestrador publica comandos sem perder mensagens?" (padrão outbox).
+
+<QuizSet>
+<Quiz question="Numa saga com passos T1, T2, T3, o passo T3 falha. Que compensações rodam?" options={["C1, C2 e C3", "C2 e C1, nessa ordem", "C1 e C2, nessa ordem", "Nenhuma; a saga tenta T3 para sempre"]} answer={1} explanation="Só os passos concluídos são compensados, em ordem inversa. T3 falhou na sua transação local, então não há o que desfazer nele." />
+<Quiz question="Qual é a principal desvantagem da coreografia em sagas longas?" options={["Exige 2PC", "O fluxo fica espalhado entre serviços e difícil de entender e depurar", "Não permite compensações", "Exige um banco compartilhado"]} answer={1} explanation="Sem um ponto central, a lógica da saga é a soma dos handlers de eventos de vários serviços, o que dificulta visualizar e evoluir o fluxo." />
+</QuizSet>

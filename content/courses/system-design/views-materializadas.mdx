@@ -1,0 +1,78 @@
+---
+title: Views materializadas
+kind: lesson
+---
+
+Um painel mostra o faturamento por categoria nos últimos 30 dias. A consulta agrega dezenas de milhões de linhas e leva 8 segundos. Se 200 pessoas abrem o painel por minuto, o banco passa o dia recalculando o mesmo número. Uma **view materializada** guarda o resultado da consulta como se fosse uma tabela, e as leituras passam a custar milissegundos.
+
+## View comum versus view materializada
+
+Uma **view comum** é só uma consulta com nome: cada `SELECT` sobre ela executa a consulta original de novo. Ela simplifica o SQL, mas não economiza trabalho. Uma **view materializada** executa a consulta uma vez e **persiste o resultado** em disco. Você pode indexá-la, e ler dela é tão barato quanto ler uma tabela pequena. O preço é que o resultado envelhece: ele reflete os dados do momento do último refresh.
+
+| | View comum | View materializada |
+| --- | --- | --- |
+| Armazena dados | Não | Sim |
+| Custo da leitura | O da consulta inteira | O de ler uma tabela |
+| Frescor | Sempre atual | Até o último refresh |
+| Aceita índices | Não | Sim |
+
+## Exemplo no PostgreSQL
+
+```sql
+CREATE MATERIALIZED VIEW faturamento_categoria_30d AS
+SELECT c.nome AS categoria,
+       date_trunc('day', p.criado_em) AS dia,
+       SUM(i.preco * i.quantidade) AS total
+FROM pedidos p
+JOIN itens_pedido i ON i.pedido_id = p.id
+JOIN produtos pr ON pr.id = i.produto_id
+JOIN categorias c ON c.id = pr.categoria_id
+WHERE p.criado_em >= now() - interval '30 days'
+GROUP BY 1, 2;
+
+CREATE UNIQUE INDEX ON faturamento_categoria_30d (categoria, dia);
+
+-- recalcula sem bloquear leitores (exige índice único)
+REFRESH MATERIALIZED VIEW CONCURRENTLY faturamento_categoria_30d;
+```
+
+O refresh pode rodar num agendador a cada 10 minutos. Sem `CONCURRENTLY`, o PostgreSQL bloqueia leituras da view enquanto recalcula.
+
+## Estratégias de atualização
+
+- **Refresh completo:** reexecuta a consulta inteira. Simples, mas o custo cresce com o volume de dados.
+- **Refresh incremental:** aplica apenas as mudanças desde a última atualização. Oracle (com logs de view materializada), SQL Server (indexed views, mantidas a cada escrita) e alguns data warehouses suportam isso de forma nativa; no PostgreSQL puro, o refresh é sempre completo.
+- **Sob demanda ou agendado:** você decide quando atualizar, aceitando dados alguns minutos atrasados.
+- **Streaming:** sistemas como Materialize ou RisingWave e motores de stream mantêm o resultado atualizado continuamente a partir de um fluxo de mudanças.
+
+## Trade-offs
+
+Pontos a favor:
+
+- Leituras de consultas caras ficam baratas e previsíveis.
+- O banco mantém a lógica: a definição está em SQL, num só lugar.
+- É mais simples que montar um pipeline de desnormalização na aplicação.
+
+Pontos contra:
+
+- **Dados defasados** entre refreshes. Não serve para saldo ou estoque em tempo real.
+- **Custo de refresh:** um refresh completo de uma consulta pesada pode competir por CPU e I/O com o tráfego de produção.
+- **Espaço extra** em disco.
+- Em alguns bancos, views mantidas a cada escrita deixam as escritas mais lentas.
+
+<Callout type="tip" title="Uma regra de bolso">
+Se o resultado pode estar alguns minutos atrasado e a consulta é muito mais cara que a leitura do resultado pronto, view materializada é candidata natural. Se precisa ser exato no instante, não é.
+</Callout>
+
+## Relação com outros conceitos
+
+Uma view materializada é uma forma de **desnormalização gerenciada pelo banco** e também um **cache** de resultado de consulta, com invalidação por tempo. A diferença para um cache como Redis é que ela vive dentro do banco, pode ser consultada com SQL e indexada. Em arquiteturas maiores, o mesmo papel é feito por tabelas de leitura alimentadas por eventos, como no lado de leitura do CQRS.
+
+## Na entrevista
+
+Quando surgir um painel, ranking ou relatório pesado, proponha pré-calcular: "o ranking de vendedores é uma view materializada atualizada a cada cinco minutos; o painel lê dela". Follow-ups: "e se o refresh demorar mais que o intervalo?" (refresh incremental, particionar por período, mover para um warehouse), "como o usuário sabe que o dado é de cinco minutos atrás?" (mostrar o horário da última atualização).
+
+<QuizSet>
+<Quiz question="Qual a diferença essencial entre uma view comum e uma view materializada?" options={["A comum aceita índices e a materializada não", "A materializada persiste o resultado da consulta; a comum reexecuta a consulta a cada leitura", "A comum é sempre mais rápida", "A materializada só funciona em NoSQL"]} answer={1} explanation="A view comum é um apelido para a consulta. A materializada guarda o resultado e precisa de refresh para refletir mudanças." />
+<Quiz question="Para qual caso uma view materializada atualizada a cada 15 minutos é inadequada?" options={["Ranking semanal de produtos mais vendidos", "Painel de faturamento diário", "Verificação de estoque disponível no checkout", "Relatório mensal de cancelamentos"]} answer={2} explanation="O checkout precisa do estoque exato naquele instante. Um dado de até 15 minutos atrás pode permitir vender o que já acabou." />
+</QuizSet>

@@ -1,0 +1,76 @@
+---
+title: Particionamento
+kind: lesson
+---
+
+Uma tabela de eventos cresce 50 GB por mês. Depois de dois anos, os índices não cabem mais em memória, o `VACUUM` demora horas e apagar dados antigos com `DELETE` trava o banco. **Particionar** é dividir uma tabela grande em pedaços menores, as partições, segundo uma regra. Cada pedaço é menor, mais fácil de manter e, muitas vezes, a consulta só precisa olhar um deles.
+
+## Particionamento horizontal e vertical
+
+- **Horizontal:** cada partição tem as mesmas colunas e um subconjunto das **linhas**. Pedidos de 2025 numa partição, de 2026 em outra.
+- **Vertical:** cada partição tem um subconjunto das **colunas**. Os dados de perfil mais acessados numa tabela, a biografia e a foto grande em outra. Reduz o tamanho das linhas lidas no caminho quente.
+
+Quando se fala só em "particionamento", geralmente é o horizontal. Se as partições ficam em **máquinas diferentes**, chamamos de **sharding**, assunto do próximo capítulo. Aqui o foco é o particionamento dentro de um mesmo servidor.
+
+## Estratégias
+
+| Estratégia | Regra | Bom para | Cuidado |
+| --- | --- | --- | --- |
+| Por intervalo (range) | Faixas de valor, como mês | Séries temporais, expurgo de dados antigos | A partição mais recente concentra as escritas |
+| Por lista | Valores explícitos, como país | Dados naturalmente agrupados | Listas desbalanceadas |
+| Por hash | `hash(chave) mod N` | Distribuição uniforme | Consultas por intervalo tocam todas as partições |
+| Composto | Range e depois hash | Volume muito grande | Mais complexidade |
+
+## Exemplo no PostgreSQL
+
+```sql
+CREATE TABLE eventos (
+  id          BIGINT,
+  usuario_id  BIGINT,
+  tipo        TEXT,
+  criado_em   TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (criado_em);
+
+CREATE TABLE eventos_2026_09 PARTITION OF eventos
+  FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+CREATE TABLE eventos_2026_10 PARTITION OF eventos
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+
+-- só a partição de outubro é lida (partition pruning)
+SELECT count(*) FROM eventos
+WHERE criado_em >= '2026-10-15' AND criado_em < '2026-10-20';
+
+-- expurgo instantâneo, sem DELETE linha a linha
+DROP TABLE eventos_2026_09;
+```
+
+A aplicação continua consultando `eventos`; o banco direciona leituras e escritas para a partição certa.
+
+## Benefícios
+
+- **Partition pruning:** consultas que filtram pela chave de partição ignoram as partições irrelevantes.
+- **Manutenção por pedaço:** reindexar, fazer vacuum ou backup de uma partição de cada vez.
+- **Expurgo barato:** remover uma partição inteira com `DROP` ou `DETACH` em vez de apagar milhões de linhas, o que gera menos log e menos inchaço.
+- **Índices menores** por partição, com mais chance de caber em memória.
+- **Armazenamento em camadas:** partições antigas podem ir para discos mais baratos.
+
+## Armadilhas
+
+- **Consultas sem a chave de partição** varrem todas as partições e podem ficar mais lentas do que numa tabela única.
+- **Unicidade global:** no PostgreSQL, uma chave primária ou `UNIQUE` em tabela particionada precisa incluir a coluna de partição.
+- **Partições demais** aumentam o tempo de planejamento das consultas. Milhares de partições pequenas costumam ser um erro.
+- **Hot partition:** com range por data, todas as escritas caem na partição atual. Num único servidor isso costuma ser aceitável; entre servidores, vira um problema sério.
+- **Esquecer de criar as próximas partições:** automatize (por exemplo, com `pg_partman`) ou as inserções do mês seguinte falham.
+
+<Callout type="tip" title="Escolha a chave pelo acesso">
+A chave de partição deve aparecer no filtro das consultas mais frequentes. Para logs e eventos, quase sempre é o tempo. Para dados por inquilino, pode ser o `tenant_id`.
+</Callout>
+
+## Na entrevista
+
+Particionamento é a resposta natural para tabelas que crescem sem parar e têm retenção definida: "particiono os eventos por mês e removo partições com mais de 13 meses". Diferencie claramente de sharding. Follow-ups: "como você escolhe a chave?" (padrão de consulta e distribuição), "e se a consulta não filtrar por data?" (índice global ou outro armazenamento para esse acesso).
+
+<QuizSet>
+<Quiz question="Qual a principal vantagem de particionar uma tabela de logs por mês para a política de retenção?" options={["Joins mais rápidos com outras tabelas", "Remover meses antigos com DROP da partição, sem DELETE massivo", "Eliminar a necessidade de índices", "Distribuir os dados entre vários servidores"]} answer={1} explanation="Apagar uma partição inteira é quase instantâneo e não gera o volume de log e inchaço de um DELETE de milhões de linhas." />
+<Quiz question="Uma tabela particionada por hash de usuario_id recebe a consulta 'pedidos entre 1 e 7 de outubro'. O que acontece?" options={["Só uma partição é lida", "Todas as partições precisam ser lidas, pois a data não é a chave de partição", "A consulta falha", "O banco reparticiona automaticamente"]} answer={1} explanation="O pruning só funciona quando o filtro envolve a chave de partição. Sem ela, todas as partições são candidatas." />
+</QuizSet>

@@ -1,0 +1,82 @@
+---
+title: Redis
+kind: lesson
+---
+
+Redis é um armazenamento em memória de estruturas de dados. Muita gente o conhece como cache, mas o que o torna onipresente em entrevistas são as estruturas prontas: com elas você implementa ranking, rate limiter, fila simples, sessão, lock e contador sem escrever um servidor novo.
+
+## Modelo de dados
+
+Cada chave aponta para um valor de um tipo específico, e cada tipo tem comandos atômicos próprios.
+
+| Tipo | Comandos típicos | Uso clássico |
+| --- | --- | --- |
+| String | `GET`, `SET`, `INCR`, `SET NX EX` | Cache, contador, lock simples |
+| Hash | `HSET`, `HGETALL`, `HINCRBY` | Objeto pequeno (sessão, perfil) |
+| List | `LPUSH`, `BRPOP`, `LRANGE` | Fila simples, últimos N itens |
+| Set | `SADD`, `SISMEMBER`, `SINTER` | Membros únicos, tags |
+| Sorted set | `ZADD`, `ZINCRBY`, `ZREVRANGE` | Leaderboard, top K, janelas de tempo |
+| Stream | `XADD`, `XREADGROUP`, `XACK` | Log leve com grupos de consumo |
+| Geo | `GEOADD`, `GEOSEARCH` | Pontos próximos num raio |
+| HyperLogLog | `PFADD`, `PFCOUNT` | Contagem aproximada de únicos |
+
+Todas as chaves podem ter TTL, o que torna expiração automática trivial.
+
+## Arquitetura
+
+**Execução single-thread.** Os comandos são executados um de cada vez por uma única thread principal (versões recentes usam threads extras só para rede). Isso tem duas consequências: cada comando é atômico sem locks, e um comando lento, como `KEYS *` ou um `ZRANGE` gigantesco, trava todo mundo. Scripts Lua e `MULTI/EXEC` permitem combinar vários comandos atomicamente.
+
+**Persistência opcional.** Há dois mecanismos:
+
+- **RDB:** snapshots periódicos do dataset inteiro. Recuperação rápida, mas perde o que mudou desde o último snapshot.
+- **AOF:** log de comandos anexado a cada escrita, com fsync a cada segundo (padrão comum) ou a cada comando. Com fsync por segundo, você pode perder até cerca de 1 segundo.
+
+**Replicação e cluster.** Réplicas recebem um fluxo assíncrono do primário. O **Redis Cluster** divide o espaço de chaves em 16.384 hash slots distribuídos entre primários, cada um com réplicas. O cliente calcula o slot por CRC16 da chave e fala direto com o nó certo.
+
+```text
+  chave "user:42" -> CRC16 % 16384 = slot 9201
+                                    |
+     [nó A: slots 0-5460] [nó B: 5461-10922] [nó C: 10923-16383]
+           |                     |                    |
+       [réplica A]           [réplica B]          [réplica C]
+```
+
+Operações com várias chaves só funcionam se todas caírem no mesmo slot; para isso existem **hash tags**, como `{user42}:carrinho` e `{user42}:sessao`.
+
+## Garantias
+
+Redis privilegia velocidade. Com replicação assíncrona, um failover pode perder escritas recentes já confirmadas ao cliente. Mesmo com AOF a cada comando, não há consenso entre nós. Portanto: ótimo para dados que você pode reconstruir ou tolerar perder em pequena quantidade; não é banco de registro para saldo de conta.
+
+## Números típicos
+
+- Latência abaixo de 1 ms dentro da mesma zona.
+- 100 mil a centenas de milhares de operações por segundo por nó; com pipelining, mais de 1 milhão.
+- Memória é o limite: um nó com 64 a 256 GB é comum. Dataset maior exige cluster.
+- Valores grandes (dezenas de MB) e chaves com milhões de elementos são antipadrões.
+
+## Padrões que você vai usar
+
+**Cache-aside com TTL.** A aplicação tenta `GET`; se falhar, busca no banco e faz `SET` com expiração.
+
+**Rate limiter.** `INCR` numa chave por usuário e janela, com `EXPIRE`; ou sorted set com timestamps para janela deslizante.
+
+**Leaderboard.** `ZINCRBY placar 10 jogador:7` e `ZREVRANGE placar 0 9 WITHSCORES` para o top 10 em tempo logarítmico.
+
+**Lock com expiração.** `SET recurso:42 token NX PX 30000`. Libere só se o token bater, via script Lua. Lembre que, por não haver consenso, esse lock é adequado para eficiência, não para correção absoluta.
+
+## Quando escolher e quando não
+
+Escolha Redis quando precisar de latência muito baixa, estruturas de dados especiais ou estado efêmero compartilhado entre instâncias stateless. Evite como fonte única de dados que não podem ser perdidos, para datasets muito maiores que a memória disponível ou para consultas ad hoc: não há índices secundários nem linguagem de consulta.
+
+<Callout type="tip" title="Sorted set resolve metade das perguntas de ranking">
+Leaderboard, top K de um período e fila de prioridade cabem num sorted set. Mencione o custo O(log N) por atualização e como você particionaria se um único set ficasse grande demais.
+</Callout>
+
+## Na entrevista
+
+"Coloco Redis em cluster na frente do Postgres como cache-aside, com TTL de 5 minutos. O ranking global fica num sorted set; se o Redis perder dados, reconstruo a partir do banco." Follow-ups comuns: o que acontece numa hot key (réplicas de leitura ou cache local), como evitar stampede quando uma chave popular expira e por que o lock no Redis não é seguro contra pausas longas de GC sem um fencing token.
+
+<QuizSet>
+<Quiz question="Por que um comando como KEYS * é perigoso em produção?" options={["Ele apaga dados", "O Redis executa comandos numa única thread; um comando lento bloqueia todos os outros", "Ele desliga a persistência", "Ele só funciona em cluster"]} answer={1} explanation="A execução é single-thread, então uma varredura completa trava o servidor para todos os clientes." />
+<Quiz question="Qual estrutura do Redis encaixa melhor num leaderboard?" options={["List", "Set", "Sorted set", "HyperLogLog"]} answer={2} explanation="Sorted sets mantêm membros ordenados por score com atualização e consulta de faixa em O(log N)." />
+</QuizSet>

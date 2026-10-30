@@ -1,0 +1,127 @@
+---
+title: Projetar o Instagram
+kind: lesson
+---
+
+O Instagram combina dois problemas: um **pipeline de mídia** pesado (fotos e vídeos enviados por celulares, processados em várias resoluções e servidos para o mundo todo) e um **feed** parecido com o de outras redes sociais. Na entrevista, o diferencial é tratar bem o caminho da mídia, porque é ali que estão os bytes e o custo.
+
+## Requisitos
+
+### Funcionais
+
+- Publicar foto ou vídeo curto com legenda.
+- Seguir usuários e ver um feed com as publicações deles.
+- Curtir e comentar.
+- Ver o perfil de um usuário com a grade de publicações.
+- Opcional: stories que expiram em 24 horas, busca de usuários e hashtags.
+
+### Não funcionais
+
+- Feed carregando em menos de 300 ms; imagens aparecendo rapidamente mesmo em 4G.
+- Upload confiável em redes móveis instáveis.
+- Mídia nunca pode ser perdida depois de confirmada.
+- Consistência eventual no feed é aceitável.
+
+## Estimativas
+
+- 500 milhões de usuários ativos por dia.
+- 100 milhões de publicações novas por dia ≈ **1.200 por segundo**, pico de 4 mil.
+- Foto original média de 3 MB; guardamos o original mais 4 variantes (miniatura, 320, 640, 1080 px) somando mais 1 MB. Cerca de 4 MB por foto: 100 M × 4 MB = **400 TB por dia**, uns 146 PB por ano. Mídia domina tudo.
+- Leituras de feed: 500 M × 15 aberturas = 7,5 bilhões por dia ≈ **87 mil por segundo**.
+- Cada feed exibe 10 imagens: quase **1 milhão de imagens servidas por segundo**. Isso só é viável com CDN.
+- Metadados por publicação: 1 KB. 100 GB por dia, irrelevante perto da mídia.
+
+## API
+
+```text
+POST /midia/upload-url        -> { "midiaId": "m_9", "url": "https://s3...assinada" }
+PUT  <url pré-assinada>        (cliente envia os bytes direto ao storage)
+POST /publicacoes             { "midiaIds": ["m_9"], "legenda": "..." }
+GET  /feed?cursor=...
+GET  /usuarios/:id/publicacoes?cursor=...
+POST /publicacoes/:id/curtidas
+POST /publicacoes/:id/comentarios   { "texto": "..." }
+```
+
+O upload não passa pelos servidores de aplicação. O cliente recebe uma URL pré-assinada e envia direto ao object storage, o que tira gigabytes por segundo do caminho da API.
+
+## Modelo de dados
+
+```text
+publicacoes (particionada por autor_id)
+  publicacao_id | autor_id | legenda | midias[] | criado_em | status
+
+midias
+  midia_id | dono_id | chave_original | variantes{} | status (pendente, pronta)
+
+seguidores / seguindo  (grafo, duas direções)
+feed_cache (Redis): feed:{usuario_id} -> lista de publicacao_id
+```
+
+Particionar publicações por `autor_id` deixa a grade do perfil numa única partição.
+
+## Arquitetura de alto nível
+
+```text
+ app --(1) pede URL--> API --> serviço de mídia
+  |                                   |
+  +--(2) PUT bytes--> Object storage (originais)
+                             |
+                             | (3) evento "upload concluído"
+                             v
+                      Fila de processamento
+                             |
+                      Workers: redimensionam, convertem, removem EXIF
+                             |
+                      Object storage (variantes) <---- CDN <---- apps
+                             |
+ app --(4) cria publicação--> Serviço de publicações --> banco
+                                       |
+                                     Kafka --> fan-out --> Redis feeds
+```
+
+## Aprofundamentos
+
+### 1. Pipeline de mídia
+
+O fluxo em detalhes:
+
+1. O app pede uma URL de upload. O serviço cria um registro `midia` com status pendente.
+2. O app comprime a imagem localmente (economiza dados do usuário) e faz o upload. Para vídeos, usa upload em partes, retomável se a conexão cair.
+3. O storage emite um evento; workers geram as variantes, convertem para formatos modernos como WebP ou AVIF e removem metadados de localização.
+4. Quando as variantes ficam prontas, o status vira "pronta". A publicação só aparece no feed dos outros nesse momento; para o autor, o app mostra a versão local imediatamente.
+
+Os workers são stateless e escalam pelo tamanho da fila. Se um falhar, a mensagem volta para a fila; o processamento é idempotente porque grava sempre nas mesmas chaves derivadas do `midia_id`.
+
+### 2. Entrega pela CDN
+
+As URLs das variantes são imutáveis (incluem o ID e a versão), então podem ter cache de um ano na CDN. O app escolhe a variante pela largura da tela e pela qualidade da rede. Uma dica útil: enviar junto com o feed um **placeholder minúsculo** (um gradiente ou uma imagem de 20 bytes em base64) para o app desenhar algo enquanto a imagem real chega.
+
+Conteúdo novo de usuários populares pode ser pré-aquecido nos pontos de presença da CDN onde estão seus seguidores.
+
+### 3. Feed
+
+Como no Twitter, use fan-out híbrido: push para autores comuns, pull para contas com milhões de seguidores. O Instagram ranqueia o feed; o pipeline é gerar candidatos (das listas em cache), pontuar com um modelo que estima a chance de interação e ordenar. Mantenha a lista de candidatos generosa, umas 500, para o ranqueador ter material.
+
+<Callout type="note" title="Stories">
+Stories têm TTL de 24 horas. Guarde-os separados das publicações, com expiração automática no cache e um job que move a mídia para armazenamento mais barato ou a apaga. A barra de stories no topo é um feed à parte, com fan-out leve: só a lista de autores com story ativo.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Custo de armazenamento**: guardar originais em classes frias de storage depois de 30 dias reduz muito o custo; variantes muito acessadas ficam na classe quente.
+- **Gerar variantes antecipadamente versus sob demanda**: antecipado dá latência previsível; sob demanda (redimensionar na borda na primeira requisição) economiza disco para formatos pouco usados. Muitos sistemas combinam: variantes principais antecipadas, o resto sob demanda.
+- **Contadores de curtidas** em publicações virais viram hot keys. Use contadores particionados e mostre números aproximados ("1,2 mi").
+- **Consistência do feed**: a publicação pode aparecer em segundos para alguns seguidores e minutos para outros durante picos; aceitável.
+
+## Perguntas de follow-up comuns
+
+- **Como detectar conteúdo impróprio?** Um passo assíncrono no pipeline de mídia com classificadores; publicações suspeitas ficam ocultas até revisão.
+- **Como fazer a busca por hashtags?** Índice invertido de hashtag para publicações, atualizado via Kafka, com resultados ordenados por relevância e recência.
+- **Como lidar com upload duplicado após timeout?** O `midiaId` funciona como chave de idempotência; criar a publicação duas vezes com o mesmo ID devolve a existente.
+- **Como servir usuários em países distantes?** Storage replicado em regiões principais e CDN global; metadados replicados de forma assíncrona.
+
+<QuizSet>
+<Quiz question="Por que o app envia a foto direto ao object storage por URL pré-assinada?" options={["Para pular a autenticação", "Para tirar o tráfego pesado de bytes dos servidores de aplicação", "Porque o banco não aceita imagens", "Para permitir edição posterior"]} answer={1} explanation="A API só emite a autorização; os bytes vão direto ao storage, que escala para esse volume." />
+<Quiz question="Por que as URLs de variantes podem ter cache de um ano na CDN?" options={["Porque imagens nunca são apagadas", "Porque são imutáveis: qualquer mudança gera uma URL nova", "Porque a CDN ignora TTL", "Porque o navegador não faz cache"]} answer={1} explanation="Com o ID e a versão na URL, o conteúdo de uma URL nunca muda, então não há risco de servir algo desatualizado." />
+</QuizSet>

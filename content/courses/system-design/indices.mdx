@@ -1,0 +1,75 @@
+---
+title: Índices
+kind: lesson
+---
+
+Sem índice, para achar o pedido `id = 42` numa tabela de 50 milhões de linhas o banco faz um **full table scan**: lê página por página até encontrar. Um **índice** é uma estrutura auxiliar, ordenada por uma ou mais colunas, que aponta para as linhas. Ele transforma uma busca linear numa busca logarítmica, do mesmo jeito que o índice remissivo de um livro evita ler todas as páginas.
+
+## Como funciona
+
+Na maioria dos bancos relacionais, o índice padrão é uma **B+ tree**: nós internos guiam a descida e as folhas guardam as chaves em ordem, ligadas entre si. Com fan-out de algumas centenas, três ou quatro níveis bastam para bilhões de chaves. Isso serve tanto para igualdade (`=`) quanto para intervalos (`BETWEEN`, `>`, `ORDER BY`).
+
+Outros tipos aparecem em casos específicos:
+
+| Tipo | Bom para | Limitação |
+| --- | --- | --- |
+| B+ tree | Igualdade, intervalo, ordenação | Padrão; custo em toda escrita |
+| Hash | Igualdade exata | Não serve para intervalos nem ordenação |
+| Invertido (GIN) | Texto, arrays, JSON | Atualização mais cara |
+| Espacial (R-tree, GiST) | Geometria, proximidade | Uso específico |
+| Bitmap | Colunas de baixa cardinalidade em análise | Ruim com muitas escritas concorrentes |
+
+### Índice clusterizado e secundário
+
+No **índice clusterizado** as próprias linhas ficam armazenadas na ordem da chave (no InnoDB, é a chave primária). Só pode haver um por tabela. Um **índice secundário** guarda a chave indexada e um ponteiro: no InnoDB, a chave primária; no PostgreSQL, a localização física da linha no heap. Usar o secundário costuma exigir um segundo acesso para buscar as outras colunas.
+
+### Índice composto e a regra do prefixo
+
+Um índice em `(cliente_id, criado_em)` ordena primeiro por cliente e, dentro de cada cliente, por data. Ele atende:
+
+```sql
+-- usa o índice: prefixo completo + intervalo na segunda coluna
+SELECT * FROM pedidos
+WHERE cliente_id = 7 AND criado_em >= '2026-01-01'
+ORDER BY criado_em DESC;
+
+-- usa o índice: só o prefixo
+SELECT * FROM pedidos WHERE cliente_id = 7;
+
+-- não aproveita bem: pula a primeira coluna
+SELECT * FROM pedidos WHERE criado_em >= '2026-01-01';
+```
+
+A regra prática: colunas comparadas por igualdade vêm primeiro; a coluna de intervalo ou ordenação vem depois.
+
+### Índice de cobertura
+
+Se o índice contém todas as colunas que a consulta precisa, o banco responde só com ele, sem visitar a tabela (*index-only scan*). No PostgreSQL você pode incluir colunas extras com `INCLUDE`:
+
+```sql
+CREATE INDEX idx_pedidos_cliente
+  ON pedidos (cliente_id, criado_em) INCLUDE (valor_total);
+```
+
+## O custo dos índices
+
+Índice não é de graça:
+
+- **Escritas mais lentas:** cada `INSERT`, `UPDATE` em coluna indexada e `DELETE` precisa atualizar todas as árvores envolvidas.
+- **Espaço:** índices podem somar mais que a própria tabela.
+- **Memória:** o ganho depende de as páginas quentes do índice caberem no buffer pool.
+- **Seletividade:** índice em coluna com poucos valores distintos (como `ativo = true` em 95% das linhas) raramente é usado; ler a tabela inteira sai mais barato. Um **índice parcial** (`WHERE ativo = false`) resolve o caso inverso.
+
+<Callout type="warning" title="Funções escondem o índice">
+`WHERE LOWER(email) = 'a@b.com'` não usa um índice em `email`. Crie um índice de expressão sobre `LOWER(email)` ou normalize o dado na escrita. O mesmo vale para conversões implícitas de tipo e `LIKE '%termo'` com curinga no início.
+</Callout>
+
+## Na entrevista
+
+Ao desenhar o modelo de dados, cite os índices junto com os padrões de acesso: "a consulta principal é pedidos do cliente por data, então crio um índice composto `(cliente_id, criado_em)`". Follow-ups comuns: "por que não indexar tudo?" (custo de escrita e memória), "como saber se o índice está sendo usado?" (`EXPLAIN`), "e em tabela com escrita massiva?" (menos índices, ou mover consultas analíticas para outro sistema).
+
+<QuizSet>
+<Quiz question="Há um índice em (cliente_id, criado_em). Qual consulta NÃO aproveita bem esse índice?" options={["WHERE cliente_id = 5", "WHERE cliente_id = 5 AND criado_em > '2026-01-01'", "WHERE criado_em > '2026-01-01'", "WHERE cliente_id = 5 ORDER BY criado_em"]} answer={2} explanation="O índice é ordenado primeiro por cliente_id. Filtrar só pela segunda coluna não permite descer pela árvore usando o prefixo." />
+<Quiz question="O que caracteriza um índice de cobertura?" options={["Ele indexa todas as colunas da tabela", "Ele contém todas as colunas que a consulta precisa, dispensando o acesso à tabela", "Ele é sempre clusterizado", "Ele só funciona com hash"]} answer={1} explanation="Com todas as colunas necessárias no índice, o banco faz um index-only scan e evita o segundo acesso." />
+<Quiz question="Por que um índice hash não ajuda em WHERE preco BETWEEN 10 AND 50?" options={["Hash não suporta números", "A função hash espalha as chaves e destrói a ordem, então não há como varrer um intervalo", "Hash só funciona em memória", "Intervalos exigem índice bitmap"]} answer={1} explanation="Chaves vizinhas caem em posições aleatórias. Intervalos e ordenação precisam de uma estrutura ordenada como a B+ tree." />
+</QuizSet>

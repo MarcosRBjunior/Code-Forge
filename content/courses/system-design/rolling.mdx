@@ -1,0 +1,96 @@
+---
+title: Rolling deploy
+kind: lesson
+---
+
+Você tem dez instâncias atrás de um load balancer e quer trocar a versão de todas sem tirar o serviço do ar e sem pagar por outras dez máquinas. O **rolling deploy** faz isso substituindo as instâncias aos poucos, em lotes, enquanto as demais continuam atendendo. É a estratégia padrão do Kubernetes (`RollingUpdate`) e de grupos de autoscaling em nuvem.
+
+## Como funciona
+
+```text
+início     : [v1][v1][v1][v1][v1][v1]
+lote 1     : [v2][v2][v1][v1][v1][v1]   <- 2 novas sobem, passam no readiness
+lote 2     : [v2][v2][v2][v2][v1][v1]
+lote 3     : [v2][v2][v2][v2][v2][v2]   fim
+```
+
+Para cada lote, o orquestrador:
+
+1. Sobe instâncias da versão nova (ou retira antigas, dependendo da configuração).
+2. Espera que passem na **readiness probe** e só então as coloca no load balancer.
+3. Faz **connection draining** nas antigas: para de mandar novas requisições e dá um prazo para as em andamento terminarem.
+4. Encerra as antigas e passa ao próximo lote.
+
+Se as novas instâncias não ficam prontas, o rollout para. Nada de avançar com uma versão que nem sobe.
+
+## Os dois botões: surge e unavailable
+
+No Kubernetes, dois parâmetros controlam o ritmo:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%        # até 3 pods extras acima de 10 durante a troca
+      maxUnavailable: 0    # nunca menos que 10 pods prontos
+  minReadySeconds: 20      # o pod precisa ficar pronto por 20 s antes de contar
+```
+
+- **maxSurge** alto acelera o deploy, mas exige capacidade sobrando no cluster.
+- **maxUnavailable** alto também acelera, mas reduz a capacidade durante a troca. Com `maxUnavailable: 0`, a capacidade nunca cai, o que é o mais seguro para serviços no limite.
+- **minReadySeconds** evita que um pod que fica pronto e morre logo depois seja considerado sucesso.
+
+O valor percentual é arredondado: surge para cima, unavailable para baixo. Com 10 réplicas, 25% de surge viram 3 pods.
+
+## Vantagens
+
+- Sem downtime e sem duplicar a infraestrutura.
+- Suporte nativo nos orquestradores, sem ferramentas extras.
+- Problemas que aparecem logo na subida (crash, configuração faltando) param o rollout no primeiro lote.
+
+## Desvantagens e armadilhas
+
+- **Duas versões convivem durante todo o rollout.** Um usuário pode ter uma requisição atendida pela v2 e a seguinte pela v1. APIs, formatos de cache, mensagens em filas e schema do banco precisam ser compatíveis nos dois sentidos.
+- **Rollback não é instantâneo.** Voltar significa fazer outro rolling para a versão anterior, lote a lote.
+- **Exposição não é controlada por usuário.** A fração de tráfego na versão nova é proporcional às instâncias trocadas, e cresce rápido. Um bug sutil, que só aparece em métricas de negócio depois de uma hora, já atingiu todo mundo.
+- **Readiness mal feita engana o processo.** Se o endpoint responde 200 antes do aquecimento de caches ou do pool de conexões, as primeiras requisições sofrem.
+- **Conexões longas (WebSocket, gRPC streaming)** não terminam sozinhas durante o draining. Defina prazo e faça o cliente reconectar com elegância.
+
+<Callout type="tip" title="Rolling com freio automático">
+Combine o rolling com verificação de métricas entre os lotes: pausar após o primeiro lote, comparar taxa de erro e latência com as instâncias antigas e só seguir se estiver tudo bem. Na prática, isso aproxima o rolling de um canary, e ferramentas como Argo Rollouts automatizam esse passo.
+</Callout>
+
+## Encerramento elegante
+
+O lado da aplicação também importa. Ao receber `SIGTERM`, o processo deve parar de aceitar novas conexões, terminar as requisições em andamento e só então sair. Um padrão comum no Kubernetes é um pequeno atraso antes de fechar o listener, porque a remoção do pod dos endpoints do Service se propaga de forma assíncrona e algumas requisições ainda podem chegar nos primeiros segundos.
+
+```python
+import signal, sys, time
+
+encerrando = False
+
+def ao_receber_sigterm(signum, frame):
+    global encerrando
+    encerrando = True        # readiness passa a responder 503
+    time.sleep(5)            # espera o balanceador parar de mandar tráfego
+    servidor.parar_aceitando()
+    servidor.aguardar_requisicoes(timeout=25)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, ao_receber_sigterm)
+```
+
+## Na entrevista
+
+Rolling é a resposta padrão para "como você faz deploy desses serviços sem estado?". Mostre que conhece os parâmetros de ritmo, a dependência de boas probes e o custo da convivência de versões. Follow-ups: o que acontece se a nova versão sobe mas tem 5% de erro (resposta: o rolling comum não percebe; precisa de análise de métricas ou canary) e como fazer rolling em serviços com estado, como um banco replicado (um nó por vez, réplicas primeiro e líder por último, após failover controlado).
+
+<QuizSet>
+<Quiz question="Com 10 réplicas, maxSurge: 0 e maxUnavailable: 2, o que acontece durante o rolling?" options={["O cluster chega a ter 12 pods", "Até 2 pods antigos são removidos antes das novas versões subirem, reduzindo a capacidade temporariamente", "Nada é trocado", "Todos os pods são trocados de uma vez"]} answer={1} explanation="Sem surge, a única forma de abrir espaço é derrubar pods antigos. A capacidade cai para 8 durante cada etapa." />
+<Quiz question="Por que um rolling deploy exige compatibilidade entre versões?" options={["Porque usa o dobro de máquinas", "Porque, durante o rollout, instâncias v1 e v2 atendem tráfego ao mesmo tempo", "Porque reinicia o banco", "Porque só funciona com UDP"]} answer={1} explanation="Enquanto os lotes são trocados, as duas versões compartilham tráfego, banco, cache e filas." />
+</QuizSet>

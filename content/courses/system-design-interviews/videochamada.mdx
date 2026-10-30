@@ -1,0 +1,133 @@
+---
+title: Projetar videochamadas
+kind: lesson
+---
+
+Videochamada é diferente de quase tudo que você projeta em entrevistas: o dado principal (áudio e vídeo) não passa pelo seu banco, não é persistido e não tolera atraso. Uma mensagem de chat pode chegar 2 segundos depois; um quadro de vídeo atrasado 2 segundos é lixo. A questão avalia se você separa bem o **plano de sinalização** do **plano de mídia**.
+
+## Requisitos
+
+### Funcionais
+
+- Chamadas um a um e em grupo (até 50 participantes com vídeo).
+- Ligar, aceitar, recusar, encerrar.
+- Ligar e desligar câmera e microfone; compartilhar tela.
+- Funcionar em redes ruins e atrás de NAT corporativo.
+- Opcional: gravação e legendas.
+
+### Não funcionais
+
+- Latência boca-ouvido abaixo de 150 ms para conversa natural; acima de 400 ms fica ruim.
+- Degradar qualidade antes de travar: perder resolução é melhor que perder fluidez.
+- Alta disponibilidade da sinalização; uma chamada em curso deve sobreviver a falhas pontuais.
+- Escala: dezenas de milhões de minutos por dia.
+
+## Estimativas
+
+- 10 milhões de chamadas por dia, duração média de 20 minutos e 4 participantes.
+- Chamadas simultâneas no pico: 10 M × 20 min / 1.440 min ≈ 140 mil em média; com pico de 3×, **cerca de 420 mil chamadas** ao mesmo tempo.
+- Banda por participante enviando vídeo 720p: em torno de 1,5 Mbps de subida.
+- Numa chamada de 4 pessoas via servidor, cada participante sobe 1 fluxo e desce 3: 1,5 + 4,5 = 6 Mbps por pessoa. O servidor de mídia movimenta 4 × 6 = **24 Mbps por chamada**.
+- Total: 420 mil × 24 Mbps ≈ **10 Tbps** no pico. Isso exige servidores de mídia distribuídos geograficamente, perto dos usuários.
+
+## API
+
+A sinalização usa WebSocket; a mídia usa WebRTC sobre UDP.
+
+```json
+{ "tipo": "criar_sala" }
+{ "tipo": "sala_criada", "salaId": "s_88a", "token": "..." }
+
+{ "tipo": "entrar", "salaId": "s_88a", "sdpOferta": "v=0..." }
+{ "tipo": "resposta", "sdpResposta": "v=0...",
+  "servidorMidia": "sfu-gru-12.exemplo.com:443" }
+
+{ "tipo": "candidato_ice", "candidato": "udp 192.0.2.10 54400 ..." }
+{ "tipo": "participante_entrou", "usuario": "u_4", "fluxos": ["cam", "mic"] }
+```
+
+O SDP descreve codecs e formatos que cada lado aceita; os candidatos ICE são os endereços possíveis para a conexão de mídia.
+
+## Modelo de dados
+
+```text
+salas (Redis, efêmero)
+  sala_id | servidor_midia | criada_em | participantes[]
+
+chamadas (banco relacional, histórico)
+  chamada_id | sala_id | iniciada_em | encerrada_em | participantes
+
+metricas_qualidade (série temporal)
+  chamada_id | usuario_id | ts | perda_pct | jitter_ms | bitrate
+```
+
+Só metadados são persistidos. A mídia em si nunca toca disco, a não ser que a gravação esteja ligada.
+
+## Arquitetura de alto nível
+
+```text
+            sinalização (WebSocket)
+ cliente A ---------------------------+
+   |   \                              |
+   |    \  mídia (UDP/SRTP)    +------v-------+     +---------+
+   |     \                     | Serviço de   |---->| Redis   |
+   |      v                    | sinalização  |     | (salas) |
+   |   +--------------+        +------+-------+     +---------+
+   |   | SFU região   |<--------------+ aloca servidor
+   |   | São Paulo    |               |
+   |   +------+-------+        +------v-------+
+   |          |  cascata       | Alocador de  |
+   |   +------v-------+        | mídia        |
+   |   | SFU região   |        +--------------+
+   |   | Virgínia     |
+   |   +------^-------+
+   |          |
+ cliente B ---+        STUN/TURN: descoberta de endereço e retransmissão
+```
+
+## Aprofundamentos
+
+### 1. Topologia de mídia: P2P, MCU ou SFU
+
+| Topologia | Como funciona | Quando usar |
+| --- | --- | --- |
+| Ponto a ponto | Cada cliente envia direto aos outros | Chamadas de 2 pessoas; zero custo de servidor |
+| MCU | Servidor decodifica todos, compõe um mosaico e reencoda | Clientes muito fracos; caríssimo em CPU |
+| SFU | Servidor só repassa pacotes, sem decodificar | Padrão para grupos |
+
+Em P2P com 5 pessoas, cada uma precisaria subir 4 fluxos, o que estoura a banda de um celular. A **SFU** (selective forwarding unit) resolve: cada cliente sobe um fluxo, e o servidor decide quais encaminhar a quem. Como não decodifica vídeo, um servidor SFU aguenta centenas de participantes com CPU modesta; o gargalo vira banda de rede.
+
+Uma boa resposta: chamadas 1:1 tentam P2P primeiro; grupos vão direto para SFU.
+
+### 2. Simulcast e adaptação à rede
+
+Na SFU, cada cliente envia o mesmo vídeo em **três qualidades** (por exemplo 180p, 360p e 720p). O servidor escolhe qual camada encaminhar para cada receptor com base na banda estimada dele e no tamanho do quadro na tela. Quem está numa miniatura recebe 180p; quem está em destaque recebe 720p. Se a rede de um receptor piora, a SFU troca de camada sem pedir nada ao remetente.
+
+O áudio tem prioridade sobre o vídeo. Em rede muito ruim, desligar o vídeo e manter o áudio é melhor que travar tudo. O protocolo usa UDP justamente porque retransmitir um pacote atrasado não faz sentido: ele chegaria tarde demais para ser tocado. Correção de erro antecipada (FEC) e ocultação de perda cobrem as falhas.
+
+### 3. NAT, STUN e TURN
+
+A maioria dos aparelhos está atrás de NAT e não tem IP público. O cliente consulta um servidor **STUN** para descobrir seu endereço público e tenta conexão direta. Em redes corporativas que bloqueiam UDP, usa-se **TURN**: um servidor que retransmite toda a mídia, inclusive via TCP na porta 443. TURN é caro em banda, então deve ser o último recurso. Com SFU, o próprio servidor de mídia costuma ter IP público e aceitar TCP, o que reduz a necessidade de TURN.
+
+<Callout type="note" title="Escolha do servidor de mídia">
+O alocador escolhe a SFU mais próxima do primeiro participante, ou da maioria. Para chamadas intercontinentais, use SFUs em cascata: cada participante conecta à SFU da sua região, e as SFUs trocam fluxos entre si por um backbone privado.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Banda das SFUs** é o custo dominante. Encaminhar só os fluxos visíveis (não mandar 49 vídeos para quem vê 9 na tela) corta muito.
+- **SFU é stateful**: se cair, a chamada trava. O cliente detecta, pede um novo servidor à sinalização e renegocia em 1 a 3 segundos. Não tente replicar estado de mídia.
+- **Criptografia ponta a ponta** conflita com recursos do servidor (gravação, legendas). Com SFU dá para cifrar o conteúdo do quadro e deixar só os cabeçalhos legíveis para o roteamento.
+- **Grupos enormes** (webinar de 10 mil) viram outro problema: poucos apresentadores via WebRTC e audiência por streaming com segundos de atraso.
+
+## Perguntas de follow-up comuns
+
+- **Como gravar a chamada?** Um participante "robô" entra na SFU, recebe os fluxos e os grava ou compõe num worker separado, com upload para object storage.
+- **Como medir qualidade?** Clientes enviam estatísticas a cada poucos segundos (perda, jitter, bitrate) para uma série temporal; alarmes por região e por SFU.
+- **Como tocar quem está recebendo a ligação?** A sinalização envia push ao aparelho; o app acorda e abre o WebSocket antes de negociar mídia.
+- **Como lidar com eco?** Cancelamento de eco acontece no cliente, antes de codificar o áudio.
+
+<QuizSet>
+<Quiz question="Por que a SFU é preferida ao MCU em chamadas de grupo?" options={["Porque a SFU decodifica e compõe vídeo melhor", "Porque a SFU apenas repassa pacotes, gastando pouca CPU", "Porque o MCU não suporta áudio", "Porque a SFU dispensa sinalização"]} answer={1} explanation="Sem decodificar nem reencodar, a SFU escala com CPU modesta; o MCU precisa processar cada fluxo." />
+<Quiz question="Para que serve o simulcast?" options={["Para gravar a chamada em três formatos", "Para que o servidor escolha uma qualidade adequada para cada receptor", "Para cifrar o vídeo três vezes", "Para enviar áudio por TCP"]} answer={1} explanation="O remetente envia várias camadas e a SFU encaminha a que cabe na banda e no layout de cada receptor." />
+</QuizSet>

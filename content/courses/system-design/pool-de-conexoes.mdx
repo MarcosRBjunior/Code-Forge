@@ -1,0 +1,68 @@
+---
+title: Pool de conexões
+kind: lesson
+---
+
+Abrir uma conexão com o banco não é barato. Há handshake TCP, muitas vezes negociação TLS, autenticação e, no PostgreSQL, a criação de um processo inteiro no servidor para atender aquela conexão. Isso pode custar alguns milissegundos e vários megabytes de memória. Se cada requisição HTTP abrir e fechar a própria conexão, você paga esse preço milhares de vezes por segundo. Um **pool de conexões** mantém um conjunto de conexões abertas e as empresta para quem precisa.
+
+## Como funciona
+
+1. Na inicialização, o pool abre um número mínimo de conexões.
+2. Quando o código precisa do banco, pede uma conexão emprestada (*checkout*).
+3. Ao terminar, devolve a conexão ao pool (*checkin*) em vez de fechá-la.
+4. Se todas estiverem em uso, o pedido espera numa fila até um limite de tempo; estourado o limite, falha.
+5. O pool valida conexões ociosas, descarta as quebradas e recicla as muito antigas.
+
+```python
+import psycopg_pool
+
+pool = psycopg_pool.ConnectionPool(
+    "postgresql://app@db/loja",
+    min_size=5,
+    max_size=20,
+    timeout=2.0,      # tempo máximo esperando uma conexão livre
+    max_lifetime=1800 # recicla conexões a cada 30 minutos
+)
+
+def buscar_pedido(pedido_id):
+    with pool.connection() as conn:          # checkout
+        return conn.execute(
+            "SELECT * FROM pedidos WHERE id = %s", (pedido_id,)
+        ).fetchone()
+    # ao sair do bloco, a conexão volta ao pool
+```
+
+## Dimensionando o pool
+
+Mais conexões não significa mais throughput. O banco tem um número limitado de núcleos e de discos; com conexões demais, elas passam a disputar CPU, locks e memória, e cada uma fica mais lenta. Um ponto de partida comum para bancos relacionais é algo na ordem de **duas vezes o número de núcleos** do servidor, ajustado com testes de carga.
+
+Faça a conta de ponta a ponta. Se você tem 40 instâncias da aplicação, cada uma com pool máximo de 20, são até 800 conexões chegando ao banco, que talvez aceite 200. Com autoscaling, esse número cresce sozinho.
+
+## Pool no lado da aplicação versus proxy de pool
+
+| Tipo | Exemplos | Vantagem | Limitação |
+| --- | --- | --- | --- |
+| Na aplicação | HikariCP, psycopg_pool, pool do driver | Simples, sem salto extra | Cada instância tem seu pool; o total cresce com as instâncias |
+| Proxy externo | PgBouncer, ProxySQL, RDS Proxy | Limita o total de conexões reais ao banco | Mais um componente para operar |
+
+O PgBouncer oferece modos de pool. No **modo sessão**, o cliente fica com uma conexão real até desconectar. No **modo transação**, a conexão real só fica presa durante uma transação, o que permite milhares de clientes sobre poucas dezenas de conexões. O custo é perder recursos ligados à sessão, como variáveis de sessão, `LISTEN` e, dependendo da versão, prepared statements.
+
+<Callout type="warning" title="Vazamento de conexões">
+Se o código não devolve a conexão (exceção sem `finally`, transação esquecida aberta), o pool esgota e todas as requisições passam a esperar e falhar por timeout. Use sempre gerenciadores de contexto e configure detecção de vazamento e timeout de transação ociosa.
+</Callout>
+
+## Armadilhas
+
+- **Serverless:** cada execução de função pode abrir sua conexão, e milhares de execuções simultâneas derrubam o banco. Um proxy de pool é quase obrigatório.
+- **Transações longas** prendem conexões e reduzem a capacidade efetiva do pool. Não faça chamadas HTTP externas com uma transação aberta.
+- **Timeout de espera infinito** transforma lentidão do banco em fila infinita na aplicação. Prefira falhar rápido.
+- **Conexões mortas** após failover ou reinício do banco: valide antes de entregar ou recicle com `max_lifetime`.
+
+## Na entrevista
+
+Cite o pool ao mostrar a ligação entre a camada de aplicação e o banco, e faça a conta de conexões totais quando houver autoscaling: "50 pods com pool de 10 dão 500 conexões; coloco um PgBouncer em modo transação para manter 100 conexões reais". Follow-ups: "o que acontece quando o pool esgota?" (fila, timeout, backpressure), "por que não aumentar o pool para 1.000?" (contenção no banco).
+
+<QuizSet>
+<Quiz question="Sua aplicação escalou de 10 para 60 instâncias, cada uma com pool máximo de 30, e o banco passou a recusar conexões. Qual a solução mais adequada?" options={["Aumentar o pool de cada instância para 100", "Colocar um proxy de pool como PgBouncer para limitar as conexões reais ao banco", "Remover o pool e abrir uma conexão por requisição", "Trocar TCP por UDP"]} answer={1} explanation="60 x 30 = 1.800 conexões possíveis. Um proxy multiplexa muitos clientes sobre poucas conexões reais." />
+<Quiz question="Por que um pool maior pode deixar o sistema mais lento?" options={["Porque o pool usa mais rede", "Porque conexões demais disputam CPU, memória e locks no banco, aumentando a latência de todas", "Porque conexões abertas expiram", "Porque o otimizador ignora pools grandes"]} answer={1} explanation="O banco tem recursos finitos. Além de certo ponto, mais concorrência só aumenta a disputa e a troca de contexto." />
+</QuizSet>

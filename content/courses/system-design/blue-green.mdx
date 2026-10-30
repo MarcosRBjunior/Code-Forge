@@ -1,0 +1,77 @@
+---
+title: Blue-green
+kind: lesson
+---
+
+No rolling deploy, a troca acontece aos poucos e voltar atrás leva tempo. E se você pudesse preparar a versão nova inteira, testá-la com calma em ambiente idêntico ao de produção e, quando estivesse confiante, mudar todo o tráfego num único movimento, com a opção de desfazer na mesma velocidade? Essa é a proposta do **blue-green deployment**.
+
+## Como funciona
+
+Você mantém dois ambientes completos de aplicação, chamados por convenção de **blue** e **green**. Num dado momento, só um deles recebe tráfego de usuários.
+
+```text
+                         +--> [blue  - v1]  (ativo)
+usuários -> roteador ----|
+                         +..> [green - v2]  (ocioso: recebe deploy e testes)
+
+após a troca:
+                         +..> [blue  - v1]  (ocioso: pronto para rollback)
+usuários -> roteador ----|
+                         +--> [green - v2]  (ativo)
+```
+
+O ciclo:
+
+1. Faça deploy da v2 no ambiente ocioso (green).
+2. Rode smoke tests, testes de integração e aquecimento contra o green, usando um endereço interno.
+3. Troque o roteador para apontar todo o tráfego ao green.
+4. Monitore. Se algo der errado, aponte de volta para o blue.
+5. Depois de um período de confiança, o blue vira o ambiente ocioso do próximo deploy.
+
+## Onde fica a chave
+
+O "roteador" pode ser várias coisas, e a escolha afeta a velocidade da troca:
+
+| Mecanismo | Velocidade | Observação |
+| --- | --- | --- |
+| Load balancer (trocar target group ou upstream) | Segundos | O mais comum e previsível |
+| Service do Kubernetes (mudar o selector de label) | Segundos | Simples e nativo |
+| DNS | Minutos a horas | Caches e TTL atrasam a troca; clientes que ignoram TTL ficam no ambiente antigo |
+| Service mesh ou API gateway | Segundos | Permite também troca gradual por peso |
+
+Prefira mecanismos que não dependem de cache de clientes. DNS é o menos confiável para rollback rápido.
+
+## O problema do estado
+
+A aplicação é duplicada, mas o banco de dados geralmente não. Os dois ambientes compartilham o mesmo banco, filas e caches. Isso tem consequências:
+
+- **Schema compatível com as duas versões.** Se a v2 renomeia uma coluna, o blue (v1) quebra quando você fizer rollback. Use o padrão expandir e contrair: primeiro adicione o novo, depois migre, e só remova o antigo quando nenhuma versão o usar.
+- **Dados escritos pela v2 continuam lá após o rollback.** A v1 precisa tolerar registros num formato novo, ou o rollback vira um segundo incidente.
+- **Trabalhos em segundo plano.** Consumidores de fila e jobs agendados do ambiente ocioso devem estar desligados, senão as duas versões processam as mesmas mensagens.
+
+<Callout type="warning" title="Sessões e conexões em andamento">
+Na troca, conexões abertas no ambiente antigo precisam ser drenadas. Se a sessão do usuário mora em memória da aplicação, todos são deslogados no momento do switch. Mantenha sessões em armazenamento compartilhado ou em tokens.
+</Callout>
+
+## Vantagens
+
+- **Rollback quase instantâneo**, enquanto o ambiente antigo estiver de pé.
+- **Teste no ambiente real** antes de qualquer usuário ver a mudança: mesma rede, mesma configuração, mesma escala.
+- **Nunca há mistura de versões atendendo usuários**, exceto no breve momento da troca.
+
+## Desvantagens
+
+- **Custo:** dois ambientes completos durante o deploy. Na nuvem, dá para criar o green sob demanda e destruí-lo depois, o que reduz o custo a algumas horas de capacidade dobrada.
+- **Exposição tudo ou nada:** todos os usuários passam para a v2 ao mesmo tempo. Um bug que os testes não pegaram atinge 100% do tráfego, mesmo que por pouco tempo.
+- **Aquecimento:** o ambiente green começa com caches locais frios e pools de conexão vazios. Uma troca brusca pode gerar um pico de latência. Aqueça com tráfego sintético antes.
+
+Muitos times combinam as ideias: preparam o green como no blue-green, mas mudam o peso do roteador gradualmente (1%, 10%, 100%), que é essencialmente um canary entre dois ambientes.
+
+## Na entrevista
+
+Cite blue-green quando o requisito for rollback imediato ou validação completa antes da exposição, por exemplo num sistema de pagamentos com janelas de risco curtas. Mostre que sabe que o banco é compartilhado e que isso exige migrações compatíveis. Follow-ups: como fazer rollback se a v2 já gravou dados novos, por que não usar DNS para a troca e como reduzir o custo da infraestrutura duplicada.
+
+<QuizSet>
+<Quiz question="Qual é a principal vantagem do blue-green em relação ao rolling deploy?" options={["Não precisa de load balancer", "Rollback praticamente instantâneo, trocando o roteador de volta para o ambiente antigo", "Usa metade da infraestrutura", "Dispensa migrações de banco compatíveis"]} answer={1} explanation="O ambiente antigo continua de pé e pronto. Voltar é só reapontar o tráfego." />
+<Quiz question="Por que a troca via DNS é a menos indicada para blue-green?" options={["DNS não suporta registros A", "Caches e TTL fazem parte dos clientes continuar no ambiente antigo por minutos ou horas", "DNS só funciona com UDP", "DNS criptografa o tráfego"]} answer={1} explanation="A propagação depende de caches fora do seu controle, o que torna tanto a troca quanto o rollback lentos e imprevisíveis." />
+</QuizSet>

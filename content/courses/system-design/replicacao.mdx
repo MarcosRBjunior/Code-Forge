@@ -1,0 +1,60 @@
+---
+title: Replicação
+kind: lesson
+---
+
+Se o seu banco roda em uma única máquina, um disco queimado pode significar dados perdidos, e um pico de leituras pode derrubar tudo. **Replicação** é manter cópias dos mesmos dados em várias máquinas, as réplicas. Ela serve a três objetivos: **disponibilidade** (outra réplica assume se uma cair), **escala de leitura** (distribuir consultas) e **latência** (réplicas perto dos usuários).
+
+## Líder-seguidor (primário-réplica)
+
+O modelo mais comum. Uma réplica é o **líder**: só ela aceita escritas. Ela registra as mudanças num log (o WAL no PostgreSQL, o binlog no MySQL) e envia esse fluxo aos **seguidores**, que aplicam as mesmas mudanças na mesma ordem. Leituras podem ir a qualquer réplica.
+
+```text
+          escritas
+App ───────────────▶ Líder ──log──▶ Seguidor 1  ◀── leituras
+  │                     └────log──▶ Seguidor 2  ◀── leituras
+  └──── leituras ──────────────────────────────────────┘
+```
+
+### Síncrona ou assíncrona
+
+| Modo | Como confirma a escrita | Vantagem | Risco |
+| --- | --- | --- | --- |
+| Síncrono | Espera o seguidor gravar | Nenhuma perda se o líder morrer | Latência maior; seguidor lento trava escritas |
+| Assíncrono | Confirma logo após gravar no líder | Rápido | Escritas recentes podem se perder no failover |
+| Semi-síncrono | Espera pelo menos um seguidor | Equilíbrio | Configuração mais delicada |
+
+Na prática, é comum ter um seguidor síncrono (para não perder dados) e os demais assíncronos.
+
+### Replication lag
+
+Com replicação assíncrona, o seguidor fica alguns milissegundos (ou minutos, sob carga) atrás do líder. Isso causa anomalias visíveis:
+
+- **Ler a própria escrita:** o usuário edita o perfil, recarrega a página, a leitura vai para um seguidor atrasado e a edição "sumiu". Solução: ler do líder logo após uma escrita do próprio usuário, ou esperar o seguidor alcançar a posição do log da escrita.
+- **Leituras monotônicas:** duas leituras seguidas caem em réplicas com atrasos diferentes e o dado parece voltar no tempo. Solução: fixar o usuário numa réplica.
+
+### Failover
+
+Quando o líder cai, um seguidor é promovido. Os riscos: escolher um seguidor desatualizado e perder escritas, ou ter **dois líderes** ao mesmo tempo (split brain) se o antigo voltar achando que ainda manda. Ferramentas como Patroni usam um armazenamento de consenso (etcd) para eleger o líder com segurança e cercar o antigo.
+
+## Multi-líder
+
+Vários nós aceitam escritas, cada um replicando para os outros. É útil para operar em várias regiões, cada uma escrevendo localmente, ou para apps que funcionam offline. O problema são os **conflitos**: dois líderes alteram o mesmo registro ao mesmo tempo. Estratégias incluem last-write-wins (simples, mas perde dados), mesclar valores, CRDTs ou devolver o conflito para a aplicação resolver.
+
+## Sem líder (leaderless)
+
+No estilo Dynamo (Cassandra, Riak), o cliente escreve e lê em várias réplicas diretamente. Com **N** réplicas, a escrita espera **W** confirmações e a leitura consulta **R** réplicas. Se `R + W > N`, os conjuntos de leitura e escrita se sobrepõem e a leitura encontra pelo menos uma cópia com a última escrita confirmada. Réplicas atrasadas são corrigidas por *read repair* e por processos de anti-entropia em segundo plano.
+
+<Callout type="warning" title="Replicação não é backup">
+Um `DELETE` sem `WHERE` é replicado fielmente para todas as cópias em milissegundos. Você ainda precisa de backups e de recuperação para um ponto no tempo.
+</Callout>
+
+## Na entrevista
+
+Diga qual modelo usa e por quê: "líder-seguidor com uma réplica síncrona na mesma região e duas assíncronas para leitura". Mostre que conhece o lag e como lidar com ele. Follow-ups: "como garantir que o usuário veja o próprio comentário?" (read-your-writes), "o que acontece se o líder cair?" (failover, perda de escritas assíncronas, cerca contra split brain), "replicação resolve escala de escrita?" (não; para isso existe sharding).
+
+<QuizSet>
+<Quiz question="Um usuário atualiza o nome, recarrega a página e vê o nome antigo. A leitura foi para um seguidor. Qual garantia foi violada?" options={["Atomicidade", "Read-your-writes (ler a própria escrita)", "Durabilidade", "Isolamento serializável"]} answer={1} explanation="O seguidor ainda não aplicou a escrita. Ler do líder após escritas do próprio usuário resolve." />
+<Quiz question="Num sistema leaderless com N = 3, qual configuração garante que a leitura sobreponha a última escrita confirmada?" options={["W = 1, R = 1", "W = 2, R = 2", "W = 1, R = 2", "W = 0, R = 3"]} answer={1} explanation="Com R + W maior que N (2 + 2 = 4, maior que 3), todo conjunto de leitura intercepta o de escrita." />
+<Quiz question="Qual o principal risco da replicação assíncrona num failover?" options={["Leituras mais lentas", "Perder escritas confirmadas pelo líder que ainda não chegaram ao seguidor promovido", "Impossibilidade de criar índices", "Conflitos de escrita entre líderes"]} answer={1} explanation="O líder confirmou ao cliente antes de replicar. Se ele morre, o novo líder não tem essas escritas." />
+</QuizSet>

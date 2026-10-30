@@ -1,0 +1,92 @@
+---
+title: R-trees
+kind: lesson
+---
+
+Geohash e quadtree indexam bem **pontos**. Mas muitos dados espaciais são formas com área: o polígono de um bairro, o traçado de uma rua, a área de cobertura de uma loja, o retângulo de um anúncio num mapa. Para indexar esses objetos e responder "quais formas tocam esta região?", bancos de dados usam a **R-tree**, proposta por Antonin Guttman em 1984. Ela é a estrutura por trás dos índices espaciais do PostGIS (via GiST), do SQLite (módulo R*Tree), do MySQL e de muitas bibliotecas de GIS.
+
+## A ideia: retângulos que envolvem retângulos
+
+Cada objeto é representado pelo seu **MBR** (minimum bounding rectangle), o menor retângulo alinhado aos eixos que o contém. A R-tree é uma árvore balanceada, parecida com uma B-tree, em que:
+
+- Cada folha guarda até M entradas, cada uma com o MBR de um objeto e um ponteiro para ele.
+- Cada nó interno guarda até M entradas, cada uma com o MBR que envolve **todo** o conteúdo de um filho.
+- Todas as folhas ficam na mesma profundidade.
+
+```text
+                 [ R1 | R2 ]                    nó raiz
+                 /         \
+        [ a | b | c ]   [ d | e ]               folhas com MBRs de objetos
+
+R1 envolve a, b e c; R2 envolve d e e.
+R1 e R2 podem se sobrepor: um ponto pode estar dentro dos dois.
+```
+
+A diferença fundamental para a quadtree: as regiões de nós irmãos **podem se sobrepor**, e não dividem o espaço de forma fixa. Elas se moldam aos dados.
+
+## Busca
+
+Para encontrar objetos que intersectam uma janela de consulta:
+
+1. Na raiz, verifique cada entrada cujo MBR intersecta a janela.
+2. Desça recursivamente em **todas** essas entradas (por causa da sobreposição, pode ser mais de uma).
+3. Nas folhas, teste o MBR de cada objeto; para os aprovados, faça o teste exato com a geometria real.
+
+O passo 3 é importante: MBRs são um **filtro grosso**. Uma rua diagonal tem um MBR enorme, cheio de espaço vazio. O índice elimina candidatos impossíveis rapidamente, e a geometria exata confirma os restantes. Esse padrão "filtro e refinamento" está em todo índice espacial.
+
+## Inserção e divisão
+
+Ao inserir, a árvore escolhe a folha cujo MBR precisa **crescer menos** para acomodar o novo objeto, e ajusta os MBRs no caminho até a raiz. Quando uma folha estoura M entradas, ela se divide em duas, e o objetivo é que os dois novos MBRs tenham a menor área e a menor sobreposição possível. A divisão pode subir até a raiz, como na B-tree.
+
+A qualidade da árvore depende muito dessas heurísticas. Variantes conhecidas:
+
+| Variante | Ideia principal |
+| --- | --- |
+| R-tree original | Divisão quadrática ou linear, simples |
+| R*-tree | Minimiza sobreposição e reinsere entradas antes de dividir; buscas bem melhores |
+| R+-tree | Proíbe sobreposição duplicando objetos em vários nós |
+| Hilbert R-tree | Ordena entradas pela curva de Hilbert para agrupar vizinhos |
+
+Para dados estáticos, a construção em lote (*bulk loading*), como STR (sort-tile-recursive), ordena tudo e monta nós cheios de uma vez, gerando árvores muito mais eficientes que inserções uma a uma.
+
+## Exemplo com PostGIS
+
+```sql
+CREATE TABLE zonas_entrega (
+  id     serial PRIMARY KEY,
+  nome   text,
+  area   geometry(Polygon, 4326)
+);
+
+CREATE INDEX idx_zonas_area ON zonas_entrega USING GIST (area);
+
+-- quais zonas cobrem o ponto do cliente?
+SELECT id, nome
+FROM zonas_entrega
+WHERE ST_Contains(area, ST_SetSRID(ST_MakePoint(-46.6559, -23.5614), 4326));
+```
+
+O índice GiST implementa uma R-tree. O operador `&&` (intersecção de MBR) é a etapa de filtro, e funções como `ST_Contains` fazem o refinamento exato.
+
+<Callout type="note" title="Sobreposição é o custo">
+Quanto mais os MBRs de nós irmãos se sobrepõem, mais ramos a busca precisa visitar. Uma R-tree mal construída pode degenerar para algo próximo de uma varredura completa. Por isso variantes como R*-tree e o bulk loading importam na prática.
+</Callout>
+
+## Comparação
+
+| Critério | Quadtree | R-tree |
+| --- | --- | --- |
+| Divide o quê | O espaço, em quadrantes fixos | Os dados, em grupos de objetos |
+| Sobreposição entre nós | Não | Sim |
+| Balanceamento | Não garantido | Sempre balanceada |
+| Objetos com área | Precisa duplicar ou guardar em nós altos | Natural |
+| Uso típico | Índice em memória de pontos | Índice em disco de bancos espaciais |
+
+## Na entrevista
+
+Cite R-tree quando o problema envolve formas, não só pontos: "a qual zona de entrega este endereço pertence?", "quais imóveis estão dentro deste polígono desenhado pelo usuário?". Diga que você usaria um banco com índice espacial (PostGIS) em vez de implementar a árvore. Follow-up comum: "por que não geohash?" (geohash representa pontos; para polígonos você precisaria cobri-los com muitas células e ainda refinar).
+
+<QuizSet>
+<Quiz question="O que um nó interno de uma R-tree guarda para cada filho?" options={["O centroide do filho", "O retângulo mínimo que envolve todo o conteúdo do filho", "Um geohash do filho", "Uma cópia de todos os objetos do filho"]} answer={1} explanation="Cada entrada interna é um MBR que contém todos os objetos daquela subárvore, permitindo descartá-la se não intersectar a consulta." />
+<Quiz question="Por que uma busca na R-tree pode precisar descer em mais de um filho do mesmo nó?" options={["Porque a árvore não é balanceada", "Porque os MBRs de nós irmãos podem se sobrepor", "Porque os dados são duplicados", "Porque usa hashing"]} answer={1} explanation="Diferente da quadtree, a R-tree permite sobreposição; se a janela intersecta dois MBRs irmãos, os dois ramos precisam ser visitados." />
+</QuizSet>

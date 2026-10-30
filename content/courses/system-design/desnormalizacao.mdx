@@ -1,0 +1,87 @@
+---
+title: Desnormalização
+kind: lesson
+---
+
+A normalização organiza os dados para que cada fato fique em um só lugar: o nome do cliente mora na tabela `clientes`, e os pedidos apenas apontam para ele. Isso evita inconsistências, mas cobra um preço na leitura: montar uma tela pode exigir quatro ou cinco joins. Quando essa tela é acessada milhões de vezes por dia, o custo dos joins vira gargalo. **Desnormalizar** é duplicar dados de propósito para que a leitura comum seja barata.
+
+## Como funciona
+
+Você identifica o padrão de leitura dominante e grava os dados já no formato que essa leitura precisa. Formas comuns:
+
+- **Copiar colunas:** guardar `nome_cliente` dentro de `pedidos`.
+- **Contadores pré-calculados:** `posts.total_comentarios` em vez de `COUNT(*)` a cada exibição.
+- **Tabelas de leitura:** uma tabela `feed_usuario` com os itens prontos para cada usuário.
+- **Agregados embutidos:** em bancos de documentos, guardar os itens do pedido dentro do próprio documento do pedido.
+
+## Exemplo
+
+Modelo normalizado e a consulta da listagem de posts:
+
+```sql
+SELECT p.id, p.titulo, u.nome AS autor, COUNT(c.id) AS comentarios
+FROM posts p
+JOIN usuarios u ON u.id = p.autor_id
+LEFT JOIN comentarios c ON c.post_id = p.id
+GROUP BY p.id, p.titulo, u.nome
+ORDER BY p.criado_em DESC
+LIMIT 20;
+```
+
+Versão desnormalizada: o post carrega o nome do autor e o contador.
+
+```sql
+ALTER TABLE posts ADD COLUMN autor_nome TEXT;
+ALTER TABLE posts ADD COLUMN total_comentarios INT DEFAULT 0;
+
+-- a leitura vira um acesso simples por índice
+SELECT id, titulo, autor_nome, total_comentarios
+FROM posts ORDER BY criado_em DESC LIMIT 20;
+
+-- a escrita de comentário passa a fazer duas coisas
+BEGIN;
+INSERT INTO comentarios (post_id, autor_id, texto) VALUES (10, 3, 'Ótimo!');
+UPDATE posts SET total_comentarios = total_comentarios + 1 WHERE id = 10;
+COMMIT;
+```
+
+A leitura ficou trivial; a escrita ficou mais complexa.
+
+## Mantendo as cópias em dia
+
+O problema central da desnormalização é a **sincronização**. Se o usuário muda o nome, todos os posts dele precisam ser atualizados. Estratégias:
+
+| Estratégia | Consistência | Custo |
+| --- | --- | --- |
+| Atualizar na mesma transação | Forte | Escritas mais lentas, contenção |
+| Triggers no banco | Forte | Lógica escondida, difícil de depurar |
+| Eventos assíncronos (fila, CDC) | Eventual | Infra extra, janela de inconsistência |
+| Job periódico de reconciliação | Eventual | Atraso; útil como rede de segurança |
+
+Escolha conforme o dado tolera atraso. Um contador de curtidas atrasado alguns segundos não incomoda ninguém; um saldo copiado errado é um incidente.
+
+<Callout type="warning" title="Contadores quentes">
+Um post viral recebendo milhares de comentários por segundo transforma a linha `posts.total_comentarios` num ponto de contenção de locks. Alternativas: incrementar no Redis e consolidar periodicamente, ou dividir o contador em N sub-contadores e somar na leitura.
+</Callout>
+
+## Quando desnormalizar
+
+Bons sinais:
+
+- Leituras superam escritas por uma ordem de grandeza ou mais.
+- O dado copiado muda raramente (nome de produto, autor).
+- Os joins atravessam shards ou serviços diferentes, onde join simplesmente não existe.
+- Você já mediu e o join é o gargalo, não um palpite.
+
+Maus sinais: dado que muda o tempo todo, requisito de consistência forte em todas as cópias ou um modelo ainda instável, em que a duplicação multiplica o trabalho de cada mudança.
+
+Em bancos NoSQL como Cassandra ou DynamoDB, desnormalizar não é otimização, é o padrão: você modela uma tabela por consulta, porque o banco não faz joins.
+
+## Na entrevista
+
+Diga explicitamente o que está duplicando e como mantém a cópia atualizada: "guardo o nome do autor no post para evitar o join no feed; quando o nome mudar, um evento atualiza os posts de forma assíncrona, e aceito alguns segundos de atraso". Follow-ups: "e se o evento se perder?" (outbox, reprocessamento, job de reconciliação), "qual a diferença para uma view materializada?" (na view, o banco mantém a cópia; aqui, a aplicação).
+
+<QuizSet>
+<Quiz question="Qual é o principal custo da desnormalização?" options={["Leituras mais lentas", "Manter as cópias sincronizadas, com escritas mais complexas e risco de inconsistência", "Impossibilidade de criar índices", "Perda de durabilidade"]} answer={1} explanation="Duplicar dados acelera a leitura, mas cada mudança precisa alcançar todas as cópias." />
+<Quiz question="Em qual cenário a desnormalização é mais indicada?" options={["Dado que muda a cada segundo e exige consistência forte em todas as cópias", "Feed lido milhões de vezes por dia, cujo join com a tabela de autores é o gargalo medido", "Tabela com 200 linhas", "Modelo de dados ainda em definição"]} answer={1} explanation="Leitura muito mais frequente que escrita, dado copiado estável e gargalo medido formam o cenário clássico." />
+</QuizSet>

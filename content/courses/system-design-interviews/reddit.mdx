@@ -1,0 +1,138 @@
+---
+title: Projetar o Reddit
+kind: lesson
+---
+
+O Reddit é organizado em comunidades temáticas onde usuários publicam links ou textos, votam para cima ou para baixo e discutem em árvores de comentários profundas. Diferente do Twitter, o feed não depende de quem você segue, e sim de **votos e tempo**. A questão gira em torno de ranking, contagem de votos e leitura eficiente de árvores de comentários.
+
+## Requisitos
+
+### Funcionais
+
+- Criar comunidades e se inscrever nelas.
+- Publicar posts (texto, link ou imagem) numa comunidade.
+- Votar positiva ou negativamente em posts e comentários.
+- Ver a página de uma comunidade ordenada por "em alta", "novos" e "mais votados".
+- Página inicial com posts das comunidades inscritas.
+- Comentários em árvore, com respostas a respostas.
+
+### Não funcionais
+
+- Páginas de listagem carregando em menos de 200 ms.
+- Contagem de votos e ranking podem atrasar alguns segundos.
+- Muito mais leitura que escrita, com visitantes anônimos lendo sem login.
+
+## Estimativas
+
+- 70 milhões de usuários ativos por dia, 100 mil comunidades ativas.
+- Posts: 1 milhão por dia (≈ 12 por segundo). Comentários: 10 milhões por dia (≈ 120 por segundo).
+- Votos: 200 milhões por dia ≈ **2.300 por segundo**, pico de 10 mil, concentrados em poucos posts.
+- Leituras de página: 2 bilhões por dia ≈ **23 mil por segundo**, pico de 80 mil. Visitantes anônimos são metade.
+- Armazenamento: posts e comentários somam 11 M × 1 KB ≈ 11 GB por dia, uns 4 TB por ano. Votos: 200 M × 25 bytes = 5 GB por dia.
+
+Volumes de escrita modestos; o desafio está em ranquear e servir leituras.
+
+## API
+
+```text
+GET  /r/:comunidade?ordem=alta|novos|top&periodo=dia&cursor=...
+GET  /inicio?ordem=alta&cursor=...
+POST /r/:comunidade/posts        { "titulo": "...", "tipo": "link", "url": "..." }
+PUT  /posts/:id/voto             { "valor": 1 }    (1, -1 ou 0 para remover)
+GET  /posts/:id/comentarios?ordem=melhores&profundidade=5
+POST /posts/:id/comentarios      { "texto": "...", "paiId": "c_88" }
+```
+
+O voto é um `PUT` com o valor final, não um incremento. Repetir a requisição não conta duas vezes.
+
+## Modelo de dados
+
+```text
+posts         post_id | comunidade_id | autor_id | titulo | tipo | criado_em
+              | ups | downs | pontuacao_alta
+votos         (usuario_id, item_id) -> valor   (chave composta, única)
+comentarios   comentario_id | post_id | pai_id | caminho | autor_id | texto
+              | ups | downs | criado_em
+inscricoes    usuario_id | comunidade_id
+```
+
+O campo `caminho` guarda a sequência de ancestrais (por exemplo `c1/c7/c42`), o que permite buscar uma subárvore inteira com uma consulta por prefixo.
+
+## Arquitetura de alto nível
+
+```text
+ visitantes --> CDN (páginas anônimas, TTL 30-60 s)
+                 |
+ logados  ---> API gateway
+                 |
+   +-------------+---------------+------------------+
+   |             |               |                  |
+ Serviço de   Serviço de      Serviço de         Serviço de
+ listagens    posts           votos              comentários
+   |             |               |                  |
+ Redis        Postgres        Kafka --> Agregador  Postgres
+ (listas      (particionado     de votos -->       (por post_id)
+ ranqueadas)  por comunidade)  atualiza contagem
+   ^                            e pontuação
+   +----------------------------------+
+```
+
+## Aprofundamentos
+
+### 1. O ranking "em alta"
+
+A ideia é combinar popularidade e frescor. Uma fórmula simples e própria:
+
+```python
+import math
+
+def pontuacao_alta(ups: int, downs: int, criado_em_s: float) -> float:
+    saldo = ups - downs
+    ordem = math.log10(max(abs(saldo), 1))
+    sinal = 1 if saldo > 0 else -1 if saldo < 0 else 0
+    horas = criado_em_s / 3600
+    return sinal * ordem + horas / 12.5
+```
+
+O logaritmo faz os primeiros 10 votos valerem tanto quanto os 90 seguintes; o termo de tempo dá vantagem constante a posts mais novos. O ponto-chave: a parcela de tempo depende só da data de criação, então **a pontuação de um post só muda quando ele recebe votos**. Não é preciso recalcular todos os posts a cada minuto.
+
+Para cada comunidade, mantenha um sorted set no Redis com os mil melhores posts por pontuação. Cada voto processado atualiza a pontuação do post e seu lugar no conjunto. A página da comunidade é um `ZREVRANGE`.
+
+### 2. Votos em escala
+
+Votos chegam concentrados num punhado de posts quentes. O serviço de votos grava o voto individual (upsert na chave `usuario_id, item_id`) e publica um evento com o **delta** (de +1 para -1 é delta de -2). O agregador acumula deltas por item durante alguns segundos e aplica um único update no contador e no sorted set. O voto individual é a fonte da verdade; os contadores podem ser recalculados.
+
+Para combater manipulação, votos de contas novas ou suspeitas podem ser descartados no agregador e o número exibido recebe um pequeno ruído, dificultando que robôs confirmem se seus votos contaram.
+
+### 3. Árvore de comentários
+
+Um post popular tem 20 mil comentários em vários níveis. Carregar tudo é inviável. A estratégia:
+
+- Busque os comentários de nível superior ordenados por "melhores", limitados a 50.
+- Para cada um, traga as respostas até uma profundidade de 4 ou 5 e no máximo N filhos por nó; o restante vira um link "ver mais respostas".
+- Ordene irmãos por uma pontuação de confiança que favorece comentários com proporção alta de votos positivos e amostra suficiente, não só o saldo bruto.
+
+Com o campo `caminho` indexado, carregar a subárvore de "ver mais" é uma consulta por prefixo. Para posts muito quentes, a árvore renderizada fica em cache por alguns segundos.
+
+<Callout type="note" title="Leitores anônimos são a maior parte do tráfego">
+Páginas de comunidade vistas sem login são iguais para todos. Cache na CDN com TTL de 30 a 60 segundos remove metade da carga de leitura sem nenhuma lógica extra.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Página inicial personalizada**: mesclar as listas "em alta" das comunidades inscritas (até centenas) a cada requisição é caro. Limite a mescla às 50 comunidades mais ativas do usuário e guarde o resultado em cache por um minuto.
+- **Sorted set por comunidade**: comunidades gigantes concentram votos num único conjunto. O agregador em janela reduz a frequência de atualização.
+- **"Top de todos os tempos"**: calculado por job periódico, não em tempo real.
+- **Exatidão versus custo**: contadores exibidos atrasam alguns segundos; ninguém percebe.
+
+## Perguntas de follow-up comuns
+
+- **Como moderar?** Moderadores removem posts, que são marcados como removidos e saem das listas; filtros automáticos rodam de forma assíncrona após a publicação.
+- **Como fazer busca?** Índice invertido alimentado por eventos, com filtros por comunidade e período.
+- **Como dar escala de escrita ao banco?** Particione posts por comunidade e comentários por `post_id`; quase todas as consultas ficam numa partição.
+- **Como lidar com um post que vai para a página principal do site?** O tráfego explode; cache curto da árvore de comentários e da página do post absorve o pico.
+
+<QuizSet>
+<Quiz question="Na fórmula de 'em alta' com termo de tempo baseado na criação, quando a pontuação de um post muda?" options={["A cada minuto", "Somente quando recebe votos", "A cada leitura", "Uma vez por dia"]} answer={1} explanation="O termo de tempo é fixo para cada post; só os votos alteram a pontuação, então não há recálculo periódico." />
+<Quiz question="Por que o voto é enviado como valor final e não como incremento?" options={["Para ocupar menos bytes", "Para que a operação seja idempotente e permita trocar de voto corretamente", "Porque o banco não suporta incremento", "Para facilitar o cache na CDN"]} answer={1} explanation="Com o valor final, repetir a requisição não duplica o voto, e trocar de +1 para -1 gera o delta correto." />
+</QuizSet>

@@ -1,0 +1,142 @@
+---
+title: Projetar um editor colaborativo
+kind: lesson
+---
+
+Um editor colaborativo, no estilo Google Docs, permite que várias pessoas digitem no mesmo documento ao mesmo tempo e vejam as mudanças umas das outras quase instantaneamente. O desafio central não é escala bruta, e sim **convergência**: todos os participantes precisam terminar com o mesmo texto, mesmo quando editam o mesmo trecho simultaneamente.
+
+## Requisitos
+
+### Funcionais
+
+- Criar, abrir e editar documentos de texto rico.
+- Edição simultânea por vários usuários, com as mudanças aparecendo em tempo real.
+- Mostrar cursores e seleções dos outros participantes.
+- Histórico de versões e possibilidade de restaurar.
+- Opcional: comentários, edição offline, permissões por documento.
+
+### Não funcionais
+
+- Latência local zero: o que eu digito aparece na hora, sem esperar o servidor.
+- Propagação para os outros em menos de 200 ms na mesma região.
+- **Convergência garantida**: nunca dois usuários com textos diferentes depois que tudo sincroniza.
+- Durabilidade: nenhuma edição confirmada pode ser perdida.
+
+## Estimativas
+
+- 50 milhões de usuários ativos por dia, 10 milhões de documentos abertos por dia.
+- Documentos com edição simultânea no pico: 2 milhões; a maioria com 1 a 3 editores, poucos com 50 ou mais.
+- Um editor ativo gera uma operação a cada 300 ms enquanto digita, mas digita 20% do tempo: cerca de 0,7 operação por segundo. Com 4 milhões de editores ativos no pico: **2,8 milhões de operações por segundo**.
+- Cada operação tem uns 100 bytes: 280 MB/s de entrada, distribuídos entre muitos documentos independentes.
+- Armazenamento: documento médio de 50 KB mais histórico de operações. Com 2 bilhões de documentos: 100 TB de snapshots, mais o log de operações compactado periodicamente.
+
+O ponto importante: a carga se divide naturalmente por documento. Não há operação que cruze documentos.
+
+## API
+
+```text
+GET  /docs/:id                -> snapshot + versão atual
+WS   /docs/:id/sessao         -> canal de operações
+
+cliente -> servidor
+  { "tipo": "op", "versaoBase": 1042, "idOp": "c7-311",
+    "ops": [ { "inserir": "olá", "pos": 120 } ] }
+
+servidor -> cliente
+  { "tipo": "ack", "idOp": "c7-311", "versao": 1043 }
+  { "tipo": "op_remota", "versao": 1044, "autor": "u_5",
+    "ops": [ { "apagar": 3, "pos": 40 } ] }
+  { "tipo": "cursor", "autor": "u_5", "pos": 37 }
+```
+
+## Modelo de dados
+
+```text
+documentos
+  doc_id | titulo | dono_id | versao_snapshot | snapshot_url
+
+operacoes (log append-only, particionado por doc_id)
+  doc_id | versao | autor_id | ops | criado_em
+
+permissoes
+  doc_id | usuario_id | papel (leitor, comentador, editor)
+```
+
+O documento atual é o último snapshot mais as operações posteriores. A cada mil operações, um worker gera um novo snapshot e as antigas podem ir para armazenamento frio, preservando o histórico.
+
+## Arquitetura de alto nível
+
+```text
+ editores                     +----------------------+
+ A  B  C  ---- WebSocket ---->| Gateway (roteia por  |
+                              | doc_id, hash cons.)  |
+                              +----------+-----------+
+                                         |
+                              +----------v-----------+
+                              | Servidor de sessão   |  um dono por
+                              | do documento X       |  documento ativo
+                              | (estado em memória)  |
+                              +---+-------------+----+
+                                  |             |
+                       +----------v---+   +-----v-----------+
+                       | Log de ops   |   | Snapshots       |
+                       | (append)     |   | (object storage)|
+                       +--------------+   +-----------------+
+```
+
+Todos os editores de um documento conectam ao **mesmo** servidor de sessão, escolhido por hash consistente do `doc_id`. Esse servidor ordena as operações e atribui versões. Ter um único dono por documento simplifica enormemente a convergência.
+
+## Aprofundamentos
+
+### 1. Transformação operacional (OT)
+
+Suponha o texto "gato". A insere "o " na posição 0; ao mesmo tempo, B apaga o caractere na posição 3 ("o" final). Se o servidor aplicar a operação de B depois da de A sem ajuste, apagará o caractere errado, pois as posições mudaram. A **transformação operacional** ajusta cada operação contra as concorrentes: a remoção de B, transformada contra a inserção de A, passa de posição 3 para posição 5.
+
+O fluxo com servidor central:
+
+1. O cliente aplica a operação localmente na hora (latência zero) e a envia com `versaoBase`.
+2. O servidor transforma a operação contra todas as que foram aceitas depois de `versaoBase`, aplica, atribui nova versão e grava no log.
+3. Envia `ack` ao autor e a operação transformada aos demais.
+4. Cada cliente transforma operações remotas contra suas operações locais ainda não confirmadas.
+
+Com um servidor central definindo a ordem, as funções de transformação ficam bem mais simples do que em OT totalmente distribuído.
+
+### 2. CRDT como alternativa
+
+CRDTs (tipos de dados replicados sem conflito) dão a cada caractere um identificador único e ordenável, de modo que inserções concorrentes convergem sem transformação e sem servidor central. Isso facilita edição offline longa e topologias ponto a ponto.
+
+| Aspecto | OT com servidor | CRDT |
+| --- | --- | --- |
+| Precisa de ordem central | Sim | Não |
+| Edição offline longa | Difícil | Natural |
+| Metadados | Pequenos | Maiores (IDs por caractere, lápides) |
+| Maturidade em texto rico | Alta | Boa e crescente |
+
+Na entrevista, escolha um e justifique. OT com servidor de sessão é a resposta clássica; CRDT é ótima se o entrevistador enfatizar offline.
+
+### 3. Dono do documento e falhas
+
+Se o servidor de sessão cair, os clientes reconectam e o gateway atribui o documento a outro nó. O novo dono carrega o snapshot e reaplica o log a partir dali. Para evitar dois donos ao mesmo tempo (por exemplo, numa partição de rede), use um lease com número de época: o log só aceita escrita com a época atual, e o dono antigo é rejeitado.
+
+<Callout type="warning" title="Ack só depois do log">
+O servidor só confirma a operação ao autor depois de gravá-la no log durável. Caso contrário, uma queda logo após o ack perderia edições que o usuário acredita estarem salvas.
+</Callout>
+
+## Gargalos e trade-offs
+
+- **Documentos muito populares** (uma planilha com 200 editores) concentram carga num servidor. Limite editores simultâneos e transforme o excedente em leitores com atualizações em lote.
+- **Cursores** geram mais tráfego que o texto. Envie com throttle (no máximo 10 por segundo) e sem persistência.
+- **Tamanho do log**: compactar em snapshots reduz tempo de abertura, mas o histórico de versões precisa manter pontos de restauração nomeados.
+- **Consistência versus latência**: aplicar localmente antes do ack dá sensação instantânea, ao custo de lógica de rebase no cliente.
+
+## Perguntas de follow-up comuns
+
+- **Como implementar o histórico de versões?** Pontos de restauração apontam para uma versão do log; restaurar gera uma nova operação que leva o texto àquele estado, sem apagar o histórico.
+- **Como funcionam permissões?** Checadas ao abrir a sessão; mudanças de permissão derrubam a sessão do afetado.
+- **E edição offline?** O cliente acumula operações e, ao reconectar, envia tudo com a última versão conhecida; o servidor transforma em lote.
+- **Como escalar a busca dentro dos documentos?** Indexação assíncrona a partir dos snapshots, nunca no caminho de edição.
+
+<QuizSet>
+<Quiz question="Por que todos os editores de um documento devem se conectar ao mesmo servidor de sessão?" options={["Para economizar memória", "Para que um único dono defina a ordem das operações e simplifique a convergência", "Porque WebSocket não funciona com vários servidores", "Para facilitar o cache de CDN"]} answer={1} explanation="Com um dono por documento, existe uma ordem total das operações, e a transformação fica bem mais simples." />
+<Quiz question="Em que cenário um CRDT costuma ser mais vantajoso que OT com servidor central?" options={["Documentos pequenos", "Edição offline longa e sincronização sem servidor central", "Quando não há cursores", "Quando o documento é só leitura"]} answer={1} explanation="CRDTs convergem sem ordem central, o que facilita mesclar longas sessões offline." />
+</QuizSet>

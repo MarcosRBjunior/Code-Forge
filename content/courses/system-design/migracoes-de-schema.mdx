@@ -1,0 +1,78 @@
+---
+title: Migrações de schema
+kind: lesson
+---
+
+Fazer deploy de código sem downtime é relativamente fácil: há várias estratégias para isso. O banco de dados é outra história. Ele é compartilhado por todas as versões da aplicação, guarda estado que não pode ser recriado, e algumas alterações de estrutura travam tabelas inteiras. Uma **migração de schema** mal planejada é uma das causas mais comuns de incidentes em deploys.
+
+## Por que é difícil
+
+1. **Versões convivem.** Durante um rolling ou canary, a v1 e a v2 leem e escrevem nas mesmas tabelas. O schema precisa servir às duas.
+2. **Rollback de código não desfaz dados.** Se a v2 já gravou mil pedidos no formato novo, voltar o binário para a v1 não apaga esses registros.
+3. **Locks.** Em muitos bancos, certas operações de DDL bloqueiam leituras ou escritas enquanto reescrevem a tabela. Numa tabela de 500 milhões de linhas, isso pode durar horas.
+
+## Expandir e contrair
+
+O padrão central é dividir uma mudança incompatível em várias mudanças compatíveis, cada uma num deploy separado. Exemplo: renomear a coluna `nome` para `nome_completo` em `clientes`.
+
+```text
+fase 1 - expandir  : ADD COLUMN nome_completo (nullable)
+fase 2 - escrita dupla: app v2 escreve em nome E nome_completo; ainda lê de nome
+fase 3 - backfill  : copiar nome -> nome_completo em lotes, para linhas antigas
+fase 4 - virar leitura: app v3 lê de nome_completo; continua escrevendo nas duas
+fase 5 - parar escrita antiga: app v4 só usa nome_completo
+fase 6 - contrair  : DROP COLUMN nome (depois de um período de segurança)
+```
+
+Em qualquer ponto, a versão atual e a anterior funcionam com o schema existente, então o rollback de código é sempre seguro. O custo é tempo: uma renomeação vira uma sequência de deploys ao longo de dias.
+
+## Regras práticas por operação
+
+| Operação | Risco | Como fazer com segurança |
+| --- | --- | --- |
+| Adicionar coluna nullable | Baixo | Direto; a v1 ignora a coluna |
+| Adicionar coluna NOT NULL | Médio | Adicione nullable, faça backfill, depois adicione a restrição |
+| Remover coluna | Alto | Primeiro remova o uso do código, faça deploy, só então o DROP |
+| Renomear coluna ou tabela | Alto | Expandir e contrair; nunca rename direto |
+| Mudar tipo | Alto | Nova coluna com o tipo novo e migração gradual |
+| Criar índice | Médio | Use criação online, por exemplo `CREATE INDEX CONCURRENTLY` no PostgreSQL |
+| Adicionar foreign key | Médio | No PostgreSQL, crie como `NOT VALID` e depois `VALIDATE CONSTRAINT` |
+
+O comportamento exato de locks varia por banco e versão. No PostgreSQL moderno, adicionar uma coluna com valor padrão constante é rápido, porque o valor é guardado nos metadados; em versões antigas, isso reescrevia a tabela. Sempre verifique a documentação do seu banco e teste numa cópia com volume real.
+
+## Backfill sem derrubar o banco
+
+Atualizar 200 milhões de linhas num único `UPDATE` cria uma transação gigante, segura locks e sobrecarrega a replicação. Faça em lotes pequenos, com pausa entre eles:
+
+```sql
+-- repetir até não haver mais linhas afetadas
+UPDATE clientes
+SET nome_completo = nome
+WHERE id IN (
+  SELECT id FROM clientes
+  WHERE nome_completo IS NULL
+  ORDER BY id
+  LIMIT 5000
+);
+```
+
+Monitore o atraso das réplicas e reduza o ritmo se ele crescer. Ferramentas como gh-ost e pt-online-schema-change (MySQL) fazem alterações pesadas copiando a tabela em segundo plano e trocando-a no final.
+
+<Callout type="warning" title="Timeout de lock salva o dia">
+Mesmo uma operação rápida pode ficar na fila atrás de uma consulta longa, e enquanto espera ela bloqueia todas as consultas que chegam depois. Defina `lock_timeout` curto (por exemplo, alguns segundos) nas migrações e tente de novo em vez de congelar a tabela.
+</Callout>
+
+## Migrações no pipeline
+
+- **Versione as migrações** com ferramentas como Flyway, Liquibase, Alembic ou as do seu framework. Cada uma tem um número e é aplicada uma vez.
+- **Rode migrações separadas do start da aplicação.** Se dez réplicas tentam migrar ao subir, elas competem. Use um job dedicado no pipeline, antes do deploy do código que depende da mudança.
+- **Migrações para frente.** Escrever migrações reversas é útil, mas o mais confiável é nunca precisar delas: cada passo é compatível com o anterior.
+
+## Na entrevista
+
+Se você propõe mudar o modelo de dados de um sistema em produção, o entrevistador pode perguntar como fazer isso sem downtime. Responda com expandir e contrair, escrita dupla, backfill em lotes e remoção só no final. Follow-ups: como migrar para outro banco inteiro (mesma ideia: escrita dupla, backfill, comparação de leituras, troca), como lidar com uma tabela gigante e como garantir que o rollback continua possível.
+
+<QuizSet>
+<Quiz question="Você precisa remover a coluna telefone_antigo. Qual a ordem segura?" options={["DROP COLUMN e depois deploy do código que não usa a coluna", "Deploy do código que não usa mais a coluna, depois DROP COLUMN em outra etapa", "Renomear a coluna e fazer deploy ao mesmo tempo", "Remover a coluna durante o rolling deploy"]} answer={1} explanation="Enquanto alguma versão em produção ler a coluna, removê-la quebra essa versão. Primeiro o código para de usá-la; depois o schema muda." />
+<Quiz question="Por que fazer backfill em lotes em vez de um único UPDATE?" options={["Porque UPDATE não aceita WHERE", "Para evitar transações enormes, locks prolongados e atraso de replicação", "Porque lotes deixam o resultado diferente", "Para dispensar índices"]} answer={1} explanation="Lotes pequenos mantêm cada transação curta, liberam locks rapidamente e deixam as réplicas acompanharem." />
+</QuizSet>

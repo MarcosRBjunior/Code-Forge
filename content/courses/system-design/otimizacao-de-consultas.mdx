@@ -1,0 +1,91 @@
+---
+title: Otimização de consultas
+kind: lesson
+---
+
+Antes de adicionar réplicas, cache ou shards, vale olhar para as consultas. É comum que um único `SELECT` mal escrito ou sem índice consuma a maior parte da CPU do banco. Otimizar consultas é a forma mais barata de escalar: não muda a arquitetura, só faz o banco trabalhar menos.
+
+## Como o banco executa uma consulta
+
+O SQL é declarativo: você diz **o que** quer, e o **otimizador** decide **como** buscar. Ele gera planos candidatos (usar índice A ou B, ordem dos joins, algoritmo de join) e estima o custo de cada um com base em **estatísticas** da tabela: número de linhas, distribuição de valores, cardinalidade das colunas. O plano mais barato estimado vence.
+
+Os algoritmos de join mais comuns:
+
+| Algoritmo | Quando brilha |
+| --- | --- |
+| Nested loop | Lado externo pequeno e índice no lado interno |
+| Hash join | Duas entradas grandes sem ordem útil, join por igualdade |
+| Merge join | Entradas já ordenadas pela chave do join |
+
+Se as estatísticas estiverem desatualizadas, o otimizador estima errado e escolhe um plano ruim. Por isso existe `ANALYZE` (PostgreSQL) ou `ANALYZE TABLE` (MySQL).
+
+## Leia o plano com EXPLAIN
+
+```sql
+EXPLAIN ANALYZE
+SELECT p.id, p.valor_total
+FROM pedidos p
+JOIN clientes c ON c.id = p.cliente_id
+WHERE c.cidade = 'Recife' AND p.status = 'PAGO';
+```
+
+```text
+Hash Join  (actual time=0.9..412.3 rows=1830)
+  Hash Cond: (p.cliente_id = c.id)
+  ->  Seq Scan on pedidos p  (rows=2100000)
+        Filter: (status = 'PAGO')
+  ->  Hash
+        ->  Index Scan using idx_clientes_cidade on clientes c (rows=950)
+```
+
+O que procurar:
+
+- **Seq Scan em tabela grande** com filtro seletivo: falta índice ou ele não é aproveitado.
+- **Diferença grande entre linhas estimadas e reais:** estatísticas ruins ou correlação entre colunas que o otimizador não conhece.
+- **Sort ou hash que vai para disco:** memória de trabalho insuficiente ou conjunto grande demais.
+
+Aqui, ler 2,1 milhões de pedidos para devolver 1.830 sugere um índice em `pedidos (cliente_id, status)`, permitindo um nested loop a partir dos 950 clientes.
+
+## Problemas clássicos
+
+### N+1 consultas
+
+O ORM carrega 100 pedidos e, para cada um, dispara uma consulta para buscar o cliente: 101 viagens ao banco. A latência de rede domina. A solução é carregar em lote (`WHERE id IN (...)`) ou usar join/eager loading.
+
+### SELECT *
+
+Trazer colunas que você não usa aumenta I/O, tráfego de rede e impede index-only scans. Peça só o necessário.
+
+### Paginação com OFFSET
+
+`OFFSET 100000 LIMIT 20` obriga o banco a gerar e descartar 100 mil linhas. Prefira **paginação por cursor (keyset)**:
+
+```sql
+SELECT id, titulo FROM posts
+WHERE (criado_em, id) < ('2026-10-01 12:00', 98765)
+ORDER BY criado_em DESC, id DESC
+LIMIT 20;
+```
+
+Com índice em `(criado_em, id)`, cada página custa o mesmo, não importa a profundidade.
+
+### Predicados que não usam índice
+
+Funções aplicadas à coluna, conversões implícitas de tipo, `OR` entre colunas diferentes e `LIKE '%x'` costumam impedir o uso do índice. Reescreva a condição para que a coluna fique "limpa" de um lado da comparação.
+
+<Callout type="tip" title="Meça antes de mudar">
+Use o log de consultas lentas ou extensões como `pg_stat_statements` para ranquear consultas por tempo total (frequência vezes duração). Uma consulta de 5 ms executada 10 mil vezes por segundo pesa mais que um relatório de 3 s rodado uma vez por hora.
+</Callout>
+
+## Trade-offs
+
+Cada índice novo acelera leituras e encarece escritas. Reescrever consultas com hints específicos de um banco cria acoplamento e pode envelhecer mal quando os dados mudam. E algumas consultas não têm conserto no banco transacional: agregações sobre a base inteira pertencem a views materializadas, réplicas de leitura ou um data warehouse.
+
+## Na entrevista
+
+Mostre que você otimiza na ordem certa: medir, achar as consultas mais caras, ler o plano, ajustar índices e consultas, e só então escalar a infraestrutura. Follow-ups comuns: "como paginar um feed infinito?" (keyset), "a consulta ficou lenta do nada, o que pode ser?" (estatísticas desatualizadas, mudança de plano, crescimento de dados, bloqueios).
+
+<QuizSet>
+<Quiz question="Uma tela lista 50 pedidos e o log mostra 51 consultas ao banco por requisição. Qual é o problema?" options={["Falta de réplica de leitura", "N+1 consultas: uma para a lista e uma para cada item", "Paginação por cursor", "Estatísticas desatualizadas"]} answer={1} explanation="Cada item dispara uma consulta extra. Carregar os relacionados em lote ou com join resolve." />
+<Quiz question="Por que paginação por cursor escala melhor que OFFSET em páginas profundas?" options={["Porque usa menos memória no cliente", "Porque o banco desce pelo índice direto ao ponto de partida, sem gerar e descartar as linhas anteriores", "Porque dispensa ORDER BY", "Porque funciona sem índice"]} answer={1} explanation="OFFSET N exige produzir N linhas e jogá-las fora. Com keyset, a condição sobre a chave ordenada começa exatamente onde a página anterior parou." />
+</QuizSet>

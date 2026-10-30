@@ -1,0 +1,300 @@
+---
+title: Projetar um jogo de xadrez
+kind: lesson
+---
+
+Xadrez é o oposto do jogo da velha: as regras são tantas que é impossível implementar tudo numa entrevista. O que o entrevistador avalia é **como você corta o escopo** e se o design deixa espaço para as regras que ficaram de fora. Um bom candidato entrega movimento de todas as peças, captura, turnos e a regra de não deixar o próprio rei em xeque, e explica onde roque, en passant e promoção se encaixariam.
+
+## Requisitos
+
+Perguntas que valem a pena:
+
+- **Dois jogadores locais ou partida online?** Comece local. Online vira extensão (concorrência, relógio, reconexão).
+- **Preciso validar xeque e xeque-mate?** Normalmente sim para xeque (jogada que deixa o rei atacado é ilegal). Mate pode ser dito como "nenhuma jogada legal disponível e rei em xeque".
+- **Roque, en passant e promoção?** Pergunte. A resposta comum é "mencione como faria, implemente se sobrar tempo".
+- **Relógio, notação PGN, desfazer?** Fora do escopo inicial.
+
+Escopo combinado: tabuleiro 8x8, seis tipos de peça com seus movimentos, captura, alternância de turno, rejeição de jogadas que deixam o próprio rei em xeque e detecção de xeque-mate.
+
+## Entidades e responsabilidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Cor` | Enum BRANCO e PRETO. |
+| `Posicao` | Par imutável (linha, coluna) com conversão de notação "e2". |
+| `Peca` (abstrata) | Sabe gerar seus destinos candidatos a partir do tabuleiro. Cada tipo é uma subclasse. |
+| `Tabuleiro` | Mapa posição para peça, consulta de casas e verificação "esta casa é atacada pela cor X?". |
+| `Jogada` | Origem, destino e peça capturada. Permite desfazer uma simulação. |
+| `Partida` | Turnos, validação de legalidade (rei fora de xeque), histórico e status. |
+
+A decisão central é **quem sabe se um movimento é válido**. Dividimos em duas camadas: a peça conhece a geometria (o cavalo pula em L, o bispo anda na diagonal até bater em algo). A partida conhece as regras globais (não pode deixar o rei em xeque, é a vez de quem). Assim, a peça nunca precisa saber de turnos, e a partida nunca precisa saber como o cavalo se move.
+
+## Diagrama de classes
+
+```text
++------------------+       +-------------------------+
+|  Partida         |------>|  Tabuleiro              |
+|------------------|       |-------------------------|
+| - vez: Cor       |       | - casas: dict[Pos,Peca] |
+| - historico      |       | + peca_em(pos)          |
+| + mover(o, d)    |       | + atacada(pos, cor)     |
+| + jogadas_legais |       | + aplicar / desfazer    |
++------------------+       +-------------------------+
+                                     | 0..32
+                                     v
+                           +---------------------+
+                           |  Peca (abstrata)    |
+                           | - cor               |
+                           | + destinos(tab,pos) |
+                           +---------------------+
+                     ^      ^      ^      ^      ^      ^
+                   Rei  Dama  Torre  Bispo  Cavalo  Peao
+           (Dama, Torre e Bispo herdam de Deslizante)
+```
+
+## Padrões usados e por quê
+
+- **Polimorfismo / Strategy**: cada peça implementa `destinos`. Adicionar uma peça de variante (o "arcebispo" de Capablanca) é criar uma subclasse.
+- **Template Method** em `Deslizante`: torre, bispo e dama compartilham o algoritmo "ande numa direção até sair do tabuleiro ou bater numa peça"; cada uma só informa suas direções.
+- **Command** em `Jogada`: aplicar e desfazer. Isso é o que torna barata a checagem "essa jogada deixa meu rei em xeque?": aplica, testa, desfaz.
+- **Factory** simples para montar a posição inicial a partir de uma string, em vez de 32 linhas de `colocar`.
+
+## Implementação
+
+```python
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+Pos = Tuple[int, int]  # (linha 0..7, coluna 0..7); linha 0 = lado das brancas
+
+
+class Cor(Enum):
+    BRANCO = "branco"
+    PRETO = "preto"
+
+    def oposta(self):
+        return Cor.PRETO if self is Cor.BRANCO else Cor.BRANCO
+
+
+def pos(nota: str) -> Pos:
+    return int(nota[1]) - 1, ord(nota[0]) - ord("a")
+
+
+class JogadaIlegal(Exception):
+    pass
+
+
+class Peca:
+    simbolo = "?"
+
+    def __init__(self, cor: Cor):
+        self.cor = cor
+
+    def destinos(self, tab: "Tabuleiro", p: Pos) -> List[Pos]:
+        raise NotImplementedError
+
+    def __repr__(self):
+        return self.simbolo.upper() if self.cor is Cor.BRANCO else self.simbolo
+
+
+class Deslizante(Peca):
+    direcoes: List[Pos] = []
+
+    def destinos(self, tab, p):
+        res = []
+        for dl, dc in self.direcoes:
+            l, c = p[0] + dl, p[1] + dc
+            while tab.dentro((l, c)):
+                alvo = tab.peca_em((l, c))
+                if alvo is None:
+                    res.append((l, c))
+                else:
+                    if alvo.cor is not self.cor:
+                        res.append((l, c))
+                    break
+                l, c = l + dl, c + dc
+        return res
+
+
+RETAS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+DIAGS = [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+
+
+class Torre(Deslizante):
+    simbolo, direcoes = "t", RETAS
+
+
+class Bispo(Deslizante):
+    simbolo, direcoes = "b", DIAGS
+
+
+class Dama(Deslizante):
+    simbolo, direcoes = "d", RETAS + DIAGS
+
+
+class Saltadora(Peca):
+    saltos: List[Pos] = []
+
+    def destinos(self, tab, p):
+        res = []
+        for dl, dc in self.saltos:
+            q = (p[0] + dl, p[1] + dc)
+            if tab.dentro(q):
+                alvo = tab.peca_em(q)
+                if alvo is None or alvo.cor is not self.cor:
+                    res.append(q)
+        return res
+
+
+class Cavalo(Saltadora):
+    simbolo = "c"
+    saltos = [(1, 2), (2, 1), (-1, 2), (-2, 1), (1, -2), (2, -1), (-1, -2), (-2, -1)]
+
+
+class Rei(Saltadora):
+    simbolo, saltos = "r", RETAS + DIAGS
+
+
+class Peao(Peca):
+    simbolo = "p"
+
+    def destinos(self, tab, p):
+        frente = 1 if self.cor is Cor.BRANCO else -1
+        inicio = 1 if self.cor is Cor.BRANCO else 6
+        res = []
+        um = (p[0] + frente, p[1])
+        if tab.dentro(um) and tab.peca_em(um) is None:
+            res.append(um)
+            dois = (p[0] + 2 * frente, p[1])
+            if p[0] == inicio and tab.peca_em(dois) is None:
+                res.append(dois)
+        for dc in (-1, 1):
+            q = (p[0] + frente, p[1] + dc)
+            alvo = tab.peca_em(q) if tab.dentro(q) else None
+            if alvo is not None and alvo.cor is not self.cor:
+                res.append(q)
+        return res
+
+
+class Jogada:
+    def __init__(self, origem: Pos, destino: Pos, peca: Peca, capturada: Optional[Peca]):
+        self.origem, self.destino = origem, destino
+        self.peca, self.capturada = peca, capturada
+
+
+class Tabuleiro:
+    def __init__(self):
+        self.casas: Dict[Pos, Peca] = {}
+
+    @staticmethod
+    def dentro(p: Pos) -> bool:
+        return 0 <= p[0] < 8 and 0 <= p[1] < 8
+
+    def peca_em(self, p: Pos) -> Optional[Peca]:
+        return self.casas.get(p)
+
+    def aplicar(self, origem: Pos, destino: Pos) -> Jogada:
+        peca = self.casas.pop(origem)
+        j = Jogada(origem, destino, peca, self.casas.get(destino))
+        self.casas[destino] = peca
+        return j
+
+    def desfazer(self, j: Jogada) -> None:
+        self.casas[j.origem] = j.peca
+        if j.capturada:
+            self.casas[j.destino] = j.capturada
+        else:
+            del self.casas[j.destino]
+
+    def atacada(self, alvo: Pos, por: Cor) -> bool:
+        return any(p.cor is por and alvo in p.destinos(self, q)
+                   for q, p in list(self.casas.items()))
+
+    def rei(self, cor: Cor) -> Pos:
+        return next(q for q, p in self.casas.items() if isinstance(p, Rei) and p.cor is cor)
+
+    @classmethod
+    def inicial(cls) -> "Tabuleiro":
+        t = cls()
+        fila = [Torre, Cavalo, Bispo, Dama, Rei, Bispo, Cavalo, Torre]
+        for c, tipo in enumerate(fila):
+            t.casas[(0, c)], t.casas[(7, c)] = tipo(Cor.BRANCO), tipo(Cor.PRETO)
+            t.casas[(1, c)], t.casas[(6, c)] = Peao(Cor.BRANCO), Peao(Cor.PRETO)
+        return t
+
+
+class Partida:
+    def __init__(self):
+        self.tab = Tabuleiro.inicial()
+        self.vez = Cor.BRANCO
+        self.historico: List[Jogada] = []
+
+    def _deixa_rei_seguro(self, o: Pos, d: Pos, cor: Cor) -> bool:
+        j = self.tab.aplicar(o, d)
+        seguro = not self.tab.atacada(self.tab.rei(cor), cor.oposta())
+        self.tab.desfazer(j)
+        return seguro
+
+    def jogadas_legais(self, cor: Cor) -> List[Tuple[Pos, Pos]]:
+        return [(o, d) for o, p in list(self.tab.casas.items()) if p.cor is cor
+                for d in p.destinos(self.tab, o) if self._deixa_rei_seguro(o, d, cor)]
+
+    def mover(self, de: str, para: str) -> str:
+        o, d = pos(de), pos(para)
+        peca = self.tab.peca_em(o)
+        if peca is None or peca.cor is not self.vez:
+            raise JogadaIlegal(f"não há peça {self.vez.value} em {de}")
+        if d not in peca.destinos(self.tab, o) or not self._deixa_rei_seguro(o, d, self.vez):
+            raise JogadaIlegal(f"{de}-{para} não é legal")
+        self.historico.append(self.tab.aplicar(o, d))
+        self.vez = self.vez.oposta()
+        return self.status()
+
+    def status(self) -> str:
+        em_xeque = self.tab.atacada(self.tab.rei(self.vez), self.vez.oposta())
+        sem_saida = not self.jogadas_legais(self.vez)
+        if em_xeque and sem_saida:
+            return f"xeque-mate, vence {self.vez.oposta().value}"
+        if sem_saida:
+            return "afogamento (empate)"
+        return "xeque" if em_xeque else "em andamento"
+
+
+p = Partida()
+try:
+    p.mover("e2", "e5")
+except JogadaIlegal as e:
+    print("erro:", e)
+# mate do louco: o xeque-mate mais curto possível
+for de, para in [("f2", "f3"), ("e7", "e5"), ("g2", "g4")]:
+    print(de, para, "->", p.mover(de, para))
+print("d8 h4 ->", p.mover("d8", "h4"))
+```
+
+A checagem de legalidade usa aplicar, testar e desfazer. É simples e correta, e o custo (gerar ataques do adversário para cada jogada candidata) é irrelevante para 8x8. Se o entrevistador pressionar por desempenho, mencione bitboards e geração incremental de ataques.
+
+## Concorrência e extensões
+
+Numa partida online, cada partida é um agregado com sua própria trava ou fila de comandos: jogadas chegam serializadas, a partida valida se o remetente é o dono da vez e incrementa uma versão. O relógio é um componente separado que observa a troca de turno (Observer) e encerra a partida por tempo.
+
+- **Roque**: a `Jogada` ganha um tipo e um movimento secundário (a torre). O rei precisa saber se já se moveu, então `Peca` ganha `movida: bool`.
+- **En passant**: depende da última jogada, que já está no `historico`. A geração de destinos do peão recebe esse contexto.
+- **Promoção**: a `Jogada` carrega a peça escolhida; `aplicar` troca o peão pela nova peça e `desfazer` restaura.
+- **Empate por repetição ou 50 lances**: um hash da posição contado num dicionário a cada jogada.
+
+<Callout type="warning" title="Não tente implementar tudo">
+Começar pelo roque antes de ter o cavalo funcionando é a forma mais rápida de não terminar. Implemente o núcleo, mostre que roda e só então negocie as regras especiais.
+</Callout>
+
+## Follow-ups comuns
+
+- **"Por que a peça não valida xeque?"** Porque xeque é uma propriedade da posição inteira, não de uma peça. Manter isso na `Partida` evita que cada subclasse repita a mesma lógica.
+- **"Como implementar um motor de IA?"** Um `Jogador` estratégia que usa `jogadas_legais`, aplica, avalia e desfaz (minimax com poda alfa-beta). O par aplicar e desfazer da `Jogada` é exatamente o que o motor precisa.
+- **"Como gravar a partida?"** Converta o `historico` para notação algébrica. Recarregar é reaplicar as jogadas a partir da posição inicial.
+- **"Por que um dicionário e não uma matriz 8x8?"** Os dois funcionam. O dicionário deixa a iteração sobre peças vivas direta (no máximo 32 entradas) e evita checar casas vazias. A matriz dá acesso indexado sem hash. Diga que escolheu pela legibilidade e que trocaria a representação sem afetar as peças, já que elas só usam `peca_em` e `dentro`.
+- **"Como suportar variantes, como xadrez 960?"** Só a fábrica `inicial` muda: ela sorteia a ordem da primeira fileira respeitando as restrições da variante. Peças, partida e validação de xeque continuam iguais, o que mostra que a montagem do tabuleiro estava bem isolada.
+
+<QuizSet>
+<Quiz question="Onde deve ficar a regra 'não pode deixar o próprio rei em xeque'?" options={["Em cada subclasse de Peca", "Na Partida, que enxerga a posição inteira", "No enum Cor", "Na classe Posicao"]} answer={1} explanation="Xeque depende de todas as peças. A peça só conhece sua geometria; a Partida aplica as regras globais." />
+<Quiz question="Qual padrão torna barato testar se uma jogada é legal?" options={["Command, com aplicar e desfazer", "Singleton", "Adapter", "Observer"]} answer={0} explanation="A jogada é aplicada, a posição é testada e a jogada é desfeita, sem copiar o tabuleiro." />
+</QuizSet>

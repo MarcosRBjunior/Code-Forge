@@ -1,0 +1,139 @@
+---
+title: Projetar curtidas e comentários
+kind: lesson
+---
+
+Curtidas e comentários parecem funcionalidades acessórias, mas geram mais escritas que qualquer outra parte de uma rede social. Um único post viral pode receber dezenas de milhares de curtidas por segundo, todas tentando atualizar o mesmo contador. A questão testa contagem em escala, hot keys, idempotência e paginação de listas que crescem sem parar.
+
+## Requisitos
+
+### Funcionais
+
+- Curtir e descurtir um post (no máximo uma curtida por usuário por post).
+- Mostrar o total de curtidas e se **eu** curti.
+- Comentar, responder a comentários (um nível de aninhamento) e apagar o próprio comentário.
+- Listar comentários de um post, os mais relevantes ou os mais recentes primeiro.
+- Opcional: curtir comentários, notificação ao autor.
+
+### Não funcionais
+
+- Curtir precisa parecer instantâneo para quem clica.
+- O total exibido pode estar alguns segundos atrasado e pode ser aproximado em números grandes.
+- "Eu curti" precisa ser exato para o próprio usuário: se ele curtiu, o coração tem de aparecer preenchido.
+- Escala de bilhões de interações por dia.
+
+## Estimativas
+
+- 500 milhões de usuários ativos por dia, cada um curtindo 20 itens: **10 bilhões de curtidas por dia** ≈ 115 mil por segundo, pico de 400 mil.
+- Comentários: 1 bilhão por dia ≈ **12 mil por segundo**.
+- Leituras: cada post exibido no feed mostra contador e estado "eu curti". Com 1 milhão de posts exibidos por segundo, são **1 milhão de consultas de contador por segundo** e outro milhão de checagens "eu curti".
+- Armazenamento de curtidas: cada registro (usuário, post, data) cerca de 30 bytes. 10 B × 30 B = 300 GB por dia, uns **110 TB por ano**.
+- Comentários: 1 B × 300 bytes = 300 GB por dia.
+
+## API
+
+```text
+PUT    /posts/:id/curtida            (idempotente: curtir duas vezes = uma)
+DELETE /posts/:id/curtida
+GET    /posts/:id/curtidas?cursor=   (quem curtiu)
+
+POST   /posts/:id/comentarios        { "texto": "...", "respostaA": null }
+GET    /posts/:id/comentarios?ordem=relevancia&cursor=...
+DELETE /comentarios/:id
+```
+
+Usar `PUT` e `DELETE` em vez de um "alternar" torna as operações idempotentes. Se o app repetir a requisição por timeout, o resultado é o mesmo.
+
+## Modelo de dados
+
+```text
+curtidas (Cassandra ou DynamoDB)
+  partição: post_id | ordenação: usuario_id | criado_em
+  (consulta: "u curtiu p?" e "quem curtiu p")
+
+curtidas_por_usuario
+  partição: usuario_id | ordenação: criado_em desc | post_id
+  (consulta: "posts que eu curti")
+
+contadores
+  post_id | curtidas | comentarios   (cache + banco)
+
+comentarios
+  partição: post_id | ordenação: comentario_id (ordenável por tempo)
+  comentario_id | autor_id | texto | resposta_a | curtidas | apagado
+```
+
+Guardar a curtida em duas tabelas (uma por post, outra por usuário) é desnormalização deliberada: cada consulta lê uma única partição.
+
+## Arquitetura de alto nível
+
+```text
+ app -> API -> Serviço de interações
+                 |          |
+       (1) grava |          | (2) publica evento
+                 v          v
+         +-------------+  +-------+    +---------------------+
+         | Cassandra   |  | Kafka |--->| Agregador de        |
+         | curtidas    |  +---+---+    | contadores (janela) |
+         +-------------+      |        +----------+----------+
+                              |                   |
+                              |             +-----v------+
+                              |             | Redis      |<--- leitura do
+                              |             | contadores |     contador
+                              |             +------------+
+                              +--> notificações, ranking, analytics
+```
+
+## Aprofundamentos
+
+### 1. Contador sem hot key
+
+Fazer `UPDATE posts SET curtidas = curtidas + 1` a cada clique trava a linha do post viral. Três técnicas, em ordem de sofisticação:
+
+- **Agregação em janela**: o serviço grava a curtida individual e publica um evento. Um consumidor soma eventos por post durante 1 a 5 segundos e aplica um único incremento. Um post com 30 mil curtidas por segundo vira 1 escrita por segundo.
+- **Contador particionado**: o contador vira N subcontadores (`post:123:c0` a `post:123:c15`); cada incremento vai para um aleatório e a leitura soma todos. Útil quando o contador está no Redis e precisa ser atualizado direto.
+- **Exibir aproximado**: acima de 10 mil, o app mostra "10 mil", e erros de algumas dezenas são invisíveis.
+
+A verdade continua nas linhas individuais de `curtidas`; o contador pode ser recalculado a partir delas se divergir.
+
+### 2. "Eu curti" exato
+
+O total pode atrasar, mas o estado do próprio usuário não. Duas medidas:
+
+- O app aplica a mudança de forma otimista na tela e só desfaz se a requisição falhar.
+- Na leitura do feed, o serviço faz um multi-get em lote: "para estes 20 posts, quais o usuário curtiu?". Com a tabela particionada por `post_id` e ordenada por `usuario_id`, cada checagem é uma leitura pontual. Para acelerar, mantenha um cache das curtidas recentes do usuário (últimos dias), porque a maioria dos posts exibidos é recente.
+
+Para garantir no máximo uma curtida, a escrita é condicional: insere se não existe. Como a chave é `(post_id, usuario_id)`, uma repetição apenas sobrescreve o mesmo registro, e o evento duplicado é ignorado pelo agregador graças à checagem de existência anterior.
+
+### 3. Comentários e paginação
+
+Comentários de um post ficam numa partição ordenada por ID temporal, e a ordem cronológica é uma leitura sequencial com cursor. A ordem por **relevância** é diferente: depende de curtidas no comentário, de quem comentou (amigos, autor do post) e da idade. Calcule uma pontuação de forma assíncrona e mantenha, para posts populares, um índice "top comentários" pré-computado (por exemplo, um sorted set com os 200 melhores). Para posts pequenos, ordenar em tempo de leitura é barato.
+
+Apagar um comentário marca `apagado = true` em vez de remover, para preservar respostas penduradas e permitir moderação.
+
+<Callout type="tip" title="Separe a verdade da exibição">
+Deixe claro que a tabela de curtidas individuais é a fonte da verdade e o contador é uma visão derivada. Isso justifica todas as otimizações no contador sem comprometer a correção.
+</Callout>
+
+## Gargalos e trade-offs
+
+| Decisão | Prós | Contras |
+| --- | --- | --- |
+| Agregação em janela | Elimina hot key de escrita | Contador atrasa alguns segundos |
+| Contador particionado | Atualização imediata | Leitura soma N chaves |
+| Guardar quem curtiu para sempre | Permite listar e auditar | Centenas de TB por ano |
+| Comentários aninhados ilimitados | Conversas ricas | Paginação e ordenação muito mais complexas |
+
+Partições de posts virais na tabela de curtidas também crescem muito (milhões de linhas). Bancos de colunas largas toleram, mas a listagem "quem curtiu" deve paginar e mostrar primeiro amigos do usuário.
+
+## Perguntas de follow-up comuns
+
+- **Como notificar o autor sem spam?** Agrupe: "Ana e mais 340 pessoas curtiram", enviando no máximo uma notificação por janela.
+- **Como evitar curtidas falsas por robôs?** Rate limit por usuário e detecção assíncrona; curtidas fraudulentas são removidas e os contadores, recalculados.
+- **E se o agregador cair?** Os eventos ficam no Kafka; ao voltar, ele continua do último offset confirmado.
+- **Como mostrar contagem consistente entre regiões?** Cada região agrega localmente e replica somatórios; a soma global converge em segundos.
+
+<QuizSet>
+<Quiz question="Um post recebe 30 mil curtidas por segundo. Qual abordagem evita travar o contador?" options={["UPDATE direto na linha do post a cada curtida", "Agregar eventos em janelas curtas e aplicar um incremento por janela", "Usar transação serializável", "Bloquear curtidas acima de mil por segundo"]} answer={1} explanation="A agregação transforma milhares de incrementos em uma escrita por janela, eliminando a contenção." />
+<Quiz question="Por que usar PUT e DELETE em vez de um endpoint 'alternar curtida'?" options={["São mais rápidos", "Tornam a operação idempotente: repetir não muda o resultado", "Exigem menos autenticação", "Permitem cache na CDN"]} answer={1} explanation="Repetir um PUT de curtida mantém o estado 'curtido'; um alternar repetido desfaria a ação." />
+</QuizSet>

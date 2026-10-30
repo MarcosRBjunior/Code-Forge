@@ -1,0 +1,92 @@
+---
+title: Feature flags
+kind: lesson
+---
+
+Você terminou metade de uma funcionalidade grande. Se não fizer merge, o branch diverge do `main` por semanas; se fizer, o código incompleto vai para produção. **Feature flags** (ou feature toggles) resolvem esse dilema: o código novo entra em produção desligado, protegido por um `if`, e é ligado depois, para quem você quiser, sem novo deploy.
+
+## A ideia básica
+
+```python
+if flags.ativa("novo-checkout", usuario):
+    return checkout_v2(carrinho)
+return checkout_v1(carrinho)
+```
+
+A decisão de qual caminho seguir sai do código e vai para uma configuração que pode mudar em tempo de execução. Com isso você separa **deploy** (o código está lá) de **release** (o usuário vê).
+
+## Tipos de flag
+
+Nem toda flag é igual, e tratá-las da mesma forma gera bagunça:
+
+| Tipo | Para quê | Vida útil | Quem controla |
+| --- | --- | --- | --- |
+| Release | Esconder funcionalidade incompleta, lançar gradualmente | Dias a semanas | Engenharia |
+| Experimento | Teste A/B, comparar variantes | Semanas | Produto, dados |
+| Operacional (kill switch) | Desligar algo caro ou instável sob pressão | Longa | Operação |
+| Permissão | Liberar recurso para plano pago, beta testers | Permanente | Produto |
+
+Flags de release devem morrer logo depois do lançamento completo. Flags operacionais podem durar anos, por exemplo para desligar recomendações personalizadas quando o banco está sob carga e servir uma lista estática.
+
+## Como avaliar uma flag
+
+Uma regra de flag combina segmentação e porcentagem:
+
+```json
+{
+  "chave": "novo-checkout",
+  "ativa": true,
+  "regras": [
+    {"se": {"atributo": "email", "termina_com": "@empresa.com"}, "valor": true},
+    {"se": {"atributo": "pais", "igual": "BR"}, "porcentagem": 10}
+  ],
+  "padrao": false
+}
+```
+
+A porcentagem precisa ser **estável**: o mesmo usuário deve cair sempre no mesmo grupo, senão a experiência muda a cada página. Faça isso com hash determinístico:
+
+```python
+import hashlib
+
+def no_rollout(chave_flag: str, user_id: str, porcentagem: int) -> bool:
+    h = hashlib.sha256(f"{chave_flag}:{user_id}".encode()).hexdigest()
+    balde = int(h[:8], 16) % 100
+    return balde < porcentagem
+```
+
+Incluir a chave da flag no hash evita que os mesmos 10% de usuários sejam sempre as cobaias de todas as flags. E aumentar a porcentagem de 10 para 20 mantém os 10% iniciais dentro, porque o balde de cada usuário não muda.
+
+## Arquitetura de um serviço de flags
+
+```text
+[console de flags] -> [serviço de flags + banco] --stream/poll--> [SDK no serviço A]
+                                                              --> [SDK no serviço B]
+```
+
+- O SDK mantém as regras **em memória** e avalia localmente. Consultar um serviço remoto a cada `if` adicionaria latência e um ponto de falha em todo caminho crítico.
+- Atualizações chegam por streaming (SSE) ou polling a cada poucos segundos.
+- **Valor padrão seguro:** se o SDK não conseguir carregar as regras, cada flag cai no valor definido no código, normalmente o comportamento antigo.
+- **Auditoria:** quem mudou o quê e quando. Muitos incidentes são uma flag alterada por engano, e o histórico encurta a investigação.
+
+Em apps móveis e frontends, a avaliação costuma ocorrer no servidor, que devolve só os resultados, para não expor regras internas nem nomes de funcionalidades não lançadas.
+
+## Armadilhas
+
+- **Dívida de flags:** centenas de flags velhas, ninguém sabe quais ainda importam, e o código vira um labirinto de `if`. Defina dono e data de expiração ao criar cada flag, e remova o código morto depois do lançamento.
+- **Combinações não testadas:** com 10 flags, existem 1.024 combinações. Teste as combinações relevantes, principalmente "tudo novo ligado" e "tudo desligado".
+- **Flags que mudam schema ou contratos:** a flag desligada não desfaz uma migração que já rodou. Flags controlam comportamento, não estrutura de dados.
+- **Flag reaproveitada:** reutilizar uma chave antiga com outro significado já causou incidentes sérios na indústria, quando servidores com código antigo interpretaram a flag reativada da forma antiga.
+
+<Callout type="tip" title="Kill switch é ferramenta de confiabilidade">
+Coloque flags operacionais em dependências não essenciais: recomendações, busca sugerida, enriquecimento de dados. Quando um desses componentes degrada, desligar a flag preserva o fluxo principal em segundos, sem deploy.
+</Callout>
+
+## Na entrevista
+
+Feature flags aparecem quando o entrevistador pergunta sobre lançamentos seguros ou degradação controlada. Mostre a separação entre deploy e release, a avaliação local no SDK com valor padrão seguro e o rollout por hash estável. Follow-ups: como evitar latência na avaliação, o que acontece se o serviço de flags cair e como limpar flags antigas.
+
+<QuizSet>
+<Quiz question="Por que o SDK de flags avalia as regras localmente, em memória?" options={["Para economizar disco", "Para não adicionar latência nem um ponto de falha remoto a cada verificação", "Porque regras não podem ser enviadas pela rede", "Para impedir auditoria"]} answer={1} explanation="Flags ficam em caminhos críticos. A avaliação local é rápida, e se o serviço central cair, o SDK continua com as últimas regras ou com os valores padrão." />
+<Quiz question="Qual o objetivo de incluir a chave da flag no hash usado para a porcentagem de rollout?" options={["Deixar o hash mais rápido", "Evitar que os mesmos usuários fiquem sempre na fração inicial de todas as flags", "Permitir valores negativos", "Esconder o ID do usuário dos logs"]} answer={1} explanation="Sem a chave, o usuário com balde 3 cairia nos primeiros 5% de toda flag. Com ela, cada flag distribui os usuários de forma independente." />
+</QuizSet>

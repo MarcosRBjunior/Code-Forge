@@ -1,0 +1,96 @@
+---
+title: Geohash
+kind: lesson
+---
+
+Apps de entrega, transporte e mapas vivem respondendo à mesma pergunta: "o que está perto deste ponto?". Guardar latitude e longitude em duas colunas e filtrar com `BETWEEN` nas duas funciona para tabelas pequenas, mas um índice B-tree comum só aproveita bem **uma** dimensão por vez. O geohash resolve isso transformando um ponto 2D numa **string**, de modo que pontos próximos tendem a compartilhar prefixos. Aí qualquer banco que indexa strings vira um índice espacial razoável.
+
+## Como funciona
+
+A ideia é dividir o mundo ao meio repetidamente, alternando entre longitude e latitude, e anotar um bit a cada divisão:
+
+1. Comece com longitude no intervalo de -180 a 180. Se o ponto está na metade de cima, anote 1 e fique com essa metade; senão, anote 0 e fique com a de baixo.
+2. Faça o mesmo com a latitude, no intervalo de -90 a 90.
+3. Alterne entre as duas até ter bits suficientes.
+4. Agrupe os bits de 5 em 5 e converta cada grupo num caractere de um alfabeto base32 (dígitos e letras, sem `a`, `i`, `l` e `o`).
+
+Cada caractere a mais divide a célula em 32 subcélulas. O resultado é uma curva de preenchimento de espaço em formato de Z (curva de Morton).
+
+```python
+BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+def geohash(lat, lon, precisao=7):
+    lat_int, lon_int = [-90.0, 90.0], [-180.0, 180.0]
+    bits, bit_atual, usa_lon, saida = 0, 0, True, []
+    while len(saida) < precisao:
+        intervalo, valor = (lon_int, lon) if usa_lon else (lat_int, lat)
+        meio = (intervalo[0] + intervalo[1]) / 2
+        if valor >= meio:
+            bits = (bits << 1) | 1
+            intervalo[0] = meio
+        else:
+            bits = bits << 1
+            intervalo[1] = meio
+        usa_lon = not usa_lon
+        bit_atual += 1
+        if bit_atual == 5:
+            saida.append(BASE32[bits])
+            bits, bit_atual = 0, 0
+    return "".join(saida)
+
+print(geohash(-23.5614, -46.6559))  # Avenida Paulista
+print(geohash(-23.5631, -46.6544))  # algumas centenas de metros dali
+print(geohash(-22.9519, -43.2105))  # Rio de Janeiro
+```
+
+Os dois primeiros pontos compartilham um prefixo longo; o do Rio diverge logo nos primeiros caracteres.
+
+## Precisão por tamanho
+
+| Caracteres | Largura aproximada da célula (no equador) |
+| --- | --- |
+| 4 | cerca de 39 km por 20 km |
+| 5 | cerca de 5 km por 5 km |
+| 6 | cerca de 1,2 km por 0,6 km |
+| 7 | cerca de 150 m por 150 m |
+| 8 | cerca de 38 m por 19 m |
+
+As células encolhem na direção leste-oeste conforme você se afasta do equador, porque os meridianos se aproximam.
+
+## Buscando vizinhos
+
+Para achar restaurantes num raio de 1 km:
+
+1. Escolha uma precisão cuja célula seja da ordem do raio (6 caracteres, por exemplo).
+2. Calcule o geohash do usuário e das **8 células vizinhas**.
+3. Busque por prefixo, como `WHERE geohash LIKE '6gycfq%'`, nas 9 células.
+4. Filtre o resultado pela distância real (haversine), porque o quadrado contém pontos fora do círculo.
+
+<Callout type="warning" title="Por que os vizinhos são obrigatórios">
+Prefixo comum implica proximidade, mas proximidade **não** implica prefixo comum. Dois pontos separados por um metro, cada um de um lado de uma fronteira de célula, podem ter geohashes completamente diferentes. Buscar só a célula do usuário perde resultados na borda.
+</Callout>
+
+## Onde aparece
+
+- **Redis** guarda pontos de `GEOADD` num sorted set cujo score é um geohash de 52 bits.
+- **Elasticsearch** oferece agregações por grade de geohash para mapas de calor.
+- Bancos chave-valor (DynamoDB, Cassandra) usam um prefixo de geohash como chave de partição para distribuir dados geográficos.
+
+## Trade-offs
+
+| Vantagem | Desvantagem |
+| --- | --- |
+| Funciona com qualquer índice de string | Efeito de borda exige consultar vizinhos |
+| Simples de calcular e de dividir em shards | Células de tamanho fixo: áreas densas e vazias recebem a mesma granularidade |
+| Prefixo dá zoom hierárquico | Distorção perto dos polos e do antimeridiano |
+
+Para densidade muito variável (centro de São Paulo versus Amazônia), estruturas adaptativas como quadtrees se saem melhor.
+
+## Na entrevista
+
+Em problemas como "projete o Uber" ou "encontre restaurantes próximos", geohash é a forma mais rápida de mostrar que você sabe indexar dados espaciais. Explique o prefixo, escolha a precisão pelo raio, mencione os 8 vizinhos e o filtro final por distância. Follow-up comum: "e se uma célula tiver milhares de motoristas?" (aumentar a precisão ou trocar por quadtree), "como atualizar posições que mudam a cada 4 segundos?" (guardar em memória, como Redis, em vez de no banco principal).
+
+<QuizSet>
+<Quiz question="Dois pontos têm geohashes 6gycfq e 6gycfr. O que se pode afirmar?" options={["Estão a mais de 100 km de distância", "Estão relativamente próximos, pois compartilham um prefixo de 5 caracteres", "São o mesmo ponto", "Nada, geohash não tem relação com distância"]} answer={1} explanation="Um prefixo comum longo significa que ambos estão na mesma célula de 5 caracteres, de alguns quilômetros." />
+<Quiz question="Por que uma busca por proximidade com geohash consulta também as 8 células vizinhas?" options={["Para aumentar a precisão do hash", "Porque pontos muito próximos podem cair em células diferentes, com prefixos distintos", "Porque o geohash é aleatório", "Para balancear a carga entre shards"]} answer={1} explanation="Na fronteira entre células, pontos vizinhos podem ter geohashes sem prefixo comum. Consultar os vizinhos cobre esse caso." />
+</QuizSet>
