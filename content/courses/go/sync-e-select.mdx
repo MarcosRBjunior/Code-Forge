@@ -1,0 +1,132 @@
+---
+title: sync e select
+kind: lesson
+---
+
+Com goroutines e canais você faz muita coisa, mas faltam duas peças: proteger estado compartilhado e esperar por vários canais ao mesmo tempo. O pacote `sync` e a instrução `select` cobrem essas duas necessidades.
+
+## Mutex, RWMutex e Once
+
+`sync.Mutex` garante exclusão mútua: `Lock` e `Unlock`, quase sempre com `defer`. `sync.RWMutex` permite muitos leitores simultâneos ou um único escritor, e compensa quando há muito mais leituras do que escritas. `sync.Once` executa uma função uma única vez, mesmo com várias goroutines chamando, útil para inicialização preguiçosa.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Cache struct {
+	mu   sync.RWMutex
+	dados map[string]int
+}
+
+func (c *Cache) Get(k string) (int, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.dados[k]
+	return v, ok
+}
+
+func (c *Cache) Set(k string, v int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dados[k] = v
+}
+
+func main() {
+	c := &Cache{dados: make(map[string]int)}
+	var wg sync.WaitGroup
+	var once sync.Once
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			once.Do(func() { c.Set("inicio", 1) })
+			c.Set(fmt.Sprint("k", i), i)
+		}()
+	}
+	wg.Wait()
+
+	v, ok := c.Get("k3")
+	fmt.Println(v, ok)
+	_, ok = c.Get("zzz")
+	fmt.Println(ok, len(c.dados))
+}
+```
+
+```text
+Saída:
+3 true
+false 6
+```
+
+O mapa tem seis entradas: as cinco chaves `k0` a `k4` e a chave `inicio`, inserida uma única vez. Para contadores simples, o pacote `sync/atomic` evita o mutex.
+
+## select
+
+`select` é um `switch` para operações de canal: espera até que um dos casos esteja pronto e executa esse. Se vários estão prontos, escolhe um aleatoriamente. Um caso `default` torna a operação não bloqueante. Combinado com `time.After`, implementa timeout.
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	rapido := make(chan string, 1)
+	lento := make(chan string)
+
+	rapido <- "chegou"
+
+	select {
+	case m := <-rapido:
+		fmt.Println(m)
+	case m := <-lento:
+		fmt.Println(m)
+	}
+
+	select {
+	case m := <-lento:
+		fmt.Println(m)
+	case <-time.After(50 * time.Millisecond):
+		fmt.Println("timeout")
+	}
+
+	select {
+	case m := <-lento:
+		fmt.Println(m)
+	default:
+		fmt.Println("nada pronto")
+	}
+}
+```
+
+```text
+Saída:
+chegou
+timeout
+nada pronto
+```
+
+## Cancelamento com context
+
+Em programas reais, o jeito idiomático de cancelar trabalho é o pacote `context`: o `ctx.Done()` é um canal que fecha quando o contexto é cancelado ou expira, e você o inclui num `select` dentro dos laços das goroutines. Em entrevista basta saber que existe e para que serve.
+
+## Armadilhas
+
+Esquecer o `Unlock` (por isso o `defer`) trava o programa. Copiar uma struct que contém um mutex copia o estado do lock; passe sempre por ponteiro. Chamar `Lock` duas vezes na mesma goroutine causa deadlock, pois o mutex de Go não é reentrante. Nunca dependa da ordem de escolha do `select` quando vários casos estão prontos. E `time.After` num laço apertado cria muitos timers; prefira `time.NewTimer` reutilizado nesse caso.
+
+## Na entrevista
+
+Escolha a ferramenta pelo problema: mutex para proteger estrutura compartilhada (cache, contador), canal para passar dados, `select` com timeout para evitar bloqueio eterno. Follow-ups comuns: "mutex ou canal?" e "como implementaria um rate limiter ou cache thread-safe?" (mutex em volta de um mapa, `RWMutex` se a leitura dominar).
+
+<QuizSet>
+<Quiz question="Quando mais de um caso de um select está pronto, o que acontece?" options={["O primeiro escrito é executado", "Um deles é escolhido aleatoriamente", "Todos executam", "Dá erro"]} answer={1} explanation="O select escolhe de forma pseudoaleatória entre os casos prontos." />
+<Quiz question="Para que serve o caso default em um select?" options={["Tratar erros", "Tornar a operação não bloqueante", "Repetir o select", "Fechar canais"]} answer={1} explanation="Com default, se nenhum caso estiver pronto o select não espera e executa o default." />
+<Quiz question="Qual tipo de lock permite vários leitores simultâneos?" options={["sync.Mutex", "sync.RWMutex", "sync.Once", "sync.WaitGroup"]} answer={1} explanation="RWMutex permite muitos leitores com RLock ou um escritor com Lock." />
+</QuizSet>

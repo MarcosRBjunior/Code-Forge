@@ -1,0 +1,133 @@
+---
+title: async e await
+kind: lesson
+---
+
+Quando um programa espera algo lento (rede, disco, banco), travar a thread inteira enquanto isso é desperdício: ela poderia atender outras coisas. Em JavaScript você conhece isso como `async/await` com Promises, e em Python como `asyncio`. C# foi uma das primeiras linguagens a ter a sintaxe, e o modelo é muito parecido: `Task` é a promessa de um resultado futuro, `async` marca o método e `await` espera sem bloquear a thread.
+
+## Task e Task de T
+
+`Task` representa uma operação em andamento sem resultado, e `Task<T>` uma que produzirá um `T`. Um método `async` devolve um desses tipos e usa `await` dentro. Ao encontrar o `await` de uma tarefa ainda não concluída, o método devolve o controle ao chamador e retoma de onde parou quando a tarefa terminar. O valor extraído é o `T` direto, sem precisar de `.Result`.
+
+```csharp
+using System;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task<int> Dobrar(int x)
+    {
+        await Task.Delay(10);
+        return x * 2;
+    }
+
+    static async Task Rodar()
+    {
+        Console.WriteLine("inicio");
+        int a = await Dobrar(5);
+        Console.WriteLine("a = " + a);
+
+        Task<int> t1 = Dobrar(1), t2 = Dobrar(2), t3 = Dobrar(3);
+        int[] r = await Task.WhenAll(t1, t2, t3);
+        Console.WriteLine(string.Join(",", r));
+    }
+
+    static void Main()
+    {
+        Rodar().GetAwaiter().GetResult();
+        Console.WriteLine("fim");
+    }
+}
+```
+
+```text
+Saída:
+inicio
+a = 10
+2,4,6
+fim
+```
+
+Dois pontos importantes. Primeiro, as três chamadas de `Dobrar` são iniciadas antes do `await`, então rodam concorrentemente; o `WhenAll` espera todas e devolve os resultados na ordem em que as tarefas foram passadas, não na ordem em que terminaram. Se tivéssemos escrito `await Dobrar(1)`, depois `await Dobrar(2)`, elas seriam sequenciais e levariam a soma dos tempos. Segundo, o `Main` aqui é síncrono e espera com `GetAwaiter().GetResult()`. Em projetos modernos você declara `static async Task Main()` e usa `await` direto.
+
+## Exceções em código assíncrono
+
+Uma exceção lançada dentro de um método `async` é guardada na `Task` e reaparece quando você faz `await`, no ponto da chamada, como se fosse comum. Se você bloquear com `.Wait()` ou `.Result`, ela chega embrulhada numa `AggregateException`.
+
+```csharp
+using System;
+using System.Threading.Tasks;
+
+class Program
+{
+    static async Task<int> Falha()
+    {
+        await Task.Delay(5);
+        throw new InvalidOperationException("boom");
+    }
+
+    static async Task Rodar()
+    {
+        try
+        {
+            await Falha();
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.WriteLine("capturou " + ex.Message);
+        }
+
+        Task<int> t = Falha();
+        Console.WriteLine("tarefa criada");
+        try
+        {
+            t.Wait();
+        }
+        catch (AggregateException ex)
+        {
+            Console.WriteLine(ex.InnerException.Message + " via " + ex.GetType().Name);
+        }
+
+        int r = await Task.Run(() => 40 + 2);
+        Console.WriteLine(r);
+    }
+
+    static void Main()
+    {
+        Rodar().GetAwaiter().GetResult();
+    }
+}
+```
+
+```text
+Saída:
+capturou boom
+tarefa criada
+boom via AggregateException
+42
+```
+
+`Task.Run` empurra um trabalho de CPU para uma thread do pool; ele é a forma de tirar cálculo pesado da thread principal. Para esperas de I/O não use `Task.Run`: use as APIs que já são assíncronas, como `File.ReadAllTextAsync` ou `HttpClient.GetStringAsync`, que não ocupam thread enquanto aguardam.
+
+## Armadilhas
+
+- `async void` só serve para handlers de evento: ninguém consegue aguardá-lo, e as exceções dele derrubam o processo. Prefira sempre `async Task`.
+- Bloquear com `.Result` ou `.Wait()` dentro de código que roda em contexto de UI ou ASP.NET clássico pode causar deadlock. A regra é async até o topo.
+- Concorrência não é paralelismo: `await` não cria threads, apenas libera a atual. Tarefas de CPU precisam de `Task.Run` ou `Parallel`.
+- Esquecer o `await` faz o código seguir sem esperar a tarefa, e o erro dela some silenciosamente.
+- Estado compartilhado entre tarefas exige sincronização: `lock` não pode conter `await`, e `SemaphoreSlim` com `WaitAsync` é a alternativa.
+- Em bibliotecas, `ConfigureAwait(false)` evita retomar no contexto original.
+
+<Callout type="note" title="Versão necessária">
+`static async Task Main()` exige C# 7.1, e `IAsyncEnumerable` com `await foreach` exige C# 8 (.NET Core 3.0 ou superior). Exemplo: `await foreach (var linha in LerLinhas()) Console.WriteLine(linha);` consome itens que chegam aos poucos. `Parallel.ForEachAsync` é do .NET 6.
+</Callout>
+
+## Na entrevista
+
+O tema aparece mais em vagas de back-end do que em problemas de algoritmo. Mostre que você sabe: usar `async Task` em vez de `async void`, iniciar tarefas independentes antes de aguardar (`WhenAll`), propagar `CancellationToken` e não bloquear com `.Result`. Follow-ups comuns: "qual a diferença entre `Task.Run` e `await`?", "o que é um deadlock de sincronização?" e "quando `async` não ajuda?" (quando o trabalho é limitado por CPU).
+
+<QuizSet>
+<Quiz question="O que o await faz quando a tarefa ainda não terminou?" options={["Bloqueia a thread até terminar", "Devolve o controle ao chamador e retoma o método depois", "Cria uma nova thread sempre", "Cancela a tarefa"]} answer={1} explanation="await libera a thread atual enquanto espera e continua o método quando a tarefa conclui, sem bloquear." />
+<Quiz question="Você precisa de três chamadas de rede independentes. Qual abordagem é mais rápida?" options={["Aguardar uma por vez", "Iniciar as três e aguardar Task.WhenAll", "Usar async void", "Usar .Result em cada uma"]} answer={1} explanation="Iniciar as três antes de aguardar permite que rodem concorrentemente, e o tempo total tende ao da mais lenta, não à soma." />
+<Quiz question="Por que evitar async void?" options={["É mais lento", "Não pode ser aguardado e suas exceções derrubam o processo", "Não compila", "Só funciona no Windows"]} answer={1} explanation="Sem uma Task, o chamador não consegue aguardar nem tratar erros. Reserve async void para handlers de evento." />
+</QuizSet>

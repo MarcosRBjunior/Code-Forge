@@ -1,0 +1,109 @@
+---
+title: O event loop
+kind: lesson
+---
+
+JavaScript executa seu código numa única thread. Mesmo assim, um servidor Node atende milhares de conexões e uma página continua respondendo enquanto espera a rede. Quem permite isso é o event loop: um laço que pega tarefas prontas de filas e as executa, uma de cada vez, até o fim. O TypeScript não muda nada aqui, já que vira JavaScript, mas perguntas sobre "em que ordem isso imprime" são clássicas em entrevistas de front-end e Node.
+
+## Pilha, filas e a regra principal
+
+Três peças importam:
+
+- **Pilha de chamadas**: onde o código síncrono roda. Enquanto ela não esvazia, nada mais acontece.
+- **Fila de microtarefas**: callbacks de Promises (`then`, `catch`, `finally`, a continuação depois de um `await`) e `queueMicrotask`.
+- **Fila de tarefas (macrotarefas)**: `setTimeout`, `setInterval`, eventos de E/S e de interface.
+
+A regra: quando a pilha esvazia, o loop executa **todas** as microtarefas pendentes, inclusive as que forem criadas durante esse processo. Só então pega **uma** macrotarefa, e o ciclo se repete.
+
+```typescript
+console.log("1: síncrono");
+
+setTimeout(() => console.log("5: timeout"), 0);
+
+Promise.resolve().then(() => console.log("3: microtarefa"));
+
+queueMicrotask(() => console.log("4: outra microtarefa"));
+
+console.log("2: síncrono");
+```
+
+```text
+Saída:
+1: síncrono
+2: síncrono
+3: microtarefa
+4: outra microtarefa
+5: timeout
+```
+
+Mesmo com atraso `0`, o `setTimeout` vai para a fila de macrotarefas e só roda depois que todas as microtarefas terminaram. O atraso é um mínimo, não uma garantia.
+
+## Onde o await entra
+
+Tudo o que vem depois de um `await` vira uma microtarefa. A parte da função `async` antes do primeiro `await` roda de forma síncrona, junto com quem a chamou.
+
+```typescript
+async function tarefa(): Promise<void> {
+  console.log("B: início da async");
+  await null;
+  console.log("E: depois do await");
+}
+
+console.log("A: antes");
+setTimeout(() => console.log("H: timeout"), 0);
+tarefa();
+Promise.resolve()
+  .then(() => console.log("F: then 1"))
+  .then(() => console.log("G: then 2"));
+console.log("C: depois de chamar");
+console.log("D: fim do síncrono");
+```
+
+```text
+Saída:
+A: antes
+B: início da async
+C: depois de chamar
+D: fim do síncrono
+E: depois do await
+F: then 1
+G: then 2
+H: timeout
+```
+
+O segundo `then` foi criado como microtarefa durante a execução do primeiro e, mesmo assim, roda antes do timeout: a fila de microtarefas é drenada por completo antes de qualquer macrotarefa.
+
+## Bloquear o loop
+
+Como há uma só thread, um cálculo síncrono pesado congela tudo: timers atrasam, requisições ficam paradas, a página trava. Um laço de 2 segundos atrasa um `setTimeout` de 10 ms em 2 segundos.
+
+```typescript
+// setTimeout(() => console.log("timer"), 10);
+// const fim = Date.now() + 2000;
+// while (Date.now() < fim) {} // pilha ocupada por 2 s
+// // "timer" só aparece depois do laço, com cerca de 2 s de atraso
+```
+
+As saídas são dividir o trabalho em pedaços agendados com `setTimeout`, mover o cálculo para um worker thread ou, no servidor, para outro processo.
+
+## Armadilhas
+
+- Microtarefas podem "esfomear" o loop: uma cadeia infinita de `then` que agenda outro `then` nunca deixa um timer rodar.
+- `setTimeout(fn, 0)` não é imediato. Em navegadores, timers aninhados demais ganham um mínimo de cerca de 4 ms.
+- No Node existem filas extras: `process.nextTick` roda antes das microtarefas de Promise, e `setImmediate` roda numa fase própria do loop. Para a maioria das perguntas, o modelo de micro e macrotarefas basta.
+
+<Callout type="tip" title="Como responder perguntas de ordem">
+Percorra o código três vezes: primeiro anote tudo o que é síncrono, depois as microtarefas em ordem de criação, por último as macrotarefas. Diga isso em voz alta enquanto resolve.
+</Callout>
+
+## Na entrevista
+
+A pergunta típica mostra um trecho com `console.log`, `setTimeout`, `then` e `await` e pede a ordem de impressão. Aplique a regra: síncrono, todas as microtarefas, uma macrotarefa. Também aparece "por que o Node é bom para E/S e ruim para CPU?": a E/S é delegada ao sistema e não ocupa a thread, mas cálculo pesado ocupa.
+
+Follow-ups comuns: "qual a diferença entre `process.nextTick` e `setImmediate`?" e "como evitar travar o servidor com um cálculo longo?" (worker threads ou dividir o trabalho).
+
+<QuizSet>
+<Quiz question="Qual imprime primeiro: um setTimeout com atraso 0 ou um then de uma Promise já resolvida, ambos agendados no mesmo trecho síncrono?" options={["O setTimeout", "O then", "Depende do sistema", "Os dois ao mesmo tempo"]} answer={1} explanation="Callbacks de Promise são microtarefas e rodam antes de qualquer macrotarefa como o setTimeout." />
+<Quiz question="Numa função async, o código antes do primeiro await roda quando?" options={["Depois de todas as microtarefas", "Imediatamente, de forma síncrona, na chamada", "Na próxima macrotarefa", "Só se houver um then"]} answer={1} explanation="A função async executa sincronamente até o primeiro await; só a continuação vira microtarefa." />
+<Quiz question="Um laço síncrono de 3 segundos roda logo depois de agendar setTimeout de 10 ms. Quando o timer dispara?" options={["Em 10 ms", "Depois que o laço termina, cerca de 3 s", "Nunca", "Em paralelo ao laço"]} answer={1} explanation="O event loop só pega a macrotarefa quando a pilha esvazia; o laço ocupa a única thread." />
+</QuizSet>

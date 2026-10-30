@@ -34,7 +34,14 @@ async function submit(lang: Lang, source: string): Promise<Judge0Result> {
   const res = await fetch(`${base}/submissions?base64_encoded=true&wait=true`, {
     method: "POST",
     headers: { "content-type": "application/json", ...(process.env.JUDGE0_TOKEN && { "X-Auth-Token": process.env.JUDGE0_TOKEN }) },
-    body: JSON.stringify({ language_id: id, source_code: Buffer.from(source, "utf8").toString("base64"), cpu_time_limit: 5, wall_time_limit: 15 }),
+    body: JSON.stringify({
+      language_id: id,
+      source_code: Buffer.from(source, "utf8").toString("base64"),
+      // Sem isso o tsc do serviço compila para ES3/ES5 e recusa Map, BigInt, includes etc.
+      ...(lang === "typescript" && { compiler_options: "--target esnext --lib esnext,dom" }),
+      cpu_time_limit: 5,
+      wall_time_limit: 15,
+    }),
     signal: AbortSignal.timeout(40_000),
   });
   if (res.status === 429) throw new Error("O serviço de execução está com muitas requisições. Tente de novo em instantes.");
