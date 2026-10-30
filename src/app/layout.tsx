@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter, JetBrains_Mono, Literata } from "next/font/google";
 import Link from "next/link";
 import { PreferencesMenu } from "@/components/PreferencesMenu";
+import { ReviewBadge } from "@/components/review/ReviewBadge";
 import { SearchDialog } from "@/components/SearchDialog";
 import "./globals.css";
 
@@ -38,6 +39,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
             <Link href="/practice" className="rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg">
               Prática
             </Link>
+            <ReviewBadge />
             <Link href="/interview" className="rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg">
               Entrevista
             </Link>

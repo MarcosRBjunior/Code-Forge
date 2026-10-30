@@ -1,6 +1,6 @@
 import "server-only";
 import { sql } from "drizzle-orm";
-import { pgTable, text, integer, timestamp, uuid, boolean, date, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, real, timestamp, uuid, boolean, date, jsonb } from "drizzle-orm/pg-core";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
 
 /*
@@ -47,6 +47,22 @@ export const drafts = pgTable("code_drafts", {
   language: text("language").notNull(),
   code: text("code").notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Cartões de revisão espaçada. id = "problem:<curso>/<capitulo>" ou "highlight:<uuid>". */
+export const reviewCards = pgTable("review_cards", {
+  id: text("id").primaryKey(),
+  kind: text("kind").notNull(),
+  ref: text("ref").notNull(),
+  ease: real("ease").notNull().default(2.5),
+  intervalDays: integer("interval_days").notNull().default(0),
+  reps: integer("reps").notNull().default(0),
+  lapses: integer("lapses").notNull().default(0),
+  due: date("due").notNull(),
+  lastReviewed: date("last_reviewed"),
+  firstReviewed: date("first_reviewed"),
+  suspended: boolean("suspended").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const activityDays = pgTable("activity_days", {
@@ -110,6 +126,20 @@ const DDL = [
      notes text NOT NULL DEFAULT '',
      duration_s integer NOT NULL,
      created_at timestamptz NOT NULL DEFAULT now())`,
+  `CREATE TABLE IF NOT EXISTS review_cards (
+     id text PRIMARY KEY,
+     kind text NOT NULL CHECK (kind IN ('problem','highlight')),
+     ref text NOT NULL,
+     ease real NOT NULL DEFAULT 2.5 CHECK (ease >= 1.3),
+     interval_days integer NOT NULL DEFAULT 0 CHECK (interval_days >= 0),
+     reps integer NOT NULL DEFAULT 0,
+     lapses integer NOT NULL DEFAULT 0,
+     due date NOT NULL,
+     last_reviewed date,
+     first_reviewed date,
+     suspended boolean NOT NULL DEFAULT false,
+     created_at timestamptz NOT NULL DEFAULT now())`,
+  `CREATE INDEX IF NOT EXISTS review_cards_due_idx ON review_cards (due) WHERE NOT suspended`,
   `CREATE TABLE IF NOT EXISTS activity_days (
      day date PRIMARY KEY,
      events integer NOT NULL DEFAULT 0)`,
@@ -141,6 +171,11 @@ async function connect(): Promise<Db> {
 /** Dia de hoje no fuso de estudo (America/Sao_Paulo por padrão), formato YYYY-MM-DD. */
 export function today(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: process.env.TZ_STUDY ?? "America/Sao_Paulo" }).format(new Date());
+}
+
+/** Dia (YYYY-MM-DD) de um instante, no fuso de estudo. */
+export function dayOf(date: Date): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: process.env.TZ_STUDY ?? "America/Sao_Paulo" }).format(date);
 }
 
 /** Registra atividade de estudo no dia (alimenta a sequência de dias e o mapa de calor). */

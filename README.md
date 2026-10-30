@@ -10,9 +10,10 @@ Plataforma de estudo para entrevistas de engenharia, para um único usuário, in
 | Leitor | Destaques em 5 cores, notas, caderno com busca e exportação `.md`, áudio com destaque palavra a palavra, modo livro (tecla B), progresso de leitura, sumário com seção ativa, tema claro/escuro e ajustes de fonte e largura |
 | Prática | Editor Monaco com Python e JavaScript rodando no navegador, testes por caso, rascunhos salvos, suporte a listas ligadas, árvores e classes de design; catálogo agrupado por padrão, filtros e problema aleatório |
 | Entrevista | Mock interview cronometrada (estilo, nível, modo sem executar, mistura de dificuldades), avaliação nas 6 áreas da rubrica com nota de 0 a 100 e histórico |
+| Revisão | Repetição espaçada (variante do SM-2) sobre problemas resolvidos e destaques: fila diária em `/review`, notas Errei, Difícil, Bom e Fácil com atalhos 1 a 4, até 10 cartões novos por dia, selo com o total no menu |
 | Recursos | Animações passo a passo com entrada editável, roadmaps de estudo, painel com sequência de dias e mapa de atividade, busca global (Ctrl+K) |
 
-Para validar conteúdo: `node scripts/check-content.mjs`. Para validar um problema com soluções de referência: `node scripts/check-problem.mjs <problema.mdx> <sol.py> <sol.js>`. O guia de escrita está em `content/GUIA-DE-ESCRITA.md`.
+Para testar o agendador da revisão: `npm run test:srs`. Para validar conteúdo: `node scripts/check-content.mjs`. Para validar um problema com soluções de referência: `node scripts/check-problem.mjs <problema.mdx> <sol.py> <sol.js>`. O guia de escrita está em `content/GUIA-DE-ESCRITA.md`.
 
 ## Rodar no seu computador
 
