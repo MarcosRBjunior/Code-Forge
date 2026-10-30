@@ -16,7 +16,7 @@ function argDecls(lang: Lang, p: ProblemShape, sig: Signature, testIdx: number):
   const decls = sig.params
     .map((t, i) => {
       const lit = literal(lang, t, test.input[i]);
-      if (lang === "go") return `a${i} := ${lit}`;
+      if (lang === "go") return `var a${i} ${typeName("go", t)} = ${lit}`;
       const ty = lang === "java" || lang === "csharp" || lang === "cpp" ? typeName(lang, t) : "";
       return `${ty} a${i} = ${lit};`;
     })
@@ -194,7 +194,6 @@ function goProgram(code: string, p: ProblemShape, sig: Signature): string {
   return `package main
 
 import (
-	__json "encoding/json"
 	__fmt "fmt"
 	__reflect "reflect"
 	__strconv "strconv"
@@ -212,8 +211,28 @@ func __js(v __reflect.Value) string {
 		}
 		return "[" + __strings.Join(parts, ",") + "]"
 	case __reflect.String:
-		b, _ := __json.Marshal(v.String())
-		return string(b)
+		var sb __strings.Builder
+		sb.WriteByte('"')
+		for _, c := range v.String() {
+			switch {
+			case c == '"':
+				sb.WriteString("\\\\\\"")
+			case c == '\\\\':
+				sb.WriteString("\\\\\\\\")
+			case c == '\\n':
+				sb.WriteString("\\\\n")
+			case c == '\\r':
+				sb.WriteString("\\\\r")
+			case c == '\\t':
+				sb.WriteString("\\\\t")
+			case c < 0x20:
+				sb.WriteString(__fmt.Sprintf("\\\\u%04x", c))
+			default:
+				sb.WriteRune(c)
+			}
+		}
+		sb.WriteByte('"')
+		return sb.String()
 	case __reflect.Bool:
 		return __strconv.FormatBool(v.Bool())
 	case __reflect.Int, __reflect.Int8, __reflect.Int16, __reflect.Int32, __reflect.Int64:

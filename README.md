@@ -13,7 +13,7 @@ Plataforma de estudo para entrevistas de engenharia, para um único usuário, in
 | Revisão | Repetição espaçada (variante do SM-2) sobre problemas resolvidos e destaques: fila diária em `/review`, notas Errei, Difícil, Bom e Fácil com atalhos 1 a 4, até 10 cartões novos por dia, selo com o total no menu |
 | Recursos | Animações passo a passo com entrada editável, roadmaps de estudo, painel com sequência de dias e mapa de atividade, busca global (Ctrl+K) |
 
-Para testar o agendador da revisão: `npm run test:srs`. Para validar conteúdo: `node scripts/check-content.mjs`. Para validar um problema com soluções de referência: `node scripts/check-problem.mjs <problema.mdx> <sol.py> <sol.js>`. O guia de escrita está em `content/GUIA-DE-ESCRITA.md`.
+Para verificar as soluções de referência (`content/solutions/dsa/`, 7 linguagens): `npx tsx --conditions react-server scripts/check-solutions.ts --all`. Para testar o agendador da revisão: `npm run test:srs`. Para validar conteúdo: `node scripts/check-content.mjs`. Para validar um problema com soluções de referência: `node scripts/check-problem.mjs <problema.mdx> <sol.py> <sol.js>`. O guia de escrita está em `content/GUIA-DE-ESCRITA.md`.
 
 ## Rodar no seu computador
 

@@ -88,6 +88,8 @@ export function inferSignature(p: ProblemShape): Signature | null {
       settle(p.tests.reduce<Ty>((acc, t) => unify(acc, infer(t.input[i])), { k: "unknown" })),
     );
     const inPlace = (p.checkArg ?? -1) >= 0;
+    // Problemas que encurtam o array no lugar não cabem em Java, C#, Go e C++ (arrays de tamanho fixo no teste).
+    if (inPlace && p.tests.some((t) => Array.isArray(t.expected) && Array.isArray(t.input[p.checkArg!]) && t.expected.length !== (t.input[p.checkArg!] as unknown[]).length)) return null;
     const ret = inPlace ? null : settle(p.tests.reduce<Ty>((acc, t) => unify(acc, infer(t.expected)), { k: "unknown" }));
     return { params, ret };
   } catch {

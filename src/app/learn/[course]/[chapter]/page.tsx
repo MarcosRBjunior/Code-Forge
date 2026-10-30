@@ -4,6 +4,9 @@ import { chapterKey, getChapter, getCourses } from "@/lib/content";
 import { renderChapter } from "@/lib/mdx";
 import { ChapterReader } from "@/components/reader/ChapterReader";
 import { ProblemWorkspace } from "@/components/practice/ProblemWorkspace";
+import { SolutionPanel } from "@/components/practice/SolutionPanel";
+import { getSolution } from "@/lib/solutions";
+import { LANGS, type Lang } from "@/lib/langs";
 import { TableOfContents } from "@/components/reader/TableOfContents";
 
 type Params = Promise<{ course: string; chapter: string }>;
@@ -32,6 +35,16 @@ export default async function ChapterPage({ params }: { params: Params }) {
   if (!ch) notFound();
   const content = ch.available ? await renderChapter(ch.source) : null;
   const key = chapterKey(course, chapter);
+  const solution = ch.problem ? await getSolution(course, chapter) : null;
+  const solutionNodes = solution && {
+    idea: await renderChapter(solution.idea),
+    complexity: await renderChapter(solution.complexity),
+    codes: Object.fromEntries(
+      await Promise.all(
+        LANGS.filter((l) => solution.code[l]).map(async (l) => [l, await renderChapter("```" + l + "\n" + solution.code[l] + "\n```")] as const),
+      ),
+    ) as Partial<Record<Lang, React.ReactNode>>,
+  };
 
   return (
     <div className="cf-chapter-grid xl:grid xl:grid-cols-[1fr_var(--cf-layout-toc-w)]">
@@ -84,6 +97,7 @@ export default async function ChapterPage({ params }: { params: Params }) {
         {ch.problem && (
           <div className="mx-auto mt-10 max-w-[1100px]">
             <ProblemWorkspace chapterKey={key} problem={ch.problem} />
+            {solutionNodes && <div className="mt-4"><SolutionPanel {...solutionNodes} /></div>}
           </div>
         )}
 
