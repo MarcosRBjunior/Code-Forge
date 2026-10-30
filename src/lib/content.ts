@@ -103,7 +103,9 @@ async function readChapterFile(course: string, slug: string) {
   }
 }
 
-export const getCourse = cache(async (slug: string): Promise<Course | null> => {
+/** Carrega o curso lendo cada .mdx uma única vez; devolve também o corpo de cada capítulo. */
+async function loadCourse(slug: string): Promise<{ course: Course; contents: Map<string, string> } | null> {
+  const contents = new Map<string, string>();
   let file: CourseFile;
   try {
     file = JSON.parse(await fs.readFile(path.join(CONTENT_DIR, slug, "course.json"), "utf8"));
@@ -120,6 +122,7 @@ export const getCourse = cache(async (slug: string): Promise<Course | null> => {
         throw new Error(`content/courses/${slug}: capítulo "${declared.slug}" não tem .mdx nem título declarado`);
       }
       const data = file?.data ?? {};
+      if (file) contents.set(declared.slug, file.content);
       chapters.push({
         course: slug,
         slug: declared.slug,
@@ -133,7 +136,7 @@ export const getCourse = cache(async (slug: string): Promise<Course | null> => {
     }
     modules.push({ slug: mod.slug, title: mod.title, chapters });
   }
-  return {
+  const course: Course = {
     slug: file.slug,
     title: file.title,
     description: file.description,
@@ -143,7 +146,17 @@ export const getCourse = cache(async (slug: string): Promise<Course | null> => {
     chapterCount: modules.reduce((n, m) => n + m.chapters.length, 0),
     availableCount: modules.reduce((n, m) => n + m.chapters.filter((c) => c.available).length, 0),
   };
-});
+  return { course, contents };
+}
+
+export const getCourse = cache(async (slug: string): Promise<Course | null> => (await loadCourse(slug))?.course ?? null);
+
+/** Cursos com o corpo de cada capítulo, para montar o índice de busca (um curso por vez, sem leituras repetidas). */
+export async function getCoursesWithContent(): Promise<Array<{ course: Course; contents: Map<string, string> }>> {
+  const dirs = await fs.readdir(CONTENT_DIR, { withFileTypes: true });
+  const loaded = await Promise.all(dirs.filter((d) => d.isDirectory()).map((d) => loadCourse(d.name)));
+  return loaded.filter((c) => c !== null).sort((a, b) => a.course.order - b.course.order);
+}
 
 export const getCourses = cache(async (): Promise<Course[]> => {
   const dirs = await fs.readdir(CONTENT_DIR, { withFileTypes: true });
@@ -154,17 +167,18 @@ export const getCourses = cache(async (): Promise<Course[]> => {
 /** Texto corrido do MDX, usado pelo tutor de IA e para estimar o tempo de leitura. */
 function toPlainText(source: string): string {
   return source
-    .replace(/<[A-Z][\s\S]*?\/>/g, "")
-    .replace(/<\/?[A-Z][^>]*>/g, "")
+    .replace(/<Quiz(?![A-Za-z])[\s\S]*?\/>/g, "")
+    .replace(/<\/?[A-Z][A-Za-z]*(?:\s[^>]*)?>/g, "")
     .replace(/[#*`|>]/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-/** Só o texto corrido de um capítulo, sem montar o curso inteiro (usado pelo índice de busca). */
-export async function getPlainText(course: string, slug: string): Promise<string> {
-  const file = await readChapterFile(course, slug);
-  return file ? toPlainText(file.content) : "";
+/** Texto para a busca: prosa sem blocos de código, espaços colapsados e limitado a 6.000 caracteres. */
+export function toSearchText(content: string): string {
+  return toPlainText(content.replace(/^```[\s\S]*?^```/gm, " "))
+    .replace(/\s+/g, " ")
+    .slice(0, 6000);
 }
 
 function extractToc(source: string): TocItem[] {
