@@ -161,6 +161,12 @@ function toPlainText(source: string): string {
     .trim();
 }
 
+/** Só o texto corrido de um capítulo, sem montar o curso inteiro (usado pelo índice de busca). */
+export async function getPlainText(course: string, slug: string): Promise<string> {
+  const file = await readChapterFile(course, slug);
+  return file ? toPlainText(file.content) : "";
+}
+
 function extractToc(source: string): TocItem[] {
   const slugger = new GithubSlugger();
   const toc: TocItem[] = [];
