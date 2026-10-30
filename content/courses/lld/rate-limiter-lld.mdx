@@ -1,0 +1,104 @@
+---
+title: Projetar um rate limiter
+kind: lesson
+---
+
+Um rate limiter decide se uma requisição passa ou é recusada. O LLD pede a interface limpa, algoritmos intercambiáveis e cuidado com concorrência e consumo de memória. Aqui implementamos token bucket e janela deslizante atrás da mesma interface.
+
+## Requisitos
+
+- Limitar requisições por chave (usuário, IP ou API key).
+- Algoritmos trocáveis.
+- Tempo injetável para testes.
+- Seguro para várias threads.
+
+## Algoritmos
+
+| Algoritmo | Ideia | Pontos fortes e fracos |
+| --- | --- | --- |
+| Janela fixa | Contador por intervalo | Simples; permite rajada dupla na virada |
+| Janela deslizante | Guarda os instantes recentes | Preciso; usa mais memória |
+| Token bucket | Fichas repostas a taxa constante | Permite rajadas controladas; memória mínima |
+
+## Implementação
+
+```python
+import threading
+from collections import deque
+from typing import Callable, Dict
+
+
+class Limiter:
+    def permitir(self, chave: str) -> bool:
+        raise NotImplementedError
+
+
+class TokenBucket(Limiter):
+    def __init__(self, capacidade: int, repor_por_seg: float, relogio: Callable[[], float]):
+        self.capacidade, self.taxa, self.relogio = capacidade, repor_por_seg, relogio
+        self.baldes: Dict[str, list] = {}       # chave -> [fichas, ultimo instante]
+        self._lock = threading.Lock()
+
+    def permitir(self, chave: str) -> bool:
+        with self._lock:
+            agora = self.relogio()
+            fichas, ultimo = self.baldes.get(chave, [self.capacidade, agora])
+            fichas = min(self.capacidade, fichas + (agora - ultimo) * self.taxa)
+            ok = fichas >= 1
+            if ok:
+                fichas -= 1
+            self.baldes[chave] = [fichas, agora]
+            return ok
+
+
+class JanelaDeslizante(Limiter):
+    def __init__(self, limite: int, janela: float, relogio: Callable[[], float]):
+        self.limite, self.janela, self.relogio = limite, janela, relogio
+        self.registros: Dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def permitir(self, chave: str) -> bool:
+        with self._lock:
+            agora = self.relogio()
+            q = self.registros.setdefault(chave, deque())
+            while q and q[0] <= agora - self.janela:
+                q.popleft()
+            if len(q) < self.limite:
+                q.append(agora)
+                return True
+            return False
+
+
+t = [0.0]
+tb = TokenBucket(capacidade=3, repor_por_seg=1, relogio=lambda: t[0])
+print([tb.permitir("u1") for _ in range(4)])      # [True, True, True, False]
+t[0] = 2.0
+print([tb.permitir("u1") for _ in range(3)])      # [True, True, False]
+print(tb.permitir("u2"))                          # chaves independentes: True
+
+jd = JanelaDeslizante(limite=2, janela=10, relogio=lambda: t[0])
+t[0] = 0
+print(jd.permitir("a"), jd.permitir("a"), jd.permitir("a"))   # True True False
+t[0] = 10
+print(jd.permitir("a"))                                       # True
+```
+
+Token bucket não precisa de um processo reabastecendo: as fichas são calculadas na leitura pelo tempo decorrido. É o truque que mantém a memória em dois números por chave.
+
+## Concorrência e memória
+
+O lock global é correto e simples, mas serializa todas as chaves. Alternativas: um lock por chave (ou fatiado por hash) e operações atômicas num armazenamento compartilhado. Em sistema distribuído, a contagem mora num Redis com script atômico, assunto de System Design. Também é preciso expirar chaves inativas, senão o dicionário cresce sem fim.
+
+## Extensões
+
+Limites por plano do cliente (política por chave), resposta com tempo restante até poder tentar de novo, regras compostas (por segundo e por dia) combinadas, e métricas de requisições recusadas.
+
+## Na entrevista
+
+- **"Qual algoritmo escolher?"** Token bucket quando rajadas curtas são aceitáveis; janela deslizante quando a precisão importa.
+- **"Por que injetar o relógio?"** Para testar sem dormir.
+
+<QuizSet>
+<Quiz question="Como o token bucket repõe fichas sem um processo de fundo?" options={["Com uma thread por chave", "Calcula pelo tempo decorrido desde o último uso", "Reseta a cada requisição", "Não repõe"]} answer={1} explanation="Fichas novas igual a tempo decorrido vezes a taxa, limitado à capacidade." />
+<Quiz question="Qual a fraqueza da janela fixa?" options={["Usa muita memória", "Permite o dobro do limite na virada da janela", "Não conta requisições", "Exige Redis"]} answer={1} explanation="Rajadas no fim de uma janela e começo da próxima somam o dobro." />
+</QuizSet>

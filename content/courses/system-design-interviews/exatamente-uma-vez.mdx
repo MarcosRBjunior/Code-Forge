@@ -1,0 +1,78 @@
+---
+title: Processamento exatamente uma vez
+kind: lesson
+---
+
+Em um pagamento ou em um contador de cliques, processar a mesma mensagem duas vezes é um bug sério, e perdê-la também. A promessa de "exatamente uma vez" (exactly-once) é uma das mais mal compreendidas em sistemas distribuídos, e saber explicá-la bem destaca você numa entrevista.
+
+## Três semânticas de entrega
+
+| Semântica | Comportamento | Risco |
+| --- | --- | --- |
+| No máximo uma vez | Envia e esquece, sem retry | Perde mensagens |
+| Pelo menos uma vez | Repete até receber confirmação | Duplicatas |
+| Exatamente uma vez | Cada mensagem tem efeito uma só vez | Custo e complexidade |
+
+## Por que é difícil de verdade
+
+Um produtor envia uma mensagem e a rede cai antes da confirmação. Ele não sabe se a mensagem chegou. Se reenviar, pode duplicar; se não reenviar, pode perder. Esse é o problema dos dois generais: sem canal confiável, não existe entrega exatamente uma vez no nível da rede.
+
+A solução prática é outra: **entrega pelo menos uma vez + processamento idempotente = efeito exatamente uma vez**. Você aceita duplicatas na entrega e garante que reprocessar não muda o resultado.
+
+## Idempotência na prática
+
+### Chave de idempotência
+
+O cliente gera um identificador único por operação e o envia junto. O servidor guarda os identificadores já processados.
+
+```python
+def processar_pagamento(msg):
+    # o efeito e o registro de dedup acontecem na MESMA transação
+    with banco.transacao() as tx:
+        if tx.existe("processadas", msg.id):
+            return "duplicada, ignorada"
+        tx.executar("INSERT INTO pagamentos ...", msg)
+        tx.executar("INSERT INTO processadas (id) VALUES (?)", msg.id)
+```
+
+O ponto crítico é gravar o efeito e o registro de deduplicação atomicamente. Se forem passos separados, uma queda entre eles reabre a janela.
+
+### Operações naturalmente idempotentes
+
+`SET saldo = 100` é idempotente; `saldo = saldo + 10` não é. Sempre que possível, projete escritas como "definir estado" ou use upserts por chave natural.
+
+### Deduplicação com janela
+
+Guardar todos os IDs para sempre é caro. Muitos sistemas guardam por uma janela (24 horas, 7 dias) com TTL, assumindo que retries acontecem dentro dela.
+
+## Exatamente uma vez no Kafka
+
+O Kafka oferece esse recurso dentro do seu próprio ecossistema:
+
+- **Produtor idempotente:** o broker descarta duplicatas por número de sequência por partição.
+- **Transações:** consumir, processar e produzir em outro tópico viram uma unidade atômica, com os offsets commitados junto.
+
+Isso vale para o fluxo de Kafka para Kafka. Assim que você escreve em um banco externo ou chama uma API de terceiros, volta a precisar de idempotência própria (por exemplo, gravar o offset na mesma transação do banco).
+
+## Padrão outbox
+
+Para publicar um evento após alterar o banco sem perder nem duplicar, grave o evento numa tabela `outbox` na mesma transação da alteração. Um processo separado lê a outbox e publica na fila, com pelo menos uma vez; os consumidores deduplicam.
+
+## Armadilhas
+
+- Confiar no "exactly-once" de um produto sem entender seus limites.
+- Chave de idempotência gerada pelo servidor a cada tentativa (deve vir do cliente ou ser derivada da operação).
+- Efeitos colaterais externos (e-mail, SMS) que não são idempotentes: use o ID da operação como chave junto ao provedor.
+
+<Callout type="warning" title="Cuidado com a frase">
+Evite dizer que o Kafka garante exactly-once sem qualificar. Diga: pelo menos uma vez na entrega, com idempotência para obter efeito exatamente uma vez.
+</Callout>
+
+## Na entrevista
+
+Apresente a equação entrega pelo menos uma vez mais consumidor idempotente. Follow-ups: onde guardar as chaves de dedup, por quanto tempo, e o que acontece se o consumidor cair depois de processar mas antes de confirmar (reprocessa, e a idempotência absorve).
+
+<QuizSet>
+<Quiz question="Como se obtém efeito exatamente uma vez na prática?" options={["Rede perfeita", "Entrega pelo menos uma vez com consumidor idempotente", "Desligar retries", "Usar UDP"]} answer={1} explanation="Duplicatas na entrega são inevitáveis; a idempotência faz repetir não ter efeito extra." />
+<Quiz question="Por que gravar o efeito e a chave de dedup na mesma transação?" options={["Para economizar disco", "Para que uma queda entre os dois passos não gere duplicata ou perda", "Para criptografar", "Para ordenar mensagens"]} answer={1} explanation="Atomicidade evita o estado em que o efeito ocorreu mas o registro não, ou vice-versa." />
+</QuizSet>

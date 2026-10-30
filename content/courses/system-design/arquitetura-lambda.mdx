@@ -1,0 +1,63 @@
+---
+title: Arquitetura lambda
+kind: lesson
+---
+
+Imagine um painel que mostra o total de vendas. Processar o histórico inteiro em lote dá resultados corretos, mas com horas de atraso. Processar apenas eventos em tempo real dá resposta imediata, mas sujeita a erros e reordenações. A **arquitetura lambda**, popularizada por Nathan Marz, combina os dois: um caminho lento e preciso, e um caminho rápido e aproximado.
+
+## Três camadas
+
+```text
+                 +--> Camada batch  --> visões batch ----+
+Eventos --> log -+                                       +--> Camada de serviço --> consulta
+                 +--> Camada speed  --> visões em tempo -+
+                                        real
+```
+
+- **Camada batch:** guarda o conjunto mestre de dados, imutável e só com acréscimos, e recalcula visões completas periodicamente (por exemplo, a cada noite) com Spark ou MapReduce. É a fonte da verdade.
+- **Camada speed:** processa apenas os eventos recentes que o batch ainda não viu, via Flink, Kafka Streams ou similar, gerando visões incrementais de baixa latência.
+- **Camada de serviço:** indexa as visões e responde às consultas, mesclando o resultado batch (completo até certo ponto) com o resultado speed (o que veio depois).
+
+## Exemplo
+
+Contagem de visitas por página. O batch recalcula tudo até as 00h. Durante o dia, a camada speed conta as visitas desde a meia-noite. Uma consulta às 15h soma as duas.
+
+```python
+def visitas(pagina):
+    base = visoes_batch.get(pagina, 0)      # até o último batch
+    recente = visoes_speed.get(pagina, 0)   # desde então
+    return base + recente
+```
+
+Quando o próximo batch termina, ele inclui o período recente, e os valores da camada speed correspondentes são descartados.
+
+## Por que funciona
+
+Como o conjunto mestre é imutável, qualquer bug de lógica pode ser corrigido reprocessando tudo: o batch sobrescreve os erros da camada speed. Isso dá tolerância a falhas humanas, uma força real da arquitetura.
+
+## O custo: duas bases de código
+
+O maior problema é manter **a mesma lógica de negócio implementada duas vezes**, uma para batch e outra para streaming, com frameworks diferentes. Elas precisam produzir resultados equivalentes, e divergências sutis são difíceis de achar. Além disso:
+
+- Dois sistemas para operar, monitorar e escalar.
+- A mesclagem na camada de serviço adiciona complexidade.
+- Latência de correção: um erro na camada speed só desaparece quando o batch roda.
+
+| Aspecto | Batch | Speed |
+| --- | --- | --- |
+| Latência | Horas | Segundos |
+| Precisão | Alta, recalcula tudo | Aproximada, incremental |
+| Reprocessamento | Natural | Difícil |
+
+<Callout type="note" title="Quando ainda faz sentido">
+Quando o reprocessamento histórico com lógica complexa é frequente, ou quando o motor de streaming disponível não garante resultados exatos. Hoje, motores modernos reduziram essa necessidade, o que levou à arquitetura kappa, tema do próximo capítulo.
+</Callout>
+
+## Na entrevista
+
+Descreva as três camadas e a mesclagem, e já aponte a crítica: duplicação de lógica. Follow-ups: "como evitar divergência entre batch e speed?" (frameworks unificados como Spark ou Beam, testes comparando saídas) e "o que muda se o streaming for exatamente-uma-vez?" (você pode considerar kappa).
+
+<QuizSet>
+<Quiz question="Qual é a principal desvantagem da arquitetura lambda?" options={["Não permite reprocessamento", "Exige manter a mesma lógica em dois sistemas, batch e streaming", "Só funciona com bancos relacionais", "Não tem tolerância a falhas"]} answer={1} explanation="Duas implementações da mesma regra elevam o custo e o risco de resultados divergentes." />
+<Quiz question="O que a camada de serviço faz?" options={["Grava o conjunto mestre", "Mescla visões batch e speed para responder às consultas", "Executa o recálculo noturno", "Substitui o log de eventos"]} answer={1} explanation="Ela combina o resultado completo do batch com o incremental recente da camada speed." />
+</QuizSet>

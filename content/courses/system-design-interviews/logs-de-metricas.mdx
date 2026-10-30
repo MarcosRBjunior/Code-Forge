@@ -1,0 +1,89 @@
+---
+title: Projetar coleta de métricas
+kind: lesson
+---
+
+Um sistema de monitoramento (no estilo Prometheus, Datadog ou Grafana) coleta métricas de milhares de servidores, guarda em um banco de séries temporais, exibe em painéis e dispara alertas. Todo time precisa disso, e a questão testa ingestão em escala, armazenamento de séries e alertas confiáveis.
+
+## Requisitos
+
+### Funcionais
+
+- Coletar métricas (CPU, memória, latência, contagem de erros) de serviços e hosts.
+- Armazenar com retenção configurável.
+- Consultar por nome, rótulos e intervalo, com agregações (média, soma, percentis).
+- Painéis e alertas por regras (por exemplo, taxa de erro acima de 5% por 5 minutos).
+
+### Não funcionais
+
+- Alta disponibilidade, sobretudo da parte de alertas (o monitor não pode cair junto com o que monitora).
+- Escrita pesada e contínua; consultas rápidas para painéis.
+- Tolerar perda pequena de pontos, mas nunca parar de coletar.
+
+## Estimativas
+
+- 100 mil hosts × 200 métricas cada = 20 milhões de séries.
+- Intervalo de coleta de 10 segundos: **2 milhões de pontos por segundo**.
+- Ponto bruto ≈ 16 bytes (1 a 2 bytes após compressão): ~30 GB por dia comprimidos para esse volume bruto; os 7 dias mais recentes na resolução bruta custam centenas de GB.
+
+## Coleta: push ou pull
+
+| Modelo | Como funciona | Vantagem | Custo |
+| --- | --- | --- | --- |
+| Pull | O coletor consulta o endpoint de métricas de cada alvo | Sabe quando um alvo está fora do ar; controle de taxa | Descoberta de serviços; difícil com jobs efêmeros ou firewalls |
+| Push | O alvo envia ao coletor | Funciona com jobs curtos e redes restritas | Pode inundar o coletor; falta de dado é ambígua |
+
+O pull tem a vantagem de que um alvo que não responde é um sinal por si só (métrica `up = 0`). Para jobs de curta duração, use um gateway de push. Muitos sistemas grandes usam push via agentes locais que fazem buffer.
+
+## Arquitetura
+
+```text
+alvos/agentes -> balanceador -> coletores (stateless) -> Kafka -> consumidores -> TSDB (sharded)
+                                                                      |              |
+                                                            avaliador de alertas   API de consulta -> painéis
+```
+
+### Kafka como buffer
+
+A fila desacopla coleta e armazenamento: um pico ou queda do TSDB não perde dados, e vários consumidores (armazenamento, alertas, arquivamento) leem o mesmo fluxo. Particione por hash da série para manter pontos da mesma série na mesma partição, em ordem.
+
+### Armazenamento
+
+TSDB com particionamento por série e por tempo (veja o capítulo de séries temporais): buffer em memória com WAL, blocos ordenados, compressão delta-of-delta e XOR. Cada shard é replicado (fator 2 ou 3) para durabilidade. Em escala grande, sistemas como Thanos, Cortex e M3 distribuem o armazenamento e enviam blocos antigos para storage de objetos barato.
+
+### Retenção e downsampling
+
+Resolução bruta por 7 a 15 dias, agregados de 1 minuto por 3 meses, de 1 hora por 1 a 2 anos. Guarde mínimo, máximo, soma e contagem para poder recalcular a média; para percentis, use histogramas, pois percentis de percentis não são válidos.
+
+### Consultas
+
+Painéis disparam consultas repetidas com poucos segundos de diferença; faça cache de resultados por janela e pré-calcule agregações caras (regras de gravação). Limite o número de séries por consulta para proteger o banco de consultas abusivas.
+
+## Alertas
+
+Um avaliador executa regras periodicamente (a cada 30 a 60 segundos) sobre os dados. Para confiabilidade:
+
+- Exija que a condição persista por uma duração (`for: 5m`) para evitar alertas por picos.
+- Agrupe, deduplique e roteie as notificações (e-mail, Slack, paginação) em um serviço de gerenciamento de alertas.
+- Execute avaliadores redundantes em zonas diferentes; deduplique os alertas.
+- **Meta-monitoramento:** um monitor independente e simples verifica se o próprio sistema está vivo (dead man's switch: um alerta que sempre dispara, e a ausência dele é o problema).
+
+## Armadilhas
+
+- Cardinalidade explosiva por rótulos de alta variação (ID de usuário, URL completa).
+- Relógios dessincronizados nos hosts, gerando pontos fora de ordem.
+- Painéis com consultas pesadas sem limites.
+- Logs não são métricas: logs vão para um pipeline próprio (ELK ou Loki), com indexação e volumes muito maiores.
+
+<Callout type="tip" title="Quem monitora o monitor?">
+Citar o meta-monitoramento e a independência do sistema de alertas costuma marcar ponto com o entrevistador.
+</Callout>
+
+## Na entrevista
+
+Defina push ou pull com justificativa, use Kafka como buffer, TSDB particionado e alertas redundantes. Follow-ups: como controlar cardinalidade, como lidar com percentis e como escalar a leitura dos painéis.
+
+<QuizSet>
+<Quiz question="Qual vantagem do modelo pull na coleta de métricas?" options={["Menor latência sempre", "Um alvo que não responde é detectado diretamente como indisponível", "Não precisa de descoberta de serviços", "Funciona melhor com jobs de segundos"]} answer={1} explanation="Quando o coletor não consegue consultar o alvo, a própria falha é o sinal (up igual a 0)." />
+<Quiz question="Por que guardar histogramas em vez de percentis já calculados no downsampling?" options={["Para ocupar mais espaço", "Porque percentis não se combinam: o percentil de percentis não é o percentil real", "Porque percentis são ilegais", "Para evitar compressão"]} answer={1} explanation="Histogramas podem ser somados entre séries e janelas, permitindo recalcular percentis corretamente." />
+</QuizSet>

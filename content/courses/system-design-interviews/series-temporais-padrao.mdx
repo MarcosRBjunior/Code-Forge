@@ -1,0 +1,86 @@
+---
+title: Séries temporais
+kind: lesson
+---
+
+Métricas de servidores, preços de ações, leituras de sensores, eventos de cliques: dados que chegam com um carimbo de tempo, quase sempre só são anexados e são consultados por intervalo. Um banco relacional genérico sofre com isso; bancos de séries temporais (TSDB) são feitos para esse perfil.
+
+## Características da carga
+
+- **Escrita pesada e contínua:** milhões de pontos por segundo, sempre no tempo presente.
+- **Append-only:** raramente se atualiza ou apaga um ponto isolado.
+- **Consultas por janela:** "CPU média por minuto nas últimas 6 horas, por host".
+- **Valor decai:** dado de ontem é consultado muito mais que o de 2 anos atrás.
+- **Alta cardinalidade:** muitas combinações de séries (host, região, rota).
+
+## Modelo de dados
+
+Uma série é identificada por um nome e um conjunto de rótulos (tags); cada série tem pares (instante, valor).
+
+```text
+cpu_uso{host="web-12", regiao="sa-east"}
+   10:00:00 -> 0.42
+   10:00:10 -> 0.47
+   10:00:20 -> 0.51
+```
+
+**Cardinalidade** é o número de séries distintas. Colocar um ID de usuário ou de requisição como rótulo cria milhões de séries e derruba o banco. Rótulos devem ter conjunto limitado de valores.
+
+## Como o armazenamento é otimizado
+
+### Particionamento por tempo
+
+Os dados são divididos em blocos por período (um por dia, por exemplo). Consultas recentes tocam poucos blocos, e apagar dados antigos vira remover um bloco inteiro, sem custo de delete linha a linha.
+
+### Escrita em LSM / buffer em memória
+
+Os pontos novos vão para um buffer em memória (com um write-ahead log) e são descarregados em blocos ordenados. Isso transforma escritas em sequenciais, muito mais rápidas.
+
+### Compressão
+
+Timestamps regulares comprimem com delta-of-delta (guarda só a diferença da diferença, quase sempre zero); valores próximos comprimem com XOR (técnica do Gorilla, do Facebook). Pontos de 16 bytes caem para cerca de 1 a 2 bytes.
+
+## Downsampling e retenção
+
+Guarde resolução alta por pouco tempo e agregue para resoluções menores com o passar do tempo:
+
+| Idade | Resolução | Retenção |
+| --- | --- | --- |
+| 0 a 7 dias | 10 s (bruto) | 7 dias |
+| 7 a 90 dias | 1 min (média, máx, mín) | 90 dias |
+| mais de 90 dias | 1 h | 2 anos |
+
+Ao agregar, guarde mais que a média: mínimo, máximo, contagem e percentis (ou histogramas), pois a média esconde picos. Médias de médias também distorcem; guarde soma e contagem.
+
+## Escala
+
+- **Particione por série (hash) e por tempo.** Uma série fica num shard, mantendo as consultas por série locais.
+- **Ingestão por fila:** agentes enviam para Kafka, consumidores gravam em lote no TSDB, absorvendo picos.
+- **Consultas agregadas:** pré-calcule rollups para painéis populares em vez de recalcular a cada abertura.
+
+## Ferramentas
+
+| Ferramenta | Nota |
+| --- | --- |
+| Prometheus | Coleta por pull, ótimo para métricas de infra, armazenamento local |
+| InfluxDB / TimescaleDB | TSDB geral; Timescale é extensão do Postgres |
+| Cassandra / ClickHouse | Alternativas para escala muito grande e analítica |
+
+## Armadilhas
+
+- Cardinalidade explosiva por causa de rótulos mal escolhidos.
+- Pontos fora de ordem ou atrasados: defina uma janela de tolerância.
+- Reter tudo na resolução bruta para sempre.
+
+<Callout type="tip" title="Mostre que conhece o ciclo de vida">
+Falar de retenção e downsampling em três camadas costuma impressionar mais do que escolher o nome do banco.
+</Callout>
+
+## Na entrevista
+
+Descreva ingestão por fila, armazenamento particionado por tempo com compressão e rollups com retenção em camadas. Follow-ups: como controlar cardinalidade, como responder a consultas de percentil sobre dados agregados e como tratar alertas em tempo real.
+
+<QuizSet>
+<Quiz question="Por que colocar o ID do usuário como rótulo de uma métrica é um problema?" options={["Viola privacidade apenas", "Cria cardinalidade enorme, com milhões de séries", "Impede compressão de timestamps", "Aumenta a latência de rede"]} answer={1} explanation="Cada valor distinto de rótulo cria uma série nova, o que sobrecarrega índices e memória." />
+<Quiz question="Qual o objetivo do downsampling?" options={["Aumentar a resolução dos dados antigos", "Reduzir o armazenamento mantendo dados antigos em resolução menor", "Criptografar", "Ordenar os pontos"]} answer={1} explanation="Dados antigos são consultados em visão ampla, então resolução menor basta e custa menos." />
+</QuizSet>

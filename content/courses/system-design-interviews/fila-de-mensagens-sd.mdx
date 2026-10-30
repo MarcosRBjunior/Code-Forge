@@ -1,0 +1,76 @@
+---
+title: Projetar uma fila de mensagens
+kind: lesson
+---
+
+Projetar uma fila de mensagens é projetar um Kafka ou SQS simplificado: produtores publicam, consumidores leem, e o sistema garante durabilidade e entrega mesmo com falhas. As decisões giram em torno de log versus fila, ordem e semântica de entrega.
+
+## Requisitos
+
+### Funcionais
+
+- Produtores publicam mensagens em tópicos.
+- Consumidores leem mensagens, com grupos de consumo que dividem o trabalho.
+- Retenção configurável; opção de reler mensagens antigas.
+
+### Não funcionais
+
+- Alta vazão (milhões de mensagens por segundo no cluster).
+- Durabilidade: mensagem confirmada não se perde.
+- Ordem preservada dentro de uma partição.
+- Escala horizontal e tolerância a falha de broker.
+
+## Estimativas
+
+- 1 milhão de mensagens por segundo × 1 KB = **1 GB/s** de escrita. Com replicação 3, 3 GB/s de disco e rede no cluster.
+- Retenção de 7 dias: 600 TB brutos, ou cerca de 1,8 PB com replicação. Disco sequencial, não memória.
+
+## Arquitetura
+
+O modelo mais usado é o **log particionado**: cada tópico é dividido em partições, e cada partição é um arquivo de log somente de anexo.
+
+```text
+ tópico "pedidos"
+   partição 0: [m0][m1][m2][m3] ...  <- escritas só no fim
+   partição 1: [m0][m1][m2] ...
+   partição 2: [m0][m1] ...
+ consumidor lê a partir de um offset e avança o próprio offset
+```
+
+**Escrita sequencial.** Anexar ao fim de um arquivo é muito rápido em disco e aproveita o page cache. É a razão da alta vazão.
+
+**Particionamento.** O produtor escolhe a partição pelo hash da chave (mensagens da mesma chave mantêm a ordem) ou por round-robin.
+
+**Replicação.** Cada partição tem um líder e seguidores em outros brokers. A escrita é confirmada quando o conjunto de réplicas sincronizadas (ISR) a recebeu, com a opção `acks=all` para máxima durabilidade. Se o líder cai, um seguidor sincronizado é eleito.
+
+**Consumo.** Num grupo de consumo, cada partição é lida por no máximo um consumidor do grupo; mais consumidores do que partições ficam ociosos. O consumidor guarda o offset confirmado (commit), de modo que reiniciar retoma de onde parou.
+
+## Semântica de entrega
+
+| Garantia | Como ocorre | Risco |
+| --- | --- | --- |
+| No máximo uma vez | Commit do offset antes de processar | Perde mensagem se o consumidor cai |
+| Pelo menos uma vez | Commit depois de processar | Pode duplicar |
+| Exatamente uma vez | Idempotência do produtor e transações, ou consumidor idempotente | Custo e complexidade |
+
+A prática mais comum é pelo menos uma vez com consumidor idempotente.
+
+## Pontos críticos
+
+- **Partição quente:** chave muito frequente concentra carga; ajuste a chave ou use salting.
+- **Mensagens venenosas:** após N tentativas, envie para uma dead letter queue.
+- **Contrapressão:** consumidor lento acumula atraso (lag); monitore e escale.
+- **Rebalanceamento:** mudar consumidores reatribui partições e pausa brevemente o consumo.
+
+<Callout type="note" title="Log não é fila clássica">
+Num log, a mensagem não some ao ser lida; o consumidor só avança um offset. Isso permite reprocessar e ter vários grupos independentes lendo o mesmo tópico.
+</Callout>
+
+## Na entrevista
+
+Defina o log particionado, a replicação e a semântica de entrega. Follow-ups: como garantir ordem global (uma só partição, ao custo de vazão), o que acontece se um broker cai e como escalar consumidores além do número de partições (não dá; aumente partições).
+
+<QuizSet>
+<Quiz question="Como manter a ordem das mensagens de um mesmo pedido?" options={["Enviar para partições aleatórias", "Usar o ID do pedido como chave de partição", "Usar mais consumidores", "Aumentar a retenção"]} answer={1} explanation="A mesma chave cai sempre na mesma partição, que preserva a ordem." />
+<Quiz question="Qual a semântica mais comum e simples de operar?" options={["No máximo uma vez", "Pelo menos uma vez com consumidor idempotente", "Nenhuma", "Exatamente uma vez sempre sem custo"]} answer={1} explanation="Duplicatas são toleradas porque o consumidor trata repetição sem efeitos extras." />
+</QuizSet>

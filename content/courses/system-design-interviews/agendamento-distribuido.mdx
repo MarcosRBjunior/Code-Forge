@@ -1,0 +1,77 @@
+---
+title: Agendamento distribuído
+kind: lesson
+---
+
+Lembretes, cobranças recorrentes, expiração de assinaturas, e-mails programados: todo produto precisa executar algo em um instante futuro. Um simples cron em uma máquina funciona até a máquina cair, ou até haver milhões de tarefas. Agendamento distribuído resolve três coisas: não perder tarefas, não executar duas vezes e escalar.
+
+## O problema com o cron único
+
+- **Ponto único de falha:** se o servidor do cron cai, nada roda.
+- **Duplicação:** subir duas instâncias para ter redundância faz cada tarefa rodar duas vezes.
+- **Escala:** uma varredura a cada minuto por milhões de tarefas não cabe em um processo.
+
+## Modelo de dados
+
+Guarde as tarefas em um armazenamento durável, indexado pelo horário de execução:
+
+```text
+tarefas
+  id | executar_em | payload | estado (agendada, em_execucao, concluida) | tentativas
+  índice em (estado, executar_em)
+```
+
+## Padrão 1: varredura (polling) com claim atômico
+
+Vários schedulers, a cada poucos segundos, buscam as tarefas vencidas e as reivindicam de forma atômica:
+
+```sql
+UPDATE tarefas
+SET estado = 'em_execucao', dono = 'scheduler-3', lease_ate = now() + interval '60 seconds'
+WHERE id IN (
+  SELECT id FROM tarefas
+  WHERE estado = 'agendada' AND executar_em <= now()
+  ORDER BY executar_em
+  LIMIT 100
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING *;
+```
+
+`SKIP LOCKED` faz cada scheduler pegar um lote diferente, sem disputa. O `lease_ate` funciona como um contrato: se o executor morrer, outro scheduler retoma a tarefa quando o lease vencer. Isso dá entrega pelo menos uma vez, então a tarefa deve ser idempotente.
+
+## Padrão 2: particionamento
+
+Para volumes muito altos, divida as tarefas em partições (por hash do ID). Cada scheduler é dono de um conjunto de partições e varre só as dele. Uma coordenação (ZooKeeper, etcd ou o próprio mecanismo de grupos do Kafka) redistribui as partições quando um scheduler entra ou sai.
+
+## Padrão 3: roda de tempo e fila com atraso
+
+Para tarefas curtas (segundos ou minutos), mantenha em memória uma **timing wheel**: um anel de intervalos de tempo, cada um com uma lista de tarefas. Ele insere e dispara em O(1). Muitos sistemas combinam isso com uma fila com atraso (SQS com delay de até 15 minutos, filas com mensagens agendadas) e persistem as tarefas mais distantes no banco, carregando-as para a memória pouco antes da hora.
+
+## Líder único para tarefas globais
+
+Algumas tarefas devem rodar uma vez em todo o cluster (um relatório diário). Use uma eleição de líder ou um lock com lease. Cuidado: um líder em pausa longa (GC) pode perder a liderança sem saber; use fencing token para que o storage rejeite escritas do líder antigo.
+
+## Tarefas recorrentes
+
+Depois de executar uma tarefa recorrente, calcule a próxima ocorrência (a partir do horário previsto, não do atual, para evitar deriva) e insira a nova linha na mesma transação que marca a atual como concluída.
+
+## Pontos de atenção
+
+- **Fusos horários e horário de verão:** guarde em UTC e converta na borda; defina o que "todo dia às 2h30" significa quando o horário não existe.
+- **Atraso aceitável:** informe a precisão (segundos) em vez de prometer o instante exato.
+- **Rajadas:** milhões de tarefas às 00:00 geram um pico. Espalhe com jitter quando o horário exato não importa.
+- **Tarefas atrasadas:** após uma pane, decida se executa as perdidas (catch-up) ou as descarta.
+
+<Callout type="note" title="Não reinvente se não precisar">
+Existem soluções prontas: Quartz, Temporal, Airflow, Cloud Scheduler. Na entrevista, mostre que sabe como funcionam por dentro, mas diga também que em produção avaliaria uma delas.
+</Callout>
+
+## Na entrevista
+
+Proponha banco indexado por horário, schedulers com claim atômico e lease, e idempotência. Follow-ups: como escalar para bilhões de tarefas, o que fazer quando um executor morre no meio e como evitar o pico à meia-noite.
+
+<QuizSet>
+<Quiz question="Para que serve o lease (prazo) ao reivindicar uma tarefa?" options={["Criptografar a tarefa", "Permitir que outro scheduler retome a tarefa se o executor morrer", "Ordenar tarefas", "Reduzir o tamanho do payload"]} answer={1} explanation="Se o lease vence sem conclusão, a tarefa volta a ser elegível, evitando que fique presa." />
+<Quiz question="O que SKIP LOCKED resolve?" options={["Deadlock entre tabelas", "Vários schedulers pegando lotes diferentes sem esperar uns pelos outros", "Backup do banco", "Fuso horário"]} answer={1} explanation="Linhas já travadas por outro scheduler são puladas, evitando disputa e duplicação." />
+</QuizSet>

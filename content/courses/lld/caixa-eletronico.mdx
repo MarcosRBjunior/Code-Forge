@@ -1,0 +1,158 @@
+---
+title: Projetar um caixa eletrônico
+kind: lesson
+---
+
+O caixa eletrônico (ATM) junta várias preocupações em um problema só: um **fluxo por estados** (cartão, PIN, menu, operação), **regras de dinheiro** (saldo, limite, notas disponíveis) e **segurança** (tentativas de PIN). O entrevistador avalia se você separa a máquina física da conta bancária e se trata a entrega de notas como um problema próprio.
+
+## Requisitos
+
+- **Autenticação**: inserir cartão e PIN; após 3 erros, o cartão é bloqueado.
+- **Operações**: consultar saldo, sacar, depositar.
+- **Saque**: não pode exceder o saldo, e o caixa precisa ter notas para compor o valor.
+- **Notas**: o caixa guarda quantidades por denominação (por exemplo 100, 50, 20) e entrega com o menor número de notas possível.
+- Fora de escopo: rede com o banco, recibo impresso e depósitos em envelope.
+
+## Entidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Conta` | Saldo e operações de débito e crédito, sem saber de cartões |
+| `Cartao` | Número, PIN, tentativas erradas e bloqueio |
+| `Banco` | Mapeia cartões para contas e valida o PIN |
+| `Dispensador` | Estoque de notas e cálculo de como pagar um valor |
+| `CaixaEletronico` | Orquestra a sessão e o fluxo de estados |
+
+O ponto central: `Dispensador` e `Conta` são independentes. A conta pode ter saldo e o caixa não ter notas, e o inverso. Um saque só acontece quando **ambos** concordam, e o débito acontece depois de garantir que as notas existem.
+
+## Código
+
+```python
+class Conta:
+    def __init__(self, saldo: int) -> None:
+        self.saldo = saldo
+
+    def debitar(self, valor: int) -> None:
+        if valor > self.saldo:
+            raise ValueError("saldo insuficiente")
+        self.saldo -= valor
+
+    def creditar(self, valor: int) -> None:
+        self.saldo += valor
+
+
+class Cartao:
+    MAX_TENTATIVAS = 3
+
+    def __init__(self, numero: str, pin: str, conta: Conta) -> None:
+        self.numero, self._pin, self.conta = numero, pin, conta
+        self.erros = 0
+        self.bloqueado = False
+
+    def validar(self, pin: str) -> bool:
+        if self.bloqueado:
+            return False
+        if pin == self._pin:
+            self.erros = 0
+            return True
+        self.erros += 1
+        self.bloqueado = self.erros >= self.MAX_TENTATIVAS
+        return False
+
+
+class Dispensador:
+    def __init__(self, notas: dict[int, int]) -> None:
+        self.notas = dict(notas)  # denominação -> quantidade
+
+    def plano(self, valor: int) -> dict[int, int] | None:
+        """Guloso: serve para denominações em que cada uma divide a maior."""
+        restante, resultado = valor, {}
+        for nota in sorted(self.notas, reverse=True):
+            qtd = min(restante // nota, self.notas[nota])
+            if qtd:
+                resultado[nota] = qtd
+                restante -= qtd * nota
+        return resultado if restante == 0 else None
+
+    def entregar(self, plano: dict[int, int]) -> None:
+        for nota, qtd in plano.items():
+            self.notas[nota] -= qtd
+
+
+class CaixaEletronico:
+    def __init__(self, dispensador: Dispensador) -> None:
+        self.dispensador = dispensador
+        self.cartao: Cartao | None = None
+        self.autenticado = False
+
+    def inserir_cartao(self, cartao: Cartao) -> None:
+        self.cartao, self.autenticado = cartao, False
+
+    def digitar_pin(self, pin: str) -> bool:
+        assert self.cartao is not None
+        self.autenticado = self.cartao.validar(pin)
+        return self.autenticado
+
+    def saldo(self) -> int:
+        self._exigir_sessao()
+        return self.cartao.conta.saldo
+
+    def sacar(self, valor: int) -> dict[int, int]:
+        self._exigir_sessao()
+        plano = self.dispensador.plano(valor)
+        if plano is None:
+            raise ValueError("caixa sem notas para este valor")
+        self.cartao.conta.debitar(valor)  # só debita depois de saber que dá para pagar
+        self.dispensador.entregar(plano)
+        return plano
+
+    def depositar(self, valor: int) -> None:
+        self._exigir_sessao()
+        self.cartao.conta.creditar(valor)
+
+    def ejetar(self) -> None:
+        self.cartao, self.autenticado = None, False
+
+    def _exigir_sessao(self) -> None:
+        if not (self.cartao and self.autenticado):
+            raise PermissionError("faça login")
+
+
+conta = Conta(1000)
+cartao = Cartao("1111", "4321", conta)
+atm = CaixaEletronico(Dispensador({100: 5, 50: 5, 20: 5}))
+atm.inserir_cartao(cartao)
+assert atm.digitar_pin("0000") is False
+assert atm.digitar_pin("4321") is True
+assert atm.sacar(270) == {100: 2, 50: 1, 20: 1}
+assert atm.saldo() == 730
+try:
+    atm.sacar(15)
+except ValueError:
+    pass
+assert conta.saldo == 730  # falha não debita
+for _ in range(3):
+    cartao.validar("9999")
+assert cartao.bloqueado
+print("atm ok")
+```
+
+## Decisões que merecem fala
+
+- **Dinheiro em inteiros**, nunca em ponto flutuante.
+- **Ordem das operações no saque**: planejar notas, depois debitar e entregar. Em um sistema real isso seria uma transação com compensação se a entrega mecânica falhasse.
+- **Algoritmo de notas**: o guloso funciona para denominações "canônicas" como 100, 50 e 20 combinadas com um limite de estoque razoável, mas pode falhar em outras combinações; nesses casos use programação dinâmica.
+- **Estado da sessão**: aqui é um flag; se o fluxo crescer (menu, troca de PIN, timeouts), modele com State.
+
+<Callout type="warning" title="Concorrência e consistência">
+Duas máquinas sacando da mesma conta ao mesmo tempo exigem uma operação atômica de débito no banco. Cite isso sem implementar, a menos que o entrevistador peça.
+</Callout>
+
+## Na entrevista
+
+Comece separando as responsabilidades (conta, cartão, dispensador). Follow-ups: "como evitar fraudes?", "e se a entrega de notas falhar depois do débito?", "como adicionar limite diário?", "como organizar o fluxo com o padrão State?".
+
+<QuizSet>
+<Quiz question="Por que o plano de notas é calculado antes de debitar a conta?" options={["Para economizar tempo", "Para não debitar um saque que o caixa não consegue entregar", "Porque a conta não tem saldo", "Por exigência do enum"]} answer={1} explanation="Garantir que há notas antes do débito evita inconsistência entre saldo e dinheiro entregue." />
+<Quiz question="O que acontece com o cartão após 3 PINs errados?" options={["Nada", "É bloqueado", "O saldo é zerado", "A conta é fechada"]} answer={1} explanation="O contador de erros atinge o limite e o cartão passa a rejeitar qualquer PIN." />
+</QuizSet>

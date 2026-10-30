@@ -1,0 +1,73 @@
+---
+title: Projetar um leaderboard
+kind: lesson
+---
+
+Um leaderboard mostra o ranking de jogadores por pontuação: top 100 global, posição do próprio usuário e vizinhos. As operações centrais são atualizar uma pontuação e responder "em que posição estou?" rapidamente, com milhões de jogadores.
+
+## Requisitos
+
+### Funcionais
+
+- Registrar ou atualizar a pontuação de um jogador.
+- Obter o Top N.
+- Obter a posição de um jogador e os jogadores ao redor.
+- Rankings por período (diário, semanal, temporada) e por região ou amigos.
+
+### Não funcionais
+
+- Consulta de posição em milissegundos.
+- Atualizações frequentes (milhares por segundo).
+- Desempate determinístico.
+
+## Estimativas
+
+- 50 milhões de jogadores, 10 mil atualizações por segundo no pico.
+- Cada entrada: ID de 8 bytes mais score de 8 bytes, ou cerca de 16 bytes: **800 MB** para todos. Cabe num sorted set do Redis.
+
+## Solução com sorted set
+
+O Redis oferece exatamente o que se precisa:
+
+```bash
+ZADD placar 1500 jogador:7        # define ou atualiza o score
+ZINCRBY placar 25 jogador:7       # soma pontos
+ZREVRANGE placar 0 9 WITHSCORES   # Top 10
+ZREVRANK placar jogador:7         # posição (começa em 0)
+ZREVRANGE placar 41 61            # vizinhos da posição 51
+```
+
+Cada operação custa O(log N) graças a uma skip list com contagem de elementos por salto. Uma consulta de posição em 50 milhões de jogadores continua em microssegundos.
+
+Desempate: use um score composto, por exemplo pontos multiplicados por uma constante grande mais o inverso do tempo de chegada, ou ordene lexicograficamente quando os scores empatam.
+
+## Quando um único nó não basta
+
+```text
+ jogadores -> API -> particionar por faixa de score ou por hash
+```
+
+- **Por hash do jogador:** a atualização é local, mas o Top N exige mesclar os Top Ns de cada partição; a posição global exige somar quantos jogadores têm score maior em cada partição. Funciona para Top N, é mais caro para a posição exata.
+- **Por faixa de score:** cada partição guarda um intervalo de pontuação. A posição é a soma dos tamanhos das faixas acima mais o rank dentro da faixa. Escala bem, mas faixas ficam desequilibradas.
+- **Aproximação:** para a maioria dos jogadores basta um percentil ("você está entre os 5% melhores") em vez da posição exata.
+
+## Pontos críticos
+
+- **Persistência:** o Redis é cache de ranking; a pontuação é gravada num banco durável, e o sorted set se reconstrói a partir dele.
+- **Escrita em alta taxa:** agrupe atualizações em lote, ou atualize só se a nova pontuação supera a anterior.
+- **Períodos:** uma chave por período (`placar:2026-W10`) com TTL; semanal e diário viram sorted sets separados. Ao fim da temporada, congele e arquive.
+- **Ranking de amigos:** combine a lista de amigos com consulta de scores em lote, sem manter um set por usuário.
+- **Anti-trapaça:** validar pontuações no servidor, nunca confiar no cliente.
+
+<Callout type="tip" title="Rank exato só onde importa">
+Mostre posição exata para o topo e vizinhos; use percentis para o resto. Reduz custo e raramente muda a experiência do jogador.
+</Callout>
+
+## Na entrevista
+
+Apresente o sorted set e sua complexidade, depois o particionamento. Follow-ups: o que acontece se o Redis cai (reconstruir do banco), empates, como exibir ranking semanal e como escalar para bilhões de jogadores.
+
+<QuizSet>
+<Quiz question="Qual comando devolve a posição de um jogador no ranking decrescente do Redis?" options={["ZADD", "ZREVRANK", "ZCARD", "SADD"]} answer={1} explanation="ZREVRANK devolve a posição em ordem decrescente de score em O(log N)." />
+<Quiz question="Por que não confiar só no Redis para os dados do leaderboard?" options={["Ele não guarda números", "Pode perder dados; a fonte durável deve permitir reconstruir o ranking", "É lento demais", "Não suporta ordenação"]} answer={1} explanation="O Redis serve para consulta rápida, enquanto o banco guarda a verdade." />
+</QuizSet>

@@ -1,0 +1,64 @@
+---
+title: Projetar um e-commerce
+kind: lesson
+---
+
+Um e-commerce estilo Amazon mistura leitura massiva (catálogo, busca) com escritas que exigem correção (estoque, pedido, pagamento). A graça da questão é separar essas duas metades e aplicar consistência forte só onde perder dados custa dinheiro.
+
+## Requisitos
+
+### Funcionais
+
+- Navegar e buscar produtos, ver detalhe e avaliações.
+- Carrinho, checkout e pagamento.
+- Acompanhar pedidos e status de entrega.
+- Vendedores cadastram produtos e estoque.
+
+### Não funcionais
+
+- Catálogo e busca: baixa latência, alta disponibilidade, consistência eventual aceitável.
+- Estoque e pedido: nunca vender o que não existe; pedidos não podem se perder.
+- Picos enormes em datas promocionais.
+
+## Estimativas
+
+- 100 milhões de usuários ativos por dia, 20 páginas de produto cada: 2 bilhões de leituras por dia, cerca de **23 mil por segundo**, pico de 100 mil em promoção.
+- 5 milhões de pedidos por dia, cerca de **60 por segundo**, pico de 1 a 2 mil. A escrita é pequena perto da leitura.
+- 300 milhões de produtos × 10 KB de metadados = 3 TB; imagens ficam em object storage com CDN.
+
+## Arquitetura
+
+```text
+ cliente -> CDN -> API gateway
+                      |-- Catálogo (leitura) -> cache + réplicas / índice de busca
+                      |-- Carrinho            -> Redis + banco
+                      |-- Pedidos             -> banco relacional
+                      |-- Estoque             -> banco relacional (reserva)
+                      |-- Pagamento           -> PSP externo
+                      '-- Entrega/Notificação <- eventos (Kafka)
+```
+
+Cada domínio é um serviço com seu próprio banco. O catálogo é denormalizado para leitura e alimenta um índice de busca por eventos. Pedidos, estoque e pagamento se coordenam por **saga**: criar pedido, reservar estoque, cobrar, confirmar; qualquer falha dispara compensações (liberar reserva, estornar).
+
+## Pontos críticos
+
+**Estoque.** A reserva é um update condicional atômico: `UPDATE estoque SET qtd = qtd - 1 WHERE sku = ? AND qtd >= 1`. Em produto muito disputado, divida o estoque em vários registros para evitar uma linha quente. A reserva tem TTL: se o pagamento não ocorre em 10 minutos, o estoque volta.
+
+**Idempotência.** O checkout recebe uma chave de idempotência; repetir o clique não cria dois pedidos.
+
+**Preço.** O preço mostrado pode vir de cache, mas o checkout sempre revalida no serviço de preço antes de cobrar.
+
+**Picos.** Cache agressivo no catálogo, fila na frente do checkout e sala de espera virtual se necessário.
+
+<Callout type="tip" title="Consistência por domínio">
+Diga explicitamente: catálogo e busca são eventualmente consistentes; estoque e pedido são fortemente consistentes dentro do próprio serviço. Isso mostra que você escolhe garantias por necessidade, não por padrão.
+</Callout>
+
+## Na entrevista
+
+Comece pelo fluxo de compra, desenhe a saga e só depois detalhe a busca. Follow-ups comuns: como evitar venda acima do estoque na Black Friday, o que acontece se o pagamento é aprovado mas o serviço de pedidos cai (outbox e reprocessamento) e como manter o índice de busca sincronizado.
+
+<QuizSet>
+<Quiz question="Qual a forma mais segura de reservar estoque sem vender a mais?" options={["Ler a quantidade e depois gravar a nova", "Update condicional atômico que só decrementa se houver saldo", "Confiar no cache de estoque", "Verificar apenas no frontend"]} answer={1} explanation="O update condicional faz verificação e decremento numa única operação atômica no banco." />
+<Quiz question="Como coordenar pedido, estoque e pagamento em serviços separados?" options={["Transação distribuída com lock global sempre", "Saga com ações compensatórias", "Um único banco compartilhado sem regras", "Ignorar falhas parciais"]} answer={1} explanation="Saga executa passos locais e compensa os já feitos quando um passo posterior falha." />
+</QuizSet>

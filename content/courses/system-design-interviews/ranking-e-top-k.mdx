@@ -1,0 +1,86 @@
+---
+title: Ranking e top K
+kind: lesson
+---
+
+"Os 10 jogadores com mais pontos", "as 100 músicas mais tocadas da semana", "assuntos em alta agora". Ranking e top K aparecem em placares, trends, mais vendidos e analytics de anúncios. O que muda de um caso para outro é o volume, a janela de tempo e a precisão exigida.
+
+## Caso 1: placar com atualizações de score
+
+Há N jogadores, cada um com uma pontuação que sobe e desce. Consultas: top 10, a posição de um jogador e vizinhos ao redor dele.
+
+**Redis sorted set** resolve a maior parte:
+
+```text
+ZADD placar 1500 jogador:7
+ZINCRBY placar 25 jogador:7
+ZREVRANGE placar 0 9 WITHSCORES     # top 10
+ZREVRANK placar jogador:7            # posição (começa em 0)
+```
+
+Todas as operações são O(log N). Um sorted set aguenta dezenas de milhões de membros em um nó. Acima disso, particione:
+
+- **Por faixa de score:** boa para consultar o top, ruim porque os jogadores migram de faixa.
+- **Por hash do jogador:** cada shard mantém o seu top K local; o top global é o merge dos tops locais (o top K global está contido na união dos top K de cada shard). A posição exata de um jogador comum vira estimativa ("você está entre os 5% melhores").
+
+Persista o placar também no banco, para reconstruir o Redis se ele cair.
+
+## Caso 2: top K em fluxo de eventos
+
+Os "mais tocados" de bilhões de eventos: manter um contador por item e ordenar tudo é caro quando há milhões de itens.
+
+### Contagem exata em lote
+
+Um job (MapReduce ou Spark) conta por item e extrai o top K por janela. Preciso, mas com atraso de minutos ou horas. Para extrair o top K de uma lista grande, use um **min-heap de tamanho K**: percorra os itens, mantenha os K maiores e descarte o menor quando surgir um maior. Custo O(N log K).
+
+### Contagem aproximada em tempo real
+
+Use **Count-Min Sketch** para estimar frequências com memória fixa e um heap de tamanho K para os candidatos. Erros são pequenos e sempre superestimam, aceitável para trends. Alternativas: Space-Saving / Misra-Gries.
+
+### Arquitetura típica
+
+```text
+eventos -> Kafka -> processadores (Flink) -> top K parcial por partição
+                                              |
+                                  agregador: merge dos tops -> cache (Redis)
+                                              |
+                                           API de leitura
+```
+
+Cada processador mantém seu top K local; um agregador combina os parciais periodicamente e publica o resultado em cache. As leituras consultam só o cache, rápido e barato.
+
+## Janelas de tempo
+
+"Mais tocadas nos últimos 7 dias" exige esquecer eventos antigos:
+
+- **Janela deslizante:** divida o tempo em baldes (por hora); o total da janela é a soma dos 168 últimos baldes. Para cada novo balde, descarte o mais velho.
+- **Decaimento exponencial:** o score de cada item diminui continuamente, favorecendo recência sem guardar baldes. Comum em "em alta".
+- **Tumbling windows:** top K por janela fixa (por dia), simples e barato.
+
+## Trade-offs
+
+| Abordagem | Precisão | Latência | Custo |
+| --- | --- | --- | --- |
+| Sorted set | Exata | Milissegundos | Memória |
+| Lote (batch) | Exata | Minutos a horas | Computação periódica |
+| Sketch + heap | Aproximada | Segundos | Memória baixa |
+
+## Armadilhas
+
+- Ordenar milhões de itens a cada requisição.
+- Ignorar spam: um item inflado por bots chega ao topo; deduplique por usuário e filtre abusos.
+- Ranking por score puro favorece itens antigos; combine com recência.
+- Empates: defina critério de desempate determinístico (por ID ou instante).
+
+<Callout type="note" title="Pergunte sobre a precisão">
+Se o entrevistador aceita aproximação, sketches simplificam tudo. Se pede exatidão em escala, discuta particionamento e merge de tops locais.
+</Callout>
+
+## Na entrevista
+
+Para placar, sorted set com persistência no banco; para trends, stream processing com tops parciais e merge. Follow-ups: como ver a posição de qualquer usuário em escala e como evitar manipulação do ranking.
+
+<QuizSet>
+<Quiz question="Como obter o top K global quando os dados estão particionados em shards?" options={["Ordenar todos os dados em um nó", "Mesclar os top K locais de cada shard", "Escolher um shard aleatório", "Usar apenas o shard maior"]} answer={1} explanation="Todo item do top K global está no top K de seu próprio shard, então a união dos tops locais contém a resposta." />
+<Quiz question="Qual estrutura extrai os K maiores de N itens em O(N log K)?" options={["Min-heap de tamanho K", "Lista encadeada", "Tabela hash", "Pilha"]} answer={0} explanation="O heap mantém os K maiores vistos; o menor sai quando entra um item maior." />
+</QuizSet>

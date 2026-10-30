@@ -1,0 +1,137 @@
+---
+title: Projetar um sistema pub/sub
+kind: lesson
+---
+
+Pub/sub desacopla quem produz mensagens de quem as consome. Em LLD, é o padrão Observer promovido a sistema: tópicos, assinantes, entrega e o que acontece quando um assinante é lento ou falha.
+
+## Requisitos
+
+- Publicadores enviam mensagens para tópicos.
+- Assinantes se inscrevem e cancelam inscrição em tópicos.
+- Cada assinante recebe todas as mensagens publicadas após assinar, em ordem.
+- Um assinante lento ou com erro não pode travar os outros.
+
+## Entidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Mensagem` | Tópico, conteúdo e número de sequência. |
+| `Topico` | Lista de assinantes e histórico de sequência. |
+| `Assinante` | Interface `receber(msg)`; mantém sua própria fila. |
+| `Broker` | Cria tópicos, publica e gerencia inscrições. |
+
+A decisão-chave é dar uma fila a cada assinante. O publicador apenas enfileira (rápido) e cada assinante consome no seu ritmo.
+
+## Implementação
+
+```python
+import queue
+import threading
+from dataclasses import dataclass
+from typing import Callable, Dict, List
+
+
+@dataclass(frozen=True)
+class Mensagem:
+    topico: str
+    conteudo: str
+    seq: int
+
+
+class Assinante:
+    def __init__(self, nome: str, tratador: Callable[[Mensagem], None]):
+        self.nome, self.tratador = nome, tratador
+        self.fila: "queue.Queue" = queue.Queue()
+        self.falhas: List[Mensagem] = []
+        self._thread = threading.Thread(target=self._laco, daemon=True)
+        self._thread.start()
+
+    def _laco(self):
+        while True:
+            msg = self.fila.get()
+            if msg is None:
+                self.fila.task_done()
+                return
+            try:
+                self.tratador(msg)
+            except Exception:
+                self.falhas.append(msg)   # isolada: não afeta os demais
+            self.fila.task_done()
+
+    def aguardar(self):
+        self.fila.join()
+
+    def parar(self):
+        self.fila.put(None)
+        self._thread.join()
+
+
+class Broker:
+    def __init__(self):
+        self.topicos: Dict[str, List[Assinante]] = {}
+        self.seq: Dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def assinar(self, topico: str, assinante: Assinante):
+        with self._lock:
+            self.topicos.setdefault(topico, []).append(assinante)
+            self.seq.setdefault(topico, 0)
+
+    def cancelar(self, topico: str, assinante: Assinante):
+        with self._lock:
+            if assinante in self.topicos.get(topico, []):
+                self.topicos[topico].remove(assinante)
+
+    def publicar(self, topico: str, conteudo: str) -> int:
+        with self._lock:
+            self.seq[topico] = self.seq.get(topico, 0) + 1
+            msg = Mensagem(topico, conteudo, self.seq[topico])
+            destinos = list(self.topicos.get(topico, []))
+        for a in destinos:
+            a.fila.put(msg)
+        return len(destinos)
+
+
+recebidas = []
+
+def bom(m):
+    recebidas.append(("bom", m.seq, m.conteudo))
+
+def ruim(m):
+    raise RuntimeError("falhei")
+
+broker = Broker()
+a, b = Assinante("a", bom), Assinante("b", ruim)
+broker.assinar("pedidos", a)
+broker.assinar("pedidos", b)
+print(broker.publicar("pedidos", "novo pedido"))   # 2
+print(broker.publicar("outro", "ninguém ouve"))    # 0
+broker.publicar("pedidos", "pedido 2")
+a.aguardar(); b.aguardar()
+print(recebidas, len(b.falhas))
+a.parar(); b.parar()
+```
+
+O número de sequência é atribuído dentro do lock, e a entrega é feita fora dele, para que um assinante nunca bloqueie a publicação.
+
+## Semânticas de entrega
+
+| Garantia | Significado | Custo |
+| --- | --- | --- |
+| No máximo uma vez | Pode perder, nunca duplica | Simples |
+| Pelo menos uma vez | Reenvia até confirmar; pode duplicar | Assinante idempotente |
+| Exatamente uma vez | Na prática, pelo menos uma vez mais deduplicação | Alto |
+
+## Extensões
+
+Mensagens de falha em uma fila morta (dead letter), filtros por atributo na assinatura, grupos de consumidores onde só um membro recebe cada mensagem (competição), retenção do histórico para reprocessar a partir de um deslocamento, e fila limitada com política de descarte quando o assinante não acompanha (backpressure).
+
+## Na entrevista
+
+- **"Pub/sub é igual a Observer?"** Parecido, mas pub/sub tem um intermediário (broker) e os lados não se conhecem.
+- **"E se a fila do assinante encher?"** Limite o tamanho e escolha: bloquear, descartar o mais antigo ou desconectar.
+
+<QuizSet>
+<Quiz question="Por que cada assinante tem sua própria fila?" options={["Para ocupar menos memória", "Para um assinante lento ou com erro não atrasar os outros", "Para evitar tópicos", "Para garantir exatamente uma vez"]} answer={1} explanation="O publicador só enfileira; cada consumidor trabalha no seu ritmo." />
+</QuizSet>

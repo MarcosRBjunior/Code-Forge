@@ -1,0 +1,72 @@
+---
+title: Busca por proximidade
+kind: lesson
+---
+
+"Restaurantes a 2 km de mim", "motoristas próximos", "amigos por perto". A busca por proximidade (nearest neighbor geográfica) é a base de Uber, Yelp e apps de entrega. O desafio: índices comuns são unidimensionais, mas a localização tem duas dimensões.
+
+## Por que um índice em latitude e longitude não basta
+
+Uma consulta `WHERE lat BETWEEN a AND b AND lng BETWEEN c AND d` usa um índice em uma coluna e filtra a outra. Se o índice é em `lat`, ele retorna uma faixa horizontal do planeta inteira e filtra depois. Precisamos de uma estrutura que preserve a vizinhança espacial.
+
+## Abordagens
+
+### Geohash
+
+Divide o mapa recursivamente em células e codifica cada célula como uma string. Quanto mais caracteres, menor a célula; locais próximos compartilham o prefixo.
+
+| Tamanho do geohash | Célula aproximada |
+| --- | --- |
+| 4 caracteres | 39 km x 20 km |
+| 5 caracteres | 5 km x 5 km |
+| 6 caracteres | 1,2 km x 0,6 km |
+| 7 caracteres | 150 m x 150 m |
+
+Consulta: calcule o geohash do usuário num nível adequado ao raio, busque o prefixo igual e as **8 células vizinhas** (pontos perto da borda têm vizinhos de prefixo diferente), então filtre pela distância real. Funciona em qualquer banco com índice de string ou prefixo.
+
+### Quadtree
+
+Uma árvore em que cada nó cobre uma região e se divide em 4 filhos quando passa de um limite de pontos (por exemplo, 100). Regiões densas (centro de uma cidade) ficam profundas; regiões vazias, rasas. Fica em memória, bom para dados que mudam e para busca dos K vizinhos mais próximos.
+
+### S2 e H3
+
+Bibliotecas que dividem a esfera em células hierárquicas (S2 do Google com curva de Hilbert; H3 da Uber com hexágonos). Hexágonos têm vizinhos equidistantes, o que simplifica "anel de células ao redor".
+
+### Índices espaciais do banco
+
+PostGIS (R-tree via GiST), MongoDB com índice 2dsphere e Redis com `GEOSEARCH` resolvem o problema sem você implementar nada:
+
+```sql
+SELECT id, nome FROM lugares
+WHERE ST_DWithin(local, ST_MakePoint(-46.63, -23.55)::geography, 2000)
+ORDER BY local <-> ST_MakePoint(-46.63, -23.55)::geography
+LIMIT 20;
+```
+
+## Dados estáticos versus em movimento
+
+- **Lugares fixos** (restaurantes): atualizam pouco. Um índice em disco com cache e réplicas de leitura basta; particione por região se for global.
+- **Entidades móveis** (motoristas): milhões de atualizações de posição por segundo. Guarde a posição atual em memória (Redis geo ou grid em memória particionado por célula), com TTL, e grave o histórico de forma assíncrona. Cada atualização move o ponto de uma célula para outra.
+
+## Escala
+
+Particione por célula geográfica (geohash prefix ou célula S2) para que consultas locais batam em poucos shards. Cuidado com hot spots: o centro de uma metrópole concentra carga; use células menores onde há mais densidade ou particione por hash dentro da célula.
+
+## Armadilhas
+
+- Esquecer as células vizinhas e perder resultados na borda.
+- Usar distância euclidiana em graus: a longitude encurta com a latitude. Use a fórmula de haversine ou funções geográficas.
+- Esquecer a data de validade de posições de entidades móveis: um motorista offline não deve aparecer.
+
+<Callout type="tip" title="Resposta curta de entrevista">
+Geohash ou H3 para particionar e indexar, vizinhos para tratar bordas, filtro final por distância real. Se o entrevistador pedir os K mais próximos, expanda os anéis de células até juntar K candidatos.
+</Callout>
+
+## Na entrevista
+
+Pergunte se os dados são fixos ou móveis, pois isso muda o design. Follow-ups: tamanho ideal da célula, como lidar com densidade desigual e como ordenar por relevância e não só por distância.
+
+<QuizSet>
+<Quiz question="Por que consultar também as células vizinhas no geohash?" options={["Para aumentar a precisão do GPS", "Porque pontos próximos na borda de uma célula têm prefixos diferentes", "Para criptografar", "Para reduzir o armazenamento"]} answer={1} explanation="Dois locais muito próximos podem cair em células distintas se estiverem em lados opostos da borda." />
+<Quiz question="Onde guardar a posição atual de milhões de motoristas?" options={["Em disco, uma linha por atualização histórica", "Em memória (por exemplo, Redis geo) com TTL", "Em arquivos CSV", "Somente no app"]} answer={1} explanation="As atualizações são frequentes e só a posição mais recente importa; memória com TTL atende bem." />
+</QuizSet>

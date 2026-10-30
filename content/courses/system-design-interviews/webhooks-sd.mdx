@@ -1,0 +1,78 @@
+---
+title: Projetar entrega de webhooks
+kind: lesson
+---
+
+Webhooks são callbacks HTTP que sua plataforma chama quando algo acontece (pagamento aprovado, pedido enviado). O problema: o destino é um servidor de terceiros, lento, instável ou malicioso. Entregar de forma confiável sem deixar um cliente ruim afetar os demais é o coração da questão.
+
+## Requisitos
+
+### Funcionais
+
+- Clientes cadastram URLs e escolhem os tipos de evento.
+- Quando um evento ocorre, enviar um POST assinado para cada URL inscrita.
+- Retries automáticos em caso de falha.
+- Painel com histórico de entregas e reenvio manual.
+
+### Não funcionais
+
+- Entrega pelo menos uma vez; ordem não garantida (documente).
+- Isolamento: um destino lento não atrasa os outros.
+- Escala para milhares de eventos por segundo.
+- Segurança: assinatura verificável e proteção contra SSRF.
+
+## Estimativas
+
+- 100 milhões de eventos por dia, média de 2 inscritos: 200 milhões de entregas ≈ **2.300 por segundo**, pico de 20 mil.
+- Cada tentativa de 2 KB mais metadados; histórico de 30 dias ≈ 12 TB, guardado em armazenamento barato.
+
+## Arquitetura
+
+```text
+ evento interno -> Kafka -> despachante (casa evento x inscrições) 
+                              -> fila de entregas (particionada por destino)
+                                    -> workers HTTP -> endpoint do cliente
+                           falha -> fila de retry com atraso -> ... -> DLQ
+ log de tentativas -> banco / object storage -> painel
+```
+
+**Despachante.** Para cada evento, procura as inscrições e cria uma tarefa de entrega por URL, gravando o estado no banco. Assim, um evento com 3 inscritos gera 3 entregas independentes.
+
+**Workers.** Fazem o POST com timeout curto (5 a 10 s). Considera-se sucesso respostas 2xx; qualquer outra coisa ou timeout é falha.
+
+**Retries com backoff exponencial e jitter.** Por exemplo 10 s, 1 min, 10 min, 1 h, 6 h, por até 3 dias. Depois disso vai para uma dead letter queue e o destino pode ser desativado com aviso ao cliente.
+
+```python
+import random
+
+def proximo_atraso(tentativa):
+    base = min(6 * 3600, 10 * (4 ** tentativa))   # segundos
+    return base * random.uniform(0.5, 1.5)        # jitter
+```
+
+**Isolamento.** Particione ou use limites de concorrência por destino. Um endpoint que demora 10 s em todas as chamadas ocupa no máximo seu número de slots, sem esgotar os workers. Um **circuit breaker** pausa temporariamente destinos que falham em sequência.
+
+## Segurança
+
+- **Assinatura:** HMAC do corpo mais timestamp com um segredo por inscrição, enviado em cabeçalho; o cliente valida e rejeita timestamps antigos (anti-replay).
+- **SSRF:** resolva o DNS e bloqueie IPs privados e de metadados da nuvem antes de conectar; não siga redirecionamentos às cegas.
+- **Idempotência:** cada evento tem um `event_id` único; o cliente deduplica porque a entrega é pelo menos uma vez.
+
+## Pontos críticos
+
+- **Ordem:** garantir ordem por destino reduz a vazão; costuma ser melhor documentar que não há ordem e incluir um número de sequência.
+- **Evento fino versus gordo:** enviar só o ID e deixar o cliente buscar na API reduz vazamento e payload, mas aumenta o tráfego de volta.
+- **Reenvio manual:** guarde o corpo do evento por um tempo para permitir reprocessar.
+
+<Callout type="warning" title="Cuidado com SSRF">
+Você faz requisições para URLs escolhidas por terceiros. Sem filtrar IPs internos, um atacante usa seu webhook para alcançar sua rede privada.
+</Callout>
+
+## Na entrevista
+
+Foque em fila por destino, retry com backoff e isolamento. Follow-ups: como evitar duplicatas (não evita; idempotência no cliente), como lidar com um cliente que ficou uma semana fora (DLQ e replay) e como provar que você entregou.
+
+<QuizSet>
+<Quiz question="Por que usar jitter no backoff dos retries?" options={["Para atrasar mais", "Para evitar que muitas tentativas voltem sincronizadas ao mesmo destino", "Para reduzir o payload", "Para ordenar eventos"]} answer={1} explanation="Aleatorizar os atrasos espalha a carga e evita picos coordenados." />
+<Quiz question="Como o cliente deve tratar eventos duplicados?" options={["Reprocessar sempre", "Deduplicar pelo ID único do evento", "Rejeitar todos", "Ignorar assinatura"]} answer={1} explanation="Entrega pelo menos uma vez implica duplicatas; o ID permite descartá-las." />
+</QuizSet>

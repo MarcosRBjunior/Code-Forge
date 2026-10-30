@@ -1,0 +1,73 @@
+---
+title: Projetar processamento de vídeo
+kind: lesson
+---
+
+Quando alguém envia um vídeo, ele precisa virar várias resoluções e formatos para tocar em qualquer dispositivo e rede. O processamento é pesado em CPU, demorado e paralelizável, o que o torna um caso clássico de pipeline assíncrono orquestrado em estágios.
+
+## Requisitos
+
+### Funcionais
+
+- Receber o upload de vídeos grandes.
+- Transcodificar para múltiplas resoluções (240p a 4K) e bitrates.
+- Gerar miniaturas, legendas opcionais e verificações de conteúdo.
+- Informar progresso e publicar quando pronto.
+
+### Não funcionais
+
+- Upload robusto, com retomada em redes ruins.
+- Escala elástica: picos de uploads sem filas intermináveis.
+- Tolerância a falha de workers: reprocessar apenas o pedaço perdido.
+- Custo controlado: CPU e GPU são caras.
+
+## Estimativas
+
+- 500 horas de vídeo enviadas por minuto, original médio de 1 GB por hora de vídeo: ~500 GB por minuto de entrada.
+- Transcodificar para 6 resoluções: pode levar 1x a 3x o tempo do vídeo por núcleo; a paralelização por pedaços reduz o tempo total.
+- Armazenamento multiplica o original por 2 a 3 vezes ao guardar todas as versões.
+
+## Arquitetura
+
+```text
+ cliente --upload em partes--> object storage (original)
+                                  | evento "upload concluído"
+                                  v
+                       orquestrador (DAG de tarefas)
+        validar -> dividir em segmentos -> transcodificar (paralelo) -> juntar
+                         |                                       |
+                      miniaturas / áudio / moderação      empacotar HLS/DASH
+                                                                 |
+                                       object storage (saída) -> CDN
+```
+
+**Upload direto.** O cliente envia em partes para o object storage com URLs pré-assinadas, sem passar pelos servidores de aplicação, e pode retomar de onde parou.
+
+**Orquestrador e DAG.** Cada vídeo vira um grafo de tarefas, em que algumas dependem de outras e outras rodam em paralelo. Um orquestrador (Temporal, Airflow ou uma máquina de estados própria) guarda o estado de cada tarefa e reexecuta as falhas.
+
+**Divisão em segmentos.** O vídeo é cortado em pedaços de poucos segundos alinhados a quadros-chave (GOP). Cada pedaço é transcodificado em workers diferentes e todos os pedaços para todas as resoluções formam uma matriz de tarefas independentes. Um vídeo de 1 hora vira milhares de tarefas curtas rodando em paralelo, e falhar um segmento não refaz tudo.
+
+**Fila e workers.** Tarefas entram em filas por tipo e prioridade (vídeo de assinante pago ou ao vivo antes). Os workers são autoescalados pelo tamanho da fila, com instâncias spot baratas, já que tarefas são reexecutáveis. GPUs aceleram codecs pesados.
+
+**Empacotamento.** Gera playlists e segmentos HLS ou DASH para streaming adaptativo; o player escolhe a resolução conforme a banda.
+
+## Pontos críticos
+
+- **Idempotência:** cada tarefa grava sua saída em um caminho determinístico; refazer sobrescreve sem efeitos colaterais.
+- **Prioridade e justiça:** um criador enviando milhares de vídeos não pode travar os demais; limite por usuário.
+- **Perfis sob demanda:** produza primeiro uma resolução baixa para publicar rápido e as altas depois, ou apenas para vídeos que ganham audiência.
+- **Moderação:** análise de conteúdo antes da publicação, em paralelo com a transcodificação.
+- **Observabilidade:** progresso por estágio e alertas para tarefas presas.
+
+<Callout type="tip" title="Dividir para paralelizar">
+Segmentar por GOP transforma uma tarefa longa e serial em milhares de tarefas curtas e independentes. Isso melhora o tempo total e a recuperação de falhas ao mesmo tempo.
+</Callout>
+
+## Na entrevista
+
+Descreva upload direto, DAG de tarefas e segmentação. Follow-ups: como retomar após a falha de um worker (reexecutar só o segmento), como reduzir custo (spot, perfis sob demanda) e como dar feedback de progresso ao usuário.
+
+<QuizSet>
+<Quiz question="Por que dividir o vídeo em segmentos antes de transcodificar?" options={["Para perder qualidade", "Para paralelizar e reprocessar só o pedaço que falhar", "Para evitar o object storage", "Para dispensar o orquestrador"]} answer={1} explanation="Segmentos independentes rodam em paralelo e falhas ficam localizadas." />
+<Quiz question="Como o cliente deve enviar um vídeo muito grande?" options={["Pela API de aplicação em uma requisição", "Direto ao object storage em partes, com URL pré-assinada", "Por e-mail", "Pelo banco de dados"]} answer={1} explanation="Upload direto em partes é eficiente e permite retomar." />
+</QuizSet>

@@ -1,0 +1,119 @@
+---
+title: Projetar um agendador de tarefas
+kind: lesson
+---
+
+Um agendador executa tarefas em instantes futuros, uma vez ou de forma recorrente. O núcleo é uma fila de prioridade ordenada pelo horário de execução, com um laço que espera até a próxima tarefa vencer. As complicações vêm com concorrência, cancelamento e recorrência.
+
+## Requisitos
+
+- Agendar uma tarefa para um instante, ou com atraso.
+- Tarefas periódicas (a cada N segundos).
+- Cancelar tarefas pendentes.
+- Executar tarefas em ordem de horário, com um pool de workers.
+
+## Entidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Tarefa` | Função, horário, intervalo opcional e flag de cancelamento. |
+| `Agendador` | Heap de tarefas, avanço do tempo e execução. |
+| `Relogio` | Fonte de tempo injetável. |
+
+O heap garante que a próxima tarefa a vencer está sempre no topo, com inserção e remoção em O(log n). Para ordenar de forma estável quando os horários empatam, usamos um contador de sequência como desempate.
+
+## Implementação
+
+Para manter o exemplo determinístico e testável, o agendador expõe `avancar_ate(instante)`, que executa tudo que venceu. Um laço real chamaria esse método a cada espera até o próximo horário.
+
+```python
+import heapq
+import itertools
+from typing import Callable, List
+
+
+class Tarefa:
+    def __init__(self, nome: str, funcao: Callable[[], None], horario: float,
+                 intervalo: float = None):
+        self.nome, self.funcao, self.horario, self.intervalo = nome, funcao, horario, intervalo
+        self.cancelada = False
+
+    def cancelar(self):
+        self.cancelada = True
+
+
+class Agendador:
+    def __init__(self, inicio: float = 0.0):
+        self.agora = inicio
+        self._heap: List = []
+        self._seq = itertools.count()
+
+    def agendar(self, nome, funcao, atraso: float = 0, intervalo: float = None) -> Tarefa:
+        t = Tarefa(nome, funcao, self.agora + atraso, intervalo)
+        self._empilhar(t)
+        return t
+
+    def _empilhar(self, t: Tarefa):
+        heapq.heappush(self._heap, (t.horario, next(self._seq), t))
+
+    def proximo_horario(self):
+        while self._heap and self._heap[0][2].cancelada:
+            heapq.heappop(self._heap)       # descarta canceladas preguiçosamente
+        return self._heap[0][0] if self._heap else None
+
+    def avancar_ate(self, instante: float) -> int:
+        executadas = 0
+        while True:
+            prox = self.proximo_horario()
+            if prox is None or prox > instante:
+                break
+            _, _, t = heapq.heappop(self._heap)
+            self.agora = t.horario
+            t.funcao()
+            executadas += 1
+            if t.intervalo is not None and not t.cancelada:
+                t.horario += t.intervalo      # recorrente: reagenda a partir do horário previsto
+                self._empilhar(t)
+        self.agora = instante
+        return executadas
+
+
+log = []
+ag = Agendador()
+ag.agendar("b", lambda: log.append(("b", ag.agora)), atraso=5)
+ag.agendar("a", lambda: log.append(("a", ag.agora)), atraso=2)
+rec = ag.agendar("tic", lambda: log.append(("tic", ag.agora)), atraso=1, intervalo=3)
+ag.avancar_ate(8)
+print(log)      # tic em 1, a em 2, tic em 4, b em 5, tic em 7
+rec.cancelar()
+print(ag.avancar_ate(20), ag.proximo_horario())
+```
+
+Cancelar só marca a tarefa; ela é descartada quando chega ao topo do heap. Remover do meio de um heap seria O(n), e a remoção preguiçosa mantém o custo baixo.
+
+## Recorrência: duas semânticas
+
+| Modo | Próximo horário | Efeito |
+| --- | --- | --- |
+| Taxa fixa | Horário previsto mais intervalo | Não acumula deriva; pode empilhar execuções se atrasar |
+| Atraso fixo | Fim da execução mais intervalo | Nunca sobrepõe; o período real cresce |
+
+O exemplo usa taxa fixa. Escolha e justifique na entrevista.
+
+## Concorrência
+
+Em produção há uma thread de despacho que dorme até o próximo horário (com variável de condição, para acordar se entrar uma tarefa mais cedo) e um pool de workers que executa as funções. Assim uma tarefa lenta não atrasa as outras. O heap e o estado precisam de lock, e o despachador nunca executa a tarefa segurando o lock.
+
+## Extensões
+
+Prioridade entre tarefas no mesmo instante, tentativas com espera crescente, expressões cron, persistência para sobreviver a reinício e agendamento distribuído com eleição de líder ou trava no armazenamento para que só uma instância execute cada tarefa.
+
+## Na entrevista
+
+- **"Por que heap e não lista ordenada?"** Inserção O(log n) contra O(n).
+- **"Como evitar espera ocupada?"** Dormir até o próximo horário com timeout e acordar por sinal quando entrar tarefa antecipada.
+
+<QuizSet>
+<Quiz question="Por que usar um contador de sequência no heap?" options={["Para acelerar", "Desempatar tarefas no mesmo horário de forma estável e evitar comparar funções", "Para cancelar tarefas", "Para repetir tarefas"]} answer={1} explanation="Tuplas empatadas passariam a comparar os objetos Tarefa, o que não é definido." />
+<Quiz question="Como o cancelamento é tratado no exemplo?" options={["Remove do meio do heap", "Marca a tarefa e descarta ao chegar ao topo", "Reinicia o agendador", "Executa a tarefa uma última vez"]} answer={1} explanation="Remover do meio custa O(n); a marcação preguiçosa é barata." />
+</QuizSet>

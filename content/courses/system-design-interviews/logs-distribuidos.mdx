@@ -1,0 +1,75 @@
+---
+title: Projetar logs distribuídos
+kind: lesson
+---
+
+Um sistema de logs distribuídos coleta logs de milhares de máquinas, armazena e permite buscar por texto e filtros. O desafio é o volume contínuo de escrita, a busca rápida em dados enormes e o custo de reter tudo por semanas.
+
+## Requisitos
+
+### Funcionais
+
+- Coletar logs de aplicações e hosts.
+- Buscar por texto, campos (serviço, nível, trace ID) e intervalo de tempo.
+- Dashboards e alertas sobre padrões.
+- Retenção configurável com expiração.
+
+### Não funcionais
+
+- Ingestão de alta vazão sem perder logs quando há picos.
+- Logs visíveis para busca em segundos.
+- Impacto mínimo sobre as aplicações que geram os logs.
+- Custo controlado: retenção em camadas.
+
+## Estimativas
+
+- 10 mil servidores × 1 MB/s = **10 GB/s**, ou cerca de 860 TB por dia.
+- Retenção de 7 dias quente: 6 PB; 30 dias frio comprimido (10x) para o restante. Não dá para indexar tudo em memória.
+
+## Arquitetura
+
+```text
+ app -> agente local (arquivo/stdout) -> coletor regional -> Kafka (buffer)
+                                                              |
+                          processamento (parse, enriquecer) <-'
+                              |                        |
+                       índice de busca (quente)   object storage (frio, comprimido)
+ UI/consulta -> API -> índice quente  e  varredura do frio sob demanda
+```
+
+**Agente local.** Lê arquivos ou saída padrão, adiciona metadados (host, serviço, ambiente) e envia em lotes, com buffer em disco para tolerar queda de rede. Fica leve para não competir com a aplicação.
+
+**Buffer com fila.** Kafka absorve picos e desacopla ingestão do indexador. Se o índice atrasa, os logs esperam na fila em vez de se perder.
+
+**Processamento.** Transforma texto em campos estruturados (JSON de preferência), normaliza timestamps e remove dados sensíveis (mascarar CPF, tokens).
+
+**Armazenamento em camadas.**
+
+| Camada | Onde | Retenção | Uso |
+| --- | --- | --- | --- |
+| Quente | Índice invertido (Elasticsearch ou similar) | Dias | Busca interativa |
+| Morna | Dados colunares comprimidos | Semanas | Consultas analíticas |
+| Fria | Object storage | Meses/anos | Auditoria, reprocessamento |
+
+**Particionamento por tempo.** Índices diários ou por hora: consultas por intervalo tocam poucos índices e expirar dados antigos é apagar um índice inteiro, sem custo de delete linha a linha.
+
+## Pontos críticos
+
+- **Amostragem e níveis:** logs de debug em produção custam caro; filtre na origem e amostre logs repetitivos.
+- **Correlação:** um trace ID propagado entre serviços permite seguir uma requisição por todos os logs.
+- **Perda aceitável:** logs normalmente toleram perda rara; auditoria financeira, não. Trate as duas classes de forma diferente.
+- **Cardinalidade:** indexar campos de valores quase únicos (como IDs de requisição) infla o índice; indexe só o necessário.
+- **Backpressure:** o agente descarta logs de baixa prioridade antes de bloquear a aplicação.
+
+<Callout type="note" title="Logs, métricas e traces">
+Cite a diferença: logs são eventos detalhados e caros; métricas são agregados baratos para alertas; traces seguem uma requisição. Um sistema maduro usa os três.
+</Callout>
+
+## Na entrevista
+
+Percorra agente, fila, processamento e camadas de armazenamento. Follow-ups: como buscar em dados frios (consulta paralela sobre arquivos colunares ou índices leves por bloco), como lidar com um serviço que inunda os logs (cota por serviço) e como garantir ordem aproximada dos eventos (timestamps do cliente mais o horário de ingestão).
+
+<QuizSet>
+<Quiz question="Por que particionar índices por tempo?" options={["Para embaralhar dados", "Consultas por intervalo tocam poucos índices e a expiração é apagar um índice inteiro", "Para evitar compressão", "Para guardar menos campos"]} answer={1} explanation="Isso acelera buscas por período e torna a retenção barata." />
+<Quiz question="Qual o papel do Kafka entre coletores e indexador?" options={["Substituir a busca", "Absorver picos e desacoplar a ingestão do indexador", "Criptografar logs", "Gerar dashboards"]} answer={1} explanation="A fila guarda os logs enquanto o indexador está lento, evitando perdas." />
+</QuizSet>

@@ -1,0 +1,89 @@
+---
+title: Projetar entrega de comida
+kind: lesson
+---
+
+Um app de entrega de comida (como iFood ou DoorDash) é um marketplace de três lados: clientes, restaurantes e entregadores. Há busca por proximidade, um pedido que passa por vários estados, pagamento e alocação de entregadores em tempo real. É um bom problema para mostrar máquina de estados e matching.
+
+## Requisitos
+
+### Funcionais
+
+- Cliente busca restaurantes próximos e vê cardápio e tempo estimado.
+- Faz um pedido e paga.
+- Restaurante aceita e prepara.
+- O sistema aloca um entregador; o cliente acompanha o pedido no mapa.
+- Avaliações e histórico.
+
+### Não funcionais
+
+- Disponibilidade alta no horário de pico (almoço e jantar).
+- Pedido nunca perdido nem cobrado duas vezes.
+- Atualização de localização com atraso de poucos segundos.
+
+## Estimativas
+
+- 20 milhões de pedidos por dia, concentrados em 4 horas: ≈ 1.400 pedidos por segundo no pico.
+- 500 mil entregadores ativos enviando posição a cada 4 segundos: **125 mil atualizações por segundo**.
+- Visualizações de cardápio e busca: dezenas de vezes mais que pedidos, então cache e CDN.
+
+## Componentes
+
+```text
+App cliente -> API gateway -> serviços:
+   descoberta (busca) | cardápio | pedidos | pagamento | despacho | localização | notificação
+```
+
+### Descoberta de restaurantes
+
+Busca geoespacial (veja busca por proximidade) filtrada por: restaurante aberto, entrega para a localização do cliente (área de cobertura, não apenas raio), categoria e tempo estimado. Índice de busca derivado do banco de restaurantes; o cardápio é muito cacheado, com invalidação quando o restaurante o edita ou esgota um item.
+
+### Pedido como máquina de estados
+
+```text
+CRIADO -> PAGO -> ACEITO_RESTAURANTE -> EM_PREPARO -> PRONTO -> COLETADO -> ENTREGUE
+   \________ CANCELADO (em estados permitidos) ________/
+```
+
+Cada transição é validada (só avança por caminhos permitidos) e persistida com a escrita condicional `UPDATE ... WHERE estado = 'PAGO'`, evitando que mensagens duplicadas ou fora de ordem corrompam o estado. Cada mudança publica um evento (Kafka) que alimenta notificações, despacho e analytics.
+
+### Pagamento
+
+Use chave de idempotência por pedido. O fluxo costuma ser autorizar o valor ao criar o pedido e capturar ao concluir; se o restaurante recusa, a autorização é liberada. O pedido só segue para o restaurante depois da autorização.
+
+### Despacho (matching)
+
+Quando o pedido está perto de ficar pronto, o serviço de despacho escolhe um entregador. Entradas: posição do restaurante e dos entregadores (índice geoespacial em memória), carga atual de cada um e tempo de preparo previsto. Critério: minimizar o tempo total (chegar ao restaurante quando a comida ficar pronta, e não antes). Estratégias:
+
+- **Guloso:** o entregador disponível mais próximo recebe a oferta; se recusar ou não responder em 15 segundos, a oferta passa ao seguinte.
+- **Em lote:** a cada poucos segundos, resolve o emparelhamento ótimo entre vários pedidos e entregadores; melhora a eficiência global.
+- **Agrupamento:** um entregador pega dois pedidos da mesma região.
+
+Garanta que um pedido tenha **um único entregador**, usando atribuição condicional atômica (evitar reserva dupla).
+
+### Rastreamento
+
+Entregadores enviam posição por conexão leve; ela vai para um armazenamento em memória por entregador (Redis geo, TTL curto). O cliente recebe a posição do entregador do seu pedido por WebSocket ou polling a cada poucos segundos. O histórico de rotas vai de forma assíncrona para storage barato.
+
+### Estimativa de tempo
+
+Soma: tempo de preparo (histórico do restaurante, ajustado pela fila atual), deslocamento do entregador (rotas e trânsito) e entrega. Modelos de ML aprendem a partir do histórico e se corrigem continuamente.
+
+## Pico e resiliência
+
+- Filas entre serviços absorvem rajadas; se o despacho atrasa, o pedido continua aceito.
+- Degradação: desligar recomendações e promoções antes do checkout.
+- Controle de capacidade: se faltam entregadores, aumentar a taxa dinâmica, estender o tempo estimado ou pausar restaurantes sobrecarregados.
+
+<Callout type="tip" title="Mostre a máquina de estados">
+Desenhar os estados do pedido e as transições válidas demonstra rigor com consistência e com mensagens duplicadas.
+</Callout>
+
+## Na entrevista
+
+Percorra descoberta, pedido, pagamento, despacho e rastreamento, aprofundando no que o entrevistador escolher. Follow-ups: como evitar atribuir dois entregadores, o que fazer se ninguém aceita e como estimar o tempo de preparo.
+
+<QuizSet>
+<Quiz question="Como impedir que um pedido seja atribuído a dois entregadores?" options={["Esperar e torcer", "Atribuição condicional atômica no estado do pedido", "Dois bancos separados", "Aumentar o timeout"]} answer={1} explanation="Um UPDATE condicional só tem sucesso uma vez; o segundo tentante vê o pedido já atribuído." />
+<Quiz question="Por que modelar o pedido como máquina de estados?" options={["Para economizar disco", "Para validar transições e resistir a eventos duplicados ou fora de ordem", "Para evitar autenticação", "Para usar menos servidores"]} answer={1} explanation="Só transições permitidas são aceitas, mantendo o estado consistente." />
+</QuizSet>

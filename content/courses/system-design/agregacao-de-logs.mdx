@@ -1,0 +1,75 @@
+---
+title: Agregação de logs
+kind: lesson
+---
+
+Com cem instâncias de um serviço, cada uma escrevendo logs na própria máquina, investigar um incidente significa entrar por SSH em cada servidor. Pior: contêineres são efêmeros, e quando um pod morre, o log some junto. A **agregação de logs** coleta os registros de todas as origens, leva-os a um local central e os torna pesquisáveis.
+
+## Pipeline típico
+
+```text
+Aplicações --> Agente coletor --> Buffer/fila --> Processamento --> Armazenamento --> Busca e dashboards
+ (stdout)      (Fluent Bit,       (Kafka)         (parse, enrich)    (Elasticsearch,    (Kibana, Grafana)
+               Filebeat)                                             Loki, S3)
+```
+
+1. **Geração:** a aplicação escreve JSON em stdout.
+2. **Coleta:** um agente em cada nó (DaemonSet no Kubernetes) lê os arquivos de log dos contêineres e adiciona metadados como pod, namespace e versão.
+3. **Transporte e buffer:** os logs seguem para um destino. Colocar uma fila como Kafka no meio absorve picos e evita perda se o armazenamento estiver fora.
+4. **Processamento:** parsing, enriquecimento, remoção de campos sensíveis e roteamento por tipo.
+5. **Armazenamento:** um índice pesquisável para o período recente e armazenamento barato para o arquivo.
+6. **Consulta:** busca por texto e campos, com gráficos e alertas.
+
+## Stacks comuns
+
+| Stack | Ideia |
+| --- | --- |
+| ELK (Elasticsearch, Logstash, Kibana) | Indexa o conteúdo completo; busca muito poderosa, custo alto de armazenamento e operação |
+| Loki + Grafana | Indexa apenas rótulos e guarda o texto comprimido; mais barato, buscas por conteúdo mais lentas |
+| Serviços gerenciados (CloudWatch, Datadog, Cloud Logging) | Menos operação, cobrança por volume |
+
+## Decisões de projeto
+
+### Retenção em camadas
+
+Logs recentes (poucos dias) ficam em armazenamento rápido e indexado. Logs mais antigos migram para object storage barato, consultáveis sob demanda, e depois são apagados conforme a política. Algumas auditorias exigem retenção longa e imutável.
+
+### Volume e custo
+
+Em geral o custo cresce com o volume ingerido. Controle-o com níveis adequados, amostragem de eventos repetitivos, descarte de logs de health check e limites por serviço.
+
+### Garantia de entrega
+
+Perder logs durante um incidente é exatamente o pior momento. Use buffers em disco nos agentes, retry com backoff e backpressure. Para logs de auditoria, tolere latência mas não perda.
+
+### Segurança
+
+Controle quem lê quais logs, mascare dados pessoais antes de indexar e use TLS entre agente e servidor.
+
+## Exemplo de consulta
+
+```text
+{servico="checkout", nivel="ERROR"} |= "timeout" | json | duracao_ms > 2000
+```
+
+A consulta filtra erros do checkout com a palavra timeout e duração acima de dois segundos, parte do cenário típico de uma investigação.
+
+## Armadilhas
+
+- Índice de Elasticsearch com campos de cardinalidade explosiva ou mapeamentos dinâmicos inconsistentes.
+- Agente sem limite de memória derrubando o nó.
+- Relógios dessincronizados entre máquinas, bagunçando a ordem dos eventos. Use NTP e ordene pelo timestamp do evento.
+- Dependência única: se o agregador cai, a aplicação não deve parar. Logging precisa ser assíncrono e tolerante a falhas.
+
+<Callout type="tip" title="Correlacione com traces">
+Se cada linha tiver o trace_id, a interface de busca pode abrir direto o trace correspondente, e vice-versa. Essa ligação encurta muito o tempo de diagnóstico.
+</Callout>
+
+## Na entrevista
+
+Descreva o caminho completo (coletor, buffer, índice, interface) e cite os trade-offs de custo entre indexar tudo e indexar só rótulos. Follow-ups: "e se o armazenamento cair?" (buffer em fila ou disco) e "como controla o custo?" (amostragem, retenção em camadas, níveis).
+
+<QuizSet>
+<Quiz question="Por que colocar uma fila como Kafka entre os agentes e o armazenamento de logs?" options={["Para criptografar os logs", "Para absorver picos e evitar perda quando o armazenamento está indisponível", "Para eliminar a coleta", "Para substituir o índice"]} answer={1} explanation="O buffer desacopla produção e consumo, tolerando lentidão ou queda do destino." />
+<Quiz question="Qual a diferença central entre ELK e Loki?" options={["ELK não usa índices", "Loki indexa só rótulos e guarda o texto comprimido, reduzindo custo", "Loki só aceita métricas", "ELK não tem interface"]} answer={1} explanation="Elasticsearch indexa o conteúdo completo, com busca rica e custo maior; Loki indexa rótulos e fica mais barato." />
+</QuizSet>

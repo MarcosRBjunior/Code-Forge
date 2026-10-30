@@ -1,0 +1,81 @@
+---
+title: Projetar um cache distribuído
+kind: lesson
+---
+
+Aqui o pedido é construir o cache, não usá-lo: um armazenamento chave-valor em memória que escala horizontalmente, tolera falhas de nós e responde em menos de um milissegundo. É a base do que Redis e Memcached resolvem.
+
+## Requisitos
+
+### Funcionais
+
+- `GET`, `SET` e `DELETE` por chave, com TTL opcional.
+- Eviction quando a memória enche.
+- Escalar adicionando nós.
+
+### Não funcionais
+
+- Latência abaixo de 1 ms, centenas de milhares de operações por segundo por nó.
+- Alta disponibilidade; perder dados do cache é aceitável, indisponibilidade não.
+- Rebalanceamento com o mínimo de chaves movidas.
+
+## Estimativas
+
+- 1 TB de dados quentes, nós de 64 GB utilizáveis: cerca de **16 nós**, mais réplicas.
+- 1 milhão de operações por segundo / 100 mil por nó = 10 nós no mínimo; a memória costuma ser o limite.
+
+## Arquitetura
+
+```text
+ cliente (lib com mapa do cluster) --hash(chave)--> nó A | nó B | nó C
+                                                       |      |      |
+                                                   réplica réplica réplica
+```
+
+**Particionamento: consistent hashing.** As chaves e os nós são mapeados num anel. Cada chave pertence ao próximo nó no sentido horário. Adicionar ou remover um nó move só uma fração (1/N) das chaves. Nós virtuais (vários pontos do anel por nó físico) equilibram a carga.
+
+**Roteamento.** O cliente conhece a topologia (via biblioteca ou serviço de configuração) e fala direto com o nó, evitando um salto extra. Alternativa: um proxy.
+
+**Armazenamento no nó.** Tabela hash em memória mais uma estrutura de eviction. LRU clássico usa hash mais lista duplamente ligada: acesso e atualização em tempo constante.
+
+```python
+class LRU:
+    def __init__(self, capacidade):
+        self.cap, self.dados = capacidade, {}  # dict preserva ordem de inserção
+
+    def get(self, k):
+        if k not in self.dados:
+            return None
+        v = self.dados.pop(k)
+        self.dados[k] = v          # move para o fim (mais recente)
+        return v
+
+    def put(self, k, v):
+        self.dados.pop(k, None)
+        self.dados[k] = v
+        if len(self.dados) > self.cap:
+            self.dados.pop(next(iter(self.dados)))  # remove o mais antigo
+```
+
+**Replicação.** Primário com réplicas assíncronas; se o primário falha, uma réplica é promovida. Aceita-se perder as últimas escritas.
+
+**Expiração.** Lazy (checar o TTL ao ler) mais varredura periódica amostral para liberar chaves nunca lidas.
+
+## Pontos críticos
+
+- **Hot key:** uma chave muito lida sobrecarrega um nó. Replique leituras da chave, ou use um cache local pequeno no cliente.
+- **Stampede:** quando uma chave popular expira, muitos clientes recarregam juntos. Use lock de recarga, TTL com jitter ou atualização antecipada.
+- **Consistência com o banco:** o cache é secundário. Invalide ou atualize na escrita; aceite janela de inconsistência.
+
+<Callout type="tip" title="Consistent hashing com nós virtuais">
+Sem nós virtuais, remover um nó despeja toda a sua carga num único vizinho. Com eles, a carga se espalha por vários nós.
+</Callout>
+
+## Na entrevista
+
+Cubra particionamento, eviction, replicação e hot keys, nessa ordem. Follow-ups: o que acontece quando um nó cai (chaves se perdem e voltam por recarga do banco), como adicionar nós sem derrubar o cache e write-through versus write-back.
+
+<QuizSet>
+<Quiz question="Qual vantagem do consistent hashing ao adicionar um nó?" options={["Move todas as chaves", "Move só uma fração das chaves", "Elimina a replicação", "Garante consistência forte"]} answer={1} explanation="Apenas as chaves do intervalo assumido pelo novo nó mudam de lugar." />
+<Quiz question="Como reduzir stampede numa chave popular que expira?" options={["Aumentar o número de clientes", "Lock de recarga e TTL com jitter", "Desligar o cache", "Usar TTL zero"]} answer={1} explanation="Apenas um cliente recarrega, e os TTLs variam para não expirarem juntos." />
+</QuizSet>

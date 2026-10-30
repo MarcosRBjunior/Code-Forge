@@ -1,0 +1,77 @@
+---
+title: Retentativas e backoff
+kind: lesson
+---
+
+Em sistemas distribuídos, chamadas falham: a rede perde pacotes, um serviço reinicia, um banco atinge o limite. Muitas dessas falhas são **transitórias** e desaparecem se você tentar de novo. Retentativas aumentam a confiabilidade, mas, mal feitas, transformam uma falha pequena em uma queda geral.
+
+## Quando tentar de novo
+
+Retente apenas erros que podem se resolver sozinhos:
+
+- Timeouts e erros de conexão.
+- HTTP 502, 503, 504 e 429 (respeitando o cabeçalho Retry-After).
+- Falhas temporárias de dependências.
+
+Não retente erros do cliente (400, 401, 403, 404, 422): repetir a mesma requisição inválida nunca dá certo.
+
+## Backoff exponencial com jitter
+
+Tentar imediatamente e sem parar piora a sobrecarga. A prática padrão é aumentar o intervalo a cada tentativa e **acrescentar aleatoriedade**:
+
+```python
+import random, time
+
+def com_retentativas(operacao, max_tentativas=5, base=0.1, teto=10.0):
+    for tentativa in range(max_tentativas):
+        try:
+            return operacao()
+        except ErroTransitorio:
+            if tentativa == max_tentativas - 1:
+                raise
+            espera = min(teto, base * (2 ** tentativa))
+            time.sleep(random.uniform(0, espera))  # full jitter
+```
+
+Sem jitter, mil clientes que falharam juntos retentam juntos, em ondas sincronizadas, o chamado **thundering herd**. O jitter espalha as tentativas no tempo.
+
+## Controle de dano
+
+- **Limite de tentativas e prazo total (deadline):** o chamador do chamador também tem timeout. Propague o prazo restante.
+- **Retry budget:** permita que as retentativas sejam no máximo uma fração (por exemplo 10%) do tráfego normal. Se todo mundo retenta 3 vezes, a carga triplica no pior momento.
+- **Retentativa em um único nível:** em cadeias A, B, C, se cada camada retenta 3 vezes, C recebe até 27 chamadas por uma requisição original (amplificação). Retente na camada de borda, ou use orçamento.
+- **Circuit breaker:** após falhas repetidas, pare de chamar a dependência por um tempo (estado aberto), testando devagar a recuperação (meio aberto). Evita desperdiçar recursos e dá tempo para o serviço se recuperar.
+- **Timeouts sempre:** sem timeout, uma chamada pendurada nunca falha e nunca é retentada.
+
+## Idempotência
+
+Retentar é seguro só se a operação for **idempotente**: repetir produz o mesmo efeito que fazer uma vez. Ler, definir um valor ou apagar por ID são idempotentes. Cobrar um cartão ou criar um pedido não são, a menos que você adicione uma **chave de idempotência**.
+
+```text
+POST /pagamentos
+Idempotency-Key: 7c1e-...-a9f2
+```
+
+O servidor guarda a chave e o resultado: uma segunda requisição com a mesma chave devolve a resposta original sem cobrar de novo. Sem isso, um timeout seguido de retentativa pode duplicar a cobrança, pois o primeiro pedido pode ter sido processado mesmo sem a resposta ter chegado.
+
+## Em mensageria
+
+Consumidores de filas recebem entrega pelo menos uma vez, então retentativas são naturais: após N falhas, mova a mensagem para uma **dead letter queue** para análise, em vez de bloqueá-la para sempre. Use atrasos crescentes entre as tentativas (filas de retry com TTL).
+
+| Mecanismo | Problema que resolve |
+| --- | --- |
+| Backoff exponencial | Sobrecarga por repetição imediata |
+| Jitter | Ondas sincronizadas de retentativa |
+| Limite e deadline | Tentativas infinitas |
+| Circuit breaker | Insistir em dependência morta |
+| Idempotência | Efeitos duplicados |
+| DLQ | Mensagem venenosa |
+
+## Na entrevista
+
+Sempre que houver uma chamada entre serviços ou um pagamento, diga: timeout, retentativa com backoff exponencial e jitter, chave de idempotência e circuit breaker. Follow-ups: o que é amplificação de retentativas, por que o jitter importa, como tornar um POST seguro de repetir e o que fazer com uma mensagem que falha sempre.
+
+<QuizSet>
+<Quiz question="Por que adicionar jitter ao backoff?" options={["Para aumentar a latência", "Para evitar que muitos clientes retentem ao mesmo tempo em ondas sincronizadas", "Para tornar a operação idempotente", "Para evitar timeouts"]} answer={1} explanation="A aleatoriedade espalha as tentativas e evita o thundering herd sobre o serviço que está se recuperando." />
+<Quiz question="Como tornar seguro retentar um POST de pagamento?" options={["Aumentar o timeout", "Usar uma chave de idempotência que o servidor guarda e reaproveita", "Retentar sem limite", "Trocar para GET"]} answer={1} explanation="Com a chave, a segunda tentativa recebe o resultado da primeira em vez de cobrar de novo." />
+</QuizSet>

@@ -1,0 +1,80 @@
+---
+title: Projetar o Spotify
+kind: lesson
+---
+
+O Spotify é streaming de áudio: catálogo enorme (dezenas de milhões de faixas), arquivos pequenos comparados a vídeo e uma experiência centrada em playlists, busca e recomendação. A reprodução precisa começar quase instantaneamente e funcionar até sem rede (modo offline).
+
+## Requisitos
+
+### Funcionais
+
+- Buscar músicas, artistas, álbuns e playlists.
+- Reproduzir uma faixa com início imediato; pausar, pular, avançar.
+- Criar e editar playlists, seguir artistas, curtir faixas.
+- Baixar para ouvir offline.
+- Recomendações (descobertas da semana, rádios).
+
+### Não funcionais
+
+- Latência de início abaixo de 300 ms para faixas em cache.
+- Alta disponibilidade para reprodução, mesmo com serviços de apoio degradados.
+- Contabilizar reproduções com precisão (pagamento a artistas).
+
+## Estimativas
+
+- 500 milhões de usuários, 200 milhões ativos por dia, 2 horas ouvidas por dia.
+- Uma faixa de 3,5 minutos a 160 kbps ≈ **4 MB**. Catálogo de 100 milhões de faixas × cerca de 5 versões de qualidade × 4 MB ≈ **2 PB**. Cabe em armazenamento de objetos sem dificuldade.
+- Picos de 10 milhões de streams simultâneos × 160 kbps = **1,6 Tbps**: exige CDN, mas bem menos que vídeo.
+- Eventos de reprodução: 200 M usuários × 40 faixas/dia = 8 bilhões por dia ≈ **100 mil por segundo** de escrita de eventos.
+
+## Arquitetura
+
+```text
+App -> API gateway -> serviços: catálogo, playlist, busca, recomendação, usuário
+App -> CDN -> armazenamento de objetos (arquivos de áudio em chunks)
+App -> coletor de eventos -> Kafka -> processamento (royalties, recomendação)
+```
+
+### Entrega de áudio
+
+As faixas são armazenadas em vários bitrates (por exemplo, 96, 160 e 320 kbps) como arquivos segmentados e criptografados com DRM. O app pede o arquivo à CDN usando um token de curta duração, emitido após verificar a assinatura e a região. Como faixas populares se repetem, a taxa de acerto do cache é muito alta. O cliente faz **pré-carga** da próxima faixa da fila e mantém cache local; é o que permite troca instantânea e modo offline.
+
+### Metadados e playlists
+
+- **Catálogo** (faixas, álbuns, artistas): lido o tempo todo e quase imutável; replicado e muito cacheado.
+- **Playlists:** pertencem a usuários, são editadas colaborativamente. Armazene como lista ordenada com versão; use uma chave por playlist num banco distribuído e resolva edições concorrentes por operações de inserção com posição (ou transformação operacional).
+- **Biblioteca do usuário** (curtidas, seguindo): particionada por ID de usuário.
+
+### Busca
+
+Índice invertido (Elasticsearch ou similar) com campos de título, artista, álbum, com tolerância a erros de digitação e boost por popularidade. Autocomplete por prefixo.
+
+### Contagem de reproduções
+
+Considera-se uma reprodução após 30 segundos. O cliente envia o evento; ele passa por Kafka, é deduplicado por ID de evento e agregado por janelas para royalties e para os rankings. Como envolve dinheiro, o pipeline em lote reconcilia a contagem em tempo real, garantindo exatidão.
+
+### Recomendação
+
+Dois enfoques combinados: filtragem colaborativa (usuários com gostos parecidos) e conteúdo (características de áudio, texto). Os resultados são calculados offline em lote (semanalmente, no caso das descobertas) e armazenados por usuário; só a leitura é online.
+
+## Trade-offs
+
+| Decisão | Ganho | Custo |
+| --- | --- | --- |
+| Pré-carga da próxima faixa | Troca sem espera | Banda desperdiçada se o usuário pular |
+| Recomendação em lote | Barata e estável | Pouco reativa ao gosto do momento |
+| Cache local no app | Offline e rapidez | Gestão de licença e espaço |
+
+<Callout type="note" title="Áudio é mais leve que vídeo">
+O gargalo raramente é banda; está em metadados, busca, playlists colaborativas e na precisão da contagem de eventos. Direcione o aprofundamento para aí.
+</Callout>
+
+## Na entrevista
+
+Cubra reprodução (CDN e pré-carga), playlists e eventos. Follow-ups: playlists editadas por vários usuários, como funciona o offline com DRM e como evitar fraude de reproduções falsas.
+
+<QuizSet>
+<Quiz question="Por que a pré-carga da próxima faixa melhora a experiência?" options={["Reduz o catálogo", "Permite troca sem espera de rede", "Elimina o DRM", "Diminui o custo da CDN"]} answer={1} explanation="O app já tem o início da próxima faixa em cache local quando a atual termina." />
+<Quiz question="Como tratar a contagem de reproduções usada em pagamento de artistas?" options={["Somente contador em memória do app", "Eventos deduplicados em pipeline com reconciliação em lote", "Estimativa por HyperLogLog", "Contar a cada clique em play"]} answer={1} explanation="Dinheiro exige exatidão: dedup por ID de evento e reconciliação batch sobre o fluxo em tempo real." />
+</QuizSet>

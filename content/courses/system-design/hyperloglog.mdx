@@ -1,0 +1,70 @@
+---
+title: HyperLogLog
+kind: lesson
+---
+
+Quantos usuários únicos visitaram o site hoje? Quantos IPs distintos acessaram a API? Contar exatamente exige guardar todos os identificadores já vistos: um conjunto de 1 bilhão de ids de 8 bytes ocupa cerca de 8 GB e precisa ser combinado entre servidores. O **HyperLogLog (HLL)** estima a **cardinalidade** (número de elementos distintos) com erro de cerca de 1% usando apenas alguns kilobytes.
+
+## A intuição
+
+Imagine jogar uma moeda repetidamente. Ver uma sequência de 10 caras seguidas é raro, e só acontece, em média, depois de cerca de 2 elevado a 10 sequências tentadas. Portanto, se o maior número de caras seguidas que você observou foi 10, você provavelmente fez cerca de mil tentativas.
+
+O HLL aplica isso a hashes. Cada elemento é transformado em um hash uniforme de bits. Quanto mais **zeros à esquerda** um hash tem, mais raro ele é: um hash com k zeros iniciais ocorre com probabilidade de 1 em 2 elevado a k+1. O maior número de zeros iniciais já visto estima a ordem de grandeza da quantidade de itens distintos. Elementos repetidos geram o mesmo hash, então **duplicatas não alteram o resultado**.
+
+## Reduzindo a variância
+
+Uma única observação é muito ruidosa (um azar de hash distorce tudo). O HLL divide os hashes em **m registradores** (buckets):
+
+1. Use os primeiros p bits do hash para escolher um registrador (m = 2 elevado a p).
+2. Nos bits restantes, conte os zeros à esquerda (mais um) e guarde no registrador o **máximo** visto.
+3. A estimativa final é uma **média harmônica** dos valores 2 elevado ao registrador, multiplicada por m ao quadrado e por uma constante de correção.
+
+O erro padrão é aproximadamente `1,04 / sqrt(m)`. Com m = 16.384 registradores de 6 bits (cerca de 12 KB), o erro fica em torno de 0,81%, para cardinalidades de bilhões.
+
+```python
+import hashlib
+
+def hll_basico(itens, p=10):
+    m = 1 << p
+    regs = [0] * m
+    for item in itens:
+        h = int(hashlib.sha256(str(item).encode()).hexdigest(), 16) & ((1 << 64) - 1)
+        idx = h >> (64 - p)
+        resto = h & ((1 << (64 - p)) - 1)
+        rank = (64 - p) - resto.bit_length() + 1
+        regs[idx] = max(regs[idx], rank)
+    alpha = 0.7213 / (1 + 1.079 / m)
+    return alpha * m * m / sum(2.0 ** -r for r in regs)
+```
+
+(Versões reais incluem correções para cardinalidades pequenas e grandes, como o HLL++ do Google.)
+
+## Propriedades úteis
+
+- **Memória fixa:** não cresce com o número de itens distintos.
+- **Mesclável:** a união de dois HLLs é o máximo registrador a registrador. Cada servidor mantém o seu e o agregador mescla, ideal para sistemas distribuídos e janelas de tempo (some 7 dias mesclando 7 HLLs diários).
+- **Idempotente:** reprocessar eventos não distorce.
+
+## Limitações
+
+- Estimativa, não contagem exata: não serve para cobrança.
+- Não responde "o item x está no conjunto?" nem lista os elementos.
+- Interseção e diferença só podem ser estimadas por inclusão-exclusão, com erro maior.
+- Não suporta remoção.
+
+## Onde usar
+
+Redis (`PFADD`, `PFCOUNT`, `PFMERGE`), BigQuery (`APPROX_COUNT_DISTINCT`), Presto, Druid, Redshift e Postgres (extensão). Casos clássicos: usuários únicos por dia (DAU), visitantes por página, IPs únicos por alvo (detecção de ataque), valores distintos para otimizadores de consulta.
+
+<Callout type="tip" title="Combine com janelas">
+Guarde um HLL por hora ou por dia. Para "únicos nos últimos 7 dias" basta mesclar sete deles, sem reprocessar os eventos.
+</Callout>
+
+## Na entrevista
+
+Em "contar visualizações únicas" ou "DAU em escala", proponha HLL: 12 KB por contador, erro de cerca de 1%, mesclagem entre nós. Follow-ups: "e se precisar do número exato?" (conjunto exato ou banco com agregação), "como somar entre regiões?" (mesclar por máximo), "como saber se um usuário específico já viu?" (Bloom filter, não HLL).
+
+<QuizSet>
+<Quiz question="O que o HyperLogLog estima?" options={["A frequência de cada item", "O número de elementos distintos (cardinalidade)", "A pertinência de um item", "O elemento mais frequente"]} answer={1} explanation="HLL conta itens distintos de forma aproximada com memória fixa e pequena." />
+<Quiz question="Como combinar dois HyperLogLogs de servidores diferentes?" options={["Somar os registradores", "Tomar o máximo registrador a registrador", "Concatená-los", "Não é possível"]} answer={1} explanation="O máximo representa a união dos conjuntos; é a operação de PFMERGE." />
+</QuizSet>

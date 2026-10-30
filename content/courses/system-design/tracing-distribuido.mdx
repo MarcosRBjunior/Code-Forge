@@ -1,0 +1,89 @@
+---
+title: Tracing distribuído
+kind: lesson
+---
+
+Um usuário clica em "finalizar compra" e a página demora seis segundos. A requisição passou pelo gateway, pelo serviço de pedidos, pelo de estoque, pelo de pagamento e por um antifraude externo. Métricas dizem que o checkout está lento, e logs de cada serviço mostram trechos isolados. Falta a visão do caminho completo. É isso que o **tracing distribuído** entrega.
+
+## Conceitos
+
+- **Trace:** a jornada completa de uma requisição, identificada por um `trace_id`.
+- **Span:** uma unidade de trabalho dentro do trace (uma chamada HTTP, uma consulta SQL, um método). Tem nome, início, duração, atributos e um `span_id`.
+- **Relação pai-filho:** cada span aponta para o span que o originou, formando uma árvore.
+- **Contexto propagado:** os identificadores viajam de serviço em serviço, normalmente em cabeçalhos HTTP ou metadados de mensagem.
+
+```text
+trace 9f3a1c  (total 6,1 s)
+├─ gateway                       6,1 s
+│  └─ pedidos.criar              5,9 s
+│     ├─ estoque.reservar        0,2 s
+│     └─ pagamento.autorizar     5,4 s
+│        ├─ db.select cartao     0,1 s
+│        └─ antifraude.avaliar   5,2 s   <- gargalo
+```
+
+Em segundos você vê que o problema não é o banco nem o estoque, e sim o antifraude.
+
+## Propagação de contexto
+
+O padrão W3C Trace Context define o cabeçalho `traceparent`:
+
+```text
+traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+             versão  trace_id                       span_id (pai)   flags
+```
+
+Cada serviço lê o cabeçalho, cria um span filho e repassa um novo `traceparent` nas chamadas seguintes. Se um serviço esquecer de propagar, o trace é cortado ali. Isso vale também para filas: coloque o contexto nos metadados da mensagem.
+
+## Instrumentação com OpenTelemetry
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("pagamento")
+
+def autorizar(pedido):
+    with tracer.start_as_current_span("pagamento.autorizar") as span:
+        span.set_attribute("pedido.id", pedido.id)
+        span.set_attribute("valor", pedido.valor)
+        return chamar_antifraude(pedido)  # outra chamada instrumentada vira span filho
+```
+
+Bibliotecas de HTTP, banco e mensageria costumam ter instrumentação automática, que cobre grande parte dos spans sem alterar o código.
+
+## Amostragem
+
+Registrar 100% dos traces em um sistema de alto tráfego é caro. Estratégias:
+
+| Estratégia | Como decide | Observação |
+| --- | --- | --- |
+| Head-based | Decide no início da requisição (por exemplo, 1%) | Simples e barata; pode perder traces raros importantes |
+| Tail-based | Decide depois, olhando o trace completo | Mantém erros e requisições lentas; exige buffer no coletor |
+| Sempre para erros | Regra adicional | Garante que falhas sejam observáveis |
+
+## Para que serve
+
+- Achar gargalos e dependências lentas.
+- Entender o grafo real de dependências entre serviços.
+- Descobrir chamadas redundantes ou sequenciais que poderiam ser paralelas (um padrão N+1 aparece como dezenas de spans iguais).
+- Ligar logs e métricas pelo trace_id.
+
+## Armadilhas
+
+- Propagação quebrada em threads, filas ou chamadas assíncronas.
+- Atributos de alta cardinalidade ou dados sensíveis nos spans.
+- Sobrecarga de instrumentação excessiva em laços quentes.
+- Sobreposição de relógios entre máquinas, que pode gerar spans filhos aparentemente começando antes do pai.
+
+<Callout type="tip" title="Ferramentas">
+Jaeger, Zipkin e Grafana Tempo armazenam e exibem traces. OpenTelemetry padroniza a geração e o envio, o que evita ficar preso a um fornecedor.
+</Callout>
+
+## Na entrevista
+
+Quando falarem em microsserviços, mencione que propagaria um trace_id por todas as chamadas e usaria amostragem. Follow-ups: "como o trace atravessa uma fila?" (contexto nos cabeçalhos da mensagem) e "como não explodir o custo?" (tail-based sampling e retenção curta).
+
+<QuizSet>
+<Quiz question="O que é um span?" options={["O identificador do usuário", "Uma unidade de trabalho com início e duração dentro de um trace", "Um tipo de métrica counter", "Um arquivo de log rotacionado"]} answer={1} explanation="Spans formam a árvore de um trace e representam cada operação medida." />
+<Quiz question="Qual vantagem da amostragem tail-based?" options={["É a mais simples de implementar", "Pode manter traces com erro ou lentos, decidindo após ver o trace completo", "Elimina a necessidade de propagar contexto", "Garante 100% dos traces"]} answer={1} explanation="Decidir ao final permite reter os casos interessantes, ao custo de bufferizar os spans no coletor." />
+</QuizSet>

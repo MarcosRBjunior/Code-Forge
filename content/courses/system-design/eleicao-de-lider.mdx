@@ -1,0 +1,72 @@
+---
+title: Eleição de líder
+kind: lesson
+---
+
+Muitos sistemas precisam que exatamente um nó execute certo trabalho: ser o primário de um banco, agendar jobs, consumir uma partição, ser o dono de um shard. Com vários nós iguais, é preciso um mecanismo para escolher esse nó e substituí-lo quando falhar. Isso é **eleição de líder**. O risco central é ter dois líderes ao mesmo tempo (split brain), o que corrompe dados.
+
+## Por que ter um líder
+
+- **Serialização:** um único escritor evita conflitos.
+- **Coordenação barata:** decisões passam por um nó, sem negociação a cada operação.
+- **Evitar trabalho duplicado:** só um nó dispara o e-mail de cobrança diário.
+
+O custo: o líder é um ponto de gargalo e de falha, então a troca precisa ser rápida e segura.
+
+## Abordagens
+
+| Abordagem | Como funciona | Observação |
+| --- | --- | --- |
+| Valentão (bully) | O nó com maior id vence e avisa os demais | Simples, mas frágil em redes com partição |
+| Anel | Mensagem de eleição circula, vence o maior id | Didático, pouco usado |
+| Consenso (Raft, Paxos) | Votação por maioria em termos numerados | Seguro contra partições |
+| Lease em armazenamento coordenado | Nós disputam uma chave com TTL no etcd, ZooKeeper ou Consul | O mais comum em aplicações |
+| Banco de dados | Linha com expiração atualizada com UPDATE condicional | Funciona para casos modestos |
+
+## Líder por lease
+
+Padrão prático: os candidatos tentam criar uma chave com TTL. Quem consegue é o líder e **renova** a chave periodicamente. Se o líder morre ou fica isolado, a chave expira e outro assume.
+
+```python
+def tentar_ser_lider(store, meu_id, ttl=10):
+    # cria a chave somente se ela não existe
+    if store.set_if_absent("lider/job-faturamento", meu_id, ttl=ttl):
+        return True
+    return store.get("lider/job-faturamento") == meu_id
+
+# loop do líder: renova a cada ttl/3
+while sou_lider:
+    store.renovar("lider/job-faturamento", meu_id, ttl=10)
+    executar_trabalho()
+    esperar(3)
+```
+
+## A armadilha do líder zumbi
+
+Um líder pode pausar (GC longo, CPU saturada, rede lenta), perder o lease e continuar achando que é líder. Enquanto isso, outro foi eleito. Resultado: dois escrevendo. A defesa é o **fencing token**: cada eleição devolve um número crescente, e o recurso protegido (banco, storage) rejeita pedidos com token menor que o maior já visto.
+
+```text
+Líder A (token 33) pausa ... acorda e escreve com token 33
+Líder B (token 34) já escreveu
+Recurso: "33 é menor que 34, rejeitado"
+```
+
+## Boas práticas
+
+- Use número ímpar de nós no cluster de coordenação e quórum de maioria.
+- Defina o TTL maior que o pior pico de latência esperado, mas pequeno o bastante para failover rápido (segundos).
+- Faça o líder parar de trabalhar assim que não conseguir renovar o lease.
+- Torne o trabalho do líder idempotente: a troca pode repetir a última operação.
+
+<Callout type="warning" title="Relógios não são confiáveis">
+Não decida liderança só comparando horários locais. Pausas e desvios de relógio fazem dois nós concluírem que o lease ainda é deles. Combine lease com fencing token.
+</Callout>
+
+## Na entrevista
+
+Cite eleição de líder ao falar de bancos primário-réplica, schedulers e consumidores de partições. Diga como evita split brain: quórum, lease e fencing token. Follow-ups: "quanto tempo dura o failover?" (TTL mais tempo da eleição), "o que acontece durante a troca?" (breve indisponibilidade de escrita) e "como evitar dois líderes?" (maioria e fencing).
+
+<QuizSet>
+<Quiz question="Qual a função do fencing token?" options={["Criptografar a comunicação", "Fazer o recurso rejeitar escritas de líderes antigos", "Acelerar a eleição", "Substituir o quórum"]} answer={1} explanation="O token crescente permite ao recurso ignorar um líder zumbi que ainda acredita ser líder." />
+<Quiz question="Num esquema de lease, o que acontece quando o líder fica isolado e não renova a chave?" options={["Nada, ele continua líder para sempre", "A chave expira e outro nó pode assumir", "Todos os nós param", "O cluster é destruído"]} answer={1} explanation="O TTL é o mecanismo de failover; o líder antigo deve parar de trabalhar ao perder o lease." />
+</QuizSet>

@@ -1,0 +1,75 @@
+---
+title: Projetar reserva de hotel
+kind: lesson
+---
+
+Reserva de hotel parece venda de ingressos, mas o recurso é diferente: o que se vende é um tipo de quarto numa faixa de datas. O problema central é manter a disponibilidade por noite correta sob reservas concorrentes, cancelamentos e overbooking controlado.
+
+## Requisitos
+
+### Funcionais
+
+- Buscar hotéis por cidade, datas e hóspedes.
+- Ver disponibilidade e preço por tipo de quarto.
+- Reservar, pagar, alterar e cancelar.
+- Hotéis gerenciam inventário e tarifas.
+
+### Não funcionais
+
+- Sem reservas duplicadas além do permitido.
+- Busca rápida; reserva correta.
+- Leituras muito maiores que escritas.
+
+## Estimativas
+
+- 100 milhões de buscas por dia, cerca de **1.200 por segundo**, pico de 5 mil.
+- Conversão baixa: 1% vira reserva, ou seja, cerca de 1 milhão por dia, **12 por segundo**. Escrita pequena.
+- 500 mil hotéis × 20 tipos de quarto × 365 noites = 3,6 bilhões de linhas de inventário. Cabe em bancos particionados.
+
+## Modelo de dados
+
+O inventário é por noite, não por reserva:
+
+```text
+inventario (hotel_id, tipo_quarto, data) -> total, reservados, preco
+reservas   (reserva_id, hotel_id, tipo_quarto, checkin, checkout, estado, chave_idempotencia)
+```
+
+Reservar de 10 a 13 do mês é decrementar três linhas (noites 10, 11 e 12) numa única transação:
+
+```sql
+UPDATE inventario
+SET reservados = reservados + 1
+WHERE hotel_id = ? AND tipo_quarto = ? AND data >= ? AND data < ?
+  AND reservados < total;
+-- confira que o número de linhas afetadas é igual ao número de noites
+```
+
+Se alguma noite estiver cheia, a contagem não bate e a transação é desfeita.
+
+## Arquitetura
+
+- **Busca:** índice (Elasticsearch ou similar) com localização, comodidades e disponibilidade aproximada, atualizado por eventos. Pode estar levemente defasado.
+- **Reserva:** serviço com banco relacional particionado por hotel; toda a transação toca uma só partição.
+- **Pagamento:** fluxo em duas etapas, com reserva provisória de 10 a 15 minutos e confirmação após a captura.
+- **Cache:** disponibilidade quente em Redis; a verdade vem do banco no momento de reservar.
+
+## Pontos críticos
+
+- **Overbooking deliberado:** hotéis vendem um pouco acima da capacidade esperando cancelamentos. Modele como `total` maior que a capacidade física, definido pelo hotel.
+- **Idempotência:** o cliente envia uma chave por tentativa; reenvios devolvem a mesma reserva.
+- **Concorrência:** update condicional ou lock otimista com versão bastam; lock distribuído é exagero porque tudo mora numa partição.
+- **Cancelamento:** devolve as noites ao inventário e estorna conforme a política.
+
+<Callout type="tip" title="Particione pelo que a transação toca">
+Particionar por hotel mantém a reserva numa única transação local. Dividir por data forçaria transações distribuídas para estadias que cruzam partições.
+</Callout>
+
+## Na entrevista
+
+Mostre o modelo de inventário por noite e a atualização condicional. Follow-ups: como a busca sabe a disponibilidade sem consultar o banco de reservas, o que fazer com dois usuários pagando pelo último quarto e como suportar preços dinâmicos.
+
+<QuizSet>
+<Quiz question="Por que modelar o inventário por noite?" options={["Para gastar menos espaço", "Porque uma estadia é um conjunto de noites e cada uma tem sua capacidade", "Para evitar índices", "Porque quartos não têm tipo"]} answer={1} explanation="Cada noite tem capacidade própria, e reservar é decrementar todas as noites da estadia atomicamente." />
+<Quiz question="Qual o melhor critério de particionamento para reservas?" options={["Data da reserva", "Hotel", "Nome do hóspede", "Aleatório"]} answer={1} explanation="Por hotel, a transação de reserva toca uma única partição." />
+</QuizSet>

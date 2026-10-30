@@ -1,0 +1,73 @@
+---
+title: Locks distribuídos
+kind: lesson
+---
+
+Dentro de um processo, um mutex garante que só uma thread execute uma seção crítica. Com várias instâncias de um serviço em máquinas diferentes, você precisa da mesma exclusão mútua só que **entre processos e máquinas**. Exemplos: impedir que dois workers processem o mesmo pagamento, garantir que um job agendado rode em apenas uma instância, evitar a venda do último ingresso duas vezes.
+
+## Lock com Redis
+
+A forma mais simples é uma chave com valor único e TTL, criada de forma atômica.
+
+```bash
+# adquire: só cria se não existir, expira em 30 s
+SET lock:pedido:42 token-abc123 NX PX 30000
+
+# libera: só apaga se o token for o meu (script Lua, atômico)
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end
+```
+
+Pontos essenciais:
+
+- **NX** garante que só um cliente cria a chave.
+- **TTL** evita que um cliente que morreu segure o lock para sempre.
+- **Token único** evita que o cliente A apague o lock que já expirou e foi adquirido pelo cliente B.
+
+## O problema do lock expirado
+
+O TTL cria um buraco: o cliente A adquire o lock, pausa por GC por 40 s, o lock expira, B adquire e escreve, A acorda e também escreve. Os dois acreditaram estar na seção crítica. Nenhum lock baseado em tempo, por si só, impede isso.
+
+A defesa correta é o **fencing token**: cada aquisição devolve um número crescente, e o recurso final (banco, storage) rejeita operações com token menor que o maior já visto.
+
+```text
+A obtém lock, token 7  -> pausa
+B obtém lock, token 8  -> escreve (storage registra 8)
+A acorda, escreve com 7 -> storage rejeita
+```
+
+Outra defesa, sempre válida: tornar a operação protegida **idempotente** ou usar controle otimista no banco (`UPDATE ... WHERE versao = 5`).
+
+## Opções de implementação
+
+| Opção | Garantia | Quando usar |
+| --- | --- | --- |
+| Redis simples | Eficiência, sem garantia forte em failover | Evitar trabalho duplicado, correção não depende do lock |
+| Redlock (vários Redis) | Debatido; ainda sem fencing | Controverso para correção estrita |
+| ZooKeeper, etcd, Consul | Consenso, sessões, tokens monotônicos | Correção importa |
+| Lock no banco (`SELECT ... FOR UPDATE`, advisory locks) | Forte, no próprio banco | Quando já existe um banco central |
+
+Duas finalidades distintas: **eficiência** (se o lock falhar, só se perde trabalho duplicado) e **correção** (se falhar, há dado corrompido). Para eficiência, Redis serve. Para correção, use consenso mais fencing, ou melhor, evite o lock e projete com constraints e idempotência.
+
+## Boas práticas
+
+- Mantenha a seção crítica curta e o TTL um pouco acima do tempo máximo esperado.
+- Renove o lock (heartbeat) em tarefas longas, e pare se a renovação falhar.
+- Sempre libere em um bloco `finally`.
+- Prefira alternativas: filas particionadas por chave (um consumidor por chave), unique constraints e transações.
+
+<Callout type="warning" title="O lock mais barato é o que você não precisa">
+Uma constraint única no banco ou uma fila particionada por chave resolvem muitos casos sem o custo e as armadilhas de um lock distribuído.
+</Callout>
+
+## Na entrevista
+
+Ao falar de ingressos, estoque ou saldo, diga que lock distribuído é a opção quando não há como serializar no banco, e que você o combinaria com TTL, token único e fencing. Follow-ups: "o que acontece se o cliente morrer?" (TTL), "e se o Redis fizer failover?" (o lock pode se perder, por isso fencing ou etcd), "como evitar deadlock?" (TTL e ordem fixa de aquisição).
+
+<QuizSet>
+<Quiz question="Por que guardar um token único como valor do lock e conferi-lo ao liberar?" options={["Para economizar memória", "Para não apagar o lock que expirou e foi adquirido por outro cliente", "Para acelerar o SET", "Para criptografar o lock"]} answer={1} explanation="Sem o token, um cliente lento liberaria o lock de outro depois de seu próprio ter expirado." />
+<Quiz question="Qual mecanismo protege o recurso final de um cliente que pausou e perdeu o lock?" options={["Aumentar o TTL para uma hora", "Fencing token crescente verificado pelo recurso", "Reiniciar o Redis", "Usar mais threads"]} answer={1} explanation="O recurso rejeita tokens menores que o maior já visto, barrando o cliente zumbi." />
+</QuizSet>

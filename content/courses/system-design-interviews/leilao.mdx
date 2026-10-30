@@ -1,0 +1,71 @@
+---
+title: Projetar um leilão online
+kind: lesson
+---
+
+Num leilão online, cada lance precisa ser comparado com o maior atual de forma consistente, e todos os interessados querem ver o preço subir quase em tempo real. A tensão é entre correção estrita de lances e fan-out de atualizações para muita gente olhando o mesmo item.
+
+## Requisitos
+
+### Funcionais
+
+- Criar leilão com preço inicial, incremento mínimo e horário de término.
+- Dar lances e ver o maior lance em tempo real.
+- Encerrar automaticamente e definir o vencedor.
+- Notificar quem foi superado e o vencedor.
+
+### Não funcionais
+
+- Lances são serializáveis por leilão: o maior vence, sem empate ambíguo.
+- Latência baixa de propagação (menos de 1 segundo).
+- Nunca aceitar lance após o encerramento.
+
+## Estimativas
+
+- 10 milhões de leilões ativos, mas a maioria quase sem atividade.
+- Lances: 5 mil por segundo no total; um leilão quente pode receber centenas por segundo nos últimos minutos.
+- Observadores: 100 mil conexões num único leilão popular. Leitura e push dominam.
+
+## Arquitetura
+
+```text
+ cliente --lance--> API --> serviço de lances (dono do leilão X)
+                                 |-- banco: lances (append) + maior atual
+                                 '-- evento "novo maior lance" -> Kafka
+ Kafka -> serviço de push (WebSocket) -> observadores
+ Kafka -> notificações (superado)
+ timer de encerramento -> serviço de leilão
+```
+
+**Serialização por leilão.** Todos os lances de um mesmo leilão passam pelo mesmo ponto de decisão. Particione por `leilao_id` e processe sequencialmente (ator ou partição de fila). A validação é simples:
+
+```text
+se agora passou do fim: rejeitar
+se valor maior ou igual a maior_atual + incremento: aceitar e atualizar
+senão: rejeitar informando o valor atual
+```
+
+Sem partição única, use update condicional com versão: `UPDATE leiloes SET maior = ?, versao = versao + 1 WHERE id = ? AND maior + incremento <= ?`.
+
+**Encerramento.** Um agendador (fila com atraso ou sorted set por horário de término) dispara o fechamento. A regra de rejeitar lances após o fim é checada na decisão, não só no timer, para tolerar atraso do agendador. Muitos leilões estendem o prazo se há lance nos últimos minutos (anti-sniping).
+
+**Tempo real.** Observadores se conectam por WebSocket a um gateway que assina o tópico do leilão. Para um leilão com 100 mil espectadores, agrupe atualizações (no máximo uma por 200 ms) em vez de enviar cada lance.
+
+## Pontos críticos
+
+- **Relógio:** use sempre o tempo do servidor que decide, nunca o do cliente.
+- **Idempotência:** reenvio do mesmo lance pelo cliente não deve duplicar.
+- **Auditoria:** lances são append-only; o histórico resolve disputas.
+
+<Callout type="warning" title="Cuidado com o relógio">
+Aceitar lances com base no horário do cliente permite fraude. A decisão e o carimbo de tempo pertencem ao serviço dono do leilão.
+</Callout>
+
+## Na entrevista
+
+Destaque a serialização por leilão e o desacoplamento entre decisão (consistente) e distribuição (eventual). Follow-ups: lance automático até um teto (proxy bidding), como escalar um leilão com milhões de observadores e o que fazer quando dois lances iguais chegam juntos (o primeiro na ordem de processamento vence).
+
+<QuizSet>
+<Quiz question="Como garantir que lances de um mesmo leilão sejam decididos em ordem?" options={["Cada lance em um servidor aleatório", "Particionar por leilão e processar sequencialmente", "Confiar no relógio do cliente", "Usar apenas cache"]} answer={1} explanation="Um único ponto de decisão por leilão elimina corridas entre lances." />
+<Quiz question="Qual relógio decide se um lance chegou a tempo?" options={["Do cliente", "Do servidor dono do leilão", "Do navegador do vencedor", "Qualquer um"]} answer={1} explanation="Só o servidor tem autoridade; o do cliente pode ser manipulado." />
+</QuizSet>

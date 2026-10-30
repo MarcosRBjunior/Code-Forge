@@ -1,0 +1,89 @@
+---
+title: Projetar o Dropbox
+kind: lesson
+---
+
+O Dropbox sincroniza arquivos entre dispositivos e na nuvem. O ponto central: arquivos são grandes e mudam pouco a pouco, e a rede é lenta e instável. Por isso o design gira em torno de **dividir arquivos em blocos**, enviar só o que mudou e sincronizar de modo confiável.
+
+## Requisitos
+
+### Funcionais
+
+- Enviar, baixar, apagar e organizar arquivos em pastas.
+- Sincronização automática entre dispositivos.
+- Compartilhar arquivos e pastas com outros usuários.
+- Histórico de versões e recuperação de arquivos apagados.
+
+### Não funcionais
+
+- Confiabilidade: nunca perder dados (durabilidade altíssima).
+- Sincronização rápida e eficiente em banda.
+- Consistência: dois dispositivos devem convergir ao mesmo estado.
+- Funcionar com rede intermitente, com retomada de transferências.
+
+## Estimativas
+
+- 500 milhões de usuários, 50 milhões ativos por dia; 200 GB armazenados em média por usuário pago ou 2 GB gratuito: da ordem de **exabytes** no total, o que exige armazenamento de objetos.
+- Cada usuário altera 10 arquivos por dia: 500 M alterações/dia ≈ **6 mil por segundo**.
+- Metadados (nome, caminho, lista de blocos) são pequenos, mas numerosos: dezenas de bilhões de arquivos.
+
+## Ideia-chave: blocos
+
+Cada arquivo é dividido em blocos (por exemplo, 4 MB). Cada bloco é identificado pelo **hash do conteúdo** (SHA-256).
+
+```text
+relatorio.pdf (10 MB) = [bloco A: hash1] [bloco B: hash2] [bloco C: hash3]
+Editou o meio -> [hash1] [hash9] [hash3]   # só o bloco do meio sobe de novo
+```
+
+Benefícios:
+
+- **Delta sync:** envia apenas blocos alterados.
+- **Deduplicação:** se o hash já existe no servidor (de qualquer usuário), não precisa enviar. Um arquivo igual a outro já armazenado sobe em milissegundos.
+- **Retomada:** o upload é por bloco; se cair, continua do próximo.
+- **Paralelismo:** vários blocos em simultâneo.
+
+Dica avançada: blocos de tamanho variável definidos por conteúdo (content-defined chunking) evitam que inserir um byte no início desloque todos os blocos.
+
+## Componentes
+
+```text
+Cliente (watcher + chunker) <-> API/serviço de metadados (SQL) <-> fila de notificações
+          |                                                         |
+          +--> serviço de blocos -> armazenamento de objetos (S3)   +--> outros clientes
+```
+
+- **Serviço de metadados:** árvore de arquivos, versões, permissões e a lista de blocos de cada versão. Precisa de consistência forte: banco relacional particionado por usuário (ou por namespace).
+- **Armazenamento de blocos:** objetos imutáveis endereçados por hash, com replicação ou erasure coding entre zonas.
+- **Serviço de notificação:** avisa os outros dispositivos de que há mudanças (long polling ou conexão persistente).
+
+## Fluxo de upload
+
+1. O cliente detecta a mudança (watcher do sistema de arquivos) e calcula os hashes dos blocos.
+2. Pergunta ao servidor quais blocos faltam.
+3. Envia só os blocos faltantes.
+4. Faz o **commit** dos metadados: nova versão do arquivo apontando para a lista de blocos.
+5. O servidor notifica os outros dispositivos, que baixam os blocos novos e reconstroem o arquivo.
+
+O commit dos metadados só acontece depois de todos os blocos estarem armazenados, mantendo a atomicidade lógica: o arquivo só aparece completo.
+
+## Conflitos
+
+Se dois dispositivos editam a mesma versão base offline, o segundo commit detecta que a versão base mudou. A abordagem prática é criar uma **cópia em conflito** ("relatorio (conflito de Ana).pdf") em vez de sobrescrever. Para documentos colaborativos em tempo real, aí sim se usa OT ou CRDT.
+
+## Compartilhamento e versões
+
+Permissões ficam em tabelas de ACL por pasta compartilhada (namespace). Versões antigas são só referências antigas a blocos; um coletor de lixo remove blocos sem nenhuma referência, após o período de retenção.
+
+<Callout type="tip" title="Fale em hash de conteúdo">
+Endereçar blocos pelo hash entrega dedup, integridade e idempotência de upload de uma só vez. É o argumento mais forte desse design.
+</Callout>
+
+## Na entrevista
+
+Foque em blocos, metadados fortemente consistentes e notificação. Follow-ups: como escolher o tamanho do bloco, privacidade com dedup entre usuários, sincronização de pastas gigantes e coleta de lixo de blocos órfãos.
+
+<QuizSet>
+<Quiz question="Qual a vantagem de identificar blocos pelo hash do conteúdo?" options={["Ordem alfabética", "Deduplicação, delta sync e verificação de integridade", "Criptografia automática", "Menos metadados"]} answer={1} explanation="Blocos iguais têm o mesmo hash, então não são reenviados nem duplicados, e o hash valida o conteúdo." />
+<Quiz question="Dois dispositivos editam offline o mesmo arquivo. O que o servidor faz no segundo commit?" options={["Sobrescreve silenciosamente", "Detecta a versão base antiga e cria uma cópia em conflito", "Apaga os dois", "Recusa e perde a edição"]} answer={1} explanation="A cópia em conflito preserva as duas edições sem perda de dados." />
+</QuizSet>

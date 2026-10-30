@@ -1,0 +1,73 @@
+---
+title: Contagem em escala
+kind: lesson
+---
+
+Contar parece trivial: `UPDATE posts SET curtidas = curtidas + 1`. Mas quando um vídeo viral recebe 100 mil curtidas por segundo, esse mesmo comando vira o gargalo do sistema. Contadores aparecem em curtidas, visualizações, estoque, rate limiting e métricas, e a entrevista quer ver que você sabe escalar uma escrita concentrada.
+
+## O problema: hot row
+
+Todas as atualizações disputam a mesma linha (ou chave). Num banco relacional, cada `UPDATE` pega um lock de linha, então elas se enfileiram: o throughput de um único contador fica em alguns milhares por segundo, no máximo. Mais máquinas não ajudam, porque a linha mora em um só lugar.
+
+## Estratégias
+
+### 1. Redis com INCR
+
+`INCR contador:video:9` é atômico e processa dezenas de milhares de operações por segundo por nó. Persista no banco periodicamente. Risco: perda dos últimos incrementos num failover, aceitável para visualizações, não para saldo financeiro.
+
+### 2. Contador fragmentado (sharded counter)
+
+Divida um contador lógico em N contadores físicos. Cada escrita escolhe um fragmento ao acaso; a leitura soma todos.
+
+```text
+curtidas:video9:0 = 4021
+curtidas:video9:1 = 3987
+curtidas:video9:2 = 4102   --> total = soma dos fragmentos
+...
+```
+
+Com 20 fragmentos em chaves diferentes, a carga se espalha por vários nós e o throughput de escrita é multiplicado por 20. O custo é uma leitura mais cara; resolva guardando o total em cache e atualizando-o a cada poucos segundos.
+
+### 3. Agregação em lote (write batching)
+
+Em vez de gravar cada evento, acumule na memória do servidor da aplicação e envie a soma a cada segundo: "vídeo 9: mais 3.412". Isso reduz as escritas por ordem de grandeza. Se o processo morrer, perde-se no máximo um segundo de contagem.
+
+### 4. Log de eventos e agregação assíncrona
+
+Cada curtida vira um evento em Kafka; um consumidor agrega por janela e atualiza o contador. Permite reprocessar e auditar, e o banco recebe poucas escritas grandes. A contagem fica atrasada em alguns segundos (consistência eventual).
+
+### 5. Contagem aproximada
+
+Quando o número exato não importa, use estruturas probabilísticas:
+
+- **HyperLogLog** para contar únicos (visitantes distintos) com cerca de 12 KB e erro de aproximadamente 1%.
+- **Count-Min Sketch** para frequências aproximadas, base de top K em fluxos.
+
+## Exato versus aproximado
+
+| Caso | Precisão necessária | Abordagem |
+| --- | --- | --- |
+| Estoque, saldo | Exata | Banco com escrita condicional |
+| Curtidas, views | Aproximada, eventual | Redis, lote, shards |
+| Visitantes únicos | Aproximada | HyperLogLog |
+
+Mostrar "1,2 mi de visualizações" não exige precisão ao dígito. Já saber se você curtiu exige registrar quem curtiu, em tabela separada com chave composta usuário e post, para evitar curtida dupla; o contador é apenas uma contagem derivada.
+
+## Armadilhas
+
+- Contar eventos sem deduplicar (reenvios geram contagem duplicada; use IDs de evento).
+- Ler o contador do banco a cada exibição: cacheie o valor.
+- Usar contador exato onde a aproximação bastava, pagando caro sem necessidade.
+
+<Callout type="tip" title="Fale da leitura também">
+Contadores fragmentados trocam escrita barata por leitura cara. Mencione o cache do total para mostrar que você enxergou os dois lados.
+</Callout>
+
+## Na entrevista
+
+Diga: "para um contador quente, uso Redis com fragmentos e persisto em lote; o valor exibido pode atrasar alguns segundos". Follow-ups: como evitar curtida dupla, como contar únicos com pouca memória e como reconciliar o contador com a fonte de verdade periodicamente.
+
+<QuizSet>
+<Quiz question="Por que um único contador no banco não escala para milhares de incrementos por segundo?" options={["Falta de memória", "Todas as escritas disputam o lock da mesma linha", "SQL não suporta soma", "O banco não tem índices"]} answer={1} explanation="A hot row serializa as atualizações, limitando o throughput." />
+<Quiz question="O que um contador fragmentado troca?" options={["Escrita cara por leitura barata", "Escrita barata por leitura mais cara", "Precisão por segurança", "Latência por custo de disco"]} answer={1} explanation="As escritas se espalham por N fragmentos, mas a leitura precisa somá-los." />
+</QuizSet>

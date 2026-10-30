@@ -1,0 +1,87 @@
+---
+title: Projetar um agregador de cliques de anúncios
+kind: lesson
+---
+
+Plataformas de anúncios cobram por cliques e precisam informar aos anunciantes quantos cliques tiveram por anúncio, por minuto, por país. O sistema recebe um fluxo gigantesco de eventos de clique e produz agregações precisas. Como envolve dinheiro, exatidão importa tanto quanto escala.
+
+## Requisitos
+
+### Funcionais
+
+- Receber eventos de clique (anúncio, usuário, instante, país).
+- Consultar o total de cliques por anúncio nos últimos M minutos, com granularidade de 1 minuto.
+- Consultar os N anúncios mais clicados na última hora.
+- Filtrar por dimensões (país, dispositivo).
+
+### Não funcionais
+
+- Exatidão: resultados corretos, sem perda nem contagem dupla.
+- Tolerar eventos atrasados e fora de ordem.
+- Latência de consulta de poucos segundos; resultado fresco em até 1 minuto.
+- Tolerância a falhas e capacidade de recalcular.
+
+## Estimativas
+
+- 1 bilhão de cliques por dia ≈ **12 mil por segundo**, com pico de 5 vezes: 60 mil.
+- Cada evento ≈ 100 bytes: 100 GB por dia de dados brutos, **36 TB por ano**.
+- 2 milhões de anúncios; agregados por minuto são bem menores que os brutos.
+
+## Arquitetura
+
+```text
+servidores de log -> Kafka (eventos brutos) -> agregador (Flink) -> Kafka (agregados) -> banco OLAP
+                          |                                                              ^
+                          +--> armazenamento de objetos (brutos) --> job de reconciliação batch
+```
+
+### Ingestão
+
+Os servidores publicam cada clique em Kafka, particionado por `anuncio_id`. Todos os cliques de um anúncio caem na mesma partição, o que permite agregar localmente. Para evitar hot partitions (um anúncio viral), adicione um sufixo aleatório à chave e agregue em dois estágios.
+
+### Agregação por janela
+
+O processador de stream (Flink, Spark Streaming) soma cliques por anúncio em **janelas de tumbling de 1 minuto**. Para o top N, mantém um top parcial por partição e um agregador final faz o merge.
+
+### Eventos atrasados
+
+Cliques chegam com atraso (rede, celular offline). Defina a janela baseada no **tempo do evento**, não no de chegada, e use uma **marca d'água**: o sistema espera um tempo (por exemplo, 15 segundos) antes de fechar a janela. Eventos que chegam depois são tratados por uma correção posterior, no pipeline em lote. Trade-off: marca d'água maior melhora a precisão, mas atrasa o resultado.
+
+### Exatidão: exatamente uma vez
+
+Falhas fazem reprocessamento. Para evitar contagem dupla:
+
+- Eventos têm um ID único; o agregador deduplica pelo ID dentro de uma janela.
+- O processador usa checkpoints do estado e dos offsets de forma atômica, e o escritor no banco é idempotente (upsert por chave `anuncio, minuto`, que sobrescreve em vez de somar).
+
+### Armazenamento dos resultados
+
+Um banco analítico colunar (ClickHouse, Druid, Pinot) ou uma tabela particionada por tempo guarda `(anuncio, minuto, pais, cliques)`. As consultas por intervalo somam poucos registros. Dados brutos ficam em storage de objetos por meses.
+
+## Arquitetura Lambda versus Kappa
+
+- **Lambda:** caminho rápido (stream, aproximado e fresco) mais caminho lento (batch noturno, exato), com reconciliação. Fornece correção a posteriori, ao custo de manter duas lógicas.
+- **Kappa:** apenas stream; para corrigir, reprocessa-se o log do Kafka com novo código. Mais simples, desde que a retenção do log seja suficiente.
+
+Em faturamento, uma reconciliação em lote contra os brutos costuma ser exigida de qualquer forma.
+
+## Fraude
+
+Cliques de bots inflam as contas. Filtre por IP e dispositivo, limites por usuário, padrões anômalos (muitos cliques em segundos) em estágio antes da agregação. Marque como inválido sem apagar o bruto, para auditar.
+
+## Escala e falhas
+
+Aumente partições e instâncias do agregador de modo proporcional. Se o agregador cair, ele retoma do checkpoint e do offset sem perda. Se o banco cair, o Kafka armazena os agregados até a volta.
+
+<Callout type="warning" title="Exatidão tem custo">
+Se o entrevistador aceitar números aproximados, simplifique com sketches. Se envolver cobrança, defenda dedup, marca d'água e reconciliação em lote.
+</Callout>
+
+## Na entrevista
+
+Percorra ingestão em Kafka, agregação em janelas, atraso e marca d'água, e a escrita idempotente. Follow-ups: como tratar um anúncio com tráfego desproporcional, como reprocessar um dia inteiro e como provar que o total está correto.
+
+<QuizSet>
+<Quiz question="Para que serve a marca d'água em agregação por janela?" options={["Proteger direitos autorais", "Definir quanto tempo esperar por eventos atrasados antes de fechar a janela", "Compactar o log", "Escolher a partição"]} answer={1} explanation="Ela equilibra precisão (esperar mais) e latência do resultado (fechar logo)." />
+<Quiz question="Por que gravar os agregados com upsert por chave (anúncio, minuto)?" options={["Para acelerar a leitura", "Para que reprocessar a mesma janela sobrescreva em vez de somar duas vezes", "Para criptografar", "Para reduzir partições"]} answer={1} explanation="A escrita idempotente impede contagem dupla quando há reprocessamento após falhas." />
+</QuizSet>

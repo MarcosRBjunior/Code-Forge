@@ -1,0 +1,71 @@
+---
+title: Projetar venda de ingressos
+kind: lesson
+---
+
+Vender ingressos para um show popular é o caso de contenção extrema: milhões de pessoas disputam poucos milhares de assentos no mesmo segundo. O desafio não é volume de dados, é impedir que dois clientes comprem o mesmo assento e manter o sistema de pé sob o pico.
+
+## Requisitos
+
+### Funcionais
+
+- Listar eventos e mapa de assentos com disponibilidade.
+- Selecionar assentos e segurá-los por alguns minutos.
+- Pagar e receber o ingresso (QR code).
+- Cancelar ou deixar a reserva expirar.
+
+### Não funcionais
+
+- Zero venda duplicada de assento.
+- Sistema resiste a picos de 100 vezes o tráfego normal.
+- Justiça: ordem de chegada respeitada tanto quanto possível.
+
+## Estimativas
+
+- Um show com 50 mil assentos e 2 milhões de pessoas tentando entrar ao mesmo tempo.
+- Leitura do mapa: milhões de requisições em poucos minutos; precisa de cache e atualização por push.
+- Escritas reais (reservas): no máximo algumas dezenas de milhares por minuto, pois só 50 mil assentos existem.
+
+## Arquitetura
+
+```text
+ usuário -> CDN -> sala de espera virtual -> API
+                                              |-- Eventos/Mapa (cache + push)
+                                              |-- Reserva (banco + Redis)
+                                              '-- Pagamento -> PSP
+ expiração: TTL libera reservas vencidas
+```
+
+**Sala de espera virtual.** Em vez de deixar 2 milhões de pessoas baterem no backend, uma fila admite usuários em lotes controlados com tokens assinados. Isso protege o núcleo e dá justiça.
+
+**Reserva de assento.** Cada assento tem estado: livre, segurado ou vendido. A transição para segurado usa update condicional:
+
+```sql
+UPDATE assentos
+SET estado = 'segurado', usuario = ?, expira_em = now() + interval '8 minutes'
+WHERE evento = ? AND assento = ? AND (estado = 'livre' OR expira_em < now());
+```
+
+Se afetou uma linha, o assento é seu. Alternativa: `SET NX PX` no Redis para a retenção rápida, com o banco como fonte final na venda.
+
+**Pagamento.** Só após pagar o estado vira vendido, com idempotência para não cobrar duas vezes.
+
+## Pontos críticos
+
+- **Mapa em tempo real:** envie mudanças por WebSocket ou SSE e aceite que o mapa pode estar levemente defasado; a reserva é quem decide.
+- **Partição quente:** um evento popular concentra tudo numa chave. Particione por evento e por seção; a contenção real é por assento, não por evento.
+- **Bots:** limite por IP, captcha e verificação na sala de espera.
+- **Expiração:** liberar assentos vencidos deve ser barato; consulte por `expira_em` em vez de depender de um job perfeito.
+
+<Callout type="note" title="Segurar não é vender">
+Separar o estado segurado do vendido permite expirar reservas sem tocar em pagamentos concluídos. Deixe claro quem é o dono da verdade em cada fase.
+</Callout>
+
+## Na entrevista
+
+Abra com a sala de espera: ela transforma um problema de milhões de leitores em um fluxo controlado. Follow-ups: o que acontece se o pagamento demora além do TTL (revalidar a reserva antes de capturar), como lidar com assentos não numerados (contador por categoria) e como evitar que dois nós liberem e vendam o mesmo assento.
+
+<QuizSet>
+<Quiz question="Qual o principal papel da sala de espera virtual?" options={["Guardar o estoque", "Controlar a taxa de entrada no backend e dar justiça", "Processar pagamentos", "Substituir o banco"]} answer={1} explanation="Ela admite usuários em lotes, protegendo o núcleo do sistema durante o pico." />
+<Quiz question="Como garantir que dois clientes não segurem o mesmo assento?" options={["Verificar no cliente", "Update condicional atômico no estado do assento", "Aumentar o número de servidores", "Usar cache sem expiração"]} answer={1} explanation="A transição condicional só tem sucesso para um concorrente." />
+</QuizSet>

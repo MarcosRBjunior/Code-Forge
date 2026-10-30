@@ -1,0 +1,80 @@
+---
+title: Projetar contador de visualizações
+kind: lesson
+---
+
+Contar visualizações de vídeos ou posts parece trivial: incrementar um número. Mas com milhões de eventos por segundo e itens virais, um simples `UPDATE views = views + 1` vira gargalo de contenção. A questão testa agregação, contadores sharded e a escolha entre exatidão e escala.
+
+## Requisitos
+
+### Funcionais
+
+- Registrar uma visualização de um item.
+- Ler o total de visualizações de um item.
+- Opcional: contagem por período e de usuários únicos.
+
+### Não funcionais
+
+- Escrita de altíssima vazão (milhões por segundo).
+- Leitura de baixa latência.
+- O valor exibido pode atrasar alguns segundos e ser aproximado; o valor oficial (para pagamentos de criadores) precisa ser exato.
+
+## Estimativas
+
+- 100 mil visualizações por segundo na média, pico de 1 milhão.
+- 1 bilhão de itens × 8 bytes de contador = 8 GB para os totais. Pequeno; o problema é a taxa de escrita, não o armazenamento.
+
+## Por que a abordagem ingênua falha
+
+Um único contador por vídeo viral recebe dezenas de milhares de incrementos por segundo. Um banco relacional bloqueia a linha a cada update, e o throughput cai. Mesmo o Redis tem um limite por chave, em uma só thread.
+
+## Solução em camadas
+
+```text
+ cliente -> API -> Kafka (evento "view", chave = item_id)
+                     |
+                     '-> agregador (janela de 1 a 5 s): soma por item, grava lotes
+                              |
+                              '-> armazenamento de contadores (Redis / Cassandra counters)
+ leitura: API -> cache -> contador
+```
+
+**Agregue antes de gravar.** O consumidor soma as visualizações do mesmo item durante uma janela curta e faz um único `INCRBY item 3280` em vez de 3.280 escritas. Isso reduz a taxa de escrita em ordens de grandeza.
+
+**Contador sharded.** Para um item extremamente quente, divida o contador em N pedaços e incremente um aleatório:
+
+```text
+INCR views:42:{0..15}          # escolhe um shard ao acaso
+leitura = soma dos 16 shards   # ou um agregador periódico escreve o total
+```
+
+A escrita se espalha por 16 chaves (e nós), e a leitura soma, ou lê um total consolidado a cada poucos segundos.
+
+**Contagem exata versus aproximada.** Mantenha dois caminhos: o contador em tempo quase real para a tela, e um processamento batch sobre o log de eventos (com deduplicação e filtro de bots) para o número oficial.
+
+| Necessidade | Técnica |
+| --- | --- |
+| Total aproximado em tempo real | Agregação em janela mais contador sharded |
+| Total oficial exato | Batch sobre o log de eventos |
+| Usuários únicos | HyperLogLog, erro em torno de 1% |
+| Exibir "1,2 mi" | Arredondar; não precisa do valor exato |
+
+## Pontos críticos
+
+- **Idempotência:** um reenvio do evento não pode contar duas vezes. Inclua um ID de evento e deduplique no batch.
+- **Fraude e bots:** visualizações repetidas do mesmo usuário em segundos não contam; regras e filtros no processamento.
+- **Durabilidade:** o log no Kafka é a fonte da verdade; se o contador se perde, recalcule a partir do log.
+- **Definição de visualização:** por exemplo, 30 segundos assistidos; deixe a regra explícita.
+
+<Callout type="note" title="Escrever menos">
+A maior alavanca é reduzir o número de escritas, agregando em memória. Só depois pense em particionar o contador.
+</Callout>
+
+## Na entrevista
+
+Mostre por que o incremento direto não escala e proponha agregação mais sharding. Follow-ups: como contar usuários únicos (HyperLogLog), como evitar que um vídeo viral derrube um nó e como reconciliar o contador rápido com o número oficial.
+
+<QuizSet>
+<Quiz question="Qual a principal alavanca para suportar milhões de incrementos por segundo?" options={["Um banco maior", "Agregar eventos em janela e gravar em lote", "Usar float", "Desligar a persistência"]} answer={1} explanation="Somar em memória e gravar um incremento por janela reduz muito a taxa de escrita." />
+<Quiz question="Para contar usuários únicos de forma barata, o que usar?" options={["HyperLogLog", "Um contador simples", "Uma lista completa de IDs sempre", "Hash de IP"]} answer={0} explanation="HyperLogLog estima a cardinalidade com pouca memória e erro pequeno." />
+</QuizSet>

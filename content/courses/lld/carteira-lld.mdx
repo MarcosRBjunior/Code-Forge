@@ -1,0 +1,137 @@
+---
+title: Projetar uma carteira digital
+kind: lesson
+---
+
+Uma carteira digital guarda saldo e movimenta dinheiro entre contas. Aqui o que importa é correção: nenhum centavo pode aparecer ou sumir. Isso leva a livro-razão (ledger), operações atômicas e idempotência.
+
+## Requisitos
+
+- Carteiras com saldo em centavos.
+- Depósito, saque e transferência entre carteiras.
+- Saldo nunca negativo.
+- Extrato com todas as movimentações.
+- Repetir a mesma requisição (por falha de rede) não pode cobrar duas vezes.
+
+## Entidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Carteira` | Dono, saldo e lock. |
+| `Lancamento` | Registro imutável de uma movimentação. |
+| `ServicoCarteira` | Operações, extrato e idempotência. |
+
+Cada alteração de saldo gera um lançamento. O saldo é a soma dos lançamentos, e guardá-lo à parte serve só de cache que deve concordar com o livro-razão.
+
+## Implementação
+
+```python
+import threading
+from dataclasses import dataclass
+from typing import Dict, List
+
+
+@dataclass(frozen=True)
+class Lancamento:
+    carteira: str
+    valor: int          # positivo credita, negativo debita
+    descricao: str
+
+
+class Carteira:
+    def __init__(self, dono: str):
+        self.dono = dono
+        self.saldo = 0
+        self.lock = threading.Lock()
+        self.extrato: List[Lancamento] = []
+
+
+class ServicoCarteira:
+    def __init__(self):
+        self.carteiras: Dict[str, Carteira] = {}
+        self.processadas: Dict[str, str] = {}   # id da requisição -> resultado
+        self._global = threading.Lock()
+
+    def criar(self, dono: str) -> Carteira:
+        c = Carteira(dono)
+        self.carteiras[dono] = c
+        return c
+
+    def depositar(self, dono: str, valor: int, req_id: str) -> str:
+        return self._idempotente(req_id, lambda: self._creditar(dono, valor, "depósito"))
+
+    def sacar(self, dono: str, valor: int, req_id: str) -> str:
+        def op():
+            c = self.carteiras[dono]
+            with c.lock:
+                self._debitar(c, valor, "saque")
+            return "ok"
+        return self._idempotente(req_id, op)
+
+    def transferir(self, de: str, para: str, valor: int, req_id: str) -> str:
+        def op():
+            a, b = self.carteiras[de], self.carteiras[para]
+            primeiro, segundo = sorted((a, b), key=lambda c: c.dono)  # ordem fixa evita deadlock
+            with primeiro.lock, segundo.lock:
+                self._debitar(a, valor, f"transferência para {para}")
+                b.saldo += valor
+                b.extrato.append(Lancamento(para, valor, f"transferência de {de}"))
+            return "ok"
+        return self._idempotente(req_id, op)
+
+    def _creditar(self, dono, valor, desc):
+        if valor <= 0:
+            raise ValueError("valor deve ser positivo")
+        c = self.carteiras[dono]
+        with c.lock:
+            c.saldo += valor
+            c.extrato.append(Lancamento(dono, valor, desc))
+        return "ok"
+
+    def _debitar(self, c: Carteira, valor: int, desc: str):
+        if valor <= 0:
+            raise ValueError("valor deve ser positivo")
+        if c.saldo < valor:
+            raise ValueError("saldo insuficiente")
+        c.saldo -= valor
+        c.extrato.append(Lancamento(c.dono, -valor, desc))
+
+    def _idempotente(self, req_id: str, op) -> str:
+        with self._global:
+            if req_id in self.processadas:
+                return self.processadas[req_id]
+        resultado = op()
+        with self._global:
+            self.processadas[req_id] = resultado
+        return resultado
+
+
+s = ServicoCarteira()
+s.criar("ana"); s.criar("bia")
+s.depositar("ana", 10000, "r1")
+s.depositar("ana", 10000, "r1")        # repetida: ignorada
+s.transferir("ana", "bia", 4000, "r2")
+try:
+    s.sacar("bia", 9000, "r3")
+except ValueError as e:
+    print("erro:", e)
+print(s.carteiras["ana"].saldo, s.carteiras["bia"].saldo)   # 6000 4000
+total = sum(sum(l.valor for l in c.extrato) for c in s.carteiras.values())
+print(total == 10000)
+```
+
+Duas coisas para destacar: a ordem fixa na aquisição dos locks (por nome) evita deadlock quando A transfere para B e B para A ao mesmo tempo, e o id da requisição torna as operações idempotentes. Em produção a marcação de "processada" e a alteração de saldo têm de ocorrer na mesma transação.
+
+## Extensões
+
+Limites diários (política injetável), estorno (lançamento inverso, nunca apagar), múltiplas moedas, taxas e transferências agendadas. Em um banco de dados, o mesmo desenho vira transações com `SELECT ... FOR UPDATE` e uma tabela de lançamentos só de inserção.
+
+## Na entrevista
+
+- **"Como garantir consistência?"** Livro-razão imutável, atomicidade nas transferências e idempotência.
+- **"Por que não usar float?"** Erros de arredondamento; use inteiros ou Decimal.
+
+<QuizSet>
+<Quiz question="Por que adquirir os locks em ordem fixa na transferência?" options={["Para ser mais rápido", "Para evitar deadlock entre transferências cruzadas", "Para ordenar o extrato", "Para dispensar idempotência"]} answer={1} explanation="Se todos pegam na mesma ordem, não existe espera circular." />
+<Quiz question="O que a idempotência garante?" options={["Saldo maior", "Repetir a requisição não repete o efeito", "Menos lançamentos", "Transferências instantâneas"]} answer={1} explanation="O id da requisição permite devolver o resultado anterior sem reexecutar." />
+</QuizSet>

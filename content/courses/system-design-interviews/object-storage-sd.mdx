@@ -1,0 +1,73 @@
+---
+title: Projetar um object storage
+kind: lesson
+---
+
+Um object storage como o S3 guarda blobs imutáveis (fotos, backups, vídeos) identificados por chave, com durabilidade altíssima e custo baixo. A questão testa separação entre metadados e dados, replicação versus erasure coding e como obter onze noves de durabilidade.
+
+## Requisitos
+
+### Funcionais
+
+- Criar buckets; `PUT`, `GET`, `DELETE` e `LIST` de objetos por chave.
+- Objetos de bytes até terabytes (upload em partes).
+- Versionamento e controle de acesso.
+
+### Não funcionais
+
+- Durabilidade extrema (99,999999999%).
+- Alta disponibilidade e vazão; latência de dezenas de milissegundos por objeto.
+- Escala para trilhões de objetos e exabytes.
+- Custo por GB o menor possível.
+
+## Estimativas
+
+- 100 PB de dados, objeto médio de 1 MB: **100 bilhões de objetos**.
+- Metadados de 500 bytes por objeto: 50 TB. Muito menor que os dados, mas com acesso intenso.
+
+## Arquitetura
+
+```text
+ cliente -> API/frontend -> serviço de metadados  (chave -> localização, tamanho, versão)
+                |
+                '-> serviço de dados -> nós de armazenamento (discos)
+ reparo em segundo plano: detecta fragmentos perdidos e os reconstrói
+```
+
+**Separar metadados de dados.** Os metadados (bucket, chave, versão, onde estão os fragmentos) vão para um banco distribuído particionado, por exemplo por bucket mais prefixo da chave. Os bytes vão para nós de dados em armazenamento barato.
+
+**Escrita.** O objeto é dividido em blocos (por exemplo 64 MB); o frontend envia os blocos aos nós, e só depois de durável registra os metadados. O `PUT` é confirmado quando os metadados são gravados, dando atomicidade: ou o objeto existe completo ou não existe.
+
+**Durabilidade: replicação versus erasure coding.**
+
+| Técnica | Overhead | Reparo | Uso |
+| --- | --- | --- | --- |
+| Replicação 3x | 200% | Rápido (copiar) | Dados quentes |
+| Erasure coding (por ex. 10+4) | 40% | Mais caro (ler vários fragmentos) | Dados frios e grandes |
+
+No erasure coding 10+4, o bloco vira 10 fragmentos de dados e 4 de paridade em 14 discos de domínios de falha distintos (rack, zona); qualquer 10 reconstroem o bloco e se toleram até 4 perdas.
+
+**Leitura.** Consulta metadados, lê os fragmentos (ou uma cópia) e devolve; para erasure coding, ler os fragmentos de dados evita decodificação no caso comum.
+
+**Reparo.** Um processo varre e verifica checksums, detecta perda ou corrupção e reconstrói fragmentos. É o que sustenta a durabilidade ao longo dos anos.
+
+## Pontos críticos
+
+- **Upload multipart:** partes enviadas em paralelo e remontadas ao concluir; permite retomar.
+- **LIST:** como as chaves têm prefixos, particione os metadados de modo que a listagem ordenada fique eficiente.
+- **Consistência:** leitura após escrita de um objeto novo é forte se os metadados são o ponto de verdade.
+- **Exclusão:** marque e remova depois (garbage collection), pois blocos podem ser compartilhados.
+- **Tiers:** mova objetos antigos para armazenamento frio por política de ciclo de vida.
+
+<Callout type="note" title="Imutável simplifica">
+Objetos não são editados no lugar; um novo `PUT` cria uma nova versão. Sem escrita parcial, não há problemas de concorrência no nível do bloco.
+</Callout>
+
+## Na entrevista
+
+Desenhe metadados separados dos dados, justifique erasure coding e descreva o reparo. Follow-ups: como evitar perder tudo numa falha de zona (fragmentos espalhados), como detectar corrupção silenciosa (checksums e scrubbing) e como suportar buckets com bilhões de chaves.
+
+<QuizSet>
+<Quiz question="Por que erasure coding é preferido a replicação 3x para dados frios?" options={["É mais rápido de reparar", "Dá durabilidade parecida com bem menos overhead de espaço", "Elimina metadados", "Não precisa de discos"]} answer={1} explanation="10+4 usa 40% de overhead contra 200% da replicação tripla." />
+<Quiz question="Quando o PUT é considerado confirmado?" options={["Ao receber o primeiro byte", "Após os blocos estarem duráveis e os metadados gravados", "Antes de gravar qualquer coisa", "Quando o cliente fecha a conexão"]} answer={1} explanation="Registrar os metadados por último torna o objeto visível de forma atômica." />
+</QuizSet>

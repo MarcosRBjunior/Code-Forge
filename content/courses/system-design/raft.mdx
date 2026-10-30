@@ -1,0 +1,59 @@
+---
+title: Raft
+kind: lesson
+---
+
+Raft é um algoritmo de consenso projetado para ser compreensível. Ele entrega a mesma garantia do Paxos, mas divide o problema em partes claras: **eleição de líder**, **replicação de log** e **segurança**. É a base de etcd, Consul, CockroachDB, TiKV e do modo KRaft do Kafka.
+
+## Papéis e termos
+
+Cada nó está em um de três estados: **follower** (passivo, só responde), **candidate** (tentando virar líder) e **leader** (único que aceita escritas dos clientes). O tempo é dividido em **termos** numerados; cada termo tem no máximo um líder.
+
+## Eleição de líder
+
+1. O líder envia heartbeats periódicos aos followers.
+2. Se um follower fica sem ouvir o líder por um **timeout de eleição** (aleatório, por exemplo 150 a 300 ms), vira candidate, incrementa o termo, vota em si mesmo e pede votos aos demais.
+3. Cada nó vota em no máximo um candidate por termo, e só em candidates com log pelo menos tão atualizado quanto o seu.
+4. Quem obtém a maioria vira líder e passa a enviar heartbeats.
+
+O timeout aleatório evita que vários nós virem candidatos ao mesmo tempo e dividam os votos para sempre.
+
+## Replicação de log
+
+O cliente envia o comando ao líder, que o anexa ao seu log e o replica aos followers com `AppendEntries`. Quando uma **maioria** gravou a entrada, o líder a considera **confirmada (committed)**, aplica-a à máquina de estados e responde ao cliente. Os followers aprendem o índice confirmado nas mensagens seguintes.
+
+```text
+Log do líder:   [1:x=1] [1:y=2] [2:x=3] [2:z=9]
+Follower A:     [1:x=1] [1:y=2] [2:x=3] [2:z=9]
+Follower B:     [1:x=1] [1:y=2] [2:x=3]            (atrasado)
+Maioria (líder + A) gravou z=9  => confirmada
+```
+
+Cada `AppendEntries` inclui o índice e o termo da entrada anterior; se o follower não tiver essa entrada, rejeita, e o líder recua até achar o ponto em comum e sobrescreve o log divergente do follower. Assim os logs convergem.
+
+## Garantias de segurança
+
+- **Um líder por termo.**
+- **Líder só acrescenta:** nunca sobrescreve ou apaga entradas do próprio log.
+- **Correspondência de log:** se dois logs têm uma entrada com o mesmo índice e termo, os logs são idênticos até ali.
+- **Completude do líder:** um candidate só vence se seu log contém todas as entradas confirmadas, graças à regra de voto.
+
+## Pontos práticos
+
+- **Leituras:** ler direto de um follower pode devolver dado velho. Para linearizabilidade, a leitura passa pelo líder (com confirmação de que ainda é líder, o *read index* ou leases).
+- **Snapshots:** o log não cresce para sempre; periodicamente grava-se um snapshot do estado e descartam-se entradas antigas.
+- **Mudança de membros:** feita aos poucos (um nó por vez ou consenso conjunto) para nunca existirem duas maiorias disjuntas.
+- **Custo:** toda escrita passa por um líder e espera uma maioria. Para escalar, use vários grupos Raft, um por shard.
+
+<Callout type="warning" title="Cuidado com timeouts mal ajustados">
+Timeout de eleição menor que a latência de rede ou pausas de GC causam eleições em cascata: o cluster passa o tempo trocando de líder e não confirma escritas.
+</Callout>
+
+## Na entrevista
+
+Descreva Raft como "um líder eleito por maioria replica um log para os followers; uma entrada vale quando a maioria a gravou". Follow-ups: "o que acontece se o líder cai?" (um follower estoura o timeout, vira candidate e um novo líder é eleito em um novo termo), "e numa partição?" (o lado minoritário não consegue eleger nem confirmar nada; o lado maioritário segue), "Raft versus Paxos?" (mesma segurança, Raft é mais fácil de entender e implementar).
+
+<QuizSet>
+<Quiz question="Por que Raft usa timeouts de eleição aleatórios?" options={["Para economizar banda", "Para evitar que vários candidatos disputem ao mesmo tempo e dividam os votos", "Para sincronizar relógios", "Para criptografar votos"]} answer={1} explanation="A aleatoriedade faz com que normalmente um nó expire primeiro e ganhe a eleição." />
+<Quiz question="Quando uma entrada do log é considerada confirmada?" options={["Quando o líder a grava", "Quando o cliente confirma", "Quando uma maioria dos nós a gravou", "Quando todos os nós a gravaram"]} answer={2} explanation="A confirmação exige maioria; isso garante que qualquer futuro líder eleito terá a entrada." />
+</QuizSet>

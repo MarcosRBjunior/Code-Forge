@@ -1,0 +1,81 @@
+---
+title: Projetar uma carteira digital
+kind: lesson
+---
+
+Uma carteira digital guarda saldo e transfere valores entre usuários. Diferente de pagamentos com cartão, o dinheiro vive dentro do seu sistema, então o saldo é a fonte da verdade e cada transferência precisa ser atômica: debitar um lado e creditar o outro, ou nada.
+
+## Requisitos
+
+### Funcionais
+
+- Carregar saldo (depósito) e sacar.
+- Transferir entre carteiras.
+- Ver saldo e extrato.
+- Pagar comerciantes com QR code.
+
+### Não funcionais
+
+- Saldo nunca negativo, nunca dinheiro criado ou perdido.
+- Transferência é atômica e idempotente.
+- Extrato consistente com o saldo.
+- Disponibilidade alta, p99 de transferência abaixo de 500 ms.
+
+## Estimativas
+
+- 50 milhões de usuários, 10 milhões de transferências por dia, cerca de **115 por segundo**, pico de 1.000.
+- Um registro de ledger de 200 bytes por lançamento, 2 lançamentos por transferência: cerca de 4 GB por dia.
+
+## Modelo de dados
+
+```text
+contas   (conta_id, saldo_centavos, versao)
+ledger   (lancamento_id, conta_id, valor, tipo, transferencia_id, criado_em)
+transferencias (id, origem, destino, valor, estado, chave_idempotencia)
+```
+
+O saldo em `contas` é um cache consistente do ledger; o ledger é imutável.
+
+## Transferência atômica
+
+Se as duas contas estão no mesmo banco, uma transação resolve:
+
+```sql
+BEGIN;
+UPDATE contas SET saldo_centavos = saldo_centavos - 5000 WHERE conta_id = 1 AND saldo_centavos >= 5000;
+UPDATE contas SET saldo_centavos = saldo_centavos + 5000 WHERE conta_id = 2;
+INSERT INTO ledger ... ;
+COMMIT;
+```
+
+Para evitar deadlock, sempre trave as contas em ordem de ID.
+
+Quando as contas estão em shards diferentes, há três caminhos:
+
+| Abordagem | Como | Custo |
+| --- | --- | --- |
+| Two-phase commit | Coordenador pede prepare e commit | Bloqueante, frágil a falhas |
+| Saga | Debita origem, credita destino, compensa se falhar | Estados intermediários visíveis |
+| Conta de trânsito | Debita origem para uma conta de trânsito, depois credita destino | Cada passo é local e auditável |
+
+A saga com conta de trânsito costuma ser a resposta mais prática: cada passo é uma transação local idempotente, e a soma do sistema permanece zero.
+
+## Pontos críticos
+
+- **Idempotência:** chave por transferência com índice único; o retry devolve o mesmo resultado.
+- **Contas quentes:** um comerciante grande recebe milhares de créditos por segundo. Divida o saldo em sub-contas ou acumule créditos em lote e consolide.
+- **Reconciliação:** um job confere que a soma do ledger bate com o saldo de cada conta e com o dinheiro real no banco parceiro.
+- **Antifraude e limites:** valor máximo por dia, verificação de dispositivo.
+
+<Callout type="tip" title="Ledger primeiro">
+Em dúvida, derive tudo do ledger imutável. Saldo, extrato e auditoria saem dele, e correções são novos lançamentos, nunca edições.
+</Callout>
+
+## Na entrevista
+
+Mostre primeiro o caso de um único banco, depois a generalização para shards com saga. Follow-ups: o que acontece se o crédito falha depois do débito (a compensação devolve o valor), como evitar deadlock e como suportar o extrato com paginação por cursor.
+
+<QuizSet>
+<Quiz question="Como evitar deadlock ao transferir entre duas contas no mesmo banco?" options={["Travar sempre em ordem consistente de ID", "Travar em ordem aleatória", "Não usar transações", "Usar float"]} answer={0} explanation="Ordem global de aquisição de locks impede ciclos de espera." />
+<Quiz question="Por que o ledger deve ser imutável?" options={["Para ocupar mais espaço", "Para ter auditoria confiável; correções entram como novos lançamentos", "Para evitar índices", "Para permitir saldo negativo"]} answer={1} explanation="Imutabilidade preserva o histórico e permite reconstruir e conferir saldos." />
+</QuizSet>

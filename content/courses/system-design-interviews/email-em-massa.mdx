@@ -1,0 +1,78 @@
+---
+title: Projetar envio de e-mails em massa
+kind: lesson
+---
+
+Enviar milhões de e-mails (newsletters, campanhas, notificações) parece só um laço de envios, mas o gargalo é reputação, limites dos provedores de destino e tratamento de retornos. O desafio é entregar na caixa de entrada, não apenas "enviar" o e-mail.
+
+## Requisitos
+
+### Funcionais
+
+- Criar campanhas com template, lista de destinatários e horário.
+- Personalizar o conteúdo por destinatário.
+- Enviar com taxa controlada e rastrear: entregue, aberto, clicado, devolvido, descadastrado.
+- Respeitar descadastros e listas de supressão.
+
+### Não funcionais
+
+- Vazão: milhões de e-mails por hora.
+- Entregabilidade: manter boa reputação de remetente.
+- Pelo menos uma entrega, evitando enviar duas vezes a mesma campanha ao mesmo destinatário.
+- Isolamento entre clientes (tenants).
+
+## Estimativas
+
+- Campanha de 10 milhões de e-mails em 1 hora ≈ **2.800 por segundo**.
+- Cada e-mail de 50 KB renderizado: 500 GB por campanha, mas o template é guardado uma vez e renderizado no envio.
+
+## Arquitetura
+
+```text
+ API/UI -> campanha (banco) -> expansor (lê a lista em lotes)
+                                   |
+                       fila de envio (particionada por domínio de destino)
+                                   |
+                 workers: renderizar template -> SMTP -> servidor do destinatário
+                                   |
+   respostas/eventos (bounce, spam, abertura, clique) -> processador -> banco / webhooks
+```
+
+**Expansão em lotes.** Ler 10 milhões de contatos de uma vez não funciona. O expansor lê a lista por páginas e publica lotes na fila, gravando um checkpoint para retomar após falha. Cada mensagem tem um ID único (campanha mais destinatário) para evitar envio duplicado em caso de retry.
+
+**Particionar por domínio de destino.** Gmail, Outlook e outros limitam a taxa de recebimento por remetente. Uma fila por domínio permite aplicar limites e backoff próprios sem que o gargalo de um domínio trave os outros.
+
+**Aquecimento e reputação.** IPs novos começam com volume baixo e crescem gradualmente (warm-up). Use IPs separados por tipo de tráfego: transacional (recibos, redefinição de senha) nunca divide IP com marketing.
+
+**Autenticação.** Configure SPF, DKIM e DMARC; sem eles, o e-mail cai em spam.
+
+**Retornos.**
+
+| Tipo | Significado | Ação |
+| --- | --- | --- |
+| Hard bounce | Endereço inexistente | Suprimir para sempre |
+| Soft bounce | Caixa cheia, falha temporária | Retry com backoff, limite de tentativas |
+| Reclamação de spam | Usuário marcou como spam | Suprimir imediatamente |
+| Descadastro | Pedido do usuário | Suprimir e honrar de imediato |
+
+**Rastreamento.** Abertura por pixel de 1x1 e clique por redirecionamento de link rastreado passam por um serviço leve que registra o evento numa fila e devolve a resposta de forma rápida. Observação: aberturas são cada vez menos confiáveis por causa de proxies de privacidade.
+
+## Pontos críticos
+
+- **Taxa de rejeição alta** derruba a reputação: valide listas e remova endereços inválidos.
+- **Idempotência:** retry de um worker não pode reenviar o que já saiu; marque o envio por mensagem antes ou use o ID no provedor.
+- **Provedores de envio:** muitas empresas usam SES ou SendGrid em vez de operar SMTP; cite o trade-off de custo e controle.
+- **Conformidade:** link de descadastro e consentimento (LGPD).
+
+<Callout type="note" title="Transacional e marketing separados">
+Um pico de campanha não pode atrasar e-mails de redefinição de senha. Separe filas, workers e IPs por classe de tráfego.
+</Callout>
+
+## Na entrevista
+
+Descreva a expansão em lotes, filas por domínio e tratamento de retornos. Follow-ups: como enviar uma campanha exatamente uma vez para cada pessoa, como agendar por fuso do destinatário e como recuperar uma reputação danificada.
+
+<QuizSet>
+<Quiz question="Por que particionar a fila de envio por domínio de destino?" options={["Para embaralhar mensagens", "Aplicar limites de taxa e backoff por provedor sem travar os demais", "Para reduzir o tamanho do template", "Para evitar SPF"]} answer={1} explanation="Cada provedor limita o recebimento; filas separadas isolam o gargalo." />
+<Quiz question="O que fazer com um hard bounce?" options={["Tentar de novo em 1 minuto", "Adicionar à lista de supressão", "Ignorar", "Enviar por outro IP"]} answer={1} explanation="Endereço inexistente deve ser suprimido, senão prejudica a reputação." />
+</QuizSet>

@@ -1,0 +1,67 @@
+---
+title: Upload de arquivos grandes
+kind: lesson
+---
+
+Enviar um arquivo de 5 GB por uma única requisição HTTP é frágil: qualquer queda de rede obriga a recomeçar, o servidor da API vira gargalo de banda e conexões longas ocupam recursos. A solução combina três ideias: enviar direto ao armazenamento, dividir o arquivo em partes e permitir retomada.
+
+## Ideia 1: não passe os bytes pela sua API
+
+Se todo upload passa pelo seu servidor de aplicação, ele paga a banda duas vezes (entrada e saída para o storage) e precisa escalar por tráfego de bytes. Em vez disso, a API apenas autoriza e o cliente envia **direto ao armazenamento de objetos** usando uma URL pré-assinada.
+
+```text
+1. cliente -> API:     "quero enviar video.mp4 (5 GB)"
+2. API -> cliente:     URLs pré-assinadas (válidas por 15 min)
+3. cliente -> S3:      envia as partes diretamente
+4. cliente -> API:     "terminei" (ou S3 emite evento)
+5. API:                valida e marca o arquivo como disponível
+```
+
+## Ideia 2: upload em partes (multipart)
+
+O arquivo é dividido em blocos (por exemplo 5 a 100 MB). Cada bloco é enviado como requisição independente, em paralelo, com seu número de ordem. Ao final o storage monta o objeto completo.
+
+Benefícios:
+
+- **Paralelismo:** várias partes simultâneas aproveitam melhor a banda.
+- **Retomada:** se uma parte falha, repita só ela.
+- **Checksum por parte** (hash MD5 ou SHA-256) detecta corrupção.
+
+## Ideia 3: retomada entre sessões
+
+Para sobreviver a fechar o navegador ou trocar de rede, o sistema guarda o **estado do upload**: ID do upload, tamanho, partes já confirmadas. O cliente consulta quais partes existem e envia só as que faltam.
+
+```text
+upload_id | arquivo | tamanho | partes_ok [1,2,3,5] | estado | expira_em
+```
+
+Protocolos como tus e o multipart do S3 implementam esse modelo. Limpe uploads abandonados com uma regra de lifecycle, senão partes órfãs custam dinheiro.
+
+## Fluxo completo e pós-processamento
+
+Após o upload, o S3 emite um evento para uma fila, e workers fazem antivírus, geração de miniaturas, transcodificação ou indexação. O registro do arquivo no banco passa por estados: `enviando`, `processando`, `pronto`, `falhou`.
+
+```text
+S3 --evento--> fila --> workers --> atualiza estado no banco --> notifica o usuário
+```
+
+## Deduplicação
+
+Se o mesmo arquivo for enviado muitas vezes (pensando em um serviço de nuvem pessoal), calcule o hash do conteúdo no cliente e pergunte ao servidor se ele já existe antes de enviar. Se existir, basta criar uma referência. Divida em chunks de conteúdo para deduplicar também em nível de bloco e sincronizar só o que mudou.
+
+## Armadilhas
+
+- Expirar a URL pré-assinada no meio do upload: renove-a por parte.
+- Não validar tipo e tamanho: restrinja nas condições da assinatura e valide de novo no servidor.
+- Confiar no cliente para dizer que terminou: confira com o storage.
+- Publicar o registro antes de o arquivo estar completo.
+- Limites de banda e CORS do bucket.
+
+## Na entrevista
+
+Cite este padrão em drives, serviços de vídeo e redes sociais: URL pré-assinada, multipart, estado persistido, evento de conclusão e processamento assíncrono. Follow-ups: como retomar um upload interrompido, como evitar partes órfãs, como lidar com arquivos duplicados e como escalar a validação sem bloquear o usuário.
+
+<QuizSet>
+<Quiz question="Qual o benefício de enviar direto ao S3 com URL pré-assinada?" options={["Evita criptografia", "Tira o tráfego pesado dos servidores da API, que apenas autorizam", "Elimina a necessidade de banco", "Garante entrega exatamente uma vez"]} answer={1} explanation="Os bytes não passam pela sua aplicação, reduzindo custo e gargalo de banda." />
+<Quiz question="Como retomar um upload de 5 GB que falhou na parte 40 de 50?" options={["Reiniciar do começo", "Consultar as partes já confirmadas e enviar só as que faltam", "Apagar o arquivo", "Reduzir o tamanho do arquivo"]} answer={1} explanation="O estado das partes permite reenviar apenas as pendentes." />
+</QuizSet>

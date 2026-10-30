@@ -1,0 +1,113 @@
+---
+title: Projetar reserva de cinema
+kind: lesson
+---
+
+Reservar ingressos de cinema é o exemplo clássico de recurso disputado: dois clientes querem a mesma poltrona ao mesmo tempo. O design precisa de um estado transitório de retenção, com prazo, antes da compra confirmada.
+
+## Requisitos
+
+- Cinema com várias salas; cada sala tem poltronas.
+- Sessões ligam um filme, uma sala e um horário.
+- Cliente escolhe poltronas livres; elas ficam retidas por alguns minutos.
+- Confirmar o pagamento transforma a retenção em reserva; sem pagar, a retenção expira.
+
+## Entidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Sessao` | Filme, horário e mapa de poltronas. |
+| `Poltrona` | Estado: livre, retida ou vendida. |
+| `Retencao` | Cliente, poltronas e instante de expiração. |
+| `Cinema` | Retém, confirma e libera. |
+
+Estados por poltrona e por sessão: livre, retida (com dono e prazo) e vendida. Uma poltrona retida cujo prazo passou conta como livre.
+
+## Implementação
+
+```python
+from dataclasses import dataclass
+from enum import Enum
+from threading import Lock
+from typing import Callable, Dict, List, Optional
+
+
+class Estado(Enum):
+    LIVRE = 1
+    RETIDA = 2
+    VENDIDA = 3
+
+
+@dataclass
+class Poltrona:
+    estado: Estado = Estado.LIVRE
+    dono: Optional[str] = None
+    expira: float = 0.0
+
+
+class Sessao:
+    def __init__(self, filme: str, poltronas: List[str], relogio: Callable[[], float],
+                 ttl: float = 300):
+        self.filme, self.relogio, self.ttl = filme, relogio, ttl
+        self.mapa: Dict[str, Poltrona] = {p: Poltrona() for p in poltronas}
+        self._lock = Lock()
+
+    def _disponivel(self, p: Poltrona, cliente: str) -> bool:
+        if p.estado is Estado.LIVRE:
+            return True
+        return p.estado is Estado.RETIDA and (p.expira <= self.relogio() or p.dono == cliente)
+
+    def reter(self, cliente: str, assentos: List[str]) -> None:
+        with self._lock:                       # tudo ou nada
+            for a in assentos:
+                if a not in self.mapa or not self._disponivel(self.mapa[a], cliente):
+                    raise ValueError(f"poltrona {a} indisponível")
+            for a in assentos:
+                self.mapa[a] = Poltrona(Estado.RETIDA, cliente, self.relogio() + self.ttl)
+
+    def confirmar(self, cliente: str, assentos: List[str]) -> None:
+        with self._lock:
+            for a in assentos:
+                p = self.mapa[a]
+                if p.estado is not Estado.RETIDA or p.dono != cliente or p.expira <= self.relogio():
+                    raise ValueError(f"retenção de {a} inválida ou expirada")
+            for a in assentos:
+                self.mapa[a].estado = Estado.VENDIDA
+
+    def livres(self) -> List[str]:
+        with self._lock:
+            return sorted(a for a, p in self.mapa.items() if self._disponivel(p, ""))
+
+
+t = [0.0]
+s = Sessao("Filme X", ["A1", "A2", "A3"], lambda: t[0], ttl=300)
+s.reter("ana", ["A1", "A2"])
+try:
+    s.reter("bia", ["A2", "A3"])        # A2 retida: nada é retido para Bia
+except ValueError as e:
+    print("erro:", e)
+print(s.livres())                       # ['A3']
+s.confirmar("ana", ["A1"])
+t[0] = 301                              # retenção de A2 expira
+print(s.livres())                       # ['A2', 'A3']
+s.reter("bia", ["A2", "A3"])
+```
+
+A retenção é tudo ou nada: se uma poltrona falhar, nenhuma é segurada. A expiração é preguiçosa (avaliada na consulta), o que dispensa um processo de limpeza para a correção; ele só é útil para liberar memória.
+
+## Concorrência
+
+O lock por sessão serializa tentativas sobre o mesmo mapa e evita venda dupla. Em banco de dados, o equivalente é uma restrição de unicidade em (sessão, poltrona) ou atualização condicional que só vence se o estado ainda for livre.
+
+## Extensões
+
+Preços por tipo de poltrona (Strategy), cancelamento com reembolso, lista de espera, e um Observer que atualiza o mapa na tela de todos os clientes quando algo muda.
+
+## Na entrevista
+
+- **"Por que reter antes de pagar?"** O pagamento leva tempo; sem retenção, o cliente pagaria por uma poltrona já vendida.
+- **"Como expirar?"** Prazo gravado na retenção, avaliado na leitura, com limpeza opcional em segundo plano.
+
+<QuizSet>
+<Quiz question="Para que serve o estado intermediário Retida?" options={["Decoração", "Segurar a poltrona durante o pagamento sem vendê-la ainda", "Registrar histórico", "Evitar sessões"]} answer={1} explanation="Evita venda dupla e dá tempo ao cliente de pagar." />
+</QuizSet>

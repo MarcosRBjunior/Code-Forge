@@ -1,0 +1,71 @@
+---
+title: Change data capture
+kind: lesson
+---
+
+Seu banco transacional é a fonte da verdade, mas outros sistemas precisam saber o que mudou: o índice de busca, o cache, o data warehouse, outros microsserviços. Fazer a aplicação escrever em todos os destinos ("dual write") é frágil: se um falha, eles divergem. **Change Data Capture (CDC)** captura as mudanças (inserts, updates e deletes) do próprio banco e as publica como um fluxo de eventos, sem que a aplicação precise mudar.
+
+## Abordagens de captura
+
+| Abordagem | Como funciona | Problemas |
+| --- | --- | --- |
+| Polling por timestamp | Consulta `WHERE atualizado_em > ultimo` | Perde deletes, carga no banco, relógios e transações longas |
+| Triggers | Gatilhos gravam mudanças numa tabela de auditoria | Custo em cada escrita, acoplamento |
+| **Baseada em log** | Lê o log de transações do banco | Precisa de acesso e configuração; a melhor opção |
+| Dual write | A aplicação escreve em dois lugares | Sem atomicidade; evite |
+
+A abordagem baseada em log lê o **WAL** do PostgreSQL (replicação lógica), o **binlog** do MySQL, o oplog do MongoDB. Esse log já existe para replicação e recuperação, então a leitura é de baixo impacto e preserva a **ordem** e a **atomicidade** das transações.
+
+## Debezium e a arquitetura típica
+
+```text
+Banco (WAL/binlog) -> Debezium -> Kafka (um tópico por tabela) -> consumidores
+                                      |-> Elasticsearch (busca)
+                                      |-> Redis (cache)
+                                      |-> Data warehouse (analytics)
+                                      |-> outros serviços
+```
+
+O Debezium roda sobre o Kafka Connect, faz um **snapshot inicial** da tabela e depois transmite as mudanças. Cada evento costuma trazer:
+
+```json
+{
+  "op": "u",
+  "before": {"id": 7, "status": "pendente"},
+  "after":  {"id": 7, "status": "pago"},
+  "source": {"table": "pedidos", "lsn": 2456789, "ts_ms": 1767225600000}
+}
+```
+
+`op` indica criação (c), atualização (u), remoção (d) ou leitura do snapshot (r). O `lsn` (posição no log) permite retomar de onde parou.
+
+## Casos de uso
+
+- **Manter índices e caches sincronizados** sem acoplar a aplicação.
+- **Replicar para o data warehouse** quase em tempo real (alternativa aos ETLs noturnos).
+- **Padrão outbox:** a aplicação grava o evento numa tabela de outbox na mesma transação do dado; o CDC publica a tabela. Evita dual write.
+- **Migração de banco** com o sistema no ar, sincronizando o novo destino.
+- **Auditoria** de quem mudou o quê.
+- **CQRS** e materialização de views a partir do fluxo.
+
+## Cuidados
+
+- **Entrega at-least-once:** o consumidor pode receber o mesmo evento duas vezes. Faça-o idempotente (upsert por chave).
+- **Ordem:** só é garantida por chave/partição; particione o tópico pela chave primária.
+- **Evolução de esquema:** colunas novas ou removidas quebram consumidores. Use schema registry (Avro, Protobuf) com regras de compatibilidade.
+- **Retenção do log:** um conector parado por muito tempo pode fazer o banco acumular WAL e encher o disco (slots de replicação no Postgres).
+- **Deletes:** emita tombstones para limpar o destino e compactar o tópico.
+- **Dados sensíveis:** o fluxo contém tudo o que está na tabela; mascare colunas e controle acesso.
+
+<Callout type="warning" title="Cuidado com o WAL acumulado">
+Em PostgreSQL, um replication slot sem consumidor impede a limpeza do WAL. Monitore o atraso do slot e alerte antes que o disco encha.
+</Callout>
+
+## Na entrevista
+
+Use CDC quando precisar propagar mudanças do banco a outros sistemas de forma confiável: "Debezium lê o WAL e publica no Kafka; consumidores atualizam Elasticsearch, cache e warehouse". Contraste com dual write e polling. Follow-ups: "e se o consumidor ficar fora do ar?" (retoma do offset do Kafka e do LSN), "como garantir ordem?" (partição por chave), "como evitar duplicatas?" (idempotência).
+
+<QuizSet>
+<Quiz question="Qual a principal vantagem do CDC baseado em log sobre polling por timestamp?" options={["É mais simples de configurar", "Captura deletes e preserva ordem e atomicidade das transações", "Não precisa de acesso ao banco", "Elimina a necessidade de Kafka"]} answer={1} explanation="O log de transações contém todas as mudanças, inclusive deletes, em ordem, com baixo impacto no banco." />
+<Quiz question="Um consumidor de CDC recebe o mesmo evento duas vezes após uma falha. Qual a defesa?" options={["Ignorar falhas", "Tornar o processamento idempotente, como upsert pela chave", "Desligar o Kafka", "Usar dual write"]} answer={1} explanation="A entrega é at-least-once; idempotência torna reprocessar inofensivo." />
+</QuizSet>

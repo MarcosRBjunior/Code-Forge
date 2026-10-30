@@ -1,0 +1,87 @@
+---
+title: Projetar o Yelp
+kind: lesson
+---
+
+O Yelp ajuda pessoas a descobrir lugares (restaurantes, lojas) por proximidade, categoria e avaliações. É um sistema com muita leitura, dados quase estáticos e uma consulta central: "lugares perto de mim que casem com o que procuro".
+
+## Requisitos
+
+### Funcionais
+
+- Buscar lugares por localização, raio, categoria e texto.
+- Ver detalhes de um lugar (fotos, horário, avaliação média).
+- Escrever avaliações com nota e texto; enviar fotos.
+- Ordenar por relevância, distância ou nota.
+
+### Não funcionais
+
+- Busca rápida (p99 abaixo de 300 ms).
+- Leitura muito maior que escrita; consistência eventual é aceitável para avaliações.
+- Alta disponibilidade.
+
+## Estimativas
+
+- 100 milhões de usuários ativos por mês, 5 milhões de buscas por hora no pico: cerca de **1.400 buscas por segundo**, com pico de 5 mil.
+- 200 milhões de lugares × 1 KB de metadados = **200 GB**. Cabe em um índice replicado.
+- Avaliações: 1 milhão por dia ≈ 12 por segundo, escrita baixa. 500 milhões de avaliações × 1 KB = 500 GB.
+- Fotos: o grosso do armazenamento, em storage de objetos com CDN.
+
+## API
+
+```text
+GET  /busca?lat=-23.55&lng=-46.63&raio=2000&q=pizza&categoria=restaurante&cursor=
+GET  /lugares/:id
+GET  /lugares/:id/avaliacoes?cursor=
+POST /lugares/:id/avaliacoes   { "nota": 4, "texto": "..." }
+```
+
+## Busca por proximidade e texto
+
+A consulta combina filtro geográfico, filtro de categoria e relevância textual. Duas formas:
+
+1. **Índice geoespacial + filtros:** células (geohash, quadtree ou S2) apontam para listas de lugares; filtra-se por categoria e ordena-se.
+2. **Motor de busca (Elasticsearch):** índice com campos de texto, categoria e um campo geo-point. Uma consulta única aplica geo-filtro, texto com BM25 e boost por nota e distância. Para este problema é a escolha mais simples, pois resolve texto e geografia no mesmo lugar.
+
+```text
+Cliente -> API de busca -> Elasticsearch (shards por região geográfica)
+                        -> cache de detalhes (Redis) -> banco de lugares
+```
+
+### Particionamento
+
+Lugares são dados bastante estáticos, então o particionamento por região (célula geográfica ou país) faz uma consulta típica tocar poucos shards. Cuidado com densidade desigual: Manhattan tem muito mais lugares que uma cidade pequena; use células menores nas regiões densas ou particione por hash dentro da região.
+
+## Dados e armazenamento
+
+- **Lugares:** banco relacional ou documento, fonte de verdade; o índice de busca é derivado, atualizado por CDC ou eventos.
+- **Avaliações:** tabela particionada por ID do lugar, para listar as avaliações de um lugar com uma única consulta.
+- **Nota média:** não recalcule a cada leitura. Guarde `soma` e `quantidade` no lugar e atualize a cada nova avaliação (de forma assíncrona, via fila); a média é `soma / quantidade`.
+- **Fotos:** armazenamento de objetos, miniaturas geradas por jobs, entrega por CDN.
+
+## Cache
+
+Detalhes de lugares populares ficam em Redis com TTL de minutos; resultados de busca por célula e termo comuns também podem ser cacheados (chave com a célula arredondada, não com coordenadas exatas, para aumentar o acerto).
+
+## Relevância
+
+Ordene combinando: distância, nota média ponderada pelo número de avaliações (uma nota 5 com 2 votos vale menos que 4,6 com 800), correspondência de texto, se está aberto agora e popularidade. Calcule parte dos sinais offline e armazene no índice.
+
+## Armadilhas
+
+- Resultados faltando na borda de células: consulte células vizinhas.
+- Avaliações falsas: detecção de abuso e limites por usuário.
+- Fusos horários no cálculo de "aberto agora".
+
+<Callout type="tip" title="Escolha uma peça central">
+Em vez de montar geo e texto separados, diga que usa um motor de busca com campo geográfico. Simplifica o desenho e é como se faz na prática.
+</Callout>
+
+## Na entrevista
+
+Apresente a busca geotextual como o núcleo, com índice derivado do banco, e trate nota média e fotos como componentes de apoio. Follow-ups: como ordenar por relevância, como atualizar o índice quando um lugar muda e como escalar para o mundo todo.
+
+<QuizSet>
+<Quiz question="Como manter a nota média de um lugar sem recalcular tudo a cada leitura?" options={["Percorrer todas as avaliações", "Guardar soma e quantidade e atualizar a cada nova avaliação", "Calcular só no cliente", "Usar a nota mais recente"]} answer={1} explanation="Com soma e contagem a média sai em O(1) e a atualização é incremental." />
+<Quiz question="Por que o índice de busca não deve ser a fonte de verdade?" options={["Ele não guarda texto", "É uma visão derivada, eventualmente consistente e reconstruível", "Não suporta geografia", "Não tem réplicas"]} answer={1} explanation="A verdade fica no banco; o índice é atualizado por eventos e pode ser reconstruído." />
+</QuizSet>

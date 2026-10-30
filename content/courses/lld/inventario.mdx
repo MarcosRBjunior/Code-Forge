@@ -1,0 +1,115 @@
+---
+title: Projetar um controle de estoque
+kind: lesson
+---
+
+Controle de estoque parece um mapa de produto para quantidade, mas as perguntas reais são: como evitar estoque negativo, como registrar o histórico das movimentações e como avisar quando o nível fica baixo.
+
+## Requisitos
+
+- Cadastro de produtos com SKU.
+- Entrada e saída de quantidade, por depósito.
+- Nunca permitir saldo negativo.
+- Alerta quando o saldo cai abaixo de um mínimo.
+- Histórico de movimentações para auditoria.
+
+## Entidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Produto` | SKU, nome e estoque mínimo. |
+| `Movimentacao` | Registro imutável: SKU, delta, motivo. |
+| `Deposito` | Saldos por SKU, histórico e ouvintes de alerta. |
+| `transferir` | Move quantidade entre dois depósitos. |
+
+A decisão central: guardamos o saldo atual para consulta rápida, mas toda alteração passa por um único método que valida e registra a movimentação.
+
+## Implementação
+
+```python
+from dataclasses import dataclass
+from typing import Callable, Dict, List
+
+
+@dataclass(frozen=True)
+class Produto:
+    sku: str
+    nome: str
+    minimo: int = 0
+
+
+@dataclass(frozen=True)
+class Movimentacao:
+    sku: str
+    delta: int
+    motivo: str
+
+
+class Deposito:
+    def __init__(self, nome: str):
+        self.nome = nome
+        self.saldos: Dict[str, int] = {}
+        self.historico: List[Movimentacao] = []
+        self.produtos: Dict[str, Produto] = {}
+        self.ouvintes: List[Callable[[Produto, int], None]] = []
+
+    def cadastrar(self, p: Produto):
+        self.produtos[p.sku] = p
+        self.saldos.setdefault(p.sku, 0)
+
+    def _aplicar(self, sku: str, delta: int, motivo: str):
+        novo = self.saldos[sku] + delta
+        if novo < 0:
+            raise ValueError(f"estoque insuficiente de {sku}")
+        self.saldos[sku] = novo
+        self.historico.append(Movimentacao(sku, delta, motivo))
+        p = self.produtos[sku]
+        if novo < p.minimo:
+            for f in self.ouvintes:
+                f(p, novo)
+
+    def entrada(self, sku, qtd, motivo="compra"):
+        self._aplicar(sku, qtd, motivo)
+
+    def saida(self, sku, qtd, motivo="venda"):
+        self._aplicar(sku, -qtd, motivo)
+
+
+def transferir(origem: Deposito, destino: Deposito, sku: str, qtd: int):
+    origem.saida(sku, qtd, f"transferência para {destino.nome}")
+    destino.entrada(sku, qtd, f"transferência de {origem.nome}")
+
+
+d1, d2 = Deposito("SP"), Deposito("RJ")
+caneta = Produto("CAN-1", "Caneta", minimo=5)
+for d in (d1, d2):
+    d.cadastrar(caneta)
+d1.ouvintes.append(lambda p, s: print(f"ALERTA: {p.nome} com {s}"))
+d1.entrada("CAN-1", 20)
+transferir(d1, d2, "CAN-1", 12)   # saldo SP = 8
+d1.saida("CAN-1", 5)              # saldo SP = 3 -> alerta
+try:
+    d1.saida("CAN-1", 10)
+except ValueError as e:
+    print("erro:", e)
+print(d1.saldos, d2.saldos, len(d1.historico))
+```
+
+Nota sobre a transferência: se a entrada no destino falhar depois da saída na origem, o estoque some. Em produção isso exige transação ou compensação (desfazer a saída).
+
+## Concorrência
+
+Duas vendas simultâneas do último item são o caso clássico. Faça a verificação e a subtração de forma atômica: lock por SKU na memória, ou no banco um `UPDATE` condicional (só subtrai se a quantidade for suficiente) conferindo as linhas afetadas.
+
+## Extensões
+
+Reservas de estoque durante o checkout (saldo disponível é o saldo menos o reservado), lotes com validade (FEFO: o que vence primeiro sai primeiro) e inventário cíclico com ajuste de contagem.
+
+## Na entrevista
+
+- **"Como auditar?"** Histórico imutável de movimentações; o saldo pode ser recalculado.
+- **"Por que Observer no alerta?"** Para que e-mail, painel e pedido automático de compra reajam sem acoplar ao depósito.
+
+<QuizSet>
+<Quiz question="Como impedir estoque negativo sob concorrência?" options={["Conferir o saldo antes, sem lock", "Verificar e subtrair de forma atômica", "Aceitar negativo e corrigir depois", "Usar só leitura"]} answer={1} explanation="Verificar e alterar em passos separados abre uma janela para corrida." />
+</QuizSet>

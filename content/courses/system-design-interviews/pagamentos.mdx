@@ -1,0 +1,67 @@
+---
+title: Projetar um sistema de pagamentos
+kind: lesson
+---
+
+Um sistema de pagamentos move dinheiro entre partes e precisa ser correto acima de tudo: nada de cobrança dobrada, nada de dinheiro que some. Latência importa menos que consistência, auditoria e capacidade de reconciliar com o mundo externo (bancos, adquirentes).
+
+## Requisitos
+
+### Funcionais
+
+- Receber um pedido de pagamento de um comerciante e cobrar o cliente via provedor externo (PSP, adquirente).
+- Consultar status, cancelar e estornar.
+- Pagamentos a vendedores (payout).
+- Notificar o comerciante por webhook.
+
+### Não funcionais
+
+- **Exatamente uma cobrança** por intenção de pagamento, mesmo com retries.
+- Durabilidade total: toda transação fica registrada.
+- Auditabilidade e reconciliação diária com o provedor.
+- Disponibilidade alta, mas preferir falhar a cobrar errado.
+
+## Estimativas
+
+- 1 milhão de transações por dia ≈ **12 por segundo**, pico de 100. O volume é baixo; a dificuldade é correção.
+- Cada transação gera dezenas de linhas de ledger e eventos; poucos GB por dia.
+
+## Arquitetura
+
+```text
+ comerciante -> API de pagamento -> serviço de pagamento -> banco (estado + ledger)
+                                          |                        
+                                          |-> PSP / adquirente (síncrono, com timeout)
+                                          '-> outbox -> Kafka -> webhooks, ledger, risco
+ reconciliação: arquivo do PSP x ledger interno, diariamente
+```
+
+**Idempotência.** Toda requisição de cobrança carrega uma `Idempotency-Key`. O serviço grava a chave com o resultado numa tabela com índice único; repetir devolve o resultado salvo. O mesmo vale ao chamar o PSP: envie a sua chave para que um retry não cobre duas vezes.
+
+**Máquina de estados.** Criado, autorizado, capturado, falhou, estornado. Transições são válidas apenas em sequência, e cada uma é gravada de forma transacional.
+
+**Timeout no PSP.** Se a chamada expira, o resultado é desconhecido. Não assuma falha: marque como pendente e consulte o PSP (ou espere o webhook dele) até resolver. Esse é o caso que mais cai em entrevista.
+
+**Ledger de dupla entrada.** Cada movimento gera lançamentos de débito e crédito que somam zero. O saldo é derivado, o histórico é imutável e correções são novos lançamentos.
+
+**Outbox.** Gravar o estado e o evento na mesma transação do banco, e um processo publica os eventos. Evita perder o webhook quando o serviço cai após o commit.
+
+## Pontos críticos
+
+- Dinheiro em inteiro de centavos, nunca ponto flutuante.
+- Segredos de cartão ficam num cofre com tokenização (escopo PCI isolado).
+- Reconciliação detecta divergências que nenhum retry resolve.
+- Antifraude entra no fluxo como regra síncrona rápida e análise assíncrona.
+
+<Callout type="warning" title="Timeout não é falha">
+Se o PSP não respondeu, o dinheiro pode ter sido cobrado. Trate como estado pendente e resolva por consulta, nunca por nova cobrança às cegas.
+</Callout>
+
+## Na entrevista
+
+Comece por idempotência e máquina de estados; depois ledger, outbox e reconciliação. Follow-ups: como evitar cobrança dupla com dois cliques simultâneos (índice único na chave), como lidar com estorno parcial e como escalar (shard por comerciante).
+
+<QuizSet>
+<Quiz question="O PSP não respondeu dentro do timeout. O que fazer?" options={["Tentar cobrar de novo imediatamente com outra chave", "Marcar como pendente e consultar o resultado, usando a mesma chave de idempotência", "Considerar falha e avisar o cliente que não foi cobrado", "Ignorar"]} answer={1} explanation="O resultado é desconhecido; a consulta ou o reenvio com a mesma chave evita cobrança dupla." />
+<Quiz question="Para que serve o padrão outbox?" options={["Acelerar leituras", "Gravar estado e evento atomicamente para não perder notificações", "Criptografar cartões", "Substituir o ledger"]} answer={1} explanation="Estado e evento vão na mesma transação, e um publicador envia depois." />
+</QuizSet>

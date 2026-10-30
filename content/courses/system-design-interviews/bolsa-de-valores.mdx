@@ -1,0 +1,77 @@
+---
+title: Projetar uma bolsa de valores
+kind: lesson
+---
+
+Uma bolsa casa ordens de compra e venda com latência de microssegundos e justiça rigorosa. É uma das raras questões em que o caminho crítico é single-thread de propósito: a ordem em que as ordens são processadas define quem negocia com quem.
+
+## Requisitos
+
+### Funcionais
+
+- Receber ordens: limite, a mercado, cancelar.
+- Casar ordens e gerar negócios (trades).
+- Publicar dados de mercado: melhor preço, profundidade, últimos negócios.
+- Ver o estado das próprias ordens.
+
+### Não funcionais
+
+- Latência de casamento em dezenas de microssegundos.
+- Justiça: prioridade por preço e depois por tempo de chegada (FIFO).
+- Determinismo: o mesmo fluxo de entrada produz sempre o mesmo resultado.
+- Nenhuma ordem perdida; recuperação rápida após falha.
+
+## Estimativas
+
+- Alguns milhares de símbolos, centenas de milhares de ordens por segundo no total; um símbolo quente pode ter dezenas de milhares por segundo.
+- Cada ordem tem dezenas de bytes; o grosso do volume é o feed de dados de mercado, enviado a muitos assinantes.
+
+## Arquitetura
+
+```text
+ clientes -> gateway (validação, risco) -> sequenciador -> motor de casamento (por símbolo)
+                                               |                   |
+                                           log de eventos      livro de ordens
+                                               |                   '-> trades -> feed de mercado
+                                          réplicas (standby)           '-> compensação/liquidação
+```
+
+**Sequenciador.** Atribui um número de sequência único a cada evento de entrada e o grava num log durável. Esse log é a fonte da verdade; o resto é derivado.
+
+**Motor de casamento.** Uma thread por símbolo, sem locks, tudo em memória. Particione por símbolo para escalar: símbolos distintos não interagem.
+
+**Livro de ordens.** Duas estruturas ordenadas por preço, uma para compras (maior preço primeiro) e outra para vendas (menor primeiro). Cada nível de preço guarda uma fila FIFO.
+
+```python
+class Nivel:
+    def __init__(self):
+        self.ordens = []  # FIFO
+
+# compras: preços em ordem decrescente; vendas: crescente
+# casar: enquanto melhor_compra.preco >= melhor_venda.preco, gerar trade
+```
+
+Usa-se lista ligada nos níveis e mapa de ID para ordem, para cancelar em tempo constante. Os melhores preços ficam acessíveis em tempo constante ou logarítmico.
+
+**Alta disponibilidade.** Réplicas consomem o mesmo log do sequenciador e processam deterministicamente, mantendo estado idêntico. Se o primário cai, um standby assume sem perder ordens. Replay do log reconstrói o livro.
+
+**Dados de mercado.** O feed é multicast ou publicação em fan-out para assinantes, com números de sequência para detectar perdas. Clientes lentos não podem atrasar o motor, então o feed é desacoplado.
+
+## Pontos críticos
+
+- **Risco pré-negociação:** limites de exposição e de preço verificados no gateway, antes do motor.
+- **Evitar GC e alocações** no caminho crítico (linguagens sem pausas, estruturas pré-alocadas).
+- **Auditoria:** o log sequenciado atende reguladores.
+
+<Callout type="note" title="Single-thread é uma escolha">
+Locks custam microssegundos e quebram o determinismo. Um motor por símbolo, sequencial e em memória, é mais rápido e mais simples de provar correto.
+</Callout>
+
+## Na entrevista
+
+Explique sequenciador, livro de ordens e replicação por log. Follow-ups: como escalar um símbolo muito ativo (não se divide; otimize o único motor), como garantir justiça entre clientes (mesma distância de rede e timestamps do sequenciador) e como recuperar após um crash.
+
+<QuizSet>
+<Quiz question="Por que o motor de casamento de um símbolo costuma ser single-thread?" options={["Por limitação do hardware", "Para manter ordem determinística e evitar custo de locks", "Para economizar memória", "Porque bancos exigem"]} answer={1} explanation="A ordem de processamento define o resultado; uma thread sequencial é rápida e determinística." />
+<Quiz question="Como um standby assume sem perder ordens?" options={["Lendo o log sequenciado e processando o mesmo fluxo", "Pedindo aos clientes para reenviar", "Recomeçando com livro vazio", "Usando cache"]} answer={0} explanation="Estado derivado do mesmo log determinístico fica idêntico no primário e nas réplicas." />
+</QuizSet>

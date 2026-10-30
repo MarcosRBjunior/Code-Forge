@@ -1,0 +1,87 @@
+---
+title: Projetar um lock distribuído
+kind: lesson
+---
+
+Um lock distribuído garante que só um processo, entre várias máquinas, execute uma seção crítica por vez. Parece simples, mas relógios, pausas e falhas de rede tornam as garantias ingênuas perigosas. Esta é uma questão sobre saber o que o lock promete de fato.
+
+## Requisitos
+
+### Funcionais
+
+- `acquire(recurso, ttl)` retorna sucesso ou falha, e `release(recurso)` libera.
+- Renovação (lease) enquanto o dono trabalha.
+- Expiração automática se o dono morre.
+
+### Não funcionais
+
+- Exclusão mútua: no máximo um dono por vez.
+- Liveness: um dono morto não bloqueia para sempre.
+- Alta disponibilidade do serviço de locks; latência de poucos milissegundos.
+
+## Lock com Redis
+
+O jeito simples e comum:
+
+```text
+SET lock:pedido:42 <token-unico> NX PX 30000
+```
+
+`NX` só grava se a chave não existe; `PX` define o TTL. A liberação deve conferir o token, de forma atômica:
+
+```text
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+```
+
+Sem conferir o token, um cliente lento poderia apagar o lock que agora pertence a outro.
+
+## O problema da pausa
+
+```text
+ A pega o lock (TTL 30 s)  -> pausa longa (GC, rede) por 40 s
+ lock expira; B pega o lock e escreve
+ A acorda, acha que ainda é dono, e escreve também  -> corrupção
+```
+
+TTL protege a liveness, mas não a exclusão mútua contra pausas. A solução é o **fencing token**: o serviço de lock devolve um número crescente a cada aquisição, e o recurso protegido rejeita escritas com token menor que o maior já visto.
+
+```text
+A recebe token 33; B recebe token 34
+B escreve com 34; depois A tenta escrever com 33 -> rejeitado
+```
+
+Isso exige que o recurso participe da verificação.
+
+## Opções de implementação
+
+| Opção | Característica | Quando |
+| --- | --- | --- |
+| Redis de nó único | Rápido, sem consenso; failover pode perder o lock | Eficiência (evitar trabalho duplicado) |
+| Redlock (vários Redis) | Maioria dos nós; ainda debatido quanto à segurança | Uso moderado, sem exigir correção estrita |
+| ZooKeeper ou etcd | Consenso (Zab, Raft), nós efêmeros e watches, tokens monotônicos | Correção forte |
+| Banco relacional | Linha com lock ou update condicional | Já tem o banco e baixa taxa |
+
+Com ZooKeeper, o cliente cria um nó sequencial efêmero; quem tem o menor número é o dono, e os demais observam o antecessor, evitando a manada. Se a sessão morre, o nó some.
+
+## Pontos críticos
+
+- **Lock para eficiência versus correção:** se duplicar o trabalho só custa dinheiro, Redis basta. Se corrompe dados, exija consenso e fencing.
+- **Renovação:** uma thread de heartbeat estende o TTL; se falha em renovar, o dono deve parar.
+- **Granularidade:** locks finos reduzem a contenção.
+- **Alternativas:** muitas vezes dá para evitar o lock com update condicional, versão otimista ou particionando o trabalho por chave.
+
+<Callout type="warning" title="TTL sozinho não basta">
+Um lock com expiração permite dois donos ao mesmo tempo depois de uma pausa. Para exclusão mútua real, combine o lock com fencing token verificado pelo recurso.
+</Callout>
+
+## Na entrevista
+
+Diga o que o lock deve garantir, mostre o problema da pausa e o fencing token. Follow-ups: o que acontece se o Redis falha logo após conceder o lock (réplica sem a chave, dois donos), por que ZooKeeper é mais seguro e quando nem usar lock.
+
+<QuizSet>
+<Quiz question="O que o fencing token resolve?" options={["Velocidade da aquisição", "Dono antigo, após pausa, escrever depois que o lock passou para outro", "Falta de memória", "Duplicação de TTL"]} answer={1} explanation="O recurso rejeita escritas com token menor que o já visto, bloqueando donos obsoletos." />
+<Quiz question="Por que liberar o lock exige conferir o token do dono?" options={["Para economizar rede", "Para não apagar o lock que já pertence a outro cliente", "Para renovar o TTL", "Não é necessário"]} answer={1} explanation="Um cliente lento poderia liberar um lock já readquirido por outro." />
+</QuizSet>

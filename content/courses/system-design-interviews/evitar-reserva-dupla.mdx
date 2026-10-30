@@ -1,0 +1,86 @@
+---
+title: Evitar reserva dupla
+kind: lesson
+---
+
+Dois clientes tentam comprar o último ingresso ao mesmo tempo. Se o sistema deixar os dois terminarem, você vendeu o mesmo assento duas vezes. Esse é o problema de **reserva dupla** (double booking), presente em ingressos, hotéis, estoque, agendamento de consultas e caronas.
+
+## Por que acontece
+
+O padrão ingênuo é ler e depois escrever:
+
+```text
+1. SELECT disponivel FROM assentos WHERE id = 7   -> "sim"
+2. (outro cliente faz o mesmo SELECT -> "sim")
+3. UPDATE assentos SET dono = 'ana' WHERE id = 7
+4. UPDATE assentos SET dono = 'beto' WHERE id = 7  -> sobrescreve
+```
+
+Entre a verificação e a escrita existe uma janela. Em escala, essa janela é atingida o tempo todo.
+
+## Solução 1: escrita condicional atômica
+
+A forma mais simples e muitas vezes suficiente: verifique e escreva num único comando.
+
+```sql
+UPDATE assentos
+SET dono = 'ana', status = 'reservado'
+WHERE id = 7 AND status = 'livre';
+-- linhas afetadas = 1 -> ganhou; 0 -> perdeu
+```
+
+O banco serializa as duas atualizações; só uma encontra `status = 'livre'`. Funciona em um único banco relacional e em armazenamentos com compare-and-set (DynamoDB com `ConditionExpression`).
+
+## Solução 2: lock pessimista
+
+`SELECT ... FOR UPDATE` trava a linha até o fim da transação. Garante exclusividade, mas segura a conexão e reduz a concorrência; sob muita disputa gera filas de espera e risco de deadlock se várias linhas são travadas em ordens diferentes (trave sempre em ordem de ID).
+
+## Solução 3: lock otimista com versão
+
+Cada linha tem uma coluna `versao`. Você lê, calcula e grava só se a versão não mudou:
+
+```sql
+UPDATE assentos SET dono = 'ana', versao = versao + 1
+WHERE id = 7 AND versao = 12;
+```
+
+Bom quando conflitos são raros; quem perde tenta de novo ou avisa o usuário.
+
+## Solução 4: constraint de unicidade
+
+Para reservar um horário, crie uma tabela de reservas com `UNIQUE (recurso_id, horario)`. A segunda inserção falha com violação de unicidade. É a defesa final, pois vale mesmo que o código da aplicação tenha um bug.
+
+## Reserva temporária (hold)
+
+Num fluxo de compra, o usuário escolhe o assento e demora minutos para pagar. Padrão comum:
+
+1. Marcar o assento como `retido` com um prazo (por exemplo, 10 minutos) usando a escrita condicional.
+2. Se o pagamento confirmar, passar para `vendido`.
+3. Um job ou um TTL libera retenções vencidas.
+
+No Redis, `SET assento:7 usuario NX EX 600` faz a retenção com expiração. Mas o banco continua sendo a fonte de verdade para a venda final, porque o Redis pode perder o dado em um failover.
+
+## Escala e sistemas distribuídos
+
+Se o recurso está particionado em shards, garanta que todas as operações sobre o mesmo recurso passem pelo mesmo shard (partição pela chave do recurso). Em eventos de alta disputa, como a abertura de vendas de um show, uma fila de espera na frente do sistema reduz a contenção: os usuários entram na fila e são admitidos em lotes.
+
+Para reservas que envolvem vários serviços (voo, hotel e carro), use uma saga com compensações: se o hotel falhar, cancele o voo já reservado.
+
+## Armadilhas
+
+- Verificar no cache e escrever no banco sem checagem condicional.
+- Lock que expira antes de a operação terminar.
+- Não tratar o pagamento duplicado: use chave de idempotência.
+
+<Callout type="tip" title="Frase de efeito">
+"Eu transformo check-then-act em uma operação atômica no banco e uso uma constraint como rede de segurança." Mostra que você conhece a raiz do problema.
+</Callout>
+
+## Na entrevista
+
+Cite a escrita condicional primeiro, depois a retenção com TTL. Follow-ups comuns: o que fazer se o pagamento falha, como lidar com overbooking proposital (companhias aéreas) e como escalar uma venda com milhões de pessoas disputando poucos itens.
+
+<QuizSet>
+<Quiz question="Qual comando evita a corrida entre verificar e reservar?" options={["SELECT seguido de UPDATE em transações separadas", "UPDATE com WHERE status livre e checagem das linhas afetadas", "Cache em memória local", "Retry após o erro"]} answer={1} explanation="A verificação e a escrita acontecem atomicamente dentro do banco." />
+<Quiz question="Para que serve a constraint UNIQUE nesse contexto?" options={["Acelerar leituras", "Impedir duas reservas do mesmo recurso e horário mesmo com bug na aplicação", "Criptografar dados", "Substituir o pagamento"]} answer={1} explanation="É uma garantia no nível do banco, independente da lógica da aplicação." />
+</QuizSet>

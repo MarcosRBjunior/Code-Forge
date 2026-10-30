@@ -1,0 +1,77 @@
+---
+title: Jobs assíncronos
+kind: lesson
+---
+
+Nem todo trabalho cabe dentro de uma requisição HTTP. Gerar um relatório, transcodificar um vídeo, enviar 50 mil e-mails ou redimensionar uma imagem levam segundos ou minutos. Se a API espera o fim, ela estoura timeouts e trava recursos. O padrão de **jobs assíncronos** responde rápido e executa o trabalho pesado em segundo plano.
+
+## Arquitetura básica
+
+```text
+Cliente -> API -> [fila] -> workers -> resultado (banco/storage)
+             |                              ^
+             +--- retorna 202 + job_id      |
+Cliente ---- GET /jobs/job_id (polling) ----+
+```
+
+1. A API valida o pedido, grava um registro do job com estado `pendente` e publica uma mensagem na fila.
+2. Responde `202 Accepted` com o `job_id`.
+3. Workers consomem a fila, processam e atualizam o estado (`executando`, `concluido`, `falhou`).
+4. O cliente descobre o resultado por polling, webhook ou notificação (WebSocket, push).
+
+A fila desacopla produtor e consumidor: picos de entrada ficam armazenados e os workers consomem no ritmo deles. Escalar significa adicionar workers.
+
+## Escolhendo a fila
+
+| Opção | Ponto forte | Observação |
+| --- | --- | --- |
+| SQS / RabbitMQ | Fila de tarefas com ack e retry | Ordem nem sempre garantida |
+| Kafka | Alto volume, reprocessamento | Paralelismo limitado pelas partições |
+| Redis (listas/streams) | Simples e rápido | Durabilidade menor |
+| Tabela no banco | Sem infraestrutura nova | Não escala bem em volumes altos |
+
+## Confiabilidade
+
+### Ack e visibilidade
+
+O worker só confirma (ack) depois de terminar. Se morrer no meio, a mensagem volta à fila após o timeout de visibilidade e outro worker a pega. Isso é entrega pelo menos uma vez, então **o job precisa ser idempotente**.
+
+### Retries com backoff
+
+Falhas transitórias (rede, limite de API) merecem nova tentativa com espera exponencial e jitter. Limite as tentativas; erros permanentes (dado inválido) não devem repetir.
+
+### Dead letter queue
+
+Depois de N falhas, a mensagem vai para uma fila de mensagens mortas, onde pode ser inspecionada e reprocessada manualmente. Sem ela, uma mensagem venenosa trava ou repete para sempre.
+
+### Jobs longos
+
+Para tarefas de horas, grave checkpoints de progresso e envie heartbeats para estender o timeout de visibilidade, permitindo retomar do ponto em que parou.
+
+## Prioridade e isolamento
+
+Use filas separadas por prioridade ou por tipo de job (e-mails urgentes não ficam atrás de um lote de relatórios). Defina limites de concorrência por cliente para que um tenant barulhento não consuma todos os workers.
+
+## Back pressure
+
+Se a fila cresce sem parar, os workers não dão conta. Monitore a profundidade da fila e a idade da mensagem mais antiga; escale os workers automaticamente por esse indicador e, em último caso, rejeite novos pedidos de baixa prioridade.
+
+## Armadilhas
+
+- Job não idempotente executado duas vezes (cobrança dobrada).
+- Mensagem grande demais: guarde o dado em storage e coloque só a referência na fila.
+- Sem visibilidade: registre o estado de cada job e exponha métricas.
+- Ordem: se importa, particione por chave (por exemplo, usuário) para manter a ordem por chave.
+
+<Callout type="tip" title="Gancho para outros tópicos">
+Quase todo design com e-mail, notificação, upload de mídia ou relatório usa esse padrão. Cite-o em uma frase e siga em frente, a menos que o entrevistador aprofunde.
+</Callout>
+
+## Na entrevista
+
+Descreva o fluxo 202 mais fila mais workers, e então mostre as defesas: idempotência, retry com backoff, DLQ e monitoramento da profundidade da fila. Follow-ups: como garantir que o job rode uma vez só, como cancelar um job em andamento e como priorizar clientes pagantes.
+
+<QuizSet>
+<Quiz question="Por que jobs em fila precisam ser idempotentes?" options={["Para economizar memória", "Porque a entrega pelo menos uma vez pode executar o mesmo job mais de uma vez", "Para ordenar a fila", "Porque workers são stateless"]} answer={1} explanation="Se o worker morre antes do ack, a mensagem volta e outro worker repete o job." />
+<Quiz question="Qual a função da dead letter queue?" options={["Acelerar jobs", "Guardar mensagens que falharam várias vezes para análise", "Criptografar mensagens", "Balancear workers"]} answer={1} explanation="Evita que mensagens venenosas fiquem em loop e permite inspeção e reprocessamento." />
+</QuizSet>

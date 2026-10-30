@@ -1,0 +1,124 @@
+---
+title: Projetar um serviço de notificações
+kind: lesson
+---
+
+Um serviço de notificações envia mensagens por vários canais (e-mail, SMS, push) respeitando preferências do usuário. O LLD gira em torno de duas ideias: canais intercambiáveis (Strategy) e um fluxo de decisão antes do envio (preferências, templates, tentativas).
+
+## Requisitos
+
+- Canais: e-mail, SMS e push, extensíveis.
+- Cada usuário escolhe quais canais aceita por tipo de notificação.
+- Mensagens vêm de templates com variáveis.
+- Falha em um canal não impede os demais; há novas tentativas limitadas.
+
+## Entidades
+
+| Entidade | Responsabilidade |
+| --- | --- |
+| `Canal` | Interface `enviar(destino, texto)`. |
+| `Template` | Texto com variáveis. |
+| `Preferencias` | Canais habilitados por tipo. |
+| `ServicoNotificacao` | Resolve canais, renderiza e envia com retentativas. |
+
+## Implementação
+
+```python
+from string import Template as Modelo
+from typing import Dict, List, Set
+
+
+class Canal:
+    nome = "base"
+
+    def enviar(self, destino: str, texto: str) -> None:
+        raise NotImplementedError
+
+
+class Email(Canal):
+    nome = "email"
+
+    def __init__(self):
+        self.enviados = []
+
+    def enviar(self, destino, texto):
+        self.enviados.append((destino, texto))
+
+
+class Sms(Canal):
+    nome = "sms"
+
+    def __init__(self, falhas_iniciais=0):
+        self.falhas = falhas_iniciais
+        self.enviados = []
+
+    def enviar(self, destino, texto):
+        if self.falhas > 0:
+            self.falhas -= 1
+            raise ConnectionError("operadora indisponível")
+        self.enviados.append((destino, texto))
+
+
+class Usuario:
+    def __init__(self, nome: str, contatos: Dict[str, str], preferencias: Dict[str, Set[str]]):
+        self.nome, self.contatos, self.preferencias = nome, contatos, preferencias
+
+
+class ServicoNotificacao:
+    def __init__(self, canais: List[Canal], tentativas: int = 3):
+        self.canais = {c.nome: c for c in canais}
+        self.templates: Dict[str, Modelo] = {}
+        self.tentativas = tentativas
+
+    def registrar(self, tipo: str, texto: str):
+        self.templates[tipo] = Modelo(texto)
+
+    def notificar(self, usuario: Usuario, tipo: str, **vars) -> Dict[str, bool]:
+        texto = self.templates[tipo].substitute(vars)
+        resultado = {}
+        for nome in usuario.preferencias.get(tipo, set()):
+            canal = self.canais.get(nome)
+            destino = usuario.contatos.get(nome)
+            if canal is None or destino is None:
+                continue
+            resultado[nome] = self._com_retentativa(canal, destino, texto)
+        return resultado
+
+    def _com_retentativa(self, canal: Canal, destino: str, texto: str) -> bool:
+        for _ in range(self.tentativas):
+            try:
+                canal.enviar(destino, texto)
+                return True
+            except ConnectionError:
+                continue
+        return False
+
+
+email, sms = Email(), Sms(falhas_iniciais=2)
+svc = ServicoNotificacao([email, sms])
+svc.registrar("pedido_enviado", "Olá $nome, seu pedido $pedido saiu para entrega.")
+u = Usuario("Ana", {"email": "ana@ex.com", "sms": "+5511999"},
+            {"pedido_enviado": {"email", "sms"}, "promo": {"email"}})
+print(svc.notificar(u, "pedido_enviado", nome="Ana", pedido="#42"))
+print(email.enviados[0][1])
+```
+
+O SMS falha duas vezes e funciona na terceira tentativa, sem afetar o e-mail. Retentativa real usa espera crescente (backoff) e fila, não laço imediato.
+
+## Extensões
+
+Fila assíncrona para desacoplar o produto que dispara do envio, prioridade (urgentes passam na frente), limite de frequência por usuário (evitar spam), agendamento e relatório de entrega. Novos canais exigem só uma nova classe, sem mexer no serviço (Open/Closed).
+
+## Concorrência
+
+Os envios são independentes e lentos (rede), então vale usar um pool de workers consumindo uma fila. Garanta idempotência: se o worker cair depois de enviar e antes de confirmar, o reenvio não pode duplicar a notificação; um id de notificação resolve.
+
+## Na entrevista
+
+- **"Como adicionar WhatsApp?"** Nova subclasse de `Canal`, registrada no serviço.
+- **"Onde ficam as preferências?"** Fora do canal. O canal só sabe enviar.
+
+<QuizSet>
+<Quiz question="Qual padrão torna os canais intercambiáveis?" options={["Singleton", "Strategy", "Memento", "Flyweight"]} answer={1} explanation="Cada canal implementa a mesma interface e o serviço escolhe quais usar." />
+<Quiz question="Para evitar duplicidade em reenvios, o que usar?" options={["Mais retentativas", "Id de notificação para idempotência", "Remover a fila", "Aumentar o timeout"]} answer={1} explanation="Com um id, o receptor ou o serviço descarta repetições." />
+</QuizSet>

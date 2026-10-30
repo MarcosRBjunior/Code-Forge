@@ -1,0 +1,75 @@
+---
+title: Projetar um serviço de configuração
+kind: lesson
+---
+
+Um serviço de configuração distribui parâmetros (feature flags, limites, endereços) para milhares de instâncias sem exigir novo deploy. É um sistema leitura-pesada, onde o erro mais caro é uma configuração ruim derrubar a frota inteira de uma vez.
+
+## Requisitos
+
+### Funcionais
+
+- Criar e editar configurações por aplicação, ambiente e região.
+- Aplicações leem valores e recebem atualizações.
+- Versionamento, histórico, auditoria e rollback.
+- Controle de acesso e aprovação para mudanças sensíveis.
+
+### Não funcionais
+
+- Leitura com latência mínima e altíssima disponibilidade: as aplicações não podem parar se o serviço cair.
+- Propagação de mudanças em segundos.
+- Mudanças seguras: rollout gradual e reversível.
+
+## Estimativas
+
+- 100 mil instâncias, cada uma consultando a cada 30 s: **3.300 leituras por segundo**. Pequeno.
+- Escritas raras: dezenas por hora. O volume total de dados cabe em memória.
+
+## Arquitetura
+
+```text
+ editor -> API de admin -> armazenamento versionado (consistente, ex.: banco com log)
+                                   |
+                                   '-> publica nova versão -> distribuidores regionais
+ instância: SDK -> agente local/cache -> distribuidor regional (poll longo ou push)
+                       '-> cópia em disco (fallback)
+```
+
+**Fonte da verdade consistente.** Edições vão para um armazenamento com consistência forte e histórico imutável de versões (semelhante a um repositório Git). Cada versão tem número crescente e checksum.
+
+**Distribuição em camadas.** O núcleo não recebe 100 mil conexões. Distribuidores regionais fazem cache da última versão e atendem as instâncias. Elas usam **long polling** ou streaming para receber a mudança, com um poll periódico como rede de segurança.
+
+**SDK resiliente.** O cliente mantém a última configuração boa em memória e em disco. Se o serviço está fora do ar ao iniciar, usa a cópia local. Falha do serviço de configuração nunca deve ser falha da aplicação.
+
+**Modelo de leitura.** Chave hierárquica com herança e sobrescrita: valor global, por ambiente, por região, por instância. A resolução acontece no servidor ou no SDK.
+
+```yaml
+app: checkout
+ambiente: prod
+config:
+  limite_itens: 50
+  nova_tela_pagamento:
+    ativa: true
+    percentual: 10
+```
+
+## Pontos críticos
+
+- **Rollout gradual:** aplique a mudança a 1%, depois 10%, depois todos, observando métricas; reverta automaticamente se os erros sobem.
+- **Validação:** esquema e checagem de tipo antes de publicar. Uma flag mal digitada não deve chegar a produção.
+- **Consistência entre instâncias:** durante a propagação, instâncias veem versões diferentes; o código deve tolerar isso. Cada leitura pode informar a versão em uso.
+- **Segredos:** não vão como configuração comum; use um cofre com referência.
+- **Auditoria e aprovação:** quem mudou o quê e quando.
+
+<Callout type="tip" title="Falhe aberto na leitura, fechado na escrita">
+A leitura degrada para a última versão boa local. A escrita exige validação e aprovação. Essa assimetria mostra maturidade operacional.
+</Callout>
+
+## Na entrevista
+
+Enfatize resiliência do cliente e rollout gradual. Follow-ups: push versus pull (pull simples e escalável, push mais rápido), como evitar a manada quando todas as instâncias consultam ao mesmo tempo (jitter) e como garantir rollback instantâneo (apontar para a versão anterior).
+
+<QuizSet>
+<Quiz question="O serviço de configuração caiu. O que as aplicações devem fazer?" options={["Parar de atender", "Usar a última configuração boa em cache local", "Reiniciar em loop", "Usar valores aleatórios"]} answer={1} explanation="O SDK mantém uma cópia local para que a falha do serviço não derrube a aplicação." />
+<Quiz question="Qual prática reduz o risco de uma configuração ruim?" options={["Publicar para todos de uma vez", "Rollout gradual com métricas e rollback automático", "Desativar validação", "Editar direto no servidor"]} answer={1} explanation="Expor a mudança a poucos primeiro limita o impacto e permite reverter." />
+</QuizSet>

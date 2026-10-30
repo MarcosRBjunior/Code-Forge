@@ -1,0 +1,65 @@
+---
+title: Arquitetura kappa
+kind: lesson
+---
+
+A arquitetura lambda obriga a manter duas implementações da mesma lógica. Jay Kreps, um dos criadores do Kafka, propôs uma simplificação: se o log de eventos for durável e puder ser relido, **um único pipeline de streaming** basta. Reprocessar o histórico passa a ser apenas "reler o log desde o começo". Essa é a **arquitetura kappa**.
+
+## Como funciona
+
+```text
+Fontes --> Log imutável (Kafka) --> Job de streaming v1 --> Tabela de saída v1
+                  |
+                  +-----------> Job de streaming v2 --> Tabela de saída v2
+```
+
+1. Todos os eventos entram em um log distribuído, com retenção longa (dias, meses ou indefinida, com armazenamento em camadas).
+2. Um job de streaming consome o log e mantém as visões derivadas.
+3. Para alterar a lógica ou corrigir um bug, você sobe uma **nova versão** do job que lê o log desde o offset zero e grava em uma tabela nova.
+4. Quando a nova versão alcança o tempo real, o tráfego de consulta é trocado para a nova tabela e a antiga é descartada.
+
+Não há camada batch separada: o reprocessamento é o mesmo código, rodando mais rápido e em paralelo sobre dados antigos.
+
+## Exemplo de reprocessamento
+
+```bash
+# novo consumidor, grupo novo, lendo do início do tópico
+kafka-consumer-groups --bootstrap-server broker:9092 \
+  --group contagem-v2 --topic visitas --reset-offsets --to-earliest --execute
+```
+
+O job `contagem-v2` percorre todo o histórico, constrói a tabela corrigida e só então assume o papel de principal.
+
+## O que você precisa para isso funcionar
+
+- **Retenção longa e barata no log:** guardar meses de eventos em disco local de brokers é caro. Muitos usam tiered storage ou arquivam em object storage.
+- **Processamento com estado e semântica forte:** o motor de streaming precisa de checkpoints e processamento efetivamente exatamente-uma-vez, para que o resultado reprocessado seja confiável.
+- **Eventos com tempo de evento e watermarks:** para lidar com dados atrasados e fora de ordem.
+- **Capacidade de reprocessar rápido:** reler um ano de dados a velocidade de streaming pode levar muito tempo se você não puder paralelizar.
+
+## Lambda versus kappa
+
+| Critério | Lambda | Kappa |
+| --- | --- | --- |
+| Bases de código | Duas | Uma |
+| Reprocessamento | Pelo batch | Releitura do log |
+| Complexidade operacional | Alta | Menor |
+| Análises muito pesadas sobre histórico | Batch otimizado | Menos eficiente |
+| Dependência | Dois motores | Log durável e bom motor de streaming |
+
+## Trade-offs
+
+Kappa não elimina todo trabalho em lote: consultas ad hoc sobre anos de dados ainda são mais eficientes em um warehouse ou lakehouse. Também exige disciplina com versionamento de jobs e de schemas dos eventos, porque reprocessar eventos antigos significa lidar com formatos antigos.
+
+<Callout type="tip" title="Na prática">
+Muitas empresas ficam entre os dois: streaming como caminho principal e um lakehouse alimentado pelo mesmo log para análises históricas. Não se prenda ao rótulo; descreva o fluxo de dados que você escolheria.
+</Callout>
+
+## Na entrevista
+
+Posicione kappa como resposta à crítica da lambda. Diga o requisito que o torna viável (log durável e streaming exato) e como se corrige um bug (novo job relendo do início e troca de tabela). Follow-up: "e se a retenção do Kafka for de sete dias?" (arquive em object storage e reprocesse a partir dele, ou use tiered storage).
+
+<QuizSet>
+<Quiz question="Como a arquitetura kappa reprocessa dados após corrigir um bug de lógica?" options={["Executando um job batch noturno separado", "Subindo uma nova versão do job de streaming que relê o log desde o início", "Apagando o log e pedindo reenvio às fontes", "Editando as saídas manualmente"]} answer={1} explanation="O log imutável e retido permite que uma nova versão do job reconstrua a visão do zero." />
+<Quiz question="Qual requisito é essencial para a kappa funcionar bem?" options={["Dois motores de processamento", "Log durável com retenção longa e streaming confiável", "Um banco relacional gigante", "Ausência de estado nos jobs"]} answer={1} explanation="Sem histórico preservado no log, não há como reprocessar com um único pipeline." />
+</QuizSet>

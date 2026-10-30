@@ -1,0 +1,107 @@
+---
+title: Thread pool
+kind: lesson
+---
+
+Criar uma thread para cada tarefa parece simples, mas tem custo: alocar a thread, escalonar, destruir. Com milhares de tarefas curtas, o custo de criar threads supera o trabalho útil, e o sistema pode esgotar memória. Um **thread pool** mantém um número fixo de threads trabalhadoras prontas, que pegam tarefas de uma **fila** e as executam, uma após a outra, reaproveitando as mesmas threads.
+
+## Componentes
+
+- **Fila de tarefas**: onde os pedidos de trabalho esperam. É compartilhada, então precisa ser segura para threads.
+- **Workers**: threads em laço que retiram uma tarefa da fila, executam e voltam a esperar.
+- **Interface de submissão**: método `submit(tarefa)` que enfileira e devolve um resultado futuro.
+- **Encerramento**: sinal para os workers pararem depois de esvaziar a fila.
+
+```text
+submit() --> [ fila: t1 t2 t3 t4 ... ] --> worker 1
+                                       --> worker 2
+                                       --> worker 3
+```
+
+## Implementação
+
+```python
+import queue
+import threading
+from concurrent.futures import Future
+
+
+class ThreadPool:
+    _PARAR = object()  # sentinela de encerramento
+
+    def __init__(self, tamanho: int) -> None:
+        self._fila: queue.Queue = queue.Queue()
+        self._workers = [
+            threading.Thread(target=self._laco, daemon=True) for _ in range(tamanho)
+        ]
+        for w in self._workers:
+            w.start()
+
+    def _laco(self) -> None:
+        while True:
+            item = self._fila.get()
+            if item is self._PARAR:
+                return
+            funcao, args, futuro = item
+            try:
+                futuro.set_result(funcao(*args))
+            except Exception as erro:  # o erro vai para o futuro, o worker sobrevive
+                futuro.set_exception(erro)
+
+    def submit(self, funcao, *args) -> Future:
+        futuro: Future = Future()
+        self._fila.put((funcao, args, futuro))
+        return futuro
+
+    def encerrar(self) -> None:
+        for _ in self._workers:
+            self._fila.put(self._PARAR)
+        for w in self._workers:
+            w.join()
+
+
+def quadrado(n: int) -> int:
+    return n * n
+
+
+pool = ThreadPool(3)
+futuros = [pool.submit(quadrado, n) for n in range(6)]
+assert [f.result() for f in futuros] == [0, 1, 4, 9, 16, 25]
+
+erro = pool.submit(lambda: 1 / 0)
+try:
+    erro.result()
+except ZeroDivisionError:
+    print("erro propagado pelo futuro")
+pool.encerrar()
+```
+
+A `queue.Queue` já faz o controle de concorrência (travas internas), então não é preciso um lock explícito. A sentinela, um item por worker, encerra todos de forma limpa.
+
+## Decisões de design
+
+| Decisão | Opções e trade-off |
+| --- | --- |
+| Tamanho | Tarefas de CPU: perto do número de núcleos. Tarefas de I/O: pode ser bem maior |
+| Fila | Ilimitada (risco de memória) ou limitada (aplica contrapressão) |
+| Fila cheia | Bloquear quem submete, rejeitar com erro, ou executar na thread chamadora |
+| Encerramento | Imediato (descarta pendentes) ou gracioso (termina a fila) |
+
+<Callout type="note" title="Em Python na prática">
+Use `concurrent.futures.ThreadPoolExecutor` em produção. Lembre que, por causa do GIL, threads aceleram tarefas de I/O, mas não de CPU pura: para CPU use processos.
+</Callout>
+
+## Armadilhas
+
+- **Deadlock por tarefas que esperam outras tarefas** do mesmo pool, quando todos os workers estão ocupados esperando.
+- **Exceções engolidas**: sem um futuro ou log, o erro desaparece.
+- **Pool grande demais**: mais threads que o necessário só aumentam troca de contexto.
+
+## Na entrevista
+
+Aparece como componente de sistemas como agendador de tarefas, servidor web e rate limiter. Follow-ups: "como dimensionar o pool?", "o que fazer quando a fila enche?", "como encerrar com elegância?". Relacione com o padrão produtor-consumidor, que é exatamente o mecanismo interno do pool.
+
+<QuizSet>
+<Quiz question="Qual o principal ganho de um thread pool?" options={["Evitar o custo de criar uma thread por tarefa", "Eliminar a necessidade de sincronização", "Executar mais rápido que processos sempre", "Remover a fila de tarefas"]} answer={0} explanation="Reutilizar workers evita o custo de criação e limita o número de threads." />
+<Quiz question="Qual a vantagem de uma fila limitada?" options={["Maior vazão", "Contrapressão: impede acúmulo ilimitado de tarefas", "Dispensa workers", "Ordena as tarefas por prioridade"]} answer={1} explanation="Uma fila limitada força quem submete a esperar ou ser rejeitado, protegendo a memória." />
+</QuizSet>

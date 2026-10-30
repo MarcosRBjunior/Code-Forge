@@ -1,0 +1,84 @@
+---
+title: Criptografia em repouso
+kind: lesson
+---
+
+O TLS protege os dados enquanto viajam. Mas um disco roubado, um backup que vaza, um snapshot compartilhado por engano ou um administrador curioso podem expor tudo o que está armazenado. A **criptografia em repouso** (*encryption at rest*) garante que, sem a chave, os bytes gravados em disco, em bucket ou em backup sejam ilegíveis.
+
+## Contra o que protege
+
+- Furto ou descarte inadequado de discos e mídias.
+- Acesso indevido ao armazenamento subjacente (snapshots, backups, volumes desanexados).
+- Vazamento de um bucket mal configurado (reduz o dano, mas não substitui controle de acesso).
+- Requisitos regulatórios: LGPD, PCI DSS e outros exigem proteção adequada de dados pessoais e de cartão.
+
+Não protege contra uma aplicação comprometida que já tem a chave e permissão de leitura, nem contra SQL injection: o banco decripta de forma transparente para quem consulta.
+
+## Níveis de criptografia
+
+| Nível | Quem criptografa | Protege contra | Observação |
+| --- | --- | --- | --- |
+| Disco ou volume | Sistema operacional ou nuvem (EBS, LUKS, BitLocker) | Roubo físico | Transparente; o mais simples |
+| Banco ou tabela (TDE) | O próprio banco | Acesso aos arquivos de dados e backups | Quem consulta o banco vê texto claro |
+| Aplicação (por campo) | O seu código, antes de gravar | Até administradores do banco | Mais seguro; perde busca e índices diretos |
+| Cliente (ponta a ponta) | O dispositivo do usuário | Também o próprio provedor | O servidor não consegue processar o dado |
+
+Para dados muito sensíveis (CPF, cartão, prontuário), criptografar no nível do campo é comum.
+
+## Envelope encryption
+
+Criptografar tudo diretamente com uma única chave mestra seria ineficiente e arriscado. O padrão usado por KMS de nuvem é a **criptografia em envelope**:
+
+```text
+Chave mestra (KEK) --- guardada no KMS/HSM, nunca sai
+      |
+      | cifra
+      v
+Chave de dados (DEK) --- uma por objeto, volume ou tabela
+      |
+      | cifra
+      v
+Dados
+```
+
+1. A aplicação pede ao KMS uma chave de dados (DEK).
+2. Usa a DEK para cifrar os dados localmente com AES-256-GCM.
+3. Guarda, junto aos dados, a DEK **cifrada** pela chave mestra (KEK).
+4. Para ler, pede ao KMS que decifre a DEK, e então decifra os dados.
+
+Vantagens: a chave mestra nunca é exposta, a rotação da KEK exige apenas recifrar as DEKs (pequenas), e cada objeto pode ter sua chave, limitando o raio de impacto de um vazamento.
+
+```python
+def gravar(kms, dados: bytes):
+    dek_clara, dek_cifrada = kms.gerar_chave_de_dados()
+    nonce, cifrado = aes_gcm_cifrar(dek_clara, dados)
+    descartar(dek_clara)                   # nunca persistir a chave em claro
+    return {"dek": dek_cifrada, "nonce": nonce, "dados": cifrado}
+```
+
+## Gestão de chaves
+
+- Chaves ficam num KMS ou HSM, com acesso por identidade e políticas mínimas.
+- **Rotação** periódica e procedimento para revogar uma chave comprometida.
+- **Separação de funções:** quem administra o armazenamento não deve controlar as chaves.
+- **Auditoria:** cada uso de chave gera um registro.
+- Perder a chave significa perder os dados de forma irrecuperável. Planeje backup das chaves e recuperação.
+
+## Trade-offs
+
+- Criptografar campos impede buscas por igualdade ou intervalo, a menos que se use técnicas como índices cegos (hash determinístico de um campo) com cuidado.
+- Há custo de CPU, normalmente baixo graças a instruções AES em hardware.
+- Mais complexidade operacional em backup, restauração e migração.
+
+<Callout type="tip" title="Padrão razoável">
+Ative a criptografia padrão de disco e de bucket (quase de graça nas nuvens) e acrescente criptografia por campo apenas para dados verdadeiramente sensíveis.
+</Callout>
+
+## Na entrevista
+
+Cubra os três estados do dado: em trânsito (TLS), em repouso (criptografia) e em uso. Explique envelope encryption e onde ficam as chaves. Follow-up: "como rotaciona a chave sem reescrever terabytes?" (rotaciona a KEK e recifra apenas as DEKs).
+
+<QuizSet>
+<Quiz question="Qual a vantagem da criptografia em envelope?" options={["Elimina a necessidade de KMS", "A chave mestra não sai do KMS e a rotação exige recifrar só as chaves de dados", "Torna os dados pesquisáveis", "Dispensa autenticação"]} answer={1} explanation="As DEKs cifram os dados e a KEK cifra as DEKs, limitando a exposição e facilitando a rotação." />
+<Quiz question="Um atacante explora SQL injection em um banco com TDE ativo. O que acontece?" options={["Os dados saem sempre cifrados", "O banco decripta de forma transparente e os dados saem em claro", "A injeção é bloqueada pelo TDE", "O disco é apagado"]} answer={1} explanation="TDE protege os arquivos em disco, não consultas feitas por quem já tem acesso via banco." />
+</QuizSet>

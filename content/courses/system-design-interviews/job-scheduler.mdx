@@ -1,0 +1,82 @@
+---
+title: Projetar um job scheduler
+kind: lesson
+---
+
+Um job scheduler executa tarefas em horários definidos (uma vez ou recorrentes) e garante que cada uma rode, mesmo com falhas de máquinas. É o cron distribuído: o difícil é não perder execuções, não duplicá-las e escalar para milhões de jobs.
+
+## Requisitos
+
+### Funcionais
+
+- Criar, atualizar e cancelar jobs com expressão de agendamento (por exemplo cron) ou horário único.
+- Executar o job no horário e registrar o resultado.
+- Retries com backoff, timeout e prioridade.
+- Consultar histórico e status.
+
+### Não funcionais
+
+- **Pelo menos uma execução** por disparo, com tentativa de evitar duplicatas.
+- Atraso de início pequeno (segundos).
+- Escala: milhões de jobs, milhares de disparos por segundo.
+- Tolerância a falha do scheduler e dos workers.
+
+## Estimativas
+
+- 10 milhões de jobs cadastrados, 1 milhão de execuções por hora ≈ **280 por segundo**, com picos nos horários cheios (todo mundo agenda "às 00:00").
+- Metadados pequenos: 1 KB por job = 10 GB.
+
+## Arquitetura
+
+```text
+ API -> banco de jobs (definição + proxima_execucao)
+           ^
+ scanner(s) consultam "proxima_execucao <= agora" -> fila de execução -> workers
+                                                         ^ ack/heartbeat   |
+                                          reaper reenfileira jobs sem heartbeat
+ workers gravam resultado e calculam a próxima execução
+```
+
+**Armazenamento.** Uma tabela com `job_id`, `agenda`, `proxima_execucao`, `estado` e índice em `proxima_execucao`. Particione por hash do `job_id` ou por faixa de tempo para dividir a carga entre scanners.
+
+**Scanner.** Periodicamente busca os jobs vencidos e os coloca na fila. Para vários scanners sem duplicar, cada um reclama o trabalho com atualização atômica:
+
+```sql
+UPDATE jobs
+SET estado = 'enfileirado', dono = :scanner, lease_ate = now() + interval '30 seconds'
+WHERE job_id IN (
+  SELECT job_id FROM jobs
+  WHERE proxima_execucao <= now() AND estado = 'pronto'
+  ORDER BY proxima_execucao LIMIT 100
+  FOR UPDATE SKIP LOCKED)
+RETURNING job_id;
+```
+
+`SKIP LOCKED` permite que vários scanners trabalhem em paralelo sem se bloquear.
+
+**Workers.** Consomem da fila, enviam heartbeat enquanto executam e confirmam ao final. Um **reaper** devolve à fila execuções cujo lease expirou, o que dá a garantia de pelo menos uma vez.
+
+**Recorrência.** Ao concluir, o job calcula a próxima execução a partir da agenda e atualiza `proxima_execucao`.
+
+**Timing wheel.** Para muitos temporizadores de curto prazo, uma estrutura em anel de baldes por tempo é mais eficiente que ordenar tudo.
+
+## Pontos críticos
+
+- **Duplicatas:** com pelo menos uma vez, jobs devem ser idempotentes; passe um ID de execução para o job deduplicar.
+- **Thundering herd:** muitos jobs às 00:00. Distribua com jitter e use filas com prioridade.
+- **Jobs longos:** heartbeat e checkpoints; timeout para matar travados.
+- **Dependências:** DAGs (job B só depois de A) exigem controle de estado extra, como um Airflow.
+- **Fuso horário e horário de verão:** armazene em UTC e resolva a agenda com a zona do usuário.
+
+<Callout type="tip" title="Lease em vez de lock">
+Em vez de manter um lock por toda a execução, use um lease com prazo renovado por heartbeat. Se o worker morre, o lease expira e outro assume.
+</Callout>
+
+## Na entrevista
+
+Descreva o banco de jobs, o scanner com reivindicação atômica e o reaper. Follow-ups: o que acontece se dois scanners pegam o mesmo job, como garantir que um job não rode em paralelo consigo mesmo e como escalar o scanner (particionar o espaço de jobs).
+
+<QuizSet>
+<Quiz question="Como vários scanners evitam disparar o mesmo job?" options={["Esperando aleatoriamente", "Reivindicando jobs com atualização atômica ou SKIP LOCKED", "Rodando um só scanner sempre", "Duplicando no worker"]} answer={1} explanation="A reivindicação atômica garante que só um scanner enfileire cada job." />
+<Quiz question="O que o reaper faz?" options={["Apaga jobs antigos", "Reenfileira execuções cujo lease expirou", "Cria novos jobs", "Muda a agenda"]} answer={1} explanation="Ele recupera trabalho de workers que morreram sem confirmar." />
+</QuizSet>
