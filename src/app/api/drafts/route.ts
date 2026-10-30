@@ -2,10 +2,11 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getDb, drafts } from "@/db";
 import { ChapterKey, parseBody } from "@/lib/api";
+import { LANGS } from "@/lib/langs";
 
 const SaveDraft = z.object({
   key: ChapterKey,
-  language: z.enum(["python", "javascript"]),
+  language: z.enum(LANGS as [string, ...string[]]),
   code: z.string().max(65536),
 });
 

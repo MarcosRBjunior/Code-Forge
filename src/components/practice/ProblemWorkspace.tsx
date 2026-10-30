@@ -1,8 +1,9 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { getSandbox, type Compare, type Language, type RunOutcome, type TestCase, type ValueType } from "./runner";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getSandbox, isRemote, type Compare, type Language, type RunOutcome, type TestCase, type ValueType } from "./runner";
+import { allStarters, isLang, LANG_LABEL, type ProblemShape } from "@/lib/langs";
 import { PROGRESS_EVENT, type ProgressEventDetail } from "@/lib/events";
 
 const Editor = dynamic(() => import("@monaco-editor/react").then((m) => m.default), {
@@ -21,8 +22,6 @@ export interface ProblemSpec {
   starter: { python: string; javascript: string };
   tests: TestCase[];
 }
-
-const LANG_LABEL: Record<Language, string> = { python: "Python 3", javascript: "JavaScript" };
 
 function useDataTheme() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -50,8 +49,10 @@ export function ProblemWorkspace({
   /** false = modo "sem executar" da mock interview: o candidato valida exemplos de cabeça. */
   allowRun?: boolean;
 }) {
+  const starters = useMemo(() => allStarters(problem as unknown as ProblemShape), [problem]);
+  const available = useMemo(() => (Object.keys(LANG_LABEL) as Language[]).filter((l) => starters[l] !== undefined), [starters]);
   const [language, setLanguage] = useState<Language>("python");
-  const [code, setCode] = useState<Record<Language, string>>(problem.starter);
+  const [code, setCode] = useState<Partial<Record<Language, string>>>(starters);
   const [running, setRunning] = useState(false);
   const [interpreter, setInterpreter] = useState<"loading" | "ready" | "error">("loading");
   const [outcome, setOutcome] = useState<RunOutcome | null>(null);
@@ -62,14 +63,14 @@ export function ProblemWorkspace({
   // Rascunhos salvos + linguagem preferida
   useEffect(() => {
     const savedLang = localStorage.getItem("cf-lang");
-    if (savedLang === "python" || savedLang === "javascript") setLanguage(savedLang);
+    if (isLang(savedLang) && starters[savedLang] !== undefined) setLanguage(savedLang);
     fetch(`/api/state?chapter=${chapterKey}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((s: { drafts: Partial<Record<Language, string>> } | null) => {
         if (s?.drafts) setCode((c) => ({ ...c, ...s.drafts }));
       })
       .catch(() => {});
-  }, [chapterKey]);
+  }, [chapterKey, starters]);
 
   // Pré-carrega o interpretador da linguagem atual
   useEffect(() => {
@@ -96,7 +97,8 @@ export function ProblemWorkspace({
     setRunning(true);
     setOutcome(null);
     const result = await getSandbox(language).run({
-      code: code[language],
+      code: code[language] ?? "",
+      key: chapterKey,
       fn: language === "python" ? problem.fn : problem.fnJs,
       checkArg: problem.checkArg ?? -1,
       compare: problem.compare ?? "exact",
@@ -151,17 +153,17 @@ export function ProblemWorkspace({
           }}
           className="rounded-md border border-line-input bg-surface-1 px-2 py-1 text-sm"
         >
-          {(Object.keys(LANG_LABEL) as Language[]).map((l) => (
+          {available.map((l) => (
             <option key={l} value={l}>{LANG_LABEL[l]}</option>
           ))}
         </select>
         <span className="text-xs text-fg-subtle">
-          {interpreter === "loading" ? "Carregando interpretador…" : interpreter === "error" ? "Falha ao carregar o interpretador" : "Pronto"}
+          {isRemote(language) ? "Compila e executa em serviço externo" : interpreter === "loading" ? "Carregando interpretador…" : interpreter === "error" ? "Falha ao carregar o interpretador" : "Pronto"}
         </span>
         <button
           type="button"
           onClick={() => {
-            if (confirm("Restaurar o código inicial? O rascunho atual será substituído.")) onChange(problem.starter[language]);
+            if (confirm("Restaurar o código inicial? O rascunho atual será substituído.")) onChange(starters[language] ?? "");
           }}
           className="ml-auto rounded-md px-2.5 py-1 text-sm text-fg-muted hover:bg-surface-2"
         >
@@ -182,7 +184,7 @@ export function ProblemWorkspace({
       <div className="h-[380px]">
         <Editor
           language={language}
-          value={code[language]}
+          value={code[language] ?? ""}
           onChange={onChange}
           theme={theme === "dark" ? "vs-dark" : "light"}
           options={{
@@ -207,7 +209,7 @@ export function ProblemWorkspace({
           </p>
         )}
         {running && <p className="text-fg-muted">Rodando os testes…</p>}
-        {outcome?.kind === "timeout" && <p className="font-medium text-danger">Tempo limite excedido (6 s). Verifique se há um laço infinito.</p>}
+        {outcome?.kind === "timeout" && <p className="font-medium text-danger">Tempo limite excedido. Verifique se há um laço infinito.</p>}
         {outcome?.kind === "error" && <p className="font-medium text-danger">{outcome.message}</p>}
         {outcome?.kind === "compile_error" && (
           <>

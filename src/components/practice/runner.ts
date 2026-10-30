@@ -2,9 +2,14 @@
  * Execução de código 100% no navegador, sem servidor (custo zero):
  * - Python: Pyodide (CPython compilado para WebAssembly) dentro de um Web Worker.
  * - JavaScript: Web Worker dedicado.
+ * - TypeScript: tipos removidos no navegador (sucrase) e executado no worker de JavaScript.
+ * - Java, C++, C# e Go: enviados a /api/run, que compila e roda num serviço externo (Judge0).
  * O worker isola o código da página; loops infinitos são interrompidos com worker.terminate().
  */
-export type Language = "python" | "javascript";
+import type { Lang } from "@/lib/langs";
+import { REMOTE_LANGS } from "@/lib/langs";
+
+export type Language = Lang;
 
 export interface TestCase {
   input: unknown[];
@@ -48,6 +53,8 @@ export interface RunJob {
   /** Problema de design: fn é uma classe; cada teste é [operações, argumentos] e espera a lista de retornos. */
   design: boolean;
   tests: TestCase[];
+  /** Chave "<curso>/<capitulo>" do problema; o executor remoto monta o programa de teste a partir dela. */
+  key?: string;
 }
 
 const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.27.2/full/";
@@ -403,8 +410,64 @@ class SandboxWorker {
   }
 }
 
-const sandboxes: Partial<Record<Language, SandboxWorker>> = {};
-
-export function getSandbox(language: Language) {
-  return (sandboxes[language] ??= new SandboxWorker(language === "python" ? PY_WORKER : JS_WORKER));
+/** O que o editor precisa de qualquer executor, local ou remoto. */
+export interface Sandbox {
+  warmUp(): Promise<void>;
+  run(job: Omit<RunJob, "language">): Promise<RunOutcome>;
 }
+
+/** TypeScript: remove os tipos (sucrase, carregado só quando usado) e roda como JavaScript. */
+class TypeScriptSandbox implements Sandbox {
+  constructor(private js: Sandbox) {}
+  warmUp() {
+    return this.js.warmUp();
+  }
+  async run(job: Omit<RunJob, "language">): Promise<RunOutcome> {
+    let code: string;
+    try {
+      const { transform } = await import("sucrase");
+      code = transform(job.code, { transforms: ["typescript"] }).code;
+    } catch (err) {
+      return { kind: "compile_error", message: (err as Error).message };
+    }
+    return this.js.run({ ...job, code });
+  }
+}
+
+/** Java, C++, C# e Go: compilados e executados fora do navegador. */
+class RemoteSandbox implements Sandbox {
+  constructor(private language: Language) {}
+  warmUp() {
+    return Promise.resolve();
+  }
+  async run(job: Omit<RunJob, "language">): Promise<RunOutcome> {
+    if (!job.key) return { kind: "error", message: "Este problema não pode ser executado nesta linguagem." };
+    try {
+      const res = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: job.key, language: this.language, code: job.code }),
+        signal: AbortSignal.timeout(50_000),
+      });
+      const data = await res.json();
+      if (!res.ok) return { kind: "error", message: data?.error?.message ?? "Falha ao executar." };
+      return data as RunOutcome;
+    } catch (err) {
+      return (err as Error).name === "TimeoutError" ? { kind: "timeout" } : { kind: "error", message: "Não foi possível falar com o serviço de execução." };
+    }
+  }
+}
+
+const sandboxes: Partial<Record<Language, Sandbox>> = {};
+
+export function getSandbox(language: Language): Sandbox {
+  if (!sandboxes[language]) {
+    if (language === "python") sandboxes[language] = new SandboxWorker(PY_WORKER);
+    else if (language === "javascript") sandboxes[language] = new SandboxWorker(JS_WORKER);
+    else if (language === "typescript") sandboxes[language] = new TypeScriptSandbox(getSandbox("javascript"));
+    else sandboxes[language] = new RemoteSandbox(language);
+  }
+  return sandboxes[language]!;
+}
+
+export const isRemote = (language: Language) => (REMOTE_LANGS as string[]).includes(language);
