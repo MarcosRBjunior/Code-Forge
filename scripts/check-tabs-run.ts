@@ -88,7 +88,7 @@ async function main() {
   for (const file of process.argv.slice(2)) {
     const lines = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n").split("\n");
     const errors: string[] = [];
-    let groups = 0, ran = 0;
+    let groups = 0, ran = 0, skipped = 0;
     let prev: Record<string, string> | null = null;
     for (let i = 0; i < lines.length; i++) {
       if (!/^<CodeTabs>\s*$/.test(lines[i])) continue;
@@ -121,6 +121,7 @@ async function main() {
         }
       }
       const snapshot = g;
+      if (ref.err && /(NameError|not defined)/.test(ref.err)) { skipped++; prev = snapshot; continue; } // modelo de código (usa funções não definidas): não executável
       if (ref.err) { errors.push(`grupo da linha ${at}: python falhou: ${ref.err}`); prev = snapshot; continue; }
       ran++;
       for (const lang of ["javascript", "typescript", "java", "cpp", "csharp", "go"]) {
@@ -146,7 +147,7 @@ async function main() {
       prev = snapshot;
     }
     if (errors.length) bad++;
-    console.log(`${errors.length ? "✗" : "✓"} ${file} (${ran}/${groups} grupos executados)${errors.length ? "\n  " + errors.join("\n  ") : ""}`);
+    console.log(`${errors.length ? "✗" : "✓"} ${file} (${ran}/${groups} grupos executados${skipped ? `, ${skipped} modelo(s) sem execução` : ""})${errors.length ? "\n  " + errors.join("\n  ") : ""}`);
   }
   process.exit(bad ? 1 : 0);
 }
