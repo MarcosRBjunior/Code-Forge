@@ -18,7 +18,7 @@ const norm = (s: string) => s.toLowerCase().replace(/(\d)\.0+(?!\d)/g, "$1").rep
 function wrapJava(code: string) {
   if (/class Main\b/.test(code)) return code;
   const imports: string[] = [];
-  const body = code.split("\n").filter((l) => (/^import /.test(l) ? (imports.push(l), false) : true)).map((l) => l.replace(/^(class|record|interface|enum) /, "static $1 "));
+  const body = code.split("\n").filter((l) => (/^import /.test(l) ? (imports.push(l), false) : true)).map((l) => l.replace(/^((?:abstract |final )?(?:class|record|interface|enum)) /, "static $1 "));
   return `${imports.join("\n")}\npublic class Main {\n${body.join("\n")}\n}\n`;
 }
 function wrapCs(code: string) {
