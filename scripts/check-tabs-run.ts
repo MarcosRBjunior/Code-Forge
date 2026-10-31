@@ -13,7 +13,7 @@ import type { Lang } from "../src/lib/langs";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // compara ignorando colchetes, aspas, vírgulas e espaços (cada linguagem imprime listas de um jeito)
-const norm = (s: string) => s.toLowerCase().replace(/[\[\]'",\s]+/g, " ").trim();
+const norm = (s: string) => s.toLowerCase().replace(/[\[\]()'",\s]+/g, " ").trim();
 
 function wrapJava(code: string) {
   if (/class Main\b/.test(code)) return code;
@@ -34,7 +34,7 @@ function runLocal(cmd: string, args: string[], file: string, code: string) {
   const f = path.join(dir, file);
   fs.writeFileSync(f, code);
   const r = spawnSync(cmd, [...args, f], { cwd: dir, encoding: "utf8", timeout: 30000, env: { ...process.env, PYTHONHASHSEED: "0" } });
-  return r.status === 0 ? { out: r.stdout ?? "" } : { err: (r.stderr || r.error?.message || "erro").slice(-500) };
+  return r.status === 0 ? { out: (r.stdout ?? "").split("\r\n").join("\n") } : { err: (r.stderr || r.error?.message || "erro").slice(-500) };
 }
 
 function addStub(lang: string, code: string) {
@@ -59,6 +59,29 @@ async function run(lang: string, code: string): Promise<{ out?: string; err?: st
   }
 }
 
+// Grupos que dependem do anterior (o Python usa uma função definida no bloco de cima): o código do grupo anterior,
+// sem o ponto de entrada, é colocado antes.
+function stripMain(lang: string, code: string) {
+  const re = { java: /^public static void main\(/m, cpp: /^int main\(/m, csharp: /^static void Main\(/m, go: /^func main\(/m }[lang as "java"];
+  if (!re) return code;
+  const k = code.search(re);
+  return k < 0 ? code : code.slice(0, k);
+}
+function importsGo(code: string) {
+  const set = new Set<string>();
+  const body = code.replace(/^import\s*\(([\s\S]*?)\)\s*$/gm, (_, inner) => (inner.split("\n").forEach((l: string) => l.trim() && set.add(l.trim())), "")).replace(/^import\s+("[^"]+")\s*$/gm, (_, x) => (set.add(x), ""));
+  return { set, body };
+}
+function chain(lang: string, prev: string, cur: string) {
+  if (lang === "go") {
+    const a = importsGo(stripMain("go", prev)), b = importsGo(cur);
+    const all = new Set([...a.set, ...b.set]);
+    return `import (\n${[...all].map((x) => "\t" + x).join("\n")}\n)\n${a.body}\n${b.body}`;
+  }
+  if (lang === "javascript" || lang === "typescript" || lang === "python") return prev + "\n" + cur;
+  return stripMain(lang, prev) + "\n" + cur;
+}
+
 async function main() {
   const only = process.env.ONLY_LANGS?.split(",");
   let bad = 0;
@@ -66,6 +89,7 @@ async function main() {
     const lines = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n").split("\n");
     const errors: string[] = [];
     let groups = 0, ran = 0;
+    let prev: Record<string, string> | null = null;
     for (let i = 0; i < lines.length; i++) {
       if (!/^<CodeTabs>\s*$/.test(lines[i])) continue;
       groups++;
@@ -81,16 +105,45 @@ async function main() {
         i = j;
       }
       const printed = /\bprint\(/.test(g.python ?? ""); // sem print: só confere que compila (acrescenta um main vazio)
-      const ref = await run("python", g.python);
-      if (ref.err) { errors.push(`grupo da linha ${at}: python falhou: ${ref.err}`); continue; }
+      let ref = await run("python", g.python);
+      let chained = false;
+      let expected = ref.out ?? "";
+      if (ref.err && prev && /not defined/.test(ref.err)) {
+        chained = true;
+        const before = await run("python", prev.python);
+        const all = await run("python", chain("python", prev.python, g.python));
+        ref = all.err ? all : { out: "" };
+        expected = all.out ?? "";
+        if (!all.err) {
+          const cut = (before.out ?? "").length;
+          expected = (all.out ?? "").slice(cut);
+          (ref as { out?: string }).out = expected;
+        }
+      }
+      const snapshot = g;
+      if (ref.err) { errors.push(`grupo da linha ${at}: python falhou: ${ref.err}`); prev = snapshot; continue; }
       ran++;
       for (const lang of ["javascript", "typescript", "java", "cpp", "csharp", "go"]) {
         if (only && !only.includes(lang)) continue;
-        const r = await run(lang, printed ? (g[lang] ?? "") : addStub(lang, g[lang] ?? ""));
+        const own = g[lang] ?? "";
+        let r = await run(lang, printed ? (chained ? chain(lang, prev![lang] ?? "", own) : own) : addStub(lang, own));
+        let usedChain = chained;
+        // sem dependência detectada no Python, mas a tradução pode depender do bloco anterior (ex.: classe MinHeap definida acima)
+        if (r.err && !chained && prev && prev[lang]) {
+          const r2 = await run(lang, printed ? chain(lang, prev[lang], own) : addStub(lang, chain(lang, prev[lang], own)));
+          if (!r2.err) { r = r2; usedChain = true; }
+        }
+        let got = r.out ?? "";
+        if (usedChain && (lang === "javascript" || lang === "typescript") && !r.err) {
+          const pre = await run("python", prev!.python); // o código anterior também imprime
+          const k = (pre.out ?? "").length;
+          if (norm(got.slice(0, k)) === norm(pre.out ?? "")) got = got.slice(k);
+        }
         if (r.err) errors.push(`grupo da linha ${at} [${lang}]: ${r.err}`);
-        else if (printed && norm(r.out!) !== norm(ref.out!)) errors.push(`grupo da linha ${at} [${lang}]: saída difere\n    python: ${JSON.stringify(norm(ref.out!).slice(0, 200))}\n    ${lang}: ${JSON.stringify(norm(r.out!).slice(0, 200))}`);
+        else if (printed && norm(got) !== norm(expected)) errors.push(`grupo da linha ${at} [${lang}]: saída difere\n    python: ${JSON.stringify(norm(expected).slice(0, 200))}\n    ${lang}: ${JSON.stringify(norm(got).slice(0, 200))}`);
         if (!["javascript"].includes(lang)) await sleep(350);
       }
+      prev = snapshot;
     }
     if (errors.length) bad++;
     console.log(`${errors.length ? "✗" : "✓"} ${file} (${ran}/${groups} grupos executados)${errors.length ? "\n  " + errors.join("\n  ") : ""}`);
