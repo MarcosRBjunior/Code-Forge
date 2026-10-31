@@ -75,7 +75,9 @@ function importsGo(code: string) {
 function chain(lang: string, prev: string, cur: string) {
   if (lang === "go") {
     const a = importsGo(stripMain("go", prev)), b = importsGo(cur);
-    const all = new Set([...a.set, ...b.set]);
+    const corpo = a.body + b.body;
+    // Go recusa import sem uso: mantém só os pacotes que o código junto realmente referencia
+    const all = new Set([...a.set, ...b.set].filter((imp) => new RegExp("\\b" + imp.replace(/"/g, "").split("/").pop() + "\\.").test(corpo)));
     return `import (\n${[...all].map((x) => "\t" + x).join("\n")}\n)\n${a.body}\n${b.body}`;
   }
   if (lang === "javascript" || lang === "typescript" || lang === "python") return prev + "\n" + cur;
