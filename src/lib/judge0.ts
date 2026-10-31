@@ -39,6 +39,8 @@ async function submit(lang: Lang, source: string): Promise<Judge0Result> {
       source_code: Buffer.from(source, "utf8").toString("base64"),
       // Sem isso o tsc do serviço compila para ES3/ES5 e recusa Map, BigInt, includes etc.
       ...(lang === "typescript" && { compiler_options: "--target esnext --lib esnext,dom" }),
+      // Sem -pthread o std::thread compila mas não linka ("undefined reference to pthread_create").
+      ...(lang === "cpp" && { compiler_options: "-pthread" }),
       cpu_time_limit: 5,
       wall_time_limit: 15,
     }),
