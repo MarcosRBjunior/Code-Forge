@@ -109,7 +109,7 @@ async function main() {
         g[m[1]] = lines.slice(s, j).join("\n");
         i = j;
       }
-      const printed = /\bprint\(/.test(g.python ?? ""); // sem print: só confere que compila (acrescenta um main vazio)
+      const printed = /^print\(/m.test(g.python ?? ""); // sem print: só confere que compila (acrescenta um main vazio)
       let ref = await run("python", g.python);
       let expected = ref.out ?? "";
       if (ref.err && /(NameError|not defined)/.test(ref.err) && acc.python) {
