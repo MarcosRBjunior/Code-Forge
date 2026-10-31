@@ -13,7 +13,7 @@ import type { Lang } from "../src/lib/langs";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // compara ignorando colchetes, aspas, vírgulas e espaços (cada linguagem imprime listas de um jeito)
-const norm = (s: string) => s.toLowerCase().replace(/\bmap(?=\[)/g, "").replace(/[\[\]()'",{}:=\s]+/g, " ").trim();
+const norm = (s: string) => s.toLowerCase().replace(/\bmap(?=\[)/g, "").replace(/\b(null|nil|none|undefined|nullopt)\b/g, "none").replace(/[\[\]()'",{}:=\s]+/g, " ").trim();
 
 function wrapJava(code: string) {
   if (/class Main\b/.test(code)) return code;
