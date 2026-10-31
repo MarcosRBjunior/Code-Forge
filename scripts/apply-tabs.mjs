@@ -1,7 +1,7 @@
 /**
  * Envolve o N-ésimo bloco ```python solto de um capítulo em <CodeTabs>, anexando as outras 6 linguagens.
  *   node scripts/apply-tabs.mjs <capitulo.mdx> <pasta-com-1.md,2.md,...>
- * Cada <N>.md tem os blocos javascript, typescript, java, cpp, csharp, go (nesta ordem). N conta os blocos Python soltos, de cima para baixo.
+ * Se faltar o arquivo <N>.md, o bloco fica só em Python. Cada <N>.md tem os blocos javascript, typescript, java, cpp, csharp, go (nesta ordem). N conta os blocos Python soltos, de cima para baixo.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -21,7 +21,7 @@ for (let i = 0; i < lines.length; i++) {
     const py = lines.slice(i, j + 1).join("\n");
     n++;
     const f = path.join(dir, `${n}.md`);
-    if (!fs.existsSync(f)) { console.error(`falta ${f}`); process.exit(1); }
+    if (!fs.existsSync(f)) { out.push(...lines.slice(i, j + 1)); i = j; continue; } // sem tradução: o bloco fica só em Python (pseudocódigo ou dependente de infraestrutura)
     const extra = fs.readFileSync(f, "utf8").replace(/\r\n/g, "\n").trim();
     out.push("<CodeTabs>", "", py, "", extra, "", "</CodeTabs>");
     i = j;
@@ -30,6 +30,6 @@ for (let i = 0; i < lines.length; i++) {
   out.push(l);
 }
 const extraFiles = fs.readdirSync(dir).filter((x) => /^\d+\.md$/.test(x)).length;
-if (extraFiles !== n) { console.error(`${n} blocos python, ${extraFiles} arquivos`); process.exit(1); }
+if (extraFiles > n) { console.error(`${n} blocos python, ${extraFiles} arquivos`); process.exit(1); }
 fs.writeFileSync(file, out.join(crlf ? "\r\n" : "\n"));
 console.log(`${file}: ${n} grupos`);
