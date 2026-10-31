@@ -13,7 +13,7 @@ import type { Lang } from "../src/lib/langs";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // compara ignorando colchetes, aspas, vírgulas e espaços (cada linguagem imprime listas de um jeito)
-const norm = (s: string) => s.toLowerCase().replace(/[\[\]()'",\s]+/g, " ").trim();
+const norm = (s: string) => s.toLowerCase().replace(/\bmap(?=\[)/g, "").replace(/[\[\]()'",{}:=\s]+/g, " ").trim();
 
 function wrapJava(code: string) {
   if (/class Main\b/.test(code)) return code;
@@ -84,11 +84,14 @@ function chain(lang: string, prev: string, cur: string) {
 
 async function main() {
   const only = process.env.ONLY_LANGS?.split(",");
+  const LANGS = ["javascript", "typescript", "java", "cpp", "csharp", "go"];
   let bad = 0;
   for (const file of process.argv.slice(2)) {
     const lines = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n").split("\n");
     const errors: string[] = [];
     let groups = 0, ran = 0, skipped = 0;
+    // código dos grupos anteriores (sem modelos): blocos posteriores podem depender de classes e funções definidas antes
+    const acc: Record<string, string> = {};
     let prev: Record<string, string> | null = null;
     for (let i = 0; i < lines.length; i++) {
       if (!/^<CodeTabs>\s*$/.test(lines[i])) continue;
@@ -106,45 +109,44 @@ async function main() {
       }
       const printed = /\bprint\(/.test(g.python ?? ""); // sem print: só confere que compila (acrescenta um main vazio)
       let ref = await run("python", g.python);
-      let chained = false;
       let expected = ref.out ?? "";
-      if (ref.err && prev && /not defined/.test(ref.err)) {
-        chained = true;
-        const before = await run("python", prev.python);
-        const all = await run("python", chain("python", prev.python, g.python));
-        ref = all.err ? all : { out: "" };
-        expected = all.out ?? "";
-        if (!all.err) {
-          const cut = (before.out ?? "").length;
-          expected = (all.out ?? "").slice(cut);
-          (ref as { out?: string }).out = expected;
-        }
+      if (ref.err && /(NameError|not defined)/.test(ref.err) && acc.python) {
+        const before = await run("python", acc.python);
+        const all = await run("python", acc.python + "\n" + g.python);
+        ref = all;
+        if (!all.err) expected = (all.out ?? "").slice((before.out ?? "").length);
       }
-      const snapshot = g;
-      if (ref.err && /(NameError|not defined)/.test(ref.err)) { skipped++; prev = snapshot; continue; } // modelo de código (usa funções não definidas): não executável
-      if (ref.err) { errors.push(`grupo da linha ${at}: python falhou: ${ref.err}`); prev = snapshot; continue; }
+      if (ref.err && /(NameError|not defined)/.test(ref.err)) { skipped++; prev = g; continue; } // modelo de código (usa funções não definidas): não executável
+      if (ref.err) { errors.push(`grupo da linha ${at}: python falhou: ${ref.err}`); prev = g; continue; }
       ran++;
-      for (const lang of ["javascript", "typescript", "java", "cpp", "csharp", "go"]) {
+      for (const lang of LANGS) {
         if (only && !only.includes(lang)) continue;
         const own = g[lang] ?? "";
-        let r = await run(lang, printed ? (chained ? chain(lang, prev![lang] ?? "", own) : own) : addStub(lang, own));
-        let usedChain = chained;
-        // sem dependência detectada no Python, mas a tradução pode depender do bloco anterior (ex.: classe MinHeap definida acima)
-        if (r.err && !chained && prev && prev[lang]) {
-          const r2 = await run(lang, printed ? chain(lang, prev[lang], own) : addStub(lang, chain(lang, prev[lang], own)));
-          if (!r2.err) { r = r2; usedChain = true; }
+        const prep = (code: string) => (printed ? code : addStub(lang, code));
+        // 1) sozinho; 2) depois de todo o código anterior; 3) depois só do bloco imediatamente anterior
+        const tentativas: (string | null)[] = [null];
+        if (acc[lang]) tentativas.push(acc[lang]);
+        if (prev && prev[lang] && prev[lang] !== acc[lang]) tentativas.push(prev[lang]);
+        let r: { out?: string; err?: string } = { err: "sem tentativa" };
+        let prefixo: string | null = null;
+        for (const base of tentativas) {
+          r = await run(lang, prep(base === null ? own : chain(lang, base, own)));
+          prefixo = base;
+          if (!r.err) break;
+          if (!["javascript"].includes(lang)) await sleep(350);
         }
         let got = r.out ?? "";
-        if (usedChain && (lang === "javascript" || lang === "typescript") && !r.err) {
-          const pre = await run("python", prev!.python); // o código anterior também imprime
+        if (prefixo !== null && !r.err && (lang === "javascript" || lang === "typescript")) {
+          const pre = await run(lang, prefixo); // o código anterior também imprime
           const k = (pre.out ?? "").length;
-          if (norm(got.slice(0, k)) === norm(pre.out ?? "")) got = got.slice(k);
+          if (!pre.err && norm(got.slice(0, k)) === norm(pre.out ?? "")) got = got.slice(k);
         }
         if (r.err) errors.push(`grupo da linha ${at} [${lang}]: ${r.err}`);
         else if (printed && norm(got) !== norm(expected)) errors.push(`grupo da linha ${at} [${lang}]: saída difere\n    python: ${JSON.stringify(norm(expected).slice(0, 200))}\n    ${lang}: ${JSON.stringify(norm(got).slice(0, 200))}`);
         if (!["javascript"].includes(lang)) await sleep(350);
       }
-      prev = snapshot;
+      for (const l of ["python", ...LANGS]) acc[l] = acc[l] ? chain(l, acc[l], g[l] ?? "") : (g[l] ?? "");
+      prev = g;
     }
     if (errors.length) bad++;
     console.log(`${errors.length ? "✗" : "✓"} ${file} (${ran}/${groups} grupos executados${skipped ? `, ${skipped} modelo(s) sem execução` : ""})${errors.length ? "\n  " + errors.join("\n  ") : ""}`);
