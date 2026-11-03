@@ -10,14 +10,10 @@ python, javascript, typescript, java, cpp, csharp, go.
 | dsa | 50 de 50 | completo |
 | system-design | 63 de 71 | os 8 restantes ficam só em Python (abaixo) |
 | system-design-interviews | 13 de 14 | só `spark` fica em Python (abaixo) |
-| lld | 95 de 107 | completo no que dá: dos 12 restantes, 8 não têm bloco Python (são conceituais) e 4 ficam só em Python de propósito (abaixo) |
+| lld | 99 de 107 | completo: os 8 restantes não têm bloco Python (são conceituais) |
 | concorrencia, redes, sistemas-operacionais, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de escopo: o código depende de APIs do Python (`threading`, `struct`, `socket`, `os`, `math`, `random`); uma versão em outra linguagem seria outro programa |
 
-Capítulos de LLD deixados só em Python de propósito:
-
-- `abstract-factory`: usa HMAC com SHA-256 e SHA-1 (C++ não tem isso na biblioteca padrão).
-- `facade`: imprime um id baseado em `hash()`, diferente em cada linguagem.
-- `template-method` e `realizacao`: parseiam JSON, que Java, C++ e C# não têm na biblioteca padrão.
+Em LLD, `abstract-factory` (SHA-1 e HMAC escritos à mão em C++), `facade` (id de transação calculado por cada linguagem), `template-method` (JSON mínimo em Java/C++/C#) e `realizacao` também têm abas. Em `facade` a saída não é comparável (o `hash()` do Python muda a cada execução), então vale `COMPILE_ONLY=1`.
 
 Capítulos de system-design deixados só em Python de propósito (o núcleo é um SDK ou DSL de terceiros, que não roda no Judge0 e não tem equivalente fiel em outra linguagem):
 
@@ -31,6 +27,7 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 
 - `flyweight`: a última linha do Python (`sys.getsizeof`) não tem equivalente portátil e foi omitida.
 - `iterator` (ordem do embaralhamento) e `cobras-e-escadas` (partida aleatória): dependem do gerador de cada linguagem.
+- `template-method`: Java, C++ e C# leem o JSON com um extrator mínimo (a biblioteca padrão não traz parser); o arquivo usa o escape `\u`+`FEFF` para o BOM, nunca o caractere literal.
 - `notificacoes-lld`: a ordem do `set` do Python muda a cada execução (`PYTHONHASHSEED`); as outras linguagens usam a ordem de inserção.
 - `quadtrees` e `algoritmos-balanceamento`: usam números aleatórios, então o resultado impresso varia (a lógica é a mesma).
 - `interfaces`: a linha do `TypeError` ao instanciar o contrato só existe em Python e JavaScript; em Java, C++, C# e TypeScript isso é erro de compilação.
