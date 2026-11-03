@@ -39,6 +39,8 @@ Quando a resposta chega, o cliente processa e abre a próxima requisição imedi
 
 O ponto crítico é não prender uma thread por cliente esperando. Use um modelo assíncrono e um mecanismo de notificação:
 
+<CodeTabs>
+
 ```python
 import asyncio
 
@@ -63,6 +65,226 @@ class CaixaDeEntrada:
             return []
         return self.mensagens[desde:]
 ```
+
+```javascript
+class CaixaDeEntrada {
+  constructor() {
+    this.mensagens = [];
+    this.evento = this._novoEvento();
+  }
+
+  _novoEvento() {
+    let disparar;
+    const promessa = new Promise((resolve) => (disparar = resolve));
+    return { promessa, disparar };
+  }
+
+  publicar(msg) {
+    this.mensagens.push(msg);
+    const atual = this.evento;
+    this.evento = this._novoEvento(); // próximos esperam o próximo evento
+    atual.disparar("evento");
+  }
+
+  async aguardar(desde, timeout = 30) {
+    const novas = this.mensagens.slice(desde);
+    if (novas.length > 0) {
+      return novas;
+    }
+    const evento = this.evento;
+    let temporizador;
+    const expirou = new Promise((resolve) => {
+      temporizador = setTimeout(() => resolve("timeout"), timeout * 1000);
+    });
+    const resultado = await Promise.race([evento.promessa, expirou]);
+    clearTimeout(temporizador);
+    return resultado === "timeout" ? [] : this.mensagens.slice(desde);
+  }
+}
+```
+
+```typescript
+interface Evento {
+  promessa: Promise<string>;
+  disparar: (valor: string) => void;
+}
+
+class CaixaDeEntrada {
+  private mensagens: string[] = [];
+  private evento: Evento = this.novoEvento();
+
+  private novoEvento(): Evento {
+    let disparar: (valor: string) => void = () => {};
+    const promessa = new Promise<string>((resolve) => (disparar = resolve));
+    return { promessa, disparar };
+  }
+
+  publicar(msg: string): void {
+    this.mensagens.push(msg);
+    const atual = this.evento;
+    this.evento = this.novoEvento(); // próximos esperam o próximo evento
+    atual.disparar("evento");
+  }
+
+  async aguardar(desde: number, timeout: number = 30): Promise<string[]> {
+    const novas = this.mensagens.slice(desde);
+    if (novas.length > 0) {
+      return novas;
+    }
+    const evento = this.evento;
+    let temporizador: ReturnType<typeof setTimeout> | undefined;
+    const expirou = new Promise<string>((resolve) => {
+      temporizador = setTimeout(() => resolve("timeout"), timeout * 1000);
+    });
+    const resultado = await Promise.race([evento.promessa, expirou]);
+    if (temporizador !== undefined) clearTimeout(temporizador);
+    return resultado === "timeout" ? [] : this.mensagens.slice(desde);
+  }
+}
+```
+
+```java
+import java.util.*;
+
+class CaixaDeEntrada {
+    private final List<String> mensagens = new ArrayList<>();
+
+    synchronized void publicar(String msg) {
+        mensagens.add(msg);
+        notifyAll(); // acorda quem está esperando
+    }
+
+    synchronized List<String> aguardar(int desde, long timeoutMs) throws InterruptedException {
+        if (mensagens.size() > desde) {
+            return new ArrayList<>(mensagens.subList(desde, mensagens.size()));
+        }
+        wait(timeoutMs);
+        if (mensagens.size() > desde) {
+            return new ArrayList<>(mensagens.subList(desde, mensagens.size()));
+        }
+        return new ArrayList<>(); // expirou sem novidade
+    }
+}
+```
+
+```cpp
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include <vector>
+using namespace std;
+
+class CaixaDeEntrada {
+    vector<string> mensagens;
+    mutex trava;
+    condition_variable evento;
+
+public:
+    void publicar(const string& msg) {
+        {
+            lock_guard<mutex> g(trava);
+            mensagens.push_back(msg);
+        }
+        evento.notify_all(); // acorda quem está esperando
+    }
+
+    vector<string> aguardar(size_t desde, chrono::milliseconds timeout = chrono::seconds(30)) {
+        unique_lock<mutex> lk(trava);
+        if (mensagens.size() <= desde) {
+            evento.wait_for(lk, timeout, [&] { return mensagens.size() > desde; });
+        }
+        if (mensagens.size() > desde) {
+            return vector<string>(mensagens.begin() + desde, mensagens.end());
+        }
+        return {}; // expirou sem novidade
+    }
+};
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class CaixaDeEntrada
+{
+    private readonly List<string> mensagens = new List<string>();
+    private readonly object trava = new object();
+
+    public void Publicar(string msg)
+    {
+        lock (trava)
+        {
+            mensagens.Add(msg);
+            Monitor.PulseAll(trava); // acorda quem está esperando
+        }
+    }
+
+    public List<string> Aguardar(int desde, int timeoutMs = 30000)
+    {
+        lock (trava)
+        {
+            if (mensagens.Count <= desde)
+            {
+                Monitor.Wait(trava, timeoutMs);
+            }
+            if (mensagens.Count > desde)
+            {
+                return mensagens.GetRange(desde, mensagens.Count - desde);
+            }
+            return new List<string>(); // expirou sem novidade
+        }
+    }
+}
+```
+
+```go
+import (
+	"sync"
+	"time"
+)
+
+type CaixaDeEntrada struct {
+	mu        sync.Mutex
+	mensagens []string
+	evento    chan struct{}
+}
+
+func NovaCaixa() *CaixaDeEntrada {
+	return &CaixaDeEntrada{evento: make(chan struct{})}
+}
+
+func (c *CaixaDeEntrada) publicar(msg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mensagens = append(c.mensagens, msg)
+	close(c.evento)                 // acorda todos que esperam
+	c.evento = make(chan struct{}) // próximos esperam o próximo evento
+}
+
+func (c *CaixaDeEntrada) aguardar(desde int, timeout time.Duration) []string {
+	c.mu.Lock()
+	if len(c.mensagens) > desde {
+		novas := append([]string{}, c.mensagens[desde:]...)
+		c.mu.Unlock()
+		return novas
+	}
+	evento := c.evento
+	c.mu.Unlock()
+
+	select {
+	case <-evento:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return append([]string{}, c.mensagens[desde:]...)
+	case <-time.After(timeout):
+		return nil // expirou sem novidade
+	}
+}
+```
+
+</CodeTabs>
 
 Com várias instâncias de servidor, a mensagem pode ser publicada numa instância enquanto o cliente espera em outra. É preciso um canal compartilhado (por exemplo, Redis Pub/Sub ou um broker) para acordar a instância certa.
 

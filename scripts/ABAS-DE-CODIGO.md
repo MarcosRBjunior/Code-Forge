@@ -8,8 +8,8 @@ python, javascript, typescript, java, cpp, csharp, go.
 | Curso | Com abas | Observação |
 |---|---|---|
 | dsa | 50 de 50 | completo |
-| system-design | 21 de 71 | o resto é pseudocódigo de infraestrutura (bancos, filas, SDKs) ou depende de SHA-256/MD5; fica só em Python |
-| system-design-interviews | 9 de 14 | idem |
+| system-design | 29 de 71 | o resto são fragmentos que usam nomes não definidos no bloco (`banco`, `repo`, `cache`, `fila`), SDKs específicos (JWT, Prometheus, boto) ou hash (md5/sha, sem equivalente em C++); ficam só em Python |
+| system-design-interviews | 10 de 14 | idem |
 | lld | 95 de 107 | completo no que dá: dos 12 restantes, 8 não têm bloco Python (são conceituais) e 4 ficam só em Python de propósito (abaixo) |
 | concorrencia, redes, sistemas-operacionais, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de escopo: o código depende de APIs do Python (`threading`, `struct`, `socket`, `os`, `math`, `random`); uma versão em outra linguagem seria outro programa |
 
@@ -24,6 +24,7 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - `flyweight`: a última linha do Python (`sys.getsizeof`) não tem equivalente portátil e foi omitida.
 - `iterator` (ordem do embaralhamento) e `cobras-e-escadas` (partida aleatória): dependem do gerador de cada linguagem.
 - `notificacoes-lld`: a ordem do `set` do Python muda a cada execução (`PYTHONHASHSEED`); as outras linguagens usam a ordem de inserção.
+- `quadtrees` e `algoritmos-balanceamento`: usam números aleatórios, então o resultado impresso varia (a lógica é a mesma).
 - `interfaces`: a linha do `TypeError` ao instanciar o contrato só existe em Python e JavaScript; em Java, C++, C# e TypeScript isso é erro de compilação.
 
 ## Ferramentas (em `scripts/`)
