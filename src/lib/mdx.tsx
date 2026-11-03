@@ -24,7 +24,7 @@ export async function renderChapter(source: string) {
         remarkPlugins: [remarkGfm],
         rehypePlugins: [
           rehypeSlug,
-          [rehypePrettyCode, { theme: { light: "github-light", dark: "github-dark" }, keepBackground: false }],
+          [rehypePrettyCode, { theme: { light: "github-light", dark: "tokyo-night" }, keepBackground: false }],
           rehypeCodeTabs,
           rehypeBlockIds,
         ],

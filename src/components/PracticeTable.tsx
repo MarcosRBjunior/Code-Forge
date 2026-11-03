@@ -24,6 +24,13 @@ const DIFF = {
   hard: { label: "Difícil", text: "text-danger", bar: "bg-danger" },
 } as const;
 
+/** Pílula de dificuldade: fundo a 10% da cor e borda a 20% (cores semânticas dos tokens). */
+const PILL = {
+  easy: "border-success/20 bg-success-soft text-success",
+  medium: "border-warning/20 bg-warning-soft text-warning",
+  hard: "border-danger/20 bg-danger-soft text-danger",
+} as const;
+
 const input = "rounded-md border border-line-input bg-surface-1 px-2.5 py-1.5 text-sm";
 
 export function PracticeTable({ problems: allProblems, lists }: { problems: PracticeProblem[]; lists: PracticeList[] }) {
@@ -226,7 +233,7 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
                   {!p.available && <span className="ml-2 text-[10px] uppercase tracking-wide text-fg-subtle">em breve</span>}
                 </td>
                 <td className="hidden px-3 py-2.5 text-fg-muted sm:table-cell">{p.pattern}</td>
-                <td className={`px-3 py-2.5 font-medium ${DIFF[p.difficulty].text}`}>{DIFF[p.difficulty].label}</td>
+                <td className="px-3 py-2.5"><span className={`inline-block rounded-full border px-2 py-0.5 text-xs font-medium ${PILL[p.difficulty]}`}>{DIFF[p.difficulty].label}</span></td>
               </tr>
               </Fragment>
             ))}

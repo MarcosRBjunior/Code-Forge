@@ -125,7 +125,7 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
                           href={`/learn/${course.slug}/${c.slug}`}
                           aria-current={c.slug === current ? "page" : undefined}
                           data-state={isDone ? "completed" : isStarted ? "in-progress" : undefined}
-                          className="relative flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 text-sm text-fg-muted hover:bg-surface-2 hover:text-fg current:bg-accent-soft current:font-medium current:text-fg current:before:absolute current:before:inset-y-1.5 current:before:left-0 current:before:w-0.5 current:before:rounded-full current:before:bg-accent"
+                          className="relative flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 text-sm text-fg-muted hover:bg-surface-2 hover:text-fg current:bg-accent-soft current:font-medium current:text-accent-text current:before:absolute current:before:inset-y-1.5 current:before:left-0 current:before:w-[3px] current:before:rounded-full current:before:bg-accent-hover"
                         >
                           <span
                             aria-hidden

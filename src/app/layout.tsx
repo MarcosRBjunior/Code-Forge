@@ -18,7 +18,7 @@ export const metadata: Metadata = {
 };
 
 /** Aplica tema e preferências de leitura antes do primeiro paint (sem flash). */
-const prefsScript = `(function(){try{var p=JSON.parse(localStorage.getItem("cf-prefs")||"{}");var d=document.documentElement;var t=p.theme&&p.theme!=="system"?p.theme:(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");d.dataset.theme=t;d.dataset.readerSize=p.size||"m";d.dataset.readerWidth=p.width||"normal";d.dataset.readerFont=p.font||"serif";if(p.leading&&p.leading!=="normal")d.dataset.readerLeading=p.leading;if(localStorage.getItem("cf-sidebar")==="collapsed")d.dataset.sidebar="collapsed";}catch(e){document.documentElement.dataset.theme="light";}})();`;
+const prefsScript = `(function(){try{var p=JSON.parse(localStorage.getItem("cf-prefs")||"{}");var d=document.documentElement;var t=p.theme==="light"||p.theme==="dark"?p.theme:(p.theme==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):"dark");d.dataset.theme=t;d.dataset.readerSize=p.size||"m";d.dataset.readerWidth=p.width||"normal";d.dataset.readerFont=p.font||"serif";if(p.leading&&p.leading!=="normal")d.dataset.readerLeading=p.leading;if(localStorage.getItem("cf-sidebar")==="collapsed")d.dataset.sidebar="collapsed";}catch(e){document.documentElement.dataset.theme="dark";}})();`;
 
 export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const courses = await getCourses();
@@ -52,7 +52,7 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
         <script dangerouslySetInnerHTML={{ __html: prefsScript }} />
       </head>
       <body className="font-ui antialiased">
-        <header className="sticky top-0 z-40 flex h-header items-center gap-4 border-b border-line bg-bg/90 px-4 backdrop-blur">
+        <header className="sticky top-0 z-40 flex h-header items-center gap-4 border-b border-line bg-bg/80 px-4 backdrop-blur-md">
           <Link href="/" className="flex items-center gap-2 font-semibold tracking-tight">
             <span aria-hidden className="grid size-7 place-items-center rounded-md bg-accent text-sm text-fg-on-accent">
               CF
