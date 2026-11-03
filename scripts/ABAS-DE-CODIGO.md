@@ -8,8 +8,8 @@ python, javascript, typescript, java, cpp, csharp, go.
 | Curso | Com abas | Observação |
 |---|---|---|
 | dsa | 50 de 50 | completo |
-| system-design | 29 de 71 | o resto são fragmentos que usam nomes não definidos no bloco (`banco`, `repo`, `cache`, `fila`), SDKs específicos (JWT, Prometheus, boto) ou hash (md5/sha, sem equivalente em C++); ficam só em Python |
-| system-design-interviews | 10 de 14 | idem |
+| system-design | 63 de 71 | os 8 restantes ficam só em Python (abaixo) |
+| system-design-interviews | 13 de 14 | só `spark` fica em Python (abaixo) |
 | lld | 95 de 107 | completo no que dá: dos 12 restantes, 8 não têm bloco Python (são conceituais) e 4 ficam só em Python de propósito (abaixo) |
 | concorrencia, redes, sistemas-operacionais, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de escopo: o código depende de APIs do Python (`threading`, `struct`, `socket`, `os`, `math`, `random`); uma versão em outra linguagem seria outro programa |
 
@@ -18,6 +18,14 @@ Capítulos de LLD deixados só em Python de propósito:
 - `abstract-factory`: usa HMAC com SHA-256 e SHA-1 (C++ não tem isso na biblioteca padrão).
 - `facade`: imprime um id baseado em `hash()`, diferente em cada linguagem.
 - `template-method` e `realizacao`: parseiam JSON, que Java, C++ e C# não têm na biblioteca padrão.
+
+Capítulos de system-design deixados só em Python de propósito (o núcleo é um SDK ou DSL de terceiros, que não roda no Judge0 e não tem equivalente fiel em outra linguagem):
+
+- `armazenamento-de-senhas` (argon2), `jwt` (PyJWT), `metricas` (prometheus_client), `object-storage` (boto3), `pool-de-conexoes` (psycopg_pool), `tracing-distribuido` (opentelemetry), `s2-h3` (biblioteca h3), `motores-de-streaming` (pseudo-DSL) e, em interviews, `spark` (PySpark).
+
+Traduções de fragmentos (system-design): os blocos que usam nomes não definidos (`banco`, `fila`, `cache`...) ganham, em cada aba, peças de apoio mínimas com o comentário "peças de apoio do exemplo". Como o Python desses blocos dá NameError, a verificação é só de compilação/execução: `COMPILE_ONLY=1 npx tsx --conditions react-server scripts/check-tabs-run.ts <arquivos>` compila e roda todas as abas sem comparar a saída.
+
+Hash em C++: SHA-256, MD5, CRC32 e HMAC-SHA256 foram escritos à mão (conferidos contra hashlib/zlib/hmac do Python). Em TypeScript, `crypto` entra com `declare const require: any;`; em C# o Mono não tem BigInteger (usar divisão manual de hex).
 
 Diferenças esperadas entre a saída do Python e a das outras linguagens (não são erros):
 
