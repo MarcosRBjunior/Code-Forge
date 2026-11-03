@@ -20,6 +20,8 @@ submit() --> [ fila: t1 t2 t3 t4 ... ] --> worker 1
 
 ## Implementação
 
+<CodeTabs>
+
 ```python
 import queue
 import threading
@@ -75,6 +77,515 @@ except ZeroDivisionError:
     print("erro propagado pelo futuro")
 pool.encerrar()
 ```
+
+```javascript
+// JavaScript tem um único fio de execução: os "workers" abaixo são laços assíncronos que se revezam,
+// e cada submit devolve uma Promise (o equivalente do Future).
+class ThreadPool {
+  static #PARAR = Symbol("parar"); // sentinela de encerramento
+
+  #fila = [];
+  #acordar = [];
+  #workers;
+
+  constructor(tamanho) {
+    this.#workers = Array.from({ length: tamanho }, () => this.#laco());
+  }
+
+  #proximo() {
+    if (this.#fila.length > 0) return Promise.resolve(this.#fila.shift());
+    return new Promise((resolve) => this.#acordar.push(resolve));
+  }
+
+  #empurrar(item) {
+    const espera = this.#acordar.shift();
+    if (espera) espera(item);
+    else this.#fila.push(item);
+  }
+
+  async #laco() {
+    while (true) {
+      const item = await this.#proximo();
+      if (item === ThreadPool.#PARAR) {
+        return;
+      }
+      const { funcao, args, resolve, reject } = item;
+      try {
+        resolve(funcao(...args));
+      } catch (erro) { // o erro vai para a Promise, o worker sobrevive
+        reject(erro);
+      }
+    }
+  }
+
+  submit(funcao, ...args) {
+    return new Promise((resolve, reject) => this.#empurrar({ funcao, args, resolve, reject }));
+  }
+
+  async encerrar() {
+    for (let i = 0; i < this.#workers.length; i++) this.#empurrar(ThreadPool.#PARAR);
+    await Promise.all(this.#workers);
+  }
+}
+
+const quadrado = (n) => n * n;
+
+async function principal() {
+  const pool = new ThreadPool(3);
+  const futuros = [0, 1, 2, 3, 4, 5].map((n) => pool.submit(quadrado, n));
+  const resultados = await Promise.all(futuros);
+  if (JSON.stringify(resultados) !== JSON.stringify([0, 1, 4, 9, 16, 25])) throw new Error("falhou");
+
+  const erro = pool.submit(() => {
+    throw new RangeError("divisão por zero");
+  });
+  try {
+    await erro;
+  } catch (e) {
+    console.log("erro propagado pelo futuro");
+  }
+  await pool.encerrar();
+}
+
+principal();
+```
+
+```typescript
+type Trabalho = {
+  funcao: (...args: any[]) => any;
+  args: any[];
+  resolve: (valor: any) => void;
+  reject: (erro: unknown) => void;
+};
+
+// TypeScript (como JavaScript) tem um único fio de execução: os "workers" abaixo são laços assíncronos
+// que se revezam, e cada submit devolve uma Promise (o equivalente do Future).
+class ThreadPool {
+  private static readonly PARAR = Symbol("parar"); // sentinela de encerramento
+
+  private fila: (Trabalho | symbol)[] = [];
+  private acordar: ((item: Trabalho | symbol) => void)[] = [];
+  private workers: Promise<void>[];
+
+  constructor(tamanho: number) {
+    this.workers = Array.from({ length: tamanho }, () => this.laco());
+  }
+
+  private proximo(): Promise<Trabalho | symbol> {
+    if (this.fila.length > 0) return Promise.resolve(this.fila.shift()!);
+    return new Promise((resolve) => this.acordar.push(resolve));
+  }
+
+  private empurrar(item: Trabalho | symbol): void {
+    const espera = this.acordar.shift();
+    if (espera) espera(item);
+    else this.fila.push(item);
+  }
+
+  private async laco(): Promise<void> {
+    while (true) {
+      const item = await this.proximo();
+      if (item === ThreadPool.PARAR) {
+        return;
+      }
+      const { funcao, args, resolve, reject } = item as Trabalho;
+      try {
+        resolve(funcao(...args));
+      } catch (erro) { // o erro vai para a Promise, o worker sobrevive
+        reject(erro);
+      }
+    }
+  }
+
+  submit<T>(funcao: (...args: any[]) => T, ...args: any[]): Promise<T> {
+    return new Promise<T>((resolve, reject) => this.empurrar({ funcao, args, resolve, reject }));
+  }
+
+  async encerrar(): Promise<void> {
+    for (let i = 0; i < this.workers.length; i++) this.empurrar(ThreadPool.PARAR);
+    await Promise.all(this.workers);
+  }
+}
+
+const quadrado = (n: number): number => n * n;
+
+async function principal(): Promise<void> {
+  const pool = new ThreadPool(3);
+  const futuros = [0, 1, 2, 3, 4, 5].map((n) => pool.submit(quadrado, n));
+  const resultados = await Promise.all(futuros);
+  if (JSON.stringify(resultados) !== JSON.stringify([0, 1, 4, 9, 16, 25])) throw new Error("falhou");
+
+  const erro = pool.submit(() => {
+    throw new RangeError("divisão por zero");
+  });
+  try {
+    await erro;
+  } catch (e) {
+    console.log("erro propagado pelo futuro");
+  }
+  await pool.encerrar();
+}
+
+principal();
+```
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.Supplier;
+
+class ThreadPool {
+    private static final Runnable PARAR = () -> {}; // sentinela de encerramento
+
+    private final BlockingQueue<Runnable> fila = new LinkedBlockingQueue<>();
+    private final List<Thread> workers = new ArrayList<>();
+
+    ThreadPool(int tamanho) {
+        for (int i = 0; i < tamanho; i++) {
+            Thread w = new Thread(this::laco);
+            w.setDaemon(true);
+            workers.add(w);
+            w.start();
+        }
+    }
+
+    private void laco() {
+        try {
+            while (true) {
+                Runnable item = fila.take();
+                if (item == PARAR) {
+                    return;
+                }
+                item.run();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    <T> CompletableFuture<T> submit(Supplier<T> funcao) {
+        CompletableFuture<T> futuro = new CompletableFuture<>();
+        fila.add(() -> {
+            try {
+                futuro.complete(funcao.get());
+            } catch (Exception erro) { // o erro vai para o futuro, o worker sobrevive
+                futuro.completeExceptionally(erro);
+            }
+        });
+        return futuro;
+    }
+
+    void encerrar() throws InterruptedException {
+        for (int i = 0; i < workers.size(); i++) fila.add(PARAR);
+        for (Thread w : workers) w.join();
+    }
+}
+
+static int quadrado(int n) {
+    return n * n;
+}
+
+public static void main(String[] args) throws Exception {
+    ThreadPool pool = new ThreadPool(3);
+    List<CompletableFuture<Integer>> futuros = new ArrayList<>();
+    for (int n = 0; n < 6; n++) {
+        final int x = n;
+        futuros.add(pool.submit(() -> quadrado(x)));
+    }
+    List<Integer> resultados = new ArrayList<>();
+    for (CompletableFuture<Integer> f : futuros) resultados.add(f.get());
+    if (!resultados.equals(List.of(0, 1, 4, 9, 16, 25))) throw new AssertionError("falhou");
+
+    CompletableFuture<Integer> erro = pool.submit(() -> 1 / 0);
+    try {
+        erro.get();
+    } catch (ExecutionException e) {
+        if (e.getCause() instanceof ArithmeticException) {
+            System.out.println("erro propagado pelo futuro");
+        }
+    }
+    pool.encerrar();
+}
+```
+
+```cpp
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+using namespace std;
+
+class ThreadPool {
+    queue<function<void()>> fila; // função vazia = sentinela de encerramento
+    mutex trava;
+    condition_variable temItem;
+    vector<thread> workers;
+
+    void laco() {
+        while (true) {
+            function<void()> item;
+            {
+                unique_lock<mutex> lk(trava);
+                temItem.wait(lk, [&] { return !fila.empty(); });
+                item = move(fila.front());
+                fila.pop();
+            }
+            if (!item) {
+                return;
+            }
+            item(); // packaged_task: o erro vai para o futuro, o worker sobrevive
+        }
+    }
+
+    void empurrar(function<void()> item) {
+        {
+            lock_guard<mutex> g(trava);
+            fila.push(move(item));
+        }
+        temItem.notify_one();
+    }
+
+public:
+    ThreadPool(int tamanho) {
+        for (int i = 0; i < tamanho; i++) workers.emplace_back(&ThreadPool::laco, this);
+    }
+
+    template <typename F>
+    auto submit(F funcao) -> future<decltype(funcao())> {
+        using R = decltype(funcao());
+        auto tarefa = make_shared<packaged_task<R()>>(funcao);
+        future<R> futuro = tarefa->get_future();
+        empurrar([tarefa] { (*tarefa)(); });
+        return futuro;
+    }
+
+    void encerrar() {
+        for (size_t i = 0; i < workers.size(); i++) empurrar(nullptr);
+        for (auto& w : workers) w.join();
+    }
+};
+
+int quadrado(int n) { return n * n; }
+
+int main() {
+    ThreadPool pool(3);
+    vector<future<int>> futuros;
+    for (int n = 0; n < 6; n++) futuros.push_back(pool.submit([n] { return quadrado(n); }));
+    vector<int> resultados;
+    for (auto& f : futuros) resultados.push_back(f.get());
+    if (resultados != vector<int>{0, 1, 4, 9, 16, 25}) throw runtime_error("falhou");
+
+    auto erro = pool.submit([]() -> int { throw domain_error("divisão por zero"); });
+    try {
+        erro.get();
+    } catch (const domain_error&) {
+        cout << "erro propagado pelo futuro" << endl;
+    }
+    pool.encerrar();
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+class ThreadPool
+{
+    private readonly Queue<Action> fila = new Queue<Action>(); // null = sentinela de encerramento
+    private readonly object trava = new object();
+    private readonly List<Thread> workers = new List<Thread>();
+
+    public ThreadPool(int tamanho)
+    {
+        for (int i = 0; i < tamanho; i++)
+        {
+            var w = new Thread(Laco);
+            w.IsBackground = true;
+            workers.Add(w);
+            w.Start();
+        }
+    }
+
+    private void Laco()
+    {
+        while (true)
+        {
+            Action item;
+            lock (trava)
+            {
+                while (fila.Count == 0) Monitor.Wait(trava);
+                item = fila.Dequeue();
+            }
+            if (item == null)
+            {
+                return;
+            }
+            item();
+        }
+    }
+
+    private void Empurrar(Action item)
+    {
+        lock (trava)
+        {
+            fila.Enqueue(item);
+            Monitor.Pulse(trava);
+        }
+    }
+
+    public Task<T> Submit<T>(Func<T> funcao)
+    {
+        var futuro = new TaskCompletionSource<T>();
+        Empurrar(() =>
+        {
+            try
+            {
+                futuro.SetResult(funcao());
+            }
+            catch (Exception erro) // o erro vai para o futuro, o worker sobrevive
+            {
+                futuro.SetException(erro);
+            }
+        });
+        return futuro.Task;
+    }
+
+    public void Encerrar()
+    {
+        for (int i = 0; i < workers.Count; i++) Empurrar(null);
+        foreach (var w in workers) w.Join();
+    }
+}
+
+static int Quadrado(int n)
+{
+    return n * n;
+}
+
+static void Main()
+{
+    var pool = new ThreadPool(3);
+    var futuros = Enumerable.Range(0, 6).Select(n => pool.Submit(() => Quadrado(n))).ToList();
+    var resultados = futuros.Select(f => f.Result).ToList();
+    if (!resultados.SequenceEqual(new List<int> { 0, 1, 4, 9, 16, 25 })) throw new Exception("falhou");
+
+    var erro = pool.Submit<int>(() => { throw new DivideByZeroException(); });
+    try
+    {
+        erro.Wait();
+    }
+    catch (AggregateException e)
+    {
+        if (e.InnerException is DivideByZeroException)
+        {
+            Console.WriteLine("erro propagado pelo futuro");
+        }
+    }
+    pool.Encerrar();
+}
+```
+
+```go
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+// Future: o resultado chega por um canal; o erro vai junto, e o worker sobrevive.
+type Resultado struct {
+	valor int
+	erro  error
+}
+
+type Futuro struct {
+	canal chan Resultado
+}
+
+func (f *Futuro) result() (int, error) {
+	r := <-f.canal
+	return r.valor, r.erro
+}
+
+type trabalho struct {
+	funcao func() (int, error)
+	futuro *Futuro
+}
+
+type ThreadPool struct {
+	fila chan *trabalho // nil = sentinela de encerramento
+	wg   sync.WaitGroup
+	n    int
+}
+
+func NovoThreadPool(tamanho int) *ThreadPool {
+	p := &ThreadPool{fila: make(chan *trabalho, 100), n: tamanho}
+	for i := 0; i < tamanho; i++ {
+		p.wg.Add(1)
+		go p.laco()
+	}
+	return p
+}
+
+func (p *ThreadPool) laco() {
+	defer p.wg.Done()
+	for item := range p.fila {
+		if item == nil {
+			return
+		}
+		valor, err := item.funcao()
+		item.futuro.canal <- Resultado{valor, err}
+	}
+}
+
+func (p *ThreadPool) submit(funcao func() (int, error)) *Futuro {
+	futuro := &Futuro{canal: make(chan Resultado, 1)}
+	p.fila <- &trabalho{funcao, futuro}
+	return futuro
+}
+
+func (p *ThreadPool) encerrar() {
+	for i := 0; i < p.n; i++ {
+		p.fila <- nil
+	}
+	p.wg.Wait()
+}
+
+func quadrado(n int) int { return n * n }
+
+func main() {
+	pool := NovoThreadPool(3)
+	futuros := []*Futuro{}
+	for n := 0; n < 6; n++ {
+		x := n
+		futuros = append(futuros, pool.submit(func() (int, error) { return quadrado(x), nil }))
+	}
+	esperado := []int{0, 1, 4, 9, 16, 25}
+	for i, f := range futuros {
+		valor, _ := f.result()
+		if valor != esperado[i] {
+			panic("falhou")
+		}
+	}
+
+	erro := pool.submit(func() (int, error) { return 0, errors.New("divisão por zero") })
+	if _, err := erro.result(); err != nil {
+		fmt.Println("erro propagado pelo futuro")
+	}
+	pool.encerrar()
+}
+```
+
+</CodeTabs>
 
 A `queue.Queue` já faz o controle de concorrência (travas internas), então não é preciso um lock explícito. A sentinela, um item por worker, encerra todos de forma limpa.
 

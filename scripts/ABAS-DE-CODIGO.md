@@ -3,24 +3,28 @@
 Cada bloco ```` ```python ```` de uma aula pode virar um grupo `<CodeTabs>` com 7 abas, nesta ordem:
 python, javascript, typescript, java, cpp, csharp, go.
 
-## Estado (fim da sessão de 31/10/2026)
+## Estado (fim da sessão de 03/11/2026)
 
 | Curso | Com abas | Observação |
 |---|---|---|
 | dsa | 50 de 50 | completo |
 | system-design | 21 de 71 | o resto é pseudocódigo de infraestrutura (bancos, filas, SDKs) ou depende de SHA-256/MD5; fica só em Python |
 | system-design-interviews | 9 de 14 | idem |
-| lld | ver `grep -l '<CodeTabs>' content/courses/lld/*.mdx \| wc -l` (de 99) | em andamento |
+| lld | 95 de 107 | completo no que dá: dos 12 restantes, 8 não têm bloco Python (são conceituais) e 4 ficam só em Python de propósito (abaixo) |
 | concorrencia, redes, sistemas-operacionais, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de escopo: o código depende de APIs do Python (`threading`, `struct`, `socket`, `os`, `math`, `random`); uma versão em outra linguagem seria outro programa |
 
-Capítulos de LLD já traduzidos: singleton, adapter, decorator, strategy, observer, state, composite, command,
-builder, factory-method, proxy, como-aprender-lld, casos-de-uso, yagni, escolher-padroes, diagrama-de-atividades,
-produtor-consumidor, diagrama-de-classes, kiss, maquina-de-estados, intro-padroes, mvc, lld-vs-hld, o-que-e-lld,
-concorrencia-lld, codigo-limpo, tipos-de-entrevista-lld, machine-coding, injecao-de-dependencia
-(e os da última rodada, se estiverem com `<CodeTabs>`).
+Capítulos de LLD deixados só em Python de propósito:
 
-Deixados de lado de propósito: `facade` (imprime um id baseado em `hash()`, diferente em cada linguagem) e
-`template-method` (parseia JSON, que Java, C++ e C# não têm na biblioteca padrão).
+- `abstract-factory`: usa HMAC com SHA-256 e SHA-1 (C++ não tem isso na biblioteca padrão).
+- `facade`: imprime um id baseado em `hash()`, diferente em cada linguagem.
+- `template-method` e `realizacao`: parseiam JSON, que Java, C++ e C# não têm na biblioteca padrão.
+
+Diferenças esperadas entre a saída do Python e a das outras linguagens (não são erros):
+
+- `flyweight`: a última linha do Python (`sys.getsizeof`) não tem equivalente portátil e foi omitida.
+- `iterator` (ordem do embaralhamento) e `cobras-e-escadas` (partida aleatória): dependem do gerador de cada linguagem.
+- `notificacoes-lld`: a ordem do `set` do Python muda a cada execução (`PYTHONHASHSEED`); as outras linguagens usam a ordem de inserção.
+- `interfaces`: a linha do `TypeError` ao instanciar o contrato só existe em Python e JavaScript; em Java, C++, C# e TypeScript isso é erro de compilação.
 
 ## Ferramentas (em `scripts/`)
 
@@ -31,6 +35,10 @@ Deixados de lado de propósito: `facade` (imprime um id baseado em `hash()`, dif
   `npx tsx --conditions react-server scripts/check-tabs-run.ts content/courses/lld/<aula>.mdx`
   Variável `ONLY_LANGS=java,cpp` limita as linguagens. A comparação ignora colchetes, aspas, vírgulas, `{}`, `:`, `=`,
   maiúsculas, `x.0` vs `x` e `null/nil/None`. Blocos que dependem de blocos anteriores são encadeados sozinhos.
+- `force-print.mjs <capitulo.mdx> <copia.mdx>`: o verificador acima SÓ compara as saídas quando o bloco Python tem um `print(`
+  na coluna 0. Sem isso (blocos com `if __name__ == "__main__":` ou só com `assert`) ele apenas confere que compila.
+  Este script grava uma cópia, FORA de `content/`, em que todo bloco Python passa a ter um `print(`; rode o `check-tabs-run.ts`
+  nessa cópia. Foi assim que apareceram erros que a verificação normal não via.
 
 ## Armadilhas do Judge0 (descobertas na prática)
 
@@ -38,8 +46,15 @@ Deixados de lado de propósito: `facade` (imprime um id baseado em `hash()`, dif
   o verificador os embrulha em `class Main`.
 - TypeScript é antigo: sem a palavra `override`.
 - C#/Mono: não existe `PriorityQueue`; literais com separador (`1_000_000_007L`) saem errados; sem tuplas (`ValueTuple`) em arrays.
+- O verificador embrulha o C# em `class Program`: métodos de extensão (`this T x`) e `global::Tipo` não funcionam; use métodos estáticos comuns.
+- C# (Mono): `ArgumentOutOfRangeException(string)` trata o texto como nome do parâmetro (a mensagem sai errada); use `ArgumentException`.
 - C++ precisa de `-pthread` para `std::thread` (já configurado em `src/lib/judge0.ts`).
 - Go é o 1.18: sem `min`/`max` embutidos.
+- TypeScript compila com a biblioteca do DOM: nomes de variável de topo como `status`, `name`, `history` e `length` colidem com
+  globais. Use outro nome.
+- TypeScript: `Generator<T>` sem os outros parâmetros não aceita `yield*`; use `IterableIterator<T>`.
+- JavaScript/TypeScript com `Math.random` sem semente deixam o teste instável; use um gerador com semente (mulberry32).
+- Java: uma constante `static final` de uma classe não é visível em outra sem qualificar (`Postagem.PONTOS_ACEITA`).
 - `cout << a << b` imprime `a` antes de avaliar `b`; Python avalia o f-string inteiro antes. Calcule antes de imprimir.
 - Saídas com relógio, `hash()` ou aleatoriedade nunca coincidem entre linguagens (é esperado); confira só que rodam.
 
