@@ -25,6 +25,8 @@ Cada alteração de saldo gera um lançamento. O saldo é a soma dos lançamento
 
 ## Implementação
 
+<CodeTabs>
+
 ```python
 import threading
 from dataclasses import dataclass
@@ -119,6 +121,749 @@ print(s.carteiras["ana"].saldo, s.carteiras["bia"].saldo)   # 6000 4000
 total = sum(sum(l.valor for l in c.extrato) for c in s.carteiras.values())
 print(total == 10000)
 ```
+
+```javascript
+// JavaScript executa um trecho de cada vez (um único fio), então aqui não há locks;
+// nas outras linguagens cada carteira tem o seu, sempre adquiridos em ordem fixa.
+class Lancamento {
+  constructor(carteira, valor, descricao) {
+    this.carteira = carteira;
+    this.valor = valor; // positivo credita, negativo debita
+    this.descricao = descricao;
+    Object.freeze(this);
+  }
+}
+
+class Carteira {
+  constructor(dono) {
+    this.dono = dono;
+    this.saldo = 0;
+    this.extrato = [];
+  }
+}
+
+class ServicoCarteira {
+  constructor() {
+    this.carteiras = new Map();
+    this.processadas = new Map(); // id da requisição -> resultado
+  }
+
+  criar(dono) {
+    const c = new Carteira(dono);
+    this.carteiras.set(dono, c);
+    return c;
+  }
+
+  depositar(dono, valor, reqId) {
+    return this._idempotente(reqId, () => this._creditar(dono, valor, "depósito"));
+  }
+
+  sacar(dono, valor, reqId) {
+    const op = () => {
+      const c = this.carteiras.get(dono);
+      this._debitar(c, valor, "saque");
+      return "ok";
+    };
+    return this._idempotente(reqId, op);
+  }
+
+  transferir(de, para, valor, reqId) {
+    const op = () => {
+      const a = this.carteiras.get(de);
+      const b = this.carteiras.get(para);
+      this._debitar(a, valor, `transferência para ${para}`);
+      b.saldo += valor;
+      b.extrato.push(new Lancamento(para, valor, `transferência de ${de}`));
+      return "ok";
+    };
+    return this._idempotente(reqId, op);
+  }
+
+  _creditar(dono, valor, desc) {
+    if (valor <= 0) {
+      throw new RangeError("valor deve ser positivo");
+    }
+    const c = this.carteiras.get(dono);
+    c.saldo += valor;
+    c.extrato.push(new Lancamento(dono, valor, desc));
+    return "ok";
+  }
+
+  _debitar(c, valor, desc) {
+    if (valor <= 0) {
+      throw new RangeError("valor deve ser positivo");
+    }
+    if (c.saldo < valor) {
+      throw new RangeError("saldo insuficiente");
+    }
+    c.saldo -= valor;
+    c.extrato.push(new Lancamento(c.dono, -valor, desc));
+  }
+
+  _idempotente(reqId, op) {
+    if (this.processadas.has(reqId)) {
+      return this.processadas.get(reqId);
+    }
+    const resultado = op();
+    this.processadas.set(reqId, resultado);
+    return resultado;
+  }
+}
+
+const s = new ServicoCarteira();
+s.criar("ana");
+s.criar("bia");
+s.depositar("ana", 10000, "r1");
+s.depositar("ana", 10000, "r1"); // repetida: ignorada
+s.transferir("ana", "bia", 4000, "r2");
+try {
+  s.sacar("bia", 9000, "r3");
+} catch (e) {
+  console.log("erro:", e.message);
+}
+console.log(s.carteiras.get("ana").saldo, s.carteiras.get("bia").saldo); // 6000 4000
+let total = 0;
+for (const c of s.carteiras.values()) for (const l of c.extrato) total += l.valor;
+console.log(total === 10000);
+```
+
+```typescript
+// TypeScript (como JavaScript) executa um trecho de cada vez, então aqui não há locks;
+// nas outras linguagens cada carteira tem o seu, sempre adquiridos em ordem fixa.
+class Lancamento {
+  constructor(
+    readonly carteira: string,
+    readonly valor: number, // positivo credita, negativo debita
+    readonly descricao: string,
+  ) {}
+}
+
+class Carteira {
+  saldo = 0;
+  extrato: Lancamento[] = [];
+
+  constructor(readonly dono: string) {}
+}
+
+class ServicoCarteira {
+  carteiras = new Map<string, Carteira>();
+  private processadas = new Map<string, string>(); // id da requisição -> resultado
+
+  criar(dono: string): Carteira {
+    const c = new Carteira(dono);
+    this.carteiras.set(dono, c);
+    return c;
+  }
+
+  depositar(dono: string, valor: number, reqId: string): string {
+    return this.idempotente(reqId, () => this.creditar(dono, valor, "depósito"));
+  }
+
+  sacar(dono: string, valor: number, reqId: string): string {
+    const op = (): string => {
+      const c = this.carteiras.get(dono)!;
+      this.debitar(c, valor, "saque");
+      return "ok";
+    };
+    return this.idempotente(reqId, op);
+  }
+
+  transferir(de: string, para: string, valor: number, reqId: string): string {
+    const op = (): string => {
+      const a = this.carteiras.get(de)!;
+      const b = this.carteiras.get(para)!;
+      this.debitar(a, valor, `transferência para ${para}`);
+      b.saldo += valor;
+      b.extrato.push(new Lancamento(para, valor, `transferência de ${de}`));
+      return "ok";
+    };
+    return this.idempotente(reqId, op);
+  }
+
+  private creditar(dono: string, valor: number, desc: string): string {
+    if (valor <= 0) {
+      throw new RangeError("valor deve ser positivo");
+    }
+    const c = this.carteiras.get(dono)!;
+    c.saldo += valor;
+    c.extrato.push(new Lancamento(dono, valor, desc));
+    return "ok";
+  }
+
+  private debitar(c: Carteira, valor: number, desc: string): void {
+    if (valor <= 0) {
+      throw new RangeError("valor deve ser positivo");
+    }
+    if (c.saldo < valor) {
+      throw new RangeError("saldo insuficiente");
+    }
+    c.saldo -= valor;
+    c.extrato.push(new Lancamento(c.dono, -valor, desc));
+  }
+
+  private idempotente(reqId: string, op: () => string): string {
+    const anterior = this.processadas.get(reqId);
+    if (anterior !== undefined) {
+      return anterior;
+    }
+    const resultado = op();
+    this.processadas.set(reqId, resultado);
+    return resultado;
+  }
+}
+
+const s = new ServicoCarteira();
+s.criar("ana");
+s.criar("bia");
+s.depositar("ana", 10000, "r1");
+s.depositar("ana", 10000, "r1"); // repetida: ignorada
+s.transferir("ana", "bia", 4000, "r2");
+try {
+  s.sacar("bia", 9000, "r3");
+} catch (e) {
+  console.log("erro:", (e as Error).message);
+}
+console.log(s.carteiras.get("ana")!.saldo, s.carteiras.get("bia")!.saldo); // 6000 4000
+let total = 0;
+for (const c of s.carteiras.values()) for (const l of c.extrato) total += l.valor;
+console.log(total === 10000);
+```
+
+```java
+import java.util.*;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
+
+class Lancamento {
+    final String carteira;
+    final int valor; // positivo credita, negativo debita
+    final String descricao;
+
+    Lancamento(String carteira, int valor, String descricao) {
+        this.carteira = carteira;
+        this.valor = valor;
+        this.descricao = descricao;
+    }
+}
+
+class Carteira {
+    final String dono;
+    int saldo = 0;
+    final ReentrantLock lock = new ReentrantLock();
+    final List<Lancamento> extrato = new ArrayList<>();
+
+    Carteira(String dono) {
+        this.dono = dono;
+    }
+}
+
+class ServicoCarteira {
+    final Map<String, Carteira> carteiras = new LinkedHashMap<>();
+    private final Map<String, String> processadas = new HashMap<>(); // id da requisição -> resultado
+    private final Object global = new Object();
+
+    Carteira criar(String dono) {
+        Carteira c = new Carteira(dono);
+        carteiras.put(dono, c);
+        return c;
+    }
+
+    String depositar(String dono, int valor, String reqId) {
+        return idempotente(reqId, () -> creditar(dono, valor, "depósito"));
+    }
+
+    String sacar(String dono, int valor, String reqId) {
+        return idempotente(reqId, () -> {
+            Carteira c = carteiras.get(dono);
+            c.lock.lock();
+            try {
+                debitar(c, valor, "saque");
+            } finally {
+                c.lock.unlock();
+            }
+            return "ok";
+        });
+    }
+
+    String transferir(String de, String para, int valor, String reqId) {
+        return idempotente(reqId, () -> {
+            Carteira a = carteiras.get(de), b = carteiras.get(para);
+            // ordem fixa evita deadlock
+            Carteira primeiro = a.dono.compareTo(b.dono) <= 0 ? a : b;
+            Carteira segundo = primeiro == a ? b : a;
+            primeiro.lock.lock();
+            segundo.lock.lock();
+            try {
+                debitar(a, valor, "transferência para " + para);
+                b.saldo += valor;
+                b.extrato.add(new Lancamento(para, valor, "transferência de " + de));
+            } finally {
+                segundo.lock.unlock();
+                primeiro.lock.unlock();
+            }
+            return "ok";
+        });
+    }
+
+    private String creditar(String dono, int valor, String desc) {
+        if (valor <= 0) {
+            throw new IllegalArgumentException("valor deve ser positivo");
+        }
+        Carteira c = carteiras.get(dono);
+        c.lock.lock();
+        try {
+            c.saldo += valor;
+            c.extrato.add(new Lancamento(dono, valor, desc));
+        } finally {
+            c.lock.unlock();
+        }
+        return "ok";
+    }
+
+    private void debitar(Carteira c, int valor, String desc) {
+        if (valor <= 0) {
+            throw new IllegalArgumentException("valor deve ser positivo");
+        }
+        if (c.saldo < valor) {
+            throw new IllegalArgumentException("saldo insuficiente");
+        }
+        c.saldo -= valor;
+        c.extrato.add(new Lancamento(c.dono, -valor, desc));
+    }
+
+    private String idempotente(String reqId, Supplier<String> op) {
+        synchronized (global) {
+            if (processadas.containsKey(reqId)) {
+                return processadas.get(reqId);
+            }
+        }
+        String resultado = op.get();
+        synchronized (global) {
+            processadas.put(reqId, resultado);
+        }
+        return resultado;
+    }
+}
+
+public static void main(String[] args) {
+    ServicoCarteira s = new ServicoCarteira();
+    s.criar("ana");
+    s.criar("bia");
+    s.depositar("ana", 10000, "r1");
+    s.depositar("ana", 10000, "r1"); // repetida: ignorada
+    s.transferir("ana", "bia", 4000, "r2");
+    try {
+        s.sacar("bia", 9000, "r3");
+    } catch (IllegalArgumentException e) {
+        System.out.println("erro: " + e.getMessage());
+    }
+    System.out.println(s.carteiras.get("ana").saldo + " " + s.carteiras.get("bia").saldo); // 6000 4000
+    int total = 0;
+    for (Carteira c : s.carteiras.values()) for (Lancamento l : c.extrato) total += l.valor;
+    System.out.println(total == 10000);
+}
+```
+
+```cpp
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+using namespace std;
+
+struct Lancamento {
+    string carteira;
+    int valor; // positivo credita, negativo debita
+    string descricao;
+};
+
+struct Carteira {
+    string dono;
+    int saldo = 0;
+    recursive_mutex lock;
+    vector<Lancamento> extrato;
+
+    Carteira(string dono) : dono(dono) {}
+};
+
+class ServicoCarteira {
+    map<string, string> processadas; // id da requisição -> resultado
+    mutex global;
+
+    string idempotente(const string& reqId, function<string()> op) {
+        {
+            lock_guard<mutex> g(global);
+            auto it = processadas.find(reqId);
+            if (it != processadas.end()) return it->second;
+        }
+        string resultado = op();
+        lock_guard<mutex> g(global);
+        processadas[reqId] = resultado;
+        return resultado;
+    }
+
+    string creditar(const string& dono, int valor, const string& desc) {
+        if (valor <= 0) throw invalid_argument("valor deve ser positivo");
+        Carteira& c = *carteiras.at(dono);
+        lock_guard<recursive_mutex> g(c.lock);
+        c.saldo += valor;
+        c.extrato.push_back({dono, valor, desc});
+        return "ok";
+    }
+
+    void debitar(Carteira& c, int valor, const string& desc) {
+        if (valor <= 0) throw invalid_argument("valor deve ser positivo");
+        if (c.saldo < valor) throw invalid_argument("saldo insuficiente");
+        c.saldo -= valor;
+        c.extrato.push_back({c.dono, -valor, desc});
+    }
+
+public:
+    map<string, unique_ptr<Carteira>> carteiras;
+
+    Carteira& criar(const string& dono) {
+        carteiras[dono] = make_unique<Carteira>(dono);
+        return *carteiras[dono];
+    }
+
+    string depositar(const string& dono, int valor, const string& reqId) {
+        return idempotente(reqId, [&] { return creditar(dono, valor, "depósito"); });
+    }
+
+    string sacar(const string& dono, int valor, const string& reqId) {
+        return idempotente(reqId, [&] {
+            Carteira& c = *carteiras.at(dono);
+            lock_guard<recursive_mutex> g(c.lock);
+            debitar(c, valor, "saque");
+            return string("ok");
+        });
+    }
+
+    string transferir(const string& de, const string& para, int valor, const string& reqId) {
+        return idempotente(reqId, [&] {
+            Carteira& a = *carteiras.at(de);
+            Carteira& b = *carteiras.at(para);
+            // ordem fixa evita deadlock
+            Carteira& primeiro = a.dono <= b.dono ? a : b;
+            Carteira& segundo = &primeiro == &a ? b : a;
+            lock_guard<recursive_mutex> g1(primeiro.lock);
+            lock_guard<recursive_mutex> g2(segundo.lock);
+            debitar(a, valor, "transferência para " + para);
+            b.saldo += valor;
+            b.extrato.push_back({para, valor, "transferência de " + de});
+            return string("ok");
+        });
+    }
+};
+
+int main() {
+    ServicoCarteira s;
+    s.criar("ana");
+    s.criar("bia");
+    s.depositar("ana", 10000, "r1");
+    s.depositar("ana", 10000, "r1"); // repetida: ignorada
+    s.transferir("ana", "bia", 4000, "r2");
+    try {
+        s.sacar("bia", 9000, "r3");
+    } catch (const invalid_argument& e) {
+        cout << "erro: " << e.what() << endl;
+    }
+    cout << s.carteiras["ana"]->saldo << " " << s.carteiras["bia"]->saldo << endl; // 6000 4000
+    int total = 0;
+    for (auto& [nome, c] : s.carteiras) for (auto& l : c->extrato) total += l.valor;
+    cout << boolalpha << (total == 10000) << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+class Lancamento
+{
+    public readonly string Carteira;
+    public readonly int Valor; // positivo credita, negativo debita
+    public readonly string Descricao;
+
+    public Lancamento(string carteira, int valor, string descricao)
+    {
+        Carteira = carteira;
+        Valor = valor;
+        Descricao = descricao;
+    }
+}
+
+class Carteira
+{
+    public readonly string Dono;
+    public int Saldo = 0;
+    public readonly object Trava = new object();
+    public readonly List<Lancamento> Extrato = new List<Lancamento>();
+
+    public Carteira(string dono)
+    {
+        Dono = dono;
+    }
+}
+
+class ServicoCarteira
+{
+    public readonly Dictionary<string, Carteira> Carteiras = new Dictionary<string, Carteira>();
+    private readonly Dictionary<string, string> processadas = new Dictionary<string, string>(); // id da requisição -> resultado
+    private readonly object global = new object();
+
+    public Carteira Criar(string dono)
+    {
+        var c = new Carteira(dono);
+        Carteiras[dono] = c;
+        return c;
+    }
+
+    public string Depositar(string dono, int valor, string reqId)
+    {
+        return Idempotente(reqId, () => Creditar(dono, valor, "depósito"));
+    }
+
+    public string Sacar(string dono, int valor, string reqId)
+    {
+        return Idempotente(reqId, () =>
+        {
+            var c = Carteiras[dono];
+            lock (c.Trava)
+            {
+                Debitar(c, valor, "saque");
+            }
+            return "ok";
+        });
+    }
+
+    public string Transferir(string de, string para, int valor, string reqId)
+    {
+        return Idempotente(reqId, () =>
+        {
+            var a = Carteiras[de];
+            var b = Carteiras[para];
+            // ordem fixa evita deadlock
+            var primeiro = string.CompareOrdinal(a.Dono, b.Dono) <= 0 ? a : b;
+            var segundo = primeiro == a ? b : a;
+            lock (primeiro.Trava)
+            lock (segundo.Trava)
+            {
+                Debitar(a, valor, "transferência para " + para);
+                b.Saldo += valor;
+                b.Extrato.Add(new Lancamento(para, valor, "transferência de " + de));
+            }
+            return "ok";
+        });
+    }
+
+    private string Creditar(string dono, int valor, string desc)
+    {
+        if (valor <= 0)
+        {
+            throw new ArgumentException("valor deve ser positivo");
+        }
+        var c = Carteiras[dono];
+        lock (c.Trava)
+        {
+            c.Saldo += valor;
+            c.Extrato.Add(new Lancamento(dono, valor, desc));
+        }
+        return "ok";
+    }
+
+    private void Debitar(Carteira c, int valor, string desc)
+    {
+        if (valor <= 0)
+        {
+            throw new ArgumentException("valor deve ser positivo");
+        }
+        if (c.Saldo < valor)
+        {
+            throw new ArgumentException("saldo insuficiente");
+        }
+        c.Saldo -= valor;
+        c.Extrato.Add(new Lancamento(c.Dono, -valor, desc));
+    }
+
+    private string Idempotente(string reqId, Func<string> op)
+    {
+        lock (global)
+        {
+            string anterior;
+            if (processadas.TryGetValue(reqId, out anterior)) return anterior;
+        }
+        string resultado = op();
+        lock (global)
+        {
+            processadas[reqId] = resultado;
+        }
+        return resultado;
+    }
+}
+
+static void Main()
+{
+    var s = new ServicoCarteira();
+    s.Criar("ana");
+    s.Criar("bia");
+    s.Depositar("ana", 10000, "r1");
+    s.Depositar("ana", 10000, "r1"); // repetida: ignorada
+    s.Transferir("ana", "bia", 4000, "r2");
+    try
+    {
+        s.Sacar("bia", 9000, "r3");
+    }
+    catch (ArgumentException e)
+    {
+        Console.WriteLine("erro: " + e.Message);
+    }
+    Console.WriteLine(s.Carteiras["ana"].Saldo + " " + s.Carteiras["bia"].Saldo); // 6000 4000
+    int total = s.Carteiras.Values.Sum(c => c.Extrato.Sum(l => l.Valor));
+    Console.WriteLine((total == 10000).ToString().ToLower());
+}
+```
+
+```go
+import (
+	"errors"
+	"fmt"
+	"sync"
+)
+
+type Lancamento struct {
+	carteira  string
+	valor     int // positivo credita, negativo debita
+	descricao string
+}
+
+type Carteira struct {
+	dono    string
+	saldo   int
+	lock    sync.Mutex
+	extrato []Lancamento
+}
+
+type ServicoCarteira struct {
+	carteiras   map[string]*Carteira
+	processadas map[string]string // id da requisição -> resultado
+	global      sync.Mutex
+}
+
+func NovoServico() *ServicoCarteira {
+	return &ServicoCarteira{carteiras: map[string]*Carteira{}, processadas: map[string]string{}}
+}
+
+func (s *ServicoCarteira) criar(dono string) *Carteira {
+	c := &Carteira{dono: dono}
+	s.carteiras[dono] = c
+	return c
+}
+
+func (s *ServicoCarteira) depositar(dono string, valor int, reqId string) (string, error) {
+	return s.idempotente(reqId, func() (string, error) { return s.creditar(dono, valor, "depósito") })
+}
+
+func (s *ServicoCarteira) sacar(dono string, valor int, reqId string) (string, error) {
+	return s.idempotente(reqId, func() (string, error) {
+		c := s.carteiras[dono]
+		c.lock.Lock()
+		defer c.lock.Unlock()
+		if err := debitar(c, valor, "saque"); err != nil {
+			return "", err
+		}
+		return "ok", nil
+	})
+}
+
+func (s *ServicoCarteira) transferir(de, para string, valor int, reqId string) (string, error) {
+	return s.idempotente(reqId, func() (string, error) {
+		a, b := s.carteiras[de], s.carteiras[para]
+		primeiro, segundo := a, b // ordem fixa evita deadlock
+		if a.dono > b.dono {
+			primeiro, segundo = b, a
+		}
+		primeiro.lock.Lock()
+		defer primeiro.lock.Unlock()
+		segundo.lock.Lock()
+		defer segundo.lock.Unlock()
+		if err := debitar(a, valor, "transferência para "+para); err != nil {
+			return "", err
+		}
+		b.saldo += valor
+		b.extrato = append(b.extrato, Lancamento{para, valor, "transferência de " + de})
+		return "ok", nil
+	})
+}
+
+func (s *ServicoCarteira) creditar(dono string, valor int, desc string) (string, error) {
+	if valor <= 0 {
+		return "", errors.New("valor deve ser positivo")
+	}
+	c := s.carteiras[dono]
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.saldo += valor
+	c.extrato = append(c.extrato, Lancamento{dono, valor, desc})
+	return "ok", nil
+}
+
+func debitar(c *Carteira, valor int, desc string) error {
+	if valor <= 0 {
+		return errors.New("valor deve ser positivo")
+	}
+	if c.saldo < valor {
+		return errors.New("saldo insuficiente")
+	}
+	c.saldo -= valor
+	c.extrato = append(c.extrato, Lancamento{c.dono, -valor, desc})
+	return nil
+}
+
+func (s *ServicoCarteira) idempotente(reqId string, op func() (string, error)) (string, error) {
+	s.global.Lock()
+	if anterior, ok := s.processadas[reqId]; ok {
+		s.global.Unlock()
+		return anterior, nil
+	}
+	s.global.Unlock()
+	resultado, err := op()
+	if err != nil {
+		return "", err
+	}
+	s.global.Lock()
+	s.processadas[reqId] = resultado
+	s.global.Unlock()
+	return resultado, nil
+}
+
+func main() {
+	s := NovoServico()
+	s.criar("ana")
+	s.criar("bia")
+	s.depositar("ana", 10000, "r1")
+	s.depositar("ana", 10000, "r1") // repetida: ignorada
+	s.transferir("ana", "bia", 4000, "r2")
+	if _, err := s.sacar("bia", 9000, "r3"); err != nil {
+		fmt.Println("erro:", err)
+	}
+	fmt.Println(s.carteiras["ana"].saldo, s.carteiras["bia"].saldo) // 6000 4000
+	total := 0
+	for _, c := range s.carteiras {
+		for _, l := range c.extrato {
+			total += l.valor
+		}
+	}
+	fmt.Println(total == 10000)
+}
+```
+
+</CodeTabs>
 
 Duas coisas para destacar: a ordem fixa na aquisição dos locks (por nome) evita deadlock quando A transfere para B e B para A ao mesmo tempo, e o id da requisição torna as operações idempotentes. Em produção a marcação de "processada" e a alteração de saldo têm de ocorrer na mesma transação.
 
