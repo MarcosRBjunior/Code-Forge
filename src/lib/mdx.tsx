@@ -7,11 +7,12 @@ import { rehypeBlockIds } from "./rehype-block-ids";
 import { rehypeCodeTabs } from "./rehype-code-tabs";
 import { Animation } from "@/components/mdx/Animation";
 import { Callout } from "@/components/mdx/Callout";
+import { CodeBlock } from "@/components/mdx/CodeBlock";
 import { CodeTabs } from "@/components/mdx/CodeTabs";
 import { Quiz } from "@/components/mdx/Quiz";
 import { QuizSet } from "@/components/mdx/QuizSet";
 
-const components = { Animation, Callout, CodeTabs, Quiz, QuizSet };
+const components = { Animation, Callout, CodeTabs, Quiz, QuizSet, pre: CodeBlock };
 
 /** Compila o MDX do capítulo no servidor (no build, para páginas estáticas). */
 export async function renderChapter(source: string) {
@@ -24,7 +25,7 @@ export async function renderChapter(source: string) {
         remarkPlugins: [remarkGfm],
         rehypePlugins: [
           rehypeSlug,
-          [rehypePrettyCode, { theme: { light: "github-light", dark: "github-dark" }, keepBackground: false }],
+          [rehypePrettyCode, { theme: { light: "github-light", dark: "tokyo-night" }, keepBackground: false }],
           rehypeCodeTabs,
           rehypeBlockIds,
         ],

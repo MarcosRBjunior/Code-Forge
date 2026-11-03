@@ -10,7 +10,7 @@ type Prefs = {
   font: "serif" | "sans" | "mono";
 };
 
-const DEFAULTS: Prefs = { theme: "system", size: "m", leading: "normal", width: "normal", font: "serif" };
+const DEFAULTS: Prefs = { theme: "dark", size: "m", leading: "normal", width: "normal", font: "serif" };
 
 function readPrefs(): Prefs {
   try {

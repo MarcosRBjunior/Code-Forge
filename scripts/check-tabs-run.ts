@@ -109,8 +109,10 @@ async function main() {
         g[m[1]] = lines.slice(s, j).join("\n");
         i = j;
       }
-      const printed = /\bprint\(/.test(g.python ?? ""); // sem print: só confere que compila (acrescenta um main vazio)
-      let ref = await run("python", g.python);
+      // COMPILE_ONLY=1: só compila/roda cada aba, sem comparar com o Python (fragmentos com nomes indefinidos, SDKs etc.)
+      const soCompila = process.env.COMPILE_ONLY === "1";
+      const printed = !soCompila && /^print\(/m.test(g.python ?? ""); // sem print: só confere que compila (acrescenta um main vazio)
+      let ref = soCompila ? { out: "" } : await run("python", g.python);
       let expected = ref.out ?? "";
       if (ref.err && /(NameError|not defined)/.test(ref.err) && acc.python) {
         const before = await run("python", acc.python);
