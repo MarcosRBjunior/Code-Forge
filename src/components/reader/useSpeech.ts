@@ -40,6 +40,8 @@ export function useSpeech(rootRef: React.RefObject<HTMLElement | null>) {
     if (!("speechSynthesis" in window)) setStatus("unsupported");
     else speechSynthesis.getVoices(); // dispara o carregamento das vozes
     return () => {
+      // Intencional: queremos o valor mais recente de session.current na limpeza (não é um nó DOM).
+      // eslint-disable-next-line react-hooks/exhaustive-deps
       session.current++;
       if ("speechSynthesis" in window) speechSynthesis.cancel();
       clearMarks();

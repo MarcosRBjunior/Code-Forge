@@ -6,7 +6,7 @@ Plataforma de estudo para entrevistas de engenharia, para um único usuário, in
 
 | Área | Recursos |
 |---|---|
-| Cursos | DSA, System Design, Entrevistas de System Design, Low Level Design e Comportamental, mais cursos de linguagem: Java, C++, C#, Go e TypeScript para entrevistas. Capítulos ainda não escritos aparecem como "em breve" |
+| Cursos | 17 cursos (980 capítulos): DSA, System Design (Fundamentos e Entrevistas), Low Level Design, Comportamental, SQL, Concorrência, Redes, Sistemas Operacionais, AI Engineering, GenAI System Design, ML System Design e cursos de linguagem para entrevistas (Java, C++, C#, Go e TypeScript). Blocos de código de DSA, System Design e LLD têm abas em 7 linguagens |
 | Leitor | Destaques em 5 cores, notas, caderno com busca e exportação `.md`, áudio com destaque palavra a palavra, modo livro (tecla B), progresso de leitura, sumário com seção ativa, tema claro/escuro e ajustes de fonte e largura |
 | Prática | Editor Monaco com Python, JavaScript e TypeScript rodando no navegador e Java, C++, C# e Go compilados num serviço externo (Judge0), com código inicial gerado dos testes (listas, árvores e design de classes só em Python, JS e TS), testes por caso, rascunhos salvos, suporte a listas ligadas, árvores e classes de design; catálogo agrupado por padrão, filtros e problema aleatório |
 | Entrevista | Mock interview cronometrada (estilo, nível, modo sem executar, mistura de dificuldades), avaliação nas 6 áreas da rubrica com nota de 0 a 100 e histórico |

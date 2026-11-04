@@ -52,12 +52,12 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
         <script dangerouslySetInnerHTML={{ __html: prefsScript }} />
       </head>
       <body className="font-ui antialiased">
-        <header className="sticky top-0 z-40 flex h-header items-center gap-4 border-b border-line bg-bg/80 px-4 backdrop-blur-md">
+        <header className="sticky top-0 z-40 flex h-header items-center gap-2 border-b sm:gap-4 border-line bg-bg/80 px-4 backdrop-blur-md">
           <Link href="/" className="flex items-center gap-2 font-semibold tracking-tight">
             <span aria-hidden className="grid size-7 place-items-center rounded-md bg-accent text-sm text-fg-on-accent">
               CF
             </span>
-            CodeForge
+            <span className="hidden sm:inline">CodeForge</span>
           </Link>
           <nav className="ml-2 flex items-center gap-1 text-sm text-fg-muted">
             <NavMenu label="Cursos" sections={courseSections} columns={2} />

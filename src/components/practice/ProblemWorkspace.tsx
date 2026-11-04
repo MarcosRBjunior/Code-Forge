@@ -133,7 +133,7 @@ export function ProblemWorkspace({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [run, running]);
+  }, [run, running, allowRun]);
 
   const passed = outcome?.kind === "done" ? outcome.cases.filter((c) => c.ok).length : 0;
   const allPassed = outcome?.kind === "done" && passed === outcome.cases.length;
