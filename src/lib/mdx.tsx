@@ -20,7 +20,10 @@ export async function renderChapter(source: string) {
     source,
     components,
     options: {
-      // O conteúdo vem do repositório (confiável); expressões JS aparecem só nas props dos componentes.
+      // O conteúdo vem do repositório (confiável); expressões JS aparecem só nas props dos componentes
+      // (ex.: options={[...]} do Quiz). A v6 bloqueia isso por padrão; liberamos `blockJS` mas mantemos
+      // `blockDangerousJS` (padrão: true), que continua barrando eval, Function, process etc.
+      blockJS: false,
       mdxOptions: {
         remarkPlugins: [remarkGfm],
         rehypePlugins: [
