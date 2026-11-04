@@ -24,6 +24,16 @@ npm run dev
 
 Abra http://localhost:3000. Os dados (progresso, destaques, notas e rascunhos de código) ficam num Postgres embutido em `.data/pglite`. Não é preciso instalar nada além do Node.
 
+## Backup e migração do progresso
+
+```bash
+npx tsx --conditions react-server scripts/backup-db.ts export            # grava em backups/ (fora do git)
+npx tsx --conditions react-server scripts/backup-db.ts import <arquivo>  # só preenche tabelas vazias
+npx tsx --conditions react-server scripts/backup-db.ts import <arquivo> --replace
+```
+
+Sem `DATABASE_URL` o script usa o PGlite local; com ela, o Neon. Para migrar: `export` sem `DATABASE_URL`, depois `import` com `DATABASE_URL` definida. Feche o app antes (o PGlite aceita um processo por vez).
+
 ## Publicar de graça (Vercel + Neon)
 
 1. Crie um banco no [Neon](https://neon.tech) (plano Free) e copie a *connection string*.
