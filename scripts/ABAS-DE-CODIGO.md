@@ -11,7 +11,26 @@ python, javascript, typescript, java, cpp, csharp, go.
 | system-design | 63 de 71 | os 8 restantes ficam só em Python (abaixo) |
 | system-design-interviews | 13 de 14 | só `spark` fica em Python (abaixo) |
 | lld | 99 de 107 | completo: os 8 restantes não têm bloco Python (são conceituais) |
-| concorrencia, redes, sistemas-operacionais, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de escopo: o código depende de APIs do Python (`threading`, `struct`, `socket`, `os`, `math`, `random`); uma versão em outra linguagem seria outro programa |
+| sistemas-operacionais | 42 de 47 | completo (05/11): os 5 restantes ficam só em Python (subprocess, mmap com filho, os.read/os.pipe, 1 fragmento). Sem JS/TS em regiao-critica #2, semaforos-e-monitores #1 e #2 e memoria-virtual #2 |
+| concorrencia, redes, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
+
+## Triagem dos 6 cursos restantes (05/11/2026)
+
+A premissa de 03/11 ("o código depende de APIs do Python") não se confirmou: lendo os 253 blocos, a maioria é lógica pura com a biblioteca padrão.
+A = tradução fiel (saída comparável), B = tradução idiomática (conceito existe, API muda), C = fica só em Python.
+
+| Curso | A | B | C | Observação |
+|---|---|---|---|---|
+| sistemas-operacionais | 36 | 6 | 5 | simuladores (escalonamento, paginação, banqueiro). C: subprocess, mmap com processo filho, os.read/os.pipe crus, 1 fragmento |
+| redes | 40 | 9 | 2 | simulações e cabeçalhos byte a byte (`struct.pack` → ByteBuffer/DataView/encoding/binary). B = sockets: o Judge0 NÃO tem rede nem localhost (`network is unreachable`), então só `COMPILE_ONLY`. C: os 2 blocos sobre o módulo `ipaddress` |
+| genai-system-design | 22 | 3 | 0 | 15 blocos são só contas de estimativa |
+| ai-engineering | 35 | 11 | 1 | nenhum SDK/LLM real. Cuidados: JSON em Java/C++/C# (extrator mínimo), regex `\w` com acentos, `round()` do Python arredonda para o par |
+| ml-system-design | 17 | 3 | 0 | 15 de 20 usam `random` com semente: a "Saída:" do texto não bate em outras linguagens. Traduzir só os determinísticos (metricas, feed-de-noticias, busca-semantica, feature-stores, pipelines-de-dados, framework-de-entrevista) |
+| concorrencia | 5 | 48 | 10 | threads/locks/filas: traduzir só java, cpp, csharp, go (JS/TS não têm memória compartilhada; omitir essas abas). C: aula do GIL, multiprocessing, asyncio entre awaits, BoundedSemaphore, fragmentos. Saída depende de tempo: `COMPILE_ONLY` na maioria |
+
+Ordem combinada: sistemas-operacionais → redes (só A) → genai-system-design → ai-engineering → concorrencia → ml-system-design (só determinísticos).
+
+Um grupo `<CodeTabs>` pode ter menos de 7 abas: as abas saem dos blocos presentes. Para omitir JS/TS, deixe o `<N>.md` só com java, cpp, csharp, go.
 
 Em LLD, `abstract-factory` (SHA-1 e HMAC escritos à mão em C++), `facade` (id de transação calculado por cada linguagem), `template-method` (JSON mínimo em Java/C++/C#) e `realizacao` também têm abas. Em `facade` a saída não é comparável (o `hash()` do Python muda a cada execução), então vale `COMPILE_ONLY=1`.
 
@@ -54,7 +73,16 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - C#/Mono: não existe `PriorityQueue`; literais com separador (`1_000_000_007L`) saem errados; sem tuplas (`ValueTuple`) em arrays.
 - O verificador embrulha o C# em `class Program`: métodos de extensão (`this T x`) e `global::Tipo` não funcionam; use métodos estáticos comuns.
 - C# (Mono): `ArgumentOutOfRangeException(string)` trata o texto como nome do parâmetro (a mensagem sai errada); use `ArgumentException`.
-- C++ precisa de `-pthread` para `std::thread` (já configurado em `src/lib/judge0.ts`).
+- C++ precisa de `-pthread` para `std::thread` (já configurado em `src/lib/judge0.ts`). Desde 05/11 também compila com `-std=c++20`
+  (GCC 14), o que libera `<semaphore>`, `<latch>` e `<barrier>`.
+- C++ com `using namespace std` + `<mutex>`/`<chrono>`: nomes globais como `pico`, `nano`, `micro`, `milli`, `kilo`, `mega`
+  colidem com os `std::ratio` de `<ratio>` ("reference to 'pico' is ambiguous"). Tire o `using namespace std` ou renomeie.
+- Formatos do Python: `{:,}` → Java `%,` com `Locale.US`, C# `N` com `InvariantCulture`, JS `toLocaleString("en-US")`, C++/Go à mão.
+  `{:g}` → C++/Go `%g` e C# `"g6"` batem; Java `%g` é diferente e JS não tem (função própria). C++20 tem `std::format`.
+- C# (Mono): parâmetro de lambda com o mesmo nome de uma variável local declarada depois no método dá CS0136; use outro nome.
+- Prints dentro de laços não contam para o verificador: na prática rode SEMPRE também a cópia do `force-print.mjs`.
+- C#: desempate por string com `string.CompareOrdinal` (a comparação padrão depende da cultura).
+- Sem rede nenhuma, nem 127.0.0.1: código com socket só pode ser verificado com `COMPILE_ONLY=1`.
 - Go é o 1.18: sem `min`/`max` embutidos.
 - TypeScript compila com a biblioteca do DOM: nomes de variável de topo como `status`, `name`, `history` e `length` colidem com
   globais. Use outro nome.

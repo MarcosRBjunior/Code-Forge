@@ -22,7 +22,8 @@ function wrapJava(code: string) {
   return `${imports.join("\n")}\npublic class Main {\n${body.join("\n")}\n}\n`;
 }
 function wrapCs(code: string) {
-  if (/class Program\b|namespace /.test(code)) return code;
+  // só declarações de verdade no início da linha: "namespace" num comentário não conta
+  if (/class Program\b|^\s*namespace\s+\w/m.test(code)) return code;
   const usings: string[] = [];
   const body = code.split("\n").filter((l) => (/^using [\w.]+;/.test(l) ? (usings.push(l), false) : true));
   return `${usings.join("\n")}\nclass Program {\n${body.join("\n")}\n}\n`;
@@ -125,7 +126,8 @@ async function main() {
       ran++;
       for (const lang of LANGS) {
         if (only && !only.includes(lang)) continue;
-        const own = g[lang] ?? "";
+        if (g[lang] === undefined) continue; // aba omitida de propósito (ex.: JS/TS sem threads com memória compartilhada)
+        const own = g[lang];
         const prep = (code: string) => (printed ? code : addStub(lang, code));
         // 1) sozinho; 2) depois de todo o código anterior; 3) depois só do bloco imediatamente anterior
         const tentativas: (string | null)[] = [null];
