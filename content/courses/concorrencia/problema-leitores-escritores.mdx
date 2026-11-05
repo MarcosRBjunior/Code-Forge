@@ -32,6 +32,8 @@ R2            chega
 
 O programa abaixo implementa as duas primeiras com uma `Condition` e reproduz o cenário do diagrama de forma determinística: o fluxo principal só avança quando o escritor e o segundo leitor já estão na posição esperada.
 
+<CodeTabs>
+
 ```python
 import threading
 import time
@@ -112,6 +114,509 @@ cenario("leitores")
 cenario("escritores")
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.function.BooleanSupplier;
+
+static class RWLock {
+    final String prioridade;
+    int leitores = 0;
+    boolean escrevendo = false;
+    // volatile: o fluxo principal lê estes dois contadores sem pegar o monitor
+    volatile int escritoresEsperando = 0;
+    volatile int leitoresEsperando = 0;
+
+    RWLock(String prioridade) {
+        this.prioridade = prioridade;
+    }
+
+    synchronized void adquirirLeitura() throws InterruptedException {
+        leitoresEsperando += 1;
+        while (escrevendo || (prioridade.equals("escritores") && escritoresEsperando > 0)) {
+            wait();
+        }
+        leitoresEsperando -= 1;
+        leitores += 1;
+    }
+
+    synchronized void liberarLeitura() {
+        leitores -= 1;
+        if (leitores == 0) {
+            notifyAll();
+        }
+    }
+
+    synchronized void adquirirEscrita() throws InterruptedException {
+        escritoresEsperando += 1;
+        while (escrevendo || leitores > 0) {
+            wait();
+        }
+        escritoresEsperando -= 1;
+        escrevendo = true;
+    }
+
+    synchronized void liberarEscrita() {
+        escrevendo = false;
+        notifyAll();
+    }
+}
+
+static void esperarAte(BooleanSupplier condicao) throws InterruptedException {
+    while (!condicao.getAsBoolean()) {
+        Thread.sleep(1);
+    }
+}
+
+static void cenario(String prioridade) throws InterruptedException {
+    RWLock rw = new RWLock(prioridade);
+    List<String> log = Collections.synchronizedList(new ArrayList<>());
+    CountDownLatch r1Dentro = new CountDownLatch(1), soltaR1 = new CountDownLatch(1);
+
+    Runnable r1 = () -> {
+        try {
+            rw.adquirirLeitura();
+            log.add("R1 le");
+            r1Dentro.countDown();
+            soltaR1.await();
+            log.add("R1 sai");
+            rw.liberarLeitura();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    };
+
+    Runnable w = () -> {
+        try {
+            rw.adquirirEscrita();
+            log.add("W escreve");
+            rw.liberarEscrita();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    };
+
+    Runnable r2 = () -> {
+        try {
+            rw.adquirirLeitura();
+            log.add("R2 le");
+            rw.liberarLeitura();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    };
+
+    List<Thread> ts = List.of(new Thread(r1), new Thread(w), new Thread(r2));
+    ts.get(0).start();
+    r1Dentro.await();
+    ts.get(1).start();
+    esperarAte(() -> rw.escritoresEsperando == 1);
+    ts.get(2).start();
+    esperarAte(() -> log.contains("R2 le") || rw.leitoresEsperando == 1);
+    soltaR1.countDown();
+    for (Thread t : ts) t.join();
+    System.out.println("prioridade a " + prioridade + ": " + String.join(" -> ", log));
+}
+
+public static void main(String[] args) throws InterruptedException {
+    cenario("leitores");
+    cenario("escritores");
+}
+```
+
+```cpp
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <iostream>
+#include <latch>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace std;
+
+class RWLock {
+    string prioridade;
+    mutex m;
+    condition_variable cond;
+    int leitores = 0;
+    bool escrevendo = false;
+
+public:
+    // atômicos: o fluxo principal lê estes dois contadores sem pegar o mutex
+    atomic<int> escritoresEsperando{0};
+    atomic<int> leitoresEsperando{0};
+
+    explicit RWLock(string prioridade) : prioridade(prioridade) {}
+
+    void adquirirLeitura() {
+        unique_lock<mutex> trava(m);
+        leitoresEsperando += 1;
+        while (escrevendo || (prioridade == "escritores" && escritoresEsperando > 0)) {
+            cond.wait(trava);
+        }
+        leitoresEsperando -= 1;
+        leitores += 1;
+    }
+
+    void liberarLeitura() {
+        lock_guard<mutex> trava(m);
+        leitores -= 1;
+        if (leitores == 0) {
+            cond.notify_all();
+        }
+    }
+
+    void adquirirEscrita() {
+        unique_lock<mutex> trava(m);
+        escritoresEsperando += 1;
+        while (escrevendo || leitores > 0) {
+            cond.wait(trava);
+        }
+        escritoresEsperando -= 1;
+        escrevendo = true;
+    }
+
+    void liberarEscrita() {
+        lock_guard<mutex> trava(m);
+        escrevendo = false;
+        cond.notify_all();
+    }
+};
+
+void esperarAte(function<bool()> condicao) {
+    while (!condicao()) {
+        this_thread::sleep_for(chrono::milliseconds(1));
+    }
+}
+
+void cenario(const string& prioridade) {
+    RWLock rw(prioridade);
+    vector<string> log;
+    mutex travaLog;  // em C++, um vector não aguenta acesso simultâneo sem lock
+    latch r1Dentro(1), soltaR1(1);
+
+    auto anotar = [&](const string& texto) {
+        lock_guard<mutex> guarda(travaLog);
+        log.push_back(texto);
+    };
+
+    auto r1 = [&]() {
+        rw.adquirirLeitura();
+        anotar("R1 le");
+        r1Dentro.count_down();
+        soltaR1.wait();
+        anotar("R1 sai");
+        rw.liberarLeitura();
+    };
+
+    auto w = [&]() {
+        rw.adquirirEscrita();
+        anotar("W escreve");
+        rw.liberarEscrita();
+    };
+
+    auto r2 = [&]() {
+        rw.adquirirLeitura();
+        anotar("R2 le");
+        rw.liberarLeitura();
+    };
+
+    vector<thread> ts;
+    ts.emplace_back(r1);
+    r1Dentro.wait();
+    ts.emplace_back(w);
+    esperarAte([&]() { return rw.escritoresEsperando == 1; });
+    ts.emplace_back(r2);
+    esperarAte([&]() {
+        lock_guard<mutex> guarda(travaLog);
+        return find(log.begin(), log.end(), "R2 le") != log.end() || rw.leitoresEsperando == 1;
+    });
+    soltaR1.count_down();
+    for (auto& t : ts) t.join();
+    cout << "prioridade a " << prioridade << ": ";
+    for (size_t i = 0; i < log.size(); i++) cout << (i ? " -> " : "") << log[i];
+    cout << endl;
+}
+
+int main() {
+    cenario("leitores");
+    cenario("escritores");
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class RWLock
+{
+    private readonly string prioridade;
+    private readonly object cond = new object();
+    private int leitores = 0;
+    private bool escrevendo = false;
+    // volatile: o fluxo principal lê estes dois contadores sem pegar o lock
+    public volatile int escritoresEsperando = 0;
+    public volatile int leitoresEsperando = 0;
+
+    public RWLock(string prioridade)
+    {
+        this.prioridade = prioridade;
+    }
+
+    public void AdquirirLeitura()
+    {
+        lock (cond)
+        {
+            leitoresEsperando += 1;
+            while (escrevendo || (prioridade == "escritores" && escritoresEsperando > 0))
+                Monitor.Wait(cond);
+            leitoresEsperando -= 1;
+            leitores += 1;
+        }
+    }
+
+    public void LiberarLeitura()
+    {
+        lock (cond)
+        {
+            leitores -= 1;
+            if (leitores == 0)
+                Monitor.PulseAll(cond);
+        }
+    }
+
+    public void AdquirirEscrita()
+    {
+        lock (cond)
+        {
+            escritoresEsperando += 1;
+            while (escrevendo || leitores > 0)
+                Monitor.Wait(cond);
+            escritoresEsperando -= 1;
+            escrevendo = true;
+        }
+    }
+
+    public void LiberarEscrita()
+    {
+        lock (cond)
+        {
+            escrevendo = false;
+            Monitor.PulseAll(cond);
+        }
+    }
+}
+
+static void EsperarAte(Func<bool> condicao)
+{
+    while (!condicao())
+        Thread.Sleep(1);
+}
+
+static void Cenario(string prioridade)
+{
+    var rw = new RWLock(prioridade);
+    var log = new List<string>();  // List não é segura entre threads: todo acesso passa por anotar ou lock (log)
+    var r1Dentro = new ManualResetEventSlim(false);
+    var soltaR1 = new ManualResetEventSlim(false);
+
+    Action<string> anotar = texto =>
+    {
+        lock (log) { log.Add(texto); }
+    };
+
+    Action r1 = () =>
+    {
+        rw.AdquirirLeitura();
+        anotar("R1 le");
+        r1Dentro.Set();
+        soltaR1.Wait();
+        anotar("R1 sai");
+        rw.LiberarLeitura();
+    };
+
+    Action w = () =>
+    {
+        rw.AdquirirEscrita();
+        anotar("W escreve");
+        rw.LiberarEscrita();
+    };
+
+    Action r2 = () =>
+    {
+        rw.AdquirirLeitura();
+        anotar("R2 le");
+        rw.LiberarLeitura();
+    };
+
+    var ts = new List<Thread> { new Thread(() => r1()), new Thread(() => w()), new Thread(() => r2()) };
+    ts[0].Start();
+    r1Dentro.Wait();
+    ts[1].Start();
+    EsperarAte(() => rw.escritoresEsperando == 1);
+    ts[2].Start();
+    EsperarAte(() =>
+    {
+        lock (log) { return log.Contains("R2 le") || rw.leitoresEsperando == 1; }
+    });
+    soltaR1.Set();
+    foreach (var t in ts) t.Join();
+    Console.WriteLine("prioridade a " + prioridade + ": " + string.Join(" -> ", log));
+}
+
+static void Main()
+{
+    Cenario("leitores");
+    Cenario("escritores");
+}
+```
+
+```go
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+)
+
+type RWLock struct {
+	prioridade          string
+	mu                  sync.Mutex
+	cond                *sync.Cond
+	leitores            int
+	escrevendo          bool
+	escritoresEsperando int
+	leitoresEsperando   int
+}
+
+func NovoRWLock(prioridade string) *RWLock {
+	rw := &RWLock{prioridade: prioridade}
+	rw.cond = sync.NewCond(&rw.mu)
+	return rw
+}
+
+func (rw *RWLock) adquirirLeitura() {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.leitoresEsperando += 1
+	for rw.escrevendo || (rw.prioridade == "escritores" && rw.escritoresEsperando > 0) {
+		rw.cond.Wait()
+	}
+	rw.leitoresEsperando -= 1
+	rw.leitores += 1
+}
+
+func (rw *RWLock) liberarLeitura() {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.leitores -= 1
+	if rw.leitores == 0 {
+		rw.cond.Broadcast()
+	}
+}
+
+func (rw *RWLock) adquirirEscrita() {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.escritoresEsperando += 1
+	for rw.escrevendo || rw.leitores > 0 {
+		rw.cond.Wait()
+	}
+	rw.escritoresEsperando -= 1
+	rw.escrevendo = true
+}
+
+func (rw *RWLock) liberarEscrita() {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	rw.escrevendo = false
+	rw.cond.Broadcast()
+}
+
+func esperarAte(condicao func() bool) {
+	for !condicao() {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func cenario(prioridade string) {
+	rw := NovoRWLock(prioridade)
+	var log []string
+	var travaLog sync.Mutex // slice não aguenta acesso simultâneo sem lock
+	r1Dentro, soltaR1 := make(chan struct{}), make(chan struct{})
+
+	anotar := func(texto string) {
+		travaLog.Lock()
+		defer travaLog.Unlock()
+		log = append(log, texto)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	r1 := func() {
+		defer wg.Done()
+		rw.adquirirLeitura()
+		anotar("R1 le")
+		close(r1Dentro)
+		<-soltaR1
+		anotar("R1 sai")
+		rw.liberarLeitura()
+	}
+
+	w := func() {
+		defer wg.Done()
+		rw.adquirirEscrita()
+		anotar("W escreve")
+		rw.liberarEscrita()
+	}
+
+	r2 := func() {
+		defer wg.Done()
+		rw.adquirirLeitura()
+		anotar("R2 le")
+		rw.liberarLeitura()
+	}
+
+	go r1()
+	<-r1Dentro
+	go w()
+	esperarAte(func() bool { // em Go, ler o contador sem lock seria corrida de dados
+		rw.mu.Lock()
+		defer rw.mu.Unlock()
+		return rw.escritoresEsperando == 1
+	})
+	go r2()
+	esperarAte(func() bool {
+		travaLog.Lock()
+		defer travaLog.Unlock()
+		for _, linha := range log {
+			if linha == "R2 le" {
+				return true
+			}
+		}
+		rw.mu.Lock()
+		defer rw.mu.Unlock()
+		return rw.leitoresEsperando == 1
+	})
+	close(soltaR1)
+	wg.Wait()
+	fmt.Println("prioridade a " + prioridade + ": " + strings.Join(log, " -> "))
+}
+
+func main() {
+	cenario("leitores")
+	cenario("escritores")
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 prioridade a leitores: R1 le -> R2 le -> R1 sai -> W escreve
@@ -123,6 +628,8 @@ Repare: com prioridade a leitores, R2 "furou a fila" do escritor. Agora imagine 
 ## A solução justa com catraca
 
 Na versão justa, todo mundo passa por um mutex de entrada. O leitor atravessa e solta na hora; o escritor **segura a catraca** enquanto espera os leitores ativos saírem, então quem chega depois fica atrás dele.
+
+<CodeTabs>
 
 ```python
 import threading
@@ -186,6 +693,372 @@ for t in ts:
 print("a =", dados["a"], "b =", dados["b"])
 print("leituras:", leituras[0], "inconsistentes:", inconsistentes[0])
 ```
+
+```java
+import java.util.*;
+import java.util.concurrent.locks.ReentrantLock;
+
+static class RWJusto {
+    // ReentrantLock e não synchronized: o escritor pega a catraca num método e solta em outro
+    final ReentrantLock catraca = new ReentrantLock();
+    final Object cond = new Object();
+    int leitores = 0;
+
+    void adquirirLeitura() {
+        catraca.lock();             // passa pela catraca e solta
+        try {
+            synchronized (cond) {
+                leitores += 1;
+            }
+        } finally {
+            catraca.unlock();
+        }
+    }
+
+    void liberarLeitura() {
+        synchronized (cond) {
+            leitores -= 1;
+            if (leitores == 0) {
+                cond.notifyAll();
+            }
+        }
+    }
+
+    void adquirirEscrita() throws InterruptedException {
+        catraca.lock();             // bloqueia novos leitores e escritores
+        synchronized (cond) {
+            while (leitores > 0) {
+                cond.wait();
+            }
+        }
+    }
+
+    void liberarEscrita() {
+        catraca.unlock();
+    }
+}
+
+static final RWJusto rw = new RWJusto();
+static final Map<String, Integer> dados = new HashMap<>(Map.of("a", 0, "b", 0));
+static int inconsistentes = 0;
+static int leituras = 0;
+static final Object contadorLock = new Object();
+
+static void escritor() {
+    try {
+        for (int i = 0; i < 200; i++) {
+            rw.adquirirEscrita();
+            dados.put("a", dados.get("a") + 1);
+            dados.put("b", dados.get("b") + 1);   // leitor nunca deve ver a != b
+            rw.liberarEscrita();
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+static void leitor() {
+    for (int i = 0; i < 300; i++) {
+        rw.adquirirLeitura();
+        boolean ok = dados.get("a").equals(dados.get("b"));
+        rw.liberarLeitura();
+        synchronized (contadorLock) {
+            leituras += 1;
+            if (!ok) {
+                inconsistentes += 1;
+            }
+        }
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> ts = new ArrayList<>();
+    for (int i = 0; i < 3; i++) ts.add(new Thread(() -> escritor()));
+    for (int i = 0; i < 5; i++) ts.add(new Thread(() -> leitor()));
+    for (Thread t : ts) t.start();
+    for (Thread t : ts) t.join();
+
+    System.out.println("a = " + dados.get("a") + " b = " + dados.get("b"));
+    System.out.println("leituras: " + leituras + " inconsistentes: " + inconsistentes);
+}
+```
+
+```cpp
+#include <condition_variable>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace std;
+
+class RWJusto {
+    mutex catraca;
+    mutex m;
+    condition_variable cond;
+    int leitores = 0;
+
+public:
+    void adquirirLeitura() {
+        lock_guard<mutex> passagem(catraca);   // passa pela catraca e solta
+        lock_guard<mutex> trava(m);
+        leitores += 1;
+    }
+
+    void liberarLeitura() {
+        lock_guard<mutex> trava(m);
+        leitores -= 1;
+        if (leitores == 0) {
+            cond.notify_all();
+        }
+    }
+
+    void adquirirEscrita() {
+        catraca.lock();             // bloqueia novos leitores e escritores
+        unique_lock<mutex> trava(m);
+        while (leitores > 0) {
+            cond.wait(trava);
+        }
+    }
+
+    void liberarEscrita() {
+        catraca.unlock();
+    }
+};
+
+RWJusto rw;
+map<string, int> dados = {{"a", 0}, {"b", 0}};
+int inconsistentes = 0;
+int leituras = 0;
+mutex contadorLock;
+
+void escritor() {
+    for (int i = 0; i < 200; i++) {
+        rw.adquirirEscrita();
+        dados["a"] += 1;
+        dados["b"] += 1;          // leitor nunca deve ver a != b
+        rw.liberarEscrita();
+    }
+}
+
+void leitor() {
+    for (int i = 0; i < 300; i++) {
+        rw.adquirirLeitura();
+        bool ok = dados.at("a") == dados.at("b");   // at, e não []: leitura pura, seguro entre leitores
+        rw.liberarLeitura();
+        lock_guard<mutex> guarda(contadorLock);
+        leituras += 1;
+        if (!ok) {
+            inconsistentes += 1;
+        }
+    }
+}
+
+int main() {
+    vector<thread> ts;
+    for (int i = 0; i < 3; i++) ts.emplace_back(escritor);
+    for (int i = 0; i < 5; i++) ts.emplace_back(leitor);
+    for (auto& t : ts) t.join();
+
+    cout << "a = " << dados["a"] << " b = " << dados["b"] << endl;
+    cout << "leituras: " << leituras << " inconsistentes: " << inconsistentes << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class RWJusto
+{
+    // Monitor.Enter e Exit, e não lock: o escritor pega a catraca num método e solta em outro
+    private readonly object catraca = new object();
+    private readonly object cond = new object();
+    private int leitores = 0;
+
+    public void AdquirirLeitura()
+    {
+        lock (catraca)              // passa pela catraca e solta
+        {
+            lock (cond)
+            {
+                leitores += 1;
+            }
+        }
+    }
+
+    public void LiberarLeitura()
+    {
+        lock (cond)
+        {
+            leitores -= 1;
+            if (leitores == 0)
+                Monitor.PulseAll(cond);
+        }
+    }
+
+    public void AdquirirEscrita()
+    {
+        Monitor.Enter(catraca);     // bloqueia novos leitores e escritores
+        lock (cond)
+        {
+            while (leitores > 0)
+                Monitor.Wait(cond);
+        }
+    }
+
+    public void LiberarEscrita()
+    {
+        Monitor.Exit(catraca);
+    }
+}
+
+static readonly RWJusto rw = new RWJusto();
+static readonly Dictionary<string, int> dados = new Dictionary<string, int> { { "a", 0 }, { "b", 0 } };
+static int inconsistentes = 0;
+static int leituras = 0;
+static readonly object contadorLock = new object();
+
+static void Escritor()
+{
+    for (int i = 0; i < 200; i++)
+    {
+        rw.AdquirirEscrita();
+        dados["a"] += 1;
+        dados["b"] += 1;          // leitor nunca deve ver a != b
+        rw.LiberarEscrita();
+    }
+}
+
+static void Leitor()
+{
+    for (int i = 0; i < 300; i++)
+    {
+        rw.AdquirirLeitura();
+        bool ok = dados["a"] == dados["b"];
+        rw.LiberarLeitura();
+        lock (contadorLock)
+        {
+            leituras += 1;
+            if (!ok)
+                inconsistentes += 1;
+        }
+    }
+}
+
+static void Main()
+{
+    var ts = new List<Thread>();
+    for (int i = 0; i < 3; i++) ts.Add(new Thread(Escritor));
+    for (int i = 0; i < 5; i++) ts.Add(new Thread(Leitor));
+    foreach (var t in ts) t.Start();
+    foreach (var t in ts) t.Join();
+
+    Console.WriteLine("a = " + dados["a"] + " b = " + dados["b"]);
+    Console.WriteLine("leituras: " + leituras + " inconsistentes: " + inconsistentes);
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+)
+
+type RWJusto struct {
+	catraca  sync.Mutex
+	mu       sync.Mutex
+	cond     *sync.Cond
+	leitores int
+}
+
+func NovoRWJusto() *RWJusto {
+	rw := &RWJusto{}
+	rw.cond = sync.NewCond(&rw.mu)
+	return rw
+}
+
+func (rw *RWJusto) adquirirLeitura() {
+	rw.catraca.Lock() // passa pela catraca e solta
+	rw.mu.Lock()
+	rw.leitores += 1
+	rw.mu.Unlock()
+	rw.catraca.Unlock()
+}
+
+func (rw *RWJusto) liberarLeitura() {
+	rw.mu.Lock()
+	rw.leitores -= 1
+	if rw.leitores == 0 {
+		rw.cond.Broadcast()
+	}
+	rw.mu.Unlock()
+}
+
+func (rw *RWJusto) adquirirEscrita() {
+	rw.catraca.Lock() // bloqueia novos leitores e escritores
+	rw.mu.Lock()
+	for rw.leitores > 0 {
+		rw.cond.Wait()
+	}
+	rw.mu.Unlock()
+}
+
+func (rw *RWJusto) liberarEscrita() {
+	rw.catraca.Unlock()
+}
+
+var rw = NovoRWJusto()
+var dados = map[string]int{"a": 0, "b": 0}
+var inconsistentes = 0
+var leituras = 0
+var contadorLock sync.Mutex
+
+func escritor(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for i := 0; i < 200; i++ {
+		rw.adquirirEscrita()
+		dados["a"] += 1
+		dados["b"] += 1 // leitor nunca deve ver a != b
+		rw.liberarEscrita()
+	}
+}
+
+func leitor(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for i := 0; i < 300; i++ {
+		rw.adquirirLeitura()
+		ok := dados["a"] == dados["b"]
+		rw.liberarLeitura()
+		contadorLock.Lock()
+		leituras += 1
+		if !ok {
+			inconsistentes += 1
+		}
+		contadorLock.Unlock()
+	}
+}
+
+func main() {
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go escritor(&wg)
+	}
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go leitor(&wg)
+	}
+	wg.Wait()
+
+	fmt.Println("a =", dados["a"], "b =", dados["b"])
+	fmt.Println("leituras:", leituras, "inconsistentes:", inconsistentes)
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

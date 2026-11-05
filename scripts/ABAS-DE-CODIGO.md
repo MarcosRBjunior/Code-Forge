@@ -16,7 +16,7 @@ python, javascript, typescript, java, cpp, csharp, go.
 | genai-system-design | 25 de 25 | completo (05/11) |
 | ai-engineering | 46 de 47 | completo (05/11): só `embeddings` #3 (fragmento) fica em Python |
 | ml-system-design | 6 de 20 | completo (05/11): metricas, feed-de-noticias, busca-semantica, feature-stores, pipelines-de-dados e framework-de-entrevista. Os demais usam `random` com semente e a "Saída:" do texto não bateria |
-| concorrencia | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
+| concorrencia | 53 de 63 | completo (05/11): blocos com threads só com java, cpp, csharp, go; JS/TS só onde não há threads ou onde Promise/async é o modelo natural. Ficam em Python os 10 blocos C da triagem | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
 
 ## Triagem dos 6 cursos restantes (05/11/2026)
 
@@ -54,6 +54,9 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - `notificacoes-lld`: a ordem do `set` do Python muda a cada execução (`PYTHONHASHSEED`); as outras linguagens usam a ordem de inserção.
 - `nao-determinismo` (genai): as contagens por temperatura saem do gerador com semente de cada linguagem; as demais linhas batem.
 - ai-engineering: `amostragem` #2 (linha "10 sorteios"), `gateways-e-fallbacks` #1 (jitter) e `bancos-vetoriais` #1 e #2 (base gaussiana com semente; aqui só a estrutura e a ordem de grandeza batem, recall 0,94 a 0,99 contra 0,95 no Python) dependem do gerador de cada linguagem. `saidas-estruturadas` #1: a mensagem do parser muda em JS, TS e Go.
+- concorrencia: `livelock-e-starvation` #1 (linha "com sorteio", gerador de cada linguagem) e `locks-reentrantes` #1 (Java e C# imprimem
+  o nome real da exceção, `IllegalMonitorStateException`/`SynchronizationLockException`, em vez de `RuntimeError`). Linhas booleanas
+  com prazo ("menos de 0.5 s" em thread-pools #2, async-await #1) podem falhar se o Judge0 estiver sobrecarregado.
 - `quadtrees` e `algoritmos-balanceamento`: usam números aleatórios, então o resultado impresso varia (a lógica é a mesma).
 - `interfaces`: a linha do `TypeError` ao instanciar o contrato só existe em Python e JavaScript; em Java, C++, C# e TypeScript isso é erro de compilação.
 
@@ -103,6 +106,8 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - C++: `for (auto& t : f()["chave"].itens)` percorre um temporário já destruído; guarde o retorno numa variável antes do laço.
 - C#: `string.Format("{3:F1}}}", x)` lê `F1}` como formato e imprime `F1` no lugar do número; converta antes com `ToString("F1", ...)`.
 - Go: `float64((1<<r)-1)` não compila (o `1` assume o tipo `float64`); use `float64((int(1)<<r)-1)`.
+- Go 1.18: sem `atomic.Bool`/`atomic.Pointer`; use `atomic.LoadInt32` e afins.
+- Não use o mesmo nome de script auxiliar em agentes paralelos (um `run.sh` compartilhado fez um agente rodar o script do outro).
 - Sem rede nenhuma, nem 127.0.0.1: código com socket só pode ser verificado com `COMPILE_ONLY=1`.
 - Go é o 1.18: sem `min`/`max` embutidos.
 - TypeScript compila com a biblioteca do DOM: nomes de variável de topo como `status`, `name`, `history` e `length` colidem com

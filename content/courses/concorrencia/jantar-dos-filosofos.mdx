@@ -22,6 +22,8 @@ Estão presentes as quatro condições de Coffman: garfos são exclusivos, cada 
 
 O programa abaixo força esse cenário de forma determinística: uma barreira garante que todos já pegaram o garfo da esquerda antes de tentar o da direita, e a tentativa usa timeout para o programa não travar de verdade.
 
+<CodeTabs>
+
 ```python
 import threading
 
@@ -50,6 +52,197 @@ print("conseguiram os dois garfos:", sum(conseguiu))
 print("deadlock: todos seguravam um garfo e esperavam o vizinho")
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+static final int N = 5;
+static final ReentrantLock[] garfos = new ReentrantLock[N];
+static final CyclicBarrier todosComEsquerdo = new CyclicBarrier(N);
+static final CyclicBarrier todosTentaram = new CyclicBarrier(N);
+static final boolean[] conseguiu = new boolean[N];
+
+static void filosofo(int i) {
+    ReentrantLock esquerdo = garfos[i], direito = garfos[(i + 1) % N];
+    esquerdo.lock();
+    try {
+        todosComEsquerdo.await();
+        if (direito.tryLock(200, TimeUnit.MILLISECONDS)) {  // sem timeout, ficaria preso para sempre
+            conseguiu[i] = true;
+            direito.unlock();
+        }
+        todosTentaram.await();  // ninguém solta o esquerdo antes de todos tentarem
+    } catch (InterruptedException | BrokenBarrierException e) {
+        Thread.currentThread().interrupt();
+    } finally {
+        esquerdo.unlock();
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    for (int i = 0; i < N; i++) garfos[i] = new ReentrantLock();
+    List<Thread> ts = new ArrayList<>();
+    for (int i = 0; i < N; i++) {
+        final int id = i;
+        ts.add(new Thread(() -> filosofo(id)));
+    }
+    for (Thread t : ts) t.start();
+    for (Thread t : ts) t.join();
+
+    int soma = 0;
+    for (boolean c : conseguiu) if (c) soma++;
+    System.out.println("conseguiram os dois garfos: " + soma);
+    System.out.println("deadlock: todos seguravam um garfo e esperavam o vizinho");
+}
+```
+
+```cpp
+#include <barrier>
+#include <chrono>
+#include <iostream>
+#include <mutex>
+#include <thread>
+#include <vector>
+using namespace std;
+
+const int N = 5;
+timed_mutex garfos[N];  // timed_mutex: o mutex comum não aceita tentativa com prazo
+barrier<> todosComEsquerdo(N);
+barrier<> todosTentaram(N);
+bool conseguiu[N] = {};
+
+void filosofo(int i) {
+    timed_mutex& esquerdo = garfos[i];
+    timed_mutex& direito = garfos[(i + 1) % N];
+    lock_guard<timed_mutex> guarda(esquerdo);
+    todosComEsquerdo.arrive_and_wait();
+    if (direito.try_lock_for(chrono::milliseconds(200))) {  // sem timeout, ficaria preso para sempre
+        conseguiu[i] = true;
+        direito.unlock();
+    }
+    todosTentaram.arrive_and_wait();  // ninguém solta o esquerdo antes de todos tentarem
+}
+
+int main() {
+    vector<thread> ts;
+    for (int i = 0; i < N; i++) ts.emplace_back(filosofo, i);
+    for (auto& t : ts) t.join();
+
+    int soma = 0;
+    for (bool c : conseguiu) soma += c;
+    cout << "conseguiram os dois garfos: " << soma << endl;
+    cout << "deadlock: todos seguravam um garfo e esperavam o vizinho" << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+const int N = 5;
+static readonly object[] garfos = new object[N];
+static readonly Barrier todosComEsquerdo = new Barrier(N);
+static readonly Barrier todosTentaram = new Barrier(N);
+static readonly bool[] conseguiu = new bool[N];
+
+static void Filosofo(int i)
+{
+    object esquerdo = garfos[i], direito = garfos[(i + 1) % N];
+    lock (esquerdo)
+    {
+        todosComEsquerdo.SignalAndWait();
+        if (Monitor.TryEnter(direito, 200))  // sem timeout, ficaria preso para sempre
+        {
+            conseguiu[i] = true;
+            Monitor.Exit(direito);
+        }
+        todosTentaram.SignalAndWait();  // ninguém solta o esquerdo antes de todos tentarem
+    }
+}
+
+static void Main()
+{
+    for (int i = 0; i < N; i++) garfos[i] = new object();
+    var ts = new List<Thread>();
+    for (int i = 0; i < N; i++)
+    {
+        int id = i;
+        ts.Add(new Thread(() => Filosofo(id)));
+    }
+    foreach (var t in ts) t.Start();
+    foreach (var t in ts) t.Join();
+
+    int soma = 0;
+    foreach (bool c in conseguiu) if (c) soma++;
+    Console.WriteLine("conseguiram os dois garfos: " + soma);
+    Console.WriteLine("deadlock: todos seguravam um garfo e esperavam o vizinho");
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+const N = 5
+
+// O sync.Mutex só tem TryLock imediato, sem prazo. Por isso cada garfo é um canal de
+// capacidade 1: enviar é pegar o lock, receber é soltar, e o select dá o timeout.
+var garfos [N]chan struct{}
+
+// Go não tem barreira pronta. Um WaitGroup de uso único faz o papel: cada um dá Done e espera os demais.
+var todosComEsquerdo, todosTentaram sync.WaitGroup
+var conseguiu [N]bool
+
+func filosofo(i int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	esquerdo, direito := garfos[i], garfos[(i+1)%N]
+	esquerdo <- struct{}{}
+	defer func() { <-esquerdo }()
+	todosComEsquerdo.Done()
+	todosComEsquerdo.Wait()
+	select {
+	case direito <- struct{}{}:
+		conseguiu[i] = true
+		<-direito
+	case <-time.After(200 * time.Millisecond): // sem timeout, ficaria preso para sempre
+	}
+	todosTentaram.Done() // ninguém solta o esquerdo antes de todos tentarem
+	todosTentaram.Wait()
+}
+
+func main() {
+	for i := range garfos {
+		garfos[i] = make(chan struct{}, 1)
+	}
+	todosComEsquerdo.Add(N)
+	todosTentaram.Add(N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go filosofo(i, &wg)
+	}
+	wg.Wait()
+
+	soma := 0
+	for _, c := range conseguiu {
+		if c {
+			soma++
+		}
+	}
+	fmt.Println("conseguiram os dois garfos:", soma)
+	fmt.Println("deadlock: todos seguravam um garfo e esperavam o vizinho")
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 conseguiram os dois garfos: 0
@@ -63,6 +256,8 @@ deadlock: todos seguravam um garfo e esperavam o vizinho
 **2. Garçom (limitar a concorrência).** Um semáforo com N menos 1 permissões deixa no máximo quatro filósofos tentarem comer ao mesmo tempo. Com cinco garfos e quatro pessoas, pelo princípio da casa dos pombos ao menos uma consegue os dois.
 
 **3. Tentar e desistir.** Pegue o primeiro, tente o segundo com `acquire(timeout=...)` ou `tryLock`; se falhar, solte o primeiro e tente de novo depois. Isso quebra o "segurar e esperar", mas pode gerar **livelock** se todos desistirem e tentarem no mesmo ritmo, então use espera aleatória.
+
+<CodeTabs>
 
 ```python
 import threading
@@ -97,6 +292,251 @@ for estrategia in (filosofo_ordenado, filosofo_com_garcom):
         t.join()
     print(estrategia.__name__, "->", comeu)
 ```
+
+```java
+import java.util.*;
+import java.util.concurrent.Semaphore;
+import java.util.function.IntConsumer;
+
+static final int N = 5;
+static final int REFEICOES = 3;
+static final Object[] garfos = new Object[N];
+static final Semaphore garcom = new Semaphore(N - 1);
+static int[] comeu = new int[N];
+
+static void filosofoOrdenado(int i) {
+    int a = i, b = (i + 1) % N;
+    Object primeiro = garfos[Math.min(a, b)], segundo = garfos[Math.max(a, b)];
+    for (int r = 0; r < REFEICOES; r++) {
+        synchronized (primeiro) {
+            synchronized (segundo) {
+                comeu[i] += 1;
+            }
+        }
+    }
+}
+
+static void filosofoComGarcom(int i) {
+    for (int r = 0; r < REFEICOES; r++) {
+        garcom.acquireUninterruptibly();
+        try {
+            synchronized (garfos[i]) {
+                synchronized (garfos[(i + 1) % N]) {
+                    comeu[i] += 1;
+                }
+            }
+        } finally {
+            garcom.release();
+        }
+    }
+}
+
+static void rodar(String nome, IntConsumer estrategia) throws InterruptedException {
+    comeu = new int[N];
+    List<Thread> ts = new ArrayList<>();
+    for (int i = 0; i < N; i++) {
+        final int id = i;
+        ts.add(new Thread(() -> estrategia.accept(id)));
+    }
+    for (Thread t : ts) t.start();
+    for (Thread t : ts) t.join();
+    System.out.println(nome + " -> " + Arrays.toString(comeu));
+}
+
+public static void main(String[] args) throws InterruptedException {
+    for (int i = 0; i < N; i++) garfos[i] = new Object();
+    rodar("filosofo_ordenado", id -> filosofoOrdenado(id));
+    rodar("filosofo_com_garcom", id -> filosofoComGarcom(id));
+}
+```
+
+```cpp
+#include <algorithm>
+#include <iostream>
+#include <mutex>
+#include <semaphore>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace std;
+
+const int N = 5;
+const int REFEICOES = 3;
+mutex garfos[N];
+counting_semaphore<N - 1> garcom(N - 1);
+int comeu[N];
+
+void filosofoOrdenado(int i) {
+    int a = i, b = (i + 1) % N;
+    mutex& primeiro = garfos[min(a, b)];
+    mutex& segundo = garfos[max(a, b)];
+    for (int r = 0; r < REFEICOES; r++) {
+        lock_guard<mutex> guarda1(primeiro);
+        lock_guard<mutex> guarda2(segundo);
+        comeu[i] += 1;
+    }
+}
+
+void filosofoComGarcom(int i) {
+    for (int r = 0; r < REFEICOES; r++) {
+        garcom.acquire();
+        {
+            lock_guard<mutex> guarda1(garfos[i]);
+            lock_guard<mutex> guarda2(garfos[(i + 1) % N]);
+            comeu[i] += 1;
+        }
+        garcom.release();
+    }
+}
+
+void rodar(const string& nome, void (*estrategia)(int)) {
+    fill(comeu, comeu + N, 0);
+    vector<thread> ts;
+    for (int i = 0; i < N; i++) ts.emplace_back(estrategia, i);
+    for (auto& t : ts) t.join();
+    cout << nome << " -> [";
+    for (int i = 0; i < N; i++) cout << (i ? ", " : "") << comeu[i];
+    cout << "]" << endl;
+}
+
+int main() {
+    rodar("filosofo_ordenado", filosofoOrdenado);
+    rodar("filosofo_com_garcom", filosofoComGarcom);
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+const int N = 5;
+const int REFEICOES = 3;
+static readonly object[] garfos = new object[N];
+static readonly SemaphoreSlim garcom = new SemaphoreSlim(N - 1);
+static int[] comeu = new int[N];
+
+static void FilosofoOrdenado(int i)
+{
+    int a = i, b = (i + 1) % N;
+    object primeiro = garfos[Math.Min(a, b)], segundo = garfos[Math.Max(a, b)];
+    for (int r = 0; r < REFEICOES; r++)
+    {
+        lock (primeiro)
+        {
+            lock (segundo)
+            {
+                comeu[i] += 1;
+            }
+        }
+    }
+}
+
+static void FilosofoComGarcom(int i)
+{
+    for (int r = 0; r < REFEICOES; r++)
+    {
+        garcom.Wait();
+        try
+        {
+            lock (garfos[i])
+            {
+                lock (garfos[(i + 1) % N])
+                {
+                    comeu[i] += 1;
+                }
+            }
+        }
+        finally
+        {
+            garcom.Release();
+        }
+    }
+}
+
+static void Rodar(string nome, Action<int> estrategia)
+{
+    comeu = new int[N];
+    var ts = new List<Thread>();
+    for (int i = 0; i < N; i++)
+    {
+        int id = i;
+        ts.Add(new Thread(() => estrategia(id)));
+    }
+    foreach (var t in ts) t.Start();
+    foreach (var t in ts) t.Join();
+    Console.WriteLine(nome + " -> [" + string.Join(", ", comeu) + "]");
+}
+
+static void Main()
+{
+    for (int i = 0; i < N; i++) garfos[i] = new object();
+    Rodar("filosofo_ordenado", FilosofoOrdenado);
+    Rodar("filosofo_com_garcom", FilosofoComGarcom);
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+)
+
+const N = 5
+const REFEICOES = 3
+
+var garfos [N]sync.Mutex
+var garcom = make(chan struct{}, N-1) // canal com N-1 lugares faz o papel do semáforo
+var comeu [N]int
+
+func filosofoOrdenado(i int) {
+	a, b := i, (i+1)%N
+	if a > b {
+		a, b = b, a
+	}
+	primeiro, segundo := &garfos[a], &garfos[b]
+	for r := 0; r < REFEICOES; r++ {
+		primeiro.Lock()
+		segundo.Lock()
+		comeu[i] += 1
+		segundo.Unlock()
+		primeiro.Unlock()
+	}
+}
+
+func filosofoComGarcom(i int) {
+	for r := 0; r < REFEICOES; r++ {
+		garcom <- struct{}{}
+		garfos[i].Lock()
+		garfos[(i+1)%N].Lock()
+		comeu[i] += 1
+		garfos[(i+1)%N].Unlock()
+		garfos[i].Unlock()
+		<-garcom
+	}
+}
+
+func rodar(nome string, estrategia func(int)) {
+	comeu = [N]int{}
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			estrategia(id)
+		}(i)
+	}
+	wg.Wait()
+	fmt.Println(nome, "->", comeu)
+}
+
+func main() {
+	rodar("filosofo_ordenado", filosofoOrdenado)
+	rodar("filosofo_com_garcom", filosofoComGarcom)
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

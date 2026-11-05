@@ -36,6 +36,8 @@ if self.tokens >= 1:        # duas threads veem 1 token
 
 Para os testes serem determinísticos, a implementação recebe um **relógio injetável**. Em produção você passaria `time.monotonic` (nunca `time.time`, que pode voltar no tempo com ajustes de NTP); no teste, um relógio falso que você avança à mão.
 
+<CodeTabs>
+
 ```python
 import threading
 
@@ -93,6 +95,351 @@ for t in threads:
 print("concorrentes permitidas:", resultados.count(True), "de", len(resultados))
 ```
 
+```java
+import java.util.*;
+import java.util.function.*;
+
+class RelogioFalso implements DoubleSupplier {
+    double agora = 0.0;
+
+    public double getAsDouble() {
+        return agora;
+    }
+
+    void avancar(double s) {
+        agora += s;
+    }
+}
+
+class TokenBucket {
+    private final int capacidade;
+    private final double taxa;                 // tokens por segundo
+    private final DoubleSupplier relogio;
+    private double tokens;
+    private double ultimo;
+    private final Object lock = new Object();
+
+    TokenBucket(int capacidade, double taxa, DoubleSupplier relogio) {
+        this.capacidade = capacidade;
+        this.taxa = taxa;
+        this.relogio = relogio;
+        this.tokens = capacidade;
+        this.ultimo = relogio.getAsDouble();
+    }
+
+    boolean permitir() {
+        synchronized (lock) {                  // reabastecer e consumir juntos
+            double agora = relogio.getAsDouble();
+            tokens = Math.min(capacidade, tokens + (agora - ultimo) * taxa);
+            ultimo = agora;
+            if (tokens >= 1) {
+                tokens -= 1;
+                return true;
+            }
+            return false;
+        }
+    }
+}
+
+static String pedir(TokenBucket balde, int n) {
+    List<String> saida = new ArrayList<>();
+    for (int i = 0; i < n; i++) saida.add(balde.permitir() ? "True" : "False");
+    return saida.toString();
+}
+
+public static void main(String[] args) throws InterruptedException {
+    RelogioFalso relogio = new RelogioFalso();
+    TokenBucket balde = new TokenBucket(3, 2, relogio);
+
+    System.out.println("rajada: " + pedir(balde, 5));
+    relogio.avancar(0.5);                      // entra 1 token
+    System.out.println("apos 0,5 s: " + pedir(balde, 2));
+    relogio.avancar(10);                       // enche, mas limita à capacidade
+    System.out.println("apos 10 s: " + pedir(balde, 4));
+
+    // 50 threads disputando o mesmo instante: só a capacidade passa
+    relogio.avancar(10);
+    List<Boolean> resultados = new ArrayList<>();
+    Object guarda = new Object();
+
+    Runnable cliente = () -> {
+        boolean ok = balde.permitir();
+        synchronized (guarda) {
+            resultados.add(ok);
+        }
+    };
+
+    List<Thread> threads = new ArrayList<>();
+    for (int i = 0; i < 50; i++) threads.add(new Thread(cliente));
+    for (Thread t : threads) t.start();
+    for (Thread t : threads) t.join();
+    System.out.println("concorrentes permitidas: " + Collections.frequency(resultados, true) + " de " + resultados.size());
+}
+```
+
+```cpp
+#include <algorithm>
+#include <functional>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace std;
+
+class RelogioFalso {
+public:
+    double agora = 0.0;
+    double operator()() const { return agora; }
+    void avancar(double s) { agora += s; }
+};
+
+class TokenBucket {
+    double capacidade;
+    double taxa;                               // tokens por segundo
+    function<double()> relogio;
+    double tokens;
+    double ultimo;
+    mutex trava;
+
+public:
+    TokenBucket(double capacidade, double taxa, function<double()> relogio)
+        : capacidade(capacidade), taxa(taxa), relogio(relogio), tokens(capacidade), ultimo(relogio()) {}
+
+    bool permitir() {
+        lock_guard<mutex> guarda(trava);       // reabastecer e consumir juntos
+        double agora = relogio();
+        tokens = min(capacidade, tokens + (agora - ultimo) * taxa);
+        ultimo = agora;
+        if (tokens >= 1) {
+            tokens -= 1;
+            return true;
+        }
+        return false;
+    }
+};
+
+string pedir(TokenBucket& balde, int n) {
+    string saida = "[";
+    for (int i = 0; i < n; i++) {
+        saida += (i ? ", " : "");
+        saida += balde.permitir() ? "True" : "False";
+    }
+    return saida + "]";
+}
+
+int main() {
+    RelogioFalso relogio;
+    TokenBucket balde(3, 2, [&relogio] { return relogio(); });
+
+    cout << "rajada: " << pedir(balde, 5) << endl;
+    relogio.avancar(0.5);                      // entra 1 token
+    cout << "apos 0,5 s: " << pedir(balde, 2) << endl;
+    relogio.avancar(10);                       // enche, mas limita à capacidade
+    cout << "apos 10 s: " << pedir(balde, 4) << endl;
+
+    // 50 threads disputando o mesmo instante: só a capacidade passa
+    relogio.avancar(10);
+    vector<bool> resultados;
+    mutex guarda_resultados;
+
+    auto cliente = [&] {
+        bool ok = balde.permitir();
+        lock_guard<mutex> guarda(guarda_resultados);
+        resultados.push_back(ok);
+    };
+
+    vector<thread> threads;
+    for (int i = 0; i < 50; i++) threads.emplace_back(cliente);
+    for (auto& t : threads) t.join();
+    cout << "concorrentes permitidas: " << count(resultados.begin(), resultados.end(), true) << " de " << resultados.size() << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+
+class RelogioFalso
+{
+    public double Agora = 0.0;
+
+    public void Avancar(double s)
+    {
+        Agora += s;
+    }
+}
+
+class TokenBucket
+{
+    readonly int capacidade;
+    readonly double taxa;                      // tokens por segundo
+    readonly Func<double> relogio;
+    double tokens;
+    double ultimo;
+    readonly object trava = new object();
+
+    public TokenBucket(int capacidade, double taxa, Func<double> relogio)
+    {
+        this.capacidade = capacidade;
+        this.taxa = taxa;
+        this.relogio = relogio;
+        this.tokens = capacidade;
+        this.ultimo = relogio();
+    }
+
+    public bool Permitir()
+    {
+        lock (trava)                           // reabastecer e consumir juntos
+        {
+            double agora = relogio();
+            tokens = Math.Min(capacidade, tokens + (agora - ultimo) * taxa);
+            ultimo = agora;
+            if (tokens >= 1)
+            {
+                tokens -= 1;
+                return true;
+            }
+            return false;
+        }
+    }
+}
+
+static string Pedir(TokenBucket balde, int n)
+{
+    var saida = new List<bool>();
+    for (int i = 0; i < n; i++) saida.Add(balde.Permitir());
+    return "[" + string.Join(", ", saida) + "]";
+}
+
+static void Main()
+{
+    RelogioFalso relogio = new RelogioFalso();
+    TokenBucket balde = new TokenBucket(3, 2, () => relogio.Agora);
+
+    Console.WriteLine("rajada: " + Pedir(balde, 5));
+    relogio.Avancar(0.5);                      // entra 1 token
+    Console.WriteLine("apos 0,5 s: " + Pedir(balde, 2));
+    relogio.Avancar(10);                       // enche, mas limita à capacidade
+    Console.WriteLine("apos 10 s: " + Pedir(balde, 4));
+
+    // 50 threads disputando o mesmo instante: só a capacidade passa
+    relogio.Avancar(10);
+    var resultados = new List<bool>();
+    object guarda = new object();
+
+    ThreadStart cliente = () =>
+    {
+        bool ok = balde.Permitir();
+        lock (guarda)
+        {
+            resultados.Add(ok);
+        }
+    };
+
+    var threads = new List<Thread>();
+    for (int i = 0; i < 50; i++) threads.Add(new Thread(cliente));
+    foreach (Thread t in threads) t.Start();
+    foreach (Thread t in threads) t.Join();
+    Console.WriteLine("concorrentes permitidas: " + resultados.Count(ok => ok) + " de " + resultados.Count);
+}
+```
+
+```go
+import (
+	"fmt"
+	"math"
+	"strings"
+	"sync"
+)
+
+type RelogioFalso struct {
+	agora float64
+}
+
+func (r *RelogioFalso) ler() float64 { return r.agora }
+
+func (r *RelogioFalso) avancar(s float64) { r.agora += s }
+
+type TokenBucket struct {
+	capacidade float64
+	taxa       float64 // tokens por segundo
+	relogio    func() float64
+	tokens     float64
+	ultimo     float64
+	mu         sync.Mutex
+}
+
+func novoTokenBucket(capacidade, taxa float64, relogio func() float64) *TokenBucket {
+	return &TokenBucket{capacidade: capacidade, taxa: taxa, relogio: relogio, tokens: capacidade, ultimo: relogio()}
+}
+
+func (b *TokenBucket) permitir() bool {
+	b.mu.Lock() // reabastecer e consumir juntos
+	defer b.mu.Unlock()
+	agora := b.relogio()
+	b.tokens = math.Min(b.capacidade, b.tokens+(agora-b.ultimo)*b.taxa)
+	b.ultimo = agora
+	if b.tokens >= 1 {
+		b.tokens -= 1
+		return true
+	}
+	return false
+}
+
+func pedir(balde *TokenBucket, n int) string {
+	saida := []string{}
+	for i := 0; i < n; i++ {
+		if balde.permitir() {
+			saida = append(saida, "True")
+		} else {
+			saida = append(saida, "False")
+		}
+	}
+	return "[" + strings.Join(saida, ", ") + "]"
+}
+
+func main() {
+	relogio := &RelogioFalso{}
+	balde := novoTokenBucket(3, 2, relogio.ler)
+
+	fmt.Println("rajada:", pedir(balde, 5))
+	relogio.avancar(0.5) // entra 1 token
+	fmt.Println("apos 0,5 s:", pedir(balde, 2))
+	relogio.avancar(10) // enche, mas limita à capacidade
+	fmt.Println("apos 10 s:", pedir(balde, 4))
+
+	// 50 goroutines disputando o mesmo instante: só a capacidade passa
+	relogio.avancar(10)
+	resultados := []bool{}
+	var guarda sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok := balde.permitir()
+			guarda.Lock()
+			defer guarda.Unlock()
+			resultados = append(resultados, ok)
+		}()
+	}
+	wg.Wait()
+	permitidas := 0
+	for _, ok := range resultados {
+		if ok {
+			permitidas += 1
+		}
+	}
+	fmt.Println("concorrentes permitidas:", permitidas, "de", len(resultados))
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 rajada: [True, True, True, False, False]
@@ -104,6 +451,8 @@ concorrentes permitidas: 3 de 50
 ## Limite por cliente
 
 Em geral o limite é por usuário ou por chave de API. Agora há dois níveis de concorrência: o mapa de clientes e o estado de cada cliente. Um lock global para tudo funciona, mas serializa clientes independentes. A versão abaixo usa um lock curto só para criar o limitador de cada cliente (evitando o check-then-act) e um lock por cliente para a janela deslizante.
+
+<CodeTabs>
 
 ```python
 import threading
@@ -164,6 +513,415 @@ print("t=0,0:", sorted(contagem.items()))
 relogio.agora = 1.0                              # a janela anterior expirou
 print("ana em t=1,0:", [limitador.permitir("ana") for _ in range(5)])
 ```
+
+```java
+import java.util.*;
+import java.util.function.*;
+
+class RelogioFalso implements DoubleSupplier {
+    double agora = 0.0;
+
+    public double getAsDouble() {
+        return agora;
+    }
+}
+
+class JanelaDeslizante {
+    private final int limite;
+    private final double janela;
+    private final DoubleSupplier relogio;
+    private final ArrayDeque<Double> eventos = new ArrayDeque<>();
+    private final Object lock = new Object();
+
+    JanelaDeslizante(int limite, double janela, DoubleSupplier relogio) {
+        this.limite = limite;
+        this.janela = janela;
+        this.relogio = relogio;
+    }
+
+    boolean permitir() {
+        synchronized (lock) {
+            double agora = relogio.getAsDouble();
+            while (!eventos.isEmpty() && eventos.peekFirst() <= agora - janela) {
+                eventos.pollFirst();             // descarta o que saiu da janela
+            }
+            if (eventos.size() < limite) {
+                eventos.addLast(agora);
+                return true;
+            }
+            return false;
+        }
+    }
+}
+
+class LimitadorPorCliente {
+    private final int limite;
+    private final double janela;
+    private final DoubleSupplier relogio;
+    private final Map<String, JanelaDeslizante> clientes = new HashMap<>();
+    private final Object lockMapa = new Object();
+
+    LimitadorPorCliente(int limite, double janela, DoubleSupplier relogio) {
+        this.limite = limite;
+        this.janela = janela;
+        this.relogio = relogio;
+    }
+
+    boolean permitir(String cliente) {
+        JanelaDeslizante lim;
+        synchronized (lockMapa) {                // só para obter/criar
+            lim = clientes.get(cliente);
+            if (lim == null) {
+                lim = new JanelaDeslizante(limite, janela, relogio);
+                clientes.put(cliente, lim);
+            }
+        }
+        return lim.permitir();                   // fora do lock global
+    }
+}
+
+static final RelogioFalso relogio = new RelogioFalso();
+static final LimitadorPorCliente limitador = new LimitadorPorCliente(4, 1.0, relogio);
+static final Map<String, Integer> contagem = new TreeMap<>();
+static final Object guarda = new Object();
+
+static void rajada(String cliente, int n) {
+    int aceitas = 0;
+    for (int i = 0; i < n; i++) {
+        if (limitador.permitir(cliente)) aceitas += 1;
+    }
+    synchronized (guarda) {
+        contagem.put(cliente, contagem.getOrDefault(cliente, 0) + aceitas);
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> threads = new ArrayList<>();
+    for (String c : List.of("ana", "bia", "caio")) {
+        for (int i = 0; i < 3; i++) threads.add(new Thread(() -> rajada(c, 5)));
+    }
+    for (Thread t : threads) t.start();
+    for (Thread t : threads) t.join();
+    System.out.println("t=0,0: " + contagem);
+
+    relogio.agora = 1.0;                         // a janela anterior expirou
+    List<String> saida = new ArrayList<>();
+    for (int i = 0; i < 5; i++) saida.add(limitador.permitir("ana") ? "True" : "False");
+    System.out.println("ana em t=1,0: " + saida);
+}
+```
+
+```cpp
+#include <deque>
+#include <functional>
+#include <initializer_list>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace std;
+
+class RelogioFalso {
+public:
+    double agora = 0.0;
+};
+
+class JanelaDeslizante {
+    int limite;
+    double janela;
+    function<double()> relogio;
+    deque<double> eventos;
+    mutex trava;
+
+public:
+    JanelaDeslizante(int limite, double janela, function<double()> relogio)
+        : limite(limite), janela(janela), relogio(relogio) {}
+
+    bool permitir() {
+        lock_guard<mutex> guarda(trava);
+        double agora = relogio();
+        while (!eventos.empty() && eventos.front() <= agora - janela) {
+            eventos.pop_front();                 // descarta o que saiu da janela
+        }
+        if ((int)eventos.size() < limite) {
+            eventos.push_back(agora);
+            return true;
+        }
+        return false;
+    }
+};
+
+class LimitadorPorCliente {
+    int limite;
+    double janela;
+    function<double()> relogio;
+    map<string, shared_ptr<JanelaDeslizante>> clientes;
+    mutex lock_mapa;
+
+public:
+    LimitadorPorCliente(int limite, double janela, function<double()> relogio)
+        : limite(limite), janela(janela), relogio(relogio) {}
+
+    bool permitir(const string& cliente) {
+        shared_ptr<JanelaDeslizante> lim;
+        {
+            lock_guard<mutex> guarda(lock_mapa); // só para obter/criar
+            auto& entrada = clientes[cliente];
+            if (!entrada) entrada = make_shared<JanelaDeslizante>(limite, janela, relogio);
+            lim = entrada;
+        }
+        return lim->permitir();                  // fora do lock global
+    }
+};
+
+int main() {
+    RelogioFalso relogio;
+    LimitadorPorCliente limitador(4, 1.0, [&relogio] { return relogio.agora; });
+    map<string, int> contagem;
+    mutex guarda_contagem;
+
+    auto rajada = [&](string cliente, int n) {
+        int aceitas = 0;
+        for (int i = 0; i < n; i++) {
+            if (limitador.permitir(cliente)) aceitas += 1;
+        }
+        lock_guard<mutex> guarda(guarda_contagem);
+        contagem[cliente] += aceitas;
+    };
+
+    vector<thread> threads;
+    for (string c : {"ana", "bia", "caio"}) {
+        for (int i = 0; i < 3; i++) threads.emplace_back(rajada, c, 5);
+    }
+    for (auto& t : threads) t.join();
+    cout << "t=0,0: [";
+    for (auto it = contagem.begin(); it != contagem.end(); ++it) {
+        cout << (it == contagem.begin() ? "" : ", ") << "(" << it->first << ", " << it->second << ")";
+    }
+    cout << "]" << endl;
+
+    relogio.agora = 1.0;                         // a janela anterior expirou
+    cout << "ana em t=1,0: [";
+    for (int i = 0; i < 5; i++) {
+        bool ok = limitador.permitir("ana");
+        cout << (i ? ", " : "") << (ok ? "True" : "False");
+    }
+    cout << "]" << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class RelogioFalso
+{
+    public double Agora = 0.0;
+}
+
+class JanelaDeslizante
+{
+    readonly int limite;
+    readonly double janela;
+    readonly Func<double> relogio;
+    readonly Queue<double> eventos = new Queue<double>();
+    readonly object trava = new object();
+
+    public JanelaDeslizante(int limite, double janela, Func<double> relogio)
+    {
+        this.limite = limite;
+        this.janela = janela;
+        this.relogio = relogio;
+    }
+
+    public bool Permitir()
+    {
+        lock (trava)
+        {
+            double agora = relogio();
+            while (eventos.Count > 0 && eventos.Peek() <= agora - janela)
+            {
+                eventos.Dequeue();               // descarta o que saiu da janela
+            }
+            if (eventos.Count < limite)
+            {
+                eventos.Enqueue(agora);
+                return true;
+            }
+            return false;
+        }
+    }
+}
+
+class LimitadorPorCliente
+{
+    readonly int limite;
+    readonly double janela;
+    readonly Func<double> relogio;
+    readonly Dictionary<string, JanelaDeslizante> clientes = new Dictionary<string, JanelaDeslizante>();
+    readonly object lockMapa = new object();
+
+    public LimitadorPorCliente(int limite, double janela, Func<double> relogio)
+    {
+        this.limite = limite;
+        this.janela = janela;
+        this.relogio = relogio;
+    }
+
+    public bool Permitir(string cliente)
+    {
+        JanelaDeslizante lim;
+        lock (lockMapa)                          // só para obter/criar
+        {
+            if (!clientes.TryGetValue(cliente, out lim))
+            {
+                lim = new JanelaDeslizante(limite, janela, relogio);
+                clientes[cliente] = lim;
+            }
+        }
+        return lim.Permitir();                   // fora do lock global
+    }
+}
+
+static readonly RelogioFalso relogio = new RelogioFalso();
+static readonly LimitadorPorCliente limitador = new LimitadorPorCliente(4, 1.0, () => relogio.Agora);
+static readonly SortedDictionary<string, int> contagem = new SortedDictionary<string, int>(StringComparer.Ordinal);
+static readonly object guarda = new object();
+
+static void Rajada(string cliente, int n)
+{
+    int aceitas = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (limitador.Permitir(cliente)) aceitas += 1;
+    }
+    lock (guarda)
+    {
+        int atual;
+        contagem.TryGetValue(cliente, out atual);
+        contagem[cliente] = atual + aceitas;
+    }
+}
+
+static void Main()
+{
+    var threads = new List<Thread>();
+    foreach (string c in new[] { "ana", "bia", "caio" })
+    {
+        for (int i = 0; i < 3; i++) threads.Add(new Thread(() => Rajada(c, 5)));
+    }
+    foreach (Thread t in threads) t.Start();
+    foreach (Thread t in threads) t.Join();
+    var pares = new List<string>();
+    foreach (var par in contagem) pares.Add("(" + par.Key + ", " + par.Value + ")");
+    Console.WriteLine("t=0,0: [" + string.Join(", ", pares) + "]");
+
+    relogio.Agora = 1.0;                         // a janela anterior expirou
+    var saida = new List<bool>();
+    for (int i = 0; i < 5; i++) saida.Add(limitador.Permitir("ana"));
+    Console.WriteLine("ana em t=1,0: [" + string.Join(", ", saida) + "]");
+}
+```
+
+```go
+import (
+	"fmt"
+	"strings"
+	"sync"
+)
+
+type RelogioFalso struct {
+	agora float64
+}
+
+type JanelaDeslizante struct {
+	limite  int
+	janela  float64
+	relogio func() float64
+	eventos []float64 // fatia usada como fila: Go não tem deque na biblioteca padrão
+	mu      sync.Mutex
+}
+
+func (j *JanelaDeslizante) permitir() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	agora := j.relogio()
+	for len(j.eventos) > 0 && j.eventos[0] <= agora-j.janela {
+		j.eventos = j.eventos[1:] // descarta o que saiu da janela
+	}
+	if len(j.eventos) < j.limite {
+		j.eventos = append(j.eventos, agora)
+		return true
+	}
+	return false
+}
+
+type LimitadorPorCliente struct {
+	limite   int
+	janela   float64
+	relogio  func() float64
+	clientes map[string]*JanelaDeslizante
+	lockMapa sync.Mutex
+}
+
+func (l *LimitadorPorCliente) permitir(cliente string) bool {
+	l.lockMapa.Lock() // só para obter/criar
+	lim, existe := l.clientes[cliente]
+	if !existe {
+		lim = &JanelaDeslizante{limite: l.limite, janela: l.janela, relogio: l.relogio}
+		l.clientes[cliente] = lim
+	}
+	l.lockMapa.Unlock()
+	return lim.permitir() // fora do lock global
+}
+
+func main() {
+	relogio := &RelogioFalso{}
+	limitador := &LimitadorPorCliente{limite: 4, janela: 1.0, relogio: func() float64 { return relogio.agora }, clientes: map[string]*JanelaDeslizante{}}
+	contagem := map[string]int{}
+	var guarda sync.Mutex
+	var wg sync.WaitGroup
+
+	rajada := func(cliente string, n int) {
+		defer wg.Done()
+		aceitas := 0
+		for i := 0; i < n; i++ {
+			if limitador.permitir(cliente) {
+				aceitas += 1
+			}
+		}
+		guarda.Lock()
+		defer guarda.Unlock()
+		contagem[cliente] += aceitas
+	}
+
+	for _, c := range []string{"ana", "bia", "caio"} {
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go rajada(c, 5)
+		}
+	}
+	wg.Wait()
+	fmt.Println("t=0,0:", contagem) // fmt imprime mapas com as chaves em ordem
+
+	relogio.agora = 1.0 // a janela anterior expirou
+	saida := []string{}
+	for i := 0; i < 5; i++ {
+		if limitador.permitir("ana") {
+			saida = append(saida, "True")
+		} else {
+			saida = append(saida, "False")
+		}
+	}
+	fmt.Println("ana em t=1,0: [" + strings.Join(saida, ", ") + "]")
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

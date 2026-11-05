@@ -42,6 +42,8 @@ Sem uma dessas arestas entre duas threads, você tem uma **data race** e, em C++
 
 O padrão mais comum é preparar dados numa thread e entregá-los a outra. O programa abaixo usa `threading.Event`: o `set()` acontece depois de preencher o dicionário e o `wait()` só retorna depois do `set()`, então o consumidor sempre vê os dados completos.
 
+<CodeTabs>
+
 ```python
 import threading
 
@@ -67,6 +69,146 @@ c.join()
 print(lido[0])
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+
+static final Map<String, String> config = new HashMap<>();
+static final CountDownLatch publicado = new CountDownLatch(1);
+static final List<String> lido = new ArrayList<>();
+
+static void produtor() {
+    config.put("host", "db.interno");
+    config.put("porta", "5432");
+    publicado.countDown();     // publica: tudo escrito antes fica visível
+}
+
+static void consumidor() {
+    try {
+        publicado.await();     // sincroniza com o countDown()
+    } catch (InterruptedException e) {
+        return;
+    }
+    lido.add(config.get("host") + ":" + config.get("porta"));
+}
+
+public static void main(String[] args) throws InterruptedException {
+    Thread c = new Thread(() -> consumidor());
+    Thread p = new Thread(() -> produtor());
+    c.start();
+    p.start();
+    p.join();
+    c.join();
+    System.out.println(lido.get(0));
+}
+```
+
+```cpp
+#include <atomic>
+#include <iostream>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+
+std::map<std::string, std::string> config;
+std::atomic<bool> publicado{false};
+std::vector<std::string> lido;
+
+void produtor() {
+    config["host"] = "db.interno";
+    config["porta"] = "5432";
+    publicado.store(true, std::memory_order_release);  // publica: tudo escrito antes fica visível
+    publicado.notify_one();
+}
+
+void consumidor() {
+    publicado.wait(false, std::memory_order_acquire);  // sincroniza com o store de liberação
+    lido.push_back(config["host"] + ":" + config["porta"]);
+}
+
+int main() {
+    std::thread c(consumidor);
+    std::thread p(produtor);
+    p.join();
+    c.join();
+    std::cout << lido[0] << std::endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+static readonly Dictionary<string, string> config = new Dictionary<string, string>();
+static readonly ManualResetEventSlim publicado = new ManualResetEventSlim(false);
+static readonly List<string> lido = new List<string>();
+
+static void Produtor()
+{
+    config["host"] = "db.interno";
+    config["porta"] = "5432";
+    publicado.Set();           // publica: tudo escrito antes fica visível
+}
+
+static void Consumidor()
+{
+    publicado.Wait();          // sincroniza com o Set()
+    lido.Add(config["host"] + ":" + config["porta"]);
+}
+
+static void Main()
+{
+    Thread c = new Thread(Consumidor);
+    Thread p = new Thread(Produtor);
+    c.Start();
+    p.Start();
+    p.Join();
+    c.Join();
+    Console.WriteLine(lido[0]);
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+)
+
+var config = map[string]string{}
+var publicado = make(chan struct{})
+var lido []string
+
+func produtor() {
+	config["host"] = "db.interno"
+	config["porta"] = "5432"
+	close(publicado) // publica: tudo escrito antes fica visível
+}
+
+func consumidor() {
+	<-publicado // sincroniza com o close()
+	lido = append(lido, config["host"]+":"+config["porta"])
+}
+
+func main() {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		consumidor()
+	}()
+	go func() {
+		defer wg.Done()
+		produtor()
+	}()
+	wg.Wait()
+	fmt.Println(lido[0])
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 db.interno:5432
@@ -81,6 +223,8 @@ O GIL faz com que, na prática, threads CPython vejam escritas umas das outras. 
 ## Inicialização preguiçosa e o double-checked locking
 
 Um clássico de entrevista: criar um singleton só quando for usado, uma única vez, mesmo com várias threads pedindo ao mesmo tempo. A versão com verificação dupla evita pegar o lock em toda chamada depois da criação.
+
+<CodeTabs>
 
 ```python
 import threading
@@ -116,6 +260,233 @@ for t in threads:
 print("instancias criadas:", Conexao.criadas)
 print("todas viram a mesma:", len(set(vistas)) == 1)
 ```
+
+```java
+import java.util.*;
+import java.util.concurrent.CyclicBarrier;
+
+static class Conexao {
+    static int criadas = 0;
+
+    Conexao() {
+        criadas += 1;
+    }
+}
+
+// volatile é obrigatório: sem ele, outra thread pode ver a referência antes de o construtor terminar
+static volatile Conexao instancia = null;
+static final Object lock = new Object();
+
+static Conexao obterConexao() {
+    if (instancia == null) {                // 1ª verificação, sem lock
+        synchronized (lock) {
+            if (instancia == null) {        // 2ª verificação, com lock
+                instancia = new Conexao();
+            }
+        }
+    }
+    return instancia;
+}
+
+static final CyclicBarrier barreira = new CyclicBarrier(8);
+static final List<Conexao> vistas = Collections.synchronizedList(new ArrayList<>());
+
+static void worker() {
+    try {
+        barreira.await();                   // todas pedem ao mesmo tempo
+    } catch (Exception e) {
+        throw new RuntimeException(e);
+    }
+    vistas.add(obterConexao());
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> threads = new ArrayList<>();
+    for (int i = 0; i < 8; i++) {
+        threads.add(new Thread(() -> worker()));
+    }
+    for (Thread t : threads) t.start();
+    for (Thread t : threads) t.join();
+    System.out.println("instancias criadas: " + Conexao.criadas);
+    System.out.println("todas viram a mesma: " + (new HashSet<>(vistas).size() == 1));
+}
+```
+
+```cpp
+#include <atomic>
+#include <barrier>
+#include <iostream>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <vector>
+
+class Conexao {
+public:
+    inline static int criadas = 0;
+
+    Conexao() {
+        criadas += 1;
+    }
+};
+
+// Em código real, prefira std::call_once ou uma variável static local. Com ponteiro comum,
+// a primeira verificação seria uma data race; por isso std::atomic com release/acquire.
+std::atomic<Conexao*> instancia{nullptr};
+std::mutex trava;
+
+Conexao* obter_conexao() {
+    Conexao* atual = instancia.load(std::memory_order_acquire);  // 1ª verificação, sem lock
+    if (atual == nullptr) {
+        std::lock_guard<std::mutex> guarda(trava);
+        atual = instancia.load(std::memory_order_relaxed);       // 2ª verificação, com lock
+        if (atual == nullptr) {
+            atual = new Conexao();
+            instancia.store(atual, std::memory_order_release);
+        }
+    }
+    return atual;
+}
+
+std::barrier<> barreira(8);
+std::vector<Conexao*> vistas;
+std::mutex vistas_lock;
+
+void worker() {
+    barreira.arrive_and_wait();                                  // todas pedem ao mesmo tempo
+    Conexao* conexao = obter_conexao();
+    std::lock_guard<std::mutex> guarda(vistas_lock);
+    vistas.push_back(conexao);
+}
+
+int main() {
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 8; i++) {
+        threads.emplace_back(worker);
+    }
+    for (auto& t : threads) t.join();
+    std::cout << "instancias criadas: " << Conexao::criadas << std::endl;
+    std::set<Conexao*> distintas(vistas.begin(), vistas.end());
+    std::cout << std::boolalpha << "todas viram a mesma: " << (distintas.size() == 1) << std::endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class Conexao
+{
+    public static int criadas = 0;
+
+    public Conexao()
+    {
+        criadas += 1;
+    }
+}
+
+// volatile: outra thread não pode ver a referência antes de o construtor terminar
+static volatile Conexao _instancia = null;
+static readonly object _lock = new object();
+
+static Conexao ObterConexao()
+{
+    if (_instancia == null)                 // 1ª verificação, sem lock
+    {
+        lock (_lock)
+        {
+            if (_instancia == null)         // 2ª verificação, com lock
+            {
+                _instancia = new Conexao();
+            }
+        }
+    }
+    return _instancia;
+}
+
+static readonly Barrier barreira = new Barrier(8);
+static readonly List<Conexao> vistas = new List<Conexao>();
+
+static void Worker()
+{
+    barreira.SignalAndWait();               // todas pedem ao mesmo tempo
+    Conexao conexao = ObterConexao();
+    lock (vistas)
+    {
+        vistas.Add(conexao);
+    }
+}
+
+static void Main()
+{
+    var threads = new List<Thread>();
+    for (int i = 0; i < 8; i++)
+    {
+        threads.Add(new Thread(Worker));
+    }
+    foreach (var t in threads) t.Start();
+    foreach (var t in threads) t.Join();
+    Console.WriteLine("instancias criadas: " + Conexao.criadas);
+    Console.WriteLine("todas viram a mesma: " + (new HashSet<Conexao>(vistas).Count == 1));
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+)
+
+type Conexao struct {
+	numero int
+}
+
+var criadas = 0
+
+// Em Go a verificação dupla feita à mão seria uma data race: o idiomático é sync.Once,
+// que por dentro faz o mesmo (leitura atômica no caminho rápido, mutex só na criação).
+var instancia *Conexao
+var once sync.Once
+
+func obterConexao() *Conexao {
+	once.Do(func() {
+		criadas += 1
+		instancia = &Conexao{numero: criadas}
+	})
+	return instancia
+}
+
+func main() {
+	largada := make(chan struct{}) // Go não tem barreira: fechar o canal solta todas as que esperam
+	var vistas []*Conexao
+	var vistasLock sync.Mutex
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-largada // todas pedem ao mesmo tempo
+			conexao := obterConexao()
+			vistasLock.Lock()
+			defer vistasLock.Unlock()
+			vistas = append(vistas, conexao)
+		}()
+	}
+	close(largada)
+	wg.Wait()
+
+	fmt.Println("instancias criadas:", criadas)
+	distintas := map[*Conexao]bool{}
+	for _, conexao := range vistas {
+		distintas[conexao] = true
+	}
+	fmt.Println("todas viram a mesma:", len(distintas) == 1)
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:
