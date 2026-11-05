@@ -148,7 +148,7 @@ async function main() {
           if (!pre.err && norm(got.slice(0, k)) === norm(pre.out ?? "")) got = got.slice(k);
         }
         if (r.err) errors.push(`grupo da linha ${at} [${lang}]: ${r.err}`);
-        else if (printed && norm(got) !== norm(expected)) errors.push(`grupo da linha ${at} [${lang}]: saída difere\n    python: ${JSON.stringify(norm(expected).slice(0, 200))}\n    ${lang}: ${JSON.stringify(norm(got).slice(0, 200))}`);
+        else if (printed && norm(got) !== norm(expected)) errors.push(`grupo da linha ${at} [${lang}]: saída difere\n    python: ${JSON.stringify(norm(expected).slice(0, 400))}\n    ${lang}: ${JSON.stringify(norm(got).slice(0, 400))}`);
         if (!["javascript"].includes(lang)) await sleep(350);
       }
       for (const l of ["python", ...LANGS]) acc[l] = acc[l] ? chain(l, acc[l], g[l] ?? "") : (g[l] ?? "");
