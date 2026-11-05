@@ -15,7 +15,8 @@ python, javascript, typescript, java, cpp, csharp, go.
 | redes | 41 de 51 | completo (05/11): ficam só em Python os 8 blocos com socket/servidor HTTP local (Judge0 sem rede) e os 2 sobre o módulo `ipaddress` |
 | genai-system-design | 25 de 25 | completo (05/11) |
 | ai-engineering | 46 de 47 | completo (05/11): só `embeddings` #3 (fragmento) fica em Python |
-| concorrencia, ml-system-design | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
+| ml-system-design | 6 de 20 | completo (05/11): metricas, feed-de-noticias, busca-semantica, feature-stores, pipelines-de-dados e framework-de-entrevista. Os demais usam `random` com semente e a "Saída:" do texto não bateria |
+| concorrencia | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
 
 ## Triagem dos 6 cursos restantes (05/11/2026)
 
@@ -100,6 +101,8 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - C# (Mono): sem funções locais (`void F() {...}` dentro de método dá CS1547); use `Action f = () => {...};`.
 - TypeScript: `String.replaceAll` não existe, mesmo com `--lib esnext` (TS2339); use `.replace(/x/g, "")`.
 - C++: `for (auto& t : f()["chave"].itens)` percorre um temporário já destruído; guarde o retorno numa variável antes do laço.
+- C#: `string.Format("{3:F1}}}", x)` lê `F1}` como formato e imprime `F1` no lugar do número; converta antes com `ToString("F1", ...)`.
+- Go: `float64((1<<r)-1)` não compila (o `1` assume o tipo `float64`); use `float64((int(1)<<r)-1)`.
 - Sem rede nenhuma, nem 127.0.0.1: código com socket só pode ser verificado com `COMPILE_ONLY=1`.
 - Go é o 1.18: sem `min`/`max` embutidos.
 - TypeScript compila com a biblioteca do DOM: nomes de variável de topo como `status`, `name`, `history` e `length` colidem com
