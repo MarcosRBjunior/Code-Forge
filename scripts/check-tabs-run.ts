@@ -86,7 +86,8 @@ function chain(lang: string, prev: string, cur: string) {
 }
 
 async function main() {
-  const only = process.env.ONLY_LANGS?.split(",");
+  // vazio conta como "sem filtro": ONLY_LANGS= não pode pular tudo e imprimir ✓
+  const only = process.env.ONLY_LANGS ? process.env.ONLY_LANGS.split(",") : undefined;
   const LANGS = ["javascript", "typescript", "java", "cpp", "csharp", "go"];
   let bad = 0;
   for (const file of process.argv.slice(2)) {
