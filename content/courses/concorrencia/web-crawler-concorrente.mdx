@@ -34,6 +34,8 @@ Quase todo o tempo de um crawler é espera: DNS, conexão, download. Uma thread 
 
 A "internet" abaixo é um dicionário, e `obter_links` dorme um pouco para simular a rede.
 
+<CodeTabs>
+
 ```python
 import queue
 import threading
@@ -94,6 +96,440 @@ for url in sorted(resultado):
     print(url)
 print("downloads:", len(downloads), "| repetidos:", len(downloads) - len(set(downloads)))
 ```
+
+```java
+import java.util.*;
+import java.util.concurrent.LinkedBlockingQueue;
+
+static final Map<String, List<String>> WEB = Map.of(
+    "http://loja.com/", List.of("http://loja.com/a", "http://loja.com/b", "http://blog.org/"),
+    "http://loja.com/a", List.of("http://loja.com/b", "http://loja.com/c"),
+    "http://loja.com/b", List.of("http://loja.com/", "http://loja.com/d"),
+    "http://loja.com/c", List.of("http://loja.com/d", "http://loja.com/a"),
+    "http://loja.com/d", List.of(),
+    "http://blog.org/", List.of("http://blog.org/x")
+);
+static final String DOMINIO = "http://loja.com/";
+static final String PILULA = "";  // a fila de Java não aceita null: a "pílula de veneno" é uma URL vazia
+static final List<String> downloads = new ArrayList<>();
+static final Object lockDownloads = new Object();
+
+// LinkedBlockingQueue não tem join: um contador de tarefas pendentes faz o papel de task_done e join
+static class Fronteira {
+    private final LinkedBlockingQueue<String> fila = new LinkedBlockingQueue<>();
+    private int pendentes = 0;
+
+    synchronized void put(String url) {
+        pendentes += 1;
+        fila.add(url);
+    }
+
+    String get() throws InterruptedException {
+        return fila.take();
+    }
+
+    synchronized void taskDone() {
+        pendentes -= 1;
+        if (pendentes == 0) notifyAll();
+    }
+
+    synchronized void join() throws InterruptedException {
+        while (pendentes > 0) wait();
+    }
+}
+
+static List<String> obterLinks(String url) throws InterruptedException {
+    Thread.sleep(20);  // simula latência de rede
+    synchronized (lockDownloads) {
+        downloads.add(url);
+    }
+    return WEB.getOrDefault(url, List.of());
+}
+
+static Set<String> rastrear(String semente, int numThreads) throws InterruptedException {
+    Set<String> visitados = new HashSet<>(Set.of(semente));
+    Object lock = new Object();
+    Fronteira fronteira = new Fronteira();
+    fronteira.put(semente);
+
+    Runnable trabalhador = () -> {
+        try {
+            while (true) {
+                String url = fronteira.get();
+                if (url.equals(PILULA)) {
+                    fronteira.taskDone();
+                    return;
+                }
+                for (String link : obterLinks(url)) {
+                    if (!link.startsWith(DOMINIO)) continue;
+                    synchronized (lock) {  // testar e marcar na mesma seção crítica
+                        if (visitados.contains(link)) continue;
+                        visitados.add(link);
+                    }
+                    fronteira.put(link);
+                }
+                fronteira.taskDone();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    };
+
+    List<Thread> threads = new ArrayList<>();
+    for (int i = 0; i < numThreads; i++) threads.add(new Thread(trabalhador));
+    for (Thread t : threads) t.start();
+    fronteira.join();          // espera fila vazia E nenhuma tarefa em andamento
+    for (int i = 0; i < numThreads; i++) fronteira.put(PILULA);   // uma "pílula de veneno" por thread
+    for (Thread t : threads) t.join();
+    return visitados;
+}
+
+public static void main(String[] args) throws InterruptedException {
+    Set<String> resultado = rastrear("http://loja.com/", 4);
+    for (String url : new TreeSet<>(resultado)) {
+        System.out.println(url);
+    }
+    int repetidos = downloads.size() - new HashSet<>(downloads).size();
+    System.out.println("downloads: " + downloads.size() + " | repetidos: " + repetidos);
+}
+```
+
+```cpp
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace std;
+
+const map<string, vector<string>> WEB = {
+    {"http://loja.com/", {"http://loja.com/a", "http://loja.com/b", "http://blog.org/"}},
+    {"http://loja.com/a", {"http://loja.com/b", "http://loja.com/c"}},
+    {"http://loja.com/b", {"http://loja.com/", "http://loja.com/d"}},
+    {"http://loja.com/c", {"http://loja.com/d", "http://loja.com/a"}},
+    {"http://loja.com/d", {}},
+    {"http://blog.org/", {"http://blog.org/x"}},
+};
+const string DOMINIO = "http://loja.com/";
+const string PILULA = "";  // a "pílula de veneno" é uma URL vazia
+vector<string> downloads;
+mutex lockDownloads;
+
+// a biblioteca padrão não tem fila bloqueante: esta faz o papel de put, get, task_done e join
+class Fronteira {
+    deque<string> fila;
+    int pendentes = 0;
+    mutex m;
+    condition_variable cond;
+
+public:
+    void put(const string& url) {
+        lock_guard<mutex> guarda(m);
+        fila.push_back(url);
+        pendentes += 1;
+        cond.notify_all();
+    }
+
+    string get() {
+        unique_lock<mutex> guarda(m);
+        while (fila.empty()) cond.wait(guarda);
+        string url = fila.front();
+        fila.pop_front();
+        return url;
+    }
+
+    void taskDone() {
+        lock_guard<mutex> guarda(m);
+        pendentes -= 1;
+        if (pendentes == 0) cond.notify_all();
+    }
+
+    void join() {
+        unique_lock<mutex> guarda(m);
+        while (pendentes > 0) cond.wait(guarda);
+    }
+};
+
+vector<string> obterLinks(const string& url) {
+    this_thread::sleep_for(chrono::milliseconds(20));  // simula latência de rede
+    {
+        lock_guard<mutex> guarda(lockDownloads);
+        downloads.push_back(url);
+    }
+    auto it = WEB.find(url);
+    return it == WEB.end() ? vector<string>{} : it->second;
+}
+
+set<string> rastrear(const string& semente, int numThreads = 4) {
+    set<string> visitados = {semente};
+    mutex lockVisitados;
+    Fronteira fronteira;
+    fronteira.put(semente);
+
+    auto trabalhador = [&]() {
+        while (true) {
+            string url = fronteira.get();
+            if (url == PILULA) {
+                fronteira.taskDone();
+                return;
+            }
+            for (const string& link : obterLinks(url)) {
+                if (!link.starts_with(DOMINIO)) continue;
+                {
+                    lock_guard<mutex> guarda(lockVisitados);  // testar e marcar na mesma seção crítica
+                    if (visitados.count(link)) continue;
+                    visitados.insert(link);
+                }
+                fronteira.put(link);
+            }
+            fronteira.taskDone();
+        }
+    };
+
+    vector<thread> threads;
+    for (int i = 0; i < numThreads; i++) threads.emplace_back(trabalhador);
+    fronteira.join();          // espera fila vazia E nenhuma tarefa em andamento
+    for (int i = 0; i < numThreads; i++) fronteira.put(PILULA);   // uma "pílula de veneno" por thread
+    for (auto& t : threads) t.join();
+    return visitados;
+}
+
+int main() {
+    set<string> resultado = rastrear("http://loja.com/");
+    for (const string& url : resultado) {  // o set já mantém as URLs ordenadas
+        cout << url << endl;
+    }
+    set<string> unicos(downloads.begin(), downloads.end());
+    cout << "downloads: " << downloads.size() << " | repetidos: " << downloads.size() - unicos.size() << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+static readonly Dictionary<string, string[]> WEB = new Dictionary<string, string[]>
+{
+    { "http://loja.com/", new[] { "http://loja.com/a", "http://loja.com/b", "http://blog.org/" } },
+    { "http://loja.com/a", new[] { "http://loja.com/b", "http://loja.com/c" } },
+    { "http://loja.com/b", new[] { "http://loja.com/", "http://loja.com/d" } },
+    { "http://loja.com/c", new[] { "http://loja.com/d", "http://loja.com/a" } },
+    { "http://loja.com/d", new string[0] },
+    { "http://blog.org/", new[] { "http://blog.org/x" } },
+};
+const string DOMINIO = "http://loja.com/";
+static readonly List<string> downloads = new List<string>();
+static readonly object lockDownloads = new object();
+
+// C# não tem uma fila com task_done e join: esta classe faz esse papel com Monitor
+class Fronteira
+{
+    private readonly Queue<string> fila = new Queue<string>();
+    private int pendentes = 0;
+
+    public void Put(string url)
+    {
+        lock (fila)
+        {
+            fila.Enqueue(url);
+            pendentes += 1;
+            Monitor.PulseAll(fila);
+        }
+    }
+
+    public string Get()
+    {
+        lock (fila)
+        {
+            while (fila.Count == 0)
+                Monitor.Wait(fila);
+            return fila.Dequeue();
+        }
+    }
+
+    public void TaskDone()
+    {
+        lock (fila)
+        {
+            pendentes -= 1;
+            if (pendentes == 0)
+                Monitor.PulseAll(fila);
+        }
+    }
+
+    public void Join()
+    {
+        lock (fila)
+        {
+            while (pendentes > 0)
+                Monitor.Wait(fila);
+        }
+    }
+}
+
+static string[] ObterLinks(string url)
+{
+    Thread.Sleep(20);  // simula latência de rede
+    lock (lockDownloads)
+    {
+        downloads.Add(url);
+    }
+    string[] links;
+    return WEB.TryGetValue(url, out links) ? links : new string[0];
+}
+
+static HashSet<string> Rastrear(string semente, int numThreads = 4)
+{
+    var visitados = new HashSet<string> { semente };
+    var lockVisitados = new object();
+    var fronteira = new Fronteira();
+    fronteira.Put(semente);
+
+    ThreadStart trabalhador = () =>
+    {
+        while (true)
+        {
+            string url = fronteira.Get();
+            if (url == null)
+            {
+                fronteira.TaskDone();
+                return;
+            }
+            foreach (string link in ObterLinks(url))
+            {
+                if (!link.StartsWith(DOMINIO, StringComparison.Ordinal))
+                    continue;
+                lock (lockVisitados)  // testar e marcar na mesma seção crítica
+                {
+                    if (visitados.Contains(link))
+                        continue;
+                    visitados.Add(link);
+                }
+                fronteira.Put(link);
+            }
+            fronteira.TaskDone();
+        }
+    };
+
+    var threads = new List<Thread>();
+    for (int i = 0; i < numThreads; i++) threads.Add(new Thread(trabalhador));
+    foreach (var t in threads) t.Start();
+    fronteira.Join();          // espera fila vazia E nenhuma tarefa em andamento
+    foreach (var t in threads) fronteira.Put(null);   // uma "pílula de veneno" por thread
+    foreach (var t in threads) t.Join();
+    return visitados;
+}
+
+static void Main()
+{
+    var resultado = new List<string>(Rastrear("http://loja.com/"));
+    resultado.Sort(string.CompareOrdinal);
+    foreach (string url in resultado)
+    {
+        Console.WriteLine(url);
+    }
+    int repetidos = downloads.Count - new HashSet<string>(downloads).Count;
+    Console.WriteLine("downloads: " + downloads.Count + " | repetidos: " + repetidos);
+}
+```
+
+```go
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+var WEB = map[string][]string{
+	"http://loja.com/":  {"http://loja.com/a", "http://loja.com/b", "http://blog.org/"},
+	"http://loja.com/a": {"http://loja.com/b", "http://loja.com/c"},
+	"http://loja.com/b": {"http://loja.com/", "http://loja.com/d"},
+	"http://loja.com/c": {"http://loja.com/d", "http://loja.com/a"},
+	"http://loja.com/d": {},
+	"http://blog.org/":  {"http://blog.org/x"},
+}
+
+const DOMINIO = "http://loja.com/"
+
+var downloads []string
+var lockDownloads sync.Mutex
+
+func obterLinks(url string) []string {
+	time.Sleep(20 * time.Millisecond) // simula latência de rede
+	lockDownloads.Lock()
+	downloads = append(downloads, url)
+	lockDownloads.Unlock()
+	return WEB[url]
+}
+
+func rastrear(semente string, numThreads int) map[string]bool {
+	visitados := map[string]bool{semente: true}
+	var lock sync.Mutex
+	// Cada URL entra uma vez só, então len(WEB) lugares bastam e um envio nunca bloqueia.
+	fronteira := make(chan string, len(WEB))
+	var tarefas sync.WaitGroup // Add é o put, Done é o task_done, Wait é o join
+	tarefas.Add(1)
+	fronteira <- semente
+
+	trabalhador := func(wg *sync.WaitGroup) {
+		defer wg.Done()
+		for url := range fronteira { // o laço termina quando o canal é fechado
+			for _, link := range obterLinks(url) {
+				if !strings.HasPrefix(link, DOMINIO) {
+					continue
+				}
+				lock.Lock() // testar e marcar na mesma seção crítica
+				if visitados[link] {
+					lock.Unlock()
+					continue
+				}
+				visitados[link] = true
+				lock.Unlock()
+				tarefas.Add(1)
+				fronteira <- link
+			}
+			tarefas.Done()
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < numThreads; i++ {
+		wg.Add(1)
+		go trabalhador(&wg)
+	}
+	tarefas.Wait()   // espera fila vazia E nenhuma tarefa em andamento
+	close(fronteira) // em Go, fechar o canal substitui as "pílulas de veneno"
+	wg.Wait()
+	return visitados
+}
+
+func main() {
+	resultado := rastrear("http://loja.com/", 4)
+	urls := make([]string, 0, len(resultado))
+	for url := range resultado {
+		urls = append(urls, url)
+	}
+	sort.Strings(urls)
+	for _, url := range urls {
+		fmt.Println(url)
+	}
+	unicos := map[string]bool{}
+	for _, url := range downloads {
+		unicos[url] = true
+	}
+	fmt.Println("downloads:", len(downloads), "| repetidos:", len(downloads)-len(unicos))
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

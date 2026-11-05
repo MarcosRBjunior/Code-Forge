@@ -22,6 +22,8 @@ Um **thread pool** resolve isso mantendo um número fixo (ou limitado) de thread
 
 Por baixo é um produtor-consumidor: quem chama `submit` produz, os workers consomem. As threads são reaproveitadas entre tarefas, e o tamanho do pool vira um **limite de concorrência** explícito. A versão mínima cabe em poucas linhas:
 
+<CodeTabs>
+
 ```python
 import threading
 import queue
@@ -66,6 +68,320 @@ for n in sorted(resultados):
     print(f"{n}! = {resultados[n]}")
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.*;
+
+class Tarefa {
+    final Function<Integer, Long> func;
+    final int args;
+    final Map<Integer, Long> saida;
+    final int chave;
+
+    Tarefa(Function<Integer, Long> func, int args, Map<Integer, Long> saida, int chave) {
+        this.func = func;
+        this.args = args;
+        this.saida = saida;
+        this.chave = chave;
+    }
+}
+
+class PoolSimples {
+    // LinkedBlockingQueue recusa null: o sentinela é um objeto próprio
+    private static final Tarefa SENTINELA = new Tarefa(null, 0, null, 0);
+    private final BlockingQueue<Tarefa> tarefas = new LinkedBlockingQueue<>();
+    private final List<Thread> workers = new ArrayList<>();
+
+    PoolSimples(int nWorkers) {
+        for (int i = 0; i < nWorkers; i++) workers.add(new Thread(this::loop));
+        for (Thread w : workers) w.start();
+    }
+
+    private void loop() {
+        try {
+            while (true) {
+                Tarefa item = tarefas.take();
+                if (item == SENTINELA) return;
+                item.saida.put(item.chave, item.func.apply(item.args));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    void submeter(Function<Integer, Long> func, int args, Map<Integer, Long> saida, int chave) {
+        tarefas.add(new Tarefa(func, args, saida, chave));
+    }
+
+    void desligar() throws InterruptedException {
+        for (int i = 0; i < workers.size(); i++) tarefas.add(SENTINELA);
+        for (Thread w : workers) w.join();
+    }
+}
+
+static long fatorial(int n) {
+    long r = 1;
+    for (int i = 2; i <= n; i++) r *= i;
+    return r;
+}
+
+public static void main(String[] args) throws InterruptedException {
+    PoolSimples pool = new PoolSimples(3);
+    // sem GIL: um HashMap comum não aguenta vários workers escrevendo ao mesmo tempo
+    Map<Integer, Long> resultados = new ConcurrentHashMap<>();
+    for (int n = 1; n < 9; n++) pool.submeter(k -> fatorial(k), n, resultados, n);
+    pool.desligar();
+
+    for (int n : new TreeSet<>(resultados.keySet())) {
+        System.out.println(n + "! = " + resultados.get(n));
+    }
+}
+```
+
+```cpp
+#include <condition_variable>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <thread>
+#include <vector>
+using namespace std;
+
+// std::map não é seguro para escrita concorrente: a saída leva o próprio mutex
+struct Saida {
+    mutex trava;
+    map<int, long> dados;
+};
+
+struct Tarefa {
+    function<long(int)> func;
+    int args;
+    Saida* saida;
+    int chave;
+};
+
+class PoolSimples {
+    // a biblioteca padrão não tem fila bloqueante: fila + mutex + variável de condição
+    queue<optional<Tarefa>> tarefas;   // optional vazio é o sentinela (o None do Python)
+    mutex trava;
+    condition_variable tem_item;
+    vector<thread> workers;
+
+    optional<Tarefa> pegar() {
+        unique_lock<mutex> guarda(trava);
+        tem_item.wait(guarda, [this] { return !tarefas.empty(); });
+        optional<Tarefa> item = tarefas.front();
+        tarefas.pop();
+        return item;
+    }
+
+    void colocar(optional<Tarefa> item) {
+        {
+            lock_guard<mutex> guarda(trava);
+            tarefas.push(item);
+        }
+        tem_item.notify_one();
+    }
+
+    void loop() {
+        while (true) {
+            optional<Tarefa> item = pegar();
+            if (!item) return;
+            long valor = item->func(item->args);
+            lock_guard<mutex> guarda(item->saida->trava);
+            item->saida->dados[item->chave] = valor;
+        }
+    }
+
+public:
+    PoolSimples(int n_workers) {
+        for (int i = 0; i < n_workers; i++) workers.emplace_back([this] { loop(); });
+    }
+
+    void submeter(function<long(int)> func, int args, Saida& saida, int chave) {
+        colocar(Tarefa{func, args, &saida, chave});
+    }
+
+    void desligar() {
+        for (size_t i = 0; i < workers.size(); i++) colocar(nullopt);
+        for (auto& w : workers) w.join();
+    }
+};
+
+long fatorial(int n) {
+    long r = 1;
+    for (int i = 2; i <= n; i++) r *= i;
+    return r;
+}
+
+int main() {
+    PoolSimples pool(3);
+    Saida resultados;
+    for (int n = 1; n < 9; n++) pool.submeter(fatorial, n, resultados, n);
+    pool.desligar();
+
+    // std::map já percorre as chaves em ordem
+    for (auto& [n, valor] : resultados.dados) cout << n << "! = " << valor << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+
+class Tarefa
+{
+    public Func<int, long> Func;
+    public int Args;
+    public ConcurrentDictionary<int, long> Saida;
+    public int Chave;
+}
+
+class PoolSimples
+{
+    readonly BlockingCollection<Tarefa> tarefas = new BlockingCollection<Tarefa>();
+    readonly List<Thread> workers = new List<Thread>();
+
+    public PoolSimples(int nWorkers)
+    {
+        for (int i = 0; i < nWorkers; i++) workers.Add(new Thread(Loop));
+        foreach (Thread w in workers) w.Start();
+    }
+
+    void Loop()
+    {
+        while (true)
+        {
+            Tarefa item = tarefas.Take();
+            if (item == null) return;   // sentinela
+            item.Saida[item.Chave] = item.Func(item.Args);
+        }
+    }
+
+    public void Submeter(Func<int, long> func, int args, ConcurrentDictionary<int, long> saida, int chave)
+    {
+        tarefas.Add(new Tarefa { Func = func, Args = args, Saida = saida, Chave = chave });
+    }
+
+    public void Desligar()
+    {
+        foreach (Thread w in workers) tarefas.Add(null);
+        foreach (Thread w in workers) w.Join();
+    }
+}
+
+static long Fatorial(int n)
+{
+    long r = 1;
+    for (int i = 2; i <= n; i++) r *= i;
+    return r;
+}
+
+static void Main()
+{
+    PoolSimples pool = new PoolSimples(3);
+    // sem GIL: um Dictionary comum não aguenta vários workers escrevendo ao mesmo tempo
+    var resultados = new ConcurrentDictionary<int, long>();
+    for (int n = 1; n < 9; n++) pool.Submeter(Fatorial, n, resultados, n);
+    pool.Desligar();
+
+    foreach (int n in resultados.Keys.OrderBy(k => k))
+    {
+        Console.WriteLine(n + "! = " + resultados[n]);
+    }
+}
+```
+
+```go
+import (
+	"fmt"
+	"sort"
+	"sync"
+)
+
+// o map de Go aborta com escrita concorrente: a saída leva o próprio mutex
+type Saida struct {
+	mu    sync.Mutex
+	dados map[int]int
+}
+
+type Tarefa struct {
+	funcao func(int) int
+	args   int
+	saida  *Saida
+	chave  int
+}
+
+type PoolSimples struct {
+	tarefas chan Tarefa
+	workers sync.WaitGroup
+}
+
+func novoPool(nWorkers int) *PoolSimples {
+	// canal com buffer: ao contrário de queue.Queue, tem limite e bloqueia quem submete quando enche
+	p := &PoolSimples{tarefas: make(chan Tarefa, 64)}
+	for i := 0; i < nWorkers; i++ {
+		p.workers.Add(1)
+		go p.loop()
+	}
+	return p
+}
+
+func (p *PoolSimples) loop() {
+	defer p.workers.Done()
+	for item := range p.tarefas { // o range termina quando o canal é fechado
+		valor := item.funcao(item.args)
+		item.saida.mu.Lock()
+		item.saida.dados[item.chave] = valor
+		item.saida.mu.Unlock()
+	}
+}
+
+func (p *PoolSimples) submeter(funcao func(int) int, args int, saida *Saida, chave int) {
+	p.tarefas <- Tarefa{funcao, args, saida, chave}
+}
+
+func (p *PoolSimples) desligar() {
+	close(p.tarefas) // em Go, fechar o canal faz o papel do sentinela
+	p.workers.Wait()
+}
+
+func fatorial(n int) int {
+	r := 1
+	for i := 2; i <= n; i++ {
+		r *= i
+	}
+	return r
+}
+
+func main() {
+	pool := novoPool(3)
+	resultados := &Saida{dados: map[int]int{}}
+	for n := 1; n < 9; n++ {
+		pool.submeter(fatorial, n, resultados, n)
+	}
+	pool.desligar()
+
+	chaves := []int{}
+	for n := range resultados.dados {
+		chaves = append(chaves, n)
+	}
+	sort.Ints(chaves)
+	for _, n := range chaves {
+		fmt.Printf("%d! = %d\n", n, resultados.dados[n])
+	}
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 1! = 1
@@ -81,6 +397,8 @@ Saída:
 ## Na prática: executores
 
 Ninguém escreve o pool à mão em produção. Em Python há `concurrent.futures.ThreadPoolExecutor`; em Java, `ExecutorService` com `Executors.newFixedThreadPool(n)` ou, para controle fino, `ThreadPoolExecutor` com fila limitada e política de rejeição; em Go, o padrão é lançar N goroutines lendo do mesmo canal (goroutines são baratas, mas limitar concorrência ainda importa para proteger recursos externos); em C++ você usa uma biblioteca ou monta o seu com `std::thread` e uma fila.
+
+<CodeTabs>
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
@@ -110,6 +428,256 @@ print(nomes[:3], "...", nomes[-1])
 print("nunca mais de 4 ao mesmo tempo:", pico <= 4)
 print("8 esperas de 0.1 s em menos de 0.5 s:", duracao < 0.5)
 ```
+
+```java
+import java.util.*;
+import java.util.concurrent.*;
+
+static int ativos = 0;
+static int pico = 0;
+static final Object lock = new Object();
+
+static String baixar(int id) throws InterruptedException {
+    synchronized (lock) {
+        ativos += 1;
+        pico = Math.max(pico, ativos);
+    }
+    Thread.sleep(100);  // simula espera de I/O
+    synchronized (lock) {
+        ativos -= 1;
+    }
+    return "arquivo-" + id;
+}
+
+public static void main(String[] args) throws Exception {
+    long inicio = System.nanoTime();
+    ExecutorService executor = Executors.newFixedThreadPool(4);
+    List<Future<String>> futuros = new ArrayList<>();
+    for (int i = 0; i < 8; i++) {
+        final int id = i;
+        futuros.add(executor.submit(() -> baixar(id)));
+    }
+    List<String> nomes = new ArrayList<>();
+    for (Future<String> f : futuros) nomes.add(f.get());  // ler na ordem de submissão preserva a ordem de entrada
+    executor.shutdown();  // Java não tem o "with": para de aceitar tarefas
+    executor.awaitTermination(5, TimeUnit.SECONDS);  // e espera as pendentes
+    double duracao = (System.nanoTime() - inicio) / 1e9;
+
+    System.out.println(nomes.subList(0, 3) + " ... " + nomes.get(nomes.size() - 1));
+    System.out.println("nunca mais de 4 ao mesmo tempo: " + (pico <= 4 ? "True" : "False"));
+    System.out.println("8 esperas de 0.1 s em menos de 0.5 s: " + (duracao < 0.5 ? "True" : "False"));
+}
+```
+
+```cpp
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <thread>
+#include <vector>
+// sem "using namespace std": std::pico (de <ratio>) colidiria com a variável pico
+
+// C++ não traz executor pronto: este é o pool à mão, com fila + mutex + variável de condição
+class Executor {
+    std::queue<std::function<void()>> tarefas;
+    std::mutex trava;
+    std::condition_variable mudou;
+    std::vector<std::thread> workers;
+    bool desligando = false;
+
+    void loop() {
+        while (true) {
+            std::function<void()> tarefa;
+            {
+                std::unique_lock<std::mutex> guarda(trava);
+                mudou.wait(guarda, [this] { return desligando || !tarefas.empty(); });
+                if (tarefas.empty()) return;  // desligando e sem pendências
+                tarefa = std::move(tarefas.front());
+                tarefas.pop();
+            }
+            tarefa();
+        }
+    }
+
+public:
+    Executor(int max_workers) {
+        for (int i = 0; i < max_workers; i++) workers.emplace_back([this] { loop(); });
+    }
+
+    std::future<std::string> submeter(std::function<std::string()> func) {
+        auto tarefa = std::make_shared<std::packaged_task<std::string()>>(func);
+        std::future<std::string> futuro = tarefa->get_future();
+        {
+            std::lock_guard<std::mutex> guarda(trava);
+            tarefas.push([tarefa] { (*tarefa)(); });
+        }
+        mudou.notify_one();
+        return futuro;
+    }
+
+    // o destrutor faz o papel do fim do "with": espera as pendentes terminarem
+    ~Executor() {
+        {
+            std::lock_guard<std::mutex> guarda(trava);
+            desligando = true;
+        }
+        mudou.notify_all();
+        for (auto& w : workers) w.join();
+    }
+};
+
+int ativos = 0;
+int pico = 0;
+std::mutex lock_contagem;
+
+std::string baixar(int id) {
+    {
+        std::lock_guard<std::mutex> guarda(lock_contagem);
+        ativos += 1;
+        pico = std::max(pico, ativos);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // simula espera de I/O
+    {
+        std::lock_guard<std::mutex> guarda(lock_contagem);
+        ativos -= 1;
+    }
+    return "arquivo-" + std::to_string(id);
+}
+
+int main() {
+    auto inicio = std::chrono::steady_clock::now();
+    std::vector<std::string> nomes;
+    {
+        Executor executor(4);
+        std::vector<std::future<std::string>> futuros;
+        for (int i = 0; i < 8; i++) futuros.push_back(executor.submeter([i] { return baixar(i); }));
+        for (auto& f : futuros) nomes.push_back(f.get());  // ler na ordem de submissão preserva a ordem de entrada
+    }
+    std::chrono::duration<double> duracao = std::chrono::steady_clock::now() - inicio;
+
+    std::cout << "[" << nomes[0] << ", " << nomes[1] << ", " << nomes[2] << "] ... " << nomes.back() << std::endl;
+    std::cout << "nunca mais de 4 ao mesmo tempo: " << (pico <= 4 ? "True" : "False") << std::endl;
+    std::cout << "8 esperas de 0.1 s em menos de 0.5 s: " << (duracao.count() < 0.5 ? "True" : "False") << std::endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+static int ativos = 0;
+static int pico = 0;
+static readonly object trava = new object();
+
+static string Baixar(int id)
+{
+    lock (trava)
+    {
+        ativos += 1;
+        pico = Math.Max(pico, ativos);
+    }
+    Thread.Sleep(100);  // simula espera de I/O
+    lock (trava)
+    {
+        ativos -= 1;
+    }
+    return "arquivo-" + id;
+}
+
+static void Main()
+{
+    // o pool do .NET cria threads aos poucos: garante as 4 desde o início
+    ThreadPool.SetMinThreads(4, 4);
+    // C# não tem executor de tamanho fixo: este agendador limita a 4 as tarefas em execução
+    var limite = new ConcurrentExclusiveSchedulerPair(TaskScheduler.Default, 4);
+    Stopwatch inicio = Stopwatch.StartNew();
+    var tarefas = new List<Task<string>>();
+    for (int i = 0; i < 8; i++)
+    {
+        int id = i;
+        tarefas.Add(Task.Factory.StartNew(() => Baixar(id), CancellationToken.None, TaskCreationOptions.None, limite.ConcurrentScheduler));
+    }
+    Task.WaitAll(tarefas.ToArray());
+    List<string> nomes = tarefas.Select(t => t.Result).ToList();  // a lista de tarefas preserva a ordem de entrada
+    double duracao = inicio.Elapsed.TotalSeconds;
+
+    Console.WriteLine("[" + string.Join(", ", nomes.Take(3)) + "] ... " + nomes[nomes.Count - 1]);
+    Console.WriteLine("nunca mais de 4 ao mesmo tempo: " + (pico <= 4));
+    Console.WriteLine("8 esperas de 0.1 s em menos de 0.5 s: " + (duracao < 0.5));
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+var ativos, pico = 0, 0
+var lock sync.Mutex
+
+func baixar(id int) string {
+	lock.Lock()
+	ativos += 1
+	if ativos > pico {
+		pico = ativos
+	}
+	lock.Unlock()
+	time.Sleep(100 * time.Millisecond) // simula espera de I/O
+	lock.Lock()
+	ativos -= 1
+	lock.Unlock()
+	return fmt.Sprintf("arquivo-%d", id)
+}
+
+func textoBool(b bool) string {
+	if b {
+		return "True"
+	}
+	return "False"
+}
+
+func main() {
+	inicio := time.Now()
+	entradas := make(chan int)
+	nomes := make([]string, 8)
+	var wg sync.WaitGroup
+	// em Go, o "pool" são N goroutines lendo do mesmo canal
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for id := range entradas {
+				nomes[id] = baixar(id) // cada goroutine escreve numa posição diferente: preserva a ordem de entrada
+			}
+		}()
+	}
+	for id := 0; id < 8; id++ {
+		entradas <- id
+	}
+	close(entradas) // sem novas tarefas: os workers saem quando a fila acabar
+	wg.Wait()
+	duracao := time.Since(inicio).Seconds()
+
+	fmt.Println(nomes[:3], "...", nomes[len(nomes)-1])
+	fmt.Println("nunca mais de 4 ao mesmo tempo:", textoBool(pico <= 4))
+	fmt.Println("8 esperas de 0.1 s em menos de 0.5 s:", textoBool(duracao < 0.5))
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

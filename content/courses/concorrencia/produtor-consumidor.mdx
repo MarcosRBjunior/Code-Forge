@@ -28,6 +28,8 @@ As três exigências de corretude são:
 
 A versão clássica usa um lock e duas variáveis de condição: `nao_cheio` para acordar produtores e `nao_vazio` para acordar consumidores. Repare no `while` em volta de cada `wait()`: depois de acordar, a thread precisa reverificar a condição, porque outra pode ter chegado antes ou o despertar pode ter sido espúrio.
 
+<CodeTabs>
+
 ```python
 import threading
 from collections import deque
@@ -89,6 +91,416 @@ print("sem perdas nem duplicatas:", sorted(consumidos) == list(range(10)) + list
 print("ocupacao nunca passou da capacidade:", buffer.maior_ocupacao <= 3)
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+static class BufferLimitado {
+    // LinkedList aceita null, usado aqui como sentinela (ArrayDeque não aceita)
+    private final LinkedList<Integer> itens = new LinkedList<>();
+    private final int capacidade;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition naoCheio = lock.newCondition();
+    private final Condition naoVazio = lock.newCondition();
+    int maiorOcupacao = 0;
+
+    BufferLimitado(int capacidade) {
+        this.capacidade = capacidade;
+    }
+
+    void colocar(Integer item) throws InterruptedException {
+        lock.lock();
+        try {
+            while (itens.size() == capacidade) {
+                naoCheio.await();
+            }
+            itens.addLast(item);
+            maiorOcupacao = Math.max(maiorOcupacao, itens.size());
+            naoVazio.signal();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    Integer retirar() throws InterruptedException {
+        lock.lock();
+        try {
+            while (itens.isEmpty()) {
+                naoVazio.await();
+            }
+            Integer item = itens.removeFirst();
+            naoCheio.signal();
+            return item;
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+static final BufferLimitado buffer = new BufferLimitado(3);
+static final List<Integer> consumidos = new ArrayList<>();
+static final Object lockResultado = new Object();
+
+static void produtor(int inicio) {
+    try {
+        for (int i = inicio; i < inicio + 10; i++) {
+            buffer.colocar(i);
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+static void consumidor() {
+    try {
+        while (true) {
+            Integer item = buffer.retirar();
+            if (item == null) {  // sentinela: fim do trabalho
+                return;
+            }
+            synchronized (lockResultado) {
+                consumidos.add(item);
+            }
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> prods = new ArrayList<>();
+    for (int k = 0; k < 2; k++) {
+        int inicio = k * 100;
+        prods.add(new Thread(() -> produtor(inicio)));
+    }
+    List<Thread> cons = new ArrayList<>();
+    for (int i = 0; i < 3; i++) {
+        cons.add(new Thread(() -> consumidor()));
+    }
+    for (Thread t : prods) t.start();
+    for (Thread t : cons) t.start();
+    for (Thread t : prods) t.join();
+    for (int i = 0; i < cons.size(); i++) {
+        buffer.colocar(null);  // uma sentinela por consumidor
+    }
+    for (Thread t : cons) t.join();
+
+    List<Integer> esperado = new ArrayList<>();
+    for (int i = 0; i < 10; i++) esperado.add(i);
+    for (int i = 100; i < 110; i++) esperado.add(i);
+    Collections.sort(consumidos);
+    System.out.println("itens consumidos: " + consumidos.size());
+    System.out.println("sem perdas nem duplicatas: " + (consumidos.equals(esperado) ? "True" : "False"));
+    System.out.println("ocupacao nunca passou da capacidade: " + (buffer.maiorOcupacao <= 3 ? "True" : "False"));
+}
+```
+
+```cpp
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <vector>
+using namespace std;
+
+class BufferLimitado {
+    deque<optional<int>> itens;
+    size_t capacidade;
+    mutex lock;
+    condition_variable nao_cheio;
+    condition_variable nao_vazio;
+
+public:
+    size_t maior_ocupacao = 0;
+
+    explicit BufferLimitado(size_t capacidade) : capacidade(capacidade) {}
+
+    void colocar(optional<int> item) {
+        unique_lock<mutex> trava(lock);
+        while (itens.size() == capacidade) {
+            nao_cheio.wait(trava);
+        }
+        itens.push_back(item);
+        maior_ocupacao = max(maior_ocupacao, itens.size());
+        nao_vazio.notify_one();
+    }
+
+    optional<int> retirar() {
+        unique_lock<mutex> trava(lock);
+        while (itens.empty()) {
+            nao_vazio.wait(trava);
+        }
+        optional<int> item = itens.front();
+        itens.pop_front();
+        nao_cheio.notify_one();
+        return item;
+    }
+};
+
+BufferLimitado buffer(3);
+vector<int> consumidos;
+mutex lock_resultado;
+
+void produtor(int inicio) {
+    for (int i = inicio; i < inicio + 10; i++) {
+        buffer.colocar(i);
+    }
+}
+
+void consumidor() {
+    while (true) {
+        optional<int> item = buffer.retirar();
+        if (!item) {  // sentinela: fim do trabalho
+            return;
+        }
+        lock_guard<mutex> guarda(lock_resultado);
+        consumidos.push_back(*item);
+    }
+}
+
+int main() {
+    vector<thread> prods;
+    for (int k = 0; k < 2; k++) {
+        prods.emplace_back(produtor, k * 100);
+    }
+    vector<thread> cons;
+    for (int i = 0; i < 3; i++) {
+        cons.emplace_back(consumidor);
+    }
+    for (auto& t : prods) {
+        t.join();
+    }
+    for (size_t i = 0; i < cons.size(); i++) {
+        buffer.colocar(nullopt);  // uma sentinela por consumidor
+    }
+    for (auto& t : cons) {
+        t.join();
+    }
+
+    vector<int> esperado;
+    for (int i = 0; i < 10; i++) esperado.push_back(i);
+    for (int i = 100; i < 110; i++) esperado.push_back(i);
+    sort(consumidos.begin(), consumidos.end());
+    cout << "itens consumidos: " << consumidos.size() << endl;
+    cout << "sem perdas nem duplicatas: " << (consumidos == esperado ? "True" : "False") << endl;
+    cout << "ocupacao nunca passou da capacidade: " << (buffer.maior_ocupacao <= 3 ? "True" : "False") << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+
+class BufferLimitado
+{
+    private readonly Queue<int?> itens = new Queue<int?>();
+    private readonly int capacidade;
+    // o Monitor tem uma única fila de espera por objeto: não há como ter nao_cheio e nao_vazio
+    // sobre o mesmo lock, então produtores e consumidores dividem a condição e o aviso é PulseAll
+    private readonly object cond = new object();
+    public int MaiorOcupacao = 0;
+
+    public BufferLimitado(int capacidade)
+    {
+        this.capacidade = capacidade;
+    }
+
+    public void Colocar(int? item)
+    {
+        lock (cond)
+        {
+            while (itens.Count == capacidade)
+                Monitor.Wait(cond);
+            itens.Enqueue(item);
+            MaiorOcupacao = Math.Max(MaiorOcupacao, itens.Count);
+            Monitor.PulseAll(cond);
+        }
+    }
+
+    public int? Retirar()
+    {
+        lock (cond)
+        {
+            while (itens.Count == 0)
+                Monitor.Wait(cond);
+            int? item = itens.Dequeue();
+            Monitor.PulseAll(cond);
+            return item;
+        }
+    }
+}
+
+static readonly BufferLimitado buffer = new BufferLimitado(3);
+static readonly List<int> consumidos = new List<int>();
+static readonly object lockResultado = new object();
+
+static void Produtor(int inicio)
+{
+    for (int i = inicio; i < inicio + 10; i++)
+        buffer.Colocar(i);
+}
+
+static void Consumidor()
+{
+    while (true)
+    {
+        int? item = buffer.Retirar();
+        if (item == null)  // sentinela: fim do trabalho
+            return;
+        lock (lockResultado)
+        {
+            consumidos.Add(item.Value);
+        }
+    }
+}
+
+static void Main()
+{
+    var prods = new List<Thread>();
+    for (int k = 0; k < 2; k++)
+    {
+        int inicio = k * 100;
+        prods.Add(new Thread(() => Produtor(inicio)));
+    }
+    var cons = new List<Thread>();
+    for (int i = 0; i < 3; i++)
+        cons.Add(new Thread(Consumidor));
+    foreach (var t in prods) t.Start();
+    foreach (var t in cons) t.Start();
+    foreach (var t in prods) t.Join();
+    for (int i = 0; i < cons.Count; i++)
+        buffer.Colocar(null);  // uma sentinela por consumidor
+    foreach (var t in cons) t.Join();
+
+    var esperado = Enumerable.Range(0, 10).Concat(Enumerable.Range(100, 10));
+    consumidos.Sort();
+    Console.WriteLine("itens consumidos: " + consumidos.Count);
+    Console.WriteLine("sem perdas nem duplicatas: " + (consumidos.SequenceEqual(esperado) ? "True" : "False"));
+    Console.WriteLine("ocupacao nunca passou da capacidade: " + (buffer.MaiorOcupacao <= 3 ? "True" : "False"));
+}
+```
+
+```go
+import (
+	"fmt"
+	"reflect"
+	"sort"
+	"sync"
+)
+
+type BufferLimitado struct {
+	itens         []*int // nil é a sentinela (o None do Python)
+	capacidade    int
+	lock          sync.Mutex
+	naoCheio      *sync.Cond
+	naoVazio      *sync.Cond
+	maiorOcupacao int
+}
+
+func NovoBufferLimitado(capacidade int) *BufferLimitado {
+	b := &BufferLimitado{capacidade: capacidade}
+	b.naoCheio = sync.NewCond(&b.lock)
+	b.naoVazio = sync.NewCond(&b.lock)
+	return b
+}
+
+func (b *BufferLimitado) colocar(item *int) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	for len(b.itens) == b.capacidade { // for é o "while" do Go
+		b.naoCheio.Wait()
+	}
+	b.itens = append(b.itens, item)
+	if len(b.itens) > b.maiorOcupacao {
+		b.maiorOcupacao = len(b.itens)
+	}
+	b.naoVazio.Signal()
+}
+
+func (b *BufferLimitado) retirar() *int {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	for len(b.itens) == 0 {
+		b.naoVazio.Wait()
+	}
+	item := b.itens[0]
+	b.itens = b.itens[1:]
+	b.naoCheio.Signal()
+	return item
+}
+
+var buffer = NovoBufferLimitado(3)
+var consumidos []int
+var lockResultado sync.Mutex
+
+func produtor(inicio int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for i := inicio; i < inicio+10; i++ {
+		item := i
+		buffer.colocar(&item)
+	}
+}
+
+func consumidor(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		item := buffer.retirar()
+		if item == nil { // sentinela: fim do trabalho
+			return
+		}
+		lockResultado.Lock()
+		consumidos = append(consumidos, *item)
+		lockResultado.Unlock()
+	}
+}
+
+func main() {
+	var prods, cons sync.WaitGroup
+	for k := 0; k < 2; k++ {
+		prods.Add(1)
+		go produtor(k*100, &prods)
+	}
+	const numConsumidores = 3
+	for i := 0; i < numConsumidores; i++ {
+		cons.Add(1)
+		go consumidor(&cons)
+	}
+	prods.Wait()
+	for i := 0; i < numConsumidores; i++ {
+		buffer.colocar(nil) // uma sentinela por consumidor
+	}
+	cons.Wait()
+
+	var esperado []int
+	for i := 0; i < 10; i++ {
+		esperado = append(esperado, i)
+	}
+	for i := 100; i < 110; i++ {
+		esperado = append(esperado, i)
+	}
+	sort.Ints(consumidos)
+	fmt.Println("itens consumidos:", len(consumidos))
+	if reflect.DeepEqual(consumidos, esperado) {
+		fmt.Println("sem perdas nem duplicatas: True")
+	} else {
+		fmt.Println("sem perdas nem duplicatas: False")
+	}
+	if buffer.maiorOcupacao <= 3 {
+		fmt.Println("ocupacao nunca passou da capacidade: True")
+	} else {
+		fmt.Println("ocupacao nunca passou da capacidade: False")
+	}
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 itens consumidos: 20
@@ -101,6 +513,8 @@ O encerramento usa **sentinelas** (pílulas de veneno): depois que todos os prod
 ## A versão de produção: queue.Queue
 
 Na prática, você não reimplementa o buffer. Em Python, `queue.Queue(maxsize=n)` já é uma fila bloqueante thread-safe. Em Java, o equivalente é `BlockingQueue` (`ArrayBlockingQueue`, `LinkedBlockingQueue`) com `put` e `take`; em Go, um canal com buffer (`make(chan int, 5)`) é exatamente esse padrão embutido na linguagem, e `close(ch)` substitui a sentinela.
+
+<CodeTabs>
 
 ```python
 import threading
@@ -135,6 +549,280 @@ for c in consumidores:
 for n in sorted(resultados):
     print(n, "->", resultados[n][0])
 ```
+
+```java
+import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+
+static final BlockingQueue<Integer> fila = new ArrayBlockingQueue<>(4);
+static final int FIM = -1;   // ArrayBlockingQueue não aceita null: a sentinela é um valor que nunca é item
+static final int TOTAL = 8;
+// BlockingQueue não tem task_done/join: com o total conhecido, um latch faz esse papel
+static final CountDownLatch pendentes = new CountDownLatch(TOTAL);
+static final Map<Integer, Map.Entry<Integer, String>> resultados = new ConcurrentHashMap<>();
+
+static void produtor() throws InterruptedException {
+    for (int n = 1; n <= TOTAL; n++) {
+        fila.put(n);          // bloqueia se a fila estiver cheia
+    }
+}
+
+static void consumidor(String nome) {
+    try {
+        while (true) {
+            int n = fila.take();  // bloqueia se a fila estiver vazia
+            if (n == FIM) {
+                return;
+            }
+            resultados.put(n, Map.entry(n * n, nome));
+            pendentes.countDown();
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> consumidores = new ArrayList<>();
+    for (int i = 0; i < 2; i++) {
+        String nome = "c" + i;
+        consumidores.add(new Thread(() -> consumidor(nome)));
+    }
+    for (Thread c : consumidores) c.start();
+    produtor();
+    pendentes.await();        // espera todos os itens serem processados
+    for (int i = 0; i < consumidores.size(); i++) {
+        fila.put(FIM);
+    }
+    for (Thread c : consumidores) c.join();
+
+    for (int n : new TreeSet<>(resultados.keySet())) {
+        System.out.println(n + " -> " + resultados.get(n).getKey());
+    }
+}
+```
+
+```cpp
+#include <condition_variable>
+#include <deque>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+using namespace std;
+
+// C++ não tem fila bloqueante na biblioteca padrão: esta cobre put, get, task_done e join
+class FilaBloqueante {
+    deque<optional<int>> itens;
+    size_t capacidade;
+    size_t pendentes = 0;
+    mutex m;
+    condition_variable nao_cheia, nao_vazia, tudo_feito;
+
+public:
+    explicit FilaBloqueante(size_t capacidade) : capacidade(capacidade) {}
+
+    void put(optional<int> item) {
+        unique_lock<mutex> trava(m);
+        while (itens.size() == capacidade) {
+            nao_cheia.wait(trava);
+        }
+        itens.push_back(item);
+        pendentes += 1;
+        nao_vazia.notify_one();
+    }
+
+    optional<int> get() {
+        unique_lock<mutex> trava(m);
+        while (itens.empty()) {
+            nao_vazia.wait(trava);
+        }
+        optional<int> item = itens.front();
+        itens.pop_front();
+        nao_cheia.notify_one();
+        return item;
+    }
+
+    void task_done() {
+        lock_guard<mutex> trava(m);
+        pendentes -= 1;
+        if (pendentes == 0) {
+            tudo_feito.notify_all();
+        }
+    }
+
+    void join() {
+        unique_lock<mutex> trava(m);
+        while (pendentes > 0) {
+            tudo_feito.wait(trava);
+        }
+    }
+};
+
+FilaBloqueante fila(4);
+map<int, pair<int, string>> resultados;  // std::map já mantém as chaves ordenadas
+mutex lock_resultados;
+
+void produtor() {
+    for (int n = 1; n < 9; n++) {
+        fila.put(n);          // bloqueia se a fila estiver cheia
+    }
+}
+
+void consumidor(string nome) {
+    while (true) {
+        optional<int> n = fila.get();  // bloqueia se a fila estiver vazia
+        if (!n) {
+            fila.task_done();
+            return;
+        }
+        {
+            lock_guard<mutex> guarda(lock_resultados);
+            resultados[*n] = {*n * *n, nome};
+        }
+        fila.task_done();
+    }
+}
+
+int main() {
+    vector<thread> consumidores;
+    for (int i = 0; i < 2; i++) {
+        consumidores.emplace_back(consumidor, "c" + to_string(i));
+    }
+    produtor();
+    fila.join();              // espera todos os itens serem processados
+    for (size_t i = 0; i < consumidores.size(); i++) {
+        fila.put(nullopt);
+    }
+    for (auto& c : consumidores) {
+        c.join();
+    }
+
+    for (const auto& [n, valor] : resultados) {
+        cout << n << " -> " << valor.first << endl;
+    }
+}
+```
+
+```csharp
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+
+const int TOTAL = 8;
+static readonly BlockingCollection<int?> fila = new BlockingCollection<int?>(4);
+// BlockingCollection não tem task_done/join: com o total conhecido, um CountdownEvent faz esse papel
+static readonly CountdownEvent pendentes = new CountdownEvent(TOTAL);
+static readonly Dictionary<int, KeyValuePair<int, string>> resultados = new Dictionary<int, KeyValuePair<int, string>>();
+
+static void Produtor()
+{
+    for (int n = 1; n <= TOTAL; n++)
+        fila.Add(n);          // bloqueia se a fila estiver cheia
+}
+
+static void Consumidor(string nome)
+{
+    while (true)
+    {
+        int? n = fila.Take();  // bloqueia se a fila estiver vazia
+        if (n == null)
+            return;
+        lock (resultados)
+        {
+            resultados[n.Value] = new KeyValuePair<int, string>(n.Value * n.Value, nome);
+        }
+        pendentes.Signal();
+    }
+}
+
+static void Main()
+{
+    var consumidores = new List<Thread>();
+    for (int i = 0; i < 2; i++)
+    {
+        string nome = "c" + i;
+        consumidores.Add(new Thread(() => Consumidor(nome)));
+    }
+    foreach (var c in consumidores) c.Start();
+    Produtor();
+    pendentes.Wait();         // espera todos os itens serem processados
+    for (int i = 0; i < consumidores.Count; i++)
+        fila.Add(null);
+    foreach (var c in consumidores) c.Join();
+
+    var chaves = new List<int>(resultados.Keys);
+    chaves.Sort();
+    foreach (int n in chaves)
+        Console.WriteLine(n + " -> " + resultados[n].Key);
+}
+```
+
+```go
+import (
+	"fmt"
+	"sort"
+	"sync"
+)
+
+type Resultado struct {
+	quadrado int
+	nome     string
+}
+
+var fila = make(chan int, 4)
+var pendentes sync.WaitGroup // canal não tem task_done/join: o WaitGroup faz esse papel
+var resultados = map[int]Resultado{}
+var trava sync.Mutex // map do Go não pode ser escrito por várias goroutines sem proteção
+
+func produtor() {
+	for n := 1; n < 9; n++ {
+		pendentes.Add(1)
+		fila <- n // bloqueia se o canal estiver cheio
+	}
+}
+
+func consumidor(nome string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for n := range fila { // bloqueia se o canal estiver vazio; o laço termina quando ele é fechado
+		trava.Lock()
+		resultados[n] = Resultado{n * n, nome}
+		trava.Unlock()
+		pendentes.Done()
+	}
+}
+
+func main() {
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go consumidor(fmt.Sprintf("c%d", i), &wg)
+	}
+	produtor()
+	pendentes.Wait() // espera todos os itens serem processados
+	close(fila)      // close substitui as sentinelas
+	wg.Wait()
+
+	var chaves []int
+	for n := range resultados {
+		chaves = append(chaves, n)
+	}
+	sort.Ints(chaves)
+	for _, n := range chaves {
+		fmt.Println(n, "->", resultados[n].quadrado)
+	}
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

@@ -19,6 +19,8 @@ Em Java você usa `ReentrantReadWriteLock` (com `readLock()` e `writeLock()`) ou
 
 A versão abaixo conta leitores ativos, marca se há escritor e também conta escritores **esperando**. Novos leitores não entram enquanto houver escritor na fila, o que evita que um fluxo contínuo de leituras deixe a escrita esperando para sempre.
 
+<CodeTabs>
+
 ```python
 import threading
 
@@ -86,6 +88,450 @@ leitor.join()
 print(eventos)
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+
+static class RWLock {
+    private int leitores = 0;
+    private boolean escrevendo = false;
+    private int escritoresEsperando = 0;
+
+    synchronized void adquirirLeitura() throws InterruptedException {
+        while (escrevendo || escritoresEsperando > 0) {
+            wait();
+        }
+        leitores += 1;
+    }
+
+    synchronized void liberarLeitura() {
+        leitores -= 1;
+        if (leitores == 0) {
+            notifyAll();
+        }
+    }
+
+    synchronized void adquirirEscrita() throws InterruptedException {
+        escritoresEsperando += 1;
+        while (escrevendo || leitores > 0) {
+            wait();
+        }
+        escritoresEsperando -= 1;
+        escrevendo = true;
+    }
+
+    synchronized void liberarEscrita() {
+        escrevendo = false;
+        notifyAll();
+    }
+}
+
+static final RWLock rw = new RWLock();
+
+// 1) Três leitores dentro ao mesmo tempo: a barreira só abre se os três estiverem lá
+static final CyclicBarrier barreira = new CyclicBarrier(3);
+// os leitores estão juntos lá dentro: a lista precisa de proteção própria
+static final List<Integer> passaram = Collections.synchronizedList(new ArrayList<>());
+// 2) A ordem desta lista é garantida pelo próprio lock
+static final List<String> eventos = new ArrayList<>();
+
+static void leitorSimultaneo(int i) {
+    try {
+        rw.adquirirLeitura();
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+    }
+    try {
+        barreira.await(2, TimeUnit.SECONDS);
+        passaram.add(i);
+    } catch (Exception e) {  // TimeoutException, BrokenBarrierException ou InterruptedException
+        System.out.println("barreira estourou o prazo");
+    } finally {
+        rw.liberarLeitura();
+    }
+}
+
+static void lerDepois() {
+    try {
+        rw.adquirirLeitura();
+        eventos.add("leitor entrou");
+        rw.liberarLeitura();
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> ts = new ArrayList<>();
+    for (int i = 0; i < 3; i++) {
+        int id = i;
+        ts.add(new Thread(() -> leitorSimultaneo(id)));
+    }
+    for (Thread t : ts) t.start();
+    for (Thread t : ts) t.join();
+    System.out.println("leitores simultaneos: " + passaram.size());
+
+    // 2) Com um escritor dentro, o leitor precisa esperar
+    rw.adquirirEscrita();
+    Thread leitor = new Thread(() -> lerDepois());
+    leitor.start();
+    eventos.add("escritor terminou");
+    rw.liberarEscrita();
+    leitor.join();
+    System.out.println(eventos);
+}
+```
+
+```cpp
+#include <chrono>
+#include <condition_variable>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+using namespace std;
+
+class RWLock {
+    mutex m;
+    condition_variable cond;
+    int leitores = 0;
+    bool escrevendo = false;
+    int escritores_esperando = 0;
+
+public:
+    void adquirir_leitura() {
+        unique_lock<mutex> trava(m);
+        while (escrevendo || escritores_esperando > 0) {
+            cond.wait(trava);
+        }
+        leitores += 1;
+    }
+
+    void liberar_leitura() {
+        lock_guard<mutex> trava(m);
+        leitores -= 1;
+        if (leitores == 0) {
+            cond.notify_all();
+        }
+    }
+
+    void adquirir_escrita() {
+        unique_lock<mutex> trava(m);
+        escritores_esperando += 1;
+        while (escrevendo || leitores > 0) {
+            cond.wait(trava);
+        }
+        escritores_esperando -= 1;
+        escrevendo = true;
+    }
+
+    void liberar_escrita() {
+        lock_guard<mutex> trava(m);
+        escrevendo = false;
+        cond.notify_all();
+    }
+};
+
+// std::barrier não tem prazo: esta é uma barreira mínima, de uma rodada, com wait_for
+class BarreiraComPrazo {
+    mutex m;
+    condition_variable cond;
+    int faltam;
+
+public:
+    explicit BarreiraComPrazo(int n) : faltam(n) {}
+
+    // devolve false se o prazo acabar antes de todas chegarem
+    bool esperar(chrono::seconds prazo) {
+        unique_lock<mutex> trava(m);
+        faltam -= 1;
+        if (faltam == 0) {
+            cond.notify_all();
+        }
+        return cond.wait_for(trava, prazo, [this] { return faltam == 0; });
+    }
+};
+
+RWLock rw;
+
+// 1) Três leitores dentro ao mesmo tempo: a barreira só abre se os três estiverem lá
+BarreiraComPrazo barreira(3);
+vector<int> passaram;
+mutex trava_passaram;  // os leitores estão juntos lá dentro: a lista precisa de proteção própria
+
+void leitor_simultaneo(int i) {
+    rw.adquirir_leitura();
+    if (barreira.esperar(chrono::seconds(2))) {
+        lock_guard<mutex> guarda(trava_passaram);
+        passaram.push_back(i);
+    }
+    rw.liberar_leitura();
+}
+
+int main() {
+    vector<thread> ts;
+    for (int i = 0; i < 3; i++) {
+        ts.emplace_back(leitor_simultaneo, i);
+    }
+    for (auto& t : ts) {
+        t.join();
+    }
+    cout << "leitores simultaneos: " << passaram.size() << endl;
+
+    // 2) Com um escritor dentro, o leitor precisa esperar
+    vector<string> eventos;
+    rw.adquirir_escrita();
+    thread leitor([&eventos] {
+        rw.adquirir_leitura();
+        eventos.push_back("leitor entrou");
+        rw.liberar_leitura();
+    });
+    eventos.push_back("escritor terminou");
+    rw.liberar_escrita();
+    leitor.join();
+    cout << "['" << eventos[0] << "', '" << eventos[1] << "']" << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class RWLock
+{
+    private readonly object _cond = new object();
+    private int _leitores = 0;
+    private bool _escrevendo = false;
+    private int _escritoresEsperando = 0;
+
+    public void AdquirirLeitura()
+    {
+        lock (_cond)
+        {
+            while (_escrevendo || _escritoresEsperando > 0)
+                Monitor.Wait(_cond);
+            _leitores += 1;
+        }
+    }
+
+    public void LiberarLeitura()
+    {
+        lock (_cond)
+        {
+            _leitores -= 1;
+            if (_leitores == 0)
+                Monitor.PulseAll(_cond);
+        }
+    }
+
+    public void AdquirirEscrita()
+    {
+        lock (_cond)
+        {
+            _escritoresEsperando += 1;
+            while (_escrevendo || _leitores > 0)
+                Monitor.Wait(_cond);
+            _escritoresEsperando -= 1;
+            _escrevendo = true;
+        }
+    }
+
+    public void LiberarEscrita()
+    {
+        lock (_cond)
+        {
+            _escrevendo = false;
+            Monitor.PulseAll(_cond);
+        }
+    }
+}
+
+static readonly RWLock rw = new RWLock();
+
+// 1) Três leitores dentro ao mesmo tempo: a barreira só abre se os três estiverem lá
+static readonly Barrier barreira = new Barrier(3);
+static readonly List<int> passaram = new List<int>();
+
+static void LeitorSimultaneo(int i)
+{
+    rw.AdquirirLeitura();
+    try
+    {
+        // SignalAndWait devolve false se o prazo acabar
+        if (barreira.SignalAndWait(2000))
+        {
+            // os leitores estão juntos lá dentro: a lista precisa de proteção própria
+            lock (passaram)
+            {
+                passaram.Add(i);
+            }
+        }
+    }
+    finally
+    {
+        rw.LiberarLeitura();
+    }
+}
+
+static void Main()
+{
+    var ts = new List<Thread>();
+    for (int i = 0; i < 3; i++)
+    {
+        int id = i;
+        ts.Add(new Thread(() => LeitorSimultaneo(id)));
+    }
+    foreach (var t in ts) t.Start();
+    foreach (var t in ts) t.Join();
+    Console.WriteLine("leitores simultaneos: " + passaram.Count);
+
+    // 2) Com um escritor dentro, o leitor precisa esperar
+    var eventos = new List<string>();
+    rw.AdquirirEscrita();
+    var leitor = new Thread(() =>
+    {
+        rw.AdquirirLeitura();
+        eventos.Add("leitor entrou");
+        rw.LiberarLeitura();
+    });
+    leitor.Start();
+    eventos.Add("escritor terminou");
+    rw.LiberarEscrita();
+    leitor.Join();
+    Console.WriteLine("['" + string.Join("', '", eventos) + "']");
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+type RWLock struct {
+	mu                  sync.Mutex
+	cond                *sync.Cond
+	leitores            int
+	escrevendo          bool
+	escritoresEsperando int
+}
+
+func NovoRWLock() *RWLock {
+	r := &RWLock{}
+	r.cond = sync.NewCond(&r.mu)
+	return r
+}
+
+func (r *RWLock) adquirirLeitura() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for r.escrevendo || r.escritoresEsperando > 0 {
+		r.cond.Wait()
+	}
+	r.leitores += 1
+}
+
+func (r *RWLock) liberarLeitura() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.leitores -= 1
+	if r.leitores == 0 {
+		r.cond.Broadcast()
+	}
+}
+
+func (r *RWLock) adquirirEscrita() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.escritoresEsperando += 1
+	for r.escrevendo || r.leitores > 0 {
+		r.cond.Wait()
+	}
+	r.escritoresEsperando -= 1
+	r.escrevendo = true
+}
+
+func (r *RWLock) liberarEscrita() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.escrevendo = false
+	r.cond.Broadcast()
+}
+
+// Go não tem barreira, e sync.Cond não tem prazo: esta é uma barreira mínima, de uma rodada,
+// em que o canal fecha quando a última chega e o prazo vem do select com time.After
+type BarreiraComPrazo struct {
+	mu     sync.Mutex
+	faltam int
+	abriu  chan struct{}
+}
+
+func (b *BarreiraComPrazo) esperar(prazo time.Duration) bool {
+	b.mu.Lock()
+	b.faltam -= 1
+	if b.faltam == 0 {
+		close(b.abriu)
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.abriu:
+		return true
+	case <-time.After(prazo):
+		return false
+	}
+}
+
+var rw = NovoRWLock()
+
+// 1) Três leitores dentro ao mesmo tempo: a barreira só abre se os três estiverem lá
+var barreira = &BarreiraComPrazo{faltam: 3, abriu: make(chan struct{})}
+var passaram []int
+var travaPassaram sync.Mutex // os leitores estão juntos lá dentro: a lista precisa de proteção própria
+
+func leitorSimultaneo(i int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	rw.adquirirLeitura()
+	defer rw.liberarLeitura()
+	if barreira.esperar(2 * time.Second) {
+		travaPassaram.Lock()
+		passaram = append(passaram, i)
+		travaPassaram.Unlock()
+	}
+}
+
+func main() {
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go leitorSimultaneo(i, &wg)
+	}
+	wg.Wait()
+	fmt.Println("leitores simultaneos:", len(passaram))
+
+	// 2) Com um escritor dentro, o leitor precisa esperar
+	var eventos []string
+	rw.adquirirEscrita()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		rw.adquirirLeitura()
+		eventos = append(eventos, "leitor entrou")
+		rw.liberarLeitura()
+	}()
+	eventos = append(eventos, "escritor terminou")
+	rw.liberarEscrita()
+	wg.Wait()
+	fmt.Println(eventos)
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 leitores simultaneos: 3
@@ -95,6 +541,8 @@ leitores simultaneos: 3
 Se o lock fosse um mutex comum, os três leitores nunca estariam dentro juntos e a barreira estouraria o prazo. Na segunda parte, a ordem é garantida pelo próprio lock: o leitor só consegue entrar depois que o escritor libera.
 
 ## Uso típico: configuração lida o tempo todo
+
+<CodeTabs>
 
 ```python
 import threading
@@ -175,6 +623,284 @@ for t in threads:
 print("inconsistencias vistas:", sum(inconsistencias))
 print("versao final:", cfg.ler())
 ```
+
+```java
+import java.util.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+// Em Java o RW lock vem pronto: não é preciso escrever a classe RWLock
+static class Config {
+    private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+    private int versao = 0;
+    private int timeout = 0;  // invariante: timeout == versao * 10
+
+    int[] ler() {
+        rw.readLock().lock();
+        try {
+            return new int[]{versao, timeout};
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+
+    void atualizar() {
+        rw.writeLock().lock();
+        try {
+            versao += 1;
+            timeout = versao * 10;
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+}
+
+static final Config cfg = new Config();
+static final int[] inconsistencias = new int[4];
+
+static void leitor(int i) {
+    for (int k = 0; k < 2000; k++) {
+        int[] lido = cfg.ler();
+        if (lido[1] != lido[0] * 10) {
+            inconsistencias[i] += 1;
+        }
+    }
+}
+
+static void escritor() {
+    for (int k = 0; k < 300; k++) {
+        cfg.atualizar();
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> threads = new ArrayList<>();
+    for (int i = 0; i < 4; i++) {
+        int id = i;
+        threads.add(new Thread(() -> leitor(id)));
+    }
+    threads.add(new Thread(() -> escritor()));
+    for (Thread t : threads) t.start();
+    for (Thread t : threads) t.join();
+
+    int soma = 0;
+    for (int x : inconsistencias) soma += x;
+    System.out.println("inconsistencias vistas: " + soma);
+    int[] fim = cfg.ler();
+    System.out.println("versao final: (" + fim[0] + ", " + fim[1] + ")");
+}
+```
+
+```cpp
+#include <iostream>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
+#include <utility>
+#include <vector>
+using namespace std;
+
+// Em C++ o RW lock vem pronto: não é preciso escrever a classe RWLock
+class Config {
+    shared_mutex rw;
+    int versao = 0;
+    int timeout = 0;  // invariante: timeout == versao * 10
+
+public:
+    pair<int, int> ler() {
+        shared_lock<shared_mutex> leitura(rw);
+        return {versao, timeout};
+    }
+
+    void atualizar() {
+        unique_lock<shared_mutex> escrita(rw);
+        versao += 1;
+        timeout = versao * 10;
+    }
+};
+
+Config cfg;
+int inconsistencias[4] = {0, 0, 0, 0};
+
+void leitor(int i) {
+    for (int k = 0; k < 2000; k++) {
+        auto [v, t] = cfg.ler();
+        if (t != v * 10) {
+            inconsistencias[i] += 1;
+        }
+    }
+}
+
+void escritor() {
+    for (int k = 0; k < 300; k++) {
+        cfg.atualizar();
+    }
+}
+
+int main() {
+    vector<thread> threads;
+    for (int i = 0; i < 4; i++) {
+        threads.emplace_back(leitor, i);
+    }
+    threads.emplace_back(escritor);
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    int soma = 0;
+    for (int x : inconsistencias) {
+        soma += x;
+    }
+    cout << "inconsistencias vistas: " << soma << endl;
+    auto [versao, timeout] = cfg.ler();
+    cout << "versao final: (" << versao << ", " << timeout << ")" << endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+
+// Em C# o RW lock vem pronto: não é preciso escrever a classe RWLock
+class Config
+{
+    private readonly ReaderWriterLockSlim rw = new ReaderWriterLockSlim();
+    private int versao = 0;
+    private int timeout = 0;  // invariante: timeout == versao * 10
+
+    public int[] Ler()
+    {
+        rw.EnterReadLock();
+        try
+        {
+            return new[] { versao, timeout };
+        }
+        finally
+        {
+            rw.ExitReadLock();
+        }
+    }
+
+    public void Atualizar()
+    {
+        rw.EnterWriteLock();
+        try
+        {
+            versao += 1;
+            timeout = versao * 10;
+        }
+        finally
+        {
+            rw.ExitWriteLock();
+        }
+    }
+}
+
+static readonly Config cfg = new Config();
+static readonly int[] inconsistencias = new int[4];
+
+static void Leitor(int i)
+{
+    for (int k = 0; k < 2000; k++)
+    {
+        int[] lido = cfg.Ler();
+        if (lido[1] != lido[0] * 10)
+            inconsistencias[i] += 1;
+    }
+}
+
+static void Escritor()
+{
+    for (int k = 0; k < 300; k++)
+        cfg.Atualizar();
+}
+
+static void Main()
+{
+    var threads = new List<Thread>();
+    for (int i = 0; i < 4; i++)
+    {
+        int id = i;
+        threads.Add(new Thread(() => Leitor(id)));
+    }
+    threads.Add(new Thread(Escritor));
+    foreach (var t in threads) t.Start();
+    foreach (var t in threads) t.Join();
+
+    Console.WriteLine("inconsistencias vistas: " + inconsistencias.Sum());
+    int[] fim = cfg.Ler();
+    Console.WriteLine("versao final: (" + fim[0] + ", " + fim[1] + ")");
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+)
+
+// Em Go o RW lock vem pronto: não é preciso escrever o tipo RWLock
+type Config struct {
+	rw      sync.RWMutex
+	versao  int
+	timeout int // invariante: timeout == versao * 10
+}
+
+func (c *Config) ler() (int, int) {
+	c.rw.RLock()
+	defer c.rw.RUnlock()
+	return c.versao, c.timeout
+}
+
+func (c *Config) atualizar() {
+	c.rw.Lock()
+	defer c.rw.Unlock()
+	c.versao += 1
+	c.timeout = c.versao * 10
+}
+
+var cfg Config
+var inconsistencias [4]int
+
+func leitor(i int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for k := 0; k < 2000; k++ {
+		v, t := cfg.ler()
+		if t != v*10 {
+			inconsistencias[i] += 1
+		}
+	}
+}
+
+func escritor(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for k := 0; k < 300; k++ {
+		cfg.atualizar()
+	}
+}
+
+func main() {
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go leitor(i, &wg)
+	}
+	wg.Add(1)
+	go escritor(&wg)
+	wg.Wait()
+
+	soma := 0
+	for _, x := range inconsistencias {
+		soma += x
+	}
+	fmt.Println("inconsistencias vistas:", soma)
+	versao, timeout := cfg.ler()
+	fmt.Printf("versao final: (%d, %d)\n", versao, timeout)
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

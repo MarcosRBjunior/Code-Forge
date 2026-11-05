@@ -25,6 +25,8 @@ Em Python, a versão reentrante é `threading.RLock`. Em Java, tanto `synchroniz
 
 O programa abaixo mostra a diferença usando `acquire(timeout=...)` para que a segunda tentativa desista em vez de travar para sempre:
 
+<CodeTabs>
+
 ```python
 import threading
 
@@ -56,6 +58,254 @@ reentrante.release()
 print("liberar RLock de outra thread ->", erros[0])
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.StampedLock;
+
+public static void main(String[] args) throws InterruptedException {
+    // synchronized e ReentrantLock são reentrantes; StampedLock não é
+    StampedLock comum = new StampedLock();
+    long carimbo = comum.writeLock();
+    long segundo = comum.tryWriteLock(200, TimeUnit.MILLISECONDS);  // devolve 0 quando desiste
+    System.out.println("Lock: segunda aquisicao pela mesma thread -> " + (segundo != 0));
+    comum.unlockWrite(carimbo);
+
+    ReentrantLock reentrante = new ReentrantLock();
+    reentrante.lock();
+    System.out.println("RLock: segunda aquisicao pela mesma thread -> " + reentrante.tryLock(200, TimeUnit.MILLISECONDS));
+    reentrante.unlock();
+    reentrante.unlock();
+
+    // Só o dono pode liberar um ReentrantLock
+    reentrante.lock();
+    List<String> erros = new ArrayList<>();
+
+    Thread t = new Thread(() -> {
+        try {
+            reentrante.unlock();
+        } catch (IllegalMonitorStateException e) {
+            erros.add(e.getClass().getSimpleName());
+        }
+    });
+    t.start();
+    t.join();
+    reentrante.unlock();
+    System.out.println("liberar RLock de outra thread -> " + erros.get(0));
+}
+```
+
+```cpp
+#include <chrono>
+#include <condition_variable>
+#include <iostream>
+#include <mutex>
+#include <semaphore>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+// Liberar um recursive_mutex de outra thread é comportamento indefinido: ninguém avisa.
+// Para ver a regra do dono, esta classe guarda o dono e o contador, como a aula descreve.
+class RuntimeError : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+class LockComDono {
+    std::mutex interno;
+    std::condition_variable livre;
+    std::thread::id dono;
+    int contador = 0;
+
+public:
+    void acquire() {
+        std::unique_lock<std::mutex> guarda(interno);
+        auto eu = std::this_thread::get_id();
+        livre.wait(guarda, [&] { return contador == 0 || dono == eu; });
+        dono = eu;
+        contador += 1;
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> guarda(interno);
+        if (contador == 0 || dono != std::this_thread::get_id()) {
+            throw RuntimeError("liberado por quem nao e o dono");
+        }
+        contador -= 1;
+        if (contador == 0) livre.notify_one();
+    }
+};
+
+int main() {
+    std::cout << std::boolalpha;
+
+    // Travar de novo um std::mutex na mesma thread é comportamento indefinido, então o
+    // auto-deadlock é mostrado com um semáforo binário, que não tem dono e aceita prazo.
+    std::binary_semaphore comum(1);
+    comum.acquire();
+    std::cout << "Lock: segunda aquisicao pela mesma thread -> "
+              << comum.try_acquire_for(std::chrono::milliseconds(200)) << std::endl;
+    comum.release();
+
+    std::recursive_timed_mutex reentrante;
+    reentrante.lock();
+    std::cout << "RLock: segunda aquisicao pela mesma thread -> "
+              << reentrante.try_lock_for(std::chrono::milliseconds(200)) << std::endl;
+    reentrante.unlock();
+    reentrante.unlock();
+
+    // Só o dono pode liberar
+    LockComDono com_dono;
+    com_dono.acquire();
+    std::vector<std::string> erros;
+
+    std::thread t([&] {
+        try {
+            com_dono.release();
+        } catch (const RuntimeError&) {
+            erros.push_back("RuntimeError");
+        }
+    });
+    t.join();
+    com_dono.release();
+    std::cout << "liberar RLock de outra thread -> " << erros[0] << std::endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+static void Main()
+{
+    // lock e Monitor são reentrantes; SemaphoreSlim com uma vaga não tem dono nem reentrância
+    var comum = new SemaphoreSlim(1);
+    comum.Wait();
+    Console.WriteLine("Lock: segunda aquisicao pela mesma thread -> " + comum.Wait(200));
+    comum.Release();
+
+    object reentrante = new object();
+    Monitor.Enter(reentrante);
+    Console.WriteLine("RLock: segunda aquisicao pela mesma thread -> " + Monitor.TryEnter(reentrante, 200));
+    Monitor.Exit(reentrante);
+    Monitor.Exit(reentrante);
+
+    // Só o dono pode liberar um Monitor
+    Monitor.Enter(reentrante);
+    var erros = new List<string>();
+
+    Thread t = new Thread(() =>
+    {
+        try
+        {
+            Monitor.Exit(reentrante);
+        }
+        catch (SynchronizationLockException e)
+        {
+            erros.Add(e.GetType().Name);
+        }
+    });
+    t.Start();
+    t.Join();
+    Monitor.Exit(reentrante);
+    Console.WriteLine("liberar RLock de outra thread -> " + erros[0]);
+}
+```
+
+```go
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// Em Go não existe mutex reentrante, de propósito, e goroutine não expõe um id.
+// Para reproduzir a aula, este tipo recebe o dono como parâmetro. Em código real, separe
+// métodos que travam de métodos internos que supõem o lock já seguro.
+type LockReentrante struct {
+	interno  sync.Mutex
+	dono     int
+	contador int
+}
+
+func (l *LockReentrante) Acquire(dono int, prazo time.Duration) bool {
+	limite := time.Now().Add(prazo)
+	for {
+		l.interno.Lock()
+		if l.contador == 0 || l.dono == dono {
+			l.dono = dono
+			l.contador += 1
+			l.interno.Unlock()
+			return true
+		}
+		l.interno.Unlock()
+		if time.Now().After(limite) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (l *LockReentrante) Release(dono int) error {
+	l.interno.Lock()
+	defer l.interno.Unlock()
+	if l.contador == 0 || l.dono != dono {
+		return errors.New("RuntimeError")
+	}
+	l.contador -= 1
+	return nil
+}
+
+// sync.Mutex só tem TryLock, sem prazo: a espera com prazo é um laço de tentativas
+func tentarComPrazo(lock *sync.Mutex, prazo time.Duration) bool {
+	limite := time.Now().Add(prazo)
+	for time.Now().Before(limite) {
+		if lock.TryLock() {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+func main() {
+	prazo := 200 * time.Millisecond
+
+	var comum sync.Mutex
+	comum.Lock()
+	fmt.Println("Lock: segunda aquisicao pela mesma thread ->", tentarComPrazo(&comum, prazo))
+	comum.Unlock()
+
+	reentrante := &LockReentrante{}
+	reentrante.Acquire(1, prazo)
+	fmt.Println("RLock: segunda aquisicao pela mesma thread ->", reentrante.Acquire(1, prazo))
+	reentrante.Release(1)
+	reentrante.Release(1)
+
+	// Só o dono pode liberar
+	reentrante.Acquire(1, prazo)
+	var erros []string
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := reentrante.Release(2); err != nil { // esta goroutine é o dono 2
+			erros = append(erros, err.Error())
+		}
+	}()
+	wg.Wait()
+	reentrante.Release(1)
+	fmt.Println("liberar RLock de outra thread ->", erros[0])
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 Lock: segunda aquisicao pela mesma thread -> False
@@ -66,6 +316,8 @@ liberar RLock de outra thread -> RuntimeError
 Sem o `timeout`, a segunda linha nunca terminaria com o `Lock` comum. Repare também que o `RLock` tem dono: outra thread não pode liberá-lo. Um `Lock` comum, curiosamente, pode ser liberado por qualquer thread em Python.
 
 ## O caso típico: métodos que se chamam
+
+<CodeTabs>
 
 ```python
 import threading
@@ -103,6 +355,282 @@ for t in threads:
 print("itens:", len(carrinho._itens))
 print("total:", carrinho.total())
 ```
+
+```java
+import java.util.*;
+
+static class Item {
+    final String nome;
+    final int preco;
+
+    Item(String nome, int preco) {
+        this.nome = nome;
+        this.preco = preco;
+    }
+}
+
+static class Carrinho {
+    final List<Item> itens = new ArrayList<>();
+
+    // o monitor de synchronized é reentrante: um método pode chamar outro do mesmo objeto
+    synchronized void adicionar(String nome, int preco) {
+        itens.add(new Item(nome, preco));
+    }
+
+    synchronized int total() {
+        int soma = 0;
+        for (Item item : itens) soma += item.preco;
+        return soma;
+    }
+
+    synchronized int adicionarVarios(List<Item> novos) {   // mantém a operação composta atômica
+        for (Item item : novos) {
+            adicionar(item.nome, item.preco);   // readquire o mesmo lock
+        }
+        return total();                         // e de novo
+    }
+}
+
+static final Carrinho carrinho = new Carrinho();
+
+static void comprar(int base) {
+    List<Item> novos = new ArrayList<>();
+    for (int i = 0; i < 3; i++) {
+        novos.add(new Item("item" + (base + i), 10));
+    }
+    carrinho.adicionarVarios(novos);
+}
+
+public static void main(String[] args) throws InterruptedException {
+    List<Thread> threads = new ArrayList<>();
+    for (int k = 0; k < 4; k++) {
+        int base = k * 3;
+        threads.add(new Thread(() -> comprar(base)));
+    }
+    for (Thread t : threads) t.start();
+    for (Thread t : threads) t.join();
+
+    System.out.println("itens: " + carrinho.itens.size());
+    System.out.println("total: " + carrinho.total());
+}
+```
+
+```cpp
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+class Carrinho {
+    std::recursive_mutex trava;  // com std::mutex, a chamada interna seria comportamento indefinido
+
+public:
+    std::vector<std::pair<std::string, int>> itens;
+
+    void adicionar(const std::string& nome, int preco) {
+        std::lock_guard<std::recursive_mutex> guarda(trava);
+        itens.emplace_back(nome, preco);
+    }
+
+    int total() {
+        std::lock_guard<std::recursive_mutex> guarda(trava);
+        int soma = 0;
+        for (const auto& item : itens) soma += item.second;
+        return soma;
+    }
+
+    int adicionar_varios(const std::vector<std::pair<std::string, int>>& novos) {
+        std::lock_guard<std::recursive_mutex> guarda(trava);  // mantém a operação composta atômica
+        for (const auto& [nome, preco] : novos) {
+            adicionar(nome, preco);  // readquire o mesmo lock
+        }
+        return total();              // e de novo
+    }
+};
+
+Carrinho carrinho;
+
+void comprar(int base) {
+    std::vector<std::pair<std::string, int>> novos;
+    for (int i = 0; i < 3; i++) {
+        novos.emplace_back("item" + std::to_string(base + i), 10);
+    }
+    carrinho.adicionar_varios(novos);
+}
+
+int main() {
+    std::vector<std::thread> threads;
+    for (int k = 0; k < 4; k++) {
+        threads.emplace_back(comprar, k * 3);
+    }
+    for (auto& t : threads) t.join();
+
+    std::cout << "itens: " << carrinho.itens.size() << std::endl;
+    std::cout << "total: " << carrinho.total() << std::endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class Item
+{
+    public readonly string nome;
+    public readonly int preco;
+
+    public Item(string nome, int preco)
+    {
+        this.nome = nome;
+        this.preco = preco;
+    }
+}
+
+class Carrinho
+{
+    private readonly object _lock = new object();   // lock em C# é reentrante
+    public readonly List<Item> itens = new List<Item>();
+
+    public void Adicionar(string nome, int preco)
+    {
+        lock (_lock)
+        {
+            itens.Add(new Item(nome, preco));
+        }
+    }
+
+    public int Total()
+    {
+        lock (_lock)
+        {
+            int soma = 0;
+            foreach (Item item in itens) soma += item.preco;
+            return soma;
+        }
+    }
+
+    public int AdicionarVarios(List<Item> novos)
+    {
+        lock (_lock)    // mantém a operação composta atômica
+        {
+            foreach (Item item in novos)
+            {
+                Adicionar(item.nome, item.preco);   // readquire o mesmo lock
+            }
+            return Total();                         // e de novo
+        }
+    }
+}
+
+static readonly Carrinho carrinho = new Carrinho();
+
+static void Comprar(int inicio)
+{
+    var novos = new List<Item>();
+    for (int i = 0; i < 3; i++)
+    {
+        novos.Add(new Item("item" + (inicio + i), 10));
+    }
+    carrinho.AdicionarVarios(novos);
+}
+
+static void Main()
+{
+    var threads = new List<Thread>();
+    for (int k = 0; k < 4; k++)
+    {
+        int b = k * 3;
+        threads.Add(new Thread(() => Comprar(b)));
+    }
+    foreach (var t in threads) t.Start();
+    foreach (var t in threads) t.Join();
+
+    Console.WriteLine("itens: " + carrinho.itens.Count);
+    Console.WriteLine("total: " + carrinho.Total());
+}
+```
+
+```go
+import (
+	"fmt"
+	"strconv"
+	"sync"
+)
+
+type Item struct {
+	nome  string
+	preco int
+}
+
+// sync.Mutex não é reentrante: se AdicionarVarios chamasse Adicionar, a goroutine ficaria
+// esperando por ela mesma. A alternativa idiomática é separar os métodos públicos, que
+// travam, dos internos, que supõem o lock já seguro.
+type Carrinho struct {
+	lock  sync.Mutex
+	itens []Item
+}
+
+func (c *Carrinho) adicionarSemLock(nome string, preco int) {
+	c.itens = append(c.itens, Item{nome, preco})
+}
+
+func (c *Carrinho) totalSemLock() int {
+	soma := 0
+	for _, item := range c.itens {
+		soma += item.preco
+	}
+	return soma
+}
+
+func (c *Carrinho) Adicionar(nome string, preco int) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.adicionarSemLock(nome, preco)
+}
+
+func (c *Carrinho) Total() int {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	return c.totalSemLock()
+}
+
+func (c *Carrinho) AdicionarVarios(itens []Item) int {
+	c.lock.Lock() // mantém a operação composta atômica
+	defer c.lock.Unlock()
+	for _, item := range itens {
+		c.adicionarSemLock(item.nome, item.preco) // não readquire: o lock já está seguro
+	}
+	return c.totalSemLock()
+}
+
+func main() {
+	carrinho := &Carrinho{}
+
+	comprar := func(base int, wg *sync.WaitGroup) {
+		defer wg.Done()
+		var itens []Item
+		for i := 0; i < 3; i++ {
+			itens = append(itens, Item{"item" + strconv.Itoa(base+i), 10})
+		}
+		carrinho.AdicionarVarios(itens)
+	}
+
+	var wg sync.WaitGroup
+	for k := 0; k < 4; k++ {
+		wg.Add(1)
+		go comprar(k*3, &wg)
+	}
+	wg.Wait()
+
+	fmt.Println("itens:", len(carrinho.itens))
+	fmt.Println("total:", carrinho.Total())
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:

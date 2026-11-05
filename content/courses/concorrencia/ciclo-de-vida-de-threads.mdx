@@ -35,6 +35,8 @@ Em Java, `Thread.getState()` devolve `NEW`, `RUNNABLE`, `BLOCKED`, `WAITING`, `T
 
 O programa abaixo usa um `Event` para segurar a thread em espera, de modo que conseguimos observá-la viva antes de liberá-la.
 
+<CodeTabs>
+
 ```python
 import threading
 
@@ -60,6 +62,176 @@ print("depois do join, viva?", t.is_alive())
 print("log:", log)
 ```
 
+```java
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+
+static final CountDownLatch liberar = new CountDownLatch(1);
+// lista sincronizada: a main consulta a lista enquanto a thread escreve nela
+static final List<String> log = Collections.synchronizedList(new ArrayList<>());
+
+static void tarefa() {
+    log.add("comecou");
+    try {
+        liberar.await();    // fica bloqueada até o latch ser sinalizado
+    } catch (InterruptedException e) {
+        return;
+    }
+    log.add("terminou");
+}
+
+public static void main(String[] args) throws InterruptedException {
+    Thread t = new Thread(() -> tarefa(), "trabalhadora");
+    System.out.println("antes do start, viva? " + t.isAlive());
+
+    t.start();
+    while (log.isEmpty()) { }   // espera a thread registrar que começou
+    System.out.println("depois do start, viva? " + t.isAlive());
+
+    liberar.countDown();
+    t.join();
+    System.out.println("depois do join, viva? " + t.isAlive());
+    System.out.println("log: " + log);
+}
+```
+
+```cpp
+#include <atomic>
+#include <iostream>
+#include <latch>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+int main() {
+    std::latch liberar(1);
+    std::mutex trava;
+    std::vector<std::string> log;
+    // std::thread não tem is_alive(): joinable() só diz que falta um join, mesmo que a
+    // função já tenha acabado. Quem quer saber se ela ainda roda mantém uma flag atômica.
+    std::atomic<bool> viva{false};
+
+    auto tarefa = [&] {
+        {
+            std::lock_guard<std::mutex> guarda(trava);
+            log.push_back("comecou");
+        }
+        liberar.wait();     // fica bloqueada até o latch ser sinalizado
+        {
+            std::lock_guard<std::mutex> guarda(trava);
+            log.push_back("terminou");
+        }
+        viva = false;
+    };
+
+    std::thread t;          // ainda sem thread associada: é o construtor com função que a inicia
+    std::cout << std::boolalpha << "antes do start, viva? " << viva << std::endl;
+
+    viva = true;
+    t = std::thread(tarefa);
+    while (true) {          // espera a thread registrar que começou
+        std::lock_guard<std::mutex> guarda(trava);
+        if (!log.empty()) break;
+    }
+    std::cout << "depois do start, viva? " << viva << std::endl;
+
+    liberar.count_down();
+    t.join();
+    std::cout << "depois do join, viva? " << viva << std::endl;
+    std::cout << "log: [" << log[0] << ", " << log[1] << "]" << std::endl;
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+static readonly ManualResetEventSlim liberar = new ManualResetEventSlim(false);
+static readonly List<string> log = new List<string>();
+
+static void Tarefa()
+{
+    lock (log) log.Add("comecou");
+    liberar.Wait();         // fica bloqueada até o evento ser sinalizado
+    lock (log) log.Add("terminou");
+}
+
+static bool LogVazio()
+{
+    lock (log) return log.Count == 0;
+}
+
+static void Main()
+{
+    Thread t = new Thread(Tarefa);
+    t.Name = "trabalhadora";
+    Console.WriteLine("antes do start, viva? " + t.IsAlive);
+
+    t.Start();
+    while (LogVazio()) { }  // espera a thread registrar que começou
+    Console.WriteLine("depois do start, viva? " + t.IsAlive);
+
+    liberar.Set();
+    t.Join();
+    Console.WriteLine("depois do join, viva? " + t.IsAlive);
+    Console.WriteLine("log: [" + string.Join(", ", log) + "]");
+}
+```
+
+```go
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+func main() {
+	liberar := make(chan struct{})
+	var trava sync.Mutex
+	var log []string
+	// goroutine não tem objeto nem is_alive(): quem quer saber se ela ainda roda mantém
+	// uma flag atômica. O WaitGroup faz o papel do join.
+	var viva int32
+	var wg sync.WaitGroup
+
+	tarefa := func() {
+		defer wg.Done()
+		trava.Lock()
+		log = append(log, "comecou")
+		trava.Unlock()
+		<-liberar // fica bloqueada até o canal ser fechado
+		trava.Lock()
+		log = append(log, "terminou")
+		trava.Unlock()
+		atomic.StoreInt32(&viva, 0)
+	}
+
+	fmt.Println("antes do start, viva?", atomic.LoadInt32(&viva) == 1)
+
+	atomic.StoreInt32(&viva, 1)
+	wg.Add(1)
+	go tarefa()
+	for { // espera a goroutine registrar que começou
+		trava.Lock()
+		vazio := len(log) == 0
+		trava.Unlock()
+		if !vazio {
+			break
+		}
+	}
+	fmt.Println("depois do start, viva?", atomic.LoadInt32(&viva) == 1)
+
+	close(liberar)
+	wg.Wait()
+	fmt.Println("depois do join, viva?", atomic.LoadInt32(&viva) == 1)
+	fmt.Println("log:", log)
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 antes do start, viva? False
@@ -77,6 +249,8 @@ O laço `while not log` é uma espera ativa usada só para fins didáticos; em c
 **`join` com timeout não mata a thread.** Ele apenas para de esperar. Se a thread continuar viva depois do prazo, ela segue rodando em segundo plano.
 
 **Threads daemon morrem com o processo.** Quando só restam threads daemon, o interpretador (ou a JVM) encerra sem esperá-las. Threads não daemon mantêm o processo vivo: esquecer uma delas rodando em laço infinito faz o programa nunca terminar.
+
+<CodeTabs>
 
 ```python
 import threading
@@ -102,6 +276,223 @@ t.join()
 print("terminada; viva?", t.is_alive())
 print("era daemon?", t.daemon)
 ```
+
+```java
+import java.util.concurrent.CountDownLatch;
+
+static final CountDownLatch parar = new CountDownLatch(1);
+
+static void laco() {
+    try {
+        parar.await();      // simula trabalho longo
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+public static void main(String[] args) throws InterruptedException {
+    Thread t = new Thread(() -> laco());
+    t.setDaemon(true);
+    t.start();
+
+    t.join(100);
+    System.out.println("join com timeout voltou; ainda viva? " + t.isAlive());
+
+    try {
+        t.start();
+    } catch (IllegalThreadStateException e) {
+        // a exceção do Java vem sem mensagem: o texto é escrito aqui
+        System.out.println("segundo start: threads can only be started once");
+    }
+
+    parar.countDown();
+    t.join();
+    System.out.println("terminada; viva? " + t.isAlive());
+    System.out.println("era daemon? " + t.isDaemon());
+}
+```
+
+```cpp
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <thread>
+
+// std::thread nasce rodando (não tem start), não tem is_alive e seu join não aceita prazo.
+// Esta classe pequena monta essas três coisas para reproduzir o ciclo de vida da aula:
+// a regra "só inicia uma vez" é dela, não da linguagem.
+class Tarefa {
+    struct Estado {
+        std::atomic<bool> viva{false};
+        std::promise<void> fim;
+    };
+    std::function<void()> alvo;
+    // compartilhado com a thread: continua válido mesmo depois de o objeto sair de escopo
+    std::shared_ptr<Estado> estado = std::make_shared<Estado>();
+    std::future<void> fim = estado->fim.get_future();
+    bool iniciada = false;
+
+public:
+    bool daemon = false;
+
+    explicit Tarefa(std::function<void()> alvo) : alvo(std::move(alvo)) {}
+
+    void start() {
+        if (iniciada) throw std::runtime_error("threads can only be started once");
+        iniciada = true;
+        estado->viva = true;
+        std::thread t([e = estado, f = alvo] {
+            f();
+            e->viva = false;
+            e->fim.set_value();
+        });
+        // o mais próximo de daemon em C++: sem detach, destruir a thread aborta o programa;
+        // depois do detach, o processo termina sem esperar por ela
+        t.detach();
+        daemon = true;
+    }
+
+    void join() { fim.wait(); }
+
+    void join(std::chrono::milliseconds prazo) { fim.wait_for(prazo); }
+
+    bool is_alive() const { return estado->viva; }
+};
+
+int main() {
+    std::promise<void> parar;
+    std::shared_future<void> sinal = parar.get_future().share();
+
+    Tarefa t([sinal] { sinal.wait(); });  // simula trabalho longo
+    t.start();
+
+    t.join(std::chrono::milliseconds(100));
+    std::cout << std::boolalpha << "join com timeout voltou; ainda viva? " << t.is_alive() << std::endl;
+
+    try {
+        t.start();
+    } catch (const std::runtime_error& e) {
+        std::cout << "segundo start: " << e.what() << std::endl;
+    }
+
+    parar.set_value();
+    t.join();
+    std::cout << "terminada; viva? " << t.is_alive() << std::endl;
+    std::cout << "era daemon? " << t.daemon << std::endl;
+}
+```
+
+```csharp
+using System;
+using System.Threading;
+
+static readonly ManualResetEventSlim parar = new ManualResetEventSlim(false);
+
+static void Laco()
+{
+    parar.Wait();           // simula trabalho longo
+}
+
+static void Main()
+{
+    Thread t = new Thread(Laco);
+    t.IsBackground = true;  // em C#, thread de segundo plano é a thread daemon
+    t.Start();
+
+    t.Join(100);
+    Console.WriteLine("join com timeout voltou; ainda viva? " + t.IsAlive);
+
+    try
+    {
+        t.Start();
+    }
+    catch (ThreadStateException)
+    {
+        // a mensagem da exceção é outra em C#: o texto é escrito aqui
+        Console.WriteLine("segundo start: threads can only be started once");
+    }
+
+    bool eraDaemon = t.IsBackground;  // ler IsBackground de uma thread já terminada lança exceção
+    parar.Set();
+    t.Join();
+    Console.WriteLine("terminada; viva? " + t.IsAlive);
+    Console.WriteLine("era daemon? " + eraDaemon);
+}
+```
+
+```go
+import (
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"time"
+)
+
+// Goroutine não tem objeto: `go f()` inicia uma nova a cada vez e não há is_alive nem
+// join com prazo. Este tipo pequeno monta isso para reproduzir o ciclo de vida da aula:
+// a regra "só inicia uma vez" é dele, não da linguagem.
+type Tarefa struct {
+	alvo     func()
+	iniciada int32
+	viva     int32
+	fim      chan struct{}
+}
+
+func novaTarefa(alvo func()) *Tarefa {
+	return &Tarefa{alvo: alvo, fim: make(chan struct{})}
+}
+
+func (t *Tarefa) Start() error {
+	if !atomic.CompareAndSwapInt32(&t.iniciada, 0, 1) {
+		return errors.New("threads can only be started once")
+	}
+	atomic.StoreInt32(&t.viva, 1)
+	go func() {
+		t.alvo()
+		atomic.StoreInt32(&t.viva, 0)
+		close(t.fim)
+	}()
+	return nil
+}
+
+func (t *Tarefa) Join() { <-t.fim }
+
+func (t *Tarefa) JoinComPrazo(prazo time.Duration) {
+	select {
+	case <-t.fim:
+	case <-time.After(prazo):
+	}
+}
+
+func (t *Tarefa) IsAlive() bool { return atomic.LoadInt32(&t.viva) == 1 }
+
+func main() {
+	parar := make(chan struct{})
+	t := novaTarefa(func() {
+		<-parar // simula trabalho longo
+	})
+	t.Start()
+
+	t.JoinComPrazo(100 * time.Millisecond)
+	fmt.Println("join com timeout voltou; ainda viva?", t.IsAlive())
+
+	if err := t.Start(); err != nil {
+		fmt.Println("segundo start:", err)
+	}
+
+	close(parar)
+	t.Join()
+	fmt.Println("terminada; viva?", t.IsAlive())
+	// toda goroutine se comporta como daemon: o processo termina quando main retorna
+	fmt.Println("era daemon?", true)
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:
