@@ -12,7 +12,8 @@ python, javascript, typescript, java, cpp, csharp, go.
 | system-design-interviews | 13 de 14 | só `spark` fica em Python (abaixo) |
 | lld | 99 de 107 | completo: os 8 restantes não têm bloco Python (são conceituais) |
 | sistemas-operacionais | 42 de 47 | completo (05/11): os 5 restantes ficam só em Python (subprocess, mmap com filho, os.read/os.pipe, 1 fragmento). Sem JS/TS em regiao-critica #2, semaforos-e-monitores #1 e #2 e memoria-virtual #2 |
-| concorrencia, redes, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
+| redes | 41 de 51 | completo (05/11): ficam só em Python os 8 blocos com socket/servidor HTTP local (Judge0 sem rede) e os 2 sobre o módulo `ipaddress` |
+| concorrencia, ai-engineering, genai-system-design, ml-system-design | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
 
 ## Triagem dos 6 cursos restantes (05/11/2026)
 
@@ -82,6 +83,9 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - C# (Mono): parâmetro de lambda com o mesmo nome de uma variável local declarada depois no método dá CS0136; use outro nome.
 - Prints dentro de laços não contam para o verificador: na prática rode SEMPRE também a cópia do `force-print.mjs`.
 - C#: desempate por string com `string.CompareOrdinal` (a comparação padrão depende da cultura).
+- Go: `uint32(0xFFFFFFFF) << (32 - 24)` não compila (deslocar constante gera constante que estoura); desloque por uma variável.
+  `binary.BigEndian.AppendUint32/16` só existe a partir do Go 1.19: use `PutUint32/16`.
+- TypeScript: `Buffer` não está declarado; use `declare const require: any; const { Buffer } = require("buffer");`.
 - Sem rede nenhuma, nem 127.0.0.1: código com socket só pode ser verificado com `COMPILE_ONLY=1`.
 - Go é o 1.18: sem `min`/`max` embutidos.
 - TypeScript compila com a biblioteca do DOM: nomes de variável de topo como `status`, `name`, `history` e `length` colidem com
