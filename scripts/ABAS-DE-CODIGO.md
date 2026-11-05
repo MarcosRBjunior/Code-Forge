@@ -15,7 +15,7 @@ python, javascript, typescript, java, cpp, csharp, go.
 | redes | 41 de 51 | completo (05/11): ficam só em Python os 8 blocos com socket/servidor HTTP local (Judge0 sem rede) e os 2 sobre o módulo `ipaddress` |
 | genai-system-design | 25 de 25 | completo (05/11) |
 | ai-engineering | 46 de 47 | completo (05/11): só `embeddings` #3 (fragmento) fica em Python |
-| ml-system-design | 6 de 20 | completo (05/11): metricas, feed-de-noticias, busca-semantica, feature-stores, pipelines-de-dados e framework-de-entrevista. Os demais usam `random` com semente e a "Saída:" do texto não bateria |
+| ml-system-design | 20 de 20 | completo (05/11). 6 batem com o Python; os outros 14 sorteiam com o gerador de cada linguagem, e cada aba avisa num comentário que os números diferem do texto. Conferido que as conclusões das aulas valem em todas; exceção: em testes-ab-de-modelos, C++ e Go caem nos ~20% de sementes em que o efeito real não sai significativo, e o comentário dessas abas explica isso |
 | concorrencia | 53 de 63 | completo (05/11): blocos com threads só com java, cpp, csharp, go; JS/TS só onde não há threads ou onde Promise/async é o modelo natural. Ficam em Python os 10 blocos C da triagem | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
 
 ## Triagem dos 6 cursos restantes (05/11/2026)
