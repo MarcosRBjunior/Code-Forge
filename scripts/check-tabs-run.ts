@@ -129,7 +129,11 @@ async function main() {
         if (only && !only.includes(lang)) continue;
         if (g[lang] === undefined) continue; // aba omitida de propósito (ex.: JS/TS sem threads com memória compartilhada)
         const own = g[lang];
-        const prep = (code: string) => (printed ? code : addStub(lang, code));
+        // trecho sem ponto de entrada (só classes/funções): não imprime nada, então só dá para conferir que compila,
+        // mesmo quando o Python imprime (por exemplo, na cópia do force-print)
+        const semMain = addStub(lang, own) !== own;
+        const compara = printed && !semMain;
+        const prep = (code: string) => (compara ? code : addStub(lang, code));
         // 1) sozinho; 2) depois de todo o código anterior; 3) depois só do bloco imediatamente anterior
         const tentativas: (string | null)[] = [null];
         if (acc[lang]) tentativas.push(acc[lang]);
@@ -149,7 +153,7 @@ async function main() {
           if (!pre.err && norm(got.slice(0, k)) === norm(pre.out ?? "")) got = got.slice(k);
         }
         if (r.err) errors.push(`grupo da linha ${at} [${lang}]: ${r.err}`);
-        else if (printed && norm(got) !== norm(expected)) errors.push(`grupo da linha ${at} [${lang}]: saída difere\n    python: ${JSON.stringify(norm(expected).slice(0, 400))}\n    ${lang}: ${JSON.stringify(norm(got).slice(0, 400))}`);
+        else if (compara && norm(got) !== norm(expected)) errors.push(`grupo da linha ${at} [${lang}]: saída difere\n    python: ${JSON.stringify(norm(expected).slice(0, 400))}\n    ${lang}: ${JSON.stringify(norm(got).slice(0, 400))}`);
         if (!["javascript"].includes(lang)) await sleep(350);
       }
       for (const l of ["python", ...LANGS]) acc[l] = acc[l] ? chain(l, acc[l], g[l] ?? "") : (g[l] ?? "");
