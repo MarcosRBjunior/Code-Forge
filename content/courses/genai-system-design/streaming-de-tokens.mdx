@@ -31,6 +31,8 @@ Cada salto precisa repassar os pedaços assim que chegam. Os problemas clássico
 
 O programa abaixo usa geradores para simular o servidor emitindo tokens e o orquestrador transformando-os em eventos SSE. O relógio é virtual, então nada espera de verdade. Ele também agrupa tokens em pedaços de até 3 para reduzir o número de eventos e mostra o cancelamento: quando o cliente desiste, o gerador para e a GPU deixa de gastar tokens com ele.
 
+<CodeTabs>
+
 ```python
 def modelo(texto, ttft_ms=350, ms_por_token=25):
     t = ttft_ms
@@ -65,6 +67,468 @@ print("cancelado:", [ev.strip().replace("\n", " | ") for _, ev in parcial])
 req_s, duracao_s = 3000, 9
 print(f"conexoes SSE simultaneas: {req_s * duracao_s:,}".replace(",", "."))
 ```
+
+```javascript
+function* modelo(texto, ttftMs = 350, msPorToken = 25) {
+  let t = ttftMs;
+  for (const tok of texto.split(" ")) {
+    yield [t, tok];
+    t += msPorToken;
+  }
+}
+
+function* sse(tokens, agrupar = 3, cancelarEmMs = null) {
+  let buf = [];
+  let t = 0;
+  for (const [tAtual, tok] of tokens) {
+    t = tAtual;
+    if (cancelarEmMs !== null && t >= cancelarEmMs) {
+      yield [t, "event: cancelado\ndata: \n"];
+      return;   // o gerador de tokens para de ser consumido
+    }
+    buf.push(tok);
+    if (buf.length === agrupar) {
+      yield [t, "data: " + buf.join(" ") + "\n"];
+      buf = [];
+    }
+  }
+  if (buf.length > 0) {
+    yield [t, "data: " + buf.join(" ") + "\n"];
+  }
+  yield [t, "event: fim\ndata: [DONE]\n"];
+}
+
+const formatar = (ev) => ev.trim().split("\n").join(" | ");
+
+const resposta = "o cache guarda respostas para perguntas repetidas e reduz custo e latencia";
+const eventos = [...sse(modelo(resposta))];
+for (const [t, ev] of eventos) {
+  console.log(`${String(t).padStart(4)} ms | ` + formatar(ev));
+}
+console.log(`primeiro pedaco em ${eventos[0][0]} ms, fim em ${eventos[eventos.length - 1][0]} ms, ${eventos.length} eventos`);
+
+const parcial = [...sse(modelo(resposta), 3, 420)];
+console.log("cancelado:", "[" + parcial.map(([, ev]) => `'${formatar(ev)}'`).join(", ") + "]");
+
+// Quantas conexoes abertas o gateway segura? Lei de Little: L = taxa x duracao
+const [reqS, duracaoS] = [3000, 9];
+console.log(`conexoes SSE simultaneas: ${(reqS * duracaoS).toLocaleString("en-US")}`.replace(/,/g, "."));
+```
+
+```typescript
+type Evento = [number, string];
+
+function* modelo(texto: string, ttftMs = 350, msPorToken = 25): IterableIterator<Evento> {
+  let t = ttftMs;
+  for (const tok of texto.split(" ")) {
+    yield [t, tok];
+    t += msPorToken;
+  }
+}
+
+function* sse(tokens: IterableIterator<Evento>, agrupar = 3, cancelarEmMs: number | null = null): IterableIterator<Evento> {
+  let buf: string[] = [];
+  let t = 0;
+  for (const [tAtual, tok] of tokens) {
+    t = tAtual;
+    if (cancelarEmMs !== null && t >= cancelarEmMs) {
+      yield [t, "event: cancelado\ndata: \n"];
+      return;   // o gerador de tokens para de ser consumido
+    }
+    buf.push(tok);
+    if (buf.length === agrupar) {
+      yield [t, "data: " + buf.join(" ") + "\n"];
+      buf = [];
+    }
+  }
+  if (buf.length > 0) {
+    yield [t, "data: " + buf.join(" ") + "\n"];
+  }
+  yield [t, "event: fim\ndata: [DONE]\n"];
+}
+
+function alinhar(texto: string, largura: number): string {
+  while (texto.length < largura) texto = " " + texto;
+  return texto;
+}
+const formatar = (ev: string): string => ev.trim().split("\n").join(" | ");
+
+function listar(it: IterableIterator<Evento>): Evento[] {
+  const r: Evento[] = [];
+  for (let x = it.next(); !x.done; x = it.next()) r.push(x.value);
+  return r;
+}
+
+const resposta = "o cache guarda respostas para perguntas repetidas e reduz custo e latencia";
+const eventos = listar(sse(modelo(resposta)));
+for (const [t, ev] of eventos) {
+  console.log(`${alinhar(String(t), 4)} ms | ` + formatar(ev));
+}
+console.log(`primeiro pedaco em ${eventos[0][0]} ms, fim em ${eventos[eventos.length - 1][0]} ms, ${eventos.length} eventos`);
+
+const parcial = listar(sse(modelo(resposta), 3, 420));
+console.log("cancelado:", "[" + parcial.map(([, ev]) => `'${formatar(ev)}'`).join(", ") + "]");
+
+// Quantas conexoes abertas o gateway segura? Lei de Little: L = taxa x duracao
+const [reqS, duracaoS] = [3000, 9];
+console.log(`conexoes SSE simultaneas: ${(reqS * duracaoS).toLocaleString("en-US")}`.replace(/,/g, "."));
+```
+
+```java
+import java.util.*;
+
+static class Evento {
+    int t; String texto;
+    Evento(int t, String texto) { this.t = t; this.texto = texto; }
+}
+
+// Java não tem yield de gerador: cada etapa é um Iterator que só produz o próximo item quando pedido
+static class Modelo implements Iterator<Evento> {
+    private final String[] toks; private int i = 0; private int t; private final int msPorToken;
+    Modelo(String texto, int ttftMs, int msPorToken) { this.toks = texto.split(" "); this.t = ttftMs; this.msPorToken = msPorToken; }
+    public boolean hasNext() { return i < toks.length; }
+    public Evento next() {
+        Evento e = new Evento(t, toks[i++]);
+        t += msPorToken;
+        return e;
+    }
+}
+
+static class Sse implements Iterator<Evento> {
+    private final Iterator<Evento> tokens; private final int agrupar; private final Integer cancelarEmMs;
+    private final List<String> buf = new ArrayList<>();
+    private final ArrayDeque<Evento> prontos = new ArrayDeque<>();
+    private int t; private boolean acabou = false;
+
+    Sse(Iterator<Evento> tokens, int agrupar, Integer cancelarEmMs) {
+        this.tokens = tokens; this.agrupar = agrupar; this.cancelarEmMs = cancelarEmMs;
+    }
+
+    // puxa tokens da fonte até ter um evento pronto (ou acabar)
+    public boolean hasNext() {
+        while (prontos.isEmpty() && !acabou) {
+            if (!tokens.hasNext()) {
+                if (!buf.isEmpty()) prontos.add(new Evento(t, "data: " + String.join(" ", buf) + "\n"));
+                prontos.add(new Evento(t, "event: fim\ndata: [DONE]\n"));
+                acabou = true;
+                break;
+            }
+            Evento tok = tokens.next();
+            t = tok.t;
+            if (cancelarEmMs != null && t >= cancelarEmMs) {
+                prontos.add(new Evento(t, "event: cancelado\ndata: \n"));
+                acabou = true;   // a fonte de tokens para de ser consumida
+                break;
+            }
+            buf.add(tok.texto);
+            if (buf.size() == agrupar) {
+                prontos.add(new Evento(t, "data: " + String.join(" ", buf) + "\n"));
+                buf.clear();
+            }
+        }
+        return !prontos.isEmpty();
+    }
+
+    public Evento next() {
+        if (!hasNext()) throw new NoSuchElementException();
+        return prontos.poll();
+    }
+}
+
+static List<Evento> listar(Iterator<Evento> it) {
+    List<Evento> r = new ArrayList<>();
+    while (it.hasNext()) r.add(it.next());
+    return r;
+}
+
+static String formatar(String ev) {
+    return ev.trim().replace("\n", " | ");
+}
+
+public static void main(String[] args) {
+    String resposta = "o cache guarda respostas para perguntas repetidas e reduz custo e latencia";
+    List<Evento> eventos = listar(new Sse(new Modelo(resposta, 350, 25), 3, null));
+    for (Evento e : eventos) {
+        System.out.println(String.format("%4d ms | ", e.t) + formatar(e.texto));
+    }
+    System.out.println("primeiro pedaco em " + eventos.get(0).t + " ms, fim em " + eventos.get(eventos.size() - 1).t
+            + " ms, " + eventos.size() + " eventos");
+
+    List<Evento> parcial = listar(new Sse(new Modelo(resposta, 350, 25), 3, 420));
+    StringJoiner itens = new StringJoiner(", ", "[", "]");
+    for (Evento e : parcial) itens.add("'" + formatar(e.texto) + "'");
+    System.out.println("cancelado: " + itens);
+
+    // Quantas conexoes abertas o gateway segura? Lei de Little: L = taxa x duracao
+    int reqS = 3000, duracaoS = 9;
+    System.out.println(String.format(Locale.US, "conexoes SSE simultaneas: %,d", reqS * duracaoS).replace(",", "."));
+}
+```
+
+```cpp
+#include <cstdio>
+#include <functional>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+using namespace std;
+
+// C++ não tem gerador com yield: cada etapa recebe um callback "emitir" que devolve false para parar
+// (é o mesmo contrato dos iteradores por função do Go 1.23)
+using Emitir = function<bool(int, const string&)>;
+using Fluxo = function<void(const Emitir&)>;
+
+Fluxo modelo(const string& texto, int ttftMs = 350, int msPorToken = 25) {
+    return [=](const Emitir& emitir) {
+        int t = ttftMs;
+        istringstream in(texto);
+        string tok;
+        while (getline(in, tok, ' ')) {
+            if (!emitir(t, tok)) return;   // quem consome cancelou: para de gerar
+            t += msPorToken;
+        }
+    };
+}
+
+Fluxo sse(Fluxo tokens, size_t agrupar = 3, int cancelarEmMs = -1) {   // -1 = sem cancelamento
+    return [=](const Emitir& emitir) {
+        vector<string> buf;
+        int t = 0;
+        bool parou = false;
+        auto juntar = [&]() {
+            string r;
+            for (size_t i = 0; i < buf.size(); i++) r += (i ? " " : "") + buf[i];
+            return r;
+        };
+        tokens([&](int tAtual, const string& tok) {
+            t = tAtual;
+            if (cancelarEmMs >= 0 && t >= cancelarEmMs) {
+                emitir(t, "event: cancelado\ndata: \n");
+                parou = true;
+                return false;
+            }
+            buf.push_back(tok);
+            if (buf.size() == agrupar) {
+                if (!emitir(t, "data: " + juntar() + "\n")) { parou = true; return false; }
+                buf.clear();
+            }
+            return true;
+        });
+        if (parou) return;
+        if (!buf.empty() && !emitir(t, "data: " + juntar() + "\n")) return;
+        emitir(t, "event: fim\ndata: [DONE]\n");
+    };
+}
+
+vector<pair<int, string>> listar(const Fluxo& fluxo) {
+    vector<pair<int, string>> r;
+    fluxo([&](int t, const string& ev) { r.push_back({t, ev}); return true; });
+    return r;
+}
+
+string formatar(string ev) {
+    while (!ev.empty() && (ev.back() == '\n' || ev.back() == ' ')) ev.pop_back();   // strip
+    string r;
+    for (char c : ev) r += c == '\n' ? string(" | ") : string(1, c);
+    return r;
+}
+
+int main() {
+    string resposta = "o cache guarda respostas para perguntas repetidas e reduz custo e latencia";
+    auto eventos = listar(sse(modelo(resposta)));
+    for (auto& [t, ev] : eventos) {
+        printf("%4d ms | %s\n", t, formatar(ev).c_str());
+    }
+    printf("primeiro pedaco em %d ms, fim em %d ms, %zu eventos\n", eventos.front().first, eventos.back().first, eventos.size());
+
+    auto parcial = listar(sse(modelo(resposta), 3, 420));
+    string itens;
+    for (size_t i = 0; i < parcial.size(); i++) itens += (i ? ", '" : "'") + formatar(parcial[i].second) + "'";
+    printf("cancelado: [%s]\n", itens.c_str());
+
+    // Quantas conexoes abertas o gateway segura? Lei de Little: L = taxa x duracao
+    int reqS = 3000, duracaoS = 9;
+    string n = to_string(reqS * duracaoS), comPontos;
+    for (size_t i = 0; i < n.size(); i++) {
+        if (i > 0 && (n.size() - i) % 3 == 0) comPontos += '.';
+        comPontos += n[i];
+    }
+    printf("conexoes SSE simultaneas: %s\n", comPontos.c_str());
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+class Evento
+{
+    public int T; public string Texto;
+    public Evento(int t, string texto) { T = t; Texto = texto; }
+}
+
+static IEnumerable<Evento> Modelo(string texto, int ttftMs = 350, int msPorToken = 25)
+{
+    int t = ttftMs;
+    foreach (string tok in texto.Split(' '))
+    {
+        yield return new Evento(t, tok);
+        t += msPorToken;
+    }
+}
+
+static IEnumerable<Evento> Sse(IEnumerable<Evento> tokens, int agrupar = 3, int? cancelarEmMs = null)
+{
+    var buf = new List<string>();
+    int t = 0;
+    foreach (var tok in tokens)
+    {
+        t = tok.T;
+        if (cancelarEmMs.HasValue && t >= cancelarEmMs.Value)
+        {
+            yield return new Evento(t, "event: cancelado\ndata: \n");
+            yield break;   // o gerador de tokens para de ser consumido
+        }
+        buf.Add(tok.Texto);
+        if (buf.Count == agrupar)
+        {
+            yield return new Evento(t, "data: " + string.Join(" ", buf) + "\n");
+            buf = new List<string>();
+        }
+    }
+    if (buf.Count > 0)
+        yield return new Evento(t, "data: " + string.Join(" ", buf) + "\n");
+    yield return new Evento(t, "event: fim\ndata: [DONE]\n");
+}
+
+static string Formatar(string ev)
+{
+    return ev.Trim().Replace("\n", " | ");
+}
+
+static void Main()
+{
+    string resposta = "o cache guarda respostas para perguntas repetidas e reduz custo e latencia";
+    var eventos = Sse(Modelo(resposta)).ToList();
+    foreach (var e in eventos)
+        Console.WriteLine($"{e.T,4} ms | " + Formatar(e.Texto));
+    Console.WriteLine($"primeiro pedaco em {eventos[0].T} ms, fim em {eventos[eventos.Count - 1].T} ms, {eventos.Count} eventos");
+
+    var parcial = Sse(Modelo(resposta), cancelarEmMs: 420).ToList();
+    Console.WriteLine("cancelado: [" + string.Join(", ", parcial.Select(e => $"'{Formatar(e.Texto)}'")) + "]");
+
+    // Quantas conexoes abertas o gateway segura? Lei de Little: L = taxa x duracao
+    int reqS = 3000, duracaoS = 9;
+    Console.WriteLine(("conexoes SSE simultaneas: " + (reqS * duracaoS).ToString("N0", CultureInfo.InvariantCulture)).Replace(",", "."));
+}
+```
+
+```go
+import (
+	"fmt"
+	"strings"
+)
+
+// Go 1.18 não tem gerador com yield: cada etapa recebe uma função "emitir" que devolve false para parar
+// (é o mesmo contrato dos iteradores por função que o Go 1.23 adotou)
+type Fluxo func(emitir func(t int, s string) bool)
+
+func modelo(texto string, ttftMs, msPorToken int) Fluxo {
+	return func(emitir func(int, string) bool) {
+		t := ttftMs
+		for _, tok := range strings.Split(texto, " ") {
+			if !emitir(t, tok) {
+				return // quem consome cancelou: para de gerar
+			}
+			t += msPorToken
+		}
+	}
+}
+
+// cancelarEmMs < 0 = sem cancelamento (o None do Python)
+func sse(tokens Fluxo, agrupar, cancelarEmMs int) Fluxo {
+	return func(emitir func(int, string) bool) {
+		buf := []string{}
+		t := 0
+		parou := false
+		tokens(func(tAtual int, tok string) bool {
+			t = tAtual
+			if cancelarEmMs >= 0 && t >= cancelarEmMs {
+				emitir(t, "event: cancelado\ndata: \n")
+				parou = true
+				return false
+			}
+			buf = append(buf, tok)
+			if len(buf) == agrupar {
+				if !emitir(t, "data: "+strings.Join(buf, " ")+"\n") {
+					parou = true
+					return false
+				}
+				buf = []string{}
+			}
+			return true
+		})
+		if parou {
+			return
+		}
+		if len(buf) > 0 && !emitir(t, "data: "+strings.Join(buf, " ")+"\n") {
+			return
+		}
+		emitir(t, "event: fim\ndata: [DONE]\n")
+	}
+}
+
+type Evento struct {
+	t  int
+	ev string
+}
+
+func listar(f Fluxo) []Evento {
+	r := []Evento{}
+	f(func(t int, ev string) bool {
+		r = append(r, Evento{t, ev})
+		return true
+	})
+	return r
+}
+
+func formatar(ev string) string {
+	return strings.ReplaceAll(strings.TrimSpace(ev), "\n", " | ")
+}
+
+func main() {
+	resposta := "o cache guarda respostas para perguntas repetidas e reduz custo e latencia"
+	eventos := listar(sse(modelo(resposta, 350, 25), 3, -1))
+	for _, e := range eventos {
+		fmt.Printf("%4d ms | %s\n", e.t, formatar(e.ev))
+	}
+	fmt.Printf("primeiro pedaco em %d ms, fim em %d ms, %d eventos\n", eventos[0].t, eventos[len(eventos)-1].t, len(eventos))
+
+	parcial := listar(sse(modelo(resposta, 350, 25), 3, 420))
+	itens := []string{}
+	for _, e := range parcial {
+		itens = append(itens, "'"+formatar(e.ev)+"'")
+	}
+	fmt.Printf("cancelado: [%s]\n", strings.Join(itens, ", "))
+
+	// Quantas conexoes abertas o gateway segura? Lei de Little: L = taxa x duracao
+	reqS, duracaoS := 3000, 9
+	n := fmt.Sprint(reqS * duracaoS)
+	comPontos := ""
+	for i := 0; i < len(n); i++ {
+		if i > 0 && (len(n)-i)%3 == 0 {
+			comPontos += "."
+		}
+		comPontos += string(n[i])
+	}
+	fmt.Printf("conexoes SSE simultaneas: %s\n", comPontos)
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:
