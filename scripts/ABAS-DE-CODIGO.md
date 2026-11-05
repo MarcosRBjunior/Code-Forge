@@ -14,7 +14,8 @@ python, javascript, typescript, java, cpp, csharp, go.
 | sistemas-operacionais | 42 de 47 | completo (05/11): os 5 restantes ficam só em Python (subprocess, mmap com filho, os.read/os.pipe, 1 fragmento). Sem JS/TS em regiao-critica #2, semaforos-e-monitores #1 e #2 e memoria-virtual #2 |
 | redes | 41 de 51 | completo (05/11): ficam só em Python os 8 blocos com socket/servidor HTTP local (Judge0 sem rede) e os 2 sobre o módulo `ipaddress` |
 | genai-system-design | 25 de 25 | completo (05/11) |
-| concorrencia, ai-engineering, ml-system-design | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
+| ai-engineering | 46 de 47 | completo (05/11): só `embeddings` #3 (fragmento) fica em Python |
+| concorrencia, ml-system-design | 0 | decisão de 03/11 revista em 05/11: ver "Triagem dos 6 cursos restantes" abaixo |
 
 ## Triagem dos 6 cursos restantes (05/11/2026)
 
@@ -51,6 +52,7 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - `template-method`: Java, C++ e C# leem o JSON com um extrator mínimo (a biblioteca padrão não traz parser); o arquivo usa o escape `\u`+`FEFF` para o BOM, nunca o caractere literal.
 - `notificacoes-lld`: a ordem do `set` do Python muda a cada execução (`PYTHONHASHSEED`); as outras linguagens usam a ordem de inserção.
 - `nao-determinismo` (genai): as contagens por temperatura saem do gerador com semente de cada linguagem; as demais linhas batem.
+- ai-engineering: `amostragem` #2 (linha "10 sorteios"), `gateways-e-fallbacks` #1 (jitter) e `bancos-vetoriais` #1 e #2 (base gaussiana com semente; aqui só a estrutura e a ordem de grandeza batem, recall 0,94 a 0,99 contra 0,95 no Python) dependem do gerador de cada linguagem. `saidas-estruturadas` #1: a mensagem do parser muda em JS, TS e Go.
 - `quadtrees` e `algoritmos-balanceamento`: usam números aleatórios, então o resultado impresso varia (a lógica é a mesma).
 - `interfaces`: a linha do `TypeError` ao instanciar o contrato só existe em Python e JavaScript; em Java, C++, C# e TypeScript isso é erro de compilação.
 
@@ -95,6 +97,9 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
   exato (0.99987) e arredonda metade para o par. Use `new BigDecimal(x).setScale(n, RoundingMode.HALF_EVEN)` em Java e
   `Math.Round(decimal.Parse(x.ToString("G17")), n, MidpointRounding.ToEven)` em C#; em JS/TS, um helper de arredondamento par.
 - TS: `JSON.stringify` de lista não põe espaço após a vírgula; formate à mão se a lista for impressa.
+- C# (Mono): sem funções locais (`void F() {...}` dentro de método dá CS1547); use `Action f = () => {...};`.
+- TypeScript: `String.replaceAll` não existe, mesmo com `--lib esnext` (TS2339); use `.replace(/x/g, "")`.
+- C++: `for (auto& t : f()["chave"].itens)` percorre um temporário já destruído; guarde o retorno numa variável antes do laço.
 - Sem rede nenhuma, nem 127.0.0.1: código com socket só pode ser verificado com `COMPILE_ONLY=1`.
 - Go é o 1.18: sem `min`/`max` embutidos.
 - TypeScript compila com a biblioteca do DOM: nomes de variável de topo como `status`, `name`, `history` e `length` colidem com
