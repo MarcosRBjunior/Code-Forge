@@ -93,6 +93,9 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
   `{:g}` → C++/Go `%g` e C# `"g6"` batem; Java `%g` é diferente e JS não tem (função própria). C++20 tem `std::format`.
 - C# (Mono): parâmetro de lambda com o mesmo nome de uma variável local declarada depois no método dá CS0136; use outro nome.
 - Prints dentro de laços não contam para o verificador: na prática rode SEMPRE também a cópia do `force-print.mjs`.
+  Trechos sem `main` (só classes e funções) recebem um `main` vazio e são conferidos só na compilação, também na cópia do force-print.
+- Bloco que depende do anterior: se o anterior sorteia sem semente, a saída dele muda a cada execução e o verificador não
+  consegue descontá-la, dando ✗ intermitente no bloco seguinte. Sempre use semente (em JS/TS, mulberry32).
 - C#: desempate por string com `string.CompareOrdinal` (a comparação padrão depende da cultura).
 - Go: `uint32(0xFFFFFFFF) << (32 - 24)` não compila (deslocar constante gera constante que estoura); desloque por uma variável.
   `binary.BigEndian.AppendUint32/16` só existe a partir do Go 1.19: use `PutUint32/16`.
