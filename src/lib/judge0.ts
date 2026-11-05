@@ -40,7 +40,8 @@ async function submit(lang: Lang, source: string): Promise<Judge0Result> {
       // Sem isso o tsc do serviço compila para ES3/ES5 e recusa Map, BigInt, includes etc.
       ...(lang === "typescript" && { compiler_options: "--target esnext --lib esnext,dom" }),
       // Sem -pthread o std::thread compila mas não linka ("undefined reference to pthread_create").
-      ...(lang === "cpp" && { compiler_options: "-pthread" }),
+      // O GCC 14 do serviço usa C++17 por padrão; -std=c++20 libera <semaphore>, <latch> e <barrier>.
+      ...(lang === "cpp" && { compiler_options: "-pthread -std=c++20" }),
       cpu_time_limit: 5,
       wall_time_limit: 15,
     }),
