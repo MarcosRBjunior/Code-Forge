@@ -53,7 +53,9 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - `template-method`: Java, C++ e C# leem o JSON com um extrator mínimo (a biblioteca padrão não traz parser); o arquivo usa o escape `\u`+`FEFF` para o BOM, nunca o caractere literal.
 - `notificacoes-lld`: a ordem do `set` do Python muda a cada execução (`PYTHONHASHSEED`); as outras linguagens usam a ordem de inserção.
 - `nao-determinismo` (genai): as contagens por temperatura saem do gerador com semente de cada linguagem; as demais linhas batem.
-- ai-engineering: `amostragem` #2 (linha "10 sorteios"), `gateways-e-fallbacks` #1 (jitter) e `bancos-vetoriais` #1 e #2 (base gaussiana com semente; aqui só a estrutura e a ordem de grandeza batem, recall 0,94 a 0,99 contra 0,95 no Python) dependem do gerador de cada linguagem. `saidas-estruturadas` #1: a mensagem do parser muda em JS, TS e Go.
+- ai-engineering: `amostragem` #2 (linha "10 sorteios"), e `gateways-e-fallbacks` #1 (jitter) dependem do gerador de cada linguagem. `bancos-vetoriais` usa um gerador escrito à mão
+  (`GeradorSemente`: mulberry32 + Box-Muller), igual nas 7 abas, e bate exatamente; use esse padrão quando a saída sorteada precisar
+  bater. No Python some com laço simples, não com `sum()`: desde o 3.12 o `sum()` de floats compensa o erro e muda o último bit. `saidas-estruturadas` #1: a mensagem do parser muda em JS, TS e Go.
 - concorrencia: `livelock-e-starvation` #1 (linha "com sorteio", gerador de cada linguagem) e `locks-reentrantes` #1 (Java e C# imprimem
   o nome real da exceção, `IllegalMonitorStateException`/`SynchronizationLockException`, em vez de `RuntimeError`).
 - Medir paralelismo: compare o tempo total com a soma das esperas em série (`duracao < 8 * 0.1`), nunca com um prazo fixo, e
