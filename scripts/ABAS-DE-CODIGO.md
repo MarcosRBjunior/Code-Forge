@@ -99,10 +99,15 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - TypeScript: `Buffer` não está declarado; use `declare const require: any; const { Buffer } = require("buffer");`.
 - C++: `for (auto x : {1, 2})` precisa de `#include <initializer_list>`.
 - Java: `String.format` em laço longo (centenas de milhares de chamadas) faz o processo ser morto ("Killed").
+- TypeScript: `top` (window.top) também colide como variável de topo; use `topo`.
 - TypeScript: `crypto` e `prompt` também são globais do DOM; renomeie (`nodeCrypto`, `textoPrompt`).
 - Casas decimais: Java `%.Nf` e C# `"F"` (Mono) arredondam a forma decimal curta (0.999875 → 0.99988); Python usa o binário
-  exato (0.99987) e arredonda metade para o par. Use `new BigDecimal(x).setScale(n, RoundingMode.HALF_EVEN)` em Java e
-  `Math.Round(decimal.Parse(x.ToString("G17")), n, MidpointRounding.ToEven)` em C#; em JS/TS, um helper de arredondamento par.
+  exato (0.99987) e arredonda metade para o par. NUNCA multiplique por 10^n antes de arredondar (2.675*100 dá exatamente 267.5 e
+  sai 2.68; o Python dá 2.67). Copie os helpers testados de `content/courses/ai-engineering/avaliacao.mdx` (0 diferenças contra o
+  Python em milhares de valores): Java `new BigDecimal(x).setScale(n, RoundingMode.HALF_EVEN)`; C# `FixoPar`/`Arred`, que
+  reconstroem o valor exato em `decimal` (mantissa × 2^expoente) — `Math.Round(x, n, ToEven)` e a rota `decimal.Parse(G17)`
+  ERRAM; JS/TS `fixoPar` sobre `toFixed` (que já usa o valor exato), corrigindo só empates exatos para o par; C++/Go `arred` com
+  `snprintf "%.*f"` + `strtod` / `strconv`. Para só imprimir, `printf`/`std::format` (C++) e `fmt` (Go) já batem com o Python.
 - TS: `JSON.stringify` de lista não põe espaço após a vírgula; formate à mão se a lista for impressa.
 - C# (Mono): sem funções locais (`void F() {...}` dentro de método dá CS1547); use `Action f = () => {...};`.
 - TypeScript: `String.replaceAll` não existe, mesmo com `--lib esnext` (TS2339); use `.replace(/x/g, "")`.
