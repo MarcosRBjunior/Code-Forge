@@ -35,6 +35,8 @@ Um **stream** é uma troca requisição/resposta, identificada por um número: o
 
 Como cada frame diz a qual stream pertence, o remetente pode intercalá-los livremente. O programa a seguir monta frames de dois streams intercalados e depois os separa do lado do receptor, como faria uma implementação real.
 
+<CodeTabs>
+
 ```python
 import struct
 
@@ -70,6 +72,338 @@ for sid, corpo in sorted(streams.items()):
     print("corpo do stream", sid, "=", corpo.decode())
 ```
 
+```javascript
+const TIPOS = { 0: "DATA", 1: "HEADERS" };
+const END_STREAM = 0x1, END_HEADERS = 0x4;
+
+function frame(tipo, flags, stream, payload) {
+  const tamanho = payload.length;
+  // cabeçalho de 9 bytes: tamanho (24 bits), tipo, flags e stream (31 bits), tudo big-endian
+  const cab = Buffer.alloc(9);
+  cab.writeUInt8(tamanho >> 16, 0);
+  cab.writeUInt16BE(tamanho & 0xffff, 1);
+  cab.writeUInt8(tipo, 3);
+  cab.writeUInt8(flags, 4);
+  cab.writeUInt32BE(stream & 0x7fffffff, 5);
+  return Buffer.concat([cab, payload]);
+}
+
+const fio = Buffer.concat([
+  frame(1, END_HEADERS, 1, Buffer.from("<hpack /a>")),
+  frame(1, END_HEADERS, 3, Buffer.from("<hpack /b>")),
+  frame(0, 0, 3, Buffer.from("bbbb")),
+  frame(0, 0, 1, Buffer.from("aaaaaa")),
+  frame(0, END_STREAM, 3, Buffer.from("bb")),
+  frame(0, END_STREAM, 1, Buffer.from("aa")),
+]);
+console.log("bytes no fio:", fio.length);
+
+let pos = 0;
+const streams = new Map();
+while (pos < fio.length) {
+  const alto = fio.readUInt8(pos), baixo = fio.readUInt16BE(pos + 1);
+  const tipo = fio.readUInt8(pos + 3), flags = fio.readUInt8(pos + 4), sid = fio.readUInt32BE(pos + 5);
+  const tamanho = (alto << 16) | baixo;
+  const payload = fio.subarray(pos + 9, pos + 9 + tamanho);
+  pos += 9 + tamanho;
+  const fim = tipo === 0 && flags & END_STREAM ? " END_STREAM" : "";
+  console.log(`stream ${sid}: ${TIPOS[tipo].padEnd(7)} ${String(tamanho).padStart(2)} bytes${fim}`);
+  if (tipo === 0) {
+    streams.set(sid, Buffer.concat([streams.get(sid) ?? Buffer.alloc(0), payload]));
+  }
+}
+for (const [sid, corpo] of [...streams.entries()].sort((a, b) => a[0] - b[0])) {
+  console.log("corpo do stream", sid, "=", corpo.toString());
+}
+```
+
+```typescript
+const TIPOS: { [tipo: number]: string } = { 0: "DATA", 1: "HEADERS" };
+const END_STREAM = 0x1, END_HEADERS = 0x4;
+
+function bytesDe(texto: string): Uint8Array {
+  return Uint8Array.from(texto.split("").map((c) => c.charCodeAt(0)));
+}
+
+function frame(tipo: number, flags: number, stream: number, payload: Uint8Array): Uint8Array {
+  const tamanho = payload.length;
+  // cabeçalho de 9 bytes: tamanho (24 bits), tipo, flags e stream (31 bits), tudo big-endian
+  const saida = new Uint8Array(9 + tamanho);
+  const cab = new DataView(saida.buffer);
+  cab.setUint8(0, tamanho >> 16);
+  cab.setUint16(1, tamanho & 0xffff);
+  cab.setUint8(3, tipo);
+  cab.setUint8(4, flags);
+  cab.setUint32(5, stream & 0x7fffffff);
+  saida.set(payload, 9);
+  return saida;
+}
+
+const quadros = [
+  frame(1, END_HEADERS, 1, bytesDe("<hpack /a>")),
+  frame(1, END_HEADERS, 3, bytesDe("<hpack /b>")),
+  frame(0, 0, 3, bytesDe("bbbb")),
+  frame(0, 0, 1, bytesDe("aaaaaa")),
+  frame(0, END_STREAM, 3, bytesDe("bb")),
+  frame(0, END_STREAM, 1, bytesDe("aa")),
+];
+const fio = new Uint8Array(quadros.reduce((s, q) => s + q.length, 0));
+let ocupado = 0;
+for (const q of quadros) {
+  fio.set(q, ocupado);
+  ocupado += q.length;
+}
+console.log("bytes no fio:", fio.length);
+
+const visao = new DataView(fio.buffer);
+let pos = 0;
+const streams = new Map<number, string>();
+while (pos < fio.length) {
+  const alto = visao.getUint8(pos), baixo = visao.getUint16(pos + 1);
+  const tipo = visao.getUint8(pos + 3), flags = visao.getUint8(pos + 4), sid = visao.getUint32(pos + 5);
+  const tamanho = (alto << 16) | baixo;
+  const payload = fio.slice(pos + 9, pos + 9 + tamanho);
+  pos += 9 + tamanho;
+  const fim = tipo === 0 && flags & END_STREAM ? " END_STREAM" : "";
+  console.log(`stream ${sid}: ${TIPOS[tipo].padEnd(7)} ${String(tamanho).padStart(2)} bytes${fim}`);
+  if (tipo === 0) {
+    streams.set(sid, (streams.get(sid) || "") + String.fromCharCode(...Array.from(payload)));
+  }
+}
+for (const [sid, corpo] of Array.from(streams.entries()).sort((a, b) => a[0] - b[0])) {
+  console.log("corpo do stream", sid, "=", corpo);
+}
+```
+
+```java
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+static final String[] TIPOS = {"DATA", "HEADERS"};
+static final int END_STREAM = 0x1, END_HEADERS = 0x4;
+
+static byte[] frame(int tipo, int flags, int stream, String texto) {
+    byte[] payload = texto.getBytes(StandardCharsets.US_ASCII);
+    int tamanho = payload.length;
+    // cabeçalho de 9 bytes: tamanho (24 bits), tipo, flags e stream (31 bits); ByteBuffer já é big-endian
+    ByteBuffer cab = ByteBuffer.allocate(9 + tamanho);
+    cab.put((byte) (tamanho >> 16));
+    cab.putShort((short) (tamanho & 0xFFFF));
+    cab.put((byte) tipo);
+    cab.put((byte) flags);
+    cab.putInt(stream & 0x7FFFFFFF);
+    cab.put(payload);
+    return cab.array();
+}
+
+public static void main(String[] args) {
+    ByteArrayOutputStream junta = new ByteArrayOutputStream();
+    junta.writeBytes(frame(1, END_HEADERS, 1, "<hpack /a>"));
+    junta.writeBytes(frame(1, END_HEADERS, 3, "<hpack /b>"));
+    junta.writeBytes(frame(0, 0, 3, "bbbb"));
+    junta.writeBytes(frame(0, 0, 1, "aaaaaa"));
+    junta.writeBytes(frame(0, END_STREAM, 3, "bb"));
+    junta.writeBytes(frame(0, END_STREAM, 1, "aa"));
+    byte[] fio = junta.toByteArray();
+    System.out.println("bytes no fio: " + fio.length);
+
+    ByteBuffer buf = ByteBuffer.wrap(fio);
+    int pos = 0;
+    Map<Integer, String> streams = new TreeMap<>();
+    while (pos < fio.length) {
+        int alto = buf.get(pos) & 0xFF, baixo = buf.getShort(pos + 1) & 0xFFFF;
+        int tipo = buf.get(pos + 3) & 0xFF, flags = buf.get(pos + 4) & 0xFF, sid = buf.getInt(pos + 5);
+        int tamanho = (alto << 16) | baixo;
+        String payload = new String(fio, pos + 9, tamanho, StandardCharsets.US_ASCII);
+        pos += 9 + tamanho;
+        String fim = tipo == 0 && (flags & END_STREAM) != 0 ? " END_STREAM" : "";
+        System.out.println(String.format("stream %d: %-7s %2d bytes%s", sid, TIPOS[tipo], tamanho, fim));
+        if (tipo == 0) {
+            streams.put(sid, streams.getOrDefault(sid, "") + payload);
+        }
+    }
+    for (Map.Entry<Integer, String> e : streams.entrySet()) {
+        System.out.println("corpo do stream " + e.getKey() + " = " + e.getValue());
+    }
+}
+```
+
+```cpp
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
+using namespace std;
+
+const char* TIPOS[] = {"DATA", "HEADERS"};
+const int END_STREAM = 0x1, END_HEADERS = 0x4;
+
+vector<uint8_t> frame(int tipo, int flags, uint32_t stream, const string& payload) {
+    uint32_t tamanho = payload.size();
+    uint32_t sid = stream & 0x7FFFFFFF;
+    // cabeçalho de 9 bytes: tamanho (24 bits), tipo, flags e stream (31 bits), tudo big-endian
+    vector<uint8_t> cab = {
+        uint8_t(tamanho >> 16), uint8_t(tamanho >> 8), uint8_t(tamanho),
+        uint8_t(tipo), uint8_t(flags),
+        uint8_t(sid >> 24), uint8_t(sid >> 16), uint8_t(sid >> 8), uint8_t(sid),
+    };
+    cab.insert(cab.end(), payload.begin(), payload.end());
+    return cab;
+}
+
+int main() {
+    vector<uint8_t> fio;
+    for (auto q : {frame(1, END_HEADERS, 1, "<hpack /a>"), frame(1, END_HEADERS, 3, "<hpack /b>"),
+                   frame(0, 0, 3, "bbbb"), frame(0, 0, 1, "aaaaaa"),
+                   frame(0, END_STREAM, 3, "bb"), frame(0, END_STREAM, 1, "aa")}) {
+        fio.insert(fio.end(), q.begin(), q.end());
+    }
+    printf("bytes no fio: %zu\n", fio.size());
+
+    size_t pos = 0;
+    map<uint32_t, string> streams; // map já percorre em ordem de chave
+    while (pos < fio.size()) {
+        uint32_t alto = fio[pos], baixo = (fio[pos + 1] << 8) | fio[pos + 2];
+        int tipo = fio[pos + 3], flags = fio[pos + 4];
+        uint32_t sid = (uint32_t(fio[pos + 5]) << 24) | (fio[pos + 6] << 16) | (fio[pos + 7] << 8) | fio[pos + 8];
+        uint32_t tamanho = (alto << 16) | baixo;
+        string payload(fio.begin() + pos + 9, fio.begin() + pos + 9 + tamanho);
+        pos += 9 + tamanho;
+        const char* fim = tipo == 0 && (flags & END_STREAM) ? " END_STREAM" : "";
+        printf("stream %u: %-7s %2u bytes%s\n", sid, TIPOS[tipo], tamanho, fim);
+        if (tipo == 0) {
+            streams[sid] += payload;
+        }
+    }
+    for (auto& [sid, corpo] : streams) {
+        printf("corpo do stream %u = %s\n", sid, corpo.c_str());
+    }
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+static readonly string[] TIPOS = { "DATA", "HEADERS" };
+const int END_STREAM = 0x1, END_HEADERS = 0x4;
+
+static byte[] Frame(int tipo, int flags, int stream, string texto) {
+    byte[] payload = Encoding.ASCII.GetBytes(texto);
+    int tamanho = payload.Length;
+    int sid = stream & 0x7FFFFFFF;
+    // cabeçalho de 9 bytes: tamanho (24 bits), tipo, flags e stream (31 bits), tudo big-endian
+    var cab = new List<byte> {
+        (byte) (tamanho >> 16), (byte) (tamanho >> 8), (byte) tamanho,
+        (byte) tipo, (byte) flags,
+        (byte) (sid >> 24), (byte) (sid >> 16), (byte) (sid >> 8), (byte) sid,
+    };
+    cab.AddRange(payload);
+    return cab.ToArray();
+}
+
+static void Main() {
+    var junta = new List<byte>();
+    junta.AddRange(Frame(1, END_HEADERS, 1, "<hpack /a>"));
+    junta.AddRange(Frame(1, END_HEADERS, 3, "<hpack /b>"));
+    junta.AddRange(Frame(0, 0, 3, "bbbb"));
+    junta.AddRange(Frame(0, 0, 1, "aaaaaa"));
+    junta.AddRange(Frame(0, END_STREAM, 3, "bb"));
+    junta.AddRange(Frame(0, END_STREAM, 1, "aa"));
+    byte[] fio = junta.ToArray();
+    Console.WriteLine("bytes no fio: " + fio.Length);
+
+    int pos = 0;
+    var streams = new SortedDictionary<int, string>();
+    while (pos < fio.Length) {
+        int alto = fio[pos], baixo = (fio[pos + 1] << 8) | fio[pos + 2];
+        int tipo = fio[pos + 3], flags = fio[pos + 4];
+        int sid = (fio[pos + 5] << 24) | (fio[pos + 6] << 16) | (fio[pos + 7] << 8) | fio[pos + 8];
+        int tamanho = (alto << 16) | baixo;
+        string payload = Encoding.ASCII.GetString(fio, pos + 9, tamanho);
+        pos += 9 + tamanho;
+        string fim = tipo == 0 && (flags & END_STREAM) != 0 ? " END_STREAM" : "";
+        Console.WriteLine($"stream {sid}: {TIPOS[tipo],-7} {tamanho,2} bytes{fim}");
+        if (tipo == 0) {
+            streams[sid] = (streams.ContainsKey(sid) ? streams[sid] : "") + payload;
+        }
+    }
+    foreach (var e in streams) {
+        Console.WriteLine($"corpo do stream {e.Key} = {e.Value}");
+    }
+}
+```
+
+```go
+import (
+	"encoding/binary"
+	"fmt"
+	"sort"
+)
+
+var TIPOS = map[byte]string{0: "DATA", 1: "HEADERS"}
+
+const END_STREAM, END_HEADERS = 0x1, 0x4
+
+func frame(tipo, flags byte, stream uint32, payload string) []byte {
+	tamanho := len(payload)
+	// cabeçalho de 9 bytes: tamanho (24 bits), tipo, flags e stream (31 bits), tudo big-endian
+	cab := make([]byte, 9)
+	cab[0] = byte(tamanho >> 16)
+	binary.BigEndian.PutUint16(cab[1:3], uint16(tamanho&0xFFFF))
+	cab[3] = tipo
+	cab[4] = flags
+	binary.BigEndian.PutUint32(cab[5:9], stream&0x7FFFFFFF)
+	return append(cab, payload...)
+}
+
+func main() {
+	fio := []byte{}
+	for _, q := range [][]byte{
+		frame(1, END_HEADERS, 1, "<hpack /a>"),
+		frame(1, END_HEADERS, 3, "<hpack /b>"),
+		frame(0, 0, 3, "bbbb"),
+		frame(0, 0, 1, "aaaaaa"),
+		frame(0, END_STREAM, 3, "bb"),
+		frame(0, END_STREAM, 1, "aa"),
+	} {
+		fio = append(fio, q...)
+	}
+	fmt.Println("bytes no fio:", len(fio))
+
+	pos, streams := 0, map[uint32]string{}
+	for pos < len(fio) {
+		alto, baixo := int(fio[pos]), int(binary.BigEndian.Uint16(fio[pos+1:pos+3]))
+		tipo, flags, sid := fio[pos+3], fio[pos+4], binary.BigEndian.Uint32(fio[pos+5:pos+9])
+		tamanho := (alto << 16) | baixo
+		payload := string(fio[pos+9 : pos+9+tamanho])
+		pos += 9 + tamanho
+		fim := ""
+		if tipo == 0 && flags&END_STREAM != 0 {
+			fim = " END_STREAM"
+		}
+		fmt.Printf("stream %d: %-7s %2d bytes%s\n", sid, TIPOS[tipo], tamanho, fim)
+		if tipo == 0 {
+			streams[sid] += payload
+		}
+	}
+	sids := []uint32{}
+	for sid := range streams {
+		sids = append(sids, sid)
+	}
+	sort.Slice(sids, func(i, j int) bool { return sids[i] < sids[j] })
+	for _, sid := range sids {
+		fmt.Println("corpo do stream", sid, "=", streams[sid])
+	}
+}
+```
+
+</CodeTabs>
+
 ```text
 Saída:
 bytes no fio: 88
@@ -88,6 +422,8 @@ Esse intercalamento elimina o head-of-line blocking **na camada HTTP**: uma resp
 ## HPACK: comprimir cabeçalhos com estado
 
 No 1.1, cada requisição reenvia `cookie`, `user-agent` e `authorization` inteiros, e isso pode passar de 1 KB por requisição. O HPACK mantém, dos dois lados, uma **tabela estática** de 61 cabeçalhos comuns (como `:method: GET`) e uma **tabela dinâmica** com o que já foi enviado nesta conexão. Um cabeçalho repetido vira um índice de um ou dois bytes. A simulação simplificada abaixo mostra o efeito em três requisições seguidas.
+
+<CodeTabs>
 
 ```python
 ESTATICA = [(":method", "GET"), (":scheme", "https"), (":path", "/")]
@@ -115,6 +451,255 @@ for i, caminho in enumerate(["/pedidos", "/carrinho", "/perfil"], 1):
     texto = sum(len(k) + len(v) + 4 for k, v in pedido)
     print(f"requisicao {i}: texto ~{texto} bytes, comprimido {comp.codificar(pedido)} bytes")
 ```
+
+```javascript
+const ESTATICA = [[":method", "GET"], [":scheme", "https"], [":path", "/"]];
+
+class CompressorSimples {
+  constructor() {
+    this.dinamica = [];
+  }
+
+  codificar(cabecalhos) {
+    let total = 0;
+    for (const par of cabecalhos) {
+      const tabela = [...ESTATICA, ...this.dinamica];
+      if (tabela.some(([k, v]) => k === par[0] && v === par[1])) {
+        total += 1; // só o índice
+      } else {
+        total += 2 + par[0].length + par[1].length; // literal
+        this.dinamica.unshift(par); // entra na tabela dinâmica
+      }
+    }
+    return total;
+  }
+}
+
+const cabs = [[":method", "GET"], [":scheme", "https"], [":authority", "api.loja.com"],
+  ["user-agent", "app-ios/7.3.1 (iPhone; iOS 18)"], ["cookie", "sessao=" + "x".repeat(120)]];
+const comp = new CompressorSimples();
+["/pedidos", "/carrinho", "/perfil"].forEach((caminho, idx) => {
+  const i = idx + 1;
+  const pedido = [...cabs, [":path", caminho]];
+  const texto = pedido.reduce((s, [k, v]) => s + k.length + v.length + 4, 0);
+  console.log(`requisicao ${i}: texto ~${texto} bytes, comprimido ${comp.codificar(pedido)} bytes`);
+});
+```
+
+```typescript
+type Par = [string, string];
+
+const ESTATICA: Par[] = [[":method", "GET"], [":scheme", "https"], [":path", "/"]];
+
+class CompressorSimples {
+  dinamica: Par[] = [];
+
+  codificar(cabecalhos: Par[]): number {
+    let total = 0;
+    for (const par of cabecalhos) {
+      const tabela = ESTATICA.concat(this.dinamica);
+      if (tabela.some(([k, v]) => k === par[0] && v === par[1])) {
+        total += 1; // só o índice
+      } else {
+        total += 2 + par[0].length + par[1].length; // literal
+        this.dinamica.unshift(par); // entra na tabela dinâmica
+      }
+    }
+    return total;
+  }
+}
+
+const cabs: Par[] = [[":method", "GET"], [":scheme", "https"], [":authority", "api.loja.com"],
+  ["user-agent", "app-ios/7.3.1 (iPhone; iOS 18)"], ["cookie", "sessao=" + "x".repeat(120)]];
+const comp = new CompressorSimples();
+["/pedidos", "/carrinho", "/perfil"].forEach((caminho, idx) => {
+  const i = idx + 1;
+  const pedido: Par[] = cabs.concat([[":path", caminho]]);
+  const texto = pedido.reduce((s, [k, v]) => s + k.length + v.length + 4, 0);
+  console.log(`requisicao ${i}: texto ~${texto} bytes, comprimido ${comp.codificar(pedido)} bytes`);
+});
+```
+
+```java
+import java.util.*;
+
+static final List<List<String>> ESTATICA = List.of(
+    List.of(":method", "GET"), List.of(":scheme", "https"), List.of(":path", "/"));
+
+static class CompressorSimples {
+    List<List<String>> dinamica = new ArrayList<>();
+
+    int codificar(List<List<String>> cabecalhos) {
+        int total = 0;
+        for (List<String> par : cabecalhos) {
+            List<List<String>> tabela = new ArrayList<>(ESTATICA);
+            tabela.addAll(dinamica);
+            if (tabela.contains(par)) {
+                total += 1; // só o índice
+            } else {
+                total += 2 + par.get(0).length() + par.get(1).length(); // literal
+                dinamica.add(0, par); // entra na tabela dinâmica
+            }
+        }
+        return total;
+    }
+}
+
+public static void main(String[] args) {
+    List<List<String>> cabs = List.of(List.of(":method", "GET"), List.of(":scheme", "https"),
+        List.of(":authority", "api.loja.com"), List.of("user-agent", "app-ios/7.3.1 (iPhone; iOS 18)"),
+        List.of("cookie", "sessao=" + "x".repeat(120)));
+    CompressorSimples comp = new CompressorSimples();
+    String[] caminhos = {"/pedidos", "/carrinho", "/perfil"};
+    for (int i = 1; i <= caminhos.length; i++) {
+        List<List<String>> pedido = new ArrayList<>(cabs);
+        pedido.add(List.of(":path", caminhos[i - 1]));
+        int texto = 0;
+        for (List<String> kv : pedido) texto += kv.get(0).length() + kv.get(1).length() + 4;
+        System.out.println("requisicao " + i + ": texto ~" + texto + " bytes, comprimido " + comp.codificar(pedido) + " bytes");
+    }
+}
+```
+
+```cpp
+#include <algorithm>
+#include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
+using namespace std;
+
+using Par = pair<string, string>;
+
+const vector<Par> ESTATICA = {{":method", "GET"}, {":scheme", "https"}, {":path", "/"}};
+
+class CompressorSimples {
+public:
+    vector<Par> dinamica;
+
+    int codificar(const vector<Par>& cabecalhos) {
+        int total = 0;
+        for (const Par& par : cabecalhos) {
+            vector<Par> tabela = ESTATICA;
+            tabela.insert(tabela.end(), dinamica.begin(), dinamica.end());
+            if (find(tabela.begin(), tabela.end(), par) != tabela.end()) {
+                total += 1; // só o índice
+            } else {
+                total += 2 + par.first.size() + par.second.size(); // literal
+                dinamica.insert(dinamica.begin(), par); // entra na tabela dinâmica
+            }
+        }
+        return total;
+    }
+};
+
+int main() {
+    vector<Par> cabs = {{":method", "GET"}, {":scheme", "https"}, {":authority", "api.loja.com"},
+                        {"user-agent", "app-ios/7.3.1 (iPhone; iOS 18)"}, {"cookie", "sessao=" + string(120, 'x')}};
+    CompressorSimples comp;
+    int i = 1;
+    for (string caminho : {"/pedidos", "/carrinho", "/perfil"}) {
+        vector<Par> pedido = cabs;
+        pedido.push_back({":path", caminho});
+        size_t texto = 0;
+        for (auto& [k, v] : pedido) texto += k.size() + v.size() + 4;
+        int comprimido = comp.codificar(pedido);
+        printf("requisicao %d: texto ~%zu bytes, comprimido %d bytes\n", i++, texto, comprimido);
+    }
+}
+```
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+public static readonly List<Tuple<string, string>> ESTATICA = new List<Tuple<string, string>> {
+    Tuple.Create(":method", "GET"), Tuple.Create(":scheme", "https"), Tuple.Create(":path", "/") };
+
+class CompressorSimples {
+    public List<Tuple<string, string>> dinamica = new List<Tuple<string, string>>();
+
+    public int Codificar(List<Tuple<string, string>> cabecalhos) {
+        int total = 0;
+        foreach (var par in cabecalhos) {
+            var tabela = Program.ESTATICA.Concat(dinamica).ToList();
+            if (tabela.Contains(par)) {
+                total += 1; // só o índice
+            } else {
+                total += 2 + par.Item1.Length + par.Item2.Length; // literal
+                dinamica.Insert(0, par); // entra na tabela dinâmica
+            }
+        }
+        return total;
+    }
+}
+
+static void Main() {
+    var cabs = new List<Tuple<string, string>> {
+        Tuple.Create(":method", "GET"), Tuple.Create(":scheme", "https"), Tuple.Create(":authority", "api.loja.com"),
+        Tuple.Create("user-agent", "app-ios/7.3.1 (iPhone; iOS 18)"), Tuple.Create("cookie", "sessao=" + new string('x', 120)) };
+    var comp = new CompressorSimples();
+    var caminhos = new[] { "/pedidos", "/carrinho", "/perfil" };
+    for (int i = 1; i <= caminhos.Length; i++) {
+        var pedido = new List<Tuple<string, string>>(cabs) { Tuple.Create(":path", caminhos[i - 1]) };
+        int texto = pedido.Sum(kv => kv.Item1.Length + kv.Item2.Length + 4);
+        Console.WriteLine($"requisicao {i}: texto ~{texto} bytes, comprimido {comp.Codificar(pedido)} bytes");
+    }
+}
+```
+
+```go
+import (
+	"fmt"
+	"strings"
+)
+
+type par struct{ nome, valor string }
+
+var ESTATICA = []par{{":method", "GET"}, {":scheme", "https"}, {":path", "/"}}
+
+type CompressorSimples struct {
+	dinamica []par
+}
+
+func (c *CompressorSimples) codificar(cabecalhos []par) int {
+	total := 0
+	for _, p := range cabecalhos {
+		tabela := append(append([]par{}, ESTATICA...), c.dinamica...)
+		achou := false
+		for _, t := range tabela {
+			if t == p {
+				achou = true
+				break
+			}
+		}
+		if achou {
+			total += 1 // só o índice
+		} else {
+			total += 2 + len(p.nome) + len(p.valor)          // literal
+			c.dinamica = append([]par{p}, c.dinamica...) // entra na tabela dinâmica
+		}
+	}
+	return total
+}
+
+func main() {
+	cabs := []par{{":method", "GET"}, {":scheme", "https"}, {":authority", "api.loja.com"},
+		{"user-agent", "app-ios/7.3.1 (iPhone; iOS 18)"}, {"cookie", "sessao=" + strings.Repeat("x", 120)}}
+	comp := &CompressorSimples{}
+	for i, caminho := range []string{"/pedidos", "/carrinho", "/perfil"} {
+		pedido := append(append([]par{}, cabs...), par{":path", caminho})
+		texto := 0
+		for _, kv := range pedido {
+			texto += len(kv.nome) + len(kv.valor) + 4
+		}
+		fmt.Printf("requisicao %d: texto ~%d bytes, comprimido %d bytes\n", i+1, texto, comp.codificar(pedido))
+	}
+}
+```
+
+</CodeTabs>
 
 ```text
 Saída:
