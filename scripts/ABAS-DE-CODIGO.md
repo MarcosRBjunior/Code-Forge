@@ -55,8 +55,9 @@ Diferenças esperadas entre a saída do Python e a das outras linguagens (não s
 - `nao-determinismo` (genai): as contagens por temperatura saem do gerador com semente de cada linguagem; as demais linhas batem.
 - ai-engineering: `amostragem` #2 (linha "10 sorteios"), `gateways-e-fallbacks` #1 (jitter) e `bancos-vetoriais` #1 e #2 (base gaussiana com semente; aqui só a estrutura e a ordem de grandeza batem, recall 0,94 a 0,99 contra 0,95 no Python) dependem do gerador de cada linguagem. `saidas-estruturadas` #1: a mensagem do parser muda em JS, TS e Go.
 - concorrencia: `livelock-e-starvation` #1 (linha "com sorteio", gerador de cada linguagem) e `locks-reentrantes` #1 (Java e C# imprimem
-  o nome real da exceção, `IllegalMonitorStateException`/`SynchronizationLockException`, em vez de `RuntimeError`). Linhas booleanas
-  com prazo ("menos de 0.5 s" em thread-pools #2, async-await #1) podem falhar se o Judge0 estiver sobrecarregado.
+  o nome real da exceção, `IllegalMonitorStateException`/`SynchronizationLockException`, em vez de `RuntimeError`).
+- Medir paralelismo: compare o tempo total com a soma das esperas em série (`duracao < 8 * 0.1`), nunca com um prazo fixo, e
+  imprima só o booleano. Assim a linha não falha com o Judge0 lento (ver thread-pools #2 e async-await #1).
 - `quadtrees` e `algoritmos-balanceamento`: usam números aleatórios, então o resultado impresso varia (a lógica é a mesma).
 - `interfaces`: a linha do `TypeError` ao instanciar o contrato só existe em Python e JavaScript; em Java, C++, C# e TypeScript isso é erro de compilação.
 
