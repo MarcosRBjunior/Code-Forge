@@ -16,6 +16,8 @@ COPY . .
 RUN npm run build
 
 FROM node:22-slim AS run
+# Liga o pacote do ghcr.io ao repositório (o GITHUB_TOKEN do Actions pode publicar nele).
+LABEL org.opencontainers.image.source=https://github.com/MarcosRBjunior/Code-Forge
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
 RUN useradd --system --uid 1001 nextjs
