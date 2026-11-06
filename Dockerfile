@@ -1,0 +1,28 @@
+# Imagem de produção do CodeForge (Azure Container Apps). Usa o build "standalone" do Next.
+# docker build -t codeforge . && docker run -p 3000:3000 -e APP_PASSWORD=... -e DATABASE_URL=... codeforge
+
+FROM node:22-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM node:22-slim AS build
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+ARG NEXT_BUILD_CPUS=2
+ENV NEXT_BUILD_CPUS=$NEXT_BUILD_CPUS
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+FROM node:22-slim AS run
+WORKDIR /app
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
+RUN useradd --system --uid 1001 nextjs
+COPY --from=build --chown=nextjs /app/.next/standalone ./
+COPY --from=build --chown=nextjs /app/.next/static ./.next/static
+# As aulas são lidas do disco em tempo de execução (o tracing já as inclui; isto garante).
+COPY --from=build --chown=nextjs /app/content ./content
+USER nextjs
+EXPOSE 3000
+CMD ["node", "server.js"]

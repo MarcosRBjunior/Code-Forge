@@ -152,10 +152,18 @@ const globalForDb = globalThis as unknown as { cfDb?: Promise<Db> };
 
 async function connect(): Promise<Db> {
   let db: Db;
-  if (process.env.DATABASE_URL) {
+  const url = process.env.DATABASE_URL;
+  if (url && new URL(url).hostname.endsWith(".neon.tech")) {
+    // Neon (Vercel): driver HTTP, sem conexão persistente — bom para funções serverless.
     const { neon } = await import("@neondatabase/serverless");
     const { drizzle } = await import("drizzle-orm/neon-http");
-    db = drizzle(neon(process.env.DATABASE_URL)) as unknown as Db;
+    db = drizzle(neon(url)) as unknown as Db;
+  } else if (url) {
+    // Qualquer outro Postgres (Azure Database for PostgreSQL etc.): pool TCP do node-postgres.
+    // A Azure exige TLS; use "?sslmode=verify-full" na DATABASE_URL (verifica o certificado do servidor).
+    const { Pool } = await import("pg");
+    const { drizzle } = await import("drizzle-orm/node-postgres");
+    db = drizzle(new Pool({ connectionString: url, max: 5 })) as unknown as Db;
   } else {
     const { PGlite } = await import("@electric-sql/pglite");
     const { drizzle } = await import("drizzle-orm/pglite");
