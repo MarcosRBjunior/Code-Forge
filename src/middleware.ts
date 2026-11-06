@@ -7,7 +7,7 @@ export async function middleware(req: NextRequest) {
 
   // Sem senha configurada o app fica FECHADO (nunca aberto por engano), em qualquer ambiente.
   if (!password) {
-    const message = "APP_PASSWORD não está configurada. Defina-a no .env.local (local) ou nas variáveis da Vercel.";
+    const message = "APP_PASSWORD não está configurada. Defina-a no .env.local (local) ou nos segredos do Container App na Azure.";
     return isApi
       ? NextResponse.json({ error: { code: "NOT_CONFIGURED", message } }, { status: 503 })
       : new NextResponse(message, { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });

@@ -4,8 +4,9 @@
  *   npx tsx --conditions react-server scripts/backup-db.ts export [arquivo.json]
  *   npx tsx --conditions react-server scripts/backup-db.ts import <arquivo.json> [--replace]
  *
- * O banco é escolhido como no app: com DATABASE_URL usa o Neon; sem ela, o PGlite local (.data/pglite).
- * Migrar do PGlite para o Neon = `export` sem DATABASE_URL, depois `import` com DATABASE_URL.
+ * O banco é escolhido como no app: com DATABASE_URL usa esse Postgres (Azure); sem ela, o PGlite local (.data/pglite).
+ * Migrar entre bancos = `export` com o .env de origem, depois `import` com o de destino
+ * (ex.: npx tsx --env-file=.env.azure --conditions react-server scripts/backup-db.ts export).
  *
  * - export grava em backups/ por padrão (a pasta está no .gitignore: o arquivo tem suas notas).
  * - import só preenche tabelas VAZIAS; as que já têm dados são puladas. Com --replace, apaga e reimporta.
@@ -34,7 +35,7 @@ const rowsOf = (r: any): any[] => (Array.isArray(r) ? r : r.rows);
 async function main() {
   const [cmd, arg, flag] = process.argv.slice(2);
   const db = await getDb();
-  const where = process.env.DATABASE_URL ? "Neon (DATABASE_URL)" : "PGlite local (.data/pglite)";
+  const where = process.env.DATABASE_URL ? `Postgres ${new URL(process.env.DATABASE_URL).hostname}` : "PGlite local (.data/pglite)";
 
   if (cmd === "export") {
     const out: Record<string, unknown[]> = {};
