@@ -8,7 +8,7 @@ python, javascript, typescript, java, cpp, csharp, go.
 | Curso | Com abas | Observação |
 |---|---|---|
 | dsa | 50 de 50 | completo |
-| system-design | 63 de 71 | os 8 restantes ficam só em Python (abaixo) |
+| system-design | 68 de 76 | os 8 restantes ficam só em Python (abaixo) |
 | system-design-interviews | 13 de 14 | só `spark` fica em Python (abaixo) |
 | lld | 99 de 107 | completo: os 8 restantes não têm bloco Python (são conceituais) |
 | sistemas-operacionais | 42 de 47 | completo (05/11): os 5 restantes ficam só em Python (subprocess, mmap com filho, os.read/os.pipe, 1 fragmento). Sem JS/TS em regiao-critica #2, semaforos-e-monitores #1 e #2 e memoria-virtual #2 |
