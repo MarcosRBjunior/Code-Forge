@@ -6,6 +6,7 @@ import { NavMenu, ReviewCount } from "@/components/NavMenus";
 import { COURSE_GROUPS } from "@/lib/course-groups";
 import { getCourses } from "@/lib/content";
 import { SearchDialog } from "@/components/SearchDialog";
+import { HeaderGuard } from "@/components/HeaderGuard";
 import "./globals.css";
 
 const inter = Inter({ subsets: ["latin", "latin-ext"], variable: "--font-inter", display: "swap" });
@@ -53,29 +54,31 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
       </head>
       <body className="font-ui antialiased">
         <header className="sticky top-0 z-40 flex h-header items-center gap-2 border-b sm:gap-4 border-line bg-bg/80 px-4 backdrop-blur-md">
-          <Link href="/" className="flex items-center gap-2 font-semibold tracking-tight">
-            <span aria-hidden className="grid size-7 place-items-center rounded-md bg-accent text-sm text-fg-on-accent">
-              CF
-            </span>
-            <span className="hidden sm:inline">CodeForge</span>
-          </Link>
-          <nav className="ml-2 flex items-center gap-1 text-sm text-fg-muted">
-            <NavMenu label="Cursos" sections={courseSections} columns={2} />
-            <NavMenu label="Prática" sections={practiceSections} badge={<ReviewCount />} />
-            <Link href="/roadmaps" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg md:inline">
-              Roadmaps
+          <HeaderGuard>
+            <Link href="/" className="flex items-center gap-2 font-semibold tracking-tight">
+              <span aria-hidden className="grid size-7 place-items-center rounded-md bg-accent text-sm text-fg-on-accent">
+                CF
+              </span>
+              <span className="hidden sm:inline">CodeForge</span>
             </Link>
-            <Link href="/dashboard" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg sm:inline">
-              Painel
-            </Link>
-            <Link href="/notebook/dsa" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg lg:inline">
-              Caderno
-            </Link>
-          </nav>
-          <div className="ml-auto flex items-center gap-2">
-            <SearchDialog />
-            <PreferencesMenu />
-          </div>
+            <nav className="ml-2 flex items-center gap-1 text-sm text-fg-muted">
+              <NavMenu label="Cursos" sections={courseSections} columns={2} />
+              <NavMenu label="Prática" sections={practiceSections} badge={<ReviewCount />} />
+              <Link href="/roadmaps" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg md:inline">
+                Roadmaps
+              </Link>
+              <Link href="/dashboard" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg sm:inline">
+                Painel
+              </Link>
+              <Link href="/notebook/dsa" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg lg:inline">
+                Caderno
+              </Link>
+            </nav>
+            <div className="ml-auto flex items-center gap-2">
+              <SearchDialog />
+              <PreferencesMenu />
+            </div>
+          </HeaderGuard>
         </header>
         {children}
       </body>
