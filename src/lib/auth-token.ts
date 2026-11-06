@@ -1,14 +1,17 @@
 /**
- * Proteção simples para uso pessoal: se APP_PASSWORD estiver definida, o app inteiro
- * exige login. O cookie guarda um SHA-256 da senha (nunca a senha em si).
+ * Proteção simples para uso pessoal: o app inteiro exige login com APP_PASSWORD.
+ * O cookie guarda um HMAC-SHA256 (chave = senha) de um rótulo com versão, nunca a senha em si.
+ * Trocar TOKEN_VERSION invalida todos os cookies já emitidos (todo mundo precisa entrar de novo).
  * Funciona no runtime Edge (middleware) e no Node (rotas), via Web Crypto.
  */
 export const AUTH_COOKIE = "cf_auth";
+const TOKEN_VERSION = "v2";
 
 export async function authToken(password: string): Promise<string> {
-  const data = new TextEncoder().encode(`codeforge:${password}`);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, enc.encode(`codeforge-session:${TOKEN_VERSION}`));
+  return Array.from(new Uint8Array(mac), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /** Comparação em tempo constante para strings de mesmo tamanho. */
