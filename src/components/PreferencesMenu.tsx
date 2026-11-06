@@ -115,6 +115,16 @@ export function PreferencesMenu() {
             options={[["compact", "Estreita"], ["normal", "Normal"], ["wide", "Larga"], ["full", "Total"]]} />
           <Segmented label="Fonte" value={prefs.font} onChange={(v) => update("font", v)}
             options={[["serif", "Serifa"], ["sans", "Sans"], ["mono", "Mono"]]} />
+          <button
+            type="button"
+            onClick={async () => {
+              await fetch("/api/logout", { method: "POST" });
+              window.location.href = "/login";
+            }}
+            className="mt-2 w-full rounded-md border border-line px-3 py-1.5 text-sm hover:bg-surface-2"
+          >
+            Sair
+          </button>
         </div>
       )}
     </div>
