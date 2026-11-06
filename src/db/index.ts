@@ -5,7 +5,7 @@ import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
 
 /*
  * Modo pessoal: um único estudante, sem tabela de usuários.
- * Local: PGlite (Postgres embutido, arquivo em .data/). Produção (Vercel): Neon free via DATABASE_URL.
+ * Com DATABASE_URL: Postgres (produção: Azure Database for PostgreSQL). Sem ela: PGlite (arquivo em .data/).
  * chapter_key = "<curso>/<capitulo>".
  */
 export const chapterProgress = pgTable("chapter_progress", {
@@ -153,13 +153,8 @@ const globalForDb = globalThis as unknown as { cfDb?: Promise<Db> };
 async function connect(): Promise<Db> {
   let db: Db;
   const url = process.env.DATABASE_URL;
-  if (url && new URL(url).hostname.endsWith(".neon.tech")) {
-    // Neon (Vercel): driver HTTP, sem conexão persistente — bom para funções serverless.
-    const { neon } = await import("@neondatabase/serverless");
-    const { drizzle } = await import("drizzle-orm/neon-http");
-    db = drizzle(neon(url)) as unknown as Db;
-  } else if (url) {
-    // Qualquer outro Postgres (Azure Database for PostgreSQL etc.): pool TCP do node-postgres.
+  if (url) {
+    // Postgres (Azure Database for PostgreSQL em produção): pool TCP do node-postgres.
     // A Azure exige TLS; use "?sslmode=verify-full" na DATABASE_URL (verifica o certificado do servidor).
     const { Pool } = await import("pg");
     const { drizzle } = await import("drizzle-orm/node-postgres");

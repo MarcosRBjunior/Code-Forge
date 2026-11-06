@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   serverExternalPackages: ["@electric-sql/pglite", "pg"],
-  // Servidor Node autocontido em .next/standalone (imagem Docker para a Azure). Na Vercel não muda nada.
+  // Servidor Node autocontido em .next/standalone (imagem Docker para o Azure Container Apps).
   output: "standalone",
   // ~1.200 páginas estáticas: em máquinas mais lentas (Docker, GitHub Actions) uma página pode passar de 60 s.
   staticPageGenerationTimeout: 300,
