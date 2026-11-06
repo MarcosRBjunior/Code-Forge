@@ -11,6 +11,10 @@ export function apiError(status: number, code: string, message: string, fields?:
 
 /** Valida o corpo JSON com Zod e converte falhas em 400/422 no formato padrão de erro. */
 export async function parseBody<T extends z.ZodTypeAny>(req: Request, schema: T): Promise<z.infer<T> | NextResponse> {
+  // Exigir JSON obriga o navegador a fazer preflight de CORS: outro site não consegue mandar um POST "simples" (text/plain).
+  if (!req.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return apiError(415, "UNSUPPORTED_MEDIA_TYPE", "Envie o corpo como application/json.");
+  }
   let json: unknown;
   try {
     json = await req.json();

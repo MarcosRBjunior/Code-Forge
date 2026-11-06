@@ -19,7 +19,14 @@ export default function LoginPage() {
     setLoading(false);
     if (res.ok) {
       const next = new URLSearchParams(window.location.search).get("next");
-      window.location.href = next && next.startsWith("/") && !next.startsWith("//") ? next : "/";
+      // Só volta para o próprio site: resolve a URL como o navegador faria ("/\host", "/\t/host" viram "//host")
+      // e compara a origem.
+      let destino = "/";
+      if (next) {
+        const u = new URL(next, window.location.origin);
+        if (u.origin === window.location.origin) destino = u.pathname + u.search + u.hash;
+      }
+      window.location.href = destino;
     } else {
       setError("Senha incorreta.");
     }

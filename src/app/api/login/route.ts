@@ -7,7 +7,7 @@ const Login = z.object({ password: z.string().min(1).max(200) });
 
 export async function POST(req: Request) {
   const expected = process.env.APP_PASSWORD;
-  if (!expected) return new NextResponse(null, { status: 204 });
+  if (!expected) return apiError(503, "NOT_CONFIGURED", "APP_PASSWORD não está configurada.");
 
   const body = await parseBody(req, Login);
   if (body instanceof NextResponse) return body;
