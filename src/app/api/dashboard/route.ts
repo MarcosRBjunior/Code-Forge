@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { desc, gte, sql } from "drizzle-orm";
 import { getDb, activityDays, chapterProgress, highlights, notes, today } from "@/db";
+import { authorize } from "@/server/auth/current-user";
 
 export const dynamic = "force-dynamic";
 
@@ -13,7 +14,9 @@ function addDays(iso: string, delta: number) {
 }
 
 /** GET /api/dashboard — sequência de dias, mapa de calor, capítulos recentes e totais. */
-export async function GET() {
+export async function GET(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const db = await getDb();
   const now = today();
   const since = addDays(now, -(HEATMAP_DAYS - 1));

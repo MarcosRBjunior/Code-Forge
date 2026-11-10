@@ -2,11 +2,14 @@ import { NextResponse } from "next/server";
 import { like } from "drizzle-orm";
 import { getDb, highlights, notes } from "@/db";
 import { apiError } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 export const dynamic = "force-dynamic";
 
 /** GET /api/notebook?course=dsa — todos os destaques e notas do curso. */
 export async function GET(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const course = new URL(req.url).searchParams.get("course");
   if (!course || !/^[a-z0-9-]+$/.test(course)) return apiError(422, "VALIDATION_FAILED", "Curso inválido.");
   const db = await getDb();

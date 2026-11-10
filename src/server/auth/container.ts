@@ -1,0 +1,59 @@
+import "server-only";
+import { after } from "next/server";
+import { getDb } from "@/db";
+import { getEnv } from "@/server/env";
+import { AuthService } from "./auth-service";
+import { SessionService } from "./session-service";
+import { PasswordResetService } from "./password-reset-service";
+import { PostgresRateLimiter, type RateLimiter } from "./rate-limit";
+import { createMailService } from "./mail";
+import { consoleLogger, systemClock, type AuthDb } from "./deps";
+
+/** Composição dos services com as dependências reais. Os testes montam os services direto, sem passar por aqui. */
+export interface AuthContainer {
+  auth: AuthService;
+  sessions: SessionService;
+  passwordReset: PasswordResetService;
+  rateLimiter: RateLimiter;
+  production: boolean;
+}
+
+const globalForAuth = globalThis as unknown as { cfAuth?: Promise<AuthContainer> };
+
+async function build(): Promise<AuthContainer> {
+  const env = getEnv();
+  const db: AuthDb = await getDb();
+  const production = env.NODE_ENV === "production";
+  const sessions = new SessionService(db, systemClock);
+  const rateLimiter = new PostgresRateLimiter(db, systemClock);
+  return {
+    sessions,
+    rateLimiter,
+    production,
+    auth: new AuthService({
+      db,
+      sessions,
+      rateLimiter,
+      registration: { open: env.REGISTRATION_OPEN, allowlist: env.REGISTRATION_ALLOWLIST },
+    }),
+    passwordReset: new PasswordResetService({
+      db,
+      sessions,
+      rateLimiter,
+      mailer: createMailService(production, consoleLogger),
+      logger: consoleLogger,
+      appUrl: env.APP_URL,
+      // Roda depois de a resposta sair: o tempo de resposta não depende de o e-mail existir.
+      defer: (job) => after(job),
+      clock: systemClock,
+    }),
+  };
+}
+
+export function getAuth(): Promise<AuthContainer> {
+  globalForAuth.cfAuth ??= build().catch((err) => {
+    globalForAuth.cfAuth = undefined;
+    throw err;
+  });
+  return globalForAuth.cfAuth;
+}

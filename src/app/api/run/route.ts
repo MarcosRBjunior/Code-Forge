@@ -6,6 +6,7 @@ import { buildProgram, parseOutput, userLineOffset } from "@/lib/harness";
 import { runOnJudge0 } from "@/lib/judge0";
 import { inferSignature, REMOTE_LANGS, type ProblemShape } from "@/lib/langs";
 import type { CaseResult, RunOutcome } from "@/components/practice/runner";
+import { authorize } from "@/server/auth/current-user";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +29,8 @@ const fixLines = (msg: string, offset: number) =>
 
 /** POST /api/run — compila e roda o código num serviço externo (Judge0) contra os testes do problema. */
 export async function POST(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, RunBody);
   if (body instanceof NextResponse) return body;
 

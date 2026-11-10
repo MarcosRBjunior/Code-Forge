@@ -25,6 +25,8 @@ COPY --from=build --chown=nextjs /app/.next/standalone ./
 COPY --from=build --chown=nextjs /app/.next/static ./.next/static
 # As aulas são lidas do disco em tempo de execução (o tracing já as inclui; isto garante).
 COPY --from=build --chown=nextjs /app/content ./content
+# Migrações do drizzle-kit, aplicadas na primeira conexão com o banco.
+COPY --from=build --chown=nextjs /app/drizzle ./drizzle
 USER nextjs
 EXPOSE 3000
 CMD ["node", "server.js"]

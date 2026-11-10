@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, highlights, recordActivity } from "@/db";
 import { apiError, ChapterKey, HighlightColor, parseBody } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 const CreateHighlight = z
   .object({
@@ -19,6 +20,8 @@ const CreateHighlight = z
 const UpdateHighlight = z.object({ id: z.string().uuid(), color: HighlightColor });
 
 export async function POST(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, CreateHighlight);
   if (body instanceof NextResponse) return body;
   const db = await getDb();
@@ -32,6 +35,8 @@ export async function POST(req: Request) {
 }
 
 export async function PATCH(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, UpdateHighlight);
   if (body instanceof NextResponse) return body;
   const db = await getDb();
@@ -41,6 +46,8 @@ export async function PATCH(req: Request) {
 }
 
 export async function DELETE(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const id = new URL(req.url).searchParams.get("id");
   if (!id || !z.string().uuid().safeParse(id).success) return apiError(422, "VALIDATION_FAILED", "id inválido.");
   const db = await getDb();

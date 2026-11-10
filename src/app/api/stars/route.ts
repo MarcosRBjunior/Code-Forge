@@ -3,10 +3,13 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, stars } from "@/db";
 import { ChapterKey, parseBody } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 const StarBody = z.object({ key: ChapterKey });
 
 export async function PUT(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, StarBody);
   if (body instanceof NextResponse) return body;
   const db = await getDb();
@@ -15,6 +18,8 @@ export async function PUT(req: Request) {
 }
 
 export async function DELETE(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, StarBody);
   if (body instanceof NextResponse) return body;
   const db = await getDb();

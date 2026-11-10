@@ -1,23 +1,18 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { AUTH_COOKIE, authToken, safeEqual } from "@/lib/auth-token";
+import { sessionCookieName } from "@/server/auth/cookie";
 
-export async function middleware(req: NextRequest) {
-  const isApi = req.nextUrl.pathname.startsWith("/api/");
-  const password = process.env.APP_PASSWORD;
+/*
+ * Checagem OTIMISTA (Edge, sem banco): só verifica se o cookie de sessão existe, para mandar quem não entrou
+ * para /login sem renderizar a página. Um cookie qualquer passa daqui; quem decide de verdade é
+ * requireAuth()/authorize() (src/server/auth/current-user.ts) em cada rota da API.
+ */
+const COOKIE = sessionCookieName(process.env.NODE_ENV === "production");
 
-  // Sem senha configurada o app fica FECHADO (nunca aberto por engano), em qualquer ambiente.
-  if (!password) {
-    const message = "APP_PASSWORD não está configurada. Defina-a no .env.local (local) ou nos segredos do Container App na Azure.";
-    return isApi
-      ? NextResponse.json({ error: { code: "NOT_CONFIGURED", message } }, { status: 503 })
-      : new NextResponse(message, { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
-  }
+export function middleware(req: NextRequest) {
+  if (req.cookies.get(COOKIE)?.value) return NextResponse.next();
 
-  const cookie = req.cookies.get(AUTH_COOKIE)?.value ?? "";
-  if (cookie && safeEqual(cookie, await authToken(password))) return NextResponse.next();
-
-  if (isApi) {
-    return NextResponse.json({ error: { code: "UNAUTHENTICATED", message: "Faça login." } }, { status: 401 });
+  if (req.nextUrl.pathname.startsWith("/api/")) {
+    return NextResponse.json({ error: { code: "UNAUTHENTICATED", message: "Faça login para continuar." } }, { status: 401 });
   }
   const login = new URL("/login", req.url);
   login.searchParams.set("next", req.nextUrl.pathname + req.nextUrl.search);
@@ -25,5 +20,6 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!login|api/login|_next/static|_next/image|favicon.ico).*)"],
+  // Públicas: login, reset de senha (página futura), as rotas de auth e os arquivos estáticos.
+  matcher: ["/((?!login|reset-password|api/auth/|_next/static|_next/image|favicon.ico).*)"],
 };

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { eq, like } from "drizzle-orm";
 import { getDb, chapterProgress, stars, highlights, notes, drafts } from "@/db";
 import { apiError, ChapterKey } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 export const dynamic = "force-dynamic";
 
@@ -11,6 +12,8 @@ export const dynamic = "force-dynamic";
  * GET /api/state                     → progresso de todos os cursos
  */
 export async function GET(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const url = new URL(req.url);
   const db = await getDb();
   const chapter = url.searchParams.get("chapter");
