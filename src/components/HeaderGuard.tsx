@@ -3,11 +3,11 @@
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
-const AVISO = "Faça login com a senha para acessar os cursos e o restante do CodeForge.";
+const AVISO = "Faça login para acessar os cursos e o restante do CodeForge.";
 
 /**
  * Na tela de login, o cabeçalho continua visível, mas nenhum item dele funciona: um clique em link ou botão
- * (menus de cursos e prática, busca, preferências) é barrado, mostra um aviso e leva o foco ao campo de senha.
+ * (menus de cursos e prática, busca, preferências) é barrado, mostra um aviso e leva o foco ao campo de e-mail.
  * A proteção de verdade é o middleware; isto só evita que o usuário pense que o site está aberto.
  */
 export function HeaderGuard({ children }: { children: React.ReactNode }) {
@@ -19,7 +19,7 @@ export function HeaderGuard({ children }: { children: React.ReactNode }) {
     setAviso(true);
     clearTimeout(timer.current);
     timer.current = setTimeout(() => setAviso(false), 5000);
-    document.getElementById("password")?.focus();
+    document.getElementById("email")?.focus();
   };
 
   // Ctrl+K (busca) também fica bloqueado. A escuta em captura na window roda antes da do SearchDialog.

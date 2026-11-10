@@ -118,7 +118,7 @@ export function PreferencesMenu() {
           <button
             type="button"
             onClick={async () => {
-              await fetch("/api/logout", { method: "POST" });
+              await fetch("/api/auth/logout", { method: "POST" });
               window.location.href = "/login";
             }}
             className="mt-2 w-full rounded-md border border-line px-3 py-1.5 text-sm hover:bg-surface-2"

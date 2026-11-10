@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getDb, drafts } from "@/db";
 import { ChapterKey, parseBody } from "@/lib/api";
 import { LANGS } from "@/lib/langs";
+import { authorize } from "@/server/auth/current-user";
 
 const SaveDraft = z.object({
   key: ChapterKey,
@@ -12,6 +13,8 @@ const SaveDraft = z.object({
 
 /** PUT /api/drafts — salva o código em andamento de um problema. */
 export async function PUT(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, SaveDraft);
   if (body instanceof NextResponse) return body;
   const db = await getDb();

@@ -3,6 +3,7 @@ import { desc } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, mockInterviews, recordActivity } from "@/db";
 import { parseBody } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 export const dynamic = "force-dynamic";
 
@@ -29,13 +30,17 @@ const SaveInterview = z.object({
   durationS: z.number().int().min(0).max(4 * 3600),
 });
 
-export async function GET() {
+export async function GET(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const db = await getDb();
   const rows = await db.select().from(mockInterviews).orderBy(desc(mockInterviews.createdAt)).limit(30);
   return NextResponse.json(rows);
 }
 
 export async function POST(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, SaveInterview);
   if (body instanceof NextResponse) return body;
   const db = await getDb();

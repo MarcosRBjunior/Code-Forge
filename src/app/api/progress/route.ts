@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, chapterProgress, recordActivity } from "@/db";
 import { ChapterKey, parseBody } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 const UpsertProgress = z.object({
   key: ChapterKey,
@@ -13,6 +14,8 @@ const UpsertProgress = z.object({
 
 /** PUT /api/progress — idempotente; percentRead só cresce. Também aceita POST (navigator.sendBeacon). */
 export async function PUT(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, UpsertProgress);
   if (body instanceof NextResponse) return body;
   const db = await getDb();

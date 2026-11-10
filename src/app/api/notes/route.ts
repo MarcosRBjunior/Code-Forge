@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, notes, recordActivity } from "@/db";
 import { apiError, ChapterKey, parseBody } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 const NoteBody = z.string().trim().min(1).max(20000);
 const CreateNote = z.object({
@@ -14,6 +15,8 @@ const CreateNote = z.object({
 const UpdateNote = z.object({ id: z.string().uuid(), body: NoteBody });
 
 export async function POST(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, CreateNote);
   if (body instanceof NextResponse) return body;
   const db = await getDb();
@@ -26,6 +29,8 @@ export async function POST(req: Request) {
 }
 
 export async function PATCH(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, UpdateNote);
   if (body instanceof NextResponse) return body;
   const db = await getDb();
@@ -39,6 +44,8 @@ export async function PATCH(req: Request) {
 }
 
 export async function DELETE(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const id = new URL(req.url).searchParams.get("id");
   if (!id || !z.string().uuid().safeParse(id).success) return apiError(422, "VALIDATION_FAILED", "id inválido.");
   const db = await getDb();

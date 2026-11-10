@@ -2,6 +2,7 @@ import "server-only";
 import { sql } from "drizzle-orm";
 import { pgTable, text, integer, real, timestamp, uuid, boolean, date, jsonb } from "drizzle-orm/pg-core";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
+import { migratePg, migratePglite } from "@/server/db/migrate";
 
 /*
  * Modo pessoal: um único estudante, sem tabela de usuários.
@@ -158,14 +159,18 @@ async function connect(): Promise<Db> {
     // A Azure exige TLS; use "?sslmode=verify-full" na DATABASE_URL (verifica o certificado do servidor).
     const { Pool } = await import("pg");
     const { drizzle } = await import("drizzle-orm/node-postgres");
-    db = drizzle(new Pool({ connectionString: url, max: 5 })) as unknown as Db;
+    const pool = new Pool({ connectionString: url, max: 5 });
+    await migratePg(pool);
+    db = drizzle(pool) as unknown as Db;
   } else {
     const { PGlite } = await import("@electric-sql/pglite");
     const { drizzle } = await import("drizzle-orm/pglite");
     const { mkdirSync } = await import("node:fs");
     const dataDir = process.env.PGLITE_DIR ?? ".data/pglite";
     mkdirSync(dataDir, { recursive: true });
-    db = drizzle(new PGlite(dataDir)) as unknown as Db;
+    const client = new PGlite(dataDir);
+    await migratePglite(client);
+    db = drizzle(client) as unknown as Db;
   }
   for (const stmt of DDL) await db.execute(sql.raw(stmt));
   return db;

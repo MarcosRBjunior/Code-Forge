@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, reviewCards } from "@/db";
 import { apiError, parseBody } from "@/lib/api";
+import { authorize } from "@/server/auth/current-user";
 
 const SuspendBody = z.object({
   id: z.string().regex(/^(problem:[a-z0-9-]+\/[a-z0-9-]+|highlight:[0-9a-f-]{36})$/).max(240),
@@ -11,6 +12,8 @@ const SuspendBody = z.object({
 
 /** POST /api/reviews/suspend — para (ou retoma) a revisão de um cartão, sem apagar o histórico dele. */
 export async function POST(req: Request) {
+  const denied = await authorize(req);
+  if (denied instanceof Response) return denied;
   const body = await parseBody(req, SuspendBody);
   if (body instanceof NextResponse) return body;
 
