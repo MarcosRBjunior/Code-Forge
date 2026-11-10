@@ -1,5 +1,5 @@
 # Imagem de produção do CodeForge (Azure Container Apps). Usa o build "standalone" do Next.
-# docker build -t codeforge . && docker run -p 3000:3000 -e APP_PASSWORD=... -e DATABASE_URL=... codeforge
+# docker build -t codeforge . && docker run -p 3000:3000 -e APP_URL=https://... -e DATABASE_URL=... codeforge
 
 FROM node:22-slim AS deps
 WORKDIR /app
