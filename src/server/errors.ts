@@ -15,6 +15,7 @@ export type AppErrorCode =
   | "CONFLICT"
   | "EMAIL_IN_USE"
   | "INVALID_RESET_TOKEN"
+  | "INVALID_VERIFICATION_TOKEN"
   | "RATE_LIMITED"
   | "INTERNAL";
 
@@ -51,6 +52,8 @@ export const Errors = {
   emailInUse: () => new AppError("EMAIL_IN_USE", 409, "Este e-mail já está cadastrado."),
   registrationClosed: () => new AppError("REGISTRATION_CLOSED", 403, "O cadastro está fechado no momento."),
   invalidResetToken: () => new AppError("INVALID_RESET_TOKEN", 400, "Link de redefinição inválido ou expirado."),
+  invalidVerificationToken: () =>
+    new AppError("INVALID_VERIFICATION_TOKEN", 400, "Link de confirmação inválido, expirado ou já usado."),
   notFound: (message: string) => new AppError("NOT_FOUND", 404, message),
   conflict: (message: string) => new AppError("CONFLICT", 409, message),
   /** 422 com mensagem única (as rotas antigas usam 422 para dado inválido que passou no schema). */

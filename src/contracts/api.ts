@@ -40,6 +40,9 @@ export type ForgotPasswordInput = z.infer<typeof ForgotPasswordInput>;
 export const ResetPasswordInput = z.object({ token: z.string().min(1).max(200), password: NewPassword });
 export type ResetPasswordInput = z.infer<typeof ResetPasswordInput>;
 
+export const VerifyEmailInput = z.object({ token: z.string().min(1).max(200) });
+export type VerifyEmailInput = z.infer<typeof VerifyEmailInput>;
+
 // ---------------------------------------------------------------------------
 // Saídas
 // ---------------------------------------------------------------------------

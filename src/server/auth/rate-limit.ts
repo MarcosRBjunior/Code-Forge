@@ -29,6 +29,8 @@ export const RATE_LIMITS = {
   loginIp: { name: "login:ip", limit: 10, windowMs: MIN15 },
   loginEmail: { name: "login:email", limit: 5, windowMs: MIN15 },
   registerIp: { name: "register:ip", limit: 10, windowMs: MIN15 },
+  /** Cada cadastro manda um e-mail: limita quantos chegam à mesma caixa (vale igual exista a conta ou não). */
+  registerEmail: { name: "register:email", limit: 3, windowMs: MIN15 },
   forgotIp: { name: "forgot:ip", limit: 5, windowMs: MIN15 },
   forgotEmail: { name: "forgot:email", limit: 3, windowMs: MIN15 },
   /** O tutor consome créditos da Anthropic. */

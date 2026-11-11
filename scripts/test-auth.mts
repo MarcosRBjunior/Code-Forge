@@ -17,11 +17,15 @@ import { eq } from "drizzle-orm";
 import { parseOptions } from "@node-rs/argon2";
 
 import { migratePglite } from "../src/server/db/migrate.ts";
-import { passwordResetTokens, rateLimits, sessions as sessionsTable, users } from "../src/server/db/schema/auth.ts";
+import { passwordResetTokens, pendingRegistrations, rateLimits, sessions as sessionsTable, users } from "../src/server/db/schema/auth.ts";
 import {
   AuthService,
   PasswordResetService,
   PostgresRateLimiter,
+  RegistrationService,
+  VERIFICATION_TOKEN_TTL_MS,
+  emailVerificationMessage,
+  accountExistsMessage,
   RATE_LIMITS,
   enforceRateLimits,
   RESET_TOKEN_TTL_MS,
@@ -58,7 +62,15 @@ interface SentMail {
   resetUrl: string;
 }
 
-async function setup(opts: { registrationOpen?: boolean; allowlist?: string[]; failingMailer?: boolean } = {}) {
+interface Verification {
+  to: string;
+  name: string;
+  verifyUrl: string;
+}
+
+async function setup(
+  opts: { registrationOpen?: boolean; allowlist?: string[]; failingMailer?: boolean; failingVerificationMail?: boolean } = {},
+) {
   const client = new PGlite();
   await migratePglite(client);
   const db = drizzle(client) as unknown as AuthDb;
@@ -69,7 +81,9 @@ async function setup(opts: { registrationOpen?: boolean; allowlist?: string[]; f
     now = new Date(now.getTime() + ms);
   };
 
-  const sent: SentMail[] = [];
+  const sent: SentMail[] = []; // só os e-mails de redefinição
+  const verifications: Verification[] = [];
+  const notices: string[] = []; // avisos de "você já tem conta" (destinatários)
   const logged: string[] = [];
   const logger: Logger = {
     info: (m, meta) => logged.push(`${m} ${JSON.stringify(meta ?? {})}`),
@@ -81,6 +95,13 @@ async function setup(opts: { registrationOpen?: boolean; allowlist?: string[]; f
       if (opts.failingMailer) throw new Error("SMTP fora do ar");
       sent.push({ to: mail.to, resetUrl: mail.resetUrl });
     },
+    async sendEmailVerification(mail) {
+      if (opts.failingVerificationMail) throw new Error("SMTP fora do ar");
+      verifications.push({ to: mail.to, name: mail.name, verifyUrl: mail.verifyUrl });
+    },
+    async sendAccountExists(mail) {
+      notices.push(mail.to);
+    },
   };
   const pending: Promise<void>[] = [];
   const flush = async () => {
@@ -89,11 +110,18 @@ async function setup(opts: { registrationOpen?: boolean; allowlist?: string[]; f
 
   const sessions = new SessionService(db, clock);
   const rateLimiter = new PostgresRateLimiter(db, clock);
-  const auth = new AuthService({
+  const auth = new AuthService({ db, sessions, rateLimiter });
+  const defer = (job: () => Promise<void>) => void pending.push(job());
+  const registration = new RegistrationService({
     db,
     sessions,
     rateLimiter,
     registration: { open: opts.registrationOpen ?? true, allowlist: opts.allowlist ?? [] },
+    mailer,
+    logger,
+    appUrl: "http://localhost:3000",
+    defer,
+    clock,
   });
   const reset = new PasswordResetService({
     db,
@@ -102,15 +130,46 @@ async function setup(opts: { registrationOpen?: boolean; allowlist?: string[]; f
     mailer,
     logger,
     appUrl: "http://localhost:3000",
-    defer: (job) => void pending.push(job()),
+    defer,
     clock,
   });
 
-  const register = (email = "ana@exemplo.com", ip = IP) =>
-    auth.register(RegisterInput.parse({ email, password: PASSWORD, name: "Ana" }), { ip });
+  /** Só o pedido de cadastro (sem confirmar). */
+  const requestRegistration = (email = "ana@exemplo.com", ip = IP, password = PASSWORD, name = "Ana") =>
+    registration.register(RegisterInput.parse({ email, password, name }), { ip });
+  /** Token do último link de confirmação enviado (para `to`, se dado). */
+  const verificationToken = (to?: string) => {
+    const v = verifications.filter((m) => !to || m.to === to).at(-1);
+    assert.ok(v, `nenhum link de confirmação${to ? ` para ${to}` : ""}`);
+    return v.verifyUrl.split("#token=")[1];
+  };
+  /** Fluxo completo: pede o cadastro, recebe o link e confirma. Devolve conta + sessão. */
+  const register = async (email = "ana@exemplo.com", ip = IP) => {
+    await requestRegistration(email, ip);
+    await flush();
+    return registration.verifyEmail({ token: verificationToken(email.trim().toLowerCase()) });
+  };
   const tokenFromMail = (i = sent.length - 1) => sent[i].resetUrl.split("#token=")[1];
 
-  return { db, client, auth, reset, sessions, rateLimiter, sent, logged, flush, advance, register, tokenFromMail };
+  return {
+    db,
+    client,
+    auth,
+    registration,
+    reset,
+    sessions,
+    rateLimiter,
+    sent,
+    verifications,
+    notices,
+    logged,
+    flush,
+    advance,
+    register,
+    requestRegistration,
+    verificationToken,
+    tokenFromMail,
+  };
 }
 
 /** Espera um AppError com o código (e status) dados. */
@@ -164,37 +223,107 @@ describe("contratos", () => {
 // Cadastro
 // ---------------------------------------------------------------------------
 
-describe("cadastro", () => {
-  test("cria a conta com hash argon2id, e-mail normalizado e já abre sessão", async () => {
+describe("cadastro com confirmação de e-mail", () => {
+  test("pedido não cria conta nem sessão; o link cria a conta (argon2id, e-mail normalizado) e abre a sessão", async () => {
     const t = await setup();
-    const { user, session } = await t.register("  Ana@Exemplo.COM ");
+    await t.requestRegistration("  Ana@Exemplo.COM ");
+    await t.flush();
+    assert.equal((await t.db.select().from(users)).length, 0);
+    assert.equal((await t.db.select().from(sessionsTable)).length, 0);
+    assert.equal(t.verifications.length, 1);
+    assert.equal(t.verifications[0].to, "ana@exemplo.com");
+    assert.match(t.verifications[0].verifyUrl, /^http:\/\/localhost:3000\/verify-email#token=[A-Za-z0-9_-]{43}$/);
 
+    const { user, session } = await t.registration.verifyEmail({ token: t.verificationToken() });
     assert.equal(user.email, "ana@exemplo.com");
     assert.equal(user.role, "student");
     assert.ok(PublicUser.safeParse(user).success);
     assert.ok(!("passwordHash" in user) && !("password_hash" in user));
-
     const [row] = await t.db.select().from(users).where(eq(users.id, user.id));
     assert.match(row.passwordHash, /^\$argon2id\$/);
-    assert.notEqual(row.passwordHash, PASSWORD);
-
-    const validated = await t.sessions.validate(session.token);
-    assert.equal(validated?.user.id, user.id);
+    assert.equal((await t.sessions.validate(session.token))?.user.id, user.id);
     assert.equal(session.expiresAt.getTime() - Date.parse("2026-11-10T12:00:00.000Z"), SESSION_TTL_MS);
+    assert.equal((await t.db.select().from(pendingRegistrations)).length, 0);
   });
 
-  test("e-mail já cadastrado (em qualquer caixa) → 409 EMAIL_IN_USE", async () => {
+  test("antes de confirmar, o login falha como credencial inválida", async () => {
+    const t = await setup();
+    await t.requestRegistration();
+    await t.flush();
+    await rejectsWith(t.auth.login({ email: "ana@exemplo.com", password: PASSWORD }, { ip: IP }), "INVALID_CREDENTIALS", 401);
+    await t.registration.verifyEmail({ token: t.verificationToken() });
+    const { user } = await t.auth.login({ email: "ana@exemplo.com", password: PASSWORD }, { ip: IP });
+    assert.equal(user.email, "ana@exemplo.com");
+  });
+
+  test("o banco guarda só o SHA-256 do token de confirmação", async () => {
+    const t = await setup();
+    await t.requestRegistration();
+    await t.flush();
+    const [row] = await t.db.select().from(pendingRegistrations);
+    assert.equal(row.tokenHash, hashToken(t.verificationToken()));
+  });
+
+  test("e-mail que já tem conta: mesma resposta, nenhum link, e o dono recebe um aviso", async () => {
     const t = await setup();
     await t.register("ana@exemplo.com");
-    await rejectsWith(t.register("ANA@exemplo.com"), "EMAIL_IN_USE", 409);
+    const before = t.verifications.length;
+    await t.requestRegistration("ANA@exemplo.com", IP, "outraSenha9");
+    await t.flush();
+    assert.equal(t.verifications.length, before);
+    assert.deepEqual(t.notices, ["ana@exemplo.com"]);
+    assert.equal((await t.db.select().from(pendingRegistrations)).length, 0);
+    // A senha da conta não mudou.
+    await t.auth.login({ email: "ana@exemplo.com", password: PASSWORD }, { ip: IP });
   });
 
-  test("cadastros simultâneos do mesmo e-mail: um passa, o outro 409 (índice unique)", async () => {
+  test("cada pedido tem seu link e sua senha; o primeiro confirmado cria a conta e invalida os outros", async () => {
     const t = await setup();
-    const results = await Promise.allSettled([t.register("dup@exemplo.com"), t.register("dup@exemplo.com")]);
+    await t.requestRegistration("ana@exemplo.com", IP, "senhaDoAtacante1", "Atacante");
+    await t.requestRegistration("ana@exemplo.com", IP, "senhaDaAna1", "Ana");
+    await t.flush();
+    const [linkAtacante, linkAna] = t.verifications.map((v) => v.verifyUrl.split("#token=")[1]);
+
+    const { user } = await t.registration.verifyEmail({ token: linkAna });
+    assert.equal(user.name, "Ana");
+    await t.auth.login({ email: "ana@exemplo.com", password: "senhaDaAna1" }, { ip: IP });
+    await rejectsWith(t.registration.verifyEmail({ token: linkAtacante }), "INVALID_VERIFICATION_TOKEN", 400);
+    await rejectsWith(t.auth.login({ email: "ana@exemplo.com", password: "senhaDoAtacante1" }, { ip: IP }), "INVALID_CREDENTIALS");
+  });
+
+  test("link reutilizado, vencido (24 h) ou malformado → 400 INVALID_VERIFICATION_TOKEN", async () => {
+    const t = await setup();
+    await t.requestRegistration("a@exemplo.com");
+    await t.requestRegistration("b@exemplo.com");
+    await t.flush();
+    const a = t.verificationToken("a@exemplo.com");
+    await t.registration.verifyEmail({ token: a });
+    await rejectsWith(t.registration.verifyEmail({ token: a }), "INVALID_VERIFICATION_TOKEN", 400);
+
+    t.advance(VERIFICATION_TOKEN_TTL_MS);
+    await rejectsWith(t.registration.verifyEmail({ token: t.verificationToken("b@exemplo.com") }), "INVALID_VERIFICATION_TOKEN", 400);
+    await rejectsWith(t.registration.verifyEmail({ token: "curto" }), "INVALID_VERIFICATION_TOKEN", 400);
+    await rejectsWith(t.registration.verifyEmail({ token: "x".repeat(43) }), "INVALID_VERIFICATION_TOKEN", 400);
+  });
+
+  test("pedidos vencidos são apagados no pedido seguinte", async () => {
+    const t = await setup();
+    await t.requestRegistration("a@exemplo.com");
+    await t.flush();
+    t.advance(VERIFICATION_TOKEN_TTL_MS + 1);
+    await t.requestRegistration("b@exemplo.com");
+    await t.flush();
+    assert.deepEqual((await t.db.select().from(pendingRegistrations)).map((r) => r.email), ["b@exemplo.com"]);
+  });
+
+  test("dois cliques simultâneos no mesmo link: uma conta só", async () => {
+    const t = await setup();
+    await t.requestRegistration();
+    await t.flush();
+    const token = t.verificationToken();
+    const results = await Promise.allSettled([t.registration.verifyEmail({ token }), t.registration.verifyEmail({ token })]);
     assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
-    const failed = results.find((r) => r.status === "rejected");
-    assert.ok(failed && failed.status === "rejected" && AppError.is(failed.reason) && failed.reason.code === "EMAIL_IN_USE");
+    assert.equal((await t.db.select().from(users)).length, 1);
   });
 
   test("banco recusa e-mail não normalizado mesmo se a aplicação falhar (CHECK)", async () => {
@@ -207,17 +336,29 @@ describe("cadastro", () => {
 
   test("cadastro fechado: 403, exceto para e-mails da allowlist", async () => {
     const t = await setup({ registrationOpen: false, allowlist: ["liberado@exemplo.com"] });
-    await rejectsWith(t.register("outro@exemplo.com"), "REGISTRATION_CLOSED", 403);
+    await rejectsWith(t.requestRegistration("outro@exemplo.com"), "REGISTRATION_CLOSED", 403);
     const { user } = await t.register("Liberado@Exemplo.com");
     assert.equal(user.email, "liberado@exemplo.com");
   });
 
-  test("rate limit: 10 por IP em 15 min → 429 com Retry-After", async () => {
+  test("rate limit: 10 por IP e 3 por e-mail em 15 min → 429 com Retry-After", async () => {
     const t = await setup();
-    for (let i = 0; i < 10; i++) await t.register(`u${i}@exemplo.com`);
-    const err = await rejectsWith(t.register("u10@exemplo.com"), "RATE_LIMITED", 429);
+    for (let i = 0; i < 10; i++) await t.requestRegistration(`u${i}@exemplo.com`);
+    const err = await rejectsWith(t.requestRegistration("u10@exemplo.com"), "RATE_LIMITED", 429);
     assert.equal(err.retryAfterSeconds, 15 * 60);
-    await t.register("u10@exemplo.com", "203.0.113.99"); // outro IP passa
+    await t.requestRegistration("u10@exemplo.com", "203.0.113.99"); // outro IP passa
+
+    for (let i = 0; i < 3; i++) await t.requestRegistration("alvo@exemplo.com", `198.51.100.${i}`);
+    await rejectsWith(t.requestRegistration("alvo@exemplo.com", "198.51.100.99"), "RATE_LIMITED", 429);
+  });
+
+  test("falha no envio do link é só logada, sem token no log", async () => {
+    const t = await setup({ failingVerificationMail: true });
+    await t.requestRegistration();
+    await t.flush();
+    const [row] = await t.db.select().from(pendingRegistrations);
+    assert.ok(t.logged.some((l) => l.includes("register: falha")));
+    assert.ok(!t.logged.join("\n").includes(row.tokenHash));
   });
 });
 
@@ -528,6 +669,16 @@ describe("e-mail", () => {
     assert.ok(msg.plainText.includes("09:30"));
     assert.ok(!msg.html.includes("<img"));
     assert.ok(msg.html.includes("&lt;img"));
+  });
+
+  test("confirmação e aviso de conta existente: links presentes e nome escapado", () => {
+    const verifyUrl = "https://app.exemplo.com/verify-email#token=abc";
+    const v = emailVerificationMessage({ to: "a@b.com", name: "<b>x</b>", verifyUrl, expiresAt: new Date("2026-11-11T12:00:00.000Z") });
+    assert.ok(v.plainText.includes(verifyUrl) && v.html.includes(`href="${verifyUrl}"`));
+    assert.ok(v.plainText.includes("11/11") && v.plainText.includes("09:00"));
+    assert.ok(!v.html.includes("<b>x"));
+    const e = accountExistsMessage({ to: "a@b.com", name: "Ana", loginUrl: "https://x/login", forgotUrl: "https://x/forgot-password" });
+    assert.ok(e.html.includes('href="https://x/login"') && e.html.includes('href="https://x/forgot-password"'));
   });
 });
 

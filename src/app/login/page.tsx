@@ -7,12 +7,14 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [badCredentials, setBadCredentials] = useState(false);
   const [loading, setLoading] = useState(false);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    setBadCredentials(false);
     const res = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -30,8 +32,9 @@ export default function LoginPage() {
       }
       window.location.href = destino;
     } else {
-      const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+      const body = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
       setError(body?.error?.message ?? "Não foi possível entrar.");
+      setBadCredentials(body?.error?.code === "INVALID_CREDENTIALS");
     }
   }
 
@@ -67,6 +70,7 @@ export default function LoginPage() {
         {error && (
           <p id="login-error" className="mt-2 text-sm text-danger">
             {error}
+            {badCredentials && <span className="mt-1 block text-fg-muted">Acabou de criar a conta? Ela só passa a valer depois que você abre o link de confirmação enviado por e-mail.</span>}
           </p>
         )}
         <button
