@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { getDb, notes, recordActivity } from "@/db";
+import { getDb } from "@/db";
 import { apiError, ChapterKey, parseBody } from "@/lib/api";
 import { authorize } from "@/server/auth/current-user";
+import { toErrorResponse } from "@/server/http";
+import { createNote, deleteNote, updateNote } from "@/server/study/annotations";
 
 const NoteBody = z.string().trim().min(1).max(20000);
 const CreateNote = z.object({
@@ -15,40 +16,34 @@ const CreateNote = z.object({
 const UpdateNote = z.object({ id: z.string().uuid(), body: NoteBody });
 
 export async function POST(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, CreateNote);
   if (body instanceof NextResponse) return body;
-  const db = await getDb();
-  const [row] = await db
-    .insert(notes)
-    .values({ id: body.id, chapterKey: body.key, highlightId: body.highlightId ?? null, body: body.body })
-    .returning();
-  await recordActivity(db);
-  return NextResponse.json(row, { status: 201 });
+  try {
+    return NextResponse.json(await createNote(await getDb(), user.id, body), { status: 201 });
+  } catch (err) {
+    return toErrorResponse(err);
+  }
 }
 
 export async function PATCH(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, UpdateNote);
   if (body instanceof NextResponse) return body;
-  const db = await getDb();
-  const [row] = await db
-    .update(notes)
-    .set({ body: body.body, updatedAt: new Date() })
-    .where(eq(notes.id, body.id))
-    .returning();
-  if (!row) return apiError(404, "NOT_FOUND", "Nota não encontrada.");
-  return NextResponse.json(row);
+  try {
+    return NextResponse.json(await updateNote(await getDb(), user.id, body.id, body.body));
+  } catch (err) {
+    return toErrorResponse(err);
+  }
 }
 
 export async function DELETE(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const id = new URL(req.url).searchParams.get("id");
   if (!id || !z.string().uuid().safeParse(id).success) return apiError(422, "VALIDATION_FAILED", "id inválido.");
-  const db = await getDb();
-  await db.delete(notes).where(eq(notes.id, id));
+  await deleteNote(await getDb(), user.id, id);
   return new NextResponse(null, { status: 204 });
 }

@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { getDb, reviewCards } from "@/db";
-import { apiError, parseBody } from "@/lib/api";
+import { getDb } from "@/db";
+import { parseBody } from "@/lib/api";
 import { authorize } from "@/server/auth/current-user";
+import { toErrorResponse } from "@/server/http";
+import { suspendCard } from "@/server/study/reviews";
 
 const SuspendBody = z.object({
   id: z.string().regex(/^(problem:[a-z0-9-]+\/[a-z0-9-]+|highlight:[0-9a-f-]{36})$/).max(240),
@@ -12,13 +13,14 @@ const SuspendBody = z.object({
 
 /** POST /api/reviews/suspend — para (ou retoma) a revisão de um cartão, sem apagar o histórico dele. */
 export async function POST(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, SuspendBody);
   if (body instanceof NextResponse) return body;
-
-  const db = await getDb();
-  const updated = await db.update(reviewCards).set({ suspended: body.suspended }).where(eq(reviewCards.id, body.id)).returning({ id: reviewCards.id });
-  if (!updated.length) return apiError(404, "NOT_FOUND", "Cartão não encontrado.");
-  return new NextResponse(null, { status: 204 });
+  try {
+    await suspendCard(await getDb(), user.id, body.id, body.suspended);
+    return new NextResponse(null, { status: 204 });
+  } catch (err) {
+    return toErrorResponse(err);
+  }
 }

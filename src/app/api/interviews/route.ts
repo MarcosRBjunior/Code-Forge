@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { desc } from "drizzle-orm";
 import { z } from "zod";
-import { getDb, mockInterviews, recordActivity } from "@/db";
+import { getDb } from "@/db";
 import { parseBody } from "@/lib/api";
 import { authorize } from "@/server/auth/current-user";
+import { listInterviews, saveInterview } from "@/server/study/interviews";
 
 export const dynamic = "force-dynamic";
 
@@ -31,20 +31,16 @@ const SaveInterview = z.object({
 });
 
 export async function GET(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
-  const db = await getDb();
-  const rows = await db.select().from(mockInterviews).orderBy(desc(mockInterviews.createdAt)).limit(30);
-  return NextResponse.json(rows);
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
+  return NextResponse.json(await listInterviews(await getDb(), user.id));
 }
 
 export async function POST(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, SaveInterview);
   if (body instanceof NextResponse) return body;
-  const db = await getDb();
-  await db.insert(mockInterviews).values(body).onConflictDoNothing();
-  await recordActivity(db);
+  await saveInterview(await getDb(), user.id, body);
   return new NextResponse(null, { status: 201 });
 }

@@ -3,7 +3,7 @@ import { check, index, integer, pgEnum, pgTable, text, timestamp, uuid } from "d
 
 /*
  * Tabelas do módulo de autenticação (multiusuário).
- * Migradas pelo drizzle-kit (pasta drizzle/). As tabelas antigas do modo pessoal continuam no DDL de src/db/index.ts.
+ * Migradas pelo drizzle-kit (pasta drizzle/). As tabelas de estudo (por usuário) estão em ./study.ts.
  * Tokens (sessão e reset) nunca são guardados em claro: só o SHA-256 em hex (64 caracteres).
  */
 

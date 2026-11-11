@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { previewLabels, RATING_LABELS, schedule, type Rating } from "@/lib/srs";
-import type { ReviewCounts, ReviewItem } from "@/lib/reviews";
+import type { ReviewCounts, ReviewItem } from "@/server/study/reviews";
 
 const RATINGS: Rating[] = [1, 2, 3, 4];
 const RATING_STYLE: Record<Rating, string> = {
