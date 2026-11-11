@@ -40,7 +40,7 @@ async function build(): Promise<AuthContainer> {
       db,
       sessions,
       rateLimiter,
-      mailer: createMailService(production, consoleLogger),
+      mailer: createMailService(production, consoleLogger, { acsConnectionString: env.ACS_CONNECTION_STRING, mailFrom: env.MAIL_FROM }),
       logger: consoleLogger,
       appUrl: env.APP_URL,
       // Roda depois de a resposta sair: o tempo de resposta não depende de o e-mail existir.
