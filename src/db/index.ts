@@ -1,151 +1,12 @@
 import "server-only";
-import { sql } from "drizzle-orm";
-import { pgTable, text, integer, real, timestamp, uuid, boolean, date, jsonb } from "drizzle-orm/pg-core";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
 import { migratePg, migratePglite } from "@/server/db/migrate";
 
 /*
- * Modo pessoal: um único estudante, sem tabela de usuários.
- * Com DATABASE_URL: Postgres (produção: Azure Database for PostgreSQL). Sem ela: PGlite (arquivo em .data/).
- * chapter_key = "<curso>/<capitulo>".
+ * Conexão com o banco. Com DATABASE_URL: Postgres (produção: Azure Database for PostgreSQL). Sem ela: PGlite (arquivo em .data/).
+ * Todas as tabelas (auth e estudo) são criadas e alteradas pelas migrações do drizzle-kit (pasta drizzle/).
+ * Os dados de estudo são por usuário: acesse-os pelos services de src/server/study/, que sempre filtram por user_id.
  */
-export const chapterProgress = pgTable("chapter_progress", {
-  chapterKey: text("chapter_key").primaryKey(),
-  percentRead: integer("percent_read").notNull().default(0),
-  lastBlockId: text("last_block_id"),
-  completed: boolean("completed").notNull().default(false),
-  completedAt: timestamp("completed_at", { withTimezone: true }),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const stars = pgTable("stars", {
-  chapterKey: text("chapter_key").primaryKey(),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const highlights = pgTable("highlights", {
-  id: uuid("id").primaryKey(),
-  chapterKey: text("chapter_key").notNull(),
-  color: text("color").notNull(),
-  blockId: text("block_id").notNull(),
-  startOffset: integer("start_offset").notNull(),
-  endOffset: integer("end_offset").notNull(),
-  quote: text("quote").notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const notes = pgTable("notes", {
-  id: uuid("id").primaryKey(),
-  chapterKey: text("chapter_key").notNull(),
-  highlightId: uuid("highlight_id"),
-  body: text("body").notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const drafts = pgTable("code_drafts", {
-  chapterKey: text("chapter_key").notNull(),
-  language: text("language").notNull(),
-  code: text("code").notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-/** Cartões de revisão espaçada. id = "problem:<curso>/<capitulo>" ou "highlight:<uuid>". */
-export const reviewCards = pgTable("review_cards", {
-  id: text("id").primaryKey(),
-  kind: text("kind").notNull(),
-  ref: text("ref").notNull(),
-  ease: real("ease").notNull().default(2.5),
-  intervalDays: integer("interval_days").notNull().default(0),
-  reps: integer("reps").notNull().default(0),
-  lapses: integer("lapses").notNull().default(0),
-  due: date("due").notNull(),
-  lastReviewed: date("last_reviewed"),
-  firstReviewed: date("first_reviewed"),
-  suspended: boolean("suspended").notNull().default(false),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const activityDays = pgTable("activity_days", {
-  day: date("day").primaryKey(),
-  events: integer("events").notNull().default(0),
-});
-
-export const mockInterviews = pgTable("mock_interviews", {
-  id: uuid("id").primaryKey(),
-  config: jsonb("config").notNull(),
-  problems: jsonb("problems").notNull(),
-  scores: jsonb("scores").notNull(),
-  total: integer("total").notNull(),
-  notes: text("notes").notNull().default(""),
-  durationS: integer("duration_s").notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
-
-const DDL = [
-  `CREATE TABLE IF NOT EXISTS chapter_progress (
-     chapter_key text PRIMARY KEY,
-     percent_read integer NOT NULL DEFAULT 0 CHECK (percent_read BETWEEN 0 AND 100),
-     last_block_id text,
-     completed boolean NOT NULL DEFAULT false,
-     completed_at timestamptz,
-     updated_at timestamptz NOT NULL DEFAULT now())`,
-  `CREATE TABLE IF NOT EXISTS stars (
-     chapter_key text PRIMARY KEY,
-     created_at timestamptz NOT NULL DEFAULT now())`,
-  `CREATE TABLE IF NOT EXISTS highlights (
-     id uuid PRIMARY KEY,
-     chapter_key text NOT NULL,
-     color text NOT NULL CHECK (color IN ('yellow','green','blue','pink','purple')),
-     block_id text NOT NULL,
-     start_offset integer NOT NULL CHECK (start_offset >= 0),
-     end_offset integer NOT NULL,
-     quote text NOT NULL,
-     created_at timestamptz NOT NULL DEFAULT now(),
-     CHECK (end_offset > start_offset))`,
-  `CREATE INDEX IF NOT EXISTS highlights_chapter_idx ON highlights (chapter_key)`,
-  `CREATE TABLE IF NOT EXISTS notes (
-     id uuid PRIMARY KEY,
-     chapter_key text NOT NULL,
-     highlight_id uuid REFERENCES highlights(id) ON DELETE SET NULL,
-     body text NOT NULL CHECK (char_length(body) <= 20000),
-     created_at timestamptz NOT NULL DEFAULT now(),
-     updated_at timestamptz NOT NULL DEFAULT now())`,
-  `CREATE INDEX IF NOT EXISTS notes_chapter_idx ON notes (chapter_key)`,
-  `CREATE TABLE IF NOT EXISTS code_drafts (
-     chapter_key text NOT NULL,
-     language text NOT NULL,
-     code text NOT NULL,
-     updated_at timestamptz NOT NULL DEFAULT now(),
-     PRIMARY KEY (chapter_key, language))`,
-  `CREATE TABLE IF NOT EXISTS mock_interviews (
-     id uuid PRIMARY KEY,
-     config jsonb NOT NULL,
-     problems jsonb NOT NULL,
-     scores jsonb NOT NULL,
-     total integer NOT NULL CHECK (total BETWEEN 0 AND 100),
-     notes text NOT NULL DEFAULT '',
-     duration_s integer NOT NULL,
-     created_at timestamptz NOT NULL DEFAULT now())`,
-  `CREATE TABLE IF NOT EXISTS review_cards (
-     id text PRIMARY KEY,
-     kind text NOT NULL CHECK (kind IN ('problem','highlight')),
-     ref text NOT NULL,
-     ease real NOT NULL DEFAULT 2.5 CHECK (ease >= 1.3),
-     interval_days integer NOT NULL DEFAULT 0 CHECK (interval_days >= 0),
-     reps integer NOT NULL DEFAULT 0,
-     lapses integer NOT NULL DEFAULT 0,
-     due date NOT NULL,
-     last_reviewed date,
-     first_reviewed date,
-     suspended boolean NOT NULL DEFAULT false,
-     created_at timestamptz NOT NULL DEFAULT now())`,
-  `CREATE INDEX IF NOT EXISTS review_cards_due_idx ON review_cards (due) WHERE NOT suspended`,
-  `CREATE TABLE IF NOT EXISTS activity_days (
-     day date PRIMARY KEY,
-     events integer NOT NULL DEFAULT 0)`,
-];
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Db = PgDatabase<PgQueryResultHKT, any>;
 
@@ -172,26 +33,7 @@ async function connect(): Promise<Db> {
     await migratePglite(client);
     db = drizzle(client) as unknown as Db;
   }
-  for (const stmt of DDL) await db.execute(sql.raw(stmt));
   return db;
-}
-
-/** Dia de hoje no fuso de estudo (America/Sao_Paulo por padrão), formato YYYY-MM-DD. */
-export function today(): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: process.env.TZ_STUDY ?? "America/Sao_Paulo" }).format(new Date());
-}
-
-/** Dia (YYYY-MM-DD) de um instante, no fuso de estudo. */
-export function dayOf(date: Date): string {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: process.env.TZ_STUDY ?? "America/Sao_Paulo" }).format(date);
-}
-
-/** Registra atividade de estudo no dia (alimenta a sequência de dias e o mapa de calor). */
-export async function recordActivity(db: Db) {
-  await db
-    .insert(activityDays)
-    .values({ day: today(), events: 1 })
-    .onConflictDoUpdate({ target: activityDays.day, set: { events: sql`${activityDays.events} + 1` } });
 }
 
 /** Conexão única por processo (sobrevive ao hot reload em dev). */

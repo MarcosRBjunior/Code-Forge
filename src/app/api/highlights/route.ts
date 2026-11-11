@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { getDb, highlights, recordActivity } from "@/db";
+import { getDb } from "@/db";
 import { apiError, ChapterKey, HighlightColor, parseBody } from "@/lib/api";
 import { authorize } from "@/server/auth/current-user";
+import { toErrorResponse } from "@/server/http";
+import { createHighlight, deleteHighlight, updateHighlightColor } from "@/server/study/annotations";
 
 const CreateHighlight = z
   .object({
@@ -20,37 +21,34 @@ const CreateHighlight = z
 const UpdateHighlight = z.object({ id: z.string().uuid(), color: HighlightColor });
 
 export async function POST(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, CreateHighlight);
   if (body instanceof NextResponse) return body;
-  const db = await getDb();
-  const [row] = await db
-    .insert(highlights)
-    .values({ ...body, chapterKey: body.key })
-    .onConflictDoNothing()
-    .returning();
-  await recordActivity(db);
-  return NextResponse.json(row ?? null, { status: 201 });
+  try {
+    return NextResponse.json(await createHighlight(await getDb(), user.id, body), { status: 201 });
+  } catch (err) {
+    return toErrorResponse(err);
+  }
 }
 
 export async function PATCH(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, UpdateHighlight);
   if (body instanceof NextResponse) return body;
-  const db = await getDb();
-  const [row] = await db.update(highlights).set({ color: body.color }).where(eq(highlights.id, body.id)).returning();
-  if (!row) return apiError(404, "NOT_FOUND", "Destaque não encontrado.");
-  return NextResponse.json(row);
+  try {
+    return NextResponse.json(await updateHighlightColor(await getDb(), user.id, body.id, body.color));
+  } catch (err) {
+    return toErrorResponse(err);
+  }
 }
 
 export async function DELETE(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const id = new URL(req.url).searchParams.get("id");
   if (!id || !z.string().uuid().safeParse(id).success) return apiError(422, "VALIDATION_FAILED", "id inválido.");
-  const db = await getDb();
-  await db.delete(highlights).where(eq(highlights.id, id));
+  await deleteHighlight(await getDb(), user.id, id);
   return new NextResponse(null, { status: 204 });
 }

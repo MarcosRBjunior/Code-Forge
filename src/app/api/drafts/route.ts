@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { getDb, drafts } from "@/db";
+import { getDb } from "@/db";
+import { saveDraft } from "@/server/study/progress";
 import { ChapterKey, parseBody } from "@/lib/api";
 import { LANGS } from "@/lib/langs";
 import { authorize } from "@/server/auth/current-user";
@@ -13,17 +14,10 @@ const SaveDraft = z.object({
 
 /** PUT /api/drafts — salva o código em andamento de um problema. */
 export async function PUT(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, SaveDraft);
   if (body instanceof NextResponse) return body;
-  const db = await getDb();
-  await db
-    .insert(drafts)
-    .values({ chapterKey: body.key, language: body.language, code: body.code })
-    .onConflictDoUpdate({
-      target: [drafts.chapterKey, drafts.language],
-      set: { code: body.code, updatedAt: new Date() },
-    });
+  await saveDraft(await getDb(), user.id, body);
   return new NextResponse(null, { status: 204 });
 }
