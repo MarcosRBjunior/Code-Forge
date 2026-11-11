@@ -14,9 +14,13 @@ const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   /** Origem pública do app (CSRF e links de reset). Normalizada para a origem, sem barra no final. */
   APP_URL: z.url({ protocol: /^https?$/ }).transform((u) => new URL(u).origin),
-  DATABASE_URL: z.string().min(1).optional(),
+  /** Vazia conta como ausente (PGlite): `DATABASE_URL= npm run dev` testa local mesmo com o .env.local apontando para produção. */
+  DATABASE_URL: z
+    .string()
+    .optional()
+    .transform((v) => v || undefined),
   /**
-   * Os dados de estudo ainda não são separados por usuário; por isso o cadastro nasce fechado em produção.
+   * Cadastro fechado por padrão (abrir para o público é uma decisão de produto, não técnica).
    * REGISTRATION_OPEN=true abre para qualquer e-mail; REGISTRATION_ALLOWLIST libera só os e-mails listados.
    */
   REGISTRATION_OPEN: Bool,

@@ -74,15 +74,20 @@ export function NavMenu({ label, sections, columns = 1, badge }: { label: string
   );
 }
 
+/** Páginas abertas sem login: não há sessão para consultar (evita um 401 em cada visita). */
+const PUBLIC_PAGES = ["/login", "/forgot-password", "/reset-password"];
+
 /** Quantidade de cartões de revisão de hoje (carregada no cliente para as páginas continuarem estáticas). */
 export function ReviewCount({ className = "" }: { className?: string }) {
   const [due, setDue] = useState(0);
+  const isPublic = PUBLIC_PAGES.includes(usePathname());
   useEffect(() => {
+    if (isPublic) return;
     fetch("/api/reviews?summary=1")
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => d && setDue(d.counts.due))
       .catch(() => {});
-  }, []);
+  }, [isPublic]);
   if (!due) return null;
   return (
     <span className={`ml-1.5 rounded-full bg-accent px-1.5 py-0.5 text-xs font-medium tabular-nums text-fg-on-accent ${className}`} aria-label={`${due} para revisar`}>

@@ -23,6 +23,7 @@ import {
   PasswordResetService,
   PostgresRateLimiter,
   RATE_LIMITS,
+  enforceRateLimits,
   RESET_TOKEN_TTL_MS,
   SESSION_TTL_MS,
   SessionService,
@@ -515,6 +516,17 @@ describe("rate limiter", () => {
 
   test("tutor: limite por usuário configurado", () => {
     assert.ok(RATE_LIMITS.tutorUser.limit > 0 && RATE_LIMITS.tutorUser.windowMs > 0);
+  });
+
+  test("execução remota (/api/run): 30 por usuário em 15 min, cada usuário com seu balde", async () => {
+    const t = await setup();
+    const rule = RATE_LIMITS.runUser;
+    for (let i = 0; i < 30; i++) await enforceRateLimits(t.rateLimiter, [[rule, "user-a"]]);
+    const err = await rejectsWith(enforceRateLimits(t.rateLimiter, [[rule, "user-a"]]), "RATE_LIMITED", 429);
+    assert.ok(err.retryAfterSeconds! > 0 && err.retryAfterSeconds! <= 15 * 60);
+    await enforceRateLimits(t.rateLimiter, [[rule, "user-b"]]);
+    t.advance(15 * 60 * 1000);
+    await enforceRateLimits(t.rateLimiter, [[rule, "user-a"]]);
   });
 });
 
