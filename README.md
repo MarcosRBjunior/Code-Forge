@@ -51,6 +51,8 @@ Produção roda no **Azure Container Apps** (região Chile Central) com **Azure 
 | `APP_PASSWORD` | Senha do app (obrigatória) | ausente = app fechado (503) |
 | `JUDGE0_URL` | Serviço que compila Java, C++, C# e Go | `https://ce.judge0.com` (instância pública gratuita) |
 | `JUDGE0_TOKEN` | Token, se a instância exigir | ausente |
+| `ACS_CONNECTION_STRING` | Azure Communication Services (e-mail de redefinição de senha); segredo `acs-connection-string` no Container App | ausente: produção não envia, dev escreve o link no console |
+| `MAIL_FROM` | Remetente, do domínio gerenciado pela Azure (`DoNotReply@<guid>.azurecomm.net`) | ausente |
 | `ANTHROPIC_API_KEY` | Liga o Tutor de IA. **É pago por uso**, então fica desligado por padrão | ausente = botão do tutor escondido |
 
 ## Como funciona

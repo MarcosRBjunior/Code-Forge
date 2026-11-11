@@ -24,6 +24,9 @@ const EnvSchema = z.object({
    * REGISTRATION_OPEN=true abre para qualquer e-mail; REGISTRATION_ALLOWLIST libera só os e-mails listados.
    */
   REGISTRATION_OPEN: Bool,
+  /** E-mail (Azure Communication Services). Sem os dois, produção não envia e dev escreve o link no console. */
+  ACS_CONNECTION_STRING: z.string().min(1).optional(),
+  MAIL_FROM: z.email().optional(),
   REGISTRATION_ALLOWLIST: z
     .string()
     .optional()

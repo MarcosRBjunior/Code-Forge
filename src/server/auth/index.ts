@@ -2,7 +2,7 @@ export { AuthService, type AuthResult, type RegistrationPolicy, type RequestCont
 export { SessionService, type IssuedSession, type SessionUser, type ValidatedSession } from "./session-service";
 export { PasswordResetService, RESET_TOKEN_TTL_MS } from "./password-reset-service";
 export { PostgresRateLimiter, RATE_LIMITS, enforceRateLimits, type RateLimiter, type RateLimitRule } from "./rate-limit";
-export { ConsoleMailService, DisabledMailService, createMailService, type MailService } from "./mail";
+export { AcsMailService, ConsoleMailService, DisabledMailService, createMailService, passwordResetMessage, type MailService } from "./mail";
 export { SESSION_TTL_MS, sessionCookieName, sessionCookieOptions } from "./cookie";
 export { getClientIp } from "./client-ip";
 export { isAllowedOrigin } from "./origin";

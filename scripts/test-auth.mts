@@ -34,6 +34,11 @@ import {
   type AuthDb,
   type Logger,
   type MailService,
+  AcsMailService,
+  ConsoleMailService,
+  DisabledMailService,
+  createMailService,
+  passwordResetMessage,
 } from "../src/server/auth/index.ts";
 import { DUMMY_PASSWORD_HASH, PASSWORD_HASH_PARAMS } from "../src/server/auth/password.ts";
 import { hashToken } from "../src/server/auth/tokens.ts";
@@ -497,6 +502,34 @@ describe("recuperação de senha", () => {
 // ---------------------------------------------------------------------------
 // Rate limiter e tutor
 // ---------------------------------------------------------------------------
+
+describe("e-mail", () => {
+  const noop: Logger = { info() {}, warn() {}, error() {} };
+
+  test("escolha do serviço: ACS quando configurado; senão Disabled em produção e Console em dev", () => {
+    const acs = { acsConnectionString: "endpoint=https://x.communication.azure.com/;accesskey=a2V5", mailFrom: "DoNotReply@x.azurecomm.net" };
+    assert.ok(createMailService(true, noop, acs) instanceof AcsMailService);
+    assert.ok(createMailService(false, noop, acs) instanceof AcsMailService);
+    assert.ok(createMailService(true, noop, { acsConnectionString: acs.acsConnectionString }) instanceof DisabledMailService);
+    assert.ok(createMailService(true, noop) instanceof DisabledMailService);
+    assert.ok(createMailService(false, noop) instanceof ConsoleMailService);
+  });
+
+  test("mensagem: link, validade em horário de Brasília e nome escapado no HTML", () => {
+    const resetUrl = "https://app.exemplo.com/reset-password#token=abc";
+    const msg = passwordResetMessage({
+      to: "a@b.com",
+      name: '<img src=x onerror="alert(1)">',
+      resetUrl,
+      expiresAt: new Date("2026-11-10T12:30:00.000Z"),
+    });
+    assert.ok(msg.plainText.includes(resetUrl));
+    assert.ok(msg.html.includes(`href="${resetUrl}"`));
+    assert.ok(msg.plainText.includes("09:30"));
+    assert.ok(!msg.html.includes("<img"));
+    assert.ok(msg.html.includes("&lt;img"));
+  });
+});
 
 describe("rate limiter", () => {
   test("janela fixa: conta, bloqueia acima do limite e reabre ao vencer", async () => {
