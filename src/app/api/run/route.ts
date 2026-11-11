@@ -6,7 +6,10 @@ import { buildProgram, parseOutput, userLineOffset } from "@/lib/harness";
 import { runOnJudge0 } from "@/lib/judge0";
 import { inferSignature, REMOTE_LANGS, type ProblemShape } from "@/lib/langs";
 import type { CaseResult, RunOutcome } from "@/components/practice/runner";
+import { getAuth } from "@/server/auth/container";
 import { authorize } from "@/server/auth/current-user";
+import { enforceRateLimits, RATE_LIMITS } from "@/server/auth/rate-limit";
+import { toErrorResponse } from "@/server/http";
 
 export const dynamic = "force-dynamic";
 
@@ -29,8 +32,8 @@ const fixLines = (msg: string, offset: number) =>
 
 /** POST /api/run — compila e roda o código num serviço externo (Judge0) contra os testes do problema. */
 export async function POST(req: Request) {
-  const denied = await authorize(req);
-  if (denied instanceof Response) return denied;
+  const user = await authorize(req);
+  if (user instanceof Response) return user;
   const body = await parseBody(req, RunBody);
   if (body instanceof NextResponse) return body;
 
@@ -42,6 +45,14 @@ export async function POST(req: Request) {
   const shape = { ...problem, starter: problem.starter } as unknown as ProblemShape;
   const sig = inferSignature(shape);
   if (!sig) return apiError(422, "UNSUPPORTED", "Este problema (listas ligadas, árvores ou design de classes) só pode ser resolvido em Python, JavaScript e TypeScript.");
+
+  // Cada execução vai ao Judge0 (até 4 chamadas com as novas tentativas): limite por usuário. Só conta pedido válido.
+  try {
+    const { rateLimiter } = await getAuth();
+    await enforceRateLimits(rateLimiter, [[RATE_LIMITS.runUser, user.id]]);
+  } catch (err) {
+    return toErrorResponse(err);
+  }
 
   const lang = body.language as "java" | "cpp" | "csharp" | "go";
   let outcome: RunOutcome;

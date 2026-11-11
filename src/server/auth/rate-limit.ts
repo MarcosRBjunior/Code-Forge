@@ -33,6 +33,8 @@ export const RATE_LIMITS = {
   forgotEmail: { name: "forgot:email", limit: 3, windowMs: MIN15 },
   /** O tutor consome créditos da Anthropic. */
   tutorUser: { name: "tutor:user", limit: 30, windowMs: 60 * 60 * 1000 },
+  /** /api/run chama o Judge0 (serviço externo; a instância pública é compartilhada): 2 por minuto em média. */
+  runUser: { name: "run:user", limit: 30, windowMs: MIN15 },
 } satisfies Record<string, RateLimitRule>;
 
 /** E-mails entram na chave como hash: a tabela de limites não guarda dado pessoal em claro. */
