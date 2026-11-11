@@ -20,6 +20,6 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  // Públicas: login, cadastro, esqueci/redefinir senha, as rotas de auth e os arquivos estáticos.
-  matcher: ["/((?!login|register|forgot-password|reset-password|api/auth/|_next/static|_next/image|favicon.ico).*)"],
+  // Públicas: login, cadastro e confirmação de e-mail, esqueci/redefinir senha, as rotas de auth e os arquivos estáticos.
+  matcher: ["/((?!login|register|verify-email|forgot-password|reset-password|api/auth/|_next/static|_next/image|favicon.ico).*)"],
 };

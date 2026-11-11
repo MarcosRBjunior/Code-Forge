@@ -63,6 +63,30 @@ export const passwordResetTokens = pgTable(
   (t) => [index("password_reset_tokens_user_id_idx").on(t.userId)],
 );
 
+/**
+ * Cadastro aguardando confirmação do e-mail. A conta (users) só nasce quando o link é aberto, com o nome e o hash
+ * de senha DESTE pedido: quem controla a caixa de entrada não ativa uma conta com a senha de outra pessoa.
+ * Vários pedidos para o mesmo e-mail podem coexistir (cada um com seu link); o primeiro confirmado cria a conta e
+ * apaga os outros. Linhas vencidas são apagadas a cada pedido novo.
+ */
+export const pendingRegistrations = pgTable(
+  "pending_registrations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    email: text("email").notNull(),
+    name: text("name").notNull(),
+    passwordHash: text("password_hash").notNull(),
+    tokenHash: text("token_hash").notNull().unique("pending_registrations_token_hash_unique"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("pending_registrations_email_idx").on(t.email),
+    index("pending_registrations_expires_at_idx").on(t.expiresAt),
+    check("pending_registrations_email_normalized", sql`${t.email} = lower(btrim(${t.email}))`),
+  ],
+);
+
 /** Janela fixa por chave (ex.: "login:ip:1.2.3.4"). Implementação Postgres da interface RateLimiter. */
 export const rateLimits = pgTable(
   "rate_limits",
@@ -79,4 +103,5 @@ export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 export type Session = typeof sessions.$inferSelect;
 export type PasswordResetToken = typeof passwordResetTokens.$inferSelect;
+export type PendingRegistration = typeof pendingRegistrations.$inferSelect;
 export type UserRole = (typeof userRole.enumValues)[number];

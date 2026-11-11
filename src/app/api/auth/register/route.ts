@@ -1,17 +1,20 @@
-import { RegisterInput, type UserResponse } from "@/contracts/api";
+import { RegisterInput } from "@/contracts/api";
 import { getAuth } from "@/server/auth/container";
 import { getClientIp } from "@/server/auth/client-ip";
-import { setSessionCookie } from "@/server/auth/current-user";
 import { assertSameOrigin, json, parseJson, withErrorHandling } from "@/server/http";
 
 export const runtime = "nodejs";
 
-/** Cria a conta e já abre a sessão. 201 + usuário público. */
+const REGISTER_MESSAGE = "Enviamos um link de confirmação para o seu e-mail";
+
+/**
+ * Pede o cadastro. Resposta SEMPRE igual (202), tenha o e-mail conta ou não: o link de confirmação (ou o aviso de
+ * conta existente) segue por e-mail. A conta só nasce em /api/auth/verify-email.
+ */
 export const POST = withErrorHandling(async (req) => {
   assertSameOrigin(req);
   const input = await parseJson(req, RegisterInput);
-  const { auth } = await getAuth();
-  const { user, session } = await auth.register(input, { ip: getClientIp(req.headers) });
-  await setSessionCookie(session);
-  return json<UserResponse>({ user }, 201);
+  const { registration } = await getAuth();
+  await registration.register(input, { ip: getClientIp(req.headers) });
+  return json({ message: REGISTER_MESSAGE }, 202);
 });
