@@ -76,9 +76,14 @@ export default function LoginPage() {
         >
           {loading ? "Entrando…" : "Entrar"}
         </button>
-        <Link href="/forgot-password" className="mt-4 inline-block text-sm text-fg-muted hover:underline">
-          Esqueci minha senha
-        </Link>
+        <div className="mt-4 flex justify-between text-sm">
+          <Link href="/forgot-password" className="text-fg-muted hover:underline">
+            Esqueci minha senha
+          </Link>
+          <Link href="/register" className="text-accent hover:underline">
+            Criar conta
+          </Link>
+        </div>
       </form>
     </main>
   );
