@@ -4,13 +4,13 @@ import Link from "next/link";
 export const metadata: Metadata = { title: "Política de privacidade" };
 
 /*
- * PREENCHER antes de publicar, se quiser identificar o responsável (LGPD, art. 9º):
+ * Identificação (LGPD, art. 9º). RESPONSAVEL ainda não preenchido (opcional):
  *   RESPONSAVEL: nome da pessoa ou empresa que mantém o CodeForge.
  *   CONTATO: e-mail para pedidos sobre dados pessoais.
  * Enquanto estiverem null, a página não mostra esses itens e indica a página Conta para excluir os dados.
  */
 const RESPONSAVEL: string | null = null;
-const CONTATO: string | null = null;
+const CONTATO: string | null = "marcosprogjunior@gmail.com";
 
 const ATUALIZADA_EM = "12 de novembro de 2026";
 
