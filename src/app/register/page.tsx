@@ -137,6 +137,13 @@ export default function RegisterPage() {
             {error}
           </p>
         )}
+        <p className="mt-4 text-xs text-fg-muted">
+          Ao criar a conta, você concorda com o uso dos seus dados descrito na{" "}
+          <Link href="/privacidade" target="_blank" className="text-accent hover:underline">
+            política de privacidade
+          </Link>
+          .
+        </p>
         <button
           type="submit"
           disabled={loading || !name.trim() || !email || !password || !confirm}

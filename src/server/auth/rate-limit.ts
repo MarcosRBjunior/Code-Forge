@@ -33,6 +33,9 @@ export const RATE_LIMITS = {
   registerEmail: { name: "register:email", limit: 3, windowMs: MIN15 },
   forgotIp: { name: "forgot:ip", limit: 5, windowMs: MIN15 },
   forgotEmail: { name: "forgot:email", limit: 3, windowMs: MIN15 },
+  /** Conta logada: cada tentativa confere a senha atual (argon2). Limite por usuário. */
+  changePasswordUser: { name: "password:user", limit: 5, windowMs: MIN15 },
+  deleteAccountUser: { name: "delete-account:user", limit: 5, windowMs: MIN15 },
   /** O tutor consome créditos da Anthropic. */
   tutorUser: { name: "tutor:user", limit: 30, windowMs: 60 * 60 * 1000 },
   /** /api/run chama o Judge0 (serviço externo; a instância pública é compartilhada): 2 por minuto em média. */

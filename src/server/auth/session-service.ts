@@ -1,4 +1,4 @@
-import { and, eq, gt, lt } from "drizzle-orm";
+import { and, eq, gt, lt, ne } from "drizzle-orm";
 import { sessions, users, type User } from "@/server/db/schema/auth";
 import { SESSION_TTL_MS } from "./cookie";
 import { generateToken, hashToken, isWellFormedToken } from "./tokens";
@@ -72,6 +72,11 @@ export class SessionService {
   /** Revoga todas as sessões do usuário (reset de senha). Aceita uma transação. */
   async revokeAllForUser(userId: string, db: AuthDb = this.db): Promise<void> {
     await db.delete(sessions).where(eq(sessions.userId, userId));
+  }
+
+  /** Revoga as sessões do usuário, menos a indicada (troca de senha com a sessão aberta). Aceita uma transação. */
+  async revokeOthersForUser(userId: string, keepSessionId: string, db: AuthDb = this.db): Promise<void> {
+    await db.delete(sessions).where(and(eq(sessions.userId, userId), ne(sessions.id, keepSessionId)));
   }
 
   /** Limpeza de sessões expiradas (job periódico). */

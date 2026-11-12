@@ -1,4 +1,5 @@
 export { AuthService, type AuthResult, type RegistrationPolicy, type RequestContext } from "./auth-service";
+export { AccountService, STUDY_TABLES, personalRateLimitKeys, type AccountActor } from "./account-service";
 export { SessionService, type IssuedSession, type SessionUser, type ValidatedSession } from "./session-service";
 export { PasswordResetService, RESET_TOKEN_TTL_MS } from "./password-reset-service";
 export { RegistrationService, VERIFICATION_TOKEN_TTL_MS } from "./registration-service";

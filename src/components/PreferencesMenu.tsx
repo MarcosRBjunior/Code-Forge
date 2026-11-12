@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 type Prefs = {
@@ -97,7 +98,7 @@ export function PreferencesMenu() {
       <button
         type="button"
         aria-expanded={open}
-        aria-label="Preferências de leitura e tema"
+        aria-label="Preferências de leitura, tema e conta"
         onClick={() => setOpen((o) => !o)}
         className="rounded-md border border-line px-2.5 py-1.5 font-prose text-sm hover:bg-surface-2"
       >
@@ -115,6 +116,13 @@ export function PreferencesMenu() {
             options={[["compact", "Estreita"], ["normal", "Normal"], ["wide", "Larga"], ["full", "Total"]]} />
           <Segmented label="Fonte" value={prefs.font} onChange={(v) => update("font", v)}
             options={[["serif", "Serifa"], ["sans", "Sans"], ["mono", "Mono"]]} />
+          <Link
+            href="/account"
+            onClick={() => setOpen(false)}
+            className="mt-4 block w-full rounded-md border border-line px-3 py-1.5 text-center text-sm hover:bg-surface-2"
+          >
+            Minha conta
+          </Link>
           <button
             type="button"
             onClick={async () => {

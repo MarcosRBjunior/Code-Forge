@@ -43,6 +43,17 @@ export type ResetPasswordInput = z.infer<typeof ResetPasswordInput>;
 export const VerifyEmailInput = z.object({ token: z.string().min(1).max(200) });
 export type VerifyEmailInput = z.infer<typeof VerifyEmailInput>;
 
+/** Senha atual (conta logada): como no login, só limites de tamanho. */
+const CurrentPassword = z.string().min(1, "Informe a senha atual.").max(128);
+
+/** Troca de senha com a sessão aberta. A nova segue a mesma política do cadastro. */
+export const ChangePasswordInput = z.object({ currentPassword: CurrentPassword, newPassword: NewPassword });
+export type ChangePasswordInput = z.infer<typeof ChangePasswordInput>;
+
+/** Exclusão da conta: exige a senha atual. */
+export const DeleteAccountInput = z.object({ password: CurrentPassword });
+export type DeleteAccountInput = z.infer<typeof DeleteAccountInput>;
+
 // ---------------------------------------------------------------------------
 // Saídas
 // ---------------------------------------------------------------------------

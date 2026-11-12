@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -9,6 +9,15 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [badCredentials, setBadCredentials] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [deleted, setDeleted] = useState(false);
+
+  // Vindo da exclusão de conta (/account): confirma e tira o parâmetro da URL.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("conta") === "excluida") {
+      setDeleted(true);
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -43,6 +52,11 @@ export default function LoginPage() {
       <form onSubmit={submit} className="w-full max-w-sm rounded-xl border border-line bg-surface-1 p-6 shadow-md">
         <h1 className="text-xl font-semibold">CodeForge</h1>
         <p className="mt-1 text-sm text-fg-muted">Entre com seu e-mail e senha.</p>
+        {deleted && (
+          <p className="mt-3 rounded-md border border-line bg-surface-2 px-3 py-2 text-sm" role="status">
+            Sua conta e todos os dados dela foram excluídos.
+          </p>
+        )}
         <label className="mt-5 block text-sm font-medium" htmlFor="email">
           E-mail
         </label>
@@ -88,6 +102,11 @@ export default function LoginPage() {
             Criar conta
           </Link>
         </div>
+        <p className="mt-4 text-center text-xs text-fg-muted">
+          <Link href="/privacidade" className="hover:underline">
+            Política de privacidade
+          </Link>
+        </p>
       </form>
     </main>
   );
