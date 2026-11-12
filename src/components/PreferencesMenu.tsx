@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 type Prefs = {
@@ -98,7 +97,7 @@ export function PreferencesMenu() {
       <button
         type="button"
         aria-expanded={open}
-        aria-label="Preferências de leitura, tema e conta"
+        aria-label="Preferências de leitura e tema"
         onClick={() => setOpen((o) => !o)}
         className="rounded-md border border-line px-2.5 py-1.5 font-prose text-sm hover:bg-surface-2"
       >
@@ -108,6 +107,7 @@ export function PreferencesMenu() {
         <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-line bg-surface-1 p-4 shadow-lg">
           <Segmented label="Tema" value={prefs.theme} onChange={(v) => update("theme", v)}
             options={[["light", "Claro"], ["dark", "Escuro"], ["system", "Sistema"]]} />
+          <p className="mt-4 border-t border-line pt-3 text-xs text-fg-subtle">Valem para o texto dos capítulos:</p>
           <Segmented label="Tamanho do texto" value={prefs.size} onChange={(v) => update("size", v)}
             options={[["xs", "XS"], ["s", "S"], ["m", "M"], ["l", "L"], ["xl", "XL"]]} />
           <Segmented label="Entrelinha" value={prefs.leading} onChange={(v) => update("leading", v)}
@@ -116,23 +116,6 @@ export function PreferencesMenu() {
             options={[["compact", "Estreita"], ["normal", "Normal"], ["wide", "Larga"], ["full", "Total"]]} />
           <Segmented label="Fonte" value={prefs.font} onChange={(v) => update("font", v)}
             options={[["serif", "Serifa"], ["sans", "Sans"], ["mono", "Mono"]]} />
-          <Link
-            href="/account"
-            onClick={() => setOpen(false)}
-            className="mt-4 block w-full rounded-md border border-line px-3 py-1.5 text-center text-sm hover:bg-surface-2"
-          >
-            Minha conta
-          </Link>
-          <button
-            type="button"
-            onClick={async () => {
-              await fetch("/api/auth/logout", { method: "POST" });
-              window.location.href = "/login";
-            }}
-            className="mt-2 w-full rounded-md border border-line px-3 py-1.5 text-sm hover:bg-surface-2"
-          >
-            Sair
-          </button>
         </div>
       )}
     </div>
