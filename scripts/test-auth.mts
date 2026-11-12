@@ -10,15 +10,18 @@ process.env.APP_URL = "http://localhost:3000";
 (process.env as Record<string, string>).NODE_ENV = "test";
 
 import { describe, test } from "node:test";
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
-import { eq } from "drizzle-orm";
+import { eq, getTableName } from "drizzle-orm";
 import { parseOptions } from "@node-rs/argon2";
 
 import { migratePglite } from "../src/server/db/migrate.ts";
 import { passwordResetTokens, pendingRegistrations, rateLimits, sessions as sessionsTable, users } from "../src/server/db/schema/auth.ts";
 import {
+  AccountService,
+  STUDY_TABLES,
   AuthService,
   PasswordResetService,
   PostgresRateLimiter,
@@ -45,6 +48,8 @@ import {
   passwordResetMessage,
 } from "../src/server/auth/index.ts";
 import { DUMMY_PASSWORD_HASH, PASSWORD_HASH_PARAMS } from "../src/server/auth/password.ts";
+import { changePasswordRoute, deleteAccountRoute, readRequestCookie } from "../src/server/auth/account-routes.ts";
+import { config as middlewareConfig } from "../src/middleware.ts";
 import { hashToken } from "../src/server/auth/tokens.ts";
 import { AppError } from "../src/server/errors.ts";
 import { assertSameOrigin, parseJson, toErrorResponse } from "../src/server/http.ts";
@@ -773,5 +778,260 @@ describe("camada HTTP", () => {
     assert.equal(getClientIp(h("2001:db8::1")), "2001:db8::1");
     assert.equal(getClientIp(h()), "unknown");
     assert.equal(getClientIp(h("não-é-ip")), "unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conta: troca de senha e exclusão (services + handlers de /api/account)
+// ---------------------------------------------------------------------------
+
+describe("conta", () => {
+  const ORIGIN = "http://localhost:3000";
+  const NEW_PASSWORD = "outra5678";
+
+  async function accountSetup() {
+    const t = await setup();
+    const account = new AccountService({ db: t.db, sessions: t.sessions, rateLimiter: t.rateLimiter });
+    const deps = { account, sessions: t.sessions, production: false };
+    const routes = { password: changePasswordRoute(async () => deps), delete: deleteAccountRoute(async () => deps) };
+
+    /** Chama o handler como o Next chamaria. `token: null` = sem cookie; `origin: null` = sem Origin. */
+    const call = (
+      route: "password" | "delete",
+      body: unknown,
+      opts: { token?: string | null; origin?: string | null; contentType?: string } = {},
+    ) => {
+      const headers: Record<string, string> = { "content-type": opts.contentType ?? "application/json" };
+      if (opts.origin !== null) headers.origin = opts.origin ?? ORIGIN;
+      if (opts.token) headers.cookie = `outro=1; ${sessionCookieName(false)}=${opts.token}`;
+      const url = route === "password" ? `${ORIGIN}/api/account/password` : `${ORIGIN}/api/account`;
+      const req = new Request(url, { method: route === "password" ? "POST" : "DELETE", headers, body: JSON.stringify(body) });
+      return routes[route](req, undefined);
+    };
+
+    const actor = async (token: string) => {
+      const v = await t.sessions.validate(token);
+      assert.ok(v);
+      return { userId: v.user.id, sessionId: v.sessionId };
+    };
+    const login = async (email = "ana@exemplo.com", password = PASSWORD) =>
+      (await t.auth.login({ email, password }, { ip: IP })).session.token;
+    const passwordHashOf = async (id: string) =>
+      (await t.db.select({ h: users.passwordHash }).from(users).where(eq(users.id, id)))[0]?.h;
+
+    return { ...t, account, call, actor, login, passwordHashOf };
+  }
+
+  const errorCode = async (res: Response) => ((await res.json()) as { error: { code: string } }).error.code;
+
+  test("troca de senha: senha atual errada → 400 WRONG_PASSWORD, nada muda", async () => {
+    const t = await accountSetup();
+    const { user, session } = await t.register();
+    const other = await t.login();
+    const before = await t.passwordHashOf(user.id);
+
+    await rejectsWith(
+      t.account.changePassword(await t.actor(session.token), { currentPassword: "errada123", newPassword: NEW_PASSWORD }),
+      "WRONG_PASSWORD",
+      400,
+    );
+    const res = await t.call("password", { currentPassword: "errada123", newPassword: NEW_PASSWORD }, { token: session.token });
+    assert.equal(res.status, 400);
+    assert.equal(await errorCode(res), "WRONG_PASSWORD");
+
+    assert.equal(await t.passwordHashOf(user.id), before);
+    assert.ok(await t.sessions.validate(other), "a outra sessão continua");
+  });
+
+  test("troca de senha: grava a nova, encerra as OUTRAS sessões (a atual continua) e invalida links de redefinição", async () => {
+    const t = await accountSetup();
+    const { session } = await t.register();
+    const phone = await t.login();
+    const laptop = await t.login();
+    await t.reset.requestReset({ email: "ana@exemplo.com" }, { ip: IP });
+    await t.flush();
+    const resetToken = t.tokenFromMail();
+
+    const res = await t.call("password", { currentPassword: PASSWORD, newPassword: NEW_PASSWORD }, { token: session.token });
+    assert.equal(res.status, 204);
+
+    assert.ok(await t.sessions.validate(session.token), "sessão atual continua");
+    assert.equal(await t.sessions.validate(phone), null);
+    assert.equal(await t.sessions.validate(laptop), null);
+    await rejectsWith(t.auth.login({ email: "ana@exemplo.com", password: PASSWORD }, { ip: IP }), "INVALID_CREDENTIALS", 401);
+    assert.ok(await t.login("ana@exemplo.com", NEW_PASSWORD));
+    await rejectsWith(t.reset.resetPassword({ token: resetToken, password: "terceira999" }), "INVALID_RESET_TOKEN", 400);
+  });
+
+  test("troca de senha: nova senha segue a política do cadastro e precisa ser diferente da atual", async () => {
+    const t = await accountSetup();
+    const { session } = await t.register();
+    for (const newPassword of ["curta1", "semnumeros", "12345678"]) {
+      const res = await t.call("password", { currentPassword: PASSWORD, newPassword }, { token: session.token });
+      assert.equal(res.status, 400);
+      assert.equal(await errorCode(res), "VALIDATION_FAILED");
+    }
+    const same = await t.call("password", { currentPassword: PASSWORD, newPassword: PASSWORD }, { token: session.token });
+    assert.equal(same.status, 422);
+  });
+
+  test("troca de senha e exclusão: 5 tentativas por usuário em 15 min → 429", async () => {
+    const t = await accountSetup();
+    const { session } = await t.register();
+    const a = await t.actor(session.token);
+    for (let i = 0; i < 5; i++) {
+      await rejectsWith(t.account.changePassword(a, { currentPassword: "errada123", newPassword: NEW_PASSWORD }), "WRONG_PASSWORD");
+    }
+    await rejectsWith(t.account.changePassword(a, { currentPassword: PASSWORD, newPassword: NEW_PASSWORD }), "RATE_LIMITED", 429);
+    for (let i = 0; i < 5; i++) await rejectsWith(t.account.deleteAccount(a, { password: "errada123" }), "WRONG_PASSWORD");
+    await rejectsWith(t.account.deleteAccount(a, { password: PASSWORD }), "RATE_LIMITED", 429);
+    t.advance(15 * 60 * 1000);
+    await t.account.changePassword(a, { currentPassword: PASSWORD, newPassword: NEW_PASSWORD });
+  });
+
+  /** Uma linha em cada tabela de estudo para o usuário. */
+  async function seedStudy(client: PGlite, userId: string) {
+    const h = randomUUID();
+    await client.exec(`
+      INSERT INTO chapter_progress (user_id, chapter_key, percent_read) VALUES ('${userId}', 'dsa/two-sum', 50);
+      INSERT INTO stars (user_id, chapter_key) VALUES ('${userId}', 'dsa/arrays');
+      INSERT INTO highlights (id, user_id, chapter_key, color, block_id, start_offset, end_offset, quote)
+        VALUES ('${h}', '${userId}', 'dsa/arrays', 'blue', 'p-1', 0, 4, 'nota');
+      INSERT INTO notes (id, user_id, chapter_key, highlight_id, body) VALUES ('${randomUUID()}', '${userId}', 'dsa/arrays', '${h}', 'minha nota');
+      INSERT INTO code_drafts (user_id, chapter_key, language, code) VALUES ('${userId}', 'dsa/two-sum', 'python', 'print(1)');
+      INSERT INTO mock_interviews (id, user_id, config, problems, scores, total, duration_s)
+        VALUES ('${randomUUID()}', '${userId}', '{}', '[]', '{}', 50, 600);
+      INSERT INTO review_cards (user_id, id, kind, ref, due) VALUES ('${userId}', 'problem:dsa/two-sum', 'problem', 'dsa/two-sum', '2026-11-10');
+      INSERT INTO activity_days (user_id, day, events) VALUES ('${userId}', '2026-11-10', 3);
+    `);
+  }
+
+  /** Linhas do usuário em CADA tabela do banco que tem coluna user_id (inclusive tabelas futuras). */
+  async function rowsByUserIdTable(client: PGlite, userId: string): Promise<Record<string, number>> {
+    const tables = (
+      await client.query<{ table_name: string }>(
+        "SELECT table_name FROM information_schema.columns WHERE table_schema = 'public' AND column_name = 'user_id' ORDER BY table_name",
+      )
+    ).rows.map((r) => r.table_name);
+    const out: Record<string, number> = {};
+    for (const table of tables) {
+      const { rows } = await client.query<{ n: number }>(`SELECT count(*)::int AS n FROM "${table}" WHERE user_id = $1`, [userId]);
+      out[table] = Number(rows[0].n);
+    }
+    return out;
+  }
+
+  test("a lista de tabelas apagadas cobre toda tabela com user_id (além de sessions e password_reset_tokens)", async () => {
+    const t = await accountSetup();
+    const { user } = await t.register();
+    const inDb = Object.keys(await rowsByUserIdTable(t.client, user.id)).sort();
+    const covered = [...STUDY_TABLES.map((tb) => getTableName(tb)), "sessions", "password_reset_tokens"].sort();
+    assert.deepEqual(inDb, covered);
+  });
+
+  test("exclusão: apaga a conta e TODOS os dados dela, sem tocar nos de outro usuário; limpa o cookie", async () => {
+    const t = await accountSetup();
+    const ana = await t.register("ana@exemplo.com");
+    const bia = await t.register("bia@exemplo.com");
+    await seedStudy(t.client, ana.user.id);
+    await seedStudy(t.client, bia.user.id);
+    await t.login("ana@exemplo.com");
+    await t.login("bia@exemplo.com");
+    for (const email of ["ana@exemplo.com", "bia@exemplo.com"]) await t.reset.requestReset({ email }, { ip: IP });
+    await t.flush();
+    await t.db.insert(pendingRegistrations).values([
+      { email: "ana@exemplo.com", name: "Ana", passwordHash: "x", tokenHash: hashToken("a"), expiresAt: new Date("2026-11-11") },
+      { email: "bia@exemplo.com", name: "Bia", passwordHash: "x", tokenHash: hashToken("b"), expiresAt: new Date("2026-11-11") },
+    ]);
+    for (const u of [ana.user.id, bia.user.id]) {
+      await t.rateLimiter.consume(RATE_LIMITS.tutorUser, u);
+      await t.rateLimiter.consume(RATE_LIMITS.runUser, u);
+    }
+    const biaBefore = await rowsByUserIdTable(t.client, bia.user.id);
+    const anaBefore = await rowsByUserIdTable(t.client, ana.user.id);
+    assert.ok(Object.values(anaBefore).every((n) => n > 0), `dados de teste em todas as tabelas: ${JSON.stringify(anaBefore)}`);
+
+    const res = await t.call("delete", { password: PASSWORD }, { token: ana.session.token });
+    assert.equal(res.status, 204);
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    assert.match(setCookie, /^session=;/);
+    assert.match(setCookie, /Expires=Thu, 01 Jan 1970/i);
+    assert.match(setCookie, /HttpOnly/i);
+
+    // Ana: nada em nenhuma tabela.
+    const anaAfter = await rowsByUserIdTable(t.client, ana.user.id);
+    assert.ok(Object.values(anaAfter).every((n) => n === 0), JSON.stringify(anaAfter));
+    assert.equal((await t.db.select().from(users).where(eq(users.id, ana.user.id))).length, 0);
+    assert.equal((await t.db.select().from(pendingRegistrations).where(eq(pendingRegistrations.email, "ana@exemplo.com"))).length, 0);
+    const keys = (await t.db.select({ key: rateLimits.key }).from(rateLimits)).map((r) => r.key);
+    assert.ok(!keys.some((k) => k.includes(ana.user.id) || k.includes(hashToken("ana@exemplo.com"))), "chaves de rate limit da Ana");
+
+    // Bia: tudo como antes.
+    assert.deepEqual(await rowsByUserIdTable(t.client, bia.user.id), biaBefore);
+    assert.equal((await t.db.select().from(users).where(eq(users.id, bia.user.id))).length, 1);
+    assert.equal((await t.db.select().from(pendingRegistrations).where(eq(pendingRegistrations.email, "bia@exemplo.com"))).length, 1);
+    assert.ok(keys.some((k) => k.includes(bia.user.id)) && keys.some((k) => k.includes(hashToken("bia@exemplo.com"))));
+    assert.ok(keys.some((k) => k.startsWith("login:ip:")), "chaves por IP não são da pessoa: ficam");
+    assert.ok(await t.sessions.validate(bia.session.token));
+
+    // O cookie antigo não vale mais, e o login da conta apagada falha.
+    const again = await t.call("delete", { password: PASSWORD }, { token: ana.session.token });
+    assert.equal(again.status, 401);
+    await rejectsWith(t.auth.login({ email: "ana@exemplo.com", password: PASSWORD }, { ip: "203.0.113.99" }), "INVALID_CREDENTIALS");
+  });
+
+  test("exclusão com senha errada → 400 WRONG_PASSWORD e nada é apagado", async () => {
+    const t = await accountSetup();
+    const { user, session } = await t.register();
+    await seedStudy(t.client, user.id);
+    const before = await rowsByUserIdTable(t.client, user.id);
+    const res = await t.call("delete", { password: "errada123" }, { token: session.token });
+    assert.equal(res.status, 400);
+    assert.equal(await errorCode(res), "WRONG_PASSWORD");
+    assert.equal(res.headers.get("set-cookie"), null);
+    assert.deepEqual(await rowsByUserIdTable(t.client, user.id), before);
+  });
+
+  test("rotas exigem Origin (CSRF) e sessão válida, antes de tocar em qualquer dado", async () => {
+    const t = await accountSetup();
+    const { user, session } = await t.register();
+    const before = await t.passwordHashOf(user.id);
+    const bodies = { password: { currentPassword: PASSWORD, newPassword: NEW_PASSWORD }, delete: { password: PASSWORD } };
+
+    for (const route of ["password", "delete"] as const) {
+      for (const origin of [null, "null", "https://evil.com", "http://localhost:3001"]) {
+        const res = await t.call(route, bodies[route], { token: session.token, origin });
+        assert.equal(res.status, 403, `${route} origin=${origin}`);
+        assert.equal(await errorCode(res), "INVALID_ORIGIN");
+      }
+      for (const token of [null, "malformado", "A".repeat(43)]) {
+        const res = await t.call(route, bodies[route], { token });
+        assert.equal(res.status, 401, `${route} token=${token}`);
+        assert.equal(await errorCode(res), "UNAUTHENTICATED");
+      }
+      const noJson = await t.call(route, bodies[route], { token: session.token, contentType: "text/plain" });
+      assert.equal(noJson.status, 415);
+    }
+    assert.equal(await t.passwordHashOf(user.id), before);
+    assert.ok(await t.sessions.validate(session.token));
+
+    // Sessão expirada também é 401.
+    t.advance(SESSION_TTL_MS + 1);
+    assert.equal((await t.call("delete", bodies.delete, { token: session.token })).status, 401);
+    assert.equal((await t.db.select().from(users).where(eq(users.id, user.id))).length, 1);
+  });
+
+  test("cookie da requisição: lê o valor pelo nome, entre outros cookies", () => {
+    const req = (cookie?: string) => new Request(ORIGIN, { headers: cookie ? { cookie } : {} });
+    assert.equal(readRequestCookie(req("a=1; session=abc; b=2"), "session"), "abc");
+    assert.equal(readRequestCookie(req("xsession=abc"), "session"), undefined);
+    assert.equal(readRequestCookie(req(), "session"), undefined);
+  });
+
+  test("middleware: /privacidade é pública; /account e /api/account exigem login", () => {
+    const re = new RegExp(`^${middlewareConfig.matcher[0]}$`);
+    const protegida = (p: string) => re.test(p);
+    for (const p of ["/privacidade", "/login", "/register", "/api/auth/login"]) assert.equal(protegida(p), false, p);
+    for (const p of ["/account", "/api/account", "/api/account/password", "/dashboard"]) assert.equal(protegida(p), true, p);
   });
 });

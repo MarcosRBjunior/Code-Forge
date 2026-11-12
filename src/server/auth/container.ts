@@ -3,6 +3,7 @@ import { after } from "next/server";
 import { getDb } from "@/db";
 import { getEnv } from "@/server/env";
 import { AuthService } from "./auth-service";
+import { AccountService } from "./account-service";
 import { SessionService } from "./session-service";
 import { PasswordResetService } from "./password-reset-service";
 import { RegistrationService } from "./registration-service";
@@ -13,6 +14,7 @@ import { consoleLogger, systemClock, type AuthDb } from "./deps";
 /** Composição dos services com as dependências reais. Os testes montam os services direto, sem passar por aqui. */
 export interface AuthContainer {
   auth: AuthService;
+  account: AccountService;
   sessions: SessionService;
   passwordReset: PasswordResetService;
   registration: RegistrationService;
@@ -36,6 +38,7 @@ async function build(): Promise<AuthContainer> {
     rateLimiter,
     production,
     auth: new AuthService({ db, sessions, rateLimiter }),
+    account: new AccountService({ db, sessions, rateLimiter }),
     registration: new RegistrationService({
       db,
       sessions,

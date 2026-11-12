@@ -7,6 +7,7 @@ export type AppErrorCode =
   | "BAD_REQUEST"
   | "UNSUPPORTED_MEDIA_TYPE"
   | "INVALID_CREDENTIALS"
+  | "WRONG_PASSWORD"
   | "UNAUTHENTICATED"
   | "FORBIDDEN"
   | "INVALID_ORIGIN"
@@ -48,6 +49,8 @@ export class AppError extends Error {
 
 export const Errors = {
   invalidCredentials: () => new AppError("INVALID_CREDENTIALS", 401, "Credenciais inválidas"),
+  /** Senha atual errada com a sessão aberta (troca de senha, exclusão). 400, não 401: a sessão continua válida. */
+  wrongPassword: () => new AppError("WRONG_PASSWORD", 400, "Senha atual incorreta."),
   unauthenticated: () => new AppError("UNAUTHENTICATED", 401, "Faça login para continuar."),
   emailInUse: () => new AppError("EMAIL_IN_USE", 409, "Este e-mail já está cadastrado."),
   registrationClosed: () => new AppError("REGISTRATION_CLOSED", 403, "O cadastro está fechado no momento."),
