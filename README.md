@@ -1,6 +1,6 @@
 # CodeForge (versão pessoal)
 
-Plataforma de estudo para entrevistas de engenharia, para um único usuário, inspirada na estrutura do AlgoMaster.io. Todo o texto é original. Roda na Azure com o crédito do Azure for Students.
+Plataforma de estudo para entrevistas de engenharia, multiusuário (cada conta tem seu próprio progresso; cadastro com confirmação por e-mail), inspirada na estrutura do AlgoMaster.io. Todo o texto é original. Roda na Azure com o crédito do Azure for Students.
 
 ## O que tem
 
