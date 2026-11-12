@@ -52,6 +52,8 @@ import { changePasswordRoute, deleteAccountRoute, readRequestCookie } from "../s
 import { config as middlewareConfig } from "../src/middleware.ts";
 import { hashToken } from "../src/server/auth/tokens.ts";
 import { purgeExpired, RATE_LIMIT_RETENTION_MS } from "../src/server/auth/maintenance.ts";
+import { passwordChangedMessage } from "../src/server/auth/mail.ts";
+import { oneLine } from "../src/server/auth/deps.ts";
 import { AppError } from "../src/server/errors.ts";
 import { assertSameOrigin, parseJson, toErrorResponse } from "../src/server/http.ts";
 import { ForgotPasswordInput, LoginInput, PublicUser, RegisterInput } from "../src/contracts/api.ts";
@@ -75,7 +77,13 @@ interface Verification {
 }
 
 async function setup(
-  opts: { registrationOpen?: boolean; allowlist?: string[]; failingMailer?: boolean; failingVerificationMail?: boolean } = {},
+  opts: {
+    registrationOpen?: boolean;
+    allowlist?: string[];
+    failingMailer?: boolean;
+    failingVerificationMail?: boolean;
+    failingChangedMail?: boolean;
+  } = {},
 ) {
   const client = new PGlite();
   await migratePglite(client);
@@ -90,6 +98,7 @@ async function setup(
   const sent: SentMail[] = []; // só os e-mails de redefinição
   const verifications: Verification[] = [];
   const notices: string[] = []; // avisos de "você já tem conta" (destinatários)
+  const changedNotices: { to: string; forgotUrl: string }[] = []; // avisos de senha alterada
   const logged: string[] = [];
   const logger: Logger = {
     info: (m, meta) => logged.push(`${m} ${JSON.stringify(meta ?? {})}`),
@@ -107,6 +116,10 @@ async function setup(
     },
     async sendAccountExists(mail) {
       notices.push(mail.to);
+    },
+    async sendPasswordChanged(mail) {
+      if (opts.failingChangedMail) throw new Error("SMTP fora do ar");
+      changedNotices.push({ to: mail.to, forgotUrl: mail.forgotUrl });
     },
   };
   const pending: Promise<void>[] = [];
@@ -169,6 +182,10 @@ async function setup(
     sent,
     verifications,
     notices,
+    changedNotices,
+    mailer,
+    logger,
+    defer,
     logged,
     flush,
     advance,
@@ -557,6 +574,25 @@ describe("recuperação de senha", () => {
     assert.ok(used.usedAt);
   });
 
+  test("redefinição pelo link avisa o dono por e-mail; falha no aviso só é logada", async () => {
+    const t = await setup();
+    await t.register();
+    await t.reset.requestReset({ email: "ana@exemplo.com" }, { ip: IP });
+    await t.flush();
+    await t.reset.resetPassword({ token: t.tokenFromMail(), password: "novaSenha99" });
+    await t.flush();
+    assert.deepEqual(t.changedNotices, [{ to: "ana@exemplo.com", forgotUrl: "http://localhost:3000/forgot-password" }]);
+
+    const f = await setup({ failingChangedMail: true });
+    await f.register();
+    await f.reset.requestReset({ email: "ana@exemplo.com" }, { ip: IP });
+    await f.flush();
+    await f.reset.resetPassword({ token: f.tokenFromMail(), password: "novaSenha99" }); // não lança
+    await f.flush();
+    assert.ok(f.logged.some((l) => l.includes("aviso de senha alterada") && l.includes("SMTP fora do ar")));
+    await f.auth.login({ email: "ana@exemplo.com", password: "novaSenha99" }, { ip: IP }); // a troca valeu
+  });
+
   test("e-mail inexistente: mesma resposta, nenhum e-mail, nenhum token", async () => {
     const t = await setup();
     await t.register();
@@ -791,9 +827,18 @@ describe("conta", () => {
   const ORIGIN = "http://localhost:3000";
   const NEW_PASSWORD = "outra5678";
 
-  async function accountSetup() {
-    const t = await setup();
-    const account = new AccountService({ db: t.db, sessions: t.sessions, rateLimiter: t.rateLimiter });
+  async function accountSetup(opts: { failingChangedMail?: boolean } = {}) {
+    const t = await setup(opts);
+    const account = new AccountService({
+      db: t.db,
+      sessions: t.sessions,
+      rateLimiter: t.rateLimiter,
+      mailer: t.mailer,
+      logger: t.logger,
+      appUrl: "http://localhost:3000",
+      defer: t.defer,
+      clock: t.clock,
+    });
     const deps = { account, sessions: t.sessions, production: false };
     const routes = { password: changePasswordRoute(async () => deps), delete: deleteAccountRoute(async () => deps) };
 
@@ -863,6 +908,48 @@ describe("conta", () => {
     await rejectsWith(t.auth.login({ email: "ana@exemplo.com", password: PASSWORD }, { ip: IP }), "INVALID_CREDENTIALS", 401);
     assert.ok(await t.login("ana@exemplo.com", NEW_PASSWORD));
     await rejectsWith(t.reset.resetPassword({ token: resetToken, password: "terceira999" }), "INVALID_RESET_TOKEN", 400);
+  });
+
+  test("troca de senha avisa o dono por e-mail; senha atual errada não avisa; falha no aviso só é logada", async () => {
+    const t = await accountSetup();
+    const { session } = await t.register();
+    await rejectsWith(
+      t.account.changePassword(await t.actor(session.token), { currentPassword: "errada123", newPassword: NEW_PASSWORD }),
+      "WRONG_PASSWORD",
+    );
+    await t.flush();
+    assert.equal(t.changedNotices.length, 0);
+
+    const res = await t.call("password", { currentPassword: PASSWORD, newPassword: NEW_PASSWORD }, { token: session.token });
+    assert.equal(res.status, 204);
+    await t.flush();
+    assert.deepEqual(t.changedNotices, [{ to: "ana@exemplo.com", forgotUrl: "http://localhost:3000/forgot-password" }]);
+
+    const f = await accountSetup({ failingChangedMail: true });
+    const { session: fs } = await f.register();
+    const fres = await f.call("password", { currentPassword: PASSWORD, newPassword: NEW_PASSWORD }, { token: fs.token });
+    assert.equal(fres.status, 204);
+    await f.flush();
+    assert.ok(f.logged.some((l) => l.includes("aviso de senha alterada") && l.includes("SMTP fora do ar")));
+  });
+
+  test("texto do aviso de senha alterada: horário de Brasília, link de redefinição e nome escapado", () => {
+    const m = passwordChangedMessage({
+      to: "a@b.com",
+      name: "<b>x</b>",
+      changedAt: new Date("2026-11-11T12:00:00.000Z"),
+      forgotUrl: "https://x/forgot-password",
+    });
+    assert.ok(m.plainText.includes("11/11") && m.plainText.includes("09:00"));
+    assert.ok(m.plainText.includes("https://x/forgot-password") && m.html.includes('href="https://x/forgot-password"'));
+    assert.ok(!m.html.includes("<b>x"));
+  });
+
+  test("logs saem numa linha só (Log Analytics)", () => {
+    assert.equal(oneLine("evento"), "evento");
+    assert.equal(oneLine("evento", {}), "evento");
+    const l = oneLine("limpeza", { a: 1, erro: "linha1\nlinha2" });
+    assert.equal(l.split("\n").length, 1);
   });
 
   test("troca de senha: nova senha segue a política do cadastro e precisa ser diferente da atual", async () => {
