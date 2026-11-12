@@ -56,7 +56,8 @@ export default function PrivacidadePage() {
           <li>
             <strong>Limite de tentativas:</strong> para conter abuso (login, cadastro, recuperação de senha e outros), contamos
             as tentativas por endereço IP, por e-mail (guardado como hash) e por conta. Esses registros servem só para
-            esse limite.
+            esse limite e são apagados automaticamente em até 24 horas. Sessões, links e cadastros não confirmados
+            também são apagados automaticamente quando vencem.
           </li>
           <li>
             <strong>No seu navegador:</strong> preferências de leitura e tema ficam no armazenamento local do navegador e

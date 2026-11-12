@@ -51,6 +51,7 @@ import { DUMMY_PASSWORD_HASH, PASSWORD_HASH_PARAMS } from "../src/server/auth/pa
 import { changePasswordRoute, deleteAccountRoute, readRequestCookie } from "../src/server/auth/account-routes.ts";
 import { config as middlewareConfig } from "../src/middleware.ts";
 import { hashToken } from "../src/server/auth/tokens.ts";
+import { purgeExpired, RATE_LIMIT_RETENTION_MS } from "../src/server/auth/maintenance.ts";
 import { AppError } from "../src/server/errors.ts";
 import { assertSameOrigin, parseJson, toErrorResponse } from "../src/server/http.ts";
 import { ForgotPasswordInput, LoginInput, PublicUser, RegisterInput } from "../src/contracts/api.ts";
@@ -159,6 +160,7 @@ async function setup(
   return {
     db,
     client,
+    clock,
     auth,
     registration,
     reset,
@@ -1033,5 +1035,60 @@ describe("conta", () => {
     const protegida = (p: string) => re.test(p);
     for (const p of ["/privacidade", "/login", "/register", "/api/auth/login"]) assert.equal(protegida(p), false, p);
     for (const p of ["/account", "/api/account", "/api/account/password", "/dashboard"]) assert.equal(protegida(p), true, p);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Limpeza periódica
+// ---------------------------------------------------------------------------
+
+describe("limpeza periódica", () => {
+  test("apaga limites de tentativas com mais de 24 h, sessões e cadastros vencidos; mantém o resto", async () => {
+    const t = await setup();
+    const HOUR = 60 * 60 * 1000;
+    const rule = { name: "teste:ip", limit: 10, windowMs: 15 * 60 * 1000 };
+    const keys = async () => (await t.db.select({ key: rateLimits.key }).from(rateLimits)).map((r) => r.key).sort();
+
+    await t.register("ana@exemplo.com"); // cria sessão (7 dias) e linhas de limite do cadastro
+    await t.rateLimiter.consume(rule, "1.1.1.1");
+    await t.requestRegistration("bia@exemplo.com"); // pendente, vence em 24 h
+    await t.flush();
+    t.advance(2 * HOUR);
+    await t.rateLimiter.consume(rule, "2.2.2.2");
+
+    // 25 h depois do início: só o que abriu janela há mais de 24 h sai.
+    t.advance(23 * HOUR);
+    const first = await purgeExpired(t.db, t.clock);
+    assert.deepEqual(await keys(), ["teste:ip:2.2.2.2"]);
+    assert.ok(first.rateLimits >= 2);
+    assert.equal(first.pendingRegistrations, 1);
+    assert.equal(first.sessions, 0);
+    assert.equal((await t.db.select().from(sessionsTable)).length, 1);
+    assert.equal((await t.db.select().from(pendingRegistrations)).length, 0);
+    assert.equal((await t.db.select().from(users)).length, 1); // a conta nunca é tocada
+
+    // Depois de 7 dias a sessão venceu e o último limite também passou das 24 h.
+    t.advance(7 * 24 * HOUR);
+    const second = await purgeExpired(t.db, t.clock);
+    assert.equal(second.sessions, 1);
+    assert.deepEqual(await keys(), []);
+    assert.equal((await t.db.select().from(users)).length, 1);
+
+    // Idempotente.
+    assert.deepEqual(await purgeExpired(t.db, t.clock), { rateLimits: 0, sessions: 0, passwordResetTokens: 0, pendingRegistrations: 0 });
+  });
+
+  test("links de redefinição vencidos saem; o prazo de retenção dos limites é 24 h", async () => {
+    const t = await setup();
+    await t.register("ana@exemplo.com");
+    const [user] = await t.db.select({ id: users.id }).from(users);
+    await t.db.insert(passwordResetTokens).values([
+      { userId: user.id, tokenHash: "vencido", expiresAt: new Date(t.clock().getTime() - 1) },
+      { userId: user.id, tokenHash: "valido", expiresAt: new Date(t.clock().getTime() + 60_000) },
+    ]);
+    assert.equal((await purgeExpired(t.db, t.clock)).passwordResetTokens, 1);
+    const left = await t.db.select({ h: passwordResetTokens.tokenHash }).from(passwordResetTokens);
+    assert.deepEqual(left.map((r) => r.h), ["valido"]);
+    assert.equal(RATE_LIMIT_RETENTION_MS, 24 * 60 * 60 * 1000);
   });
 });
