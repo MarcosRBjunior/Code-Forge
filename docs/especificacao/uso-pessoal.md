@@ -10,7 +10,7 @@ Esta versão foi implementada em `codeforge/` e é usada por um único estudante
 | Azure TTS pré-gerado com timestamps (Fase 3 §5) | **Web Speech API** do navegador; destaque por palavra via eventos `boundary` + CSS Custom Highlight API | Gratuito. A qualidade da voz depende do sistema (no Edge e no Chrome há vozes pt-BR naturais) |
 | Tutor de IA com cotas (Fase 3 §4) | Opcional, liga só com `ANTHROPIC_API_KEY` | A API da Anthropic é paga por uso |
 | Schema de 43 tabelas (`db/schema.sql`) | 5 tabelas: `chapter_progress`, `stars`, `highlights`, `notes`, `code_drafts` (`codeforge/src/db/index.ts`) | Sem usuários, pagamentos nem IA com histórico |
-| Neon / Upstash / R2 / Inngest | PGlite local ou Neon Free; sem Redis, filas nem storage | Nada disso é necessário para um usuário |
+| Vercel / Neon / Upstash / R2 / Inngest | PGlite local; em produção, Azure Container Apps com Azure Database for PostgreSQL (driver `node-postgres`); sem Redis, filas nem storage | Nada disso é necessário para um usuário |
 | Nav manifest + bitset (Fase 1 §6) | Sidebar completa no HTML | O catálogo pessoal é pequeno; volta a valer se passar de centenas de capítulos |
 
 O design system (Fase 2) foi aplicado integralmente: os mesmos `tokens.css`, temas e preferências de leitura.
@@ -25,4 +25,4 @@ O design system (Fase 2) foi aplicado integralmente: os mesmos `tokens.css`, tem
   - JavaScript resolve Move Zeroes (in-place) com 4/4, e a sidebar marca o capítulo como concluído.
   - Quiz, tema escuro persistente entre páginas e caderno funcionam.
   - Nenhum erro no console. No celular (390px) não há rolagem horizontal.
-- **Não verificado:** a voz do áudio (o navegador de teste não tem saída de som) e a conexão com o Neon (exige uma conta). O caminho Neon usa o driver oficial `drizzle-orm/neon-http`, mas não foi executado.
+- **Não verificado:** a voz do áudio (o navegador de teste não tem saída de som).
