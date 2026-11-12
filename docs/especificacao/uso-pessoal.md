@@ -5,7 +5,7 @@ Esta versão foi implementada em `codeforge/` e é usada por um único estudante
 | Especificação original | Versão pessoal | Motivo |
 |---|---|---|
 | Passes Mensal/Anual/Vitalício, Stripe, Pix, paywall e entitlements (Fase 3 §6, Fase 4) | **Removidos.** Todo conteúdo é liberado | Uso individual |
-| Better Auth, sessões por dispositivo e limite de dispositivos | Senha única (`APP_PASSWORD`) com cookie HttpOnly | Um usuário só |
+| Better Auth, sessões por dispositivo e limite de dispositivos | Auth próprio: e-mail e senha (Argon2), sessão no banco com cookie HttpOnly, cadastro com confirmação por link e redefinição de senha por e-mail (`src/server/auth/`) | Sem limite de dispositivos; o cadastro é controlado por `REGISTRATION_OPEN`/`REGISTRATION_ALLOWLIST` |
 | Judge0 em VPC isolada (Fase 3 §3) | Execução **no navegador**: Pyodide (Python) e Web Worker (JS), com timeout por `terminate()` | Custo zero; o código é seu, então o risco de código hostil é seu também |
 | Azure TTS pré-gerado com timestamps (Fase 3 §5) | **Web Speech API** do navegador; destaque por palavra via eventos `boundary` + CSS Custom Highlight API | Gratuito. A qualidade da voz depende do sistema (no Edge e no Chrome há vozes pt-BR naturais) |
 | Tutor de IA com cotas (Fase 3 §4) | Opcional, liga só com `ANTHROPIC_API_KEY` | A API da Anthropic é paga por uso |

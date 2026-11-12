@@ -22,7 +22,9 @@ npm install
 npm run dev
 ```
 
-Abra http://localhost:3000. Defina `APP_PASSWORD` no `.env.local` (sem ela o app fica fechado). Sem `DATABASE_URL`, os dados ficam num Postgres embutido em `.data/pglite`; com ela, no Postgres indicado.
+Copie `.env.example` para `.env.local` e defina ao menos `APP_URL=http://localhost:3000` (obrigatória: o servidor não sobe sem ela). Sem `DATABASE_URL` (ou com ela vazia), os dados ficam num Postgres embutido em `.data/pglite`; com ela, no Postgres indicado. Se o `.env.local` apontar para o banco de produção, rode `DATABASE_URL= npm run dev` para usar o PGlite.
+
+Abra http://localhost:3000. O login é por e-mail e senha, com sessão guardada no banco (`src/server/auth/`, rotas em `src/app/api/auth/`). O cadastro vem fechado: libere com `REGISTRATION_OPEN=true` ou com `REGISTRATION_ALLOWLIST=seu@email`. Sem `ACS_CONNECTION_STRING`/`MAIL_FROM`, em desenvolvimento os links de confirmação de cadastro e de redefinição de senha aparecem no console do `npm run dev`.
 
 ## Backup e migração do progresso
 
@@ -39,19 +41,22 @@ Sem `DATABASE_URL` o script usa o PGlite local; com ela, esse Postgres. Para esc
 Produção roda no **Azure Container Apps** (região Chile Central) com **Azure Database for PostgreSQL** (Flexible Server, B1ms).
 
 - **Deploy:** cada push na `main` dispara `.github/workflows/azure.yml`, que gera a imagem Docker (`Dockerfile`, build `standalone`), publica em `ghcr.io/marcosrbjunior/codeforge` e atualiza o Container App. O login na Azure é por OIDC (identidade `gh-codeforge-deploy`, papel Contributor só no grupo `rg-codeforge`); o repositório guarda apenas `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` e `AZURE_SUBSCRIPTION_ID`.
-- **Segredos do app:** `DATABASE_URL` e `APP_PASSWORD` ficam como segredos do Container App (`az containerapp secret set`). Localmente, ficam em `.env.azure` (fora do git).
+- **Segredos do app:** `DATABASE_URL` e `ACS_CONNECTION_STRING` ficam como segredos do Container App (`az containerapp secret set`); o app também precisa de `APP_URL` e, para enviar e-mail, `MAIL_FROM`. Localmente, ficam em `.env.azure` (fora do git).
 - **Banco:** firewall libera os serviços da Azure e o IP de quem administra. Se o seu IP mudar, adicione-o: `az postgres flexible-server firewall-rule create -g rg-codeforge -s <servidor> -n meu-ip --start-ip-address <ip> --end-ip-address <ip>`.
-- **Testar a imagem localmente:** `docker build -t codeforge . && docker run -p 3000:3000 -e APP_PASSWORD=... -e PGLITE_DIR=/tmp/pglite codeforge`.
+- **Testar a imagem localmente:** `docker build -t codeforge . && docker run -p 3000:3000 -e APP_URL=http://localhost:3000 -e PGLITE_DIR=/tmp/pglite codeforge`. A imagem roda em modo produção, então sem ACS os e-mails de confirmação não são enviados (nem escritos no console).
 
 ## Variáveis de ambiente
 
 | Variável | Para quê | Padrão |
 |---|---|---|
-| `DATABASE_URL` | Postgres (Azure em produção; use `?sslmode=verify-full`) | ausente = PGlite local em `.data/pglite` |
-| `APP_PASSWORD` | Senha do app (obrigatória) | ausente = app fechado (503) |
+| `APP_URL` | Origem pública do app, sem barra no final (checagem de Origin contra CSRF e links dos e-mails). **Obrigatória** | nenhum: o servidor não sobe sem ela |
+| `DATABASE_URL` | Postgres (Azure em produção; use `?sslmode=verify-full`) | ausente ou vazia = PGlite local |
+| `PGLITE_DIR` | Pasta do PGlite | `.data/pglite` |
+| `REGISTRATION_OPEN` | `true` abre o cadastro para qualquer e-mail | fechado |
+| `REGISTRATION_ALLOWLIST` | E-mails liberados para cadastro, separados por vírgula | vazia |
 | `JUDGE0_URL` | Serviço que compila Java, C++, C# e Go | `https://ce.judge0.com` (instância pública gratuita) |
 | `JUDGE0_TOKEN` | Token, se a instância exigir | ausente |
-| `ACS_CONNECTION_STRING` | Azure Communication Services (e-mail de redefinição de senha); segredo `acs-connection-string` no Container App | ausente: produção não envia, dev escreve o link no console |
+| `ACS_CONNECTION_STRING` | Azure Communication Services (e-mails de confirmação de cadastro e de redefinição de senha); segredo `acs-connection-string` no Container App | ausente: produção não envia, dev escreve o link no console |
 | `MAIL_FROM` | Remetente, do domínio gerenciado pela Azure (`DoNotReply@<guid>.azurecomm.net`) | ausente |
 | `ANTHROPIC_API_KEY` | Liga o Tutor de IA. **É pago por uso**, então fica desligado por padrão | ausente = botão do tutor escondido |
 
