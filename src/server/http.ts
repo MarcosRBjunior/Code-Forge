@@ -31,7 +31,11 @@ export function noContent(): NextResponse {
 export function toErrorResponse(err: unknown): NextResponse {
   if (AppError.is(err)) return errorResponse(err);
   if (err instanceof ZodError) return errorResponse(validationError(err));
-  console.error("erro não tratado na API", err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err);
+  // Uma linha só (o stack vai com \n escapado): no Log Analytics cada linha do console vira um registro.
+  console.error(
+    "erro não tratado na API " +
+      JSON.stringify(err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : { error: String(err) }),
+  );
   return errorResponse(new AppError("INTERNAL", 500, "Erro interno. Tente novamente."));
 }
 

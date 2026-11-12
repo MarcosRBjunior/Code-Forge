@@ -73,7 +73,7 @@ export class PasswordResetService {
 
   /** Troca a senha, consome o token e revoga TODAS as sessões. Qualquer falha de token: 400 INVALID_RESET_TOKEN. */
   async resetPassword(input: ResetPasswordInput): Promise<void> {
-    const { db, sessions } = this.deps;
+    const { db, sessions, mailer, appUrl, defer, logger } = this.deps;
     if (!isWellFormedToken(input.token)) throw Errors.invalidResetToken();
     const tokenHash = hashToken(input.token);
     const now = this.clock();
@@ -88,7 +88,7 @@ export class PasswordResetService {
     if (!candidate) throw Errors.invalidResetToken();
     const passwordHash = await hashPassword(input.password);
 
-    await db.transaction(async (tx) => {
+    const user = await db.transaction(async (tx) => {
       // Consumo atômico: de dois pedidos simultâneos com o mesmo token, só um passa.
       const [claimed] = await tx
         .update(passwordResetTokens)
@@ -97,9 +97,24 @@ export class PasswordResetService {
         .returning({ userId: passwordResetTokens.userId });
       if (!claimed) throw Errors.invalidResetToken();
 
-      await tx.update(users).set({ passwordHash }).where(eq(users.id, claimed.userId));
+      const [changed] = await tx
+        .update(users)
+        .set({ passwordHash })
+        .where(eq(users.id, claimed.userId))
+        .returning({ email: users.email, name: users.name });
       await sessions.revokeAllForUser(claimed.userId, tx);
+      return changed;
     });
+
+    // Aviso ao dono, depois da resposta; falha no envio só vai para o log.
+    if (user) {
+      const mail = { to: user.email, name: user.name, changedAt: now, forgotUrl: `${appUrl}/forgot-password` };
+      defer(() =>
+        mailer.sendPasswordChanged(mail).catch((err: unknown) => {
+          logger.error("password-reset: falha ao enviar aviso de senha alterada", { error: describe(err) });
+        }),
+      );
+    }
   }
 }
 

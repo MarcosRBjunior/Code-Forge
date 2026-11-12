@@ -38,7 +38,16 @@ async function build(): Promise<AuthContainer> {
     rateLimiter,
     production,
     auth: new AuthService({ db, sessions, rateLimiter }),
-    account: new AccountService({ db, sessions, rateLimiter }),
+    account: new AccountService({
+      db,
+      sessions,
+      rateLimiter,
+      mailer,
+      logger: consoleLogger,
+      appUrl: env.APP_URL,
+      defer,
+      clock: systemClock,
+    }),
     registration: new RegistrationService({
       db,
       sessions,

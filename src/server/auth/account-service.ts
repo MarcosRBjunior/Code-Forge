@@ -15,12 +15,19 @@ import { Errors } from "@/server/errors";
 import { hashPassword, verifyPassword } from "./password";
 import { emailSubject, enforceRateLimits, RATE_LIMITS, type RateLimiter, type RateLimitRule } from "./rate-limit";
 import type { SessionService } from "./session-service";
-import type { AuthDb } from "./deps";
+import type { MailService } from "./mail";
+import { systemClock, type AuthDb, type Clock, type Defer, type Logger } from "./deps";
 
 export interface AccountServiceDeps {
   db: AuthDb;
   sessions: SessionService;
   rateLimiter: RateLimiter;
+  mailer: MailService;
+  logger: Logger;
+  /** Origem pública (APP_URL), para o link de "esqueci minha senha" no aviso de troca. */
+  appUrl: string;
+  defer: Defer;
+  clock?: Clock;
 }
 
 /** Quem está agindo: o usuário da sessão e a própria sessão (a que continua aberta na troca de senha). */
@@ -64,6 +71,22 @@ export class AccountService {
       await sessions.revokeOthersForUser(user.id, actor.sessionId, tx);
       await tx.delete(passwordResetTokens).where(eq(passwordResetTokens.userId, user.id));
     });
+
+    // Aviso ao dono, depois da resposta; falha no envio só vai para o log.
+    const { mailer, logger, appUrl, defer } = this.deps;
+    const mail = {
+      to: user.email,
+      name: user.name,
+      changedAt: (this.deps.clock ?? systemClock)(),
+      forgotUrl: `${appUrl}/forgot-password`,
+    };
+    defer(() =>
+      mailer.sendPasswordChanged(mail).catch((err: unknown) => {
+        logger.error("account: falha ao enviar aviso de senha alterada", {
+          error: err instanceof Error ? `${err.name}: ${err.message}` : "erro desconhecido",
+        });
+      }),
+    );
   }
 
   /**
@@ -89,7 +112,7 @@ export class AccountService {
     const { db, rateLimiter } = this.deps;
     await enforceRateLimits(rateLimiter, [[rule, userId]]);
     const [user] = await db
-      .select({ id: users.id, email: users.email, passwordHash: users.passwordHash })
+      .select({ id: users.id, email: users.email, name: users.name, passwordHash: users.passwordHash })
       .from(users)
       .where(eq(users.id, userId))
       .limit(1);

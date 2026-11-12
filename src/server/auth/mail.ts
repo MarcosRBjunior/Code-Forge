@@ -22,11 +22,21 @@ export interface AccountExistsMail {
   forgotUrl: string;
 }
 
+/** Aviso ao dono de que a senha da conta mudou (troca na página de conta ou pelo link de redefinição). */
+export interface PasswordChangedMail {
+  to: string;
+  name: string;
+  changedAt: Date;
+  /** Link de "esqueci minha senha", para quem não reconhecer a troca. */
+  forgotUrl: string;
+}
+
 /** Contrato de envio. Implementações: AcsMailService (produção), ConsoleMailService (dev), DisabledMailService. */
 export interface MailService {
   sendPasswordReset(mail: PasswordResetMail): Promise<void>;
   sendEmailVerification(mail: EmailVerificationMail): Promise<void>;
   sendAccountExists(mail: AccountExistsMail): Promise<void>;
+  sendPasswordChanged(mail: PasswordChangedMail): Promise<void>;
 }
 
 /**
@@ -49,6 +59,10 @@ export class ConsoleMailService implements MailService {
   async sendAccountExists({ to }: AccountExistsMail): Promise<void> {
     console.info(`[mail:dev] aviso de conta existente para ${to}`);
   }
+
+  async sendPasswordChanged({ to }: PasswordChangedMail): Promise<void> {
+    console.info(`[mail:dev] aviso de senha alterada para ${to}`);
+  }
 }
 
 /** Produção sem provedor de e-mail configurado: não envia e registra o fato, sem o link. */
@@ -65,6 +79,10 @@ export class DisabledMailService implements MailService {
 
   async sendAccountExists(): Promise<void> {
     this.logger.warn("mail: provedor não configurado; aviso de conta existente não enviado");
+  }
+
+  async sendPasswordChanged(): Promise<void> {
+    this.logger.warn("mail: provedor não configurado; aviso de senha alterada não enviado");
   }
 }
 
@@ -141,6 +159,24 @@ export function accountExistsMessage({ name, loginUrl, forgotUrl }: AccountExist
   return { subject, plainText, html };
 }
 
+/** Texto do aviso de senha alterada. */
+export function passwordChangedMessage({ name, changedAt, forgotUrl }: PasswordChangedMail): MailContent {
+  const quando = brasilia(changedAt, { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const subject = "Sua senha do CodeForge foi alterada";
+  const plainText = [
+    `Olá, ${name}.`,
+    "",
+    `A senha da sua conta no CodeForge foi alterada em ${quando} (horário de Brasília).`,
+    "Se foi você, não precisa fazer nada.",
+    `Se não foi você, redefina a senha agora: ${forgotUrl}`,
+  ].join("\n");
+  const html = `<p>Olá, ${escapeHtml(name)}.</p>
+<p>A senha da sua conta no CodeForge foi alterada em ${quando} (horário de Brasília).</p>
+<p>Se foi você, não precisa fazer nada.</p>
+<p>Se não foi você, <a href="${escapeHtml(forgotUrl)}">redefina a senha agora</a>.</p>`;
+  return { subject, plainText, html };
+}
+
 /**
  * Azure Communication Services (Email). Remetente do domínio gerenciado pela Azure (DoNotReply@<guid>.azurecomm.net).
  * Roda depois da resposta (defer); falhas sobem para o service, que só registra o nome e a mensagem do erro.
@@ -161,6 +197,10 @@ export class AcsMailService implements MailService {
 
   sendAccountExists(mail: AccountExistsMail): Promise<void> {
     return this.send(mail.to, mail.name, accountExistsMessage(mail));
+  }
+
+  sendPasswordChanged(mail: PasswordChangedMail): Promise<void> {
+    return this.send(mail.to, mail.name, passwordChangedMessage(mail));
   }
 
   private async send(to: string, name: string, content: MailContent): Promise<void> {
