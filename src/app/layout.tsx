@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter, JetBrains_Mono, Literata } from "next/font/google";
 import Link from "next/link";
 import { PreferencesMenu } from "@/components/PreferencesMenu";
+import { UserMenu } from "@/components/UserMenu";
 import { NavMenu, ReviewCount } from "@/components/NavMenus";
 import { COURSE_GROUPS } from "@/lib/course-groups";
 import { getCourses } from "@/lib/content";
@@ -77,6 +78,7 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
             <div className="ml-auto flex items-center gap-2">
               <SearchDialog />
               <PreferencesMenu />
+              <UserMenu />
             </div>
           </HeaderGuard>
         </header>
