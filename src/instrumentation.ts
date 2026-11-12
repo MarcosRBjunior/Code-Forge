@@ -1,6 +1,9 @@
-/** Roda uma vez na subida do servidor Next: valida as variáveis de ambiente antes de atender requisições. */
+/**
+ * Roda uma vez na subida do servidor Next. O código só de Node (env, banco, limpeza periódica) fica em
+ * instrumentation-node.ts: com o import atrás do NEXT_RUNTIME, o bundle edge não puxa o driver do Postgres.
+ */
 export async function register() {
-  if (process.env.NEXT_RUNTIME !== "nodejs") return;
-  const { getEnv } = await import("@/server/env");
-  getEnv();
+  if (process.env.NEXT_RUNTIME === "nodejs") {
+    await import("./instrumentation-node");
+  }
 }
