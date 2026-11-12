@@ -57,7 +57,7 @@ export interface Course {
   description: string;
   level: string;
   order: number;
-  /** Seção do menu "Cursos": entrevistas, fundamentos, ia ou linguagens. */
+  /** Seção do menu "Cursos": entrevistas, fundamentos, ia, linguagens ou projetos. */
   group: CourseGroup;
   modules: CourseModule[];
   chapterCount: number;

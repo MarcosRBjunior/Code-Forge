@@ -1,0 +1,83 @@
+---
+title: Microsserviço agregador de logs
+kind: lesson
+---
+
+**Em uma frase:** um serviço que recebe logs estruturados de vários outros serviços por HTTP, guarda tudo com prazo de validade e deixa você buscar e visualizar esses logs num painel.
+
+**Nível:** avançado · **Tempo:** 3 a 4 semanas · **Pré-requisito:** uma API com banco de dados já publicada (por exemplo, o sistema de autenticação da Fase 1)
+
+## O que você vai construir
+
+Quando um sistema tem cinco serviços, abrir o terminal de cada um para descobrir por que um pedido falhou não funciona mais. O agregador resolve isso: cada serviço envia seus logs em JSON para um único endpoint, o agregador absorve picos sem cair, grava em lotes e oferece uma tela onde você filtra por serviço, nível, intervalo de tempo e texto.
+
+É uma versão pequena do que ferramentas de observabilidade fazem, e é aí que está o valor: você vai lidar com ingestão de alto volume, buffer, backpressure, escrita em lote e retenção, que são decisões de arquitetura de verdade, não só CRUD.
+
+## MVP
+
+- [ ] Endpoint `POST /ingest` que aceita um lote de logs em JSON, valida o formato e exige uma chave de API por serviço
+- [ ] Buffer em memória (ou fila) com escrita em lote no banco a cada N registros ou T milissegundos
+- [ ] Resposta `429` com `Retry-After` quando o buffer está cheio (backpressure)
+- [ ] Busca por serviço, nível, intervalo de tempo e texto, com paginação por cursor
+- [ ] Retenção automática: logs com mais de 7 dias são apagados
+- [ ] Painel com a lista filtrável e um gráfico de erros por minuto
+- [ ] README com diagrama da arquitetura, um script gerador de carga e um GIF do painel
+
+## Stack sugerida
+
+| Camada | Opção principal | Alternativa |
+|---|---|---|
+| Ingestão | Go ou Node.js (Fastify) | Python (FastAPI) |
+| Buffer/fila | Canal em memória + Redis Streams | RabbitMQ ou Kafka local |
+| Armazenamento | PostgreSQL com tabela particionada por dia | ClickHouse |
+| Painel | Next.js | React + Vite |
+
+## Fora do escopo
+
+Coleta automática de logs de arquivos (agentes como o Fluent Bit), alertas por e-mail, multi-tenant com cobrança, consultas em linguagem própria e alta disponibilidade com várias réplicas. Um processo de ingestão, um banco e um painel bastam para mostrar as ideias certas.
+
+## Etapas
+
+1. **Defina o contrato do log.** Campos obrigatórios (`timestamp`, `service`, `level`, `message`) e um campo livre `attrs` para o resto. Rejeite com `400` o que não segue o contrato: lixo na entrada vira lixo na busca.
+2. **Ingestão sem bloquear.** O handler valida, coloca os registros no buffer e responde `202 Accepted` na hora. Quem grava no banco é outro componente. Isso separa a latência de quem envia da latência do banco.
+3. **Escrita em lote.** Um consumidor esvazia o buffer quando junta 500 registros ou quando passam 200 ms, o que vier primeiro, e faz um único `INSERT` (ou `COPY`). Inserir linha a linha é o primeiro gargalo que você vai medir.
+4. **Backpressure.** O buffer tem tamanho máximo. Se encher, a ingestão devolve `429` e o cliente tenta de novo depois. É melhor recusar de forma explícita do que estourar a memória e perder tudo.
+5. **Particionamento e retenção.** Uma partição por dia transforma a retenção num `DROP` de partição antiga, que é instantâneo, em vez de um `DELETE` gigante que trava a tabela. Crie índices em `(service, timestamp)` e um índice de texto na mensagem.
+6. **Busca e painel.** Pagine por cursor usando `(timestamp, id)`: com milhões de linhas, `OFFSET` fica cada vez mais lento. O gráfico de erros por minuto é um `GROUP BY` sobre a janela pedida.
+7. **Prove com números.** Escreva um script que dispara milhares de logs por segundo e registre no README a vazão, a latência da ingestão e o que acontece quando o banco fica lento.
+
+O fluxo inteiro cabe num diagrama:
+
+```text
+serviço A ─┐
+serviço B ─┼─> POST /ingest ──> buffer (limite) ──> consumidor em lote ──> Postgres (partição/dia)
+serviço C ─┘        │ cheio? 429                                             │
+                                                     painel ──> API de busca ┘
+```
+
+<Callout type="tip" title="Decida a garantia de entrega">
+Buffer só em memória perde o que estava nele se o processo cair. Escreva no README qual garantia você oferece (no máximo uma vez ou pelo menos uma vez) e, se usar Redis Streams, explique como o consumidor confirma o lote só depois de gravá-lo.
+</Callout>
+
+## Extras para se destacar
+
+- SDK mínimo de cliente que agrupa logs localmente e reenvia com backoff exponencial.
+- Mascarar dados sensíveis (e-mails, tokens) na ingestão, antes de gravar.
+- Logs com `trace_id`, permitindo seguir uma requisição por vários serviços.
+- Comparar Postgres e ClickHouse com o mesmo gerador de carga e publicar o resultado.
+
+## O que este projeto mostra no portfólio
+
+"Eu sei projetar um serviço que aguenta carga: separei ingestão de escrita, tratei backpressure, gravei em lote e medi a vazão em vez de só supor."
+
+## Base no CodeForge
+
+- [Agregação de logs](/learn/system-design/agregacao-de-logs): o problema que este projeto resolve e as peças de uma solução real.
+- [Projetar logs distribuídos](/learn/system-design-interviews/logs-distribuidos): o mesmo sistema em escala de entrevista.
+- [Filas de mensagens](/learn/system-design/filas-de-mensagens) e [Produtor-consumidor](/learn/concorrencia/produtor-consumidor): o buffer entre ingestão e escrita.
+
+## Referências
+
+- [OpenTelemetry: logs](https://opentelemetry.io/docs/concepts/signals/logs/)
+- [PostgreSQL: particionamento de tabelas](https://www.postgresql.org/docs/current/ddl-partitioning.html)
+- [Redis Streams](https://redis.io/docs/latest/develop/data-types/streams/)

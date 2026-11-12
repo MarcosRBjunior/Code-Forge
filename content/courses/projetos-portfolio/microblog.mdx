@@ -1,0 +1,84 @@
+---
+title: "Microblog (estilo Twitter)"
+kind: lesson
+---
+
+**Em uma frase:** uma rede de posts curtos em que você segue pessoas, vê uma timeline com o que elas publicaram e curte posts, com paginação que não quebra quando chega coisa nova.
+
+**Nível:** avançado · **Tempo:** 4 a 5 semanas · **Pré-requisito:** autenticação de usuários e SQL com joins e índices
+
+## O que você vai construir
+
+Postar e listar posts é fácil. O projeto fica interessante na timeline: como montar, para cada pessoa, a lista dos posts mais recentes de quem ela segue, rápido, mesmo quando alguém tem milhares de seguidores? Essa pergunta é um clássico de entrevista de system design, e aqui você vai respondê-la com código, medição e um trade-off explicado no README.
+
+Use nome, logo e identidade visual próprios, e povoe o banco com usuários e textos fictícios gerados por um script.
+
+## MVP
+
+- [ ] Posts de até 280 caracteres, com exclusão pelo autor
+- [ ] Seguir e deixar de seguir, com contagem de seguidores e seguidos
+- [ ] Timeline com posts de quem você segue, do mais recente para o mais antigo
+- [ ] Curtir e descurtir, sem curtida duplicada e com contador
+- [ ] Paginação por cursor na timeline e no perfil (rolagem infinita)
+- [ ] Script de carga com milhares de usuários e um README comparando as duas estratégias de timeline
+
+## Stack sugerida
+
+| Camada | Opção principal | Alternativa |
+|---|---|---|
+| Front-end e API | Next.js | React + API em Go ou Node.js |
+| Banco | PostgreSQL | MySQL |
+| Cache de timelines | Redis (sorted sets) | Tabela `timeline_entries` no próprio Postgres |
+| Jobs | Fila com Redis (BullMQ) | Tabela de jobs com `SKIP LOCKED` |
+
+## Fora do escopo
+
+Respostas em thread, repost, mídia, mensagens diretas, trending topics, busca e recomendação por algoritmo. A timeline é cronológica e só de quem você segue. Já é bastante coisa.
+
+## Etapas
+
+1. **Modele o grafo.** `users`, `posts (id, author_id, created_at)`, `follows (follower_id, followee_id)` com chave primária composta, e `likes (user_id, post_id)` também com chave composta. As chaves compostas impedem seguir ou curtir duas vezes sem precisar de código extra.
+2. **Timeline na leitura (fan-out on read).** Comece pela versão mais simples: na hora de abrir a timeline, busque os posts dos autores que você segue, ordene por data e corte em 20. Com um índice em `(author_id, created_at)` isso funciona bem enquanto cada pessoa segue poucos perfis.
+3. **Paginação por cursor.** Em vez de `OFFSET`, o cliente devolve o `(created_at, id)` do último post que viu e você busca os anteriores a ele. Assim nada se repete nem some quando posts novos chegam no topo.
+
+```sql
+SELECT p.* FROM posts p
+JOIN follows f ON f.followee_id = p.author_id
+WHERE f.follower_id = $1
+  AND (p.created_at, p.id) < ($2, $3)
+ORDER BY p.created_at DESC, p.id DESC
+LIMIT 20;
+```
+
+4. **Timeline na escrita (fan-out on write).** Agora a alternativa: ao publicar, um job copia o id do post para a timeline pré-montada de cada seguidor (um sorted set por usuário no Redis). Ler vira uma consulta trivial; escrever passa a custar uma operação por seguidor.
+5. **Compare e decida.** Com o script de carga, meça a latência de leitura e o tempo de propagação nas duas estratégias. O problema clássico aparece com contas muito seguidas: fan-out na escrita para alguém com 100 mil seguidores gera 100 mil operações por post. A solução híbrida é fazer fan-out na escrita para contas comuns e misturar, na leitura, os posts das poucas contas gigantes.
+6. **Curtidas e contadores.** Insira na tabela `likes` e atualize o contador de forma atômica (`count = count + 1`) na mesma transação. Contadores aproximados em cache são um extra; o MVP precisa ser correto.
+7. **Exclusões e consistência.** Se um post é apagado, a timeline pré-montada ainda tem o id dele. Filtre ids inexistentes na hidratação e explique no README que a timeline é eventualmente consistente.
+
+| Estratégia | Leitura | Escrita | Problema |
+|---|---|---|---|
+| Fan-out na leitura | Cara (junta muitos autores) | Barata | Lenta para quem segue muita gente |
+| Fan-out na escrita | Barata (lista pronta) | Cara (uma cópia por seguidor) | Contas com muitos seguidores |
+| Híbrida | Barata na maioria dos casos | Limitada | Mais código para manter |
+
+## Extras para se destacar
+
+- Contagem de "novos posts" no topo, com atualização via Server-Sent Events.
+- Rate limiting para publicação e curtidas.
+- Contadores de curtidas agregados em lote para aguentar posts virais.
+- Testes de carga reproduzíveis com resultados em gráfico no README.
+
+## O que este projeto mostra no portfólio
+
+"Eu implementei as duas estratégias clássicas de timeline, medi as duas e consigo explicar com números quando cada uma vale a pena."
+
+## Base no CodeForge
+
+- [Projetar o Twitter](/learn/system-design-interviews/twitter) e [Projetar um feed de notícias](/learn/system-design-interviews/feed-de-noticias): fan-out e o problema das contas famosas.
+- [Projetar curtidas e comentários](/learn/system-design-interviews/curtidas): contadores sob carga.
+- [ORDER BY, LIMIT e OFFSET](/learn/sql/ordenacao-e-paginacao): por que `OFFSET` degrada e o cursor não.
+
+## Referências
+
+- [PostgreSQL: LIMIT e OFFSET](https://www.postgresql.org/docs/current/queries-limit.html)
+- [Redis: sorted sets](https://redis.io/docs/latest/develop/data-types/sorted-sets/)
