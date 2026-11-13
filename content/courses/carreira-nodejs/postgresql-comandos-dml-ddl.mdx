@@ -1,0 +1,282 @@
+---
+title: "PostgreSQL: Comandos DML e DDL"
+kind: lesson
+---
+
+Um ORM como Sequelize ou TypeORM esconde o SQL até o dia em que a migração gerada trava a tabela de produção, ou um `upsert` não faz o que você esperava. Nesse dia, quem conhece os comandos do PostgreSQL resolve em minutos. Os comandos se dividem em dois grupos: DDL (Data Definition Language), que define a estrutura (tabelas, colunas, restrições, índices), e DML (Data Manipulation Language), que mexe nos dados (inserir, atualizar, apagar). Este capítulo ensina os dois com o banco da API de livros e mostra como chamá-los do Node.js com segurança.
+
+**Você vai aprender:**
+
+- Criar tabelas com os tipos e restrições certos do PostgreSQL
+- Alterar a estrutura de uma tabela que já tem dados, sem surpresas
+- Inserir, atualizar e apagar dados com `RETURNING` e `ON CONFLICT`
+- Executar SQL a partir do Node.js com consultas parametrizadas
+- Organizar mudanças de estrutura em migrações versionadas
+
+## Preparando o ambiente
+
+Suba um PostgreSQL descartável com Docker e abra o `psql`, o cliente de linha de comando:
+
+```bash
+docker run --name pg-livros -e POSTGRES_PASSWORD=senha -e POSTGRES_DB=livros -p 5432:5432 -d postgres:17
+docker exec -it pg-livros psql -U postgres -d livros
+```
+
+Dentro do `psql`, alguns meta-comandos (começam com barra invertida e não são SQL) ajudam a explorar: `\dt` lista tabelas, `\d livros` descreve uma tabela, `\di` lista índices e `\q` sai.
+
+## DDL: criando a estrutura
+
+### Tipos que importam
+
+Escolher o tipo certo evita bugs e economiza espaço. Os mais usados numa API:
+
+| Necessidade | Tipo | Observação |
+|---|---|---|
+| Chave primária | `bigint generated always as identity` | Substitui o antigo `serial` |
+| Texto | `text` | Sem diferença de desempenho para `varchar(n)` |
+| Dinheiro | `numeric(10, 2)` | Nunca `real` ou `double precision` |
+| Data e hora | `timestamptz` | Guarda em UTC e converte pelo fuso da sessão |
+| Sim ou não | `boolean` | |
+| Dados flexíveis | `jsonb` | Indexável, use com moderação |
+| Identificador público | `uuid` | `gen_random_uuid()` já vem no PostgreSQL 13+ |
+
+### CREATE TABLE com restrições
+
+Restrições são regras que o banco garante sempre, não importa qual aplicação escreva nele. Elas são a última linha de defesa contra dado inválido.
+
+```sql
+CREATE TABLE autores (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  nome       text NOT NULL,
+  criado_em  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE livros (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  isbn        text NOT NULL UNIQUE,
+  titulo      text NOT NULL CHECK (length(titulo) > 0),
+  preco       numeric(10, 2) NOT NULL CHECK (preco >= 0),
+  estoque     integer NOT NULL DEFAULT 0 CHECK (estoque >= 0),
+  autor_id    bigint NOT NULL REFERENCES autores (id) ON DELETE RESTRICT,
+  criado_em   timestamptz NOT NULL DEFAULT now()
+);
+```
+
+O que cada restrição faz:
+
+- `PRIMARY KEY`: identifica a linha, implica `NOT NULL` e `UNIQUE`, e cria um índice.
+- `NOT NULL`: a coluna é obrigatória. Comece com tudo `NOT NULL` e libere só o que for opcional de verdade.
+- `UNIQUE`: não deixa repetir (dois livros com o mesmo ISBN). Também cria um índice.
+- `CHECK`: qualquer expressão booleana. Preço negativo vira erro no banco, mesmo que a validação da API falhe.
+- `REFERENCES ... ON DELETE`: a chave estrangeira. `RESTRICT` impede apagar um autor com livros; `CASCADE` apagaria os livros junto; `SET NULL` deixaria o livro sem autor (exigiria a coluna aceitar nulo).
+- `DEFAULT`: valor usado quando o `INSERT` não informa a coluna.
+
+O PostgreSQL **não** cria índice automaticamente na coluna da chave estrangeira. Como você vai filtrar livros por autor e o banco precisa checar a referência ao apagar um autor, crie o índice:
+
+```sql
+CREATE INDEX livros_autor_id_idx ON livros (autor_id);
+```
+
+### ALTER TABLE: mudando uma tabela com dados
+
+A estrutura muda ao longo da vida do projeto. Os comandos mais comuns:
+
+```sql
+ALTER TABLE livros ADD COLUMN paginas integer;
+ALTER TABLE livros ADD COLUMN ativo boolean NOT NULL DEFAULT true;
+ALTER TABLE livros RENAME COLUMN paginas TO num_paginas;
+ALTER TABLE livros ALTER COLUMN num_paginas SET DEFAULT 0;
+ALTER TABLE livros ADD CONSTRAINT livros_paginas_ck CHECK (num_paginas > 0);
+ALTER TABLE livros DROP COLUMN num_paginas;
+```
+
+Desde o PostgreSQL 11, adicionar uma coluna com `DEFAULT` constante é instantâneo, mesmo em tabelas enormes. Já tornar obrigatória uma coluna que existe exige cuidado: a tabela pode ter linhas com nulo. O caminho seguro é preencher antes e só depois aplicar a restrição:
+
+```sql
+ALTER TABLE livros ADD COLUMN idioma text;
+UPDATE livros SET idioma = 'pt-BR' WHERE idioma IS NULL;
+ALTER TABLE livros ALTER COLUMN idioma SET NOT NULL;
+```
+
+### DROP e TRUNCATE
+
+`DROP TABLE livros;` apaga a tabela e os dados. `TRUNCATE livros;` apaga todos os dados e mantém a estrutura, muito mais rápido que `DELETE` sem `WHERE`, porque não percorre linha a linha. Em ambiente de teste, `TRUNCATE livros, autores RESTART IDENTITY CASCADE;` zera tudo e reinicia os contadores, um comando útil antes de cada suíte de testes de integração.
+
+## DML: manipulando os dados
+
+### INSERT com RETURNING
+
+```sql
+INSERT INTO autores (nome) VALUES ('Machado de Assis'), ('José de Alencar')
+RETURNING id, nome;
+
+INSERT INTO livros (isbn, titulo, preco, estoque, autor_id)
+VALUES ('978-85-359-0277-1', 'Dom Casmurro', 39.90, 10, 1)
+RETURNING id, criado_em;
+```
+
+O `RETURNING` devolve as colunas da linha recém-inserida, incluindo as geradas pelo banco (id, defaults). Numa API, isso evita um segundo `SELECT` depois de cada `POST`.
+
+### Upsert com ON CONFLICT
+
+Importar um catálogo que pode ter livros repetidos é um caso clássico: insere se não existe, atualiza se existe. Fazer isso com um `SELECT` seguido de `INSERT` ou `UPDATE` tem condição de corrida entre duas requisições simultâneas. O `ON CONFLICT` resolve num único comando atômico:
+
+```sql
+INSERT INTO livros (isbn, titulo, preco, estoque, autor_id)
+VALUES ('978-85-359-0277-1', 'Dom Casmurro', 34.90, 5, 1)
+ON CONFLICT (isbn) DO UPDATE
+  SET preco   = EXCLUDED.preco,
+      estoque = livros.estoque + EXCLUDED.estoque
+RETURNING id, preco, estoque;
+```
+
+`EXCLUDED` é a linha que você tentou inserir. A coluna do `ON CONFLICT` precisa ter uma restrição `UNIQUE` ou ser chave primária. Para "insere se não existir, senão ignora", use `ON CONFLICT (isbn) DO NOTHING`.
+
+### UPDATE e DELETE
+
+```sql
+-- reajuste de 10% nos livros de um autor
+UPDATE livros SET preco = round(preco * 1.10, 2)
+WHERE autor_id = 1
+RETURNING titulo, preco;
+
+-- UPDATE usando outra tabela
+UPDATE livros l SET ativo = false
+FROM autores a
+WHERE l.autor_id = a.id AND a.nome = 'José de Alencar';
+
+-- baixa de estoque que nunca fica negativa
+UPDATE livros SET estoque = estoque - 1
+WHERE id = 1 AND estoque > 0
+RETURNING estoque;
+
+DELETE FROM livros WHERE ativo = false RETURNING isbn;
+```
+
+O terceiro comando é um padrão valioso: a condição `estoque > 0` no próprio `UPDATE` torna a operação atômica. Se duas compras simultâneas chegarem para o último exemplar, só uma atualiza a linha; a outra recebe zero linhas no `RETURNING` e a API responde "esgotado". Ler o estoque num `SELECT`, checar na aplicação e depois atualizar não tem essa garantia.
+
+<Callout type="warning" title="UPDATE e DELETE sem WHERE">
+Um `UPDATE livros SET preco = 0;` sem `WHERE` altera a tabela inteira, e o PostgreSQL não pede confirmação. Antes de rodar um comando destrutivo à mão, escreva primeiro o `SELECT` com o mesmo `WHERE` para ver quais linhas serão afetadas, e rode dentro de uma transação (`BEGIN;` ... confira ... `COMMIT;` ou `ROLLBACK;`). Em produção, prefira que esse tipo de correção passe por uma migração revisada.
+</Callout>
+
+## Do Node.js: consultas parametrizadas
+
+No Node.js, o driver padrão é o `pg` (node-postgres). Use um `Pool`, que reaproveita conexões, e passe os valores sempre como parâmetros (`$1`, `$2`...), nunca concatenados na string.
+
+```javascript
+// db.js
+import pg from "pg";
+
+export const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+
+export async function criarLivro({ isbn, titulo, preco, autorId }) {
+  const { rows } = await pool.query(
+    `INSERT INTO livros (isbn, titulo, preco, autor_id)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, isbn, titulo, preco`,
+    [isbn, titulo, preco, autorId]
+  );
+  return rows[0];
+}
+
+export async function venderUm(livroId) {
+  const { rowCount, rows } = await pool.query(
+    "UPDATE livros SET estoque = estoque - 1 WHERE id = $1 AND estoque > 0 RETURNING estoque",
+    [livroId]
+  );
+  return rowCount === 1 ? rows[0].estoque : null; // null = esgotado
+}
+```
+
+Com parâmetros, o valor viaja separado do comando, e o banco nunca o interpreta como SQL. Isso elimina SQL injection. A concatenação (`"... WHERE isbn = '" + isbn + "'"`) é a falha de segurança mais clássica de back-end.
+
+Erros de restrição chegam com um código que você pode traduzir para HTTP. Os mais úteis: `23505` (violação de `UNIQUE`), `23503` (violação de chave estrangeira) e `23514` (violação de `CHECK`).
+
+```javascript
+app.post("/livros", async (req, res) => {
+  try {
+    res.status(201).json(await criarLivro(req.body));
+  } catch (erro) {
+    if (erro.code === "23505") return res.status(409).json({ erro: "ISBN já cadastrado" });
+    if (erro.code === "23503") return res.status(422).json({ erro: "autor não existe" });
+    throw erro;
+  }
+});
+```
+
+## Migrações: DDL versionado
+
+Rodar `ALTER TABLE` à mão em cada ambiente não escala. Uma migração é um arquivo de DDL numerado, aplicado uma única vez em cada banco, e o banco guarda quais já rodaram. Ferramentas como as do Sequelize, TypeORM, Prisma ou `node-pg-migrate` fazem isso, mas o mecanismo cabe em poucas linhas:
+
+```javascript
+// migrar.js: aplica migrations/*.sql em ordem, uma vez cada
+import fs from "node:fs/promises";
+import { pool } from "./db.js";
+
+await pool.query(`CREATE TABLE IF NOT EXISTS migracoes (
+  nome text PRIMARY KEY, aplicada_em timestamptz NOT NULL DEFAULT now())`);
+
+const arquivos = (await fs.readdir("migrations")).filter((f) => f.endsWith(".sql")).sort();
+const { rows } = await pool.query("SELECT nome FROM migracoes");
+const aplicadas = new Set(rows.map((r) => r.nome));
+
+for (const arquivo of arquivos) {
+  if (aplicadas.has(arquivo)) continue;
+  const sql = await fs.readFile(`migrations/${arquivo}`, "utf8");
+  const cliente = await pool.connect();
+  try {
+    await cliente.query("BEGIN");
+    await cliente.query(sql);
+    await cliente.query("INSERT INTO migracoes (nome) VALUES ($1)", [arquivo]);
+    await cliente.query("COMMIT");
+    console.log("aplicada:", arquivo);
+  } catch (erro) {
+    await cliente.query("ROLLBACK");
+    throw erro;
+  } finally {
+    cliente.release();
+  }
+}
+await pool.end();
+```
+
+Um detalhe que pouca gente sabe: no PostgreSQL, quase todo DDL é transacional. Se a migração falhar no meio, o `ROLLBACK` desfaz também o `CREATE TABLE` e o `ALTER TABLE` que já tinham rodado. Em muitos outros bancos isso não acontece.
+
+## Na entrevista
+
+**Qual a diferença entre DDL e DML?** DDL define a estrutura (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`); DML manipula os dados (`INSERT`, `UPDATE`, `DELETE`, e o `SELECT` em muitas classificações).
+
+**Diferença entre DELETE sem WHERE e TRUNCATE?** Os dois esvaziam a tabela, mas o `TRUNCATE` não percorre linha a linha (é muito mais rápido), pode reiniciar a sequência de ids e não dispara triggers de linha.
+
+**Como fazer um upsert no PostgreSQL?** `INSERT ... ON CONFLICT (coluna_unica) DO UPDATE SET ...`, usando `EXCLUDED` para referenciar os valores propostos. É atômico, ao contrário de um `SELECT` seguido de `INSERT`.
+
+**Por que usar `numeric` para preço?** Porque `real` e `double precision` são ponto flutuante binário e acumulam erros de arredondamento; `numeric` é decimal exato.
+
+## Pratique
+
+Crie a pasta `migrations/` da API de livros e o `migrar.js`. Entregue:
+
+1. `001_autores_livros.sql` com as duas tabelas, restrições e o índice da chave estrangeira.
+2. `002_idioma.sql` que adiciona `idioma` como obrigatória numa tabela já populada, no padrão de três passos.
+3. Um script `importar.js` que lê um JSON com 200 livros (alguns repetidos) e usa `ON CONFLICT` para inserir ou atualizar preço, imprimindo quantos foram criados e quantos atualizados (dica: `RETURNING (xmax = 0) AS inserido`).
+4. A rota `POST /livros/:id/vender` usando o `UPDATE` atômico, devolvendo 409 quando esgotado, e um teste que dispara 20 compras simultâneas para um livro com estoque 5 e confirma exatamente 5 sucessos.
+
+<Quiz question="Qual comando adiciona com segurança uma coluna obrigatória numa tabela que já tem linhas?" options={["ADD COLUMN x text NOT NULL, sem valor padrão","ADD COLUMN, UPDATE para preencher, depois SET NOT NULL","DROP TABLE e recriar com a coluna nova","TRUNCATE e depois ADD COLUMN NOT NULL"]} answer={1} explanation="Sem default, o NOT NULL falharia pelas linhas existentes. Preencher antes e aplicar a restrição depois funciona sem perder dados." />
+
+<Quiz question="No ON CONFLICT DO UPDATE, a que se refere EXCLUDED.preco?" options={["Ao preço atual gravado na tabela","Ao preço da linha que se tentou inserir","Ao preço da linha apagada antes","Ao preço padrão definido na coluna"]} answer={1} explanation="EXCLUDED é a linha proposta pelo INSERT que entrou em conflito; o nome da tabela referencia a linha existente." />
+
+<Quiz question="Qual código de erro do PostgreSQL indica violação de UNIQUE e costuma virar HTTP 409?" options={["23505","23503","42P01","23514"]} answer={0} explanation="23505 é unique_violation. 23503 é chave estrangeira, 23514 é CHECK e 42P01 é tabela inexistente." />
+
+## Base no CodeForge
+
+- [Tipos e restrições](/learn/sql/tipos-e-restricoes): a teoria por trás dos tipos e constraints usados aqui.
+- [Modelo relacional](/learn/sql/modelo-relacional) e [Normalização](/learn/sql/normalizacao): como decidir quais tabelas criar.
+- [Transações e ACID](/learn/sql/transacoes-e-acid): o que garante o `BEGIN` e o `COMMIT` da migração.
+- [PostgreSQL: Administração e otimização do banco](/learn/carreira-nodejs/postgresql-administracao-otimizacao-banco): o próximo passo, cuidar do banco em produção.
+
+## Referências
+
+- [PostgreSQL: Data Definition](https://www.postgresql.org/docs/current/ddl.html)
+- [PostgreSQL: Data Manipulation](https://www.postgresql.org/docs/current/dml.html)
+- [PostgreSQL: ALTER TABLE](https://www.postgresql.org/docs/current/sql-altertable.html)
+- [node-postgres: Pooling](https://node-postgres.com/features/pooling)

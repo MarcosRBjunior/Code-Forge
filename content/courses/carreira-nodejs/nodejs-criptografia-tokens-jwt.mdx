@@ -1,0 +1,340 @@
+---
+title: "Node.js: Criptografia e tokens JWT"
+kind: lesson
+---
+
+Todo back-end lida com dados que não podem vazar nem ser adulterados: senhas, tokens de sessão, CPF, webhooks de pagamento. Para cada caso existe uma ferramenta criptográfica certa, e usar a errada (guardar senha com SHA-256, "criptografar" com Base64, confiar num token sem conferir a assinatura) é uma das causas mais comuns de incidentes. Neste capítulo você usa o módulo `node:crypto` para hash, HMAC, cifra simétrica e assimétrica, aprende a guardar senhas do jeito certo e entende o JWT por dentro antes de usar uma biblioteca para emiti-lo e validá-lo.
+
+**Você vai aprender:**
+
+- Diferenciar hash, HMAC, cifra simétrica e cifra assimétrica, e quando usar cada um
+- Guardar senhas com scrypt ou Argon2, com salt e comparação em tempo constante
+- Cifrar dados sensíveis com AES-256-GCM e assinar com Ed25519
+- Montar e validar um JWT, e evitar as armadilhas clássicas
+
+## O mapa
+
+| Ferramenta | Pergunta que responde | Reversível? | Exemplo |
+|---|---|---|---|
+| Hash (SHA-256) | "Esse conteúdo é igual ao original?" | Não | Checksum de arquivo, deduplicação |
+| Hash de senha (scrypt, Argon2) | "Essa senha confere?" | Não, e é lento de propósito | Login |
+| HMAC | "Quem tem a chave gerou isto, sem alteração?" | Não | Assinatura de webhook, JWT HS256 |
+| Cifra simétrica (AES-GCM) | "Só quem tem a chave lê" | Sim, com a chave | CPF no banco, cookies cifrados |
+| Assimétrica (RSA, Ed25519) | "Qualquer um verifica, só eu assino" | Assinatura: verificável | JWT RS256 ou EdDSA, chaves de API |
+
+E um esclarecimento: **Base64 não é criptografia**. É só uma codificação para transportar bytes como texto. Qualquer um decodifica.
+
+## Hash
+
+Uma função de hash transforma qualquer entrada numa saída de tamanho fixo. A mesma entrada sempre gera a mesma saída, e uma mudança mínima muda tudo.
+
+```javascript
+import { createHash } from "node:crypto";
+
+const sha = (texto) => createHash("sha256").update(texto).digest("hex");
+
+console.log(sha("livro"));  // 64 caracteres hexadecimais
+console.log(sha("livros")); // completamente diferente
+```
+
+Use hash para verificar integridade (o arquivo baixado é o publicado?) e para gerar chaves de cache ou de deduplicação. Não use hash simples para senhas: SHA-256 é rápido, e uma placa de vídeo testa bilhões de senhas por segundo contra ele.
+
+## HMAC: hash com chave
+
+HMAC combina hash com um segredo. Só quem tem o segredo produz o valor certo, então o receptor confirma origem e integridade. É assim que provedores de pagamento assinam webhooks.
+
+```javascript
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const SEGREDO = process.env.WEBHOOK_SECRET;
+
+export function assinar(corpo) {
+  return createHmac("sha256", SEGREDO).update(corpo).digest("hex");
+}
+
+export function assinaturaValida(corpo, assinaturaRecebida) {
+  const esperada = Buffer.from(assinar(corpo), "hex");
+  const recebida = Buffer.from(assinaturaRecebida ?? "", "hex");
+  return esperada.length === recebida.length && timingSafeEqual(esperada, recebida);
+}
+```
+
+```javascript
+// Express: precisa do corpo cru, exatamente como chegou
+app.post("/webhooks/pagamento", express.raw({ type: "application/json" }), (req, res) => {
+  if (!assinaturaValida(req.body, req.get("x-assinatura"))) return res.status(401).end();
+  const evento = JSON.parse(req.body.toString("utf8"));
+  // ... processa
+  res.status(204).end();
+});
+```
+
+Dois detalhes evitam falhas sutis. Primeiro, a assinatura é calculada sobre os **bytes originais**; se você fizer `JSON.parse` e `JSON.stringify` de novo, a ordem ou os espaços mudam e a assinatura não bate. Segundo, compare com `timingSafeEqual`: o `===` para no primeiro caractere diferente, e medindo o tempo de resposta um atacante descobre a assinatura byte a byte.
+
+## Senhas: scrypt e Argon2
+
+Para senhas você quer o contrário de rápido. Funções como **scrypt**, **Argon2id** e **bcrypt** são lentas e consomem memória de propósito, o que torna ataques de força bruta caros. E cada senha recebe um **salt** aleatório, para que duas pessoas com a mesma senha tenham hashes diferentes e tabelas pré-calculadas não sirvam.
+
+O scrypt vem no próprio Node:
+
+```javascript
+// src/seguranca/senha.js
+import { scrypt, randomBytes, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+
+const scryptAsync = promisify(scrypt);
+const TAMANHO = 64;
+
+export async function gerarHashSenha(senha) {
+  const salt = randomBytes(16);
+  const hash = await scryptAsync(senha.normalize("NFKC"), salt, TAMANHO);
+  return `scrypt$${salt.toString("base64")}$${hash.toString("base64")}`;
+}
+
+export async function verificarSenha(senha, armazenado) {
+  const [algoritmo, saltB64, hashB64] = armazenado.split("$");
+  if (algoritmo !== "scrypt") return false;
+  const esperado = Buffer.from(hashB64, "base64");
+  const calculado = await scryptAsync(senha.normalize("NFKC"), Buffer.from(saltB64, "base64"), esperado.length);
+  return timingSafeEqual(esperado, calculado);
+}
+```
+
+```javascript
+const guardado = await gerarHashSenha("correta-cavalo-bateria");
+console.log(guardado); // scrypt$Qk3...$9xZ...
+console.log(await verificarSenha("correta-cavalo-bateria", guardado)); // true
+console.log(await verificarSenha("errada", guardado));                 // false
+```
+
+O formato `algoritmo$salt$hash` guarda tudo o que é preciso para verificar e permite migrar de algoritmo no futuro: no login, se o prefixo for antigo, você verifica e regrava com o novo.
+
+A recomendação atual do OWASP é **Argon2id**. Em Node, use o pacote `argon2`:
+
+```javascript
+import argon2 from "argon2";
+
+const hash = await argon2.hash("correta-cavalo-bateria", { type: argon2.argon2id });
+// $argon2id$v=19$m=65536,t=3,p=4$...  (parâmetros e salt já embutidos)
+const confere = await argon2.verify(hash, "correta-cavalo-bateria");
+```
+
+Por que a versão assíncrona? scrypt e Argon2 levam dezenas de milissegundos de CPU. A versão síncrona travaria o event loop e todas as outras requisições esperariam. A assíncrona roda no pool de threads do libuv.
+
+## Cifra simétrica: AES-256-GCM
+
+Quando você precisa **ler o dado de volta** (CPF, token de integração de terceiros), use cifra simétrica. AES-256-GCM é o padrão: além de cifrar, autentica, ou seja, detecta se o texto cifrado foi alterado.
+
+```javascript
+// src/seguranca/cifra.js
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+
+const CHAVE = Buffer.from(process.env.CHAVE_DADOS, "base64"); // 32 bytes
+if (CHAVE.length !== 32) throw new Error("CHAVE_DADOS deve ter 32 bytes em base64");
+
+export function cifrar(textoPlano) {
+  const iv = randomBytes(12); // nunca reutilize o mesmo IV com a mesma chave
+  const cipher = createCipheriv("aes-256-gcm", CHAVE, iv);
+  const cifrado = Buffer.concat([cipher.update(textoPlano, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [iv, tag, cifrado].map((b) => b.toString("base64")).join(".");
+}
+
+export function decifrar(pacote) {
+  const [iv, tag, cifrado] = pacote.split(".").map((p) => Buffer.from(p, "base64"));
+  const decipher = createDecipheriv("aes-256-gcm", CHAVE, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(cifrado), decipher.final()]).toString("utf8");
+}
+```
+
+```bash
+# gerando uma chave
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
+```
+
+```javascript
+const guardado = cifrar("123.456.789-09");
+console.log(decifrar(guardado)); // 123.456.789-09
+// Alterar um caractere de guardado faz decifrar lançar erro na chamada final()
+```
+
+O IV (vetor de inicialização) não é segredo e vai junto com o dado, mas precisa ser único por cifragem. Repetir IV com a mesma chave no GCM quebra a segurança. A tag de autenticação é conferida no `final()`: se alguém mexer no dado, a decifragem falha em vez de devolver lixo.
+
+A chave fica fora do banco (variável de ambiente ou, melhor, um serviço de gerenciamento de chaves como o AWS KMS). Chave guardada ao lado do dado cifrado protege pouco.
+
+## Cifra assimétrica e assinaturas
+
+Na criptografia assimétrica há um par: a chave **privada** fica só com você; a **pública** pode ser distribuída. Para assinaturas, você assina com a privada e qualquer um verifica com a pública. Isso permite que vários serviços validem tokens sem ter o poder de emiti-los.
+
+```javascript
+import { generateKeyPairSync, sign, verify } from "node:crypto";
+
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+
+const mensagem = Buffer.from(JSON.stringify({ pedido: 42, valor: 99.9 }));
+const assinatura = sign(null, mensagem, privateKey); // Ed25519 não usa algoritmo de hash separado
+
+console.log(verify(null, mensagem, publicKey, assinatura)); // true
+
+// Exportando para guardar em arquivo ou variável de ambiente
+const pem = publicKey.export({ type: "spki", format: "pem" });
+console.log(pem);
+```
+
+RSA também é suportado (`generateKeyPairSync("rsa", { modulusLength: 2048 })`), com `publicEncrypt` e `privateDecrypt` para cifrar pequenos volumes. Na prática, cifra assimétrica é usada para trocar ou proteger uma chave simétrica, e o grosso dos dados vai com AES. É o que o TLS faz.
+
+## JWT por dentro
+
+Um JSON Web Token é uma string em três partes separadas por ponto: `header.payload.assinatura`, cada uma em Base64URL.
+
+- **Header:** o algoritmo, como `{"alg":"HS256","typ":"JWT"}`.
+- **Payload:** as **claims**. As registradas mais usadas são `sub` (de quem é o token), `exp` (expiração em segundos Unix), `iat` (emitido em), `iss` (emissor) e `aud` (para quem).
+- **Assinatura:** HMAC ou assinatura assimétrica de `header.payload`.
+
+Para tirar a mágica, aqui está um HS256 feito à mão:
+
+```javascript
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+
+function assinarJwt(payload, segredo) {
+  const corpo = `${b64url({ alg: "HS256", typ: "JWT" })}.${b64url(payload)}`;
+  const assinatura = createHmac("sha256", segredo).update(corpo).digest("base64url");
+  return `${corpo}.${assinatura}`;
+}
+
+function verificarJwt(token, segredo) {
+  const [h, p, s] = token.split(".");
+  const esperada = createHmac("sha256", segredo).update(`${h}.${p}`).digest();
+  const recebida = Buffer.from(s, "base64url");
+  if (esperada.length !== recebida.length || !timingSafeEqual(esperada, recebida)) throw new Error("assinatura inválida");
+  const payload = JSON.parse(Buffer.from(p, "base64url").toString());
+  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) throw new Error("token expirado");
+  return payload;
+}
+
+const token = assinarJwt({ sub: "17", papel: "leitor", exp: Math.floor(Date.now() / 1000) + 900 }, "segredo-de-teste");
+console.log(token);
+console.log(verificarJwt(token, "segredo-de-teste"));
+```
+
+Repare: o payload é só Base64URL. **Qualquer pessoa com o token lê o conteúdo.** A assinatura impede alteração, não leitura. Nunca coloque senha, CPF ou dados sensíveis num JWT.
+
+## JWT com biblioteca
+
+Em produção, use uma biblioteca mantida. A `jsonwebtoken` é a mais difundida em Express:
+
+```bash
+npm install jsonwebtoken
+```
+
+```javascript
+// src/seguranca/tokens.js
+import jwt from "jsonwebtoken";
+import { config } from "../config/env.js";
+
+const OPCOES = { algorithm: "HS256", issuer: "api-livros", audience: "app-livros" };
+
+export function emitirToken(usuario) {
+  return jwt.sign({ papel: usuario.papel }, config.JWT_SECRET, {
+    ...OPCOES,
+    subject: String(usuario.id),
+    expiresIn: "15m",
+  });
+}
+
+export function validarToken(token) {
+  return jwt.verify(token, config.JWT_SECRET, {
+    algorithms: ["HS256"],
+    issuer: OPCOES.issuer,
+    audience: OPCOES.audience,
+  });
+}
+```
+
+```javascript
+// Middleware de autenticação
+export function autenticar(req, res, next) {
+  const [tipo, token] = (req.get("authorization") ?? "").split(" ");
+  if (tipo !== "Bearer" || !token) return res.status(401).json({ erro: "Token ausente" });
+  try {
+    req.usuario = validarToken(token);
+    next();
+  } catch (erro) {
+    const mensagem = erro.name === "TokenExpiredError" ? "Token expirado" : "Token inválido";
+    res.status(401).json({ erro: mensagem });
+  }
+}
+```
+
+Para tokens assinados com chave assimétrica, ou para ambientes que não são Node (edge, navegador), a biblioteca `jose` implementa o padrão completo com Web Crypto:
+
+```javascript
+import { SignJWT, jwtVerify, generateKeyPair } from "jose";
+
+const { privateKey, publicKey } = await generateKeyPair("EdDSA");
+
+const token = await new SignJWT({ papel: "admin" })
+  .setProtectedHeader({ alg: "EdDSA" })
+  .setSubject("17")
+  .setIssuedAt()
+  .setExpirationTime("15m")
+  .sign(privateKey);
+
+const { payload } = await jwtVerify(token, publicKey, { algorithms: ["EdDSA"] });
+```
+
+Com assimétrico, só o serviço de autenticação tem a chave privada. Os outros serviços recebem a pública (muitas vezes por um endpoint JWKS) e validam sem conseguir emitir.
+
+<Callout type="warning" title="Confiar no alg do próprio token">
+O ataque mais conhecido contra JWT explora bibliotecas que usam o algoritmo informado no header do token. Um atacante manda `alg: none` (sem assinatura) ou troca RS256 por HS256 usando a chave pública como segredo HMAC. A defesa é sempre fixar a lista de algoritmos aceitos na verificação, como em `algorithms: ["HS256"]`, e nunca decodificar o token com `jwt.decode` para tomar decisões de acesso: `decode` não verifica nada.
+</Callout>
+
+## Escolhas de projeto com JWT
+
+- **Expiração curta.** Token de acesso de 5 a 15 minutos. Como o JWT é validado sem consultar o banco, revogar antes de expirar é difícil; vida curta limita o estrago.
+- **Refresh token** de vida longa, opaco (um valor aleatório guardado com hash no banco), trocado por um novo a cada uso. Assim dá para revogar sessões. O próximo capítulo implementa isso.
+- **Segredo forte.** Para HS256, pelo menos 32 bytes aleatórios (`randomBytes(32)`), não uma palavra.
+- **Onde guardar no cliente.** Em aplicações web, cookie `HttpOnly`, `Secure` e `SameSite` protege de roubo por XSS. Em `localStorage`, qualquer script injetado lê o token.
+
+## Na entrevista
+
+**Por que não usar SHA-256 para senhas?** Porque é rápido: um atacante com o banco vazado testa bilhões de candidatos por segundo. Funções de senha como Argon2id, scrypt e bcrypt são lentas, usam salt único por senha e, no caso de Argon2 e scrypt, exigem muita memória, o que encarece ataques em GPU.
+
+**JWT é criptografado?** Um JWT comum (JWS) é só assinado: o conteúdo é legível em Base64URL. Existe o JWE, que cifra, mas é menos usado. Não se coloca dado sensível no payload.
+
+**Qual a diferença entre HS256 e RS256?** HS256 usa um segredo compartilhado: quem valida também consegue emitir. RS256 e EdDSA usam par de chaves: só quem tem a privada emite, qualquer um com a pública valida. Em vários serviços, assimétrico é mais seguro.
+
+**Por que comparar assinaturas com timingSafeEqual?** Porque a comparação comum para no primeiro byte diferente, e o tempo de resposta vaza quantos bytes estavam certos. A comparação em tempo constante leva o mesmo tempo sempre.
+
+## Pratique
+
+Crie um módulo `src/seguranca` na API de livros e entregue:
+
+1. `senha.js` com scrypt (ou Argon2id), salt, formato com prefixo de algoritmo e testes cobrindo senha certa, errada e hash adulterado.
+2. `cifra.js` com AES-256-GCM e um teste provando que alterar um byte faz a decifragem falhar.
+3. Uma rota de webhook que valida HMAC sobre o corpo cru.
+4. `tokens.js` emitindo JWT com `sub`, `iss`, `aud` e `exp` de 15 minutos, e o middleware `autenticar`.
+5. Um teste que monta um token com `alg: none` à mão e confirma que a API responde 401.
+
+<Quiz question="Qual a melhor escolha para guardar senhas de usuários?" options={["SHA-256 com salt fixo","AES-256-GCM com chave no .env","Argon2id com salt aleatório por senha","Base64 da senha com pepper"]} answer={2} explanation="Argon2id é lento e exige memória de propósito, com salt único por senha. Hash rápido facilita força bruta e cifra é reversível, o que não se quer para senhas." />
+
+<Quiz question="Quem tem um JWT HS256 válido em mãos consegue fazer o quê sem o segredo?" options={["Ler o payload, mas não alterá-lo sem invalidar","Alterar o payload mantendo a assinatura","Nada, o payload é cifrado","Gerar novos tokens para outros usuários"]} answer={0} explanation="O payload é Base64URL e pode ser lido por qualquer um. A assinatura impede alterações, porque só quem tem o segredo recalcula o HMAC." />
+
+<Quiz question="O que acontece se você reutilizar o mesmo IV com a mesma chave em AES-GCM?" options={["Nada, o IV é público","A cifra fica mais lenta","A segurança é quebrada, podendo expor dados e permitir falsificação","A tag de autenticação fica maior"]} answer={2} explanation="No GCM, repetir IV com a mesma chave compromete confidencialidade e autenticidade. O IV pode ser público, mas precisa ser único por cifragem." />
+
+## Base no CodeForge
+
+- [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas): a teoria por trás de salt, pepper e funções lentas.
+- [JWT](/learn/system-design/jwt) e [Sessão vs token](/learn/system-design/sessao-vs-token): quando usar token e quando usar sessão.
+- [Criptografia em repouso](/learn/system-design/criptografia-em-repouso) e [TLS](/learn/redes/tls): onde AES e chaves assimétricas aparecem na infraestrutura.
+- [Node.js: Criando API Rest com autenticação, perfis de usuários e permissões](/learn/carreira-nodejs/nodejs-criando-api-rest-autenticacao-perfis-usuarios): o próximo passo, usando tudo isto num login completo.
+
+## Referências
+
+- [Node.js: Crypto](https://nodejs.org/api/crypto.html)
+- [RFC 7519: JSON Web Token](https://datatracker.ietf.org/doc/html/rfc7519)
+- [OWASP: Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+- [jose](https://github.com/panva/jose)

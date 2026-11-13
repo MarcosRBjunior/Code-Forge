@@ -1,0 +1,382 @@
+---
+title: "Infraestrutura como código: Separando ambientes na AWS com Ansible e Terraform"
+kind: lesson
+---
+
+No capítulo anterior você subiu uma EC2 com Terraform e a provisionou com Ansible. Funciona, mas é um ambiente só. Na vida real a API de livros precisa de pelo menos dois: desenvolvimento (onde você testa mudanças sem medo) e produção (onde está o usuário). Copiar a pasta inteira e trocar valores na mão é o caminho mais rápido para o dia em que alguém roda `terraform destroy` achando que estava em dev. Este capítulo mostra como organizar Terraform e Ansible para que cada ambiente seja o mesmo código com parâmetros diferentes, com estado isolado e sem chance de um respingar no outro.
+
+**Você vai aprender:**
+
+- Transformar a configuração em um módulo Terraform reutilizável
+- Separar ambientes com pastas por ambiente e estado remoto isolado no S3
+- Quando usar (e quando evitar) `terraform workspace`
+- Organizar inventários e variáveis do Ansible por ambiente
+- Ligar a saída do Terraform à entrada do Ansible sem copiar IP na mão
+
+## O que muda entre ambientes
+
+Antes de escrever código, liste o que de fato varia. Para a API de livros, a lista costuma ser curta:
+
+| Item | dev | prod |
+| --- | --- | --- |
+| Tipo de instância | `t3.micro` | `t3.small` |
+| Quantidade de máquinas | 1 | 2 |
+| Porta liberada para SSH | o seu IP | ninguém (só SSM) |
+| `NODE_ENV` | `development` | `production` |
+| Nível de log | `debug` | `info` |
+
+Todo o resto (imagem base, pacotes, versão do Node, como o serviço é configurado) deve ser **idêntico**. Esse é o ponto: se dev e prod divergem em coisas que não deviam, o teste em dev deixa de provar algo sobre prod. Essa ideia tem nome, paridade de ambientes, e o código vai refletir isso: uma única definição da infraestrutura, recebendo só os valores da tabela.
+
+## Extraindo um módulo Terraform
+
+Um módulo é só uma pasta com arquivos `.tf` que recebe variáveis e expõe saídas. A configuração que você escreveu antes vira o módulo `app`. Estrutura final do repositório de infraestrutura:
+
+```text
+infra/
+├── modules/
+│   └── app/
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
+├── envs/
+│   ├── dev/
+│   │   ├── main.tf
+│   │   └── backend.tf
+│   └── prod/
+│       ├── main.tf
+│       └── backend.tf
+└── ansible/
+    ├── inventories/
+    │   ├── dev/
+    │   └── prod/
+    ├── roles/
+    │   └── api_livros/
+    └── site.yml
+```
+
+As variáveis do módulo declaram o que pode mudar, com tipo e validação:
+
+```hcl
+# modules/app/variables.tf
+variable "ambiente" {
+  type = string
+  validation {
+    condition     = contains(["dev", "prod"], var.ambiente)
+    error_message = "ambiente deve ser dev ou prod."
+  }
+}
+
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"
+}
+
+variable "quantidade" {
+  type    = number
+  default = 1
+}
+
+variable "ssh_cidrs" {
+  type    = list(string)
+  default = []
+}
+```
+
+O `main.tf` do módulo usa essas variáveis e marca tudo com o nome do ambiente. As tags não são enfeite: são elas que o inventário dinâmico do Ansible e o relatório de custos vão usar.
+
+```hcl
+# modules/app/main.tf
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+}
+
+resource "aws_security_group" "api" {
+  name = "api-livros-${var.ambiente}"
+
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  dynamic "ingress" {
+    for_each = length(var.ssh_cidrs) > 0 ? [1] : []
+    content {
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = var.ssh_cidrs
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_instance" "api" {
+  count                  = var.quantidade
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  vpc_security_group_ids = [aws_security_group.api.id]
+  key_name               = "api-livros"
+
+  tags = {
+    Name     = "api-livros-${var.ambiente}-${count.index}"
+    Ambiente = var.ambiente
+    Projeto  = "api-livros"
+  }
+}
+```
+
+```hcl
+# modules/app/outputs.tf
+output "ips_publicos" {
+  value = aws_instance.api[*].public_ip
+}
+```
+
+O bloco `dynamic` gera a regra de SSH só quando a lista não está vazia. Em prod você passa uma lista vazia e a porta 22 simplesmente não existe.
+
+## Uma pasta por ambiente
+
+Cada ambiente é uma configuração raiz pequena que chama o módulo com os seus valores:
+
+```hcl
+# envs/prod/main.tf
+terraform {
+  required_version = ">= 1.10"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+  default_tags {
+    tags = { GerenciadoPor = "terraform" }
+  }
+}
+
+module "app" {
+  source        = "../../modules/app"
+  ambiente      = "prod"
+  instance_type = "t3.small"
+  quantidade    = 2
+  ssh_cidrs     = []
+}
+
+output "ips" {
+  value = module.app.ips_publicos
+}
+```
+
+O `envs/dev/main.tf` é igual, trocando os quatro valores. Parece repetição, e é proposital: o arquivo de cada ambiente é curto, legível e mostra exatamente o que difere. Para aplicar, você entra na pasta:
+
+```bash
+cd infra/envs/dev
+terraform init
+terraform plan -out=plano.tfplan
+terraform apply plano.tfplan
+```
+
+Não existe comando que aplique em prod estando na pasta de dev. Esse isolamento físico é o maior benefício do modelo.
+
+## Estado remoto, um por ambiente
+
+O `terraform.tfstate` local do capítulo anterior não serve para equipe: fica no seu disco, ninguém mais vê, e duas pessoas aplicando ao mesmo tempo corrompem tudo. A solução é guardar o estado num bucket S3 com trava. Desde o Terraform 1.10, o backend S3 trava com um arquivo no próprio bucket (`use_lockfile`), sem precisar de tabela no DynamoDB.
+
+Crie o bucket uma vez (fora do Terraform que ele vai guardar, por exemplo pela CLI), com versionamento ligado para poder recuperar um estado antigo:
+
+```bash
+aws s3api create-bucket --bucket api-livros-tfstate-123456789012 --region us-east-1
+aws s3api put-bucket-versioning --bucket api-livros-tfstate-123456789012 \
+  --versioning-configuration Status=Enabled
+```
+
+Depois, cada ambiente aponta para uma chave diferente:
+
+```hcl
+# envs/prod/backend.tf
+terraform {
+  backend "s3" {
+    bucket       = "api-livros-tfstate-123456789012"
+    key          = "prod/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}
+```
+
+Em dev, `key = "dev/terraform.tfstate"`. Estados separados significam que um `apply` em dev nunca enxerga recursos de prod. Em empresas maiores, o passo seguinte é ter uma conta AWS por ambiente (via AWS Organizations), e então nem as credenciais de dev conseguem tocar em prod.
+
+<Callout type="warning" title="O estado tem segredos">
+O arquivo de estado guarda em texto puro tudo o que os recursos expõem, inclusive senhas de banco geradas pelo Terraform. Nunca faça commit de `*.tfstate` (coloque no `.gitignore`), deixe o bucket privado, com `encrypt = true` e acesso restrito a quem administra a infraestrutura.
+</Callout>
+
+## E os workspaces?
+
+O Terraform tem `terraform workspace new dev`, que cria estados separados para a mesma pasta, e `terraform.workspace` dentro do código para variar valores. É tentador, porque evita as pastas. Os problemas aparecem com o tempo: o ambiente ativo é invisível (está numa variável local, não no caminho onde você está), todos os ambientes compartilham o mesmo backend e as mesmas credenciais, e qualquer diferença estrutural entre dev e prod vira um monte de condicionais.
+
+Regra prática: workspaces servem bem para cópias **temporárias e idênticas** (um ambiente por pull request, por exemplo). Para ambientes permanentes com diferenças reais, prefira pastas por ambiente chamando um módulo.
+
+## Ansible por ambiente
+
+No Ansible, a separação é feita com um inventário por ambiente. Cada inventário tem os seus hosts e as suas variáveis de grupo:
+
+```text
+ansible/inventories/
+├── dev/
+│   ├── hosts.yml
+│   └── group_vars/
+│       └── all.yml
+└── prod/
+    ├── hosts.yml
+    └── group_vars/
+        └── all.yml
+```
+
+```yaml
+# ansible/inventories/prod/group_vars/all.yml
+node_env: production
+log_level: info
+node_major: 22
+app_port: 3000
+```
+
+```yaml
+# ansible/inventories/dev/group_vars/all.yml
+node_env: development
+log_level: debug
+node_major: 22
+app_port: 3000
+```
+
+O que é igual em todos os ambientes vai para `defaults/main.yml` da role, e o inventário só sobrescreve o que muda. A role da API usa as variáveis sem saber em que ambiente está:
+
+```yaml
+# ansible/roles/api_livros/tasks/main.yml
+- name: Criar arquivo de ambiente da API
+  ansible.builtin.template:
+    src: api.env.j2
+    dest: /etc/api-livros.env
+    mode: "0600"
+  notify: Reiniciar API
+
+- name: Instalar unidade systemd
+  ansible.builtin.template:
+    src: api-livros.service.j2
+    dest: /etc/systemd/system/api-livros.service
+  notify: Reiniciar API
+```
+
+```text
+# ansible/roles/api_livros/templates/api.env.j2
+NODE_ENV={{ node_env }}
+LOG_LEVEL={{ log_level }}
+PORT={{ app_port }}
+```
+
+E o ambiente é escolhido na linha de comando, de forma explícita:
+
+```bash
+ansible-playbook -i inventories/dev site.yml
+ansible-playbook -i inventories/prod site.yml --check --diff   # simula antes
+```
+
+## Ligando Terraform e Ansible
+
+Escrever IPs no `hosts.yml` à mão quebra na primeira vez que a máquina for recriada. Há dois caminhos bons.
+
+**Inventário dinâmico.** O plugin `amazon.aws.aws_ec2` consulta a AWS e monta os grupos a partir das tags que o Terraform colocou. O `hosts.yml` vira uma consulta:
+
+```yaml
+# ansible/inventories/prod/aws_ec2.yml
+plugin: amazon.aws.aws_ec2
+regions: [us-east-1]
+filters:
+  tag:Ambiente: prod
+  tag:Projeto: api-livros
+  instance-state-name: running
+keyed_groups:
+  - key: tags.Ambiente
+    prefix: amb
+compose:
+  ansible_host: public_ip_address
+```
+
+Instale a coleção com `ansible-galaxy collection install amazon.aws` e confira o resultado com `ansible-inventory -i inventories/prod --graph`. O nome do arquivo precisa terminar em `aws_ec2.yml` para o plugin ser reconhecido.
+
+**Gerar o arquivo a partir da saída.** Mais simples para começar: `terraform output -json ips` devolve a lista, e um script curto escreve o inventário.
+
+```bash
+cd infra/envs/dev
+terraform output -json ips | node -e '
+  const ips = JSON.parse(require("fs").readFileSync(0, "utf8"));
+  const hosts = Object.fromEntries(ips.map((ip) => [ip, {}]));
+  console.log(JSON.stringify({ all: { hosts } }, null, 2));
+' > ../../ansible/inventories/dev/hosts.json
+```
+
+O inventário dinâmico é a opção que escala; o arquivo gerado é útil para entender o fluxo.
+
+## Segredos por ambiente
+
+Senha do banco de prod não pode estar em texto puro no `group_vars`. Use o Ansible Vault para criptografar o arquivo de variáveis sensíveis de cada ambiente, com uma senha diferente por ambiente:
+
+```bash
+ansible-vault create inventories/prod/group_vars/vault.yml
+ansible-playbook -i inventories/prod site.yml --ask-vault-pass
+```
+
+Uma alternativa muito usada na AWS é guardar o segredo no SSM Parameter Store e deixar a própria aplicação (ou a task do Ansible com o lookup `amazon.aws.ssm_parameter`) buscá-lo em tempo de execução. Assim o segredo nunca passa pelo repositório.
+
+## Na entrevista
+
+**Como você separa ambientes no Terraform?** Um módulo com a infraestrutura e uma configuração raiz por ambiente que chama o módulo com valores próprios, cada uma com estado remoto em chave (ou conta) separada.
+
+**Por que não usar workspaces para dev e prod?** O ambiente ativo fica implícito, os ambientes dividem backend e credenciais, e diferenças estruturais viram condicionais. Workspaces são bons para cópias efêmeras idênticas.
+
+**Como o Ansible sabe quais máquinas configurar se elas são recriadas?** Inventário dinâmico filtrando por tags que o Terraform aplica, ou um inventário gerado a partir do `terraform output`.
+
+**Onde ficam os segredos?** Fora do Git em texto puro: Ansible Vault, SSM Parameter Store ou Secrets Manager, com acesso separado por ambiente.
+
+## Pratique
+
+Pegue a configuração do capítulo anterior e entregue um repositório `infra/` com:
+
+1. Um módulo `modules/app` com variáveis validadas para ambiente, tipo de instância e quantidade.
+2. Pastas `envs/dev` e `envs/prod`, cada uma com backend S3 em chave própria e `use_lockfile = true`.
+3. Inventários Ansible por ambiente usando o plugin `aws_ec2` filtrado pela tag `Ambiente`.
+4. Um README com os quatro comandos para subir dev do zero e o comando que destrói só dev.
+
+Prove o isolamento: aplique dev, rode `terraform state list` em prod e mostre que ele não lista nada de dev.
+
+<Quiz question="Qual a principal vantagem de usar uma pasta por ambiente em vez de workspaces para dev e prod?" options={["O ambiente fica explícito no caminho e cada um tem backend próprio","O Terraform roda mais rápido com várias pastas","Workspaces não suportam o provider da AWS","Pastas dispensam o uso de módulos"]} answer={0} explanation="Com pastas, você só aplica em prod estando na pasta de prod, e cada ambiente pode ter backend e credenciais separados. Workspaces deixam o ambiente ativo implícito." />
+<Quiz question="Para que serve use_lockfile = true no backend S3?" options={["Criptografar o estado no bucket","Impedir que dois applies alterem o mesmo estado ao mesmo tempo","Versionar o arquivo de estado automaticamente","Bloquear a exclusão do bucket"]} answer={1} explanation="Desde o Terraform 1.10, o backend S3 cria um arquivo de trava no bucket durante a operação, dispensando a tabela do DynamoDB." />
+<Quiz question="No Ansible, onde ficam os valores que mudam entre dev e prod?" options={["Nas tasks da role, com condicionais por ambiente","No arquivo ansible.cfg global","No group_vars de cada inventário, sobrescrevendo os defaults da role","Em variáveis de ambiente do shell de quem roda o playbook"]} answer={2} explanation="A role define defaults iguais para todos, e cada inventário de ambiente sobrescreve só o que muda no seu group_vars." />
+
+## Base no CodeForge
+
+- [Infraestrutura como código: Preparando máquinas na AWS com Ansible](/learn/carreira-nodejs/infraestrutura-como-codigo-preparando-maquinas-aws-ansible): o capítulo anterior, com o Terraform e o Ansible básicos.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): por que ambientes parecidos tornam o deploy previsível.
+
+## Referências
+
+- [Terraform: Modules](https://developer.hashicorp.com/terraform/language/modules)
+- [Terraform: S3 backend](https://developer.hashicorp.com/terraform/language/backend/s3)
+- [Terraform: Workspaces](https://developer.hashicorp.com/terraform/language/state/workspaces)
+- [Ansible: How to build your inventory](https://docs.ansible.com/ansible/latest/inventory_guide/intro_inventory.html)

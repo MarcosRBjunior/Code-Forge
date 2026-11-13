@@ -1,0 +1,283 @@
+---
+title: "Integração Contínua: Automatize o deploy no Amazon ECS"
+kind: lesson
+---
+
+No capítulo de Terraform com ECS, cada versão nova da API de livros exigia um `terraform apply` com a tag da imagem. No capítulo de deploy na EC2, você escreveu um script que troca contêineres e volta atrás. O ECS já faz essa parte difícil sozinho: rolling update, health check, circuit breaker e rollback. O pipeline só precisa dizer "rode esta imagem". Neste capítulo você monta o deploy contínuo da API no ECS Fargate com as actions oficiais da AWS, autenticando por OIDC, e resolve as armadilhas de dividir o service entre Terraform e pipeline.
+
+**Você vai aprender:**
+
+- O que um deploy no ECS realmente é: uma revisão nova da task definition
+- Dividir responsabilidades entre Terraform e pipeline sem que um desfaça o outro
+- Montar o workflow com `amazon-ecr-login`, `amazon-ecs-render-task-definition` e `amazon-ecs-deploy-task-definition`
+- Dar à role de deploy as permissões mínimas, incluindo o `iam:PassRole`
+- Rodar migrações antes do deploy e promover entre staging e produção
+
+## O que é um deploy no ECS
+
+Lembre os conceitos: a task definition é uma receita versionada, e o service mantém N tasks de uma revisão específica. Fazer deploy é:
+
+1. Publicar a imagem nova no ECR.
+2. Registrar uma revisão nova da task definition, igual à atual, mas com a imagem nova.
+3. Atualizar o service para usar essa revisão.
+4. Esperar o service estabilizar (tasks novas saudáveis no ALB, antigas drenadas).
+
+O passo 4 é do ECS: com `minimumHealthyPercent` 100 e `maximumPercent` 200, ele sobe as tasks novas antes de parar as antigas, e o circuit breaker volta para a revisão anterior se as novas não ficam saudáveis. O pipeline só orquestra os três primeiros e acompanha o quarto.
+
+## Quem é dono do quê
+
+Se o Terraform declara a task definition com uma imagem e o pipeline registra revisões com outra, o próximo `terraform apply` vê diferença e volta o service para a imagem do código. Você publica a v2, alguém muda uma regra de security group, e a produção volta silenciosamente para a v1.
+
+A divisão que funciona:
+
+| Responsabilidade | Dono |
+| --- | --- |
+| Cluster, ALB, security groups, roles, log group, autoscaling | Terraform |
+| Primeira revisão da task definition (CPU, memória, roles, logs) | Terraform |
+| Revisões seguintes (imagem nova) e atualização do service | Pipeline |
+
+No Terraform, o service passa a ignorar a revisão:
+
+```hcl
+resource "aws_ecs_service" "api" {
+  # ... igual ao capítulo de Terraform e ECS
+
+  lifecycle {
+    ignore_changes = [task_definition, desired_count]
+  }
+}
+```
+
+E o pipeline parte da revisão que está rodando, trocando só a imagem. Assim, mudanças de CPU ou variáveis feitas no Terraform entram na próxima revisão que o pipeline registrar. Uma alternativa igualmente válida é versionar o `task-definition.json` no repositório da aplicação e tirá-lo do Terraform: o importante é haver um dono só.
+
+<Callout type="warning" title="O deploy falha com AccessDenied em iam:PassRole">
+Registrar uma task definition que referencia uma execution role e uma task role exige que quem registra tenha `iam:PassRole` sobre essas duas roles. É a proteção da AWS contra alguém criar uma task com uma role mais poderosa que a própria. A role de deploy do GitHub precisa dessa permissão, restrita às ARNs das duas roles e com a condição `iam:PassedToService` igual a `ecs-tasks.amazonaws.com`. Sem isso, o build passa e o deploy morre no registro da revisão.
+</Callout>
+
+## A role de deploy
+
+A confiança OIDC é a mesma do capítulo da EC2 (repositório e environments fixados no `sub`). As permissões mudam:
+
+```hcl
+data "aws_iam_policy_document" "deploy_ecs" {
+  statement {
+    sid = "Ecr"
+    actions = [
+      "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload",
+      "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage",
+      "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
+    ]
+    resources = [aws_ecr_repository.api.arn]
+  }
+  statement {
+    sid       = "EcrLogin"
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+  statement {
+    sid = "Ecs"
+    actions = [
+      "ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition",
+      "ecs:DescribeServices", "ecs:UpdateService",
+      "ecs:RunTask", "ecs:DescribeTasks",
+    ]
+    resources = ["*"]
+  }
+  statement {
+    sid       = "PassRoles"
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.execution.arn, aws_iam_role.task.arn]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "deploy_ecs" {
+  role   = aws_iam_role.deploy.id
+  policy = data.aws_iam_policy_document.deploy_ecs.json
+}
+```
+
+`RegisterTaskDefinition` e `DescribeTaskDefinition` não aceitam restrição por recurso, por isso o `*`. `UpdateService` e `DescribeServices` aceitam ARN do service, e vale restringir quando você tiver vários services na conta.
+
+## O workflow
+
+```yaml
+# .github/workflows/deploy-ecs.yml
+name: Deploy ECS
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: api-livros
+  CONTAINER_NAME: api
+  ROLE_ARN: arn:aws:iam::123456789012:role/github-deploy-api-livros
+
+jobs:
+  testes:
+    uses: ./.github/workflows/ci.yml
+
+  imagem:
+    needs: testes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.ecr.outputs.registry }}/api-livros:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: imagem
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        ambiente: [staging, production]
+    environment: ${{ matrix.ambiente }}
+    concurrency:
+      group: ecs-${{ matrix.ambiente }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Baixar a task definition em uso
+        run: |
+          aws ecs describe-task-definition --task-definition "${{ vars.TASK_FAMILY }}" \
+            --query taskDefinition > task-definition.json
+
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.imagem.outputs.image }}
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          service: ${{ vars.ECS_SERVICE }}
+          wait-for-service-stability: true
+```
+
+Passo a passo:
+
+- **`amazon-ecr-login@v2`** troca as credenciais da role por um login no registro e devolve o endereço em `outputs.registry`. A imagem é publicada com o SHA do commit.
+- **`describe-task-definition`** baixa a revisão mais recente da família. O JSON vem com campos somente leitura (`revision`, `status`, `registeredAt`...), que a action de deploy descarta ao registrar.
+- **`amazon-ecs-render-task-definition@v1`** troca a imagem do contêiner `api` e grava um arquivo novo, cujo caminho sai em `outputs.task-definition`.
+- **`amazon-ecs-deploy-task-definition@v2`** registra a revisão, atualiza o service e, com `wait-for-service-stability`, só termina quando o ECS diz que o service está estável. Se o circuit breaker reverter o deploy, o job falha.
+
+A matriz com `max-parallel: 1` faz os dois ambientes rodarem em sequência, staging primeiro. Cada um é um environment do GitHub com as suas variáveis (`ECS_CLUSTER`, `ECS_SERVICE`, `TASK_FAMILY`), e `production` tem revisores obrigatórios. Se staging falha, a matriz não segue para production: o padrão `fail-fast` da matriz cancela o job pendente. Para um controle mais explícito, você pode trocar a matriz por dois jobs com `needs`, como no capítulo da EC2.
+
+## Migrações de banco antes do deploy
+
+A versão nova da API pode precisar de uma coluna nova. A migração tem que rodar antes de as tasks novas receberem tráfego, e uma vez só (não em cada task que sobe). No ECS, o padrão é rodar uma task avulsa com a mesma imagem e outro comando:
+
+```yaml
+      - name: Rodar migrações
+        run: |
+          TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json "file://${{ steps.render.outputs.task-definition }}" \
+            --query taskDefinition.taskDefinitionArn --output text)
+
+          TASK=$(aws ecs run-task --cluster "${{ vars.ECS_CLUSTER }}" \
+            --task-definition "$TASK_DEF" --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ vars.SUBNETS }}],securityGroups=[${{ vars.TASK_SG }}],assignPublicIp=DISABLED}" \
+            --overrides '{"containerOverrides":[{"name":"api","command":["npm","run","db:migrate"]}]}' \
+            --query "tasks[0].taskArn" --output text)
+
+          aws ecs wait tasks-stopped --cluster "${{ vars.ECS_CLUSTER }}" --tasks "$TASK"
+          CODE=$(aws ecs describe-tasks --cluster "${{ vars.ECS_CLUSTER }}" --tasks "$TASK" \
+            --query "tasks[0].containers[0].exitCode" --output text)
+          test "$CODE" = "0"
+```
+
+Coloque esse step entre o render e o deploy. Se a migração sai com código diferente de zero, o deploy nem começa. A regra das migrações compatíveis continua valendo: durante o rolling, versão antiga e nova rodam juntas contra o mesmo banco, então a migração não pode quebrar a versão antiga.
+
+## Acompanhando e revertendo
+
+Quando o job falha em `wait-for-service-stability`, os eventos do service contam o porquê:
+
+```bash
+aws ecs describe-services --cluster api-livros --services api-livros \
+  --query "services[0].events[:10].[createdAt,message]" --output table
+```
+
+Mensagens como "failed container health checks" ou "CannotPullContainerError" apontam a causa. O circuit breaker já devolveu o tráfego para a revisão anterior; você corrige e faz um novo commit.
+
+Para reverter manualmente uma versão que subiu saudável mas tem bug, aponte o service para a revisão anterior, que continua registrada:
+
+```bash
+aws ecs update-service --cluster api-livros --service api-livros \
+  --task-definition api-livros:41
+```
+
+Além do rolling, o ECS suporta blue/green, criando o conjunto novo de tasks ao lado e trocando o tráfego no ALB de uma vez (com possibilidade de período de teste e volta instantânea). Vale considerar quando você precisa validar a versão nova com tráfego de teste antes de liberar para todos.
+
+## Na entrevista
+
+**O que acontece num deploy no ECS?** Registra-se uma revisão nova da task definition com a imagem nova, o service é atualizado para ela e o ECS faz o rolling, subindo tasks novas, esperando o health check e drenando as antigas.
+
+**Por que a role de deploy precisa de iam:PassRole?** Porque a task definition associa roles às tasks; a AWS exige que quem a registra tenha permissão de passar essas roles, para impedir escalada de privilégio.
+
+**Como evitar que Terraform e pipeline briguem pela task definition?** Um dono só: Terraform cria a infraestrutura e ignora `task_definition` no service; o pipeline registra as revisões novas.
+
+**Onde rodar migrações?** Numa task avulsa com a mesma imagem, antes do deploy, uma única vez, com migrações compatíveis com a versão anterior.
+
+## Pratique
+
+Sobre a infraestrutura ECS do capítulo de Terraform, entregue:
+
+1. A role de deploy com OIDC e as permissões mínimas, incluindo `iam:PassRole` com a condição de serviço.
+2. O `ignore_changes` em `task_definition` no service.
+3. O workflow `deploy-ecs.yml` com build no ECR, migração em task avulsa e deploy com espera de estabilidade, passando por staging e produção com aprovação.
+4. Um commit que quebra o `/health`, mostrando o job falhando, o circuit breaker revertendo e os eventos do service com a causa.
+
+<Quiz question="O build passou e o deploy no ECS falha ao registrar a task definition com AccessDenied em iam:PassRole. O que falta?" options={["Permissão de ecr:PutImage na role de deploy","Permissão para a role de deploy passar a execution role e a task role ao ECS","Permissão de ssm:GetParameters na execution role","Um security group liberando a porta 3000"]} answer={1} explanation="Registrar uma task definition que referencia roles exige iam:PassRole sobre elas, restrito ao serviço ecs-tasks.amazonaws.com." />
+<Quiz question="O que wait-for-service-stability: true faz na action de deploy do ECS?" options={["Faz o job esperar até o service estabilizar e falhar se o deploy não estabilizar","Impede que o autoscaling altere o service durante o deploy","Faz o ECS esperar uma aprovação manual","Desativa o circuit breaker durante o deploy"]} answer={0} explanation="Sem ela, o job termina logo após atualizar o service e você não sabe se o deploy deu certo. Com ela, um rollback do circuit breaker vira job vermelho." />
+<Quiz question="Por que as migrações rodam numa task avulsa e não no comando de inicialização de cada task?" options={["Porque tasks Fargate não conseguem acessar o banco","Porque o ECS proíbe comandos npm no CMD","Para rodarem uma única vez antes do tráfego, sem várias tasks migrando ao mesmo tempo","Para a migração usar a task role do pipeline"]} answer={2} explanation="Com várias tasks subindo juntas, todas tentariam migrar ao mesmo tempo. A task avulsa roda uma vez e bloqueia o deploy se falhar." />
+
+## Base no CodeForge
+
+- [Infraestrutura como código: Terraform, Docker e Elastic Container Service](/learn/carreira-nodejs/infraestrutura-como-codigo-terraform-docker-elastic-container): a infraestrutura que este pipeline atualiza.
+- [Integração Contínua: Pipeline de entrega e implementação contínua na EC2](/learn/carreira-nodejs/integracao-continua-pipeline-entrega-implementacao-continua-ec2): OIDC, environments e rollback explicados em detalhe.
+- [Amazon ECS: Gerenciando Docker na nuvem da AWS](/learn/carreira-nodejs/amazon-ecs-gerenciando-docker-nuvem-aws): os conceitos do ECS pelo console.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): rolling versus blue/green.
+
+## Referências
+
+- [aws-actions/amazon-ecs-deploy-task-definition](https://github.com/aws-actions/amazon-ecs-deploy-task-definition)
+- [aws-actions/amazon-ecs-render-task-definition](https://github.com/aws-actions/amazon-ecs-render-task-definition)
+- [ECS deployment circuit breaker](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
+- [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)

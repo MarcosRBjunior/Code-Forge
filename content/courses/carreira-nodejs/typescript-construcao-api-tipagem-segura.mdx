@@ -1,0 +1,350 @@
+---
+title: "TypeScript: Construção de uma API com tipagem segura"
+kind: lesson
+---
+
+Numa API em JavaScript puro, o erro "Cannot read properties of undefined" costuma aparecer em produção, na rota que ninguém testou. TypeScript move boa parte desses erros para o momento em que você escreve o código: o editor avisa que `livro.autor` pode não existir antes de o cliente descobrir. Mas há uma pegadinha: os tipos somem quando o código roda, e tudo o que chega pela rede é desconhecido. Uma API com tipagem segura é a combinação das duas coisas: tipos fortes por dentro e validação na fronteira.
+
+**Você vai aprender:**
+
+- Como configurar um projeto Node.js com TypeScript estrito e ESM
+- Como modelar o domínio com tipos, uniões discriminadas e tipos derivados
+- Como tipar rotas do Express 5 (parâmetros, corpo, query e resposta)
+- Por que dados externos precisam ser validados e como inferir o tipo a partir do schema
+- Como tipar camadas (repositório e service) e variáveis de ambiente
+
+## Configurando o projeto
+
+O fio condutor é a mesma API de livros, agora em TypeScript.
+
+```bash
+mkdir api-livros-ts && cd api-livros-ts
+npm init -y
+npm pkg set type=module
+npm i express zod
+npm i -D typescript tsx @types/express @types/node
+npx tsc --init
+```
+
+O `tsconfig.json` decide o quanto o compilador vai te proteger. Para uma API Node.js moderna:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+```
+
+`strict` liga as checagens essenciais, como `strictNullChecks` (o tipo `string` não aceita `undefined`) e `noImplicitAny`. `noUncheckedIndexedAccess` faz `lista[0]` ter tipo `Livro | undefined`, o que é a verdade. Com `module: NodeNext`, imports relativos precisam da extensão `.js` (o arquivo de saída), mesmo escrevendo em `.ts`.
+
+```json
+{
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit"
+  }
+}
+```
+
+Em desenvolvimento, o `tsx` executa TypeScript direto. Versões recentes do Node (a partir da 22.18 e da 23.6) também rodam arquivos `.ts` removendo os tipos, sem checá-los. Nos dois casos, quem garante os tipos é o `tsc`: rode `npm run typecheck` no CI.
+
+## Modelando o domínio
+
+Comece pelos tipos do domínio, antes das rotas. Eles são o vocabulário do resto do código.
+
+```typescript
+// src/livros/tipos.ts
+export type LivroId = string & { readonly __marca: "LivroId" };
+
+export interface Livro {
+  id: LivroId;
+  titulo: string;
+  autor: string;
+  ano: number;
+  status: StatusLivro;
+}
+
+export type StatusLivro =
+  | { tipo: "disponivel" }
+  | { tipo: "emprestado"; usuarioId: number; devolucaoPrevista: Date }
+  | { tipo: "baixado"; motivo: string };
+
+export type NovoLivro = Omit<Livro, "id" | "status">;
+export type AtualizacaoLivro = Partial<NovoLivro>;
+```
+
+Três técnicas aparecem aqui.
+
+**Tipo com marca (branded type).** `LivroId` é uma string em tempo de execução, mas o compilador não deixa passar um `usuarioId` qualquer onde se espera um `LivroId`. Isso evita trocar a ordem de dois parâmetros string.
+
+**União discriminada.** `StatusLivro` tem um campo `tipo` que diz qual variante é. Os dados de cada variante só existem nela: não há `usuarioId` num livro disponível.
+
+**Tipos derivados.** `NovoLivro` e `AtualizacaoLivro` são calculados a partir de `Livro` com `Omit` e `Partial`. Se você adicionar um campo em `Livro`, os outros acompanham.
+
+A união discriminada brilha com `switch`: o compilador estreita o tipo em cada `case` e avisa se faltar algum.
+
+```typescript
+export function rotuloStatus(status: StatusLivro): string {
+  switch (status.tipo) {
+    case "disponivel":
+      return "Disponível";
+    case "emprestado":
+      return `Emprestado até ${status.devolucaoPrevista.toLocaleDateString("pt-BR")}`;
+    case "baixado":
+      return `Baixado: ${status.motivo}`;
+    default: {
+      const nunca: never = status; // erro de compilação se surgir uma variante nova
+      return nunca;
+    }
+  }
+}
+```
+
+## Fronteira: dados de fora são unknown
+
+`req.body` vem de um JSON que qualquer cliente pode montar. Anotar `req.body as NovoLivro` não valida nada: só manda o compilador acreditar em você. O jeito correto é validar em tempo de execução e só então tratar o valor como tipado. Com Zod, o schema é a fonte da verdade e o tipo é inferido dele:
+
+```typescript
+// src/livros/schemas.ts
+import { z } from "zod";
+
+export const novoLivroSchema = z.object({
+  titulo: z.string().trim().min(1),
+  autor: z.string().trim().min(1),
+  ano: z.number().int().min(1450).max(new Date().getFullYear()),
+});
+
+export const listarQuerySchema = z.object({
+  autor: z.string().optional(),
+  pagina: z.coerce.number().int().min(1).default(1),
+  limite: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+export type NovoLivroInput = z.infer<typeof novoLivroSchema>;
+export type ListarQuery = z.infer<typeof listarQuerySchema>;
+```
+
+`z.coerce.number()` converte a string da query (`"2"`) em número antes de validar. O capítulo de validações aprofunda o Zod; aqui o importante é a ideia: **um schema, um tipo, nenhuma duplicação**.
+
+<Callout type="warning" title="as não é validação">
+`const dados = req.body as NovoLivro` compila e não protege nada. Se o cliente mandar `{ "ano": "dois mil" }`, o valor entra no sistema com o tipo errado e o erro aparece longe dali, no banco ou numa conta. Use `as` só quando você sabe algo que o compilador não sabe; para dados de rede, valide.
+</Callout>
+
+## Tipando as camadas
+
+Separe a API em camadas com contratos tipados. O repositório fala com o armazenamento; o service aplica regras; o controller traduz HTTP.
+
+```typescript
+// src/livros/repositorio.ts
+import { randomUUID } from "node:crypto";
+import type { Livro, LivroId, NovoLivro } from "./tipos.js";
+
+export interface LivroRepositorio {
+  listar(filtro: { autor?: string; offset: number; limite: number }): Promise<Livro[]>;
+  buscar(id: LivroId): Promise<Livro | undefined>;
+  criar(dados: NovoLivro): Promise<Livro>;
+}
+
+export class LivroRepositorioMemoria implements LivroRepositorio {
+  #livros = new Map<LivroId, Livro>();
+
+  async listar({ autor, offset, limite }: { autor?: string; offset: number; limite: number }) {
+    const todos = [...this.#livros.values()].filter((l) => !autor || l.autor === autor);
+    return todos.slice(offset, offset + limite);
+  }
+
+  async buscar(id: LivroId) {
+    return this.#livros.get(id);
+  }
+
+  async criar(dados: NovoLivro) {
+    const livro: Livro = { ...dados, id: randomUUID() as LivroId, status: { tipo: "disponivel" } };
+    this.#livros.set(livro.id, livro);
+    return livro;
+  }
+}
+```
+
+O retorno `Promise<Livro | undefined>` de `buscar` obriga quem chama a tratar o caso "não encontrado". Esquecer vira erro de compilação, não um 500.
+
+```typescript
+// src/livros/servico.ts
+import type { LivroRepositorio } from "./repositorio.js";
+import type { Livro, LivroId } from "./tipos.js";
+import type { ListarQuery, NovoLivroInput } from "./schemas.js";
+
+export class LivroServico {
+  readonly #repo: LivroRepositorio;
+  constructor(repo: LivroRepositorio) {
+    this.#repo = repo;
+  }
+
+  listar(q: ListarQuery): Promise<Livro[]> {
+    const filtro = { offset: (q.pagina - 1) * q.limite, limite: q.limite };
+    return this.#repo.listar(q.autor ? { ...filtro, autor: q.autor } : filtro);
+  }
+
+  async buscarOuFalhar(id: LivroId): Promise<Livro> {
+    const livro = await this.#repo.buscar(id);
+    if (!livro) throw new NaoEncontrado("Livro");
+    return livro;
+  }
+
+  criar(dados: NovoLivroInput) {
+    return this.#repo.criar(dados);
+  }
+}
+
+export class NaoEncontrado extends Error {
+  readonly status = 404;
+  constructor(recurso: string) {
+    super(`${recurso} não encontrado`);
+    this.name = "NaoEncontrado";
+  }
+}
+```
+
+O service depende da interface `LivroRepositorio`, não da implementação em memória (o campo é declarado explicitamente, e não como `private repo` no construtor, porque essa sintaxe não é suportada quando o Node remove os tipos sozinho). Trocar por PostgreSQL depois não muda uma linha do service. O spread condicional em `listar` existe por causa de `exactOptionalPropertyTypes`: com essa opção, uma propriedade opcional não aceita receber `undefined` explicitamente.
+
+## Rotas tipadas no Express 5
+
+`Request` e `Response` do Express são genéricos. A ordem dos parâmetros de `Request` é: params, corpo da resposta, corpo da requisição, query.
+
+```typescript
+// src/livros/rotas.ts
+import { Router, type Request, type Response } from "express";
+import { listarQuerySchema, novoLivroSchema } from "./schemas.js";
+import type { LivroServico } from "./servico.js";
+import type { Livro, LivroId } from "./tipos.js";
+
+type ErroBody = { erro: string; detalhes?: unknown };
+
+export function rotasLivros(servico: LivroServico) {
+  const r = Router();
+
+  r.get("/", async (req: Request, res: Response<Livro[] | ErroBody>) => {
+    const q = listarQuerySchema.safeParse(req.query);
+    if (!q.success) {
+      res.status(400).json({ erro: "query inválida", detalhes: q.error.issues });
+      return;
+    }
+    res.json(await servico.listar(q.data));
+  });
+
+  r.get("/:id", async (req: Request<{ id: string }>, res: Response<Livro>) => {
+    res.json(await servico.buscarOuFalhar(req.params.id as LivroId));
+  });
+
+  r.post("/", async (req: Request, res: Response<Livro | ErroBody>) => {
+    const corpo = novoLivroSchema.safeParse(req.body);
+    if (!corpo.success) {
+      res.status(400).json({ erro: "corpo inválido", detalhes: corpo.error.issues });
+      return;
+    }
+    res.status(201).json(await servico.criar(corpo.data));
+  });
+
+  return r;
+}
+```
+
+`Response<Livro[] | ErroBody>` faz o compilador conferir o que você passa para `res.json`: mandar um objeto com formato diferente é erro. No Express 5, uma Promise rejeitada dentro do handler vai direto para o middleware de erro, então `buscarOuFalhar` pode simplesmente lançar.
+
+```typescript
+// src/server.ts
+import express, { type NextFunction, type Request, type Response } from "express";
+import { LivroRepositorioMemoria } from "./livros/repositorio.js";
+import { LivroServico, NaoEncontrado } from "./livros/servico.js";
+import { rotasLivros } from "./livros/rotas.js";
+import { env } from "./env.js";
+
+const app = express();
+app.use(express.json());
+app.use("/livros", rotasLivros(new LivroServico(new LivroRepositorioMemoria())));
+
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  if (err instanceof NaoEncontrado) {
+    res.status(err.status).json({ erro: err.message });
+    return;
+  }
+  console.error(err);
+  res.status(500).json({ erro: "erro interno" });
+});
+
+app.listen(env.PORT, () => console.log(`API em http://localhost:${env.PORT}`));
+```
+
+O parâmetro de erro é `unknown`, não `any`: em JavaScript, qualquer valor pode ser lançado, e o `instanceof` estreita o tipo com segurança.
+
+## Variáveis de ambiente tipadas
+
+`process.env.PORT` tem tipo `string | undefined`. Validar o ambiente na inicialização faz a aplicação falhar cedo, com mensagem clara, em vez de no primeiro request.
+
+```typescript
+// src/env.ts
+import { z } from "zod";
+
+const schema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  PORT: z.coerce.number().int().default(3000),
+  DATABASE_URL: z.url().optional(),
+});
+
+export const env = schema.parse(process.env);
+export type Env = z.infer<typeof schema>;
+```
+
+Se `PORT` vier como `"abc"`, o processo para na largada com o erro do Zod apontando a variável.
+
+## Na entrevista
+
+**Os tipos do TypeScript validam o corpo da requisição?** Não. Tipos são apagados na compilação. Dados externos são `unknown` até passarem por uma validação em tempo de execução; a partir dela, o tipo pode ser inferido do schema.
+
+**`interface` ou `type`?** Para formatos de objeto, tanto faz na prática; `interface` permite extensão por declaração e `implements` em classes. Uniões, interseções e tipos derivados exigem `type`.
+
+**O que é uma união discriminada?** Uma união de objetos com um campo literal comum (como `tipo`). Checar esse campo estreita o tipo, e o `never` no `default` garante que todos os casos foram tratados.
+
+**`any` ou `unknown`?** `unknown`: obriga a checar antes de usar. `any` desliga o compilador naquele valor e em tudo o que ele toca.
+
+## Pratique
+
+Construa a API de livros em TypeScript estrito com Express 5:
+
+1. `tsconfig` com `strict` e `noUncheckedIndexedAccess`, e scripts `dev`, `build` e `typecheck`.
+2. Tipos de domínio com `LivroId` com marca e `StatusLivro` como união discriminada.
+3. Rotas `GET /livros` (com paginação e filtro validados), `GET /livros/:id`, `POST /livros` e `POST /livros/:id/emprestar`, que só funciona se o status for `disponivel`.
+4. Repositório como interface, com implementação em memória.
+5. `env.ts` validando o ambiente.
+
+Entregue o repositório com `npm run typecheck` sem erros e zero ocorrências de `any` (confirme com `grep`). Inclua no README três exemplos de `curl`, um deles recebendo 400.
+
+<Quiz question="Por que req.body as NovoLivro não torna a rota segura?" options={["Porque as só funciona com classes","Porque as só convence o compilador e não checa nada em tempo de execução","Porque o Express já valida o corpo","Porque NovoLivro precisa ser interface"]} answer={1} explanation="Asserções de tipo somem na compilação. O dado continua sendo o que o cliente enviou; só uma validação em tempo de execução garante o formato." />
+<Quiz question="Com noUncheckedIndexedAccess ligado, qual o tipo de livros[0] se livros é Livro[]?" options={["Livro","Livro | undefined","Livro | null","unknown"]} answer={1} explanation="A opção reconhece que o índice pode não existir e obriga a tratar o caso undefined." />
+<Quiz question="Qual a vantagem de z.infer sobre escrever a interface à mão?" options={["Executa mais rápido","O tipo e a validação vêm da mesma fonte e não divergem","Dispensa o tsconfig","Gera documentação OpenAPI sozinho"]} answer={1} explanation="Com o tipo inferido do schema, alterar a validação altera o tipo automaticamente, sem duas definições para manter em sincronia." />
+
+## Base no CodeForge
+
+- [Interfaces e types](/learn/typescript/interfaces-e-types), [Uniões e narrowing](/learn/typescript/unioes-e-narrowing) e [Utility types](/learn/typescript/utility-types): o sistema de tipos usado aqui, em detalhe.
+- [Generics](/learn/typescript/generics): a base para tipar repositórios e respostas.
+- [TypeScript: Desenvolvendo validações e tratando erros](/learn/carreira-nodejs/typescript-desenvolvendo-validacoes-tratando-erros): a fronteira com Zod a fundo.
+- [SOLID com TypeScript](/learn/carreira-nodejs/solid-typescript-aplicando-boas-praticas-orientacao-objetos): o próximo passo na organização das camadas.
+
+## Referências
+
+- [Everyday Types (TypeScript Handbook)](https://www.typescriptlang.org/docs/handbook/2/everyday-types.html)
+- [Referência do tsconfig](https://www.typescriptlang.org/tsconfig/)
+- [Node.js: Modules: TypeScript](https://nodejs.org/api/typescript.html)
+- [Zod](https://zod.dev/)

@@ -1,0 +1,338 @@
+---
+title: "Realizando consultas com SQL: Joins, Views e transações"
+kind: lesson
+---
+
+Num banco bem modelado, a informação fica espalhada em várias tabelas: o pedido guarda o `id` do cliente, o item guarda o `id` do livro. Isso evita duplicação, mas quase toda tela da aplicação precisa juntar as peças de novo ("pedido 3, da Ana, com dois livros, total de 87 reais"). Joins fazem essa junção, views dão nome a consultas que você repete e transações garantem que operações com várias etapas, como fechar um pedido e baixar o estoque, aconteçam por inteiro ou não aconteçam. Este é o terceiro capítulo da sequência sobre o banco da livraria.
+
+**Você vai aprender:**
+
+- Combinar tabelas com `INNER JOIN` e `LEFT JOIN`, e encadear vários joins
+- Evitar as duas armadilhas clássicas do `LEFT JOIN`
+- Criar views para reaproveitar consultas e simplificar o código da API
+- Usar transações para que operações de várias etapas sejam atômicas
+- Aplicar tudo isso no Node.js, com SQLite e com PostgreSQL
+
+## O banco de exemplo
+
+Os exemplos usam a livraria dos capítulos anteriores. Se precisar recriar, rode este script num editor de SQLite no navegador, no `sqlite3` ou no Node.js:
+
+```sql
+PRAGMA foreign_keys = ON;
+CREATE TABLE clientes (id INTEGER PRIMARY KEY, nome TEXT NOT NULL, email TEXT NOT NULL UNIQUE, cidade TEXT, criado_em TEXT NOT NULL);
+CREATE TABLE livros (id INTEGER PRIMARY KEY, titulo TEXT NOT NULL, autor TEXT NOT NULL, categoria TEXT NOT NULL, preco REAL NOT NULL CHECK (preco >= 0), estoque INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE pedidos (id INTEGER PRIMARY KEY, cliente_id INTEGER NOT NULL REFERENCES clientes (id), feito_em TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pago' CHECK (status IN ('pago', 'enviado', 'cancelado')));
+CREATE TABLE itens_pedido (pedido_id INTEGER NOT NULL REFERENCES pedidos (id), livro_id INTEGER NOT NULL REFERENCES livros (id), quantidade INTEGER NOT NULL CHECK (quantidade > 0), preco_unitario REAL NOT NULL, PRIMARY KEY (pedido_id, livro_id));
+
+INSERT INTO clientes VALUES
+  (1, 'Ana Souza', 'ana@exemplo.com', 'São Paulo', '2026-01-05'),
+  (2, 'Bruno Lima', 'bruno@exemplo.com', 'Recife', '2026-01-12'),
+  (3, 'Carla Dias', 'carla@exemplo.com', 'São Paulo', '2026-02-03'),
+  (4, 'Diego Rocha', 'diego@exemplo.com', 'Curitiba', '2026-02-20'),
+  (5, 'Elisa Melo', 'elisa@exemplo.com', NULL, '2026-03-01');
+INSERT INTO livros VALUES
+  (1, 'Dom Casmurro', 'Machado de Assis', 'Romance', 39.90, 12),
+  (2, 'Memórias Póstumas de Brás Cubas', 'Machado de Assis', 'Romance', 42.50, 8),
+  (3, 'O Cortiço', 'Aluísio Azevedo', 'Romance', 35.00, 0),
+  (4, 'Iracema', 'José de Alencar', 'Romance', 29.90, 5),
+  (5, 'Sagarana', 'Guimarães Rosa', 'Contos', 54.90, 3),
+  (6, 'A Hora da Estrela', 'Clarice Lispector', 'Romance', 44.90, 7),
+  (7, 'Libertinagem', 'Manuel Bandeira', 'Poesia', 32.00, 4),
+  (8, 'Claro Enigma', 'Carlos Drummond de Andrade', 'Poesia', 48.00, 0);
+INSERT INTO pedidos VALUES
+  (1, 1, '2026-01-10', 'enviado'), (2, 2, '2026-01-15', 'enviado'), (3, 1, '2026-01-28', 'enviado'),
+  (4, 3, '2026-02-05', 'enviado'), (5, 4, '2026-02-21', 'cancelado'), (6, 2, '2026-02-25', 'enviado'),
+  (7, 3, '2026-03-02', 'pago'), (8, 1, '2026-03-10', 'pago'), (9, 4, '2026-03-15', 'pago');
+INSERT INTO itens_pedido VALUES
+  (1, 1, 1, 39.90), (1, 7, 2, 32.00), (2, 5, 1, 54.90), (3, 2, 1, 42.50), (3, 6, 1, 44.90),
+  (4, 1, 2, 39.90), (5, 4, 1, 29.90), (6, 6, 1, 44.90), (6, 7, 1, 32.00), (7, 5, 1, 54.90),
+  (7, 2, 1, 42.50), (8, 1, 1, 39.90), (9, 6, 2, 44.90);
+```
+
+## INNER JOIN: só o que combina
+
+O `JOIN` (ou `INNER JOIN`, é o mesmo) combina cada linha de uma tabela com as linhas da outra que satisfazem a condição do `ON`. Linhas sem par dos dois lados ficam de fora.
+
+```sql
+SELECT p.id AS pedido, c.nome, p.feito_em, p.status
+FROM pedidos p
+INNER JOIN clientes c ON c.id = p.cliente_id
+ORDER BY p.id;
+```
+
+```text
+pedido | nome        | feito_em   | status
+1      | Ana Souza   | 2026-01-10 | enviado
+2      | Bruno Lima  | 2026-01-15 | enviado
+3      | Ana Souza   | 2026-01-28 | enviado
+...
+```
+
+Os apelidos `p` e `c` encurtam os nomes e são obrigatórios na prática quando duas tabelas têm colunas com o mesmo nome (as duas têm `id`). Prefira sempre qualificar as colunas (`c.nome`, não só `nome`): a consulta fica legível e não quebra quando alguém adiciona uma coluna homônima em outra tabela.
+
+### Encadeando joins
+
+Para mostrar os livros de cada pedido, você atravessa quatro tabelas. Cada `JOIN` acrescenta uma tabela à linha que está sendo montada:
+
+```sql
+SELECT p.id AS pedido, c.nome, l.titulo, i.quantidade,
+       i.quantidade * i.preco_unitario AS subtotal
+FROM pedidos p
+JOIN clientes c     ON c.id = p.cliente_id
+JOIN itens_pedido i ON i.pedido_id = p.id
+JOIN livros l       ON l.id = i.livro_id
+WHERE p.id IN (1, 3)
+ORDER BY p.id, l.titulo;
+```
+
+```text
+pedido | nome      | titulo                           | quantidade | subtotal
+1      | Ana Souza | Dom Casmurro                     | 1          | 39.9
+1      | Ana Souza | Libertinagem                     | 2          | 64.0
+3      | Ana Souza | A Hora da Estrela                | 1          | 44.9
+3      | Ana Souza | Memórias Póstumas de Brás Cubas  | 1          | 42.5
+```
+
+Repare que o pedido aparece uma vez por item. Um join "multiplica" as linhas do lado "um" pelo número de correspondências do lado "muitos". Isso é esperado, mas é a origem de totais inflados quando você soma colunas do lado "um" depois de um join (somar o frete do pedido aqui, por exemplo, contaria o frete duas vezes).
+
+## LEFT JOIN: tudo da esquerda, mesmo sem par
+
+O `LEFT JOIN` mantém todas as linhas da tabela da esquerda; quando não há correspondência, as colunas da direita vêm como `NULL`. É o que você usa para perguntas do tipo "todos os clientes, inclusive os que nunca compraram":
+
+```sql
+SELECT c.nome, count(p.id) AS pedidos
+FROM clientes c
+LEFT JOIN pedidos p ON p.cliente_id = c.id
+GROUP BY c.id
+ORDER BY pedidos DESC, c.nome;
+```
+
+```text
+nome        | pedidos
+Ana Souza   | 3
+Bruno Lima  | 2
+Carla Dias  | 2
+Diego Rocha | 2
+Elisa Melo  | 0
+```
+
+E, combinando com `IS NULL`, para encontrar o que **não** tem par (o anti-join):
+
+```sql
+-- livros que nunca foram vendidos
+SELECT l.titulo
+FROM livros l
+LEFT JOIN itens_pedido i ON i.livro_id = l.id
+WHERE i.livro_id IS NULL;
+-- O Cortiço, Claro Enigma
+```
+
+### As duas armadilhas do LEFT JOIN
+
+**Primeira: `count(*)` em vez de `count(coluna)`.** Na consulta de pedidos por cliente, trocar `count(p.id)` por `count(*)` faz a Elisa aparecer com 1 pedido, porque o `LEFT JOIN` gerou uma linha para ela (com `p.id` nulo) e `count(*)` conta linhas. `count(p.id)` ignora o nulo e dá 0.
+
+**Segunda: filtrar a tabela da direita no `WHERE`.**
+
+```sql
+-- ERRADO: a Elisa some do resultado
+SELECT c.nome, count(p.id) FROM clientes c
+LEFT JOIN pedidos p ON p.cliente_id = c.id
+WHERE p.status <> 'cancelado'
+GROUP BY c.id;
+
+-- CERTO: a condição vai para o ON
+SELECT c.nome, count(p.id) FROM clientes c
+LEFT JOIN pedidos p ON p.cliente_id = c.id AND p.status <> 'cancelado'
+GROUP BY c.id;
+```
+
+<Callout type="warning" title="WHERE na tabela da direita transforma o LEFT JOIN em INNER JOIN">
+Para quem não tem par, as colunas da direita são `NULL`, e `NULL <> 'cancelado'` é desconhecido, então o `WHERE` descarta a linha. Resultado: os clientes sem pedidos, que eram o motivo do `LEFT JOIN`, desaparecem sem erro nenhum. Condições sobre a tabela da direita vão no `ON`; no `WHERE`, só o teste `IS NULL` do anti-join.
+</Callout>
+
+### Self join
+
+Uma tabela pode ser unida a ela mesma, com dois apelidos. Por exemplo, pares de clientes da mesma cidade (útil para sugerir frete compartilhado):
+
+```sql
+SELECT a.nome, b.nome, a.cidade
+FROM clientes a
+JOIN clientes b ON a.cidade = b.cidade AND a.id < b.id;
+-- Ana Souza | Carla Dias | São Paulo
+```
+
+O `a.id < b.id` evita parear alguém consigo mesmo e repetir o par invertido.
+
+## Views: consultas com nome
+
+Algumas consultas aparecem em todo lugar: o resumo de cada pedido com cliente e total, por exemplo. Uma view é uma consulta salva no banco com um nome, que você consulta como se fosse uma tabela.
+
+```sql
+CREATE VIEW vw_pedidos_resumo AS
+SELECT p.id AS pedido_id, p.feito_em, p.status,
+       c.id AS cliente_id, c.nome AS cliente,
+       count(*)                                     AS itens,
+       sum(i.quantidade)                            AS livros,
+       round(sum(i.quantidade * i.preco_unitario), 2) AS total
+FROM pedidos p
+JOIN clientes c     ON c.id = p.cliente_id
+JOIN itens_pedido i ON i.pedido_id = p.id
+GROUP BY p.id;
+```
+
+Agora as perguntas sobre pedidos ficam curtas:
+
+```sql
+SELECT * FROM vw_pedidos_resumo WHERE cliente_id = 1;
+
+SELECT cliente, count(*) AS pedidos, round(sum(total), 2) AS gasto
+FROM vw_pedidos_resumo
+WHERE status <> 'cancelado'
+GROUP BY cliente_id
+ORDER BY gasto DESC;
+```
+
+```text
+cliente     | pedidos | gasto
+Ana Souza   | 3       | 231.2
+Carla Dias  | 2       | 177.2
+Bruno Lima  | 2       | 131.8
+Diego Rocha | 1       | 89.8
+```
+
+O que uma view **é** e o que **não é**:
+
+- Ela não guarda dados: a consulta é executada de novo a cada uso, sempre com os dados atuais. Portanto não é cache e não acelera nada sozinha.
+- Ela centraliza a regra: se a forma de calcular o total mudar (um desconto, um frete), você muda num lugar só.
+- Ela serve de camada de permissão: dá para conceder acesso à view sem dar acesso às tabelas.
+- No SQLite, views são só de leitura. Para alterar a definição, `DROP VIEW vw_pedidos_resumo;` e crie de novo (no PostgreSQL há `CREATE OR REPLACE VIEW`).
+
+O PostgreSQL também tem a view materializada (`CREATE MATERIALIZED VIEW`), que guarda o resultado e precisa ser atualizada com `REFRESH`, útil para relatórios pesados que toleram dados de alguns minutos atrás.
+
+## Transações: tudo ou nada
+
+Fechar um pedido envolve várias escritas: criar o pedido, inserir cada item e baixar o estoque de cada livro. Se o servidor cair entre o segundo e o terceiro passo, você terá um pedido sem baixa de estoque, ou estoque baixado sem pedido. Uma transação agrupa os comandos para que valham juntos.
+
+```sql
+BEGIN;
+
+INSERT INTO pedidos (id, cliente_id, feito_em, status) VALUES (10, 5, '2026-03-20', 'pago');
+INSERT INTO itens_pedido VALUES (10, 7, 1, 32.00), (10, 2, 1, 42.50);
+
+UPDATE livros SET estoque = estoque - 1 WHERE id = 7 AND estoque >= 1;
+UPDATE livros SET estoque = estoque - 1 WHERE id = 2 AND estoque >= 1;
+
+COMMIT;     -- ou ROLLBACK; para desfazer tudo desde o BEGIN
+```
+
+Entre o `BEGIN` e o `COMMIT`, as mudanças só existem para esta conexão. O `COMMIT` as torna permanentes de uma vez; o `ROLLBACK` descarta todas. Essas são as garantias ACID: atomicidade (tudo ou nada), consistência (as restrições valem no fim), isolamento (outras conexões não veem o meio do caminho) e durabilidade (depois do `COMMIT`, sobrevive a uma queda).
+
+A transação não decide sozinha quando desfazer: quem decide é o seu código. O `UPDATE ... WHERE estoque >= 1` não falha quando o estoque acabou, ele só afeta zero linhas. A aplicação precisa olhar quantas linhas mudaram e chamar `ROLLBACK`.
+
+## Transações no Node.js
+
+Com o `node:sqlite`, o padrão é `BEGIN`, `try` com os comandos, `COMMIT` no fim e `ROLLBACK` no `catch`:
+
+```javascript
+import { DatabaseSync } from "node:sqlite";
+
+const db = new DatabaseSync("livraria.db");
+db.exec("PRAGMA foreign_keys = ON");
+
+const criarPedido = db.prepare(
+  "INSERT INTO pedidos (cliente_id, feito_em, status) VALUES (?, date('now'), 'pago')"
+);
+const buscarLivro = db.prepare("SELECT preco FROM livros WHERE id = ?");
+const inserirItem = db.prepare("INSERT INTO itens_pedido VALUES (?, ?, ?, ?)");
+const baixarEstoque = db.prepare(
+  "UPDATE livros SET estoque = estoque - ? WHERE id = ? AND estoque >= ?"
+);
+
+export function fecharPedido(clienteId, itens) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const { lastInsertRowid: pedidoId } = criarPedido.run(clienteId);
+    for (const { livroId, quantidade } of itens) {
+      const livro = buscarLivro.get(livroId);
+      if (!livro) throw new Error(`livro ${livroId} não existe`);
+      const { changes } = baixarEstoque.run(quantidade, livroId, quantidade);
+      if (changes === 0) throw new Error(`estoque insuficiente para o livro ${livroId}`);
+      inserirItem.run(pedidoId, livroId, quantidade, livro.preco);
+    }
+    db.exec("COMMIT");
+    return pedidoId;
+  } catch (erro) {
+    db.exec("ROLLBACK");
+    throw erro;
+  }
+}
+
+// O Cortiço (id 3) tem estoque 0: nada deste pedido é gravado
+try {
+  fecharPedido(5, [{ livroId: 7, quantidade: 1 }, { livroId: 3, quantidade: 1 }]);
+} catch (e) {
+  console.log("pedido recusado:", e.message);
+}
+```
+
+O `BEGIN IMMEDIATE` é um detalhe do SQLite: ele reserva o direito de escrita logo no início. Com o `BEGIN` simples, duas conexões podem começar lendo e depois brigar para escrever, e uma delas recebe o erro "database is locked".
+
+No PostgreSQL, com o driver `pg`, a estrutura é a mesma, com uma diferença crucial: a transação pertence a uma **conexão**, então você precisa pegar um cliente do pool e usar sempre ele.
+
+```javascript
+const cliente = await pool.connect();
+try {
+  await cliente.query("BEGIN");
+  const { rows } = await cliente.query(
+    "INSERT INTO pedidos (cliente_id, feito_em, status) VALUES ($1, now(), 'pago') RETURNING id",
+    [clienteId]
+  );
+  // ... itens e estoque com cliente.query, nunca pool.query
+  await cliente.query("COMMIT");
+} catch (erro) {
+  await cliente.query("ROLLBACK");
+  throw erro;
+} finally {
+  cliente.release();
+}
+```
+
+Se você chamar `pool.query` dentro da transação, o comando pode ir para outra conexão do pool, fora da transação, e não será desfeito no `ROLLBACK`.
+
+## Na entrevista
+
+**Qual a diferença entre INNER JOIN e LEFT JOIN?** O `INNER` devolve só as linhas com correspondência nas duas tabelas; o `LEFT` devolve todas as da esquerda, com `NULL` nas colunas da direita quando não há par.
+
+**Como encontrar registros sem correspondência em outra tabela?** Com anti-join: `LEFT JOIN` e `WHERE direita.chave IS NULL`, ou com `NOT EXISTS`.
+
+**Uma view deixa a consulta mais rápida?** Não. Uma view comum é só uma consulta com nome, executada a cada uso. Quem guarda o resultado é a view materializada.
+
+**O que significa ACID?** Atomicidade, consistência, isolamento e durabilidade: as garantias que uma transação oferece para que operações de várias etapas sejam confiáveis.
+
+## Pratique
+
+Na API da livraria, entregue:
+
+1. A view `vw_itens_detalhados` (pedido, data, status, cliente, título, categoria, quantidade, subtotal) e duas rotas que a usam: `GET /clientes/:id/pedidos` e `GET /pedidos/:id`.
+2. Uma consulta que lista **todos** os livros com a quantidade vendida em pedidos não cancelados, mostrando 0 para os que não venderam (cuidado com as duas armadilhas do `LEFT JOIN`).
+3. A rota `POST /pedidos` usando `fecharPedido`, devolvendo 201 com o id ou 409 com a mensagem de estoque insuficiente.
+4. Um teste que tenta comprar um livro com estoque zerado junto com outro disponível e confirma que nem o pedido, nem os itens, nem a baixa do livro disponível foram gravados.
+
+<Quiz question="Clientes LEFT JOIN pedidos com WHERE p.status <> 'cancelado'. O que acontece com clientes sem pedidos?" options={["Aparecem com status NULL","Somem do resultado","Aparecem duplicados","Geram um erro de sintaxe"]} answer={1} explanation="Para eles p.status é NULL, a comparação é desconhecida e o WHERE descarta a linha, como num INNER JOIN." />
+
+<Quiz question="O que uma view comum guarda no banco?" options={["Uma cópia atualizada dos dados","Apenas a definição da consulta","Um índice sobre as colunas usadas","O último resultado executado"]} answer={1} explanation="A view comum só guarda a consulta, que roda de novo a cada uso. Guardar o resultado é papel da view materializada." />
+
+<Quiz question="Dentro de uma transação com o driver pg, por que não usar pool.query?" options={["pool.query não aceita parâmetros","O comando pode ir para outra conexão, fora da transação","pool.query faz COMMIT automático do bloco","pool.query só funciona com SELECT"]} answer={1} explanation="A transação vive numa conexão; pool.query pode escolher outra conexão do pool, e esse comando não participa do ROLLBACK." />
+
+## Base no CodeForge
+
+- [INNER JOIN](/learn/sql/inner-join), [Outer joins](/learn/sql/outer-joins) e [Self join e cross join](/learn/sql/self-e-cross-join): joins com exercícios de entrevista.
+- [Transações e ACID](/learn/sql/transacoes-e-acid) e [Níveis de isolamento](/learn/sql/niveis-de-isolamento): o que acontece entre transações concorrentes.
+- [SQLite Online: Executando consultas SQL](/learn/carreira-nodejs/sqlite-online-executando-consultas-sql) e [SQLite online: Análise de dados com SQL](/learn/carreira-nodejs/sqlite-online-analise-dados-sql): o capítulo anterior e o próximo da sequência.
+
+## Referências
+
+- [SQLite: CREATE VIEW](https://www.sqlite.org/lang_createview.html)
+- [SQLite: Transaction](https://www.sqlite.org/lang_transaction.html)
+- [PostgreSQL: Joins Between Tables](https://www.postgresql.org/docs/current/tutorial-join.html)
+- [node-postgres: Transactions](https://node-postgres.com/features/transactions)

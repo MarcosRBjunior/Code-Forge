@@ -1,0 +1,411 @@
+---
+title: "Nest.js: Persistindo dados com TypeORM e PostgreSQL"
+kind: lesson
+---
+
+Com Express, você decide tudo: onde ficam as rotas, como os services recebem o banco, como validar a entrada. Em projetos grandes, cada time decide de um jeito e a API vira uma colcha de retalhos. O Nest.js resolve isso com uma estrutura fixa (módulos, controllers e providers) e um contêiner de injeção de dependência, e o TypeORM traz o mapeamento entre classes TypeScript e tabelas do PostgreSQL. Esta aula monta a API de livros com essas três peças, do `docker compose` ao CRUD paginado.
+
+**Você vai aprender:**
+
+- Como o Nest organiza uma aplicação em módulos, controllers e providers
+- Como conectar o TypeORM ao PostgreSQL lendo a configuração do ambiente
+- Como mapear entidades com decorators e usar o `Repository` injetado
+- Como validar a entrada com DTOs e o `ValidationPipe`
+- Como paginar, filtrar e usar transações
+
+## Subindo o PostgreSQL e o projeto
+
+```yaml
+# compose.yaml
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: livros
+      POSTGRES_PASSWORD: livros
+      POSTGRES_DB: livros
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up -d
+npx @nestjs/cli new api-livros --package-manager npm
+cd api-livros
+npm i @nestjs/typeorm typeorm pg @nestjs/config class-validator class-transformer
+npx nest g resource livros --no-spec   # escolha REST API e gere os endpoints CRUD
+```
+
+```bash
+# .env
+DATABASE_URL=postgres://livros:livros@localhost:5432/livros
+PORT=3000
+```
+
+O `nest g resource` cria a pasta `src/livros` com módulo, controller, service, DTOs e entidade. É um ponto de partida; vamos reescrever cada arquivo entendendo o que faz.
+
+## Módulos, controllers e providers
+
+Três conceitos sustentam o Nest:
+
+| Peça | Papel | Decorator |
+|---|---|---|
+| Módulo | agrupa uma funcionalidade e declara o que importa e exporta | `@Module` |
+| Controller | recebe a requisição HTTP e devolve a resposta | `@Controller`, `@Get`, `@Post` |
+| Provider | qualquer classe injetável: services, repositórios, clientes | `@Injectable` |
+
+O contêiner de injeção lê os tipos dos parâmetros do construtor e entrega as instâncias certas. Por padrão, cada provider é um singleton dentro da aplicação. Você nunca escreve `new LivrosService(...)`: declara a classe no módulo e pede pelo construtor de quem precisa.
+
+## Conectando o TypeORM
+
+A conexão é configurada uma vez, no módulo raiz. Use `forRootAsync` para ler o ambiente pelo `ConfigService`, em vez de acessar `process.env` solto:
+
+```typescript
+// src/app.module.ts
+import { Module } from "@nestjs/common";
+import { ConfigModule, ConfigService } from "@nestjs/config";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { LivrosModule } from "./livros/livros.module";
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    TypeOrmModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: "postgres",
+        url: config.getOrThrow<string>("DATABASE_URL"),
+        autoLoadEntities: true,
+        synchronize: config.get("NODE_ENV") !== "production",
+        logging: ["error", "warn"],
+      }),
+    }),
+    LivrosModule,
+  ],
+})
+export class AppModule {}
+```
+
+`autoLoadEntities` registra automaticamente toda entidade declarada com `forFeature` nos módulos. `getOrThrow` faz a aplicação falhar na inicialização se a variável estiver faltando.
+
+<Callout type="warning" title="synchronize: true em produção apaga dados">
+Com `synchronize: true`, o TypeORM altera o schema do banco a cada inicialização para bater com as entidades. Renomear uma propriedade vira "remover coluna e criar outra": os dados da coluna antiga somem sem aviso. Use `synchronize` só no começo do desenvolvimento local. Assim que houver dados que importam, desligue e passe a usar migrações (o tema do próximo capítulo).
+</Callout>
+
+## A entidade
+
+Uma entidade é uma classe com decorators que dizem como ela vira tabela.
+
+```typescript
+// src/livros/entities/livro.entity.ts
+import {
+  Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, UpdateDateColumn,
+} from "typeorm";
+
+const decimalParaNumero = {
+  to: (v: number) => v,
+  from: (v: string | null) => (v === null ? null : Number(v)),
+};
+
+@Entity({ name: "livros" })
+export class Livro {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Column({ length: 200 })
+  titulo: string;
+
+  @Index()
+  @Column({ length: 120 })
+  autor: string;
+
+  @Column({ type: "char", length: 13, unique: true })
+  isbn: string;
+
+  @Column({ type: "smallint" })
+  ano: number;
+
+  @Column({ type: "numeric", precision: 10, scale: 2, transformer: decimalParaNumero })
+  preco: number;
+
+  @Column({ default: true })
+  disponivel: boolean;
+
+  @CreateDateColumn({ name: "criado_em", type: "timestamptz" })
+  criadoEm: Date;
+
+  @UpdateDateColumn({ name: "atualizado_em", type: "timestamptz" })
+  atualizadoEm: Date;
+}
+```
+
+Alguns detalhes que evitam dor de cabeça:
+
+- O driver `pg` devolve `numeric` como **string**, porque um número JavaScript não representa todos os decimais com exatidão. O `transformer` converte na leitura. Para valores monetários em que cada centavo importa, outra opção é guardar centavos num inteiro.
+- `timestamptz` guarda o instante com fuso, e é o tipo certo para datas de evento no PostgreSQL.
+- `name` nas colunas mantém o banco em snake_case e o código em camelCase.
+- O TypeScript estrito reclama de propriedades sem inicializador. Os projetos gerados pelo Nest não ligam o `strict` completo, então `strictPropertyInitialization` fica desligado; se o seu projeto liga, use `id!: string`.
+
+## DTOs e validação
+
+O DTO (objeto de transferência de dados) descreve o que a rota aceita. No Nest, a convenção é usar `class-validator`, cujos decorators o `ValidationPipe` executa antes de o controller ser chamado.
+
+```typescript
+// src/livros/dto/create-livro.dto.ts
+import { IsInt, IsNumber, IsString, Length, Matches, Max, Min } from "class-validator";
+
+export class CreateLivroDto {
+  @IsString() @Length(1, 200)
+  titulo: string;
+
+  @IsString() @Length(1, 120)
+  autor: string;
+
+  @Matches(/^97[89]\d{10}$/, { message: "isbn deve ser um ISBN-13" })
+  isbn: string;
+
+  @IsInt() @Min(1450) @Max(2100)
+  ano: number;
+
+  @IsNumber({ maxDecimalPlaces: 2 }) @Min(0)
+  preco: number;
+}
+```
+
+```typescript
+// src/livros/dto/update-livro.dto.ts
+import { PartialType } from "@nestjs/mapped-types";
+import { CreateLivroDto } from "./create-livro.dto";
+
+export class UpdateLivroDto extends PartialType(CreateLivroDto) {}
+```
+
+```typescript
+// src/main.ts
+import { ValidationPipe } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { AppModule } from "./app.module";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.useGlobalPipes(
+    new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+  );
+  await app.listen(process.env.PORT ?? 3000);
+}
+bootstrap();
+```
+
+`whitelist` remove campos sem decorator, e `forbidNonWhitelisted` transforma campos extras em erro 400: é a proteção contra mass assignment. `transform` converte o JSON numa instância do DTO e os parâmetros de rota nos tipos declarados. Se você prefere Zod, ele também funciona no Nest com um pipe próprio que chama `schema.parse`; o importante é haver validação em toda entrada.
+
+## O service com Repository
+
+`TypeOrmModule.forFeature` registra o repositório da entidade no módulo, e `@InjectRepository` o entrega ao service:
+
+```typescript
+// src/livros/livros.module.ts
+import { Module } from "@nestjs/common";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { Livro } from "./entities/livro.entity";
+import { LivrosController } from "./livros.controller";
+import { LivrosService } from "./livros.service";
+
+@Module({
+  imports: [TypeOrmModule.forFeature([Livro])],
+  controllers: [LivrosController],
+  providers: [LivrosService],
+  exports: [LivrosService],
+})
+export class LivrosModule {}
+```
+
+```typescript
+// src/livros/livros.service.ts
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { ILike, Repository } from "typeorm";
+import { CreateLivroDto } from "./dto/create-livro.dto";
+import { UpdateLivroDto } from "./dto/update-livro.dto";
+import { Livro } from "./entities/livro.entity";
+
+@Injectable()
+export class LivrosService {
+  constructor(@InjectRepository(Livro) private readonly repo: Repository<Livro>) {}
+
+  criar(dto: CreateLivroDto) {
+    return this.repo.save(this.repo.create(dto));
+  }
+
+  async listar(pagina: number, limite: number, autor?: string) {
+    const [itens, total] = await this.repo.findAndCount({
+      where: autor ? { autor: ILike(`%${autor}%`) } : {},
+      order: { titulo: "ASC" },
+      skip: (pagina - 1) * limite,
+      take: limite,
+    });
+    return { itens, total, pagina, paginas: Math.ceil(total / limite) };
+  }
+
+  async buscar(id: string) {
+    const livro = await this.repo.findOneBy({ id });
+    if (!livro) throw new NotFoundException(`Livro ${id} não encontrado`);
+    return livro;
+  }
+
+  async atualizar(id: string, dto: UpdateLivroDto) {
+    const livro = await this.repo.preload({ id, ...dto });
+    if (!livro) throw new NotFoundException(`Livro ${id} não encontrado`);
+    return this.repo.save(livro);
+  }
+
+  async remover(id: string) {
+    const { affected } = await this.repo.delete(id);
+    if (!affected) throw new NotFoundException(`Livro ${id} não encontrado`);
+  }
+}
+```
+
+Os métodos mais usados do `Repository`:
+
+| Método | O que faz |
+|---|---|
+| `create(dados)` | cria a instância da entidade, sem tocar no banco |
+| `save(entidade)` | insere ou atualiza (faz um select antes para decidir) |
+| `findOneBy(where)` | um registro ou `null` |
+| `findAndCount(opcoes)` | página de registros mais o total, em duas consultas |
+| `preload(dados)` | carrega pelo id e mescla os campos novos; `undefined` se não existir |
+| `delete(criterio)` | remove direto, sem carregar; devolve `affected` |
+
+O `ILike` gera `ILIKE` no PostgreSQL (busca sem diferenciar maiúsculas), e o valor do filtro vai como parâmetro, sem risco de injeção.
+
+## O controller
+
+```typescript
+// src/livros/livros.controller.ts
+import {
+  Body, Controller, DefaultValuePipe, Delete, Get, HttpCode, Param, ParseIntPipe,
+  ParseUUIDPipe, Patch, Post, Query,
+} from "@nestjs/common";
+import { CreateLivroDto } from "./dto/create-livro.dto";
+import { UpdateLivroDto } from "./dto/update-livro.dto";
+import { LivrosService } from "./livros.service";
+
+@Controller("livros")
+export class LivrosController {
+  constructor(private readonly livros: LivrosService) {}
+
+  @Post()
+  criar(@Body() dto: CreateLivroDto) {
+    return this.livros.criar(dto);
+  }
+
+  @Get()
+  listar(
+    @Query("pagina", new DefaultValuePipe(1), ParseIntPipe) pagina: number,
+    @Query("limite", new DefaultValuePipe(20), ParseIntPipe) limite: number,
+    @Query("autor") autor?: string,
+  ) {
+    return this.livros.listar(pagina, Math.min(limite, 100), autor);
+  }
+
+  @Get(":id")
+  buscar(@Param("id", ParseUUIDPipe) id: string) {
+    return this.livros.buscar(id);
+  }
+
+  @Patch(":id")
+  atualizar(@Param("id", ParseUUIDPipe) id: string, @Body() dto: UpdateLivroDto) {
+    return this.livros.atualizar(id, dto);
+  }
+
+  @Delete(":id")
+  @HttpCode(204)
+  remover(@Param("id", ParseUUIDPipe) id: string) {
+    return this.livros.remover(id);
+  }
+}
+```
+
+`ParseUUIDPipe` devolve 400 para um id mal formado antes de qualquer consulta; sem ele, o PostgreSQL lançaria erro de sintaxe de UUID e o cliente veria um 500. As exceções do Nest (`NotFoundException` e companhia) viram respostas HTTP com o status certo automaticamente.
+
+## Consultas além do básico e transações
+
+Para consultas que as opções de `find` não expressam bem, use o QueryBuilder, que continua parametrizando os valores:
+
+```typescript
+async estatisticasPorAutor() {
+  return this.repo
+    .createQueryBuilder("l")
+    .select("l.autor", "autor")
+    .addSelect("COUNT(*)::int", "total")
+    .addSelect("AVG(l.preco)::float", "precoMedio")
+    .where("l.ano >= :desde", { desde: 2000 })
+    .groupBy("l.autor")
+    .orderBy("total", "DESC")
+    .getRawMany<{ autor: string; total: number; precoMedio: number }>();
+}
+```
+
+Quando várias escritas precisam acontecer juntas ou nenhuma, use uma transação. Injete o `DataSource` e use o `EntityManager` que a transação entrega; tudo o que for feito com ele participa da mesma transação:
+
+```typescript
+constructor(
+  @InjectRepository(Livro) private readonly repo: Repository<Livro>,
+  private readonly dataSource: DataSource,
+) {}
+
+async reajustarPrecos(autor: string, percentual: number) {
+  return this.dataSource.transaction(async (manager) => {
+    const livros = await manager.findBy(Livro, { autor });
+    for (const l of livros) l.preco = Math.round(l.preco * (1 + percentual / 100) * 100) / 100;
+    await manager.save(livros);
+    return livros.length;
+  });
+}
+```
+
+Se qualquer passo lançar erro, o TypeORM faz rollback. Usar `this.repo` dentro do callback seria um erro sutil: ele não está na transação.
+
+## Na entrevista
+
+**O que é um provider no Nest?** Qualquer classe registrada no contêiner de injeção (services, repositórios, fábricas). O Nest cria a instância e a injeta pelo construtor de quem declara a dependência, como singleton por padrão.
+
+**Por que não usar `synchronize: true` em produção?** Porque ele altera o schema automaticamente e pode remover colunas com dados. Em produção, o schema evolui por migrações versionadas e revisadas.
+
+**Qual a diferença entre `save` e `update` no TypeORM?** `save` trabalha com entidades: verifica se existe, insere ou atualiza e dispara hooks. `update` executa um `UPDATE` direto pelo critério, sem carregar a entidade, mais rápido e sem hooks.
+
+**Para que serve `whitelist` no `ValidationPipe`?** Remove propriedades sem decorator de validação, impedindo que o cliente envie campos que não deveria (mass assignment).
+
+## Pratique
+
+Construa a API de livros com Nest, TypeORM e PostgreSQL:
+
+1. `compose.yaml` com PostgreSQL e `.env` lido pelo `ConfigModule`.
+2. Entidade `Livro` com UUID, `numeric` convertido para número e datas `timestamptz`.
+3. CRUD completo com DTOs validados, `ValidationPipe` global com `whitelist` e `forbidNonWhitelisted`, e `ParseUUIDPipe`.
+4. Listagem paginada com filtro por autor devolvendo `itens`, `total` e `paginas`.
+5. Um endpoint `GET /livros/estatisticas` com QueryBuilder e um `POST /livros/reajuste` transacional.
+
+Entregue o repositório com uma coleção de requisições (`.http` ou `curl` no README) e um teste e2e com o `supertest` que o Nest já configura, cobrindo criação, 400 por campo extra e 404.
+
+<Quiz question="Por que o driver pg devolve colunas numeric como string?" options={["Por um bug antigo do driver","Para não perder precisão, já que number do JavaScript não representa todos os decimais exatamente","Porque o TypeORM exige","Porque numeric não existe no PostgreSQL"]} answer={1} explanation="numeric tem precisão arbitrária. Converter para number pode perder precisão, então o driver entrega string e a conversão fica a seu critério." />
+<Quiz question="Dentro de dataSource.transaction(async (manager) => ...), você usa this.repo.save. O que acontece?" options={["Funciona na mesma transação","A escrita acontece fora da transação e não é desfeita no rollback","O TypeORM lança erro de compilação","O Nest injeta o manager automaticamente"]} answer={1} explanation="Só as operações feitas com o manager entregue pelo callback participam da transação. O repositório injetado usa outra conexão." />
+<Quiz question="Qual opção do ValidationPipe faz o Nest responder 400 quando o corpo traz um campo não declarado no DTO?" options={["transform","forbidNonWhitelisted","skipMissingProperties","disableErrorMessages"]} answer={1} explanation="forbidNonWhitelisted, junto com whitelist, transforma propriedades sem decorator em erro de validação." />
+
+## Base no CodeForge
+
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia) e [Repository](/learn/lld/repository): os padrões que o Nest e o TypeORM implementam.
+- [Transações e ACID](/learn/sql/transacoes-e-acid) e [Índices](/learn/sql/indices): o que acontece no PostgreSQL por trás do ORM.
+- [Pool de conexões](/learn/system-design/pool-de-conexoes): o que o TypeORM gerencia por você.
+- [Nest.js: Lidando com migrações, relacionamentos ORM e erros em uma API](/learn/carreira-nodejs/nestjs-lidando-migracoes-relacionamentos-orm-erros-api): a continuação desta API.
+
+## Referências
+
+- [Database (documentação do Nest)](https://docs.nestjs.com/techniques/database)
+- [Validation (documentação do Nest)](https://docs.nestjs.com/techniques/validation)
+- [TypeORM](https://typeorm.io/)
+- [Documentação do PostgreSQL](https://www.postgresql.org/docs/current/)

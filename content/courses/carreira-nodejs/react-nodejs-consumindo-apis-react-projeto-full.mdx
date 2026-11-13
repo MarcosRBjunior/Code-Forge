@@ -1,0 +1,298 @@
+---
+title: "React e Node.js: Consumindo APIs no React no projeto full stack"
+kind: lesson
+---
+
+A Estante tem duas metades que ainda não se conhecem: o front-end em React, com livros num arquivo local, e a API em Express, que guarda livros e favoritos. Neste último capítulo da sequência você liga as duas. Parece só trocar um import por um `fetch`, mas é aqui que aparecem os problemas reais de integração: carregamento, erros de rede, CORS, requisições que chegam fora de ordem e a tela que precisa refletir o que o servidor confirmou.
+
+**Você vai aprender:**
+
+- Criar uma camada de serviço no front-end que concentra as chamadas HTTP
+- Buscar dados ao montar o componente com `useEffect` e cancelar com `AbortController`
+- Tratar os estados de carregamento, erro e vazio
+- Enviar alterações (POST e DELETE) e manter a tela sincronizada com o servidor
+- Configurar a URL da API por ambiente e usar o proxy do Vite
+
+## Preparando os dois lados
+
+Rode a API (`npm run dev` em `estante-api`, porta 8000) e o front (`npm run dev` em `estante-web`, porta 5173) em dois terminais. Confirme que a API responde:
+
+```bash
+curl http://localhost:8000/livros
+```
+
+A URL da API muda entre desenvolvimento e produção, então ela não pode ficar fixa no código. O Vite lê variáveis de arquivos `.env` e expõe ao código do navegador **só** as que começam com `VITE_`:
+
+```bash
+# estante-web/.env.development
+VITE_API_URL=http://localhost:8000
+```
+
+```javascript
+console.log(import.meta.env.VITE_API_URL); // http://localhost:8000
+```
+
+Tudo que começa com `VITE_` vai parar no JavaScript que o navegador baixa. Nunca coloque segredos (chaves de API, senhas) em variáveis do front-end: qualquer pessoa consegue ler.
+
+## A camada de serviço
+
+Espalhar `fetch` pelos componentes repete URL, cabeçalhos e tratamento de erro em todo lugar. Concentre as chamadas num módulo:
+
+```javascript
+// src/servicos/api.js
+const BASE = import.meta.env.VITE_API_URL ?? "";
+
+export class ErroApi extends Error {
+  constructor(status, mensagem) {
+    super(mensagem);
+    this.status = status;
+  }
+}
+
+async function requisitar(caminho, { method = "GET", corpo, signal } = {}) {
+  const resposta = await fetch(`${BASE}${caminho}`, {
+    method,
+    signal,
+    headers: corpo ? { "Content-Type": "application/json" } : undefined,
+    body: corpo ? JSON.stringify(corpo) : undefined,
+  });
+
+  if (resposta.status === 204) return null;
+
+  const dados = await resposta.json().catch(() => null);
+  if (!resposta.ok) {
+    throw new ErroApi(resposta.status, dados?.mensagem ?? `Erro ${resposta.status}`);
+  }
+  return dados;
+}
+
+export const api = {
+  listarLivros: (signal) => requisitar("/livros", { signal }),
+  listarFavoritos: (signal) => requisitar("/favoritos", { signal }),
+  favoritar: (id) => requisitar(`/favoritos/${id}`, { method: "POST" }),
+  desfavoritar: (id) => requisitar(`/favoritos/${id}`, { method: "DELETE" }),
+};
+```
+
+O detalhe mais importante está em `if (!resposta.ok)`. O `fetch` só rejeita a Promise em **falha de rede** (servidor fora do ar, DNS, CORS bloqueado). Uma resposta 404 ou 500 é, para o `fetch`, uma resposta perfeitamente bem-sucedida. Quem transforma status de erro em exceção é você. A API foi desenhada para sempre devolver `{ mensagem }` nos erros, e aqui esse contrato é aproveitado: a mensagem do servidor vira a mensagem do erro.
+
+## Buscando dados com useEffect
+
+Componentes React devem ser funções puras da renderização: calcular o JSX a partir de props e estado. Buscar dados na rede é um **efeito colateral**, e efeitos ficam em `useEffect`, que roda depois que o componente aparece na tela.
+
+```jsx
+// src/App.jsx (trecho)
+import { useEffect, useState } from "react";
+import { api } from "./servicos/api.js";
+
+export default function App() {
+  const [livros, setLivros] = useState([]);
+  const [idsFavoritos, setIdsFavoritos] = useState([]);
+  const [carregando, setCarregando] = useState(true);
+  const [erro, setErro] = useState(null);
+
+  useEffect(() => {
+    const controlador = new AbortController();
+
+    async function carregar() {
+      try {
+        const [listaLivros, listaFavoritos] = await Promise.all([
+          api.listarLivros(controlador.signal),
+          api.listarFavoritos(controlador.signal),
+        ]);
+        setLivros(listaLivros);
+        setIdsFavoritos(listaFavoritos.map((l) => l.id));
+      } catch (e) {
+        if (e.name !== "AbortError") setErro(e.message);
+      } finally {
+        if (!controlador.signal.aborted) setCarregando(false);
+      }
+    }
+
+    carregar();
+    return () => controlador.abort();
+  }, []);
+
+  // ...
+}
+```
+
+Destrinchando:
+
+- **O array de dependências `[]`** diz ao React para rodar o efeito só quando o componente monta. Se o efeito usar uma variável (como um termo de busca), ela entra no array, e o efeito roda de novo quando ela mudar.
+- **A função `async` fica dentro do efeito.** O próprio callback do `useEffect` não pode ser `async`, porque ele deve devolver a função de limpeza (ou nada), e não uma Promise.
+- **A função de limpeza** (`return () => controlador.abort()`) roda quando o componente sai da tela ou antes de o efeito rodar de novo. Ela cancela a requisição em andamento, e o `fetch` rejeita com `AbortError`, que o código ignora de propósito.
+- **`Promise.all`** busca livros e favoritos em paralelo.
+
+Em desenvolvimento, o `StrictMode` monta, desmonta e monta de novo cada componente, então você vai ver duas requisições no painel de rede. É intencional: serve para revelar efeitos sem limpeza. Com o `abort`, a primeira é cancelada e não causa problema.
+
+<Callout type="warning" title="Respostas fora de ordem">
+Sem cancelamento, buscas disparadas a cada tecla podem chegar fora de ordem: você digita "ma", depois "mac", e a resposta de "ma" (mais lenta) chega por último e sobrescreve a tela com o resultado errado. Toda requisição feita num efeito que depende de um valor que muda precisa de limpeza: cancele com `AbortController` ou ignore respostas antigas com uma variável `ativo` que a limpeza marca como falsa.
+</Callout>
+
+## Os três estados de toda tela com dados
+
+Uma tela que busca dados tem sempre, no mínimo, três estados além do sucesso: carregando, erro e vazio. Trate todos de forma explícita:
+
+```jsx
+if (carregando) return <p className="status">Carregando livros...</p>;
+
+if (erro) {
+  return (
+    <div className="status erro" role="alert">
+      <p>Não foi possível carregar a estante: {erro}</p>
+      <button onClick={() => window.location.reload()}>Tentar de novo</button>
+    </div>
+  );
+}
+
+return (
+  <main className="app">
+    <h1>Estante</h1>
+    <Pesquisa termo={termo} aoMudarTermo={setTermo} />
+    <ListaDeLivros livros={filtrados} idsFavoritos={idsFavoritos} aoAlternarFavorito={alternarFavorito} />
+  </main>
+);
+```
+
+O estado vazio já estava tratado em `ListaDeLivros` no primeiro capítulo. Para ver o estado de erro, desligue a API e recarregue a página. Para ver o carregando, use a opção de limitar a rede (throttling) nas ferramentas do navegador.
+
+## Enviando alterações
+
+Favoritar agora precisa passar pelo servidor. Há duas estratégias.
+
+**Pessimista**: espera a confirmação do servidor antes de mudar a tela. Simples e sempre correta, mas o clique parece lento.
+
+**Otimista**: muda a tela na hora e desfaz se o servidor recusar. A interface parece instantânea.
+
+```jsx
+const [pendentes, setPendentes] = useState([]);
+const [aviso, setAviso] = useState(null);
+
+async function alternarFavorito(id) {
+  if (pendentes.includes(id)) return; // evita clique duplo
+  const eraFavorito = idsFavoritos.includes(id);
+
+  // otimista: atualiza a tela antes da resposta
+  setIdsFavoritos((atuais) => (eraFavorito ? atuais.filter((x) => x !== id) : [...atuais, id]));
+  setPendentes((p) => [...p, id]);
+
+  try {
+    if (eraFavorito) await api.desfavoritar(id);
+    else await api.favoritar(id);
+  } catch (e) {
+    // 409 ao favoritar ou 404 ao desfavoritar: o servidor já está no estado desejado
+    const jaEstavaCerto = (!eraFavorito && e.status === 409) || (eraFavorito && e.status === 404);
+    if (!jaEstavaCerto) {
+      setIdsFavoritos((atuais) => (eraFavorito ? [...atuais, id] : atuais.filter((x) => x !== id)));
+      setAviso(`Não foi possível atualizar o favorito: ${e.message}`);
+    }
+  } finally {
+    setPendentes((p) => p.filter((x) => x !== id));
+  }
+}
+```
+
+Passe `pendentes` até o `CardLivro` para desabilitar o botão (`disabled={pendente}`) enquanto a requisição não volta. Repare como os códigos de status que você escolheu na API (409 e 404) agora orientam decisões no front: um contrato bem desenhado simplifica o cliente.
+
+## Busca no servidor
+
+Filtrar no navegador funciona com dezenas de livros. Com milhares, a busca precisa ir para a API (`GET /livros?busca=termo`, exercício do capítulo anterior). O efeito passa a depender do termo, e convém esperar a pessoa parar de digitar (debounce) para não disparar uma requisição por tecla:
+
+```jsx
+const [termo, setTermo] = useState("");
+const [resultado, setResultado] = useState([]);
+
+useEffect(() => {
+  const controlador = new AbortController();
+  const espera = setTimeout(async () => {
+    try {
+      const params = new URLSearchParams({ busca: termo.trim() });
+      const dados = await fetch(`${import.meta.env.VITE_API_URL}/livros?${params}`, {
+        signal: controlador.signal,
+      }).then((r) => r.json());
+      setResultado(dados);
+    } catch (e) {
+      if (e.name !== "AbortError") console.error(e);
+    }
+  }, 300);
+
+  return () => {
+    clearTimeout(espera);
+    controlador.abort();
+  };
+}, [termo]);
+```
+
+A cada tecla, a limpeza cancela o timer anterior e a requisição anterior. Só a última busca, 300 ms depois da última tecla, chega a atualizar a tela. `URLSearchParams` codifica o termo corretamente (espaços, acentos, `&`), algo que concatenar strings não faz.
+
+## Proxy do Vite: adeus CORS no desenvolvimento
+
+Uma alternativa à configuração de CORS é o proxy do servidor de desenvolvimento do Vite. O navegador chama a própria origem (`localhost:5173/api/livros`), e o Vite repassa para a API:
+
+```javascript
+// vite.config.js
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    proxy: {
+      "/api": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        rewrite: (caminho) => caminho.replace(/^\/api/, ""),
+      },
+    },
+  },
+});
+```
+
+Com isso, `VITE_API_URL` vira `/api` e não há requisição entre origens no desenvolvimento. Em produção, o mesmo efeito vem de servir front e API sob o mesmo domínio (um proxy reverso como Nginx, ou o próprio Express servindo a pasta `dist/` com `express.static`). Se ficarem em domínios diferentes, o CORS da API continua necessário.
+
+## Do lado do back-end: o que facilita o front
+
+Integrar mostra o que a API poderia fazer melhor. Lições para levar aos seus próximos projetos:
+
+- **Erros com formato único** (`{ mensagem }`) permitem um tratamento só no cliente.
+- **Status precisos** (409, 404, 400) deixam o front decidir sem analisar texto.
+- **Respostas de escrita devolvendo o recurso** evitam uma segunda requisição para atualizar a tela.
+- **Paginação e busca no servidor** mantêm o front rápido com muitos dados.
+
+## Na entrevista
+
+- **O `fetch` rejeita a Promise numa resposta 404?** Não. Ele só rejeita em falha de rede ou cancelamento. É preciso verificar `resposta.ok` ou `resposta.status` e lançar o erro manualmente.
+- **Para que serve a função de limpeza do `useEffect`?** Desfazer o que o efeito fez (cancelar requisições, timers, inscrições) quando o componente desmonta ou antes de o efeito rodar de novo, evitando vazamentos e atualizações com dados antigos.
+- **O que é atualização otimista?** Atualizar a interface antes da confirmação do servidor, desfazendo em caso de erro. Melhora a percepção de velocidade, com o custo de tratar o rollback.
+- **Como evitar requisições a cada tecla numa busca?** Debounce: esperar um intervalo sem novas teclas antes de buscar, cancelando o timer e a requisição anteriores.
+
+## Pratique
+
+Finalize a Estante full stack:
+
+1. Substitua os dados locais pela API com a camada `servicos/api.js`, tratando carregando, erro e vazio.
+2. Implemente favoritar e desfavoritar otimistas, com botão desabilitado durante a requisição e aviso de erro que some depois de alguns segundos.
+3. Crie um formulário para cadastrar livros (`POST /livros`) que mostra as mensagens de validação devolvidas pela API.
+4. Faça a busca pelo servidor com debounce.
+5. Configure o proxy do Vite e documente no README como subir os dois projetos.
+
+Entregue os dois repositórios (ou um monorepo com `web/` e `api/`) e um GIF curto mostrando o favoritar funcionando com a API desligada e ligada.
+
+<Quiz question="A API responde 500 a um fetch. O que acontece com a Promise do fetch?" options={["Rejeita com o status 500","Resolve normalmente com resposta.ok igual a false","Fica pendente até o timeout","Rejeita com AbortError"]} answer={1} explanation="O fetch só rejeita em falhas de rede ou cancelamento. Respostas HTTP de erro resolvem, e você precisa checar resposta.ok." />
+<Quiz question="Por que o callback passado ao useEffect não deve ser async?" options={["Porque o React não suporta Promises","Porque ele deve devolver a função de limpeza ou nada, e não uma Promise","Porque async deixa o componente mais lento","Porque o useEffect roda antes da renderização"]} answer={1} explanation="Uma função async sempre devolve uma Promise, e o React espera que o efeito devolva uma função de limpeza ou undefined." />
+<Quiz question="Qual variável de ambiente fica disponível no código do navegador num projeto Vite?" options={["API_URL","REACT_APP_API_URL","VITE_API_URL","NODE_API_URL"]} answer={2} explanation="O Vite só expõe ao cliente variáveis com o prefixo VITE_, justamente para evitar vazar segredos por engano." />
+
+## Base no CodeForge
+
+- [Async/await](/learn/typescript/async-await) e [Promises](/learn/typescript/promises): a base das chamadas assíncronas.
+- [Proxy e proxy reverso](/learn/system-design/proxy-reverse-proxy): como servir front e API sob o mesmo domínio em produção.
+- [HTTP/1.1](/learn/redes/http-1): o protocolo por trás de cada `fetch`.
+- [Git e GitHub: Compartilhando e colaborando em projetos](/learn/carreira-nodejs/git-github-compartilhando-colaborando-projetos): publique a Estante.
+
+## Referências
+
+- [React: useEffect](https://react.dev/reference/react/useEffect)
+- [React: Sincronizando com efeitos](https://react.dev/learn/synchronizing-with-effects)
+- [MDN: Usando a Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch)
+- [Vite: Opções do servidor](https://vite.dev/config/server-options)

@@ -1,0 +1,334 @@
+---
+title: "ORM com Node.js: Avançando nas funcionalidades do Sequelize"
+kind: lesson
+---
+
+Uma tabela isolada é fácil. A dificuldade começa quando os dados se relacionam: um autor tem vários livros, um leitor pega vários livros emprestados, e emprestar um livro precisa baixar o estoque e registrar o empréstimo ao mesmo tempo. É aqui que o ORM mostra se você sabe usá-lo ou se está gerando dezenas de consultas sem perceber. Este capítulo continua a API de livros com associações, consultas com relacionamentos, escopos, exclusão lógica e transações.
+
+**Você vai aprender:**
+
+- Declarar associações 1:N e N:N e criar as chaves estrangeiras por migração
+- Carregar dados relacionados com `include` sem cair no problema N+1
+- Reaproveitar filtros com escopos e esconder registros com exclusão lógica
+- Garantir consistência com transações gerenciadas
+- Paginar e agregar resultados direto no banco
+
+## O domínio
+
+Partimos do modelo `Livro` do capítulo anterior e adicionamos três tabelas:
+
+| Tabela | Relação |
+|---|---|
+| `autores` | Um autor tem muitos livros (1:N) |
+| `leitores` | Um leitor pega muitos livros e um livro é pego por muitos leitores (N:N) |
+| `emprestimos` | Tabela de junção com dados próprios: data de devolução e status |
+
+A coluna `autor` (texto) do livro dá lugar a `autorId`, uma chave estrangeira.
+
+## Chaves estrangeiras por migração
+
+A associação no modelo não cria a coluna no banco. Quem cria é a migração, com `references`.
+
+```javascript
+// src/database/migrations/20261114090000-criar-autores-e-emprestimos.cjs
+module.exports = {
+  async up(queryInterface, Sequelize) {
+    const tempo = {
+      createdAt: { type: Sequelize.DATE, allowNull: false },
+      updatedAt: { type: Sequelize.DATE, allowNull: false },
+    };
+    await queryInterface.createTable("autores", {
+      id: { type: Sequelize.INTEGER, autoIncrement: true, primaryKey: true },
+      nome: { type: Sequelize.STRING, allowNull: false },
+      ...tempo,
+    });
+    await queryInterface.createTable("leitores", {
+      id: { type: Sequelize.INTEGER, autoIncrement: true, primaryKey: true },
+      nome: { type: Sequelize.STRING, allowNull: false },
+      email: { type: Sequelize.STRING, allowNull: false, unique: true },
+      deletedAt: { type: Sequelize.DATE },
+      ...tempo,
+    });
+    await queryInterface.addColumn("livros", "autorId", {
+      type: Sequelize.INTEGER,
+      references: { model: "autores", key: "id" },
+      onDelete: "RESTRICT",
+    });
+    await queryInterface.addColumn("livros", "estoque", {
+      type: Sequelize.INTEGER, allowNull: false, defaultValue: 1,
+    });
+    await queryInterface.createTable("emprestimos", {
+      id: { type: Sequelize.INTEGER, autoIncrement: true, primaryKey: true },
+      livroId: { type: Sequelize.INTEGER, allowNull: false, references: { model: "livros", key: "id" } },
+      leitorId: { type: Sequelize.INTEGER, allowNull: false, references: { model: "leitores", key: "id" } },
+      status: { type: Sequelize.STRING, allowNull: false, defaultValue: "ativo" },
+      devolverAte: { type: Sequelize.DATEONLY, allowNull: false },
+      ...tempo,
+    });
+    await queryInterface.addIndex("emprestimos", ["leitorId", "status"]);
+  },
+
+  async down(queryInterface) {
+    await queryInterface.dropTable("emprestimos");
+    await queryInterface.removeColumn("livros", "estoque");
+    await queryInterface.removeColumn("livros", "autorId");
+    await queryInterface.dropTable("leitores");
+    await queryInterface.dropTable("autores");
+  },
+};
+```
+
+`onDelete: "RESTRICT"` impede apagar um autor que ainda tem livros. É uma regra de negócio garantida pelo banco, e não depende de ninguém lembrar de checar no código. O índice em `emprestimos` existe porque a consulta mais comum será "empréstimos ativos de um leitor".
+
+## Associações nos modelos
+
+O Sequelize tem quatro métodos de associação. Eles sempre aparecem em pares, um em cada lado, para que você consiga navegar nos dois sentidos.
+
+```javascript
+// src/models/associacoes.js
+import { Autor } from "./Autor.js";
+import { Livro } from "./Livro.js";
+import { Leitor } from "./Leitor.js";
+import { Emprestimo } from "./Emprestimo.js";
+
+// 1:N
+Autor.hasMany(Livro, { foreignKey: "autorId", as: "livros" });
+Livro.belongsTo(Autor, { foreignKey: "autorId", as: "autor" });
+
+// N:N através de um modelo com dados próprios
+Livro.belongsToMany(Leitor, { through: Emprestimo, foreignKey: "livroId", otherKey: "leitorId", as: "leitores" });
+Leitor.belongsToMany(Livro, { through: Emprestimo, foreignKey: "leitorId", otherKey: "livroId", as: "livros" });
+
+// Acesso direto ao modelo de junção
+Emprestimo.belongsTo(Livro, { foreignKey: "livroId", as: "livro" });
+Emprestimo.belongsTo(Leitor, { foreignKey: "leitorId", as: "leitor" });
+Leitor.hasMany(Emprestimo, { foreignKey: "leitorId", as: "emprestimos" });
+
+export { Autor, Livro, Leitor, Emprestimo };
+```
+
+Importe esse arquivo uma vez, antes de usar qualquer modelo (por exemplo, no `app.js`). Se as associações forem declaradas depois da primeira consulta, o `include` falha com "is not associated".
+
+Cada associação adiciona métodos às instâncias. `autor.getLivros()`, `autor.createLivro({...})` e `leitor.addLivro(livro, { through: { devolverAte } })` existem por causa do `hasMany` e do `belongsToMany`. O alias definido em `as` precisa ser repetido em todo `include`.
+
+## Eager loading e o problema N+1
+
+O jeito ingênuo de listar livros com o nome do autor:
+
+```javascript
+// N+1: 1 consulta de livros + 1 consulta por livro
+const livros = await Livro.findAll();
+for (const livro of livros) {
+  const autor = await livro.getAutor();
+  console.log(livro.titulo, autor?.nome);
+}
+```
+
+Com 100 livros, são 101 consultas. O `include` resolve com um `JOIN`:
+
+```javascript
+const livros = await Livro.findAll({
+  attributes: ["id", "titulo", "preco"],
+  include: [{ model: Autor, as: "autor", attributes: ["id", "nome"] }],
+  order: [["titulo", "ASC"]],
+});
+```
+
+Dá para filtrar pelo relacionamento. Com `where` dentro do `include`, a junção vira `INNER JOIN` e só voltam livros cujo autor bate com o filtro:
+
+```javascript
+import { Op } from "sequelize";
+
+const livrosDoMachado = await Livro.findAll({
+  include: [{ model: Autor, as: "autor", where: { nome: { [Op.like]: "%Machado%" } } }],
+});
+
+// Empréstimos ativos com livro e leitor, em uma só consulta
+const ativos = await Emprestimo.findAll({
+  where: { status: "ativo" },
+  include: [
+    { model: Livro, as: "livro", attributes: ["titulo"] },
+    { model: Leitor, as: "leitor", attributes: ["nome", "email"] },
+  ],
+});
+```
+
+<Callout type="warning" title="include em lista com paginação">
+Juntar `include` de um relacionamento N (como `hasMany`) com `limit` produz resultados estranhos: o limite seria aplicado às linhas do `JOIN`, não aos registros principais. O Sequelize contorna gerando uma subconsulta, o que pode ficar lento. Quando o relacionamento é de muitos, considere `separate: true` no `include` (faz uma segunda consulta com `IN`) ou carregue a lista e os filhos em duas consultas.
+</Callout>
+
+## Paginação e contagem
+
+`findAndCountAll` devolve a página e o total, útil para montar a resposta paginada.
+
+```javascript
+export async function listarLivros(req, res) {
+  const pagina = Math.max(1, Number(req.query.pagina) || 1);
+  const limite = Math.min(50, Number(req.query.limite) || 10);
+
+  const { rows, count } = await Livro.findAndCountAll({
+    include: [{ model: Autor, as: "autor", attributes: ["nome"] }],
+    limit: limite,
+    offset: (pagina - 1) * limite,
+    order: [["id", "ASC"]],
+    distinct: true,
+  });
+
+  res.json({ dados: rows, pagina, limite, total: count, paginas: Math.ceil(count / limite) });
+}
+```
+
+O `distinct: true` faz o `count` contar livros distintos, e não linhas do `JOIN`. Limitar o `limite` máximo protege o banco de um `?limite=100000`.
+
+### Agregações
+
+Para "quantos livros cada autor tem", deixe o banco agregar:
+
+```javascript
+import { fn, col } from "sequelize";
+
+const porAutor = await Livro.findAll({
+  attributes: ["autorId", [fn("COUNT", col("Livro.id")), "total"]],
+  include: [{ model: Autor, as: "autor", attributes: ["nome"] }],
+  group: ["autorId", "autor.id"],
+  raw: true,
+});
+```
+
+`Livro.count({ where })`, `Livro.sum("preco")` e `Livro.max("paginas")` cobrem os casos simples sem escrever `fn`.
+
+## Escopos: filtros com nome
+
+Se toda listagem pública esquece de filtrar `estoque > 0`, alguém vai esquecer. Escopos guardam opções de consulta reutilizáveis.
+
+```javascript
+// em Livro.init, nas opções do modelo
+{
+  sequelize,
+  modelName: "Livro",
+  tableName: "livros",
+  defaultScope: { attributes: { exclude: ["createdAt", "updatedAt"] } },
+  scopes: {
+    disponiveis: { where: { estoque: { [Op.gt]: 0 } } },
+    doAutor(autorId) {
+      return { where: { autorId } };
+    },
+    comAutor: { include: [{ association: "autor", attributes: ["nome"] }] },
+  },
+}
+```
+
+```javascript
+await Livro.scope("disponiveis").findAll();
+await Livro.scope(["disponiveis", "comAutor", { method: ["doAutor", 3] }]).findAll();
+await Livro.unscoped().findAll(); // ignora inclusive o defaultScope
+```
+
+O `defaultScope` se aplica a todas as consultas. Use com parcimônia: um filtro escondido ali confunde quem lê `Livro.findAll()` e não entende por que faltam registros.
+
+## Exclusão lógica com paranoid
+
+Apagar um leitor de verdade quebraria o histórico de empréstimos. Com `paranoid: true`, o `destroy` só preenche `deletedAt`, e as consultas passam a ignorar esses registros.
+
+```javascript
+Leitor.init(
+  {
+    nome: { type: DataTypes.STRING, allowNull: false },
+    email: { type: DataTypes.STRING, allowNull: false, unique: true, validate: { isEmail: true } },
+  },
+  { sequelize, modelName: "Leitor", tableName: "leitores", paranoid: true },
+);
+```
+
+```javascript
+await leitor.destroy();                                   // UPDATE ... SET deletedAt = agora
+await Leitor.findAll();                                   // não traz o removido
+await Leitor.findAll({ paranoid: false });                // traz todos
+await Leitor.restore({ where: { id: 7 } });               // desfaz
+await leitor.destroy({ force: true });                    // apaga de verdade
+```
+
+`paranoid` exige `timestamps` ativos e a coluna `deletedAt` criada na migração (por isso ela já estava lá). Lembre que o `unique` do e-mail continua valendo para registros removidos: se um leitor apagado tentar se cadastrar de novo, vai bater na restrição.
+
+## Transações
+
+Emprestar um livro envolve três passos: conferir estoque, baixar estoque e criar o empréstimo. Se o segundo funcionar e o terceiro falhar, o estoque fica errado. Transação garante que ou tudo acontece, ou nada.
+
+A forma **gerenciada** é a mais segura: você passa uma função, e o Sequelize faz `COMMIT` se ela resolver ou `ROLLBACK` se ela lançar erro.
+
+```javascript
+import { sequelize } from "../database/index.js";
+import { Livro, Leitor, Emprestimo } from "../models/associacoes.js";
+
+export class RegraDeNegocioError extends Error {}
+
+export async function emprestar({ livroId, leitorId }) {
+  return sequelize.transaction(async (t) => {
+    const livro = await Livro.findByPk(livroId, { transaction: t, lock: t.LOCK.UPDATE });
+    if (!livro) throw new RegraDeNegocioError("Livro não encontrado");
+    if (livro.estoque < 1) throw new RegraDeNegocioError("Sem estoque");
+
+    const ativos = await Emprestimo.count({ where: { leitorId, status: "ativo" }, transaction: t });
+    if (ativos >= 3) throw new RegraDeNegocioError("Limite de 3 empréstimos ativos");
+
+    await livro.decrement("estoque", { by: 1, transaction: t });
+
+    const devolverAte = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+    return Emprestimo.create({ livroId, leitorId, devolverAte }, { transaction: t });
+  });
+}
+```
+
+Toda operação dentro da transação precisa receber `{ transaction: t }`. Esquecer em uma delas faz aquela consulta rodar fora da transação, em outra conexão, e o rollback não a desfaz. O `lock: t.LOCK.UPDATE` gera `SELECT ... FOR UPDATE` em bancos que suportam (PostgreSQL, MySQL), impedindo que duas requisições simultâneas peguem o último exemplar. No SQLite, que trava o banco inteiro na escrita, a opção é ignorada.
+
+`decrement` gera `UPDATE livros SET estoque = estoque - 1`, calculado pelo banco. Isso é melhor do que ler o valor, subtrair no JavaScript e salvar, que perde atualizações concorrentes.
+
+## Hooks
+
+Hooks rodam código antes ou depois de eventos do modelo. Use para regras ligadas ao próprio dado, como normalizar e-mail:
+
+```javascript
+Leitor.beforeSave((leitor) => {
+  if (leitor.changed("email")) leitor.email = leitor.email.trim().toLowerCase();
+});
+```
+
+Evite colocar regra de negócio pesada em hooks (enviar e-mail, chamar outra API). Elas ficam invisíveis para quem lê o serviço, e operações em lote como `Livro.update` com `where` não disparam hooks de instância, a menos que você passe `individualHooks: true`.
+
+## Na entrevista
+
+**O que é o problema N+1 e como você resolve?** É fazer uma consulta para a lista e mais uma para cada item ao buscar o relacionamento. Resolve-se com eager loading (`include`, que vira `JOIN`) ou com uma segunda consulta usando `IN` para todos os ids de uma vez.
+
+**Quando usar transação?** Quando várias escritas precisam ser atômicas: todas ou nenhuma. E sempre que uma leitura decide uma escrita sob concorrência, como checar estoque e baixar, combinada com lock de linha ou atualização atômica.
+
+**Exclusão lógica ou física?** Lógica quando há histórico, auditoria ou relacionamentos que não podem quebrar. O custo é lembrar dela em índices únicos e em relatórios, e definir quando os dados serão expurgados de verdade (LGPD).
+
+## Pratique
+
+Evolua a API de livros e entregue:
+
+1. Migração e modelos de `Autor`, `Leitor` e `Emprestimo` com as associações deste capítulo.
+2. `GET /livros` paginado com o nome do autor e total de páginas na resposta.
+3. `POST /emprestimos` usando a transação de `emprestar`, devolvendo 422 para `RegraDeNegocioError`.
+4. `POST /emprestimos/:id/devolver` que, numa transação, marca o empréstimo como devolvido e incrementa o estoque.
+5. `DELETE /leitores/:id` lógico, e `GET /leitores/:id/emprestimos` que mostra o histórico mesmo de leitores removidos.
+
+<Quiz question="Uma consulta na transação foi chamada sem a opção transaction. O que acontece no rollback?" options={["Ela também é desfeita","Ela não é desfeita, pois rodou fora da transação","O Sequelize lança erro antes de executar","A transação inteira é confirmada"]} answer={1} explanation="Sem transaction a consulta usa outra conexão do pool, fora da transação. O rollback não alcança o que ela gravou." />
+
+<Quiz question="Para que serve distinct true em findAndCountAll com include?" options={["Remover livros repetidos do resultado","Contar registros principais em vez de linhas do JOIN","Ordenar por chave primária","Evitar a subconsulta do limit"]} answer={1} explanation="Com include o JOIN pode multiplicar linhas. distinct faz o COUNT considerar ids distintos do modelo principal." />
+
+<Quiz question="O que paranoid true faz no destroy?" options={["Pede confirmação antes de apagar","Apaga em cascata os filhos","Preenche deletedAt e esconde o registro das consultas","Copia o registro para uma tabela de histórico"]} answer={2} explanation="Com paranoid o destroy vira um UPDATE de deletedAt. Consultas normais filtram esses registros, e restore ou force true desfazem ou apagam de vez." />
+
+## Base no CodeForge
+
+- [INNER JOIN](/learn/sql/inner-join) e [OUTER JOINs](/learn/sql/outer-joins): o SQL que o `include` gera.
+- [Transações e ACID](/learn/sql/transacoes-e-acid) e [Locks no banco](/learn/sql/locks-no-banco): por que a transação e o `FOR UPDATE` funcionam.
+- [Ordenação e paginação](/learn/sql/ordenacao-e-paginacao): limites do `OFFSET` em tabelas grandes.
+- [ORM com Node.js: Desenvolvendo uma API com Sequelize e SQLite](/learn/carreira-nodejs/orm-nodejs-desenvolvendo-api-sequelize-sqlite): o capítulo anterior desta API.
+
+## Referências
+
+- [Sequelize: Associations](https://sequelize.org/docs/v6/core-concepts/assocs/)
+- [Sequelize: Transactions](https://sequelize.org/docs/v6/other-topics/transactions/)
+- [Sequelize: Scopes](https://sequelize.org/docs/v6/other-topics/scopes/)
+- [Sequelize: Paranoid](https://sequelize.org/docs/v6/core-concepts/paranoid/)

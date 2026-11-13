@@ -1,0 +1,282 @@
+---
+title: "Amazon EKS: Gerenciando aplicações conteinerizadas com Kubernetes"
+kind: lesson
+---
+
+Kubernetes virou a linguagem comum para rodar containers em produção: os mesmos manifestos YAML funcionam na AWS, no Google Cloud, no Azure ou num servidor próprio. O Amazon EKS é o Kubernetes gerenciado da AWS. Ele opera o control plane (API server, etcd, scheduler) com alta disponibilidade, e você cuida dos nós e das aplicações. Para o dev back-end, isso significa saber criar o cluster, descrever a API Node.js em manifestos e entender como ela recebe tráfego, escala e acessa a AWS com segurança.
+
+**Você vai aprender:**
+
+- O que o EKS gerencia e o que continua com você
+- Como criar um cluster com eksctl e conectar o kubectl
+- Como descrever a API em Deployment, Service e Ingress com probes e recursos
+- Como expor a aplicação com o AWS Load Balancer Controller e escalar com HPA
+- Como dar permissões da AWS a um pod sem chaves de acesso
+
+## O que o EKS gerencia
+
+Um cluster Kubernetes tem duas partes:
+
+- **Control plane:** o API server que recebe os comandos do `kubectl`, o etcd que guarda o estado, o scheduler que decide onde cada pod roda e os controllers. No EKS, a AWS roda tudo isso em várias zonas, atualiza e cobra uma taxa por hora por cluster.
+- **Data plane:** os nós onde os pods rodam. Você escolhe entre **managed node groups** (instâncias EC2 que a AWS ajuda a criar e atualizar), **Fargate** (cada pod numa micro-VM, sem nós visíveis) ou o **EKS Auto Mode**, em que a AWS também gerencia os nós e add-ons essenciais.
+
+Na rede, o EKS usa o **VPC CNI**: cada pod recebe um IP real da subnet. Isso simplifica a comunicação com RDS e outros serviços da VPC, mas consome IPs rápido. Planeje subnets grandes (`/19` ou `/20`) para os nós.
+
+## Criando o cluster
+
+O **eksctl** é a CLI oficial para criar clusters EKS. Ele gera por baixo uma stack do CloudFormation com VPC, papéis IAM e node groups. Descreva o cluster num arquivo:
+
+```yaml
+# cluster.yaml
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: livros
+  region: us-east-1
+iam:
+  withOIDC: true
+addons:
+  - name: eks-pod-identity-agent
+managedNodeGroups:
+  - name: geral
+    instanceType: t3.medium
+    minSize: 2
+    maxSize: 5
+    desiredCapacity: 2
+    privateNetworking: true
+    labels: { carga: geral }
+```
+
+```bash
+eksctl create cluster -f cluster.yaml          # leva uns 15 minutos
+aws eks update-kubeconfig --region us-east-1 --name livros
+kubectl get nodes -o wide
+```
+
+O `update-kubeconfig` grava no `~/.kube/config` as credenciais para o `kubectl` falar com o cluster usando sua identidade da AWS CLI. Quem pode fazer o quê dentro do cluster é definido pelas **access entries** do EKS, que ligam papéis IAM a permissões do Kubernetes.
+
+## A API em manifestos
+
+Os objetos principais para uma API são:
+
+| Objeto | Papel |
+|---|---|
+| Namespace | Separa os recursos do projeto |
+| Deployment | Mantém N réplicas do pod e faz rolling update |
+| Service | Nome DNS e IP estáveis na frente dos pods |
+| Ingress | Regra HTTP de entrada, vira um ALB na AWS |
+| ConfigMap e Secret | Configuração e segredos injetados nos pods |
+| HorizontalPodAutoscaler | Ajusta o número de réplicas pela carga |
+
+```yaml
+# k8s/api.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: livros
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: livros-api
+  namespace: livros
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: livros-api
+  namespace: livros
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: livros-api }
+  strategy:
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: livros-api }
+    spec:
+      serviceAccountName: livros-api
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: api
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/livros-api:a1b2c3d
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef: { name: livros-config }
+            - secretRef: { name: livros-segredos }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "10"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: livros-api
+  namespace: livros
+spec:
+  selector: { app: livros-api }
+  ports:
+    - port: 80
+      targetPort: 3000
+```
+
+Os campos que mais importam em produção:
+
+- **`requests`:** quanto de CPU e memória o scheduler reserva para o pod. Sem eles, o scheduler empilha pods no mesmo nó e o HPA não tem base para calcular percentuais.
+- **`limits.memory`:** se o processo passar disso, é morto (`OOMKilled`). O Node.js ajusta o tamanho do heap considerando o limite de memória do container, mas deixe folga para buffers e memória fora do heap.
+- **`readinessProbe`:** enquanto falha, o pod não recebe tráfego do Service. **`livenessProbe`:** se falha, o container é reiniciado. Não verifique o banco na liveness; se o banco cair, todos os pods reiniciam em loop sem motivo.
+- **`preStop` com `sleep`:** dá tempo para o pod sair dos endpoints do Service e do ALB antes de receber o `SIGTERM`. Sem isso, algumas requisições chegam a um processo que já está fechando.
+
+```bash
+kubectl create configmap livros-config -n livros \
+  --from-literal=NODE_ENV=production --from-literal=PORT=3000
+kubectl create secret generic livros-segredos -n livros \
+  --from-literal=DATABASE_URL='postgres://...'
+kubectl apply -f k8s/api.yaml
+kubectl rollout status deployment/livros-api -n livros
+```
+
+Secrets do Kubernetes são apenas codificados em base64, não criptografados para quem tem acesso ao namespace. Em produção, prefira sincronizar do Secrets Manager (com o Secrets Store CSI Driver ou o External Secrets Operator) e ative a criptografia de secrets com KMS no cluster.
+
+## Recebendo tráfego: AWS Load Balancer Controller
+
+Um `Ingress` sozinho não faz nada: precisa de um controller que o transforme em infraestrutura. Na AWS, o **AWS Load Balancer Controller** (instalado via Helm, com permissões IAM próprias) cria um ALB para cada Ingress e registra os IPs dos pods diretamente no target group.
+
+```yaml
+# k8s/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: livros-api
+  namespace: livros
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: livros-api
+                port:
+                  number: 80
+```
+
+```bash
+kubectl apply -f k8s/ingress.yaml
+kubectl get ingress -n livros   # a coluna ADDRESS mostra o DNS do ALB
+```
+
+## Escalando: HPA e nós
+
+O **HorizontalPodAutoscaler** ajusta as réplicas do Deployment com base em métricas. Ele depende do **metrics-server** instalado no cluster.
+
+```yaml
+# k8s/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: livros-api
+  namespace: livros
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: livros-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+O percentual é relativo ao `requests.cpu`: com `250m` de request, 60% significa 150 milicores em média. Quando os pods novos não cabem nos nós existentes, eles ficam `Pending`. Aí entra a escala de **nós**: o **Karpenter** (ou o Cluster Autoscaler) vê pods pendentes e cria instâncias do tamanho certo. No EKS Auto Mode, isso já vem pronto.
+
+## Permissões da AWS para o pod
+
+Se a API grava no S3 ou lê do DynamoDB, ela precisa de credenciais. Nunca coloque chaves de acesso em Secret. O **EKS Pod Identity** associa um papel IAM a uma service account; o SDK v3 dentro do pod encontra as credenciais sozinho.
+
+```bash
+eksctl create podidentityassociation \
+  --cluster livros --namespace livros \
+  --service-account-name livros-api \
+  --permission-policy-arns arn:aws:iam::123456789012:policy/livros-dynamodb
+```
+
+Como o Deployment usa `serviceAccountName: livros-api`, todo pod dele recebe esse papel, e só ele. Outros pods do cluster continuam sem acesso. A alternativa mais antiga, ainda muito usada, é o IRSA (IAM Roles for Service Accounts), que usa o provedor OIDC do cluster.
+
+## Operando no dia a dia
+
+```bash
+kubectl get pods -n livros -o wide
+kubectl describe pod <nome-do-pod> -n livros     # eventos: Pending, OOMKilled, probe falhando
+kubectl logs deploy/livros-api -n livros --tail=100 -f
+kubectl set image deployment/livros-api api=<registro>/livros-api:e4f5a6b -n livros
+kubectl rollout undo deployment/livros-api -n livros
+```
+
+Os estados que você mais vai ver: `ImagePullBackOff` (imagem ou permissão do ECR), `CrashLoopBackOff` (a aplicação cai ao iniciar, veja os logs com `--previous`), `Pending` (sem recursos nos nós ou sem IPs na subnet) e `OOMKilled` (passou do limite de memória).
+
+<Callout type="warning" title="Pods sem requests de CPU e memória">
+Sem `requests`, o HPA não consegue calcular utilização (aparece `unknown` no `kubectl get hpa`), o scheduler concentra pods em poucos nós e o autoscaler de nós não sabe quando criar máquinas. Defina requests realistas em todo container, medindo o consumo real com `kubectl top pods` depois de um teste de carga.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre readiness e liveness probe?** Readiness decide se o pod recebe tráfego; falhar só o tira do Service. Liveness decide se o container está vivo; falhar o reinicia. Dependências externas nunca entram na liveness.
+
+**O que o EKS gerencia e o que fica com você?** A AWS opera o control plane com alta disponibilidade. Você cuida dos nós (salvo Fargate ou Auto Mode), dos add-ons, das versões e de tudo que roda no cluster.
+
+**Como um pod acessa o S3 sem chave de acesso?** Com EKS Pod Identity ou IRSA: um papel IAM associado à service account, cujas credenciais temporárias o SDK obtém automaticamente.
+
+**ECS ou EKS?** ECS é mais simples e totalmente integrado à AWS. EKS traz o ecossistema Kubernetes (Helm, operators, portabilidade) ao custo de mais complexidade operacional e da taxa do control plane.
+
+## Pratique
+
+Publique a API de livros num cluster EKS de estudo:
+
+1. Cluster criado por `cluster.yaml` com eksctl, dois nós em subnets privadas.
+2. Deployment com requests, limits, readiness, liveness e `preStop`.
+3. Ingress com o AWS Load Balancer Controller e HPA de 2 a 8 réplicas.
+4. Pod Identity dando à API acesso somente à tabela DynamoDB de avaliações.
+
+Rode um teste de carga e registre, no README, a evolução das réplicas (`kubectl get hpa -w`). Depois destrua com `eksctl delete cluster -f cluster.yaml`: o control plane cobra por hora mesmo sem pods.
+
+<Quiz question="Uma readinessProbe começa a falhar num pod. O que acontece?" options={["O container é reiniciado imediatamente","O nó inteiro é drenado","O pod deixa de receber tráfego do Service","O Deployment faz rollback automático"]} answer={2} explanation="Readiness controla a entrada no Service. Quem reinicia o container é a livenessProbe." />
+<Quiz question="O kubectl get hpa mostra a utilização como unknown. Qual a causa mais comum?" options={["Faltam requests de CPU nos containers ou o metrics-server","O Ingress ainda não criou o ALB","A service account não tem papel IAM","O Deployment usa maxUnavailable igual a zero"]} answer={0} explanation="O HPA calcula utilização relativa aos requests e lê métricas do metrics-server. Sem um deles, não há valor." />
+<Quiz question="Qual a forma recomendada de dar acesso ao DynamoDB para pods no EKS?" options={["Chave de acesso num Secret do Kubernetes","Papel IAM da instância do nó para todos","EKS Pod Identity ligado à service account","Variáveis no ConfigMap do namespace"]} answer={2} explanation="Pod Identity entrega credenciais temporárias só aos pods daquela service account, sem chaves fixas." />
+
+## Base no CodeForge
+
+- [Amazon ECS: Gerenciando Docker na nuvem da AWS](/learn/carreira-nodejs/amazon-ecs-gerenciando-docker-nuvem-aws): a alternativa mais simples ao EKS.
+- [Infraestrutura como código: Terraform e Kubernetes](/learn/carreira-nodejs/infraestrutura-como-codigo-terraform-kubernetes): o cluster criado por Terraform.
+- [Service discovery](/learn/system-design/service-discovery) e [Service mesh](/learn/system-design/service-mesh): o que o Service do Kubernetes resolve e o que vem depois.
+- [Rolling](/learn/system-design/rolling) e [Rollbacks](/learn/system-design/rollbacks): a estratégia padrão do Deployment.
+
+## Referências
+
+- [What is Amazon EKS?](https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html)
+- [eksctl](https://eksctl.io/)
+- [Kubernetes Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)

@@ -1,0 +1,285 @@
+---
+title: "DevOps: Construindo e gerenciando containers com o Docker"
+kind: lesson
+---
+
+"Na minha máquina funciona" acontece porque cada máquina tem uma versão diferente do Node, do MongoDB e das bibliotecas do sistema. Containers resolvem isso empacotando a aplicação junto com tudo de que ela precisa para rodar, numa imagem que se comporta igual no seu notebook, na CI e no servidor. Hoje, quase todo deploy de API Node.js passa por uma imagem Docker, então construir e operar containers é parte do trabalho de back-end.
+
+**Você vai aprender:**
+
+- A diferença entre imagem e container, e o que o Docker isola
+- Operar containers: rodar, expor portas, ver logs, entrar e remover
+- Escrever um Dockerfile eficiente e seguro para uma API Node.js
+- Guardar dados com volumes e conectar containers por redes
+- Subir a API e o MongoDB juntos com Docker Compose
+
+## Imagem, container e o que está por baixo
+
+Uma **imagem** é um pacote somente leitura com um sistema de arquivos (o Node, o seu código, as dependências) e metadados (qual comando rodar, qual porta usar). Um **container** é uma imagem em execução: um processo isolado com uma camada gravável por cima da imagem. Da mesma imagem saem quantos containers você quiser, como de uma classe saem vários objetos.
+
+Containers não são máquinas virtuais. Uma VM emula hardware e roda um sistema operacional completo. Um container é um processo comum do Linux que o kernel isola com **namespaces** (ele só enxerga os próprios processos, rede e arquivos) e limita com **cgroups** (CPU e memória). Por isso sobe em segundos e ocupa megabytes. No Windows e no macOS, o Docker Desktop roda uma VM Linux leve por baixo.
+
+## Operando containers
+
+```bash
+docker run hello-world
+```
+
+Esse comando baixa a imagem `hello-world` do Docker Hub (o registro público padrão), cria um container, executa e termina. Agora algo mais útil, um MongoDB:
+
+```bash
+docker run -d --name mongo -p 27017:27017 mongo:8
+```
+
+| Opção | Significado |
+|---|---|
+| `-d` | Roda em segundo plano (detached) |
+| `--name mongo` | Dá um nome, para não precisar do id |
+| `-p 27017:27017` | Porta do host : porta do container |
+| `mongo:8` | Imagem e tag (versão) |
+
+Sem `-p`, o banco roda mas fica inacessível de fora do container. A porta da esquerda é a da sua máquina; a da direita, a de dentro do container. `-p 27018:27017` deixaria o Mongo acessível na 27018 do host.
+
+Comandos do dia a dia:
+
+```bash
+docker ps                      # containers rodando (-a inclui os parados)
+docker logs -f mongo           # saída do container, acompanhando (-f)
+docker exec -it mongo mongosh  # roda um comando dentro do container, interativo
+docker stop mongo              # para (envia SIGTERM, depois SIGKILL)
+docker start mongo             # inicia de novo, com os mesmos dados
+docker rm -f mongo             # remove (o -f para antes, se estiver rodando)
+docker images                  # imagens baixadas
+docker system df               # quanto espaço o Docker ocupa
+```
+
+Um container removido leva junto tudo o que gravou na camada gravável. Se aquele Mongo tinha dados, eles foram embora. Volumes, mais abaixo, resolvem isso.
+
+## Dockerfile: a receita da imagem
+
+Para empacotar a sua API, escreva um `Dockerfile` na raiz do projeto. Cada instrução gera uma **camada**, e o Docker reaproveita camadas que não mudaram (cache). A ordem das instruções é o que decide se o build leva 3 segundos ou 3 minutos.
+
+```dockerfile
+# Dockerfile
+FROM node:22-alpine
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# 1. Só os manifestos primeiro: esta camada só é refeita quando as dependências mudam
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# 2. Depois o código, que muda a todo momento
+COPY src ./src
+
+USER node
+EXPOSE 8000
+CMD ["node", "src/server.js"]
+```
+
+Instrução por instrução:
+
+- `FROM node:22-alpine`: parte de uma imagem oficial com Node 22 sobre Alpine Linux, uma base pequena. Fixe a versão maior; `node:latest` muda sem aviso.
+- `WORKDIR /app`: diretório de trabalho; cria se não existir.
+- `COPY` dos manifestos e `RUN npm ci`: instala exatamente o que está no `package-lock.json`, sem dependências de desenvolvimento.
+- `COPY src`: o código entra **depois** das dependências. Alterar uma rota invalida só esta camada, e o `npm ci` vem do cache.
+- `USER node`: a imagem oficial já tem um usuário sem privilégios chamado `node`. Rodar como root dentro do container amplia o estrago se a aplicação for invadida.
+- `EXPOSE`: documenta a porta; não publica nada sozinho.
+- `CMD` na forma de array (exec form): o Node vira o processo principal e recebe os sinais de parada diretamente.
+
+Crie também um `.dockerignore`, que funciona como o `.gitignore` para o contexto do build:
+
+```text
+node_modules
+npm-debug.log
+.env
+.git
+coverage
+```
+
+Sem ele, `node_modules` da sua máquina (talvez compilado para Windows) e o `.env` com segredos são enviados para o build e podem acabar dentro da imagem.
+
+### Construindo e rodando
+
+```bash
+docker build -t api-livros:1.0 .
+docker run -d --name api -p 8000:8000 -e PORT=8000 api-livros:1.0
+docker logs api
+```
+
+A API de livros precisa do MongoDB para subir, então por enquanto o log vai mostrar a falha de conexão: dentro do container, `localhost:27017` não é o Mongo da sua máquina. A seção de redes resolve isso.
+
+`-t` dá nome e tag à imagem; o `.` é o contexto (a pasta enviada ao build). `-e` define variáveis de ambiente, o jeito certo de passar configuração para containers: a mesma imagem roda em desenvolvimento e produção, só com variáveis diferentes. Para várias variáveis, use `--env-file .env`.
+
+<Callout type="warning" title="Ouvir só em localhost dentro do container">
+Se a API fizer `app.listen(8000, "127.0.0.1")`, ela aceita conexões só de dentro do próprio container, e o `-p 8000:8000` não adianta: o curl na sua máquina recebe conexão recusada. Dentro de containers, o servidor precisa ouvir em todas as interfaces (`0.0.0.0`), que é o padrão do `app.listen(porta)` sem host. É um dos erros mais comuns ao containerizar a primeira API.
+</Callout>
+
+### Parando com elegância
+
+O `docker stop` envia `SIGTERM` e, se o processo não terminar em 10 segundos, `SIGKILL`. Trate o sinal para fechar conexões em vez de cortar requisições no meio:
+
+```javascript
+// src/server.js
+import { app } from "./app.js";
+
+const porta = process.env.PORT ?? 8000;
+const servidor = app.listen(porta, () => console.log(`API na porta ${porta}`));
+
+process.on("SIGTERM", () => {
+  console.log("Recebi SIGTERM, encerrando");
+  servidor.close(() => process.exit(0)); // para de aceitar e espera as requisições em andamento
+});
+```
+
+## Volumes: dados que sobrevivem
+
+A camada gravável do container é descartável. Dados que precisam persistir vão para um **volume**, um armazenamento gerenciado pelo Docker e montado num caminho do container.
+
+```bash
+docker volume create dados-mongo
+docker run -d --name mongo -p 27017:27017 -v dados-mongo:/data/db mongo:8
+
+docker rm -f mongo
+docker run -d --name mongo -p 27017:27017 -v dados-mongo:/data/db mongo:8
+# os dados continuam lá
+```
+
+Há também o **bind mount**, que monta uma pasta da sua máquina no container (`-v "$(pwd)/dados:/app/dados"`). É útil em desenvolvimento, por exemplo para editar código e ver o reflexo no container. Para dados de banco, prefira volumes nomeados.
+
+## Redes: containers conversando
+
+Containers numa mesma **rede** definida pelo usuário se encontram pelo **nome**, graças a um DNS interno do Docker:
+
+```bash
+docker network create livraria
+docker run -d --name mongo --network livraria -v dados-mongo:/data/db mongo:8
+docker run -d --name api --network livraria -p 8000:8000 \
+  -e MONGODB_URI=mongodb://mongo:27017/livraria \
+  api-livros:1.0
+```
+
+Dentro do container da API, `localhost` é o **próprio container**, não a sua máquina nem o Mongo. O endereço do banco é `mongo`, o nome do container. Repare também que o Mongo não precisou de `-p`: só a API fala com ele, pela rede interna, e o banco fica sem exposição para fora.
+
+## Docker Compose: o ambiente inteiro num arquivo
+
+Digitar esses comandos toda vez não escala. O **Compose** descreve todos os serviços, redes e volumes num arquivo YAML:
+
+```yaml
+# compose.yaml
+services:
+  mongo:
+    image: mongo:8
+    volumes:
+      - dados-mongo:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+      MONGODB_URI: mongodb://mongo:27017/livraria
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  dados-mongo:
+```
+
+```bash
+docker compose up -d --build   # constrói e sobe tudo
+docker compose ps              # estado dos serviços
+docker compose logs -f api     # logs de um serviço
+docker compose exec mongo mongosh livraria
+docker compose down            # para e remove containers e rede (volumes ficam)
+docker compose down -v         # remove também os volumes (apaga os dados!)
+```
+
+O Compose cria automaticamente uma rede para o projeto, então os serviços se acham pelo nome (`mongo`). Detalhes que importam:
+
+- `depends_on` sozinho só garante a **ordem** de criação, não que o banco esteja pronto. Com `condition: service_healthy`, a API só sobe depois que o healthcheck do Mongo passar.
+- Mesmo assim, a API deve tentar reconectar se o banco cair depois. Lembre do padrão de retry do capítulo de laços.
+- `restart: unless-stopped` reinicia a API se o processo morrer.
+
+Para desenvolvimento, um segundo serviço pode montar o código e usar `node --watch`, enquanto o arquivo principal fica próximo do que roda em produção.
+
+## Imagens menores com multi-stage
+
+Projetos com etapa de build (TypeScript, por exemplo) precisam de ferramentas que não devem ir para a imagem final. O **multi-stage build** usa uma etapa para compilar e copia só o resultado para outra:
+
+```dockerfile
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+A imagem final não tem o compilador, os testes nem o código-fonte TypeScript: é menor, sobe mais rápido e oferece menos superfície de ataque.
+
+## Publicando a imagem
+
+Para um servidor usar sua imagem, ela vai para um **registro** (Docker Hub, GitHub Container Registry, Amazon ECR):
+
+```bash
+docker tag api-livros:1.0 ghcr.io/ana/api-livros:1.0
+docker push ghcr.io/ana/api-livros:1.0
+```
+
+No servidor, `docker pull` e `docker run` com as variáveis de produção. Na prática, esse build e push ficam numa pipeline de CI, que você vai montar no Nível 3.
+
+## Na entrevista
+
+- **Qual a diferença entre container e máquina virtual?** A VM virtualiza hardware e roda um kernel próprio; o container é um processo isolado que compartilha o kernel do host, usando namespaces e cgroups. Container é mais leve e rápido de subir; VM isola mais.
+- **Por que copiar o `package.json` antes do código no Dockerfile?** Para aproveitar o cache de camadas: o `npm ci` só roda de novo quando as dependências mudam, não a cada alteração de código.
+- **O que acontece com os dados de um container removido?** Somem, junto com a camada gravável. Dados persistentes devem ficar em volumes.
+- **`depends_on` garante que o banco esteja pronto?** Não, só a ordem de início. É preciso healthcheck com `condition: service_healthy` e, na aplicação, lógica de reconexão.
+
+## Pratique
+
+Containerize a API de livros (Express e MongoDB) dos capítulos anteriores:
+
+1. Escreva `Dockerfile` e `.dockerignore` com cache de dependências, `npm ci --omit=dev` e `USER node`.
+2. Crie um `compose.yaml` com a API e o MongoDB, healthcheck e volume nomeado.
+3. Trate `SIGTERM` na API para fechar o servidor e a conexão do Mongoose.
+4. Prove a persistência: cadastre livros, rode `docker compose down` e `up` de novo e mostre que os dados continuam.
+5. Compare o tamanho da imagem com base `node:22` e `node:22-alpine` (`docker images`) e anote no README.
+
+Entregue o repositório com instruções de uma linha só para subir tudo: `docker compose up -d --build`.
+
+<Quiz question="Dentro do container da API, qual host acessa o MongoDB do serviço mongo no mesmo Compose?" options={["localhost","127.0.0.1","mongo","host.docker.internal"]} answer={2} explanation="Na rede do Compose, cada serviço é encontrado pelo nome. localhost dentro do container é o próprio container da API." />
+<Quiz question="O que acontece com os dados gravados num container sem volume quando ele é removido?" options={["Ficam salvos na imagem","São perdidos","Vão para o Docker Hub","Ficam no próximo container"]} answer={1} explanation="A camada gravável pertence ao container e é apagada com ele. Use volumes para dados que precisam persistir." />
+<Quiz question="Por que copiar package.json e rodar npm ci antes de copiar o código-fonte?" options={["Porque o Docker exige essa ordem","Para reaproveitar o cache da instalação quando só o código muda","Para a imagem ficar mais segura","Para o npm ci rodar mais rápido em paralelo"]} answer={1} explanation="Cada instrução vira uma camada em cache. Se os manifestos não mudaram, a camada do npm ci é reaproveitada." />
+
+## Base no CodeForge
+
+- [Containers: namespaces e cgroups](/learn/sistemas-operacionais/containers-namespaces-cgroups): o que o kernel faz para isolar um container.
+- [Máquinas virtuais](/learn/sistemas-operacionais/maquinas-virtuais): a comparação com containers em detalhe.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): como as imagens chegam à produção sem derrubar o serviço.
+- [Scripting: Automatizando tarefas com Bash e Docker](/learn/carreira-nodejs/scripting-automatizando-tarefas-bash-docker): o Docker de novo, no Nível 2.
+
+## Referências
+
+- [Docker: O que é um container](https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-a-container/)
+- [Referência do Dockerfile](https://docs.docker.com/reference/dockerfile/)
+- [Docker: Boas práticas de build](https://docs.docker.com/build/building/best-practices/)
+- [Docker Compose](https://docs.docker.com/compose/)

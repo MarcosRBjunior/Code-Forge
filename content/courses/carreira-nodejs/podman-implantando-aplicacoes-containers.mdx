@@ -1,0 +1,220 @@
+---
+title: "Podman: Implantando aplicações em containers"
+kind: lesson
+---
+
+O Docker popularizou containers, mas o modelo dele depende de um daemon rodando como root: quem controla o socket do Docker controla a máquina. O Podman executa as mesmas imagens OCI sem daemon e, por padrão, sem root, com uma CLI praticamente idêntica. Ele também traz pods (vários containers compartilhando a rede, como no Kubernetes) e integração nativa com o systemd. É a escolha padrão no Red Hat Enterprise Linux, Fedora e derivados, e uma ótima forma de implantar uma API Node.js num servidor Linux sem orquestrador.
+
+**Você vai aprender:**
+
+- O que muda entre Podman e Docker: daemonless, rootless e pods
+- Como construir e rodar a imagem da API com Podman
+- Como agrupar API e banco num pod e exportar para YAML do Kubernetes
+- Como transformar containers em serviços do systemd com Quadlet
+- Como gerenciar segredos e atualizações automáticas de imagem
+
+## Podman e Docker: o que muda
+
+| | Docker | Podman |
+|---|---|---|
+| Arquitetura | Cliente fala com o daemon `dockerd` | Cada comando cria o processo direto, sem daemon |
+| Usuário | Daemon como root (rootless é opcional) | Rootless por padrão |
+| Agrupamento | Compose | Pods nativos, Compose e YAML do Kubernetes |
+| Serviços no boot | Política `restart` do daemon | Unidades do systemd (Quadlet) |
+| Imagens | OCI | As mesmas imagens OCI |
+
+Sem daemon, cada container é um processo filho do comando que o criou, monitorado por um pequeno processo chamado `conmon`. Rodando rootless, o root de dentro do container é mapeado para o seu usuário comum fora dele (via user namespaces). Se alguém escapar do container, cai num usuário sem privilégios, não no root da máquina.
+
+A CLI é compatível o suficiente para que muita gente faça `alias docker=podman`. O mesmo Dockerfile funciona; o Podman também aceita o nome `Containerfile`.
+
+## Construindo e rodando a API
+
+```bash
+# no Fedora/RHEL: sudo dnf install podman ; no Ubuntu: sudo apt install podman
+podman --version
+
+podman build -t livros-api:1.0 .
+podman images
+
+podman run -d --name api -p 8080:3000 \
+  -e NODE_ENV=production \
+  livros-api:1.0
+
+podman ps
+podman logs -f api
+curl http://localhost:8080/health
+```
+
+Dois detalhes que pegam quem vem do Docker:
+
+- **Nomes curtos de imagem.** O Docker assume o Docker Hub quando você escreve `node:22-alpine`. O Podman consulta a lista de registros configurada e pode perguntar qual usar (ou falhar em modo não interativo). Use sempre o nome completo: `docker.io/library/node:22-alpine`. No Dockerfile também.
+- **Volumes e SELinux.** Em distribuições com SELinux ativo, montar uma pasta do host sem rótulo resulta em `Permission denied` dentro do container. Adicione `:Z` (rótulo privado) ou `:z` (compartilhado): `-v ./dados:/app/dados:Z`.
+
+```dockerfile
+# Containerfile
+FROM docker.io/library/node:22-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY src ./src
+USER node
+EXPOSE 3000
+CMD ["node", "src/server.js"]
+```
+
+## Pods: API e banco juntos
+
+Um **pod** é um grupo de containers que compartilham o namespace de rede. Dentro dele, a API acessa o banco em `localhost`, exatamente como dois containers no mesmo pod do Kubernetes. As portas são publicadas no pod, não nos containers.
+
+```bash
+podman pod create --name livros -p 8080:3000
+
+podman run -d --pod livros --name livros-db \
+  -e POSTGRES_PASSWORD=segredo-local -e POSTGRES_DB=livros \
+  -v livros-pgdata:/var/lib/postgresql/data \
+  docker.io/library/postgres:17
+
+podman run -d --pod livros --name livros-api \
+  -e DATABASE_URL=postgres://postgres:segredo-local@localhost:5432/livros \
+  livros-api:1.0
+
+podman pod ps
+podman ps --pod
+```
+
+Do lado do Node, nada muda: a string de conexão aponta para `localhost`. Para conferir que a API espera o banco ficar pronto, ela deve tentar conectar com retentativas no boot, já que os dois containers sobem quase ao mesmo tempo:
+
+```javascript
+// src/esperar-banco.js
+import { setTimeout as dormir } from "node:timers/promises";
+import { pool } from "./db.js";
+
+export async function esperarBanco(tentativas = 10) {
+  for (let i = 1; i <= tentativas; i++) {
+    try {
+      await pool.query("SELECT 1");
+      return;
+    } catch (err) {
+      console.log(`banco indisponível (tentativa ${i}): ${err.code}`);
+      await dormir(1000 * i);
+    }
+  }
+  throw new Error("banco não respondeu");
+}
+```
+
+## Do pod para o YAML do Kubernetes e de volta
+
+O Podman gera um manifesto Kubernetes a partir de um pod existente e também roda manifestos Kubernetes localmente. É uma ponte útil: você prototipa no servidor e leva o YAML para um cluster depois.
+
+```bash
+podman kube generate livros -f livros.yaml   # gera Pod (e PVC para o volume)
+podman pod rm -f livros
+
+podman kube play livros.yaml                 # recria tudo a partir do YAML
+podman kube down livros.yaml                 # remove
+```
+
+O `kube play` entende Pod, Deployment, ConfigMap, Secret e PersistentVolumeClaim, entre outros. Ele não é um cluster: não há scheduler, nem réplicas espalhadas, nem Service com balanceamento. Serve para rodar o mesmo formato num único host.
+
+## Containers como serviços: Quadlet
+
+Num servidor, a API precisa subir no boot, reiniciar se cair e ter logs centralizados. O Podman delega isso ao **systemd**. A forma moderna é o **Quadlet**: você escreve um arquivo `.container` declarativo, e o systemd gera a unidade de serviço a partir dele.
+
+Para um serviço rootless, os arquivos ficam em `~/.config/containers/systemd/`. Para rodar como root, em `/etc/containers/systemd/`.
+
+```ini
+# ~/.config/containers/systemd/livros-api.container
+[Unit]
+Description=API de livros
+After=network-online.target
+
+[Container]
+Image=ghcr.io/sua-conta/livros-api:latest
+ContainerName=livros-api
+PublishPort=8080:3000
+Environment=NODE_ENV=production
+Secret=livros-db-url,type=env,target=DATABASE_URL
+HealthCmd=wget -qO- http://localhost:3000/health || exit 1
+HealthInterval=30s
+AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStopSec=40
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+# o segredo fica no armazenamento do Podman, fora do arquivo
+printf '%s' 'postgres://livros:senha@db.interno:5432/livros' \
+  | podman secret create livros-db-url -
+
+systemctl --user daemon-reload          # o Quadlet gera livros-api.service
+systemctl --user start livros-api
+systemctl --user status livros-api
+journalctl --user -u livros-api -f
+
+# rootless: mantém os serviços do usuário rodando sem sessão aberta
+loginctl enable-linger "$USER"
+```
+
+O nome do serviço vem do nome do arquivo: `livros-api.container` vira `livros-api.service`. A seção `[Install]` faz o serviço subir no boot. Sem o `enable-linger`, os serviços de um usuário param quando ele sai da sessão SSH, o que surpreende muita gente na primeira vez.
+
+Existem arquivos Quadlet equivalentes para outros recursos: `.pod`, `.volume`, `.network` e `.kube` (que roda um YAML do Kubernetes como serviço).
+
+## Atualizações automáticas
+
+Com `AutoUpdate=registry`, o comando `podman auto-update` compara o digest da imagem em uso com o do registro. Se houver versão nova da tag, ele puxa a imagem e reinicia o serviço; se o serviço não subir saudável, volta para a imagem anterior.
+
+```bash
+podman auto-update --dry-run      # mostra o que seria atualizado
+systemctl --user enable --now podman-auto-update.timer   # roda diariamente
+```
+
+Isso fecha um fluxo de deploy simples para um servidor único: o CI publica `livros-api:latest` no registro, e o servidor se atualiza sozinho. Para algo mais controlado, use tags por versão e troque a linha `Image=` com Ansible.
+
+## Podman Compose e Podman Desktop
+
+Se o projeto já tem um `compose.yaml`, o comando `podman compose` repassa para um provedor de Compose instalado (`docker-compose` ou `podman-compose`). Funciona bem em desenvolvimento. Para servidores, prefira Quadlet, que se integra ao systemd. No Windows e no macOS, o Podman roda os containers numa máquina virtual Linux (`podman machine init` e `podman machine start`), e o Podman Desktop oferece interface gráfica.
+
+<Callout type="warning" title="Rootless não abre portas abaixo de 1024">
+Um container rootless não consegue publicar a porta 80 ou 443 do host: o kernel reserva essas portas para root. O comando falha com erro de permissão. Publique numa porta alta (8080) e coloque um proxy reverso na frente, ou ajuste o sysctl `net.ipv4.ip_unprivileged_port_start` sabendo que isso vale para todos os usuários da máquina.
+</Callout>
+
+## Na entrevista
+
+**Qual a principal vantagem do Podman sobre o Docker?** Não ter daemon com privilégio de root. Cada container é um processo do usuário, rootless por padrão, o que reduz a superfície de ataque e simplifica a auditoria.
+
+**O que é um pod no Podman?** Um grupo de containers que compartilham rede (e outros namespaces), igual ao pod do Kubernetes. Os containers se falam por `localhost`, e as portas são publicadas no pod.
+
+**Como você roda um container como serviço no boot com Podman?** Com Quadlet: um arquivo `.container` em `~/.config/containers/systemd/` (ou `/etc/containers/systemd/`), `daemon-reload` e `systemctl start`. Para rootless, `loginctl enable-linger`.
+
+## Pratique
+
+Num servidor Linux (uma EC2 com Fedora ou Ubuntu, ou uma VM local):
+
+1. Construa a imagem da API de livros com Podman e publique num registro (GHCR ou ECR).
+2. Crie um pod com a API e o PostgreSQL, gere o YAML com `podman kube generate` e confirme que `kube play` o recria.
+3. Escreva os arquivos Quadlet `.container` da API e um `.volume` para o banco, com segredo pelo `podman secret`.
+4. Ative o `podman-auto-update.timer` e mostre, publicando uma tag nova, que o servidor se atualizou.
+
+Entregue os arquivos Quadlet, o YAML gerado e um README com o passo a passo e a saída do `systemctl --user status`.
+
+<Quiz question="Por que um container rootless não consegue publicar a porta 80 do host?" options={["Porque o Podman bloqueia HTTP sem TLS","Porque portas abaixo de 1024 exigem privilégio no kernel","Porque o conmon reserva a porta 80","Porque pods só publicam portas acima de 8000"]} answer={1} explanation="Por padrão o kernel só deixa root abrir portas abaixo de 1024. Use uma porta alta com proxy reverso." />
+<Quiz question="Dois containers estão no mesmo pod do Podman. Como a API acessa o banco?" options={["Pelo nome do container via DNS","Pelo IP do host","Por localhost","Somente por um volume compartilhado"]} answer={2} explanation="Containers do mesmo pod compartilham o namespace de rede, então se enxergam em localhost." />
+<Quiz question="Para que serve o loginctl enable-linger num serviço Quadlet rootless?" options={["Manter os serviços do usuário rodando sem sessão aberta","Permitir portas abaixo de 1024 para o usuário","Ativar a atualização automática de imagens","Gerar a unidade systemd a partir do arquivo"]} answer={0} explanation="Sem linger, o systemd do usuário encerra os serviços quando a última sessão termina." />
+
+## Base no CodeForge
+
+- [DevOps: Construindo e gerenciando containers com Docker](/learn/carreira-nodejs/devops-construindo-gerenciando-containers-docker): imagens e containers, a base comum.
+- [Amazon EKS: Gerenciando aplicações com Kubernetes](/learn/carreira-nodejs/amazon-eks-gerenciando-aplicacoes-conteinerizadas-kubernetes): para onde o YAML gerado pode ir.
+- [Sidecar](/learn/system-design/sidecar): o padrão que os pods tornam natural.
+
+## Referências
+
+- [Podman documentation](https://docs.podman.io/en/latest/)
+- [podman kube play](https://docs.podman.io/en/latest/markdown/podman-kube-play.1.html)
+- [podman-systemd.unit (Quadlet)](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)

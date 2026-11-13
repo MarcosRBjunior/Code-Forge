@@ -1,0 +1,353 @@
+---
+title: "Padrões de projeto com TypeScript: Aprimorando uma API com arquitetura limpa"
+kind: lesson
+---
+
+Os princípios SOLID dizem como as dependências devem apontar. Padrões de projeto são soluções nomeadas para problemas que se repetem: "preciso trocar o banco sem mexer na regra", "preciso adicionar cache sem alterar o repositório", "preciso de várias reações quando um empréstimo acontece". Arquitetura limpa é a forma de organizar a API inteira para que essas soluções tenham lugar certo. Juntos, eles fazem uma API em que o framework e o banco são detalhes trocáveis, e a regra de negócio é o centro.
+
+**Você vai aprender:**
+
+- A regra da dependência da arquitetura limpa e como ela vira pastas e imports
+- Repository, Adapter e Factory para isolar a infraestrutura
+- Strategy e Decorator para variar e acrescentar comportamento sem editar código estável
+- Observer (eventos de domínio) para desacoplar efeitos colaterais
+- Como saber quando um padrão está ajudando e quando está atrapalhando
+
+## A regra da dependência
+
+Arquitetura limpa organiza o código em círculos concêntricos. Do centro para fora:
+
+| Camada | Contém | Exemplo na API de livros |
+|---|---|---|
+| Domínio | entidades e regras puras | `Livro`, `Emprestimo`, cálculo de multa |
+| Aplicação | casos de uso que orquestram o domínio | `EmprestarLivro`, `DevolverLivro` |
+| Adaptadores | traduzem entre o mundo e os casos de uso | controllers HTTP, repositórios SQL |
+| Infraestrutura | frameworks e drivers | Express, `pg`, cliente SMTP |
+
+A única regra: **imports só apontam para dentro**. O domínio não importa nada das outras camadas. A aplicação importa o domínio. Os adaptadores importam a aplicação. Quem precisa falar com o banco a partir de um caso de uso faz isso por uma interface declarada na camada de aplicação e implementada do lado de fora (inversão de dependência).
+
+Na prática, isso vira uma estrutura de pastas:
+
+```text
+src/
+├── dominio/
+│   ├── livro.ts
+│   └── emprestimo.ts
+├── aplicacao/
+│   ├── portas.ts            # interfaces que os casos de uso precisam
+│   └── emprestar-livro.ts
+├── adaptadores/
+│   ├── http/livros-controller.ts
+│   ├── persistencia/livro-repositorio-pg.ts
+│   └── notificacao/notificador-email.ts
+└── main.ts                  # raiz de composição
+```
+
+Uma checagem simples que vale colocar no CI: nenhum arquivo em `dominio/` ou `aplicacao/` pode importar `express`, `pg` ou qualquer pasta de `adaptadores/`. Um `grep` resolve, e a regra `no-restricted-imports` do ESLint torna isso automático.
+
+## Entidade com Factory
+
+O domínio protege as próprias regras. Uma entidade não deve poder nascer inválida, e a forma mais clara de garantir isso é um construtor privado com métodos de fábrica nomeados:
+
+```typescript
+// src/dominio/livro.ts
+export class Livro {
+  private constructor(
+    readonly id: string,
+    readonly titulo: string,
+    private _status: "disponivel" | "emprestado",
+  ) {}
+
+  static criar(id: string, titulo: string): Livro {
+    if (titulo.trim().length === 0) throw new RegraVioladaError("título vazio");
+    return new Livro(id, titulo.trim(), "disponivel");
+  }
+
+  static reconstituir(dados: { id: string; titulo: string; status: "disponivel" | "emprestado" }) {
+    return new Livro(dados.id, dados.titulo, dados.status);
+  }
+
+  get status() {
+    return this._status;
+  }
+
+  emprestar(): void {
+    if (this._status !== "disponivel") throw new RegraVioladaError("livro já emprestado");
+    this._status = "emprestado";
+  }
+
+  devolver(): void {
+    if (this._status !== "emprestado") throw new RegraVioladaError("livro não está emprestado");
+    this._status = "disponivel";
+  }
+}
+
+export class RegraVioladaError extends Error {}
+```
+
+Há duas fábricas porque há duas situações. `criar` é um livro novo e aplica todas as validações. `reconstituir` é um livro que já existe no banco e só remonta o objeto. Separar as duas evita que dados antigos, válidos quando foram gravados, impeçam a leitura depois que uma regra muda.
+
+Repare que a regra "não emprestar livro emprestado" agora mora na entidade (`livro.emprestar()`), e não espalhada por services. Isso é o oposto do modelo anêmico, em que a entidade é só um saco de campos e toda regra fica fora dela.
+
+## Repository: a coleção que esconde o banco
+
+O padrão Repository dá ao caso de uso a ilusão de uma coleção de objetos em memória. Quem usa não sabe se por trás há SQL, MongoDB ou um `Map`.
+
+```typescript
+// src/aplicacao/portas.ts
+import type { Livro } from "../dominio/livro.js";
+
+export interface LivroRepositorio {
+  porId(id: string): Promise<Livro | null>;
+  salvar(livro: Livro): Promise<void>;
+}
+
+export interface Notificador {
+  enviar(destino: string, assunto: string, corpo: string): Promise<void>;
+}
+```
+
+```typescript
+// src/adaptadores/persistencia/livro-repositorio-pg.ts
+import type { Pool } from "pg";
+import { Livro } from "../../dominio/livro.js";
+import type { LivroRepositorio } from "../../aplicacao/portas.js";
+
+export class LivroRepositorioPg implements LivroRepositorio {
+  constructor(private readonly pool: Pool) {}
+
+  async porId(id: string) {
+    const { rows } = await this.pool.query(
+      "select id, titulo, status from livros where id = $1",
+      [id],
+    );
+    return rows[0] ? Livro.reconstituir(rows[0]) : null;
+  }
+
+  async salvar(livro: Livro) {
+    await this.pool.query(
+      `insert into livros (id, titulo, status) values ($1, $2, $3)
+       on conflict (id) do update set titulo = excluded.titulo, status = excluded.status`,
+      [livro.id, livro.titulo, livro.status],
+    );
+  }
+}
+```
+
+O repositório fala a linguagem do domínio (`porId`, `salvar` recebendo um `Livro`), não a do banco (`query`, `rows`). A tradução entre linha de tabela e entidade acontece só aqui.
+
+## Adapter: a biblioteca externa com a sua interface
+
+O caso de uso quer `Notificador.enviar`. A biblioteca de e-mail tem a API dela. Um adapter traduz uma na outra, e é o único arquivo que conhece a biblioteca:
+
+```typescript
+// src/adaptadores/notificacao/notificador-email.ts
+import type { Transporter } from "nodemailer";
+import type { Notificador } from "../../aplicacao/portas.js";
+
+export class NotificadorEmail implements Notificador {
+  constructor(private readonly transporte: Transporter, private readonly remetente: string) {}
+
+  async enviar(destino: string, assunto: string, corpo: string) {
+    await this.transporte.sendMail({ from: this.remetente, to: destino, subject: assunto, text: corpo });
+  }
+}
+```
+
+Trocar o provedor de e-mail por uma API HTTP (ou por um adapter que só grava num arquivo, em desenvolvimento) é escrever outra classe que implementa `Notificador`. Nada mais muda.
+
+## Strategy: variar o algoritmo
+
+Strategy encapsula uma família de algoritmos atrás de uma interface comum, escolhida em tempo de execução. A política de multa é o caso típico:
+
+```typescript
+// src/dominio/multa.ts
+export interface PoliticaDeMulta {
+  calcular(diasAtraso: number): number;
+}
+
+export const multaLinear: PoliticaDeMulta = {
+  calcular: (dias) => Math.max(0, dias) * 1.5,
+};
+
+export const multaComTeto = (teto: number): PoliticaDeMulta => ({
+  calcular: (dias) => Math.min(teto, multaLinear.calcular(dias)),
+});
+
+export const isento: PoliticaDeMulta = { calcular: () => 0 };
+```
+
+Em TypeScript, uma strategy não precisa ser classe: um objeto literal ou uma função que satisfaz o tipo já basta. `multaComTeto(20)` é uma fábrica de strategies, e combina com a linear em vez de duplicá-la.
+
+## Decorator: acrescentar comportamento por fora
+
+Você quer cache na leitura de livros e log de tempo em todo caso de uso. Editar o repositório e cada caso de uso misturaria essas preocupações com a lógica. O Decorator envolve um objeto com outro que implementa a mesma interface, faz algo a mais e delega:
+
+```typescript
+// src/adaptadores/persistencia/livro-repositorio-cache.ts
+import type { Livro } from "../../dominio/livro.js";
+import type { LivroRepositorio } from "../../aplicacao/portas.js";
+
+export class LivroRepositorioComCache implements LivroRepositorio {
+  private cache = new Map<string, { livro: Livro | null; expira: number }>();
+
+  constructor(private readonly interno: LivroRepositorio, private readonly ttlMs = 30_000) {}
+
+  async porId(id: string) {
+    const hit = this.cache.get(id);
+    if (hit && hit.expira > Date.now()) return hit.livro;
+    const livro = await this.interno.porId(id);
+    this.cache.set(id, { livro, expira: Date.now() + this.ttlMs });
+    return livro;
+  }
+
+  async salvar(livro: Livro) {
+    await this.interno.salvar(livro);
+    this.cache.delete(livro.id); // invalida após escrita
+  }
+}
+
+// na raiz de composição
+const livros = new LivroRepositorioComCache(new LivroRepositorioPg(pool));
+```
+
+O mesmo vale para casos de uso. Se todos implementam uma interface comum, um único decorator mede o tempo de qualquer um:
+
+```typescript
+export interface CasoDeUso<E, S> {
+  executar(entrada: E): Promise<S>;
+}
+
+export function comLog<E, S>(nome: string, uc: CasoDeUso<E, S>): CasoDeUso<E, S> {
+  return {
+    async executar(entrada) {
+      const inicio = performance.now();
+      try {
+        return await uc.executar(entrada);
+      } finally {
+        console.log(`${nome} levou ${(performance.now() - inicio).toFixed(1)}ms`);
+      }
+    },
+  };
+}
+```
+
+Decorators se empilham: `comLog("emprestar", comTransacao(new EmprestarLivro(...)))`. Cada camada faz uma coisa.
+
+## Observer: eventos de domínio
+
+Quando um empréstimo acontece, várias coisas devem reagir: enviar e-mail, atualizar estatísticas, registrar auditoria. Se o caso de uso chamar cada uma, ele passa a conhecer todas e cresce a cada requisito novo. Com Observer, o caso de uso publica um evento e quem se interessa assina.
+
+```typescript
+// src/aplicacao/eventos.ts
+export type EventoDominio =
+  | { tipo: "LivroEmprestado"; livroId: string; usuarioId: number; devolucao: Date }
+  | { tipo: "LivroDevolvido"; livroId: string; multa: number };
+
+type Assinante<T extends EventoDominio["tipo"]> = (e: Extract<EventoDominio, { tipo: T }>) => Promise<void>;
+
+export class Eventos {
+  private assinantes = new Map<string, Array<(e: EventoDominio) => Promise<void>>>();
+
+  assinar<T extends EventoDominio["tipo"]>(tipo: T, fn: Assinante<T>) {
+    const lista = this.assinantes.get(tipo) ?? [];
+    lista.push(fn as (e: EventoDominio) => Promise<void>);
+    this.assinantes.set(tipo, lista);
+  }
+
+  async publicar(evento: EventoDominio) {
+    const lista = this.assinantes.get(evento.tipo) ?? [];
+    const resultados = await Promise.allSettled(lista.map((fn) => fn(evento)));
+    for (const r of resultados) if (r.status === "rejected") console.error("assinante falhou", r.reason);
+  }
+}
+```
+
+```typescript
+// src/aplicacao/emprestar-livro.ts
+export class EmprestarLivro implements CasoDeUso<{ livroId: string; usuarioId: number }, { devolucao: Date }> {
+  constructor(private readonly livros: LivroRepositorio, private readonly eventos: Eventos) {}
+
+  async executar({ livroId, usuarioId }: { livroId: string; usuarioId: number }) {
+    const livro = await this.livros.porId(livroId);
+    if (!livro) throw new RegraVioladaError("livro não encontrado");
+    livro.emprestar();
+    await this.livros.salvar(livro);
+
+    const devolucao = new Date(Date.now() + 14 * 86_400_000);
+    await this.eventos.publicar({ tipo: "LivroEmprestado", livroId, usuarioId, devolucao });
+    return { devolucao };
+  }
+}
+```
+
+O `Extract` faz o assinante de `"LivroEmprestado"` receber o evento já com o tipo certo, com `devolucao` disponível. Um assinante que falha não derruba os outros, graças ao `allSettled`.
+
+<Callout type="warning" title="Evento em memória não é entrega garantida">
+Um barramento de eventos em memória perde os eventos se o processo cair entre o `salvar` e o `publicar`, ou se o assinante falhar. Para efeitos que não podem se perder (cobrança, integração com outro sistema), grave o evento na mesma transação do banco (padrão outbox) e processe a partir dali. Em memória, use só para efeitos que toleram perda ocasional.
+</Callout>
+
+## Juntando: a raiz de composição
+
+```typescript
+// src/main.ts
+const pool = new Pool({ connectionString: env.DATABASE_URL });
+const livros = new LivroRepositorioComCache(new LivroRepositorioPg(pool));
+const notificador = new NotificadorEmail(criarTransporte(env), "biblioteca@exemplo.com");
+const eventos = new Eventos();
+
+eventos.assinar("LivroEmprestado", async (e) => {
+  await notificador.enviar(`usuario-${e.usuarioId}@exemplo.com`, "Empréstimo", `Devolva até ${e.devolucao.toISOString()}`);
+});
+
+const emprestar = comLog("emprestar", new EmprestarLivro(livros, eventos));
+app.post("/livros/:id/emprestimos", criarController(emprestar));
+```
+
+Este arquivo é o único que conhece tudo. Repare no que **não** existe: Singleton. Instâncias únicas (o pool, o barramento) são criadas uma vez aqui e passadas adiante. Um Singleton global faz o mesmo, mas esconde a dependência e dificulta substituir nos testes.
+
+## Quando o padrão atrapalha
+
+Padrões resolvem forças específicas. Sem a força, o padrão é só indireção. Algumas perguntas antes de aplicar:
+
+- Existe, ou vai existir logo, mais de uma implementação? Se não, Repository e Adapter ainda valem para isolar infraestrutura, mas Strategy talvez seja um `if`.
+- O comportamento extra se aplica a vários objetos? Se é só um, edite o objeto em vez de criar um Decorator.
+- O efeito colateral precisa ser desacoplado? Se o caso de uso sempre precisa do resultado (e falhar junto), chamada direta é mais honesta que um evento.
+
+## Na entrevista
+
+**O que é a regra da dependência?** Dependências de código apontam só para dentro: domínio não conhece aplicação, aplicação não conhece infraestrutura. A infraestrutura implementa interfaces definidas pelas camadas internas.
+
+**Qual a diferença entre Adapter e Decorator?** Ambos envolvem um objeto. O Adapter muda a interface (traduz uma API para outra). O Decorator mantém a mesma interface e acrescenta comportamento.
+
+**Por que evitar Singleton?** Porque esconde dependências em estado global, dificulta testes e acopla o código ao ciclo de vida da instância. Criar uma instância na raiz de composição e injetá-la resolve o mesmo problema.
+
+**Repository não é só um DAO?** Um DAO espelha tabelas e operações do banco. Um Repository espelha uma coleção de entidades do domínio e esconde completamente a persistência.
+
+## Pratique
+
+Reestruture a API de livros em camadas:
+
+1. Pastas `dominio`, `aplicacao`, `adaptadores` e `main.ts`, com uma checagem automática de imports proibidos (`no-restricted-imports` no ESLint).
+2. Entidade `Livro` com construtor privado, `criar`, `reconstituir`, `emprestar` e `devolver`.
+3. `LivroRepositorio` com implementação em memória e outra em PostgreSQL (ou SQLite).
+4. Um Decorator de cache para o repositório e um Decorator de log para casos de uso.
+5. `DevolverLivro` usando uma Strategy de multa e publicando `LivroDevolvido`, com dois assinantes.
+
+Entregue o repositório com testes dos casos de uso usando só a implementação em memória e um diagrama simples (pode ser texto) mostrando as setas de dependência.
+
+<Quiz question="Na arquitetura limpa, qual import viola a regra da dependência?" options={["Um controller importando um caso de uso","Um repositório SQL importando a entidade Livro","Uma entidade de domínio importando o driver pg","A raiz de composição importando o Express"]} answer={2} explanation="O domínio é o centro e não pode depender de infraestrutura. Os outros imports apontam para dentro ou estão na raiz de composição." />
+<Quiz question="Você quer cache na leitura de livros sem alterar LivroRepositorioPg. Qual padrão usar?" options={["Singleton","Decorator","Factory","Adapter"]} answer={1} explanation="O Decorator implementa a mesma interface, adiciona o cache e delega ao repositório original, sem modificá-lo." />
+<Quiz question="Por que a entidade tem fábricas separadas criar e reconstituir?" options={["Por performance","Para que dados antigos do banco possam ser lidos mesmo se uma regra de criação mudar","Porque TypeScript exige dois construtores","Para usar o padrão Singleton"]} answer={1} explanation="criar aplica as validações de um objeto novo; reconstituir só remonta o que já foi persistido, sem rejeitar registros válidos na época em que foram gravados." />
+
+## Base no CodeForge
+
+- [Repository](/learn/lld/repository), [Adapter](/learn/lld/adapter), [Decorator](/learn/lld/decorator), [Strategy](/learn/lld/strategy), [Factory Method](/learn/lld/factory-method) e [Observer](/learn/lld/observer): cada padrão em profundidade.
+- [Como escolher padrões](/learn/lld/escolher-padroes) e [Singleton](/learn/lld/singleton): quando usar e quando evitar.
+- [Arquitetura hexagonal](/learn/system-design/hexagonal) e [Outbox](/learn/system-design/outbox): a mesma ideia de portas e adaptadores, e a entrega garantida de eventos.
+- [SOLID com TypeScript](/learn/carreira-nodejs/solid-typescript-aplicando-boas-praticas-orientacao-objetos): os princípios que sustentam esta organização.
+
+## Referências
+
+- [Catálogo de padrões de projeto (Refactoring Guru)](https://refactoring.guru/pt-br/design-patterns)
+- [Classes (TypeScript Handbook)](https://www.typescriptlang.org/docs/handbook/2/classes.html)

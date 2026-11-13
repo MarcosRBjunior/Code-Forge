@@ -1,0 +1,350 @@
+---
+title: "Infraestrutura como código: Terraform e Kubernetes"
+kind: lesson
+---
+
+O ECS resolve bem o problema de rodar contêineres na AWS, mas prende você a ela. Kubernetes é o orquestrador padrão do mercado: o mesmo manifesto roda no EKS, no AKS, no GKE ou num cluster local. O desafio é que um cluster Kubernetes tem duas camadas de infraestrutura: a do provedor (rede, plano de controle, nós) e a de dentro do cluster (namespaces, deployments, services, autoscalers). Neste capítulo você usa o Terraform para as duas, cria um cluster EKS e implanta a API de livros nele, e entende onde o Terraform deixa de ser a melhor ferramenta.
+
+**Você vai aprender:**
+
+- Criar um cluster EKS com node group gerenciado usando o módulo da comunidade
+- Separar a configuração em camadas com estados diferentes, e por quê
+- Configurar o provider `kubernetes` autenticando pelo IAM
+- Declarar namespace, Deployment, Service e HPA da API em HCL
+- Instalar componentes do cluster com o provider `helm`
+
+## Duas camadas, dois estados
+
+O provider `kubernetes` precisa do endereço e das credenciais do cluster para funcionar. Se o cluster é criado na mesma configuração, o Terraform tenta configurar o provider antes de o cluster existir, e o primeiro `plan` (ou qualquer recriação do cluster) falha de formas confusas. A própria documentação do provider recomenda: crie o cluster numa configuração e os recursos dentro dele em outra.
+
+```text
+infra-k8s/
+├── cluster/          # VPC + EKS + node group (estado: k8s/cluster.tfstate)
+│   ├── main.tf
+│   └── outputs.tf
+└── plataforma/       # namespace, app, metrics-server (estado: k8s/plataforma.tfstate)
+    ├── providers.tf
+    └── app.tf
+```
+
+A camada `plataforma` lê o que precisa do cluster por data sources, a partir do nome. Você aplica na ordem `cluster` e depois `plataforma`, e destrói na ordem inversa.
+
+## Camada 1: o cluster EKS
+
+Reaproveite o módulo de VPC do capítulo de ECS, com uma adição: subnets precisam de tags para que o Kubernetes saiba onde criar balanceadores.
+
+```hcl
+# cluster/main.tf
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name               = "livros-k8s"
+  cidr               = "10.1.0.0/16"
+  azs                = ["us-east-1a", "us-east-1b"]
+  public_subnets     = ["10.1.1.0/24", "10.1.2.0/24"]
+  private_subnets    = ["10.1.11.0/24", "10.1.12.0/24"]
+  enable_nat_gateway = true
+  single_nat_gateway = true
+
+  public_subnet_tags  = { "kubernetes.io/role/elb" = 1 }
+  private_subnet_tags = { "kubernetes.io/role/internal-elb" = 1 }
+}
+
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name    = "livros"
+  cluster_version = "1.33" # use uma versão com suporte padrão no EKS
+
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.private_subnets
+
+  cluster_endpoint_public_access           = true
+  enable_cluster_creator_admin_permissions = true
+
+  eks_managed_node_groups = {
+    padrao = {
+      instance_types = ["t3.medium"]
+      min_size       = 2
+      max_size       = 4
+      desired_size   = 2
+    }
+  }
+}
+```
+
+```hcl
+# cluster/outputs.tf
+output "cluster_name" {
+  value = module.eks.cluster_name
+}
+```
+
+O módulo cria o plano de controle, o node group (um Auto Scaling Group de EC2 que o EKS gerencia), as roles IAM e os security groups. O `enable_cluster_creator_admin_permissions` cria uma access entry dando acesso de administrador à identidade que rodou o `apply`; sem isso, você cria o cluster e não consegue usá-lo. A major `~> 20.0` está fixada de propósito: majors novas do módulo renomeiam entradas, então troque com calma, lendo o guia de upgrade.
+
+```bash
+cd infra-k8s/cluster
+terraform init && terraform apply     # leva uns 15 minutos
+
+aws eks update-kubeconfig --name livros --region us-east-1
+kubectl get nodes
+```
+
+## Camada 2: configurando os providers
+
+Na camada `plataforma`, o provider `kubernetes` lê endereço e certificado do cluster e pede um token de curta duração ao IAM a cada execução, com o bloco `exec`. Nada de token fixo em arquivo.
+
+```hcl
+# plataforma/providers.tf
+terraform {
+  required_providers {
+    aws        = { source = "hashicorp/aws", version = "~> 5.0" }
+    kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.30" }
+    helm       = { source = "hashicorp/helm", version = "~> 2.17" }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+data "aws_eks_cluster" "livros" {
+  name = "livros"
+}
+
+provider "kubernetes" {
+  host                   = data.aws_eks_cluster.livros.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.livros.certificate_authority[0].data)
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", "livros"]
+  }
+}
+
+provider "helm" {
+  kubernetes {
+    host                   = data.aws_eks_cluster.livros.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.livros.certificate_authority[0].data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", "livros"]
+    }
+  }
+}
+```
+
+O provider `helm` 3.x trocou os blocos aninhados por atributos (`kubernetes = { ... }`); a sintaxe acima é a da linha 2.x, fixada na restrição de versão.
+
+## A API como recursos do Terraform
+
+Cada objeto Kubernetes tem um recurso equivalente no provider. Os sufixos `_v1` correspondem à versão da API do Kubernetes e são os recomendados.
+
+```hcl
+# plataforma/app.tf
+variable "image" {
+  type = string # ex.: 123456789012.dkr.ecr.us-east-1.amazonaws.com/api-livros:v1.0.0
+}
+
+resource "kubernetes_namespace_v1" "livros" {
+  metadata {
+    name = "livros"
+  }
+}
+
+resource "kubernetes_deployment_v1" "api" {
+  metadata {
+    name      = "api-livros"
+    namespace = kubernetes_namespace_v1.livros.metadata[0].name
+    labels    = { app = "api-livros" }
+  }
+
+  spec {
+    replicas = 2
+
+    selector {
+      match_labels = { app = "api-livros" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "api-livros" }
+      }
+
+      spec {
+        container {
+          name  = "api"
+          image = var.image
+
+          port {
+            container_port = 3000
+          }
+
+          env {
+            name  = "NODE_ENV"
+            value = "production"
+          }
+
+          resources {
+            requests = { cpu = "250m", memory = "256Mi" }
+            limits   = { memory = "512Mi" }
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/health"
+              port = 3000
+            }
+            period_seconds = 10
+          }
+
+          liveness_probe {
+            http_get {
+              path = "/health"
+              port = 3000
+            }
+            initial_delay_seconds = 15
+            period_seconds        = 20
+          }
+        }
+      }
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [spec[0].replicas]
+  }
+}
+
+resource "kubernetes_service_v1" "api" {
+  metadata {
+    name      = "api-livros"
+    namespace = kubernetes_namespace_v1.livros.metadata[0].name
+  }
+  spec {
+    selector = { app = "api-livros" }
+    type     = "LoadBalancer"
+    port {
+      port        = 80
+      target_port = 3000
+    }
+  }
+}
+
+output "endereco" {
+  value = kubernetes_service_v1.api.status[0].load_balancer[0].ingress[0].hostname
+}
+```
+
+Os pontos que fazem diferença em produção:
+
+- **Readiness probe** decide se o pod recebe tráfego; **liveness probe** decide se o contêiner é reiniciado. Use a readiness sempre; a liveness com cuidado, para não reiniciar uma API que só está lenta.
+- **Requests** de CPU e memória são o que o agendador reserva no nó, e são a base do HPA. Sem requests, o autoscaler por CPU não tem referência.
+- O Service `LoadBalancer` faz a AWS criar um balanceador com endereço público. Para várias APIs atrás de um domínio, o caminho é um Ingress com o AWS Load Balancer Controller, instalado via Helm.
+
+## Autoscaling com HPA e Helm
+
+O Horizontal Pod Autoscaler ajusta réplicas com base em métricas, e precisa do metrics-server, que não vem no EKS por padrão. É o caso típico para o provider `helm`: instalar componentes de plataforma empacotados como charts.
+
+```hcl
+resource "helm_release" "metrics_server" {
+  name       = "metrics-server"
+  repository = "https://kubernetes-sigs.github.io/metrics-server/"
+  chart      = "metrics-server"
+  namespace  = "kube-system"
+  version    = "3.12.2"
+}
+
+resource "kubernetes_horizontal_pod_autoscaler_v2" "api" {
+  metadata {
+    name      = "api-livros"
+    namespace = kubernetes_namespace_v1.livros.metadata[0].name
+  }
+  spec {
+    min_replicas = 2
+    max_replicas = 10
+    scale_target_ref {
+      api_version = "apps/v1"
+      kind        = "Deployment"
+      name        = kubernetes_deployment_v1.api.metadata[0].name
+    }
+    metric {
+      type = "Resource"
+      resource {
+        name = "cpu"
+        target {
+          type                = "Utilization"
+          average_utilization = 60
+        }
+      }
+    }
+  }
+  depends_on = [helm_release.metrics_server]
+}
+```
+
+O `ignore_changes` em `replicas` no Deployment tem o mesmo motivo do `desired_count` no ECS: quem decide o número de réplicas agora é o HPA. Os pods escalam dentro dos nós existentes; quando os nós lotam, é o Cluster Autoscaler (ou o Karpenter) que adiciona máquinas, outro componente instalado via Helm.
+
+```bash
+cd infra-k8s/plataforma
+terraform init
+terraform apply -var="image=123456789012.dkr.ecr.us-east-1.amazonaws.com/api-livros:v1.0.0"
+kubectl -n livros get deploy,pods,svc,hpa
+```
+
+<Callout type="warning" title="Destruir na ordem errada deixa lixo e trava a VPC">
+O Service `LoadBalancer` faz o Kubernetes criar um balanceador na AWS que o Terraform não conhece. Se você destrói a camada `cluster` primeiro, esse balanceador e as interfaces de rede dele ficam órfãos, e o `destroy` da VPC trava esperando dependências que não somem. Sempre destrua `plataforma` antes de `cluster`, e confira no console do EC2 que não sobrou balanceador.
+</Callout>
+
+## Onde o Terraform para
+
+Declarar o Deployment da aplicação em HCL funciona e é ótimo para aprender, mas tem atrito no dia a dia: cada versão nova da imagem vira um `terraform apply`, o estado guarda o manifesto inteiro, e quem conhece Kubernetes espera ver YAML. A divisão que a maioria dos times adota é:
+
+| Camada | Ferramenta típica |
+| --- | --- |
+| Rede, cluster, node groups, IAM | Terraform |
+| Componentes de plataforma (metrics-server, controller de LB, cert-manager) | Terraform com Helm, ou GitOps |
+| Aplicações (Deployment, Service, HPA) | Manifestos YAML com kubectl, Kustomize ou Helm, aplicados pelo pipeline ou por GitOps (Argo CD, Flux) |
+
+É essa terceira linha que o capítulo de entrega contínua no Kubernetes automatiza com GitHub Actions. O Terraform continua dono do que muda pouco, e o pipeline fica dono do que muda a cada commit.
+
+Outro cuidado: um `kubernetes_secret_v1` gerenciado pelo Terraform grava o valor do segredo no estado. Para segredos de aplicação, prefira o Secrets Manager com o External Secrets Operator ou o driver CSI de segredos, e deixe o Terraform só instalar esses componentes.
+
+## Na entrevista
+
+**Por que separar a criação do cluster e dos recursos Kubernetes em configurações diferentes?** O provider `kubernetes` depende de dados do cluster; se o cluster nasce na mesma configuração, o provider é configurado com valores desconhecidos e o plan falha ou se comporta mal.
+
+**Como o Terraform se autentica no EKS sem guardar token?** Com o bloco `exec` chamando `aws eks get-token`, que gera um token de curta duração a partir da identidade IAM atual, autorizada por uma access entry.
+
+**Qual a diferença entre readiness e liveness probe?** Readiness tira o pod do balanceamento enquanto ele não está pronto; liveness reinicia o contêiner que travou.
+
+**Terraform ou kubectl para deploy de aplicações?** Terraform para infraestrutura e plataforma; manifestos com pipeline ou GitOps para aplicações, que mudam a cada commit.
+
+## Pratique
+
+Entregue um repositório `infra-k8s/` com:
+
+1. Camada `cluster` com VPC (subnets com as tags de ELB) e EKS com node group gerenciado de 2 a 4 nós.
+2. Camada `plataforma` com providers `kubernetes` e `helm` autenticando por `exec`, namespace `livros`, Deployment com probes e requests, Service `LoadBalancer`, metrics-server e HPA de 2 a 10 réplicas.
+3. Um teste de carga mostrando `kubectl get hpa -w` aumentando as réplicas.
+4. Um script `destroy.sh` que destrói na ordem certa.
+
+<Quiz question="Por que o cluster EKS e os recursos Kubernetes devem ficar em configurações Terraform separadas?" options={["Porque o provider kubernetes não funciona com EKS","Porque o provider kubernetes precisa de dados do cluster, que não existem no primeiro plan","Porque o estado ficaria grande demais para o S3","Porque o Helm exige um backend próprio"]} answer={1} explanation="Provider configurado a partir de um recurso criado na mesma execução recebe valores desconhecidos. Separar em camadas resolve isso." />
+<Quiz question="O HPA por CPU não escala e mostra a métrica como unknown. Qual a causa mais provável?" options={["Faltam requests de CPU no contêiner ou o metrics-server não está instalado","O Service é do tipo LoadBalancer","O node group tem só dois nós","A liveness probe está configurada"]} answer={0} explanation="O HPA calcula a utilização relativa ao request de CPU, lendo métricas do metrics-server. Sem um dos dois, a métrica fica desconhecida." />
+<Quiz question="Qual divisão de responsabilidades é a mais comum em times que usam Terraform com Kubernetes?" options={["Terraform para tudo, incluindo cada versão da aplicação","kubectl para tudo, incluindo a VPC","Terraform para rede, cluster e plataforma; pipeline ou GitOps para as aplicações","Helm para a VPC e Terraform para os pods"]} answer={2} explanation="Infraestrutura muda pouco e combina com Terraform; aplicações mudam a cada commit e combinam com manifestos aplicados pelo pipeline ou GitOps." />
+
+## Base no CodeForge
+
+- [Amazon EKS: Gerenciando aplicações conteinerizadas com Kubernetes](/learn/carreira-nodejs/amazon-eks-gerenciando-aplicacoes-conteinerizadas-kubernetes): os conceitos do EKS antes da automação.
+- [Kubernetes](/learn/system-design-interviews/kubernetes): pods, deployments e services do ponto de vista de system design.
+- [Integração Contínua: Automatizando a entrega no Kubernetes](/learn/carreira-nodejs/integracao-continua-automatizando-entrega-kubernetes): o pipeline que assume o deploy da aplicação.
+
+## Referências
+
+- [Terraform: Kubernetes provider](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs)
+- [Módulo terraform-aws-modules/eks](https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest)
+- [EKS: access entries](https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html)
+- [Kubernetes: Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)

@@ -1,0 +1,359 @@
+---
+title: "TypeScript: Desenvolvendo validações e tratando erros"
+kind: lesson
+---
+
+Uma API passa a maior parte do tempo lidando com o que deu errado: corpo mal formatado, livro que não existe, banco fora do ar, regra de negócio violada. Se cada rota trata isso do seu jeito, o cliente recebe um 500 com stack trace aqui, um 200 com `{ ok: false }` ali e um 400 sem explicação acolá. Esta aula monta as duas metades de uma API previsível em TypeScript: validação na entrada com Zod, que transforma dados desconhecidos em tipos confiáveis, e uma estratégia única de erros, que transforma qualquer falha numa resposta HTTP coerente.
+
+**Você vai aprender:**
+
+- Como escrever schemas Zod com transformações, regras entre campos e uniões discriminadas
+- Como criar um middleware de validação genérico e tipado para o Express 5
+- Como modelar erros com classes, `cause` e a distinção entre erro operacional e bug
+- Como centralizar a resposta de erro no formato Problem Details (RFC 9457)
+- Quando usar exceções e quando usar um tipo `Result`
+
+## Erros em JavaScript: qualquer coisa pode ser lançada
+
+Antes de validar, entenda o que você está tratando. Em JavaScript, `throw` aceita qualquer valor: um `Error`, uma string, `undefined`. Por isso, com `strict` ligado, o TypeScript tipa a variável do `catch` como `unknown`:
+
+```typescript
+try {
+  JSON.parse("{ quebrado");
+} catch (err) {
+  // err: unknown
+  if (err instanceof SyntaxError) {
+    console.log("JSON inválido:", err.message);
+  } else {
+    throw err; // não sei tratar: repasso
+  }
+}
+```
+
+A regra que acompanha toda esta aula: **trate o que você sabe tratar e repasse o resto**. Um `catch` que engole qualquer erro e segue em frente esconde bugs.
+
+## Zod: do desconhecido ao tipado
+
+Um schema Zod descreve o formato esperado. `parse` devolve o valor tipado ou lança `ZodError`; `safeParse` devolve um objeto com `success`, sem lançar.
+
+```typescript
+import { z } from "zod";
+
+export const novoLivroSchema = z.object({
+  titulo: z.string().trim().min(1, { error: "título é obrigatório" }).max(200),
+  autor: z.string().trim().min(1),
+  isbn: z.string().regex(/^97[89]\d{10}$/, { error: "ISBN-13 deve ter 13 dígitos" }),
+  ano: z.number().int().min(1450).max(new Date().getFullYear()),
+  tags: z.array(z.string().toLowerCase()).max(10).default([]),
+});
+
+export type NovoLivro = z.infer<typeof novoLivroSchema>;
+
+const r = novoLivroSchema.safeParse({ titulo: "  ", autor: "Machado", isbn: "123", ano: 1899 });
+if (!r.success) {
+  console.log(z.flattenError(r.error).fieldErrors);
+  // { titulo: ['título é obrigatório'], isbn: ['ISBN-13 deve ter 13 dígitos'] }
+}
+```
+
+Repare que `trim` e `toLowerCase` não só validam: eles transformam. O valor que sai do `parse` já vem normalizado. Isso tem uma consequência importante: o tipo de entrada e o de saída podem ser diferentes. `z.input<typeof schema>` dá o tipo antes das transformações e `z.infer` (igual a `z.output`) dá o de depois.
+
+### Coerção e transformação
+
+Query string e parâmetros de rota são sempre strings. `z.coerce` converte antes de validar; `transform` produz um valor novo:
+
+```typescript
+export const listarQuery = z.object({
+  pagina: z.coerce.number().int().min(1).default(1),
+  limite: z.coerce.number().int().min(1).max(100).default(20),
+  ordem: z.enum(["titulo", "ano"]).default("titulo"),
+  tags: z
+    .string()
+    .optional()
+    .transform((s) => (s ? s.split(",").map((t) => t.trim()) : [])),
+});
+
+console.log(listarQuery.parse({ pagina: "2", tags: "romance, classico" }));
+// { pagina: 2, limite: 20, ordem: 'titulo', tags: ['romance', 'classico'] }
+```
+
+Cuidado com `z.coerce.boolean()`: ele usa a conversão do JavaScript, e a string `"false"` vira `true` (string não vazia). Para flags na query, prefira `z.enum(["true", "false"]).transform((v) => v === "true")`.
+
+### Regras entre campos
+
+Validações que envolvem mais de um campo usam `refine` no objeto, indicando em `path` qual campo recebe o erro:
+
+```typescript
+export const periodoSchema = z
+  .object({
+    inicio: z.coerce.date(),
+    fim: z.coerce.date(),
+  })
+  .refine((p) => p.fim > p.inicio, { error: "fim deve ser depois do início", path: ["fim"] });
+```
+
+### Uniões discriminadas
+
+Quando o formato depende de um campo, `z.discriminatedUnion` escolhe o schema certo pelo valor do discriminador e gera mensagens de erro precisas:
+
+```typescript
+export const pagamentoSchema = z.discriminatedUnion("metodo", [
+  z.object({ metodo: z.literal("pix"), chave: z.string().min(1) }),
+  z.object({
+    metodo: z.literal("cartao"),
+    numero: z.string().regex(/^\d{16}$/),
+    parcelas: z.number().int().min(1).max(12),
+  }),
+]);
+
+type Pagamento = z.infer<typeof pagamentoSchema>;
+// { metodo: 'pix'; chave: string } | { metodo: 'cartao'; numero: string; parcelas: number }
+```
+
+O tipo inferido é uma união discriminada do TypeScript, então um `switch (p.metodo)` estreita o tipo em cada ramo.
+
+## Middleware de validação genérico
+
+Em vez de chamar `safeParse` em cada rota, crie um middleware que valida corpo, query e params e entrega os dados tipados ao handler.
+
+```typescript
+// src/http/validar.ts
+import type { NextFunction, Request, Response } from "express";
+import { z } from "zod";
+
+type Schemas = { body?: z.ZodType; query?: z.ZodType; params?: z.ZodType };
+type Saida<S extends Schemas> = { [K in keyof S]: S[K] extends z.ZodType ? z.output<S[K]> : never };
+
+export function validar<S extends Schemas>(
+  schemas: S,
+  handler: (dados: Saida<S>, req: Request, res: Response) => Promise<void>,
+) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const dados: Record<string, unknown> = {};
+    for (const parte of ["body", "query", "params"] as const) {
+      const schema = schemas[parte];
+      if (schema) dados[parte] = schema.parse(req[parte]); // ZodError vai para o handler de erro
+    }
+    await handler(dados as Saida<S>, req, res);
+  };
+}
+```
+
+```typescript
+// uso
+r.get(
+  "/livros",
+  validar({ query: listarQuery }, async ({ query }, _req, res) => {
+    // query.pagina: number, query.tags: string[]
+    res.json(await servico.listar(query));
+  }),
+);
+
+r.post(
+  "/livros",
+  validar({ body: novoLivroSchema }, async ({ body }, _req, res) => {
+    res.status(201).json(await servico.criar(body));
+  }),
+);
+```
+
+O handler nunca vê `req.body` cru. A inferência leva o tipo do schema até o parâmetro, sem nenhuma anotação manual.
+
+<Callout type="warning" title="No Express 5, req.query não pode ser substituído">
+Um padrão comum no Express 4 era validar e sobrescrever: `req.query = schema.parse(req.query)`. No Express 5, `req.query` é um getter, e a atribuição não tem efeito (ou lança erro em modo estrito). O handler continua lendo as strings originais, sem coerção nem defaults, e o bug é silencioso. Entregue os dados validados por outro caminho: um parâmetro do handler, como acima, ou `res.locals`.
+</Callout>
+
+## Modelando erros
+
+Nem todo erro é igual. A distinção mais útil é:
+
+- **Erro operacional**: algo esperado que pode acontecer com o código correto. Livro não encontrado, entrada inválida, conflito de estado, banco temporariamente fora. Vira uma resposta 4xx ou 503 com mensagem útil.
+- **Erro de programação (bug)**: `undefined is not a function`, invariante quebrada. Vira 500 genérico, log com detalhes e correção no código.
+
+Modele os operacionais como uma hierarquia de classes. Cada uma sabe seu status HTTP e um código estável que o cliente pode usar:
+
+```typescript
+// src/erros.ts
+export abstract class ErroApp extends Error {
+  abstract readonly status: number;
+  abstract readonly codigo: string;
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = new.target.name;
+  }
+}
+
+export class NaoEncontrado extends ErroApp {
+  readonly status = 404;
+  readonly codigo = "nao_encontrado";
+  constructor(recurso: string, id: string) {
+    super(`${recurso} ${id} não encontrado`);
+  }
+}
+
+export class Conflito extends ErroApp {
+  readonly status = 409;
+  readonly codigo = "conflito";
+}
+
+export class ServicoIndisponivel extends ErroApp {
+  readonly status = 503;
+  readonly codigo = "servico_indisponivel";
+}
+```
+
+`new.target.name` dá o nome da subclasse concreta, sem repetir em cada uma. A opção `cause` (padrão desde o ES2022) encadeia o erro original. Use-a ao traduzir erros de infraestrutura em erros do domínio, para não perder o diagnóstico:
+
+```typescript
+import { DatabaseError } from "pg";
+
+async function criarLivro(dados: NovoLivro) {
+  try {
+    return await repo.inserir(dados);
+  } catch (err) {
+    if (err instanceof DatabaseError && err.code === "23505") {
+      throw new Conflito(`ISBN ${dados.isbn} já cadastrado`, { cause: err });
+    }
+    if (err instanceof Error && "code" in err && err.code === "ECONNREFUSED") {
+      throw new ServicoIndisponivel("banco indisponível", { cause: err });
+    }
+    throw err; // desconhecido: é bug ou algo novo, sobe como está
+  }
+}
+```
+
+O código `23505` é a violação de unicidade do PostgreSQL. O cliente recebe 409 com uma mensagem útil; o log mantém o erro do banco em `cause`.
+
+## O handler central e o Problem Details
+
+Toda resposta de erro sai de um único lugar. O formato Problem Details (RFC 9457) é um padrão para isso, com `content-type: application/problem+json` e campos conhecidos: `type`, `title`, `status`, `detail` e `instance`, aos quais você pode acrescentar campos próprios.
+
+```typescript
+// src/http/tratar-erros.ts
+import type { NextFunction, Request, Response } from "express";
+import { z } from "zod";
+import { ErroApp } from "../erros.js";
+
+export function tratarErros(err: unknown, req: Request, res: Response, _next: NextFunction) {
+  const problema = (status: number, title: string, extra: object = {}) =>
+    res.status(status).type("application/problem+json").json({ title, status, instance: req.originalUrl, ...extra });
+
+  if (err instanceof z.ZodError) {
+    return problema(400, "Dados inválidos", { codigo: "validacao", erros: z.flattenError(err).fieldErrors });
+  }
+  if (err instanceof SyntaxError && "body" in err) {
+    return problema(400, "JSON mal formado", { codigo: "json_invalido" });
+  }
+  if (err instanceof ErroApp) {
+    if (err.status >= 500) console.error(err);
+    return problema(err.status, err.message, { codigo: err.codigo });
+  }
+
+  console.error("erro inesperado", err);
+  return problema(500, "Erro interno", { codigo: "interno" });
+}
+
+// src/server.ts, depois de todas as rotas
+app.use((req, res) => res.status(404).type("application/problem+json").json({ title: "Rota não encontrada", status: 404 }));
+app.use(tratarErros);
+```
+
+```bash
+curl -s -X POST localhost:3000/livros -H 'content-type: application/json' -d '{"titulo":""}'
+```
+
+```json
+{
+  "title": "Dados inválidos",
+  "status": 400,
+  "instance": "/livros",
+  "codigo": "validacao",
+  "erros": { "titulo": ["título é obrigatório"], "autor": ["Invalid input: expected string, received undefined"] }
+}
+```
+
+Bugs nunca vazam a mensagem interna: só os erros que você modelou de propósito (`ErroApp`) expõem `message`. No Express 5, erros lançados em handlers `async` chegam a esse middleware sozinhos, sem `try/catch` em cada rota.
+
+## Erros que escapam de tudo
+
+Uma Promise rejeitada sem `catch` fora de uma rota (num `setInterval`, num listener de evento) não passa pelo Express. Registre os handlers do processo para ao menos logar e encerrar de forma controlada:
+
+```typescript
+process.on("unhandledRejection", (reason) => {
+  console.error("rejeição não tratada", reason);
+  process.exitCode = 1;
+  servidor.close(); // para de aceitar conexões e deixa o orquestrador reiniciar
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("exceção não capturada", err);
+  process.exit(1);
+});
+```
+
+Depois de uma exceção não capturada, o estado do processo é desconhecido. Continuar rodando é arriscado; o certo é encerrar e deixar o Docker, o Kubernetes ou o PM2 subir outro.
+
+## Exceções ou Result?
+
+Exceções são invisíveis na assinatura: nada em `buscar(id): Promise<Livro>` diz que ela pode lançar `NaoEncontrado`. Uma alternativa é devolver o erro como valor:
+
+```typescript
+type Result<T, E> = { ok: true; valor: T } | { ok: false; erro: E };
+
+type ErroEmprestimo = "livro_inexistente" | "ja_emprestado" | "limite_atingido";
+
+async function emprestar(livroId: string, usuarioId: number): Promise<Result<{ devolucao: Date }, ErroEmprestimo>> {
+  const livro = await repo.buscar(livroId);
+  if (!livro) return { ok: false, erro: "livro_inexistente" };
+  if (livro.status !== "disponivel") return { ok: false, erro: "ja_emprestado" };
+  // ...
+  return { ok: true, valor: { devolucao: new Date() } };
+}
+
+const r = await emprestar("1", 7);
+if (!r.ok) {
+  // o compilador sabe quais erros são possíveis
+}
+```
+
+O critério prático: use `Result` para falhas de regra de negócio que o chamador **deve** tratar e que fazem parte do fluxo normal; use exceções para o resto (infraestrutura, bugs, situações que o chamador direto não consegue resolver). Misturar os dois sem critério é pior do que escolher qualquer um.
+
+## Na entrevista
+
+**Por que o `catch` recebe `unknown`?** Porque qualquer valor pode ser lançado, não só `Error`. É preciso estreitar com `instanceof` antes de acessar propriedades.
+
+**Qual a diferença entre `parse` e `safeParse`?** `parse` lança `ZodError` em caso de falha; `safeParse` devolve `{ success, data }` ou `{ success, error }`. `parse` combina com um handler central; `safeParse` com tratamento local.
+
+**Erro operacional e erro de programação?** O operacional é esperado (entrada inválida, recurso inexistente) e vira resposta 4xx ou 503; o de programação é bug, vira 500 genérico e precisa de correção no código.
+
+**Para que serve `cause`?** Para encadear o erro original ao traduzir uma falha de baixo nível num erro de domínio, preservando o diagnóstico no log.
+
+## Pratique
+
+Na API de livros em TypeScript:
+
+1. Schemas Zod para criar livro, atualizar livro (parcial e `.strict()`), listar com paginação e filtros, e criar empréstimo com período validado entre campos.
+2. O middleware `validar` genérico, sem nenhum `req.body` cru nos handlers.
+3. A hierarquia `ErroApp` com pelo menos quatro classes, e a tradução da violação de unicidade do banco em `Conflito` com `cause`.
+4. Handler central respondendo em Problem Details.
+5. Testes de integração (com `supertest` ou `fetch`) para: corpo inválido (400 com `erros`), JSON mal formado (400), recurso inexistente (404), ISBN duplicado (409) e erro inesperado (500 sem mensagem interna).
+
+Entregue o repositório e um trecho do README documentando os códigos de erro (`codigo`) que um cliente pode receber.
+
+<Quiz question="Qual o problema de z.coerce.boolean() numa flag de query string?" options={["Não aceita valores padrão","A string false vira true porque string não vazia é truthy","Só funciona no body","Lança erro para qualquer valor"]} answer={1} explanation="coerce usa Boolean() do JavaScript. Qualquer string não vazia, inclusive false, vira true; use um enum com transform." />
+<Quiz question="No Express 5, o que acontece com req.query = schema.parse(req.query)?" options={["Funciona como no Express 4","A atribuição não substitui o valor, pois req.query é um getter","O Express valida automaticamente","Lança ZodError"]} answer={1} explanation="No Express 5 req.query é um getter. O handler continua lendo a query original, sem coerção nem defaults; entregue os dados validados por outro caminho." />
+<Quiz question="Ao traduzir um erro de unicidade do banco em Conflito, por que passar { cause: err }?" options={["Para o cliente ver o erro do banco","Para preservar o erro original no log sem expô-lo na resposta","Porque o construtor de Error exige","Para mudar o status para 500"]} answer={1} explanation="cause encadeia o erro de baixo nível ao erro de domínio. O cliente recebe a mensagem tratada; o log mantém o diagnóstico completo." />
+
+## Base no CodeForge
+
+- [Erros em TypeScript](/learn/typescript/erros) e [Uniões e narrowing](/learn/typescript/unioes-e-narrowing): a base de `unknown`, `instanceof` e uniões discriminadas.
+- [TypeScript: Construção de uma API com tipagem segura](/learn/carreira-nodejs/typescript-construcao-api-tipagem-segura): a API que este capítulo completa.
+- [Desenvolvimento seguro](/learn/carreira-nodejs/desenvolvimento-seguro): validação como defesa contra injeção e mass assignment.
+
+## Referências
+
+- [Zod: definindo schemas](https://zod.dev/api)
+- [Zod: formatando erros](https://zod.dev/error-formatting)
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)
+- [Error: cause (MDN)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error/cause)

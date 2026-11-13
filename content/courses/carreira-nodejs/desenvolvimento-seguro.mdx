@@ -1,0 +1,280 @@
+---
+title: "Desenvolvimento seguro"
+kind: lesson
+---
+
+A maioria dos vazamentos não vem de ataques sofisticados. Vem de uma consulta montada com concatenação de strings, de uma rota que confere se o usuário está logado mas não se o recurso é dele, de uma chave de API commitada no repositório ou de uma dependência com falha conhecida há meses. O OWASP Top 10 é a lista dos riscos mais frequentes em aplicações web, e quase todos se resolvem com hábitos simples no código de todo dia. Esta aula aplica esses riscos a uma API Node.js com Express 5, com o ataque e a correção lado a lado.
+
+**Você vai aprender:**
+
+- Como evitar injeção de SQL, de operadores do MongoDB e de comandos do sistema
+- Como guardar senhas, proteger o login e não errar no controle de acesso
+- Como validar entradas, limitar requisições e configurar headers de segurança
+- Como cuidar de segredos e dependências, que são a parte mais esquecida
+- Como tratar erros e logs sem entregar informação ao atacante
+
+## O modelo mental: toda entrada é hostil
+
+Tudo o que atravessa a fronteira da sua aplicação pode ter sido escrito por um atacante: corpo, query string, parâmetros de rota, headers, cookies, nomes de arquivos enviados e até respostas de APIs de terceiros. A defesa segue três regras que aparecem em todas as seções:
+
+1. **Valide na entrada**: formato, tipo, tamanho e valores permitidos (lista do que pode, não do que não pode).
+2. **Separe dados de código**: nunca deixe um dado do usuário virar parte de uma consulta, de um comando ou de HTML.
+3. **Negue por padrão**: sem regra explícita que permita, o acesso é recusado.
+
+## Injeção
+
+Injeção acontece quando um dado é interpretado como instrução. É o risco mais antigo da lista e continua aparecendo.
+
+### SQL
+
+```typescript
+// VULNERÁVEL: o termo vira parte do SQL
+const termo = req.query.titulo; // "x' OR '1'='1"
+await pool.query(`select * from livros where titulo = '${termo}'`);
+
+// CORRETO: consulta parametrizada; o driver envia o valor separado do comando
+await pool.query("select * from livros where titulo = $1", [termo]);
+```
+
+Com o parâmetro `$1`, o banco recebe o texto do comando e o valor em canais separados. Não existe valor que mude a estrutura da consulta. ORMs (Sequelize, TypeORM, Prisma) parametrizam por padrão, mas oferecem saídas para SQL cru (`sequelize.query`, `query()` do TypeORM, `$queryRawUnsafe` do Prisma): nelas, a responsabilidade volta para você.
+
+Nomes de coluna e direção de ordenação não podem ser parametrizados. Para eles, use uma lista fixa:
+
+```typescript
+const COLUNAS = { titulo: "titulo", ano: "ano" } as const;
+const coluna = COLUNAS[req.query.ordem as keyof typeof COLUNAS] ?? "titulo";
+await pool.query(`select * from livros order by ${coluna} limit $1`, [20]);
+```
+
+### Operadores do MongoDB
+
+O MongoDB não tem SQL, mas tem operadores em objetos. Se o corpo JSON chega direto no filtro, o atacante manda um objeto no lugar de uma string:
+
+```typescript
+// corpo: { "email": "ana@exemplo.com", "senha": { "$ne": null } }
+const usuario = await Usuario.findOne({ email: req.body.email, senha: req.body.senha });
+// $ne: null casa com qualquer senha: login sem senha
+```
+
+A correção principal é validar o tipo (a senha precisa ser string) antes de qualquer consulta, como na seção de validação. Como segunda camada, o Mongoose tem a opção `mongoose.set("sanitizeFilter", true)`, que neutraliza chaves iniciadas por `$` nos filtros.
+
+### Comandos do sistema
+
+```typescript
+import { exec, execFile } from "node:child_process";
+
+// VULNERÁVEL: o shell interpreta ; && | $()
+exec(`convert ${req.body.arquivo} capa.png`);   // arquivo = "a.jpg; rm -rf /"
+
+// CORRETO: sem shell, cada argumento é um item do array
+execFile("convert", [req.body.arquivo, "capa.png"]);
+```
+
+`execFile` (e `spawn` sem `shell: true`) não passa por um shell, então metacaracteres são só texto. Mesmo assim, valide o nome do arquivo contra um padrão permitido.
+
+## Validação de entrada e mass assignment
+
+Validação com schema resolve vários riscos de uma vez: tipos errados, campos extras, tamanhos absurdos.
+
+```typescript
+import { z } from "zod";
+
+const atualizarPerfil = z
+  .object({
+    nome: z.string().trim().min(1).max(100),
+    bio: z.string().max(500).optional(),
+  })
+  .strict(); // campos não declarados são erro
+
+app.patch("/me", async (req, res) => {
+  const dados = atualizarPerfil.parse(req.body);
+  await Usuario.updateOne({ _id: req.user.id }, dados);
+  res.sendStatus(204);
+});
+```
+
+Sem o schema, um `Object.assign(usuario, req.body)` aceitaria `{ "papel": "admin" }`. Isso é mass assignment: o cliente escreve em campos que nunca deveria tocar. A defesa é sempre listar explicitamente o que pode ser alterado.
+
+Limite também o tamanho do corpo. O `express.json()` aceita 100 KB por padrão; reduza nas rotas que só recebem poucos campos e aumente só onde for necessário: `express.json({ limit: "10kb" })`.
+
+## Autenticação
+
+### Senhas
+
+Senha nunca é guardada em texto nem com hash rápido (MD5, SHA-256). Hashes rápidos permitem bilhões de tentativas por segundo numa GPU. Use um algoritmo lento e com salt: Argon2id, scrypt ou bcrypt. O Node tem scrypt nativo:
+
+```typescript
+import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+
+const scryptAsync = promisify(scrypt) as (s: string, salt: Buffer, len: number) => Promise<Buffer>;
+
+export async function hashSenha(senha: string) {
+  const salt = randomBytes(16);
+  const hash = await scryptAsync(senha, salt, 64);
+  return `${salt.toString("hex")}:${hash.toString("hex")}`;
+}
+
+export async function conferirSenha(senha: string, armazenado: string) {
+  const [saltHex, hashHex] = armazenado.split(":");
+  const esperado = Buffer.from(hashHex!, "hex");
+  const obtido = await scryptAsync(senha, Buffer.from(saltHex!, "hex"), 64);
+  return esperado.length === obtido.length && timingSafeEqual(esperado, obtido);
+}
+```
+
+`timingSafeEqual` compara em tempo constante, sem dar pistas pelo tempo de resposta de quantos bytes batem.
+
+### O login
+
+- Responda a mesma mensagem para "usuário não existe" e "senha errada" (`credenciais inválidas`). Mensagens diferentes permitem descobrir quais e-mails têm conta.
+- Limite tentativas por IP e por conta (veja rate limit abaixo).
+- Tokens de sessão ou JWT com expiração curta; cookies com `httpOnly`, `secure` e `sameSite`.
+- Ao trocar a senha, invalide as sessões existentes.
+
+## Controle de acesso
+
+É o risco número um da lista atual do OWASP e o mais fácil de deixar passar, porque o teste "logado consegue acessar" passa. A pergunta certa é: **este usuário pode fazer esta ação neste recurso específico?**
+
+```typescript
+// VULNERÁVEL (IDOR): qualquer usuário logado lê o empréstimo de qualquer outro
+app.get("/emprestimos/:id", autenticar, async (req, res) => {
+  res.json(await Emprestimo.findById(req.params.id));
+});
+
+// CORRETO: o filtro inclui o dono
+app.get("/emprestimos/:id", autenticar, async (req, res) => {
+  const emp = await Emprestimo.findOne({ _id: req.params.id, usuarioId: req.user.id });
+  if (!emp) {
+    res.sendStatus(404); // 404, não 403: não confirma que o recurso existe
+    return;
+  }
+  res.json(emp);
+});
+```
+
+IDOR (referência direta insegura a objeto) é trocar o `id` na URL e ver dados de outra pessoa. IDs aleatórios (UUID) dificultam adivinhar, mas não substituem a checagem. Para papéis, centralize a regra num middleware em vez de espalhar `if` pelas rotas:
+
+```typescript
+const exigirPapel = (...papeis: string[]) => (req, res, next) =>
+  papeis.includes(req.user?.papel) ? next() : res.sendStatus(403);
+
+app.delete("/livros/:id", autenticar, exigirPapel("bibliotecario", "admin"), removerLivro);
+```
+
+<Callout type="warning" title="Autenticado não é autorizado">
+O erro de segurança mais comum em APIs é conferir só o login. Toda rota que recebe um identificador (`/pedidos/:id`, `/usuarios/:id/endereco`) precisa verificar se o recurso pertence ao usuário ou se o papel dele permite a ação. Escreva um teste para cada rota assim: usuário A tenta ler o recurso de B e deve receber 404.
+</Callout>
+
+## Rate limit e headers de segurança
+
+```typescript
+import express from "express";
+import helmet from "helmet";
+import cors from "cors";
+import { rateLimit } from "express-rate-limit";
+
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1); // se estiver atrás de um load balancer
+app.use(helmet());
+app.use(cors({ origin: ["https://biblioteca.exemplo.com"], credentials: true }));
+app.use(express.json({ limit: "10kb" }));
+
+app.use(rateLimit({ windowMs: 60_000, limit: 100, standardHeaders: "draft-7", legacyHeaders: false }));
+app.use("/auth/login", rateLimit({ windowMs: 15 * 60_000, limit: 5 }));
+```
+
+O `helmet` configura headers como `Strict-Transport-Security`, `X-Content-Type-Options` e uma `Content-Security-Policy` padrão. O CORS libera só as origens conhecidas; `origin: "*"` com credenciais é recusado pelos navegadores, e com razão. O rate limit em memória serve para uma instância; com várias réplicas, use um store compartilhado (Redis) para o limite valer no total. O `trust proxy` faz o Express ler o IP real do header `X-Forwarded-For`; sem ele, atrás de um load balancer, todos os clientes parecem ter o mesmo IP.
+
+## Segredos
+
+- Segredos vêm de variáveis de ambiente ou de um cofre (AWS Secrets Manager, Azure Key Vault), nunca do código.
+- `.env` no `.gitignore`; no repositório, só um `.env.example` sem valores.
+- Ative a proteção de push de segredos do GitHub.
+- Se um segredo vazou, **revogue e gere outro**. Apagar o commit não adianta: o valor já está em clones, forks e caches.
+- Cada ambiente com segredos próprios, e o mínimo de permissão para cada credencial.
+
+Valide a presença dos segredos na inicialização (com Zod, por exemplo) para que a aplicação não suba "meio configurada".
+
+## Dependências
+
+Uma API Node.js comum tem centenas de pacotes transitivos, e cada um roda com as mesmas permissões que o seu código.
+
+```bash
+npm audit --omit=dev          # vulnerabilidades conhecidas no que vai para produção
+npm audit fix                 # aplica atualizações compatíveis
+npm ci                        # no CI e no Docker: instala exatamente o lockfile
+npm ci --ignore-scripts       # bloqueia scripts de instalação de pacotes
+```
+
+Commite o `package-lock.json`, ative o Dependabot, desconfie de pacotes com nomes parecidos com os populares (typosquatting) e prefira o que a plataforma já oferece (`node:crypto`, `fetch`, `node:test`) a mais uma dependência.
+
+## Erros, logs e SSRF
+
+**Erros.** Nunca devolva stack trace ou mensagem do banco ao cliente. Elas revelam versões, caminhos e nomes de tabela. Responda uma mensagem genérica com um identificador e registre o detalhe no log:
+
+```typescript
+import { randomUUID } from "node:crypto";
+
+app.use((err, req, res, _next) => {
+  const id = randomUUID();
+  req.log?.error({ err, id }, "erro não tratado");
+  res.status(500).json({ erro: "erro interno", id });
+});
+```
+
+**Logs.** Registre eventos de segurança (login falho, acesso negado, troca de senha), mas nunca senhas, tokens, cartões ou documentos. Loggers como o pino têm a opção `redact` para mascarar caminhos como `req.headers.authorization`.
+
+**SSRF.** Se a API busca uma URL informada pelo usuário (uma capa de livro, um webhook), o atacante pode apontar para serviços internos, como `http://169.254.169.254` (metadados da nuvem). Permita só protocolos e hosts conhecidos:
+
+```typescript
+const HOSTS_PERMITIDOS = new Set(["covers.openlibrary.org"]);
+const url = new URL(req.body.capaUrl);
+if (url.protocol !== "https:" || !HOSTS_PERMITIDOS.has(url.hostname)) {
+  res.status(400).json({ erro: "url não permitida" });
+  return;
+}
+const capa = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(5000) });
+```
+
+## Na entrevista
+
+**Como você previne SQL injection?** Consultas parametrizadas sempre; para partes que não aceitam parâmetro (coluna, direção de ordenação), lista fixa de valores permitidos.
+
+**O que é IDOR e como evitar?** Acessar um recurso alheio trocando o identificador. Evita-se verificando a posse ou permissão em toda rota, idealmente incluindo o dono no próprio filtro da consulta.
+
+**Como guardar senhas?** Com algoritmo lento e salt único por senha (Argon2id, scrypt ou bcrypt), comparando em tempo constante. Nunca com hash rápido ou criptografia reversível.
+
+**Um segredo foi commitado. O que fazer?** Revogar e rotacionar imediatamente; depois limpar o histórico se for o caso. Reescrever o histórico sozinho não resolve.
+
+## Pratique
+
+Faça uma auditoria de segurança numa API sua (ou na API de livros) e entregue um relatório curto com correções:
+
+1. Procure concatenação em consultas (`grep` por crases e `+` perto de `query`) e troque por parâmetros.
+2. Adicione schemas `.strict()` em todas as rotas que recebem corpo.
+3. Escreva testes de IDOR: para cada rota com `:id`, o usuário A não acessa o recurso de B.
+4. Configure `helmet`, CORS restrito, limite de corpo e rate limit no login.
+5. Rode `npm audit --omit=dev` e resolva o que for alto ou crítico.
+6. Troque o hash de senha por scrypt ou Argon2id, se ainda não for.
+
+Entregue um `SECURITY.md` com uma tabela: risco, onde estava, como foi corrigido e o teste que comprova.
+
+<Quiz question="Qual é a forma correta de usar um termo de busca vindo da query numa consulta SQL?" options={["Escapar aspas com replace antes de concatenar","Passar como parâmetro posicional, como $1 com o valor no array","Validar que o termo não contém a palavra OR","Converter o termo para maiúsculas"]} answer={1} explanation="Parâmetros enviam comando e valor separados, então nenhum valor altera a estrutura da consulta. Filtros de palavras e escapes manuais sempre deixam brechas." />
+<Quiz question="Um usuário logado troca o id na URL e vê o empréstimo de outra pessoa. Qual risco é esse?" options={["Injeção","Falha de controle de acesso (IDOR)","Falha criptográfica","SSRF"]} answer={1} explanation="A rota checa a autenticação, mas não se o recurso pertence ao usuário. A correção é incluir o dono no filtro ou verificar a permissão." />
+<Quiz question="Por que usar execFile em vez de exec ao chamar um programa com dado do usuário?" options={["execFile é mais rápido","execFile não passa por um shell, então metacaracteres como ponto e vírgula não viram comandos","exec não funciona no Linux","execFile valida o nome do arquivo sozinho"]} answer={1} explanation="Sem shell, cada argumento é entregue literalmente ao programa, eliminando a injeção de comandos pelo shell." />
+
+## Base no CodeForge
+
+- [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas), [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao) e [RBAC](/learn/system-design/rbac): os fundamentos de autenticação e permissões.
+- [Rate limiting](/learn/system-design/rate-limiting) e [Gestão de segredos](/learn/system-design/gestao-de-segredos): os algoritmos e as práticas em detalhe.
+- [Node.js: Criptografia e tokens JWT](/learn/carreira-nodejs/nodejs-criptografia-tokens-jwt): hashing e tokens na prática.
+- [TypeScript: Desenvolvendo validações e tratando erros](/learn/carreira-nodejs/typescript-desenvolvendo-validacoes-tratando-erros): validação de entrada com Zod a fundo.
+
+## Referências
+
+- [OWASP Top 10](https://owasp.org/Top10/)
+- [Node.js Security Cheat Sheet (OWASP)](https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html)
+- [Security best practices (Node.js)](https://nodejs.org/en/learn/getting-started/security-best-practices)
+- [Production best practices: security (Express)](https://expressjs.com/en/advanced/best-practice-security.html)

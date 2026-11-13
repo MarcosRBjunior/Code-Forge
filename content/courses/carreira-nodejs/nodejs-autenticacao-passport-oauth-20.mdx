@@ -1,0 +1,332 @@
+---
+title: "Node.js: Autenticação, Passport e OAuth 2.0"
+kind: lesson
+---
+
+Login com e-mail e senha é só uma das formas de entrar. Usuários esperam o botão "Entrar com Google" ou "Entrar com GitHub", e outras aplicações vão querer acessar a sua API em nome de alguém, sem nunca ver a senha dessa pessoa. O protocolo por trás disso é o OAuth 2.0, e no ecossistema Express a biblioteca que organiza as várias formas de autenticação é o Passport. Neste capítulo você entende o fluxo OAuth peça por peça e implementa, na API de livros, login local, login com Google e proteção de rotas por JWT, tudo com estratégias do Passport.
+
+**Você vai aprender:**
+
+- Os papéis e o fluxo Authorization Code do OAuth 2.0, com `state` e PKCE
+- A diferença entre OAuth 2.0 (autorização) e OpenID Connect (identidade)
+- Como o Passport organiza estratégias, sessão e `req.user`
+- Implementar login local, login social com Google e rotas protegidas por JWT
+- Vincular contas sociais a usuários existentes com segurança
+
+## O problema que o OAuth resolve
+
+Antes do OAuth, para um aplicativo ler sua agenda do Google, você dava a ele sua senha do Google. O aplicativo passava a ter acesso total, para sempre, e a única forma de revogar era trocar a senha. O OAuth 2.0 troca isso por **tokens de acesso delegados**: limitados em escopo, com validade, revogáveis, e obtidos sem que o aplicativo veja a senha.
+
+Os quatro papéis:
+
+| Papel | Quem é | No exemplo |
+|---|---|---|
+| Resource owner | A pessoa dona dos dados | Você |
+| Client | A aplicação que quer acesso | A API de livros |
+| Authorization server | Quem autentica e emite tokens | `accounts.google.com` |
+| Resource server | A API que guarda os dados | APIs do Google |
+
+## O fluxo Authorization Code
+
+É o fluxo recomendado para aplicações com back-end, e o único que você deve usar em aplicações novas (com PKCE, inclusive em apps móveis e SPAs).
+
+```text
+1. Navegador -> API:    GET /auth/google
+2. API -> Navegador:    302 para accounts.google.com/o/oauth2/v2/auth
+                          ?client_id=...&redirect_uri=.../callback
+                          &response_type=code&scope=openid email profile
+                          &state=XYZ&code_challenge=...&code_challenge_method=S256
+3. Pessoa faz login no Google e consente
+4. Google -> Navegador: 302 para /auth/google/callback?code=ABC&state=XYZ
+5. API confere state, e troca o code no servidor:
+   POST oauth2.googleapis.com/token  (code, client_secret, code_verifier)
+6. Google -> API:       access_token, id_token, (refresh_token)
+7. API identifica ou cria o usuário e abre a sessão dela
+```
+
+Pontos que caem em entrevista:
+
+- **O `code` vai pelo navegador, o token não.** A troca do código pelo token acontece de servidor para servidor, com o `client_secret`. Quem intercepta o redirecionamento só vê um código de uso único e curta duração.
+- **`state`** é um valor aleatório gerado no passo 2 e conferido no passo 5. Ele impede CSRF no login: sem ele, um atacante faz você terminar o fluxo com o código dele e entrar na conta errada.
+- **PKCE** (Proof Key for Code Exchange): o cliente gera um segredo (`code_verifier`), envia só o hash (`code_challenge`) no passo 2 e o original no passo 5. Quem roubar o código não consegue trocá-lo. É obrigatório para clientes públicos e recomendado para todos.
+- **`redirect_uri`** precisa estar cadastrada exatamente no provedor. Isso impede que o código seja enviado para um domínio do atacante.
+
+## OAuth 2.0 e OpenID Connect
+
+OAuth 2.0 é um protocolo de **autorização**: o `access_token` diz o que o cliente pode fazer, não quem é a pessoa. Usar OAuth puro para login é um abuso do protocolo que levou a falhas reais.
+
+O **OpenID Connect (OIDC)** é uma camada sobre o OAuth 2.0 para **autenticação**. Pedindo o escopo `openid`, o provedor devolve também um `id_token`, um JWT assinado com quem é a pessoa (`sub`, `email`, `email_verified`, `name`). Quando você implementa "Entrar com Google", está usando OIDC, mesmo que a biblioteca chame de OAuth.
+
+| | OAuth 2.0 | OpenID Connect |
+|---|---|---|
+| Responde | O que o cliente pode acessar | Quem é a pessoa |
+| Token principal | `access_token` | `id_token` (JWT) |
+| Uso | Acessar APIs em nome do usuário | Login |
+
+## Passport: estratégias plugáveis
+
+O Passport é um middleware de autenticação para Express. Ele não sabe nada sobre senhas ou Google: cada forma de autenticar é uma **estratégia** instalada à parte (são centenas). Todas seguem o mesmo contrato:
+
+1. Você registra a estratégia com `passport.use(new Estrategia(opcoes, verificar))`.
+2. A função `verificar` recebe as credenciais (ou o perfil do provedor) e chama `done(erro, usuario)`.
+3. Na rota, `passport.authenticate("nome")` executa a estratégia. Se der certo, o usuário fica em `req.user`.
+
+```bash
+npm install passport passport-local passport-jwt passport-google-oauth20 express-session
+```
+
+### Estratégia local
+
+```javascript
+// src/auth/passport.js
+import passport from "passport";
+import { Strategy as LocalStrategy } from "passport-local";
+import { Usuario } from "../models/Usuario.js";
+import { verificarSenha } from "../seguranca/senha.js";
+
+passport.use(
+  new LocalStrategy({ usernameField: "email", passwordField: "senha", session: false }, async (email, senha, done) => {
+    try {
+      const usuario = await Usuario.scope("comSenha").findOne({ where: { email: email.toLowerCase() } });
+      if (!usuario || !usuario.senhaHash || !(await verificarSenha(senha, usuario.senhaHash))) {
+        return done(null, false, { message: "E-mail ou senha inválidos" });
+      }
+      return done(null, usuario);
+    } catch (erro) {
+      return done(erro);
+    }
+  }),
+);
+```
+
+`done(null, false)` significa "credenciais erradas", diferente de `done(erro)`, que é falha do sistema (banco fora). Repare em `!usuario.senhaHash`: usuários que só entram pelo Google não têm senha.
+
+```javascript
+// src/routes/auth.js
+import { Router } from "express";
+import passport from "passport";
+import { emitirToken } from "../seguranca/tokens.js";
+
+export const authRouter = Router();
+
+authRouter.post("/login", passport.authenticate("local", { session: false, failWithError: true }), (req, res) => {
+  res.json({ tokenAcesso: emitirToken(req.user) });
+});
+```
+
+Com `failWithError: true`, a falha vira um erro 401 que segue para o middleware de erro, em vez da resposta padrão em texto puro.
+
+### Estratégia JWT para proteger a API
+
+```javascript
+import { Strategy as JwtStrategy, ExtractJwt } from "passport-jwt";
+import { config } from "../config/env.js";
+
+passport.use(
+  new JwtStrategy(
+    {
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      secretOrKey: config.JWT_SECRET,
+      algorithms: ["HS256"],
+      issuer: "api-livros",
+      audience: "app-livros",
+    },
+    async (payload, done) => {
+      try {
+        const usuario = await Usuario.findByPk(payload.sub);
+        if (!usuario || !usuario.ativo) return done(null, false);
+        return done(null, usuario);
+      } catch (erro) {
+        return done(erro);
+      }
+    },
+  ),
+);
+
+export const autenticarJwt = passport.authenticate("jwt", { session: false });
+```
+
+```javascript
+livrosRouter.post("/", autenticarJwt, exigir("livros:escrever"), LivroController.criar);
+```
+
+É o mesmo `autenticar` do capítulo anterior, agora como estratégia. A vantagem aparece quando há várias: `passport.authenticate(["jwt", "apikey"], { session: false })` aceita qualquer uma das duas.
+
+## Login com Google
+
+### Configurando o provedor
+
+No Google Cloud Console, crie credenciais do tipo **ID do cliente OAuth** para aplicativo da Web, com a URI de redirecionamento `http://localhost:3000/auth/google/callback` (e a de produção depois). Guarde `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET` no `.env`.
+
+### A estratégia
+
+O fluxo OAuth atravessa dois redirecionamentos, e o `state` precisa ser lembrado entre eles. Por isso essa parte usa sessão, mesmo que o resto da API seja só JWT.
+
+```javascript
+// src/app.js
+import session from "express-session";
+import passport from "passport";
+import "./auth/passport.js";
+
+app.use(
+  session({
+    secret: config.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { httpOnly: true, secure: config.NODE_ENV === "production", sameSite: "lax", maxAge: 10 * 60 * 1000 },
+  }),
+);
+app.use(passport.initialize());
+```
+
+Em produção, troque o armazenamento em memória padrão do `express-session` por Redis ou banco (`connect-redis`, `connect-session-sequelize`): o padrão perde tudo ao reiniciar e não funciona com várias instâncias.
+
+```javascript
+// src/auth/passport.js (continuação)
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
+import { vincularOuCriarPorGoogle } from "./contas.js";
+
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: config.GOOGLE_CLIENT_ID,
+      clientSecret: config.GOOGLE_CLIENT_SECRET,
+      callbackURL: `${config.URL_PUBLICA}/auth/google/callback`,
+      state: true,
+      pkce: true,
+    },
+    async (accessToken, refreshToken, perfil, done) => {
+      try {
+        const usuario = await vincularOuCriarPorGoogle(perfil);
+        return done(null, usuario);
+      } catch (erro) {
+        return done(erro);
+      }
+    },
+  ),
+);
+```
+
+`state: true` faz a estratégia gerar o valor aleatório, guardar na sessão e conferir no retorno. `pkce: true` adiciona o `code_challenge` e o `code_verifier`. Você não implementa nada disso à mão, mas precisa saber que está lá.
+
+```javascript
+// src/routes/auth.js (continuação)
+authRouter.get("/google", passport.authenticate("google", { scope: ["openid", "email", "profile"], session: false }));
+
+authRouter.get(
+  "/google/callback",
+  passport.authenticate("google", { session: false, failureRedirect: "/login?erro=google" }),
+  async (req, res) => {
+    const refresh = await emitirRefresh(req.user.id);
+    res.cookie("refresh", refresh, { httpOnly: true, secure: true, sameSite: "lax", path: "/auth" });
+    res.redirect(`${config.URL_FRONT}/entrar/concluido`);
+  },
+);
+```
+
+Depois do callback a API não precisa mais de sessão: emite seu próprio refresh token num cookie `HttpOnly`, e o front chama `/auth/renovar` para obter o token de acesso. O token do Google não é repassado ao front; ele pertence à integração com o Google, não à sua API.
+
+### Vinculando contas
+
+Com mais de uma forma de login, a mesma pessoa pode chegar por caminhos diferentes. Uma tabela de identidades externas resolve:
+
+```javascript
+// src/auth/contas.js
+// Identidade: { provedor: "google", idExterno: "1098...", usuarioId }
+import { Usuario } from "../models/Usuario.js";
+import { Identidade } from "../models/Identidade.js";
+import { sequelize } from "../database/index.js";
+
+export async function vincularOuCriarPorGoogle(perfil) {
+  const idExterno = perfil.id;
+  const email = perfil.emails?.[0]?.value?.toLowerCase();
+  const verificado = perfil.emails?.[0]?.verified === true || perfil._json?.email_verified === true;
+
+  return sequelize.transaction(async (t) => {
+    const identidade = await Identidade.findOne({ where: { provedor: "google", idExterno }, transaction: t });
+    if (identidade) return Usuario.findByPk(identidade.usuarioId, { transaction: t });
+
+    if (!email || !verificado) throw new Error("O Google não confirmou o e-mail desta conta");
+
+    let usuario = await Usuario.findOne({ where: { email }, transaction: t });
+    if (!usuario) {
+      usuario = await Usuario.create({ nome: perfil.displayName, email, senhaHash: null }, { transaction: t });
+    }
+    await Identidade.create({ provedor: "google", idExterno, usuarioId: usuario.id }, { transaction: t });
+    return usuario;
+  });
+}
+```
+
+A busca é **primeiro pelo id do provedor** (`sub`), que nunca muda, e só depois pelo e-mail. O e-mail pode mudar, e o mesmo endereço pode ser reaproveitado. Para `senhaHash: null` funcionar, a coluna precisa aceitar nulo, diferente do capítulo anterior.
+
+<Callout type="warning" title="Vincular por e-mail não verificado">
+Juntar a conta social a uma conta existente só porque o e-mail bate é perigoso se o provedor não garantiu que o e-mail pertence à pessoa. Um atacante cria uma conta num provedor com o seu e-mail, sem confirmar, faz login social e herda sua conta. Só vincule automaticamente quando o provedor afirma `email_verified`, e mesmo assim muitas aplicações preferem pedir a senha atual antes de juntar as contas.
+</Callout>
+
+## Sessão com Passport
+
+Se o seu cliente for um site renderizado no servidor, sessão com cookie é mais simples que JWT. O Passport guarda o usuário na sessão com `serializeUser` e reconstrói em cada requisição com `deserializeUser`.
+
+```javascript
+passport.serializeUser((usuario, done) => done(null, usuario.id));
+passport.deserializeUser(async (id, done) => {
+  try {
+    done(null, await Usuario.findByPk(id));
+  } catch (erro) {
+    done(erro);
+  }
+});
+
+app.use(passport.session()); // depois de session() e passport.initialize()
+
+app.post("/login", passport.authenticate("local", { successRedirect: "/", failureRedirect: "/login" }));
+app.post("/logout", (req, res, next) => {
+  req.logout((erro) => (erro ? next(erro) : res.redirect("/")));
+});
+```
+
+Guarde só o id na sessão, nunca o objeto inteiro. Desde a versão 0.6, `req.logout` exige um callback, e o Passport regenera o id da sessão no login, o que previne fixação de sessão.
+
+## Sua API como provedor
+
+Este capítulo usou o Google como servidor de autorização. Se outras empresas forem acessar a **sua** API em nome dos seus usuários, você precisa ser o servidor de autorização. Não implemente do zero: use um produto pronto (Keycloak, Auth0, Cognito, Microsoft Entra ID) ou uma biblioteca certificada como `oidc-provider`. A especificação tem muitos detalhes de segurança que só aparecem quando alguém os explora.
+
+## Na entrevista
+
+**Explique o fluxo Authorization Code.** O cliente redireciona a pessoa ao servidor de autorização com `client_id`, escopos, `redirect_uri`, `state` e o desafio PKCE. Após login e consentimento, o servidor redireciona de volta com um código. O back-end confere o `state` e troca o código, com o segredo e o verificador PKCE, por tokens, numa chamada direta de servidor para servidor.
+
+**Para que serve o state? E o PKCE?** O `state` protege contra CSRF no retorno do fluxo, ligando a resposta à requisição que você iniciou. O PKCE impede que um código interceptado seja trocado por tokens, porque só quem gerou o verificador original consegue completar a troca.
+
+**OAuth 2.0 é autenticação?** Não. É autorização delegada. Para autenticação usa-se OpenID Connect, que acrescenta o `id_token` com a identidade da pessoa.
+
+**O que o Passport faz?** Padroniza autenticação no Express por meio de estratégias plugáveis. Cada estratégia valida um tipo de credencial e entrega o usuário em `req.user`, e o Passport cuida de sessão e redirecionamentos.
+
+## Pratique
+
+Na API de livros, entregue:
+
+1. Estratégias `local` e `jwt` do Passport substituindo o login e o middleware manuais.
+2. Login com Google com `state` e PKCE, criando o usuário na primeira vez e emitindo refresh token em cookie `HttpOnly`.
+3. Tabela `identidades` com vínculo por `sub` e regra de e-mail verificado.
+4. Um segundo provedor (GitHub com `passport-github2`) reaproveitando a mesma lógica de vínculo.
+5. No README, um diagrama de sequência em texto do fluxo, marcando onde ficam `state`, `code`, `code_verifier` e o segredo do cliente.
+
+<Quiz question="Por que a troca do code pelo token acontece no servidor e não no navegador?" options={["Porque o navegador não faz POST","Porque exige o client_secret, que não pode ir ao navegador","Porque o code expira mais rápido no navegador","Porque o Google bloqueia CORS"]} answer={1} explanation="A troca exige o segredo do cliente, que fica só no servidor. Assim o navegador só vê um código de uso único e curta duração." />
+
+<Quiz question="Qual ataque o parâmetro state previne no fluxo OAuth?" options={["Roubo do client_secret","CSRF no retorno do login","Força bruta de senha","Replay do id_token"]} answer={1} explanation="O state liga o retorno à requisição iniciada pelo próprio usuário. Sem ele, um atacante pode fazer a vítima concluir o fluxo com o código dele." />
+
+<Quiz question="Ao receber um login do Google, qual chave usar primeiro para achar o usuário?" options={["O e-mail informado no perfil","O nome de exibição","O id do provedor (sub)","O access_token"]} answer={2} explanation="O sub é estável e único no provedor. E-mails mudam e podem ser reaproveitados, então servem só como segundo critério, e apenas se verificados." />
+
+## Base no CodeForge
+
+- [OAuth 2.0](/learn/system-design/oauth2) e [SSO](/learn/system-design/sso): a visão de arquitetura do mesmo fluxo.
+- [Sessão vs token](/learn/system-design/sessao-vs-token): quando usar `passport.session` e quando JWT.
+- [Node.js: Criando API Rest com autenticação, perfis de usuários e permissões](/learn/carreira-nodejs/nodejs-criando-api-rest-autenticacao-perfis-usuarios): os perfis, permissões e refresh tokens reaproveitados aqui.
+
+## Referências
+
+- [Passport: Authentication](https://www.passportjs.org/concepts/authentication/)
+- [passport-google-oauth20](https://www.passportjs.org/packages/passport-google-oauth20/)
+- [RFC 6749: OAuth 2.0](https://datatracker.ietf.org/doc/html/rfc6749)
+- [OAuth.net: PKCE](https://oauth.net/2/pkce/)

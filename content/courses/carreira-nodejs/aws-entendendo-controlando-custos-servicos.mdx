@@ -1,0 +1,259 @@
+---
+title: "AWS: Entendendo e controlando os custos dos serviços"
+kind: lesson
+---
+
+Na AWS você paga pelo que fica ligado, pelo que armazena e pelo que trafega, e a conta chega no fim do mês. Isso é ótimo para começar barato e péssimo quando alguém esquece um NAT Gateway ligado ou um banco grande num ambiente de teste. Entender como cada serviço cobra e montar alertas antes de precisar deles é parte do trabalho de quem faz deploy: em muitas empresas, o dev que sobe o serviço também responde pelo custo dele.
+
+**Você vai aprender:**
+
+- As dimensões de cobrança que aparecem em quase todo serviço (tempo, armazenamento, requisições, transferência)
+- Os modelos de compra de computação: sob demanda, Savings Plans, instâncias reservadas e Spot
+- Como estimar antes de criar, com a calculadora oficial
+- Como criar orçamentos, tags de custo e detecção de anomalias
+- Como consultar e reduzir custos com a CLI e o SDK em Node.js
+
+## Como a AWS cobra
+
+Os preços mudam por região, por geração de instância e com o tempo, então não decore valores. Decore as **dimensões**, que são estáveis. Quase todo serviço combina algumas destas:
+
+| Dimensão | Exemplos |
+|---|---|
+| Tempo ligado (por segundo ou hora) | EC2, RDS, NAT Gateway, ALB, tarefas Fargate (vCPU e memória) |
+| Capacidade provisionada | Volume EBS por GB-mês, IOPS provisionadas, RDS storage |
+| Armazenamento usado | S3 por GB-mês, snapshots, logs no CloudWatch |
+| Requisições ou execuções | Lambda, API Gateway, S3 (GET e PUT), DynamoDB sob demanda |
+| Transferência de dados | Saída para a internet, entre regiões, entre zonas de disponibilidade |
+| Processamento | NAT Gateway e ALB por dados processados, CloudWatch Logs por ingestão |
+
+Algumas consequências práticas que pegam iniciantes:
+
+- **Entrada é quase sempre grátis, saída não.** Dados que saem da AWS para a internet são cobrados por GB. Uma API que serve arquivos grandes direto do EC2 paga mais que uma que usa CloudFront na frente.
+- **Tráfego entre zonas tem custo.** Uma API na zona `a` falando com um banco na zona `b` paga por GB nos dois sentidos. Alta disponibilidade tem esse preço embutido.
+- **Coisas paradas também custam.** Uma instância parada não cobra computação, mas o volume EBS dela continua cobrando. Um IP público IPv4 é cobrado por hora, esteja ou não em uso.
+- **Logs crescem sem ninguém ver.** Cada `console.log` da API vira ingestão e armazenamento no CloudWatch. Defina retenção nos grupos de log; o padrão é guardar para sempre.
+
+O nível gratuito (free tier) existe, mas as regras mudaram ao longo dos anos e variam por tipo de conta. Confira a página oficial antes de assumir que algo é grátis.
+
+## Modelos de compra para computação
+
+Para EC2, Fargate e Lambda, o mesmo recurso pode ter preços bem diferentes conforme o compromisso que você assume:
+
+| Modelo | Como funciona | Quando usar |
+|---|---|---|
+| Sob demanda | Paga pelo uso, sem compromisso | Cargas novas, imprevisíveis ou temporárias |
+| Savings Plans | Compromisso de gasto por hora durante 1 ou 3 anos, com desconto | Base estável de computação, mesmo mudando tipo de instância ou indo para Fargate |
+| Instâncias reservadas | Compromisso com um tipo de instância (EC2) ou de banco (RDS) | Bancos RDS de produção, que raramente mudam de tamanho |
+| Spot | Capacidade ociosa com grande desconto, pode ser interrompida com aviso de 2 minutos | Workers de fila, processamento em lote, CI, réplicas extras de um ASG |
+
+A estratégia comum é cobrir a carga mínima (o `min-size` do Auto Scaling, por exemplo) com Savings Plans e deixar os picos sob demanda ou Spot. Spot exige que a aplicação aguente ser interrompida: um worker que consome uma fila e só confirma a mensagem depois de processar é um bom candidato; um banco não é.
+
+## Estime antes de criar
+
+A **AWS Pricing Calculator** monta uma estimativa mensal a partir da arquitetura: você adiciona serviços, informa região, quantidade, horas ligadas e volume de dados, e ela mostra o total e o detalhamento. Para a API de livros com ALB, duas instâncias, RDS Multi-AZ e NAT Gateway, faça o exercício de colocar cada item e observe quais dominam. Em contas pequenas, é comum o NAT Gateway e o RDS Multi-AZ superarem a computação.
+
+Salve o link da estimativa no README do projeto. Ele vira a referência para comparar com a fatura real.
+
+## Orçamentos e alertas
+
+O primeiro passo em qualquer conta nova é criar um **budget**. Ele não bloqueia gastos, só avisa, mas avisa cedo: você pode alertar quando o gasto **previsto** para o mês passar de um percentual do limite.
+
+```bash
+cat > budget.json <<'EOF'
+{
+  "BudgetName": "conta-estudos",
+  "BudgetLimit": { "Amount": "20", "Unit": "USD" },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}
+EOF
+
+cat > notificacoes.json <<'EOF'
+[
+  {
+    "Notification": {
+      "NotificationType": "FORECASTED",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 80,
+      "ThresholdType": "PERCENTAGE"
+    },
+    "Subscribers": [{ "SubscriptionType": "EMAIL", "Address": "voce@exemplo.com" }]
+  },
+  {
+    "Notification": {
+      "NotificationType": "ACTUAL",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 100,
+      "ThresholdType": "PERCENTAGE"
+    },
+    "Subscribers": [{ "SubscriptionType": "EMAIL", "Address": "voce@exemplo.com" }]
+  }
+]
+EOF
+
+CONTA=$(aws sts get-caller-identity --query Account --output text)
+aws budgets create-budget --account-id "$CONTA" \
+  --budget file://budget.json \
+  --notifications-with-subscribers file://notificacoes.json
+```
+
+O valor de 20 dólares é o **seu** limite, não um preço. Escolha o que faz sentido para você.
+
+Complementos úteis:
+
+- **Cost Anomaly Detection:** aprende o padrão de gasto por serviço e avisa quando algo foge dele, como um dia com dez vezes mais transferência de dados.
+- **Budget actions:** um budget pode aplicar uma política IAM que impede criar recursos novos ao atingir o limite. Use com cuidado em produção.
+
+```bash
+aws ce create-anomaly-monitor --anomaly-monitor \
+  '{"MonitorName":"por-servico","MonitorType":"DIMENSIONAL","MonitorDimension":"SERVICE"}'
+```
+
+## Tags de alocação de custo
+
+Na fatura, "EC2: X dólares" não diz qual projeto gastou. **Tags** resolvem isso: marque todo recurso com chaves padronizadas (`projeto`, `ambiente`, `time`) e ative essas chaves como tags de alocação de custo. A partir daí, o Cost Explorer agrupa por elas.
+
+```bash
+aws ec2 create-tags --resources i-0abc123def4567890 \
+  --tags Key=projeto,Value=livros Key=ambiente,Value=dev
+
+aws ce update-cost-allocation-tags-status \
+  --cost-allocation-tags-status TagKey=projeto,Status=Active TagKey=ambiente,Status=Active
+```
+
+As tags só passam a valer para custos registrados depois da ativação, e podem levar até um dia para aparecer. Por isso, defina o padrão de tags no primeiro dia e aplique-o pelo Terraform (o provider AWS aceita `default_tags`, que marca tudo automaticamente).
+
+## Consultando custos com a CLI e com Node.js
+
+O **Cost Explorer** mostra gráficos por serviço, região, tag e período no console. A mesma informação está na API, útil para relatórios automáticos. Cada chamada da API do Cost Explorer é cobrada, então consulte com moderação (uma vez por dia num job é suficiente).
+
+```bash
+aws ce get-cost-and-usage \
+  --time-period Start=2026-10-01,End=2026-11-01 \
+  --granularity MONTHLY --metrics UnblendedCost \
+  --group-by Type=DIMENSION,Key=SERVICE \
+  --query 'ResultsByTime[0].Groups[].[Keys[0],Metrics.UnblendedCost.Amount]' \
+  --output table
+```
+
+Um script em Node.js com o SDK v3 que lista os cinco serviços mais caros do mês corrente:
+
+```javascript
+// scripts/top-custos.js
+import {
+  CostExplorerClient,
+  GetCostAndUsageCommand,
+} from "@aws-sdk/client-cost-explorer";
+
+const ce = new CostExplorerClient({ region: "us-east-1" });
+const hoje = new Date();
+const inicio = new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth(), 1));
+const fmt = (d) => d.toISOString().slice(0, 10);
+
+const resposta = await ce.send(
+  new GetCostAndUsageCommand({
+    TimePeriod: { Start: fmt(inicio), End: fmt(hoje) },
+    Granularity: "MONTHLY",
+    Metrics: ["UnblendedCost"],
+    GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }],
+  }),
+);
+
+const linhas = resposta.ResultsByTime[0].Groups.map((g) => ({
+  servico: g.Keys[0],
+  usd: Number(g.Metrics.UnblendedCost.Amount),
+}))
+  .sort((a, b) => b.usd - a.usd)
+  .slice(0, 5);
+
+console.table(linhas.map((l) => ({ ...l, usd: l.usd.toFixed(2) })));
+```
+
+No primeiro dia do mês, `Start` e `End` seriam iguais e a API rejeita o intervalo; num script de verdade, trate esse caso consultando o mês anterior.
+
+## Onde cortar
+
+Depois de ver o que custa, a redução segue uma ordem de impacto:
+
+1. **Apague o que não é usado.** Volumes EBS soltos, IPs elásticos sem associação, snapshots antigos, load balancers de testes.
+2. **Desligue fora do horário.** Ambientes de desenvolvimento não precisam rodar à noite e no fim de semana.
+3. **Dimensione certo.** O Compute Optimizer analisa o uso de CPU e memória e sugere tipos menores. Instâncias Graviton (ARM) costumam ter melhor custo por desempenho e rodam Node.js sem mudanças.
+4. **Compre com compromisso** o que sobrou de estável (Savings Plans).
+5. **Revise a arquitetura:** gateway endpoints no lugar de NAT para S3 e DynamoDB, CloudFront na frente de conteúdo estático, retenção de logs.
+
+```bash
+# volumes sem instância
+aws ec2 describe-volumes --filters Name=status,Values=available \
+  --query 'Volumes[].[VolumeId,Size,CreateTime]' --output table
+
+# IPs elásticos sem associação
+aws ec2 describe-addresses \
+  --query 'Addresses[?AssociationId==null].[PublicIp,AllocationId]' --output table
+```
+
+Para desligar o ambiente de dev à noite, uma função agendada pelo EventBridge Scheduler resolve:
+
+```javascript
+// lambda/parar-dev.js
+import {
+  EC2Client,
+  DescribeInstancesCommand,
+  StopInstancesCommand,
+} from "@aws-sdk/client-ec2";
+
+const ec2 = new EC2Client({});
+
+export async function handler() {
+  const { Reservations = [] } = await ec2.send(
+    new DescribeInstancesCommand({
+      Filters: [
+        { Name: "tag:ambiente", Values: ["dev"] },
+        { Name: "instance-state-name", Values: ["running"] },
+      ],
+    }),
+  );
+  const ids = Reservations.flatMap((r) => r.Instances.map((i) => i.InstanceId));
+  if (ids.length > 0) await ec2.send(new StopInstancesCommand({ InstanceIds: ids }));
+  return { paradas: ids };
+}
+```
+
+<Callout type="warning" title="Recursos esquecidos em outra região">
+O console mostra uma região por vez. É comum testar algo em `us-east-1`, voltar para `sa-east-1` e esquecer um NAT Gateway ou um cluster ligado do outro lado. O Cost Explorer agrupado por região denuncia isso, e o budget com alerta de previsão avisa antes do fim do mês. Ao terminar qualquer experimento, rode o destroy (ou apague a stack) no mesmo dia.
+</Callout>
+
+## Na entrevista
+
+**Como você reduziria a conta de AWS de um serviço?** Primeiro mediria com Cost Explorer por serviço e por tag. Depois atacaria na ordem: recursos ociosos, desligar fora do horário, dimensionamento correto, compromisso de uso (Savings Plans) e mudanças de arquitetura.
+
+**Quando usar Spot?** Para cargas que toleram interrupção: workers de fila idempotentes, batch, CI, instâncias extras de um Auto Scaling group. Nunca como única capacidade de algo com estado.
+
+**Por que o NAT Gateway pesa tanto na fatura?** Cobra por hora e por GB processado. Tráfego de S3 ou DynamoDB pode sair por gateway endpoints, que não têm esse custo.
+
+## Pratique
+
+Crie, na sua conta de estudos:
+
+1. Um budget mensal com alerta de previsão em 80% e alerta real em 100%.
+2. Um monitor de anomalias por serviço.
+3. As tags `projeto` e `ambiente` ativadas como tags de alocação de custo, aplicadas a tudo que você criar a partir de agora.
+4. O script `top-custos.js` rodando num GitHub Actions agendado (cron diário) que publica a tabela no resumo do job.
+
+Entregue o repositório com o workflow, o JSON do budget e uma estimativa da Pricing Calculator para a API de livros, comparada com o custo real de uma semana.
+
+<Quiz question="Uma instância EC2 parada continua gerando qual custo?" options={["Computação por hora","Volume EBS anexado a ela","Transferência de dados de entrada","Nenhum custo enquanto parada"]} answer={1} explanation="Parada, a instância não cobra computação, mas o volume EBS continua sendo cobrado por GB-mês." />
+<Quiz question="Qual modelo de compra combina melhor com workers de fila idempotentes?" options={["Instâncias reservadas por 3 anos","Hosts dedicados","Instâncias Spot","Savings Plans de 3 anos"]} answer={2} explanation="Spot tem grande desconto e pode ser interrompido. Workers idempotentes reprocessam a mensagem sem problema." />
+<Quiz question="O que um AWS Budget faz por padrão ao atingir o limite?" options={["Envia notificação aos assinantes configurados","Desliga todos os recursos da conta","Bloqueia a criação de novas instâncias","Converte recursos para o modelo Spot"]} answer={0} explanation="Budgets avisam. Bloquear exige configurar budget actions explicitamente." />
+
+## Base no CodeForge
+
+- [Amazon VPC: Configurando redes na AWS](/learn/carreira-nodejs/amazon-vpc-configurando-redes-aws): onde estão o NAT Gateway e os endpoints que pesam na conta.
+- [Amazon EC2: Alta disponibilidade e escalabilidade](/learn/carreira-nodejs/amazon-ec2-alta-disponibilidade-escalabilidade-aplicacao): o Auto Scaling que define a carga mínima.
+- [Serverless](/learn/system-design/serverless): o modelo de pagar por execução.
+
+## Referências
+
+- [AWS Pricing Calculator](https://calculator.aws/)
+- [Managing your costs with AWS Budgets](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html)
+- [Analyzing your costs with AWS Cost Explorer](https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html)
+- [Using cost allocation tags](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/cost-alloc-tags.html)

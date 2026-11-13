@@ -1,0 +1,374 @@
+---
+title: "Node.js: Continue seu projeto full stack criando uma API com Express"
+kind: lesson
+---
+
+No capítulo anterior, a Estante ganhou uma interface em React com livros guardados num arquivo do próprio front-end. Isso não serve para um produto: os favoritos somem ao recarregar a página e cada navegador tem a sua cópia dos dados. Agora você cria a API que passa a ser a fonte da verdade, com Express 5, persistência em arquivo JSON e uma arquitetura em camadas que permite trocar o arquivo por um banco depois sem reescrever as rotas.
+
+**Você vai aprender:**
+
+- Montar o projeto da API e o contrato combinado com o front-end
+- Separar rotas, controllers e serviços, e por que cada camada existe
+- Ler e gravar dados em arquivo JSON com `fs/promises` sem corromper o arquivo
+- Validar entradas e responder com os códigos HTTP certos
+- Liberar o acesso do front-end com CORS
+
+## O contrato
+
+O front-end já definiu o que precisa. Antes de escrever qualquer linha da API, fixe o contrato:
+
+| Rota | Resposta de sucesso | Erros |
+|---|---|---|
+| `GET /livros` | 200, array de livros | |
+| `GET /livros/:id` | 200, um livro | 404 |
+| `POST /livros` | 201, livro criado | 400 |
+| `PATCH /livros/:id` | 200, livro alterado | 400, 404 |
+| `DELETE /livros/:id` | 204 | 404 |
+| `GET /favoritos` | 200, array de livros favoritos | |
+| `POST /favoritos/:id` | 201, livro favoritado | 404, 409 |
+| `DELETE /favoritos/:id` | 204 | 404 |
+
+Formato de um livro (o mesmo do arquivo `dados/livros.js` do front):
+
+```json
+{ "id": "1", "titulo": "Dom Casmurro", "autor": "Machado de Assis", "ano": 1899, "capa": "/capas/dom-casmurro.jpg" }
+```
+
+Formato de erro, igual em todas as rotas:
+
+```json
+{ "mensagem": "Livro não encontrado" }
+```
+
+## Estrutura do projeto
+
+```bash
+mkdir estante-api && cd estante-api
+npm init -y
+npm pkg set type=module
+npm pkg set scripts.dev="node --watch src/server.js"
+npm pkg set scripts.start="node src/server.js"
+npm install express cors
+```
+
+```text
+estante-api/
+  dados/
+    livros.json
+    favoritos.json
+  src/
+    servicos/armazenamento.js
+    servicos/livrosServico.js
+    servicos/favoritosServico.js
+    controladores/livrosControlador.js
+    controladores/favoritosControlador.js
+    rotas/livros.js
+    rotas/favoritos.js
+    erros.js
+    app.js
+    server.js
+```
+
+Cada camada tem um trabalho:
+
+- **Rotas** dizem qual URL e verbo chamam qual controlador. Nada de lógica.
+- **Controladores** falam HTTP: leem `req.params` e `req.body`, chamam o serviço e escolhem o status da resposta.
+- **Serviços** têm a regra de negócio e o acesso aos dados. Não sabem que existe HTTP.
+
+A vantagem aparece quando algo muda. Trocar o arquivo JSON por MongoDB mexe só nos serviços. Expor a mesma lógica numa fila ou num comando de terminal reaproveita os serviços sem tocar no Express.
+
+## Persistência em arquivo JSON
+
+Para um projeto pequeno, um arquivo JSON é um banco suficiente e didático. Crie `dados/livros.json` com o array de livros do front-end e `dados/favoritos.json` com `[]`.
+
+```javascript
+// src/servicos/armazenamento.js
+import { readFile, writeFile, rename } from "node:fs/promises";
+import path from "node:path";
+
+const PASTA = path.resolve("dados");
+
+export async function ler(nome) {
+  const texto = await readFile(path.join(PASTA, `${nome}.json`), "utf8");
+  return JSON.parse(texto);
+}
+
+export async function gravar(nome, dados) {
+  const destino = path.join(PASTA, `${nome}.json`);
+  const temporario = `${destino}.tmp`;
+  await writeFile(temporario, JSON.stringify(dados, null, 2));
+  await rename(temporario, destino);
+}
+```
+
+A gravação em dois passos (escreve num arquivo temporário e renomeia) é proposital. Se o processo morrer no meio de um `writeFile` direto, o arquivo fica pela metade e o `JSON.parse` falha para sempre. O `rename` troca o arquivo de uma vez, então o arquivo final está sempre inteiro: ou a versão antiga, ou a nova.
+
+## Os serviços
+
+```javascript
+// src/erros.js
+export class ErroHttp extends Error {
+  constructor(status, mensagem) {
+    super(mensagem);
+    this.status = status;
+  }
+}
+```
+
+```javascript
+// src/servicos/livrosServico.js
+import { randomUUID } from "node:crypto";
+import { ler, gravar } from "./armazenamento.js";
+import { ErroHttp } from "../erros.js";
+
+const CAMPOS = ["titulo", "autor", "ano", "capa"];
+
+function validar(dados, { parcial = false } = {}) {
+  const erros = [];
+  const { titulo, autor, ano, capa } = dados;
+
+  if (!parcial || titulo !== undefined) {
+    if (typeof titulo !== "string" || titulo.trim() === "") erros.push("titulo é obrigatório");
+  }
+  if (!parcial || autor !== undefined) {
+    if (typeof autor !== "string" || autor.trim() === "") erros.push("autor é obrigatório");
+  }
+  if (ano !== undefined && (!Number.isInteger(ano) || ano < 0 || ano > new Date().getFullYear())) {
+    erros.push("ano deve ser um inteiro entre 0 e o ano atual");
+  }
+  if (capa !== undefined && typeof capa !== "string") erros.push("capa deve ser texto");
+
+  if (erros.length > 0) throw new ErroHttp(400, erros.join("; "));
+}
+
+function apenasCamposConhecidos(dados) {
+  return Object.fromEntries(Object.entries(dados).filter(([chave]) => CAMPOS.includes(chave)));
+}
+
+export async function listar() {
+  return ler("livros");
+}
+
+export async function buscar(id) {
+  const livros = await ler("livros");
+  const livro = livros.find((l) => l.id === id);
+  if (!livro) throw new ErroHttp(404, "Livro não encontrado");
+  return livro;
+}
+
+export async function criar(dados) {
+  validar(dados ?? {});
+  const livros = await ler("livros");
+  const novo = { id: randomUUID(), ...apenasCamposConhecidos(dados) };
+  await gravar("livros", [...livros, novo]);
+  return novo;
+}
+
+export async function atualizar(id, dados) {
+  validar(dados ?? {}, { parcial: true });
+  const livros = await ler("livros");
+  const indice = livros.findIndex((l) => l.id === id);
+  if (indice === -1) throw new ErroHttp(404, "Livro não encontrado");
+
+  const atualizado = { ...livros[indice], ...apenasCamposConhecidos(dados) };
+  await gravar("livros", livros.with(indice, atualizado));
+  return atualizado;
+}
+
+export async function remover(id) {
+  const livros = await ler("livros");
+  if (!livros.some((l) => l.id === id)) throw new ErroHttp(404, "Livro não encontrado");
+  await gravar("livros", livros.filter((l) => l.id !== id));
+}
+```
+
+Repare em três decisões:
+
+- **O servidor gera o id** com `randomUUID`. O cliente nunca escolhe o id de um recurso novo.
+- **Lista branca de campos.** `apenasCamposConhecidos` descarta qualquer chave extra do corpo. Sem isso, um cliente pode gravar `{"id": "outro", "admin": true}` e sobrescrever o que não devia.
+- **`livros.with(indice, atualizado)`** devolve um novo array com um item trocado, sem alterar o original. É o mesmo cuidado com imutabilidade do front-end.
+
+O serviço de favoritos guarda só os ids e devolve os livros completos:
+
+```javascript
+// src/servicos/favoritosServico.js
+import { ler, gravar } from "./armazenamento.js";
+import { ErroHttp } from "../erros.js";
+
+export async function listar() {
+  const [livros, ids] = await Promise.all([ler("livros"), ler("favoritos")]);
+  return livros.filter((l) => ids.includes(l.id));
+}
+
+export async function adicionar(id) {
+  const [livros, ids] = await Promise.all([ler("livros"), ler("favoritos")]);
+  const livro = livros.find((l) => l.id === id);
+  if (!livro) throw new ErroHttp(404, "Livro não encontrado");
+  if (ids.includes(id)) throw new ErroHttp(409, "Livro já está nos favoritos");
+  await gravar("favoritos", [...ids, id]);
+  return livro;
+}
+
+export async function remover(id) {
+  const ids = await ler("favoritos");
+  if (!ids.includes(id)) throw new ErroHttp(404, "Livro não está nos favoritos");
+  await gravar("favoritos", ids.filter((x) => x !== id));
+}
+```
+
+O 409 Conflict comunica "o pedido é válido, mas conflita com o estado atual". O front pode decidir tratar isso como sucesso silencioso.
+
+## Controladores e rotas
+
+```javascript
+// src/controladores/livrosControlador.js
+import * as servico from "../servicos/livrosServico.js";
+
+export async function listar(req, res) {
+  res.json(await servico.listar());
+}
+
+export async function buscar(req, res) {
+  res.json(await servico.buscar(req.params.id));
+}
+
+export async function criar(req, res) {
+  const livro = await servico.criar(req.body);
+  res.status(201).location(`/livros/${livro.id}`).json(livro);
+}
+
+export async function atualizar(req, res) {
+  res.json(await servico.atualizar(req.params.id, req.body));
+}
+
+export async function remover(req, res) {
+  await servico.remover(req.params.id);
+  res.status(204).end();
+}
+```
+
+```javascript
+// src/rotas/livros.js
+import { Router } from "express";
+import * as controlador from "../controladores/livrosControlador.js";
+
+export const rotasLivros = Router();
+rotasLivros.get("/", controlador.listar);
+rotasLivros.get("/:id", controlador.buscar);
+rotasLivros.post("/", controlador.criar);
+rotasLivros.patch("/:id", controlador.atualizar);
+rotasLivros.delete("/:id", controlador.remover);
+```
+
+Os controladores ficam curtos porque não tratam erros: o Express 5 encaminha qualquer Promise rejeitada para o middleware de erros. O cabeçalho `Location` no 201 indica onde o recurso novo pode ser buscado, uma convenção do HTTP. O controlador e as rotas de favoritos seguem o mesmo molde.
+
+## A aplicação e o CORS
+
+```javascript
+// src/app.js
+import express from "express";
+import cors from "cors";
+import { rotasLivros } from "./rotas/livros.js";
+import { rotasFavoritos } from "./rotas/favoritos.js";
+import { ErroHttp } from "./erros.js";
+
+export const app = express();
+
+app.use(cors({ origin: process.env.ORIGEM_WEB ?? "http://localhost:5173" }));
+app.use(express.json());
+
+app.use("/livros", rotasLivros);
+app.use("/favoritos", rotasFavoritos);
+
+app.use((req, res) => {
+  res.status(404).json({ mensagem: `Rota ${req.method} ${req.path} não existe` });
+});
+
+app.use((erro, req, res, next) => {
+  if (erro instanceof ErroHttp) {
+    return res.status(erro.status).json({ mensagem: erro.message });
+  }
+  if (erro.type === "entity.parse.failed") {
+    return res.status(400).json({ mensagem: "JSON inválido no corpo" });
+  }
+  console.error(erro);
+  res.status(500).json({ mensagem: "Erro interno do servidor" });
+});
+```
+
+```javascript
+// src/server.js
+import { app } from "./app.js";
+
+const porta = process.env.PORT ?? 8000;
+app.listen(porta, () => console.log(`Estante API em http://localhost:${porta}`));
+```
+
+`app.use("/livros", rotasLivros)` monta o roteador sob um prefixo, por isso as rotas lá dentro são `/` e `/:id`.
+
+**CORS** (Cross-Origin Resource Sharing) existe por causa de uma regra de segurança do navegador: uma página em `http://localhost:5173` só pode ler respostas de `http://localhost:8000` (outra porta é outra origem) se o servidor autorizar, com o cabeçalho `Access-Control-Allow-Origin`. O pacote `cors` responde esse cabeçalho e as requisições de verificação prévia (`OPTIONS`) que o navegador faz antes de um `POST` com JSON.
+
+<Callout type="warning" title="CORS não é segurança da API">
+`cors()` sem opções libera qualquer origem, e o erro de CORS só aparece no navegador: curl, Postman ou outro servidor chamam sua API normalmente, com ou sem CORS. Ou seja, CORS não protege seus dados, ele só controla quais sites podem ler as respostas dentro do navegador do usuário. Configure a origem exata do seu front-end e proteja a API de verdade com autenticação, como você vai fazer mais adiante na carreira.
+</Callout>
+
+## Testando a API
+
+```bash
+npm run dev
+
+curl http://localhost:8000/livros
+curl -i -X POST http://localhost:8000/livros \
+  -H "Content-Type: application/json" \
+  -d '{"titulo": "Memórias Póstumas de Brás Cubas", "autor": "Machado de Assis", "ano": 1881}'
+# HTTP/1.1 201 Created
+# Location: /livros/0f5c...
+
+curl -X POST http://localhost:8000/favoritos/1
+curl -X POST http://localhost:8000/favoritos/1     # {"mensagem":"Livro já está nos favoritos"}
+curl http://localhost:8000/favoritos
+curl -X POST http://localhost:8000/livros -H "Content-Type: application/json" -d '{"ano": "abc"}'
+# {"mensagem":"titulo é obrigatório; autor é obrigatório; ano deve ser um inteiro entre 0 e o ano atual"}
+```
+
+Teste os caminhos de erro com o mesmo cuidado que os de sucesso: é por eles que o front-end vai descobrir o que mostrar ao usuário.
+
+## Limites do arquivo JSON
+
+O arquivo JSON tem dois problemas que aparecem com uso real. Primeiro, **concorrência**: duas requisições simultâneas leem o mesmo arquivo, cada uma adiciona um favorito e grava; a segunda gravação apaga a primeira. Segundo, **escala**: cada operação lê e reescreve o arquivo inteiro. Para um projeto pessoal, tudo bem. Para qualquer coisa com mais de um usuário, troque os serviços para usar MongoDB (como nos capítulos anteriores) ou um banco relacional. Como as rotas e os controladores não sabem de onde os dados vêm, a troca fica contida em `servicos/`.
+
+## Na entrevista
+
+- **Por que separar controlador e serviço?** O controlador lida com HTTP (entrada, status, formato da resposta); o serviço com regra de negócio e dados. A separação permite testar regras sem HTTP e trocar a persistência sem mexer nas rotas.
+- **O que é CORS e quem o aplica?** Um mecanismo em que o servidor informa, por cabeçalhos, quais origens podem ler suas respostas. Quem aplica a regra é o navegador; clientes fora do navegador ignoram.
+- **Quando usar 409 Conflict?** Quando a requisição é válida mas conflita com o estado atual do recurso, como duplicar um item único ou editar uma versão desatualizada.
+- **Por que o servidor deve gerar o id?** Para garantir unicidade e evitar que o cliente escolha ou sobrescreva identificadores de outros recursos.
+
+## Pratique
+
+Complete a `estante-api`:
+
+1. Escreva o controlador e as rotas de favoritos.
+2. Adicione `GET /livros?busca=termo`, que filtra por título ou autor ignorando acentos (reaproveite o `normalizar` do front).
+3. Resolva o problema de concorrência da gravação com uma fila simples: uma Promise encadeada por arquivo, para que gravações no mesmo arquivo aconteçam uma depois da outra.
+4. Crie testes com `node:test` para os serviços, usando uma pasta de dados temporária.
+
+Entregue o repositório com README contendo a tabela do contrato e exemplos de curl. No próximo capítulo, o front-end da Estante passa a consumir esta API.
+
+<Quiz question="Por que gravar num arquivo temporário e depois renomear?" options={["Porque writeFile não aceita JSON","Para o arquivo final nunca ficar pela metade se o processo cair","Porque rename é mais rápido que writeFile","Para manter um histórico de versões"]} answer={1} explanation="O rename substitui o arquivo de uma vez. Se o processo morrer durante a escrita, só o temporário fica corrompido." />
+<Quiz question="Uma chamada via curl para uma API sem CORS configurado:" options={["É bloqueada pelo servidor","Funciona normalmente","Retorna 403 Forbidden","Precisa de um cabeçalho Origin"]} answer={1} explanation="CORS é aplicado pelo navegador. Clientes como curl não verificam esses cabeçalhos." />
+<Quiz question="Em qual camada deve ficar a regra de que um livro não pode ser favoritado duas vezes?" options={["Na rota","No serviço","No middleware de CORS","No server.js"]} answer={1} explanation="É regra de negócio, então fica no serviço. O controlador só traduz o erro para o status HTTP." />
+
+## Base no CodeForge
+
+- [Cliente-servidor](/learn/system-design/cliente-servidor) e [REST](/learn/system-design/rest): o contrato entre front e API.
+- [Idempotência](/learn/system-design/idempotencia): como pensar em POST repetido, como no favorito duplicado.
+- [Projeto de autenticação de usuários](/learn/projetos-portfolio/autenticacao-de-usuarios): o próximo passo natural para a Estante ter favoritos por usuário.
+- [React e Node.js: Consumindo APIs no React no projeto full stack](/learn/carreira-nodejs/react-nodejs-consumindo-apis-react-projeto-full): o terceiro capítulo desta sequência.
+
+## Referências
+
+- [Express 5: API](https://expressjs.com/en/5x/api.html)
+- [Pacote cors do Express](https://github.com/expressjs/cors)
+- [MDN: CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS)
+- [Node.js: File system](https://nodejs.org/api/fs.html)

@@ -1,0 +1,380 @@
+---
+title: "Node.js: Criando API Rest com autenticação, perfis de usuários e permissões"
+kind: lesson
+---
+
+Quase toda API real tem duas perguntas em cada requisição: **quem é você** (autenticação) e **você pode fazer isso** (autorização). Um leitor consulta o catálogo, um bibliotecário cadastra livros, um administrador gerencia usuários, e ninguém pode editar o perfil de outra pessoa. Se essas regras ficam espalhadas em `if` dentro dos controllers, uma rota nova esquece a checagem e vira uma brecha. Neste capítulo você monta, na API de livros, cadastro e login com JWT, refresh token revogável, perfis com permissões guardadas no banco (RBAC) e middlewares que aplicam tudo de forma declarativa.
+
+**Você vai aprender:**
+
+- Modelar usuários, perfis e permissões com relacionamentos N:N
+- Implementar cadastro, login, refresh e logout com tokens
+- Proteger rotas com middlewares de autenticação e de permissão
+- Tratar regras de posse (só o dono edita) além do perfil
+- Evitar as falhas mais comuns de controle de acesso
+
+## Autenticação e autorização
+
+| | Autenticação | Autorização |
+|---|---|---|
+| Pergunta | Quem é você? | O que você pode fazer? |
+| Quando falha | `401 Unauthorized` | `403 Forbidden` |
+| Exemplo | Token ausente, expirado ou com assinatura inválida | Leitor tentando apagar um livro |
+
+O nome do status 401 confunde (diz "não autorizado", mas significa "não autenticado"). A regra prática: 401 quando você não sabe quem é a pessoa, 403 quando sabe e ela não pode.
+
+## Modelo de dados: RBAC
+
+No controle de acesso baseado em papéis (**RBAC**), permissões não são dadas direto ao usuário. O usuário tem **perfis** (papéis), e cada perfil reúne **permissões**. Mudar o que um bibliotecário pode fazer é mudar o perfil, não cada pessoa.
+
+```text
+usuarios ── usuarios_perfis ── perfis ── perfis_permissoes ── permissoes
+```
+
+| Perfil | Permissões |
+|---|---|
+| leitor | `livros:ler`, `emprestimos:criar` |
+| bibliotecario | `livros:ler`, `livros:escrever`, `emprestimos:gerenciar` |
+| admin | todas, inclusive `usuarios:gerenciar` |
+
+Permissões no formato `recurso:acao` são mais estáveis que nomes de perfil. O código checa `livros:escrever`; quem tem essa permissão pode mudar com o tempo sem mexer em nenhuma rota.
+
+```javascript
+// src/models/Usuario.js
+import { DataTypes, Model } from "sequelize";
+import { sequelize } from "../database/index.js";
+
+export class Usuario extends Model {}
+
+Usuario.init(
+  {
+    nome: { type: DataTypes.STRING, allowNull: false },
+    email: { type: DataTypes.STRING, allowNull: false, unique: true, validate: { isEmail: true } },
+    senhaHash: { type: DataTypes.STRING, allowNull: false },
+    ativo: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+  },
+  {
+    sequelize,
+    modelName: "Usuario",
+    tableName: "usuarios",
+    defaultScope: { attributes: { exclude: ["senhaHash"] } },
+    scopes: { comSenha: { attributes: { include: ["senhaHash"] } } },
+  },
+);
+```
+
+O `defaultScope` remove o hash de senha de toda consulta. Só o login pede explicitamente `Usuario.scope("comSenha")`. É uma defesa contra devolver o hash num `res.json(usuario)` distraído.
+
+```javascript
+// src/models/associacoes-acesso.js
+import { Usuario } from "./Usuario.js";
+import { Perfil } from "./Perfil.js";         // { nome: STRING unique }
+import { Permissao } from "./Permissao.js";   // { nome: STRING unique, descricao: STRING }
+
+Usuario.belongsToMany(Perfil, {
+  through: "usuarios_perfis",
+  as: { singular: "perfil", plural: "perfis" }, // senão o Sequelize gera addPerfi
+  foreignKey: "usuarioId",
+});
+Perfil.belongsToMany(Usuario, { through: "usuarios_perfis", as: "usuarios", foreignKey: "perfilId" });
+
+Perfil.belongsToMany(Permissao, {
+  through: "perfis_permissoes",
+  as: { singular: "permissao", plural: "permissoes" },
+  foreignKey: "perfilId",
+});
+Permissao.belongsToMany(Perfil, { through: "perfis_permissoes", as: "perfis", foreignKey: "permissaoId" });
+
+export async function permissoesDo(usuarioId) {
+  const usuario = await Usuario.findByPk(usuarioId, {
+    include: {
+      association: "perfis",
+      attributes: ["nome"],
+      through: { attributes: [] },
+      include: { association: "permissoes", attributes: ["nome"], through: { attributes: [] } },
+    },
+  });
+  if (!usuario || !usuario.ativo) return null;
+  const perfis = usuario.perfis.map((p) => p.nome);
+  const permissoes = new Set(usuario.perfis.flatMap((p) => p.permissoes.map((x) => x.nome)));
+  return { perfis, permissoes };
+}
+```
+
+O alias em objeto (`singular` e `plural`) existe porque o Sequelize deriva os nomes dos métodos com regras do inglês: a partir de `"perfis"` ele geraria `addPerfi`. Declarando os dois, você ganha `usuario.addPerfil` e `usuario.setPerfis`. As tabelas, perfis e permissões iniciais entram por migração e seeder, como nos capítulos de Sequelize.
+
+## Cadastro
+
+```javascript
+// src/controllers/AuthController.js
+import { z } from "zod";
+import { Usuario } from "../models/Usuario.js";
+import { Perfil } from "../models/Perfil.js";
+import { gerarHashSenha } from "../seguranca/senha.js";
+import { sequelize } from "../database/index.js";
+
+const Cadastro = z.object({
+  nome: z.string().trim().min(2),
+  email: z.string().trim().toLowerCase().email(),
+  senha: z.string().min(10).max(128),
+});
+
+export async function cadastrar(req, res) {
+  const dados = Cadastro.parse(req.body);
+  const usuario = await sequelize.transaction(async (t) => {
+    const criado = await Usuario.create(
+      { nome: dados.nome, email: dados.email, senhaHash: await gerarHashSenha(dados.senha) },
+      { transaction: t },
+    );
+    const leitor = await Perfil.findOne({ where: { nome: "leitor" }, transaction: t });
+    await criado.addPerfil(leitor, { transaction: t });
+    return criado;
+  });
+  res.status(201).json({ id: usuario.id, nome: usuario.nome, email: usuario.email });
+}
+```
+
+Três decisões importantes:
+
+- **O perfil não vem do corpo da requisição.** Todo cadastro público nasce `leitor`. Se aceitar `perfil` no corpo, alguém manda `"admin"`.
+- **A senha passa pelo hash** do capítulo de criptografia (scrypt ou Argon2id), nunca é gravada como veio.
+- **A resposta lista os campos** em vez de devolver o objeto inteiro.
+
+## Login com tokens de acesso e de atualização
+
+O login devolve dois tokens:
+
+- **Token de acesso:** JWT de 15 minutos, enviado em cada requisição. Validado sem ir ao banco.
+- **Refresh token:** valor aleatório de vida longa (dias), guardado **com hash** no banco. Serve só para obter um novo token de acesso, e pode ser revogado.
+
+```javascript
+// src/models/RefreshToken.js  (campos: usuarioId, tokenHash, expiraEm, revogadoEm)
+
+// src/seguranca/refresh.js
+import { randomBytes, createHash } from "node:crypto";
+import { RefreshToken } from "../models/RefreshToken.js";
+
+const hashToken = (token) => createHash("sha256").update(token).digest("hex");
+const TRINTA_DIAS = 30 * 24 * 60 * 60 * 1000;
+
+export async function emitirRefresh(usuarioId, transaction) {
+  const token = randomBytes(32).toString("base64url");
+  await RefreshToken.create(
+    { usuarioId, tokenHash: hashToken(token), expiraEm: new Date(Date.now() + TRINTA_DIAS) },
+    { transaction },
+  );
+  return token;
+}
+
+export async function buscarRefreshValido(token, transaction) {
+  const registro = await RefreshToken.findOne({ where: { tokenHash: hashToken(token) }, transaction });
+  if (!registro) return null;
+  if (registro.revogadoEm) {
+    // Reuso de token já trocado: possível roubo. Revoga todos do usuário.
+    await RefreshToken.update({ revogadoEm: new Date() }, { where: { usuarioId: registro.usuarioId, revogadoEm: null }, transaction });
+    return null;
+  }
+  if (registro.expiraEm < new Date()) return null;
+  return registro;
+}
+```
+
+Aqui SHA-256 é adequado: o refresh token já é um valor aleatório de 256 bits, impossível de adivinhar por força bruta. Função lenta só é necessária para senhas, que têm pouca entropia.
+
+```javascript
+// continuação de src/controllers/AuthController.js
+import { verificarSenha } from "../seguranca/senha.js";
+import { emitirToken } from "../seguranca/tokens.js";
+import { emitirRefresh, buscarRefreshValido } from "../seguranca/refresh.js";
+
+const HASH_FALSO = await gerarHashSenha("senha-que-ninguem-usa");
+
+export async function login(req, res) {
+  const { email, senha } = req.body ?? {};
+  const usuario = await Usuario.scope("comSenha").findOne({ where: { email: String(email).toLowerCase() } });
+
+  // Sempre roda a verificação, para o tempo de resposta não revelar se o e-mail existe
+  const confere = await verificarSenha(String(senha), usuario?.senhaHash ?? HASH_FALSO);
+  if (!usuario || !confere || !usuario.ativo) {
+    return res.status(401).json({ erro: "E-mail ou senha inválidos" });
+  }
+
+  res.json({
+    tokenAcesso: emitirToken(usuario),
+    refreshToken: await emitirRefresh(usuario.id),
+  });
+}
+
+export async function renovar(req, res) {
+  const resultado = await sequelize.transaction(async (t) => {
+    const registro = await buscarRefreshValido(String(req.body?.refreshToken), t);
+    if (!registro) return null;
+    await registro.update({ revogadoEm: new Date() }, { transaction: t }); // rotação: o antigo morre
+    const usuario = await Usuario.findByPk(registro.usuarioId, { transaction: t });
+    return { tokenAcesso: emitirToken(usuario), refreshToken: await emitirRefresh(usuario.id, t) };
+  });
+  if (!resultado) return res.status(401).json({ erro: "Refresh token inválido" });
+  res.json(resultado);
+}
+
+export async function logout(req, res) {
+  const registro = await buscarRefreshValido(String(req.body?.refreshToken));
+  if (registro) await registro.update({ revogadoEm: new Date() });
+  res.status(204).end();
+}
+```
+
+A **rotação** troca o refresh token a cada uso. Se um token já trocado aparecer de novo, alguém o copiou: a função revoga todas as sessões do usuário, e a pessoa legítima precisa entrar de novo.
+
+A mensagem de erro do login é a mesma para e-mail inexistente e senha errada. Mensagens diferentes ("usuário não encontrado") permitem descobrir quais e-mails têm conta.
+
+## Middlewares de autenticação e permissão
+
+A autenticação valida o JWT e anexa o usuário à requisição. A autorização carrega as permissões e verifica.
+
+```javascript
+// src/middlewares/acesso.js
+import { validarToken } from "../seguranca/tokens.js";
+import { permissoesDo } from "../models/associacoes-acesso.js";
+
+export function autenticar(req, res, next) {
+  const [tipo, token] = (req.get("authorization") ?? "").split(" ");
+  if (tipo !== "Bearer" || !token) return res.status(401).json({ erro: "Não autenticado" });
+  try {
+    const payload = validarToken(token);
+    req.usuario = { id: Number(payload.sub) };
+    next();
+  } catch {
+    res.status(401).json({ erro: "Token inválido ou expirado" });
+  }
+}
+
+export function exigir(...necessarias) {
+  return async (req, res, next) => {
+    const acesso = await permissoesDo(req.usuario.id);
+    if (!acesso) return res.status(401).json({ erro: "Usuário inativo" });
+    req.usuario.perfis = acesso.perfis;
+    req.usuario.permissoes = acesso.permissoes;
+    const faltando = necessarias.filter((p) => !acesso.permissoes.has(p));
+    if (faltando.length > 0) return res.status(403).json({ erro: "Sem permissão", faltando });
+    next();
+  };
+}
+```
+
+Buscar permissões no banco a cada requisição tem um custo, mas tem uma vantagem forte: tirar uma permissão ou desativar um usuário vale **imediatamente**, sem esperar o token expirar. Se o volume pedir, coloque um cache curto (Redis, 30 segundos) na frente de `permissoesDo`. A alternativa, colocar as permissões dentro do JWT, é mais rápida mas só reflete mudanças quando o token é renovado.
+
+Com isso as rotas declaram o que exigem:
+
+```javascript
+// src/routes/livros.js
+import { Router } from "express";
+import { autenticar, exigir } from "../middlewares/acesso.js";
+import { LivroController } from "../controllers/LivroController.js";
+
+export const livrosRouter = Router()
+  .get("/", LivroController.listar)                                         // público
+  .get("/:id", LivroController.buscar)                                      // público
+  .post("/", autenticar, exigir("livros:escrever"), LivroController.criar)
+  .put("/:id", autenticar, exigir("livros:escrever"), LivroController.atualizar)
+  .delete("/:id", autenticar, exigir("livros:remover"), LivroController.remover);
+
+// src/routes/auth.js
+export const authRouter = Router()
+  .post("/cadastro", cadastrar)
+  .post("/login", login)
+  .post("/renovar", renovar)
+  .post("/logout", logout);
+```
+
+## Posse: além do perfil
+
+Perfil responde "leitores podem editar perfis de usuário?". Mas a regra real é "cada leitor edita **o próprio** perfil, e só admin edita qualquer um". Isso depende do recurso específico, e não cabe num middleware genérico de permissão.
+
+```javascript
+// src/controllers/UsuarioController.js
+export async function atualizarUsuario(req, res) {
+  const alvoId = Number(req.params.id);
+  const ehDono = req.usuario.id === alvoId;
+  const ehAdmin = req.usuario.permissoes.has("usuarios:gerenciar");
+
+  if (!ehDono && !ehAdmin) return res.status(403).json({ erro: "Sem permissão" });
+
+  const usuario = await Usuario.findByPk(alvoId);
+  if (!usuario) return res.status(404).json({ erro: "Usuário não encontrado" });
+
+  const { nome } = req.body;
+  await usuario.update({ nome });
+  res.json({ id: usuario.id, nome: usuario.nome });
+}
+
+export async function alterarPerfis(req, res) {
+  // rota protegida por exigir("usuarios:gerenciar")
+  const usuario = await Usuario.findByPk(req.params.id);
+  if (!usuario) return res.status(404).json({ erro: "Usuário não encontrado" });
+  const perfis = await Perfil.findAll({ where: { nome: req.body.perfis } });
+  await usuario.setPerfis(perfis);
+  res.status(204).end();
+}
+```
+
+```javascript
+usuariosRouter
+  .get("/me", autenticar, exigir(), (req, res) => res.json(req.usuario))
+  .patch("/:id", autenticar, exigir(), atualizarUsuario)
+  .put("/:id/perfis", autenticar, exigir("usuarios:gerenciar"), alterarPerfis);
+```
+
+`exigir()` sem argumentos só carrega as permissões, sem exigir nenhuma. O mesmo raciocínio vale para listas: `GET /emprestimos` de um leitor deve filtrar `where: { leitorId: req.usuario.id }`, enquanto o bibliotecário vê todos.
+
+<Callout type="warning" title="IDOR: o id na URL não é seu">
+A falha de acesso mais comum em APIs é checar que a pessoa está logada e esquecer de checar se o recurso é dela. `GET /emprestimos/123` devolve o empréstimo de outra pessoa só porque o id existe. O nome técnico é IDOR (referência direta insegura a objeto), e é o primeiro item do OWASP API Top 10. Toda rota que recebe um id precisa responder: este usuário pode ver ou alterar **este** registro? Filtrar a consulta pelo dono (`where: { id, leitorId: req.usuario.id }`) resolve na maioria dos casos.
+</Callout>
+
+## Protegendo o login
+
+- **Limite de tentativas** por IP e por e-mail, com `express-rate-limit` ou um contador no Redis. Sem isso, força bruta é questão de tempo.
+- **HTTPS sempre.** Senha e tokens viajam no corpo e nos headers.
+- **Senhas fracas.** Mínimo de 10 caracteres e, se possível, checagem contra listas de senhas vazadas.
+- **Troca de senha** revoga todos os refresh tokens do usuário.
+- **Log de eventos de segurança**: login falho, troca de senha, mudança de perfil. Nunca registre a senha ou o token no log.
+
+## Na entrevista
+
+**Qual a diferença entre 401 e 403?** 401 é falha de autenticação: o servidor não sabe quem você é (sem token, token inválido). 403 é falha de autorização: sabe quem é, mas você não tem permissão para a ação.
+
+**Como revogar um JWT antes de expirar?** O JWT em si não é revogável, porque é validado sem consulta. As saídas são vida curta para o token de acesso com refresh token revogável no banco, uma lista de tokens bloqueados consultada na validação, ou checar o estado do usuário no banco a cada requisição.
+
+**RBAC versus permissões por usuário?** No RBAC as permissões pertencem a perfis e usuários recebem perfis. Escala melhor e é mais fácil de auditar. Regras que dependem do recurso (dono, departamento, horário) complementam com checagens de atributos, o chamado ABAC.
+
+**Por que guardar o refresh token com hash?** Se o banco vazar, quem tiver a tabela não consegue usar os tokens, só os hashes. Como o token é aleatório e longo, um hash rápido como SHA-256 basta.
+
+## Pratique
+
+Na API de livros, entregue:
+
+1. Migrações e seeders de usuários, perfis (leitor, bibliotecario, admin), permissões e tabelas de junção.
+2. Rotas `/auth/cadastro`, `/auth/login`, `/auth/renovar` e `/auth/logout` com rotação de refresh token e detecção de reuso.
+3. Middlewares `autenticar` e `exigir`, aplicados em todas as rotas de escrita.
+4. Regra de posse em `PATCH /usuarios/:id` e em `GET /emprestimos/:id`.
+5. Testes de integração cobrindo: 401 sem token, 403 com perfil errado, leitor não vê empréstimo de outro (404 ou 403), refresh reutilizado invalida a sessão.
+
+<Quiz question="Um leitor autenticado tenta apagar um livro sem ter a permissão. Qual status responder?" options={["400 Bad Request","401 Unauthorized","403 Forbidden","404 Not Found"]} answer={2} explanation="A pessoa foi identificada, então não é 401. Ela não tem permissão para a ação, o que é 403 Forbidden." />
+
+<Quiz question="Por que o login deve dar a mesma mensagem para e-mail inexistente e senha errada?" options={["Para simplificar o código","Para não revelar quais e-mails têm conta","Porque o JWT exige","Para o rate limit funcionar"]} answer={1} explanation="Mensagens diferentes permitem enumerar contas. A mesma resposta, e um tempo de resposta parecido, não dão essa pista." />
+
+<Quiz question="O que a rotação de refresh token permite detectar?" options={["Senha fraca do usuário","Token de acesso expirado","Uso de um refresh token roubado","Permissões desatualizadas"]} answer={2} explanation="Cada refresh token vale uma vez. Se um já trocado reaparece, alguém tem uma cópia, e o sistema revoga todas as sessões do usuário." />
+
+## Base no CodeForge
+
+- [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao) e [RBAC](/learn/system-design/rbac): os conceitos usados aqui.
+- [Sessão vs token](/learn/system-design/sessao-vs-token): quando preferir sessão no servidor.
+- [Rate limiting](/learn/system-design/rate-limiting): como limitar tentativas de login.
+- [Node.js: Criptografia e tokens JWT](/learn/carreira-nodejs/nodejs-criptografia-tokens-jwt): o hash de senha e o JWT usados neste capítulo.
+- [Autenticação de usuários](/learn/projetos-portfolio/autenticacao-de-usuarios): um projeto de portfólio para aplicar tudo.
+
+## Referências
+
+- [OWASP: Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP: Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html)
+- [Express: Using middleware](https://expressjs.com/en/guide/using-middleware.html)

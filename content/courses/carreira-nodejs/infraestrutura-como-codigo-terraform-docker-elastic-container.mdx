@@ -1,0 +1,345 @@
+---
+title: "Infraestrutura como código: Terraform, Docker e Elastic Container Service"
+kind: lesson
+---
+
+Com o Beanstalk você ganhou simplicidade, mas cada instância ainda é uma máquina inteira rodando um contêiner, com sistema operacional para atualizar e capacidade ociosa para pagar. O Elastic Container Service (ECS) é o orquestrador de contêineres da AWS: você descreve quais contêineres rodar, com quanta CPU e memória, e ele os distribui, reinicia quando caem e registra no balanceador. Com o Fargate, nem as máquinas existem para você: paga por tarefa. Neste capítulo você descreve a API de livros no ECS Fargate inteiramente em Terraform, da rede ao autoscaling.
+
+**Você vai aprender:**
+
+- Os conceitos do ECS: cluster, task definition, service e Fargate
+- A diferença entre execution role e task role (pergunta clássica)
+- Criar rede, ALB, task definition e service com Terraform
+- Injetar segredos do Parameter Store sem colocá-los no código
+- Escalar o service e fazer deploy seguro com circuit breaker
+
+## Os quatro conceitos do ECS
+
+| Conceito | O que é | Analogia |
+| --- | --- | --- |
+| Cluster | Agrupamento lógico onde as tarefas rodam | O "lugar" |
+| Task definition | Receita versionada: imagem, CPU, memória, portas, variáveis, logs | Um `docker run` descrito em JSON |
+| Task | Uma execução da task definition (um ou mais contêineres juntos) | Um contêiner rodando |
+| Service | Mantém N tasks rodando, substitui as que caem e as registra no ALB | O Auto Scaling Group dos contêineres |
+
+E dois modos de capacidade: **EC2**, em que você fornece as máquinas do cluster, e **Fargate**, em que a AWS fornece a capacidade sob demanda para cada task. Fargate custa um pouco mais por recurso, mas elimina patch de sistema, dimensionamento de máquinas e bin packing. Para uma API Node.js, é o ponto de partida natural.
+
+Cada task definition registrada ganha uma revisão (`api-livros:1`, `api-livros:2`...). Um deploy é, essencialmente, apontar o service para uma revisão nova.
+
+## Rede com o módulo da comunidade
+
+Tasks Fargate devem rodar em subnets privadas, saindo para a internet por NAT (para baixar imagens e falar com APIs externas). Em vez de escrever VPC, subnets, tabelas de rota e NAT à mão, use o módulo `terraform-aws-modules/vpc`, o mais usado do registry:
+
+```hcl
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "api-livros"
+  cidr = "10.0.0.0/16"
+  azs  = ["us-east-1a", "us-east-1b"]
+
+  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
+  private_subnets = ["10.0.11.0/24", "10.0.12.0/24"]
+
+  enable_nat_gateway = true
+  single_nat_gateway = true # economiza em dev; em prod, um por zona
+}
+```
+
+Fixe sempre a versão principal (`~> 5.0`) de módulos de terceiros: uma major nova pode renomear variáveis e quebrar o seu `plan`.
+
+## Cluster, logs e as duas roles
+
+```hcl
+resource "aws_ecs_cluster" "main" {
+  name = "api-livros"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "api" {
+  name              = "/ecs/api-livros"
+  retention_in_days = 14
+}
+```
+
+Agora o ponto que mais confunde. O ECS usa **duas** roles IAM diferentes:
+
+- **Execution role**: usada pelo *agente do ECS* para preparar a task. Precisa baixar a imagem do ECR, escrever logs no CloudWatch e ler os segredos que você injeta como variáveis.
+- **Task role**: usada pelo *seu código* dentro do contêiner. Se a API grava capas de livro no S3, a permissão de `s3:PutObject` vai aqui.
+
+```hcl
+data "aws_iam_policy_document" "ecs_tasks" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "execution" {
+  name               = "api-livros-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks.json
+}
+
+resource "aws_iam_role_policy_attachment" "execution" {
+  role       = aws_iam_role.execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role_policy" "execution_ssm" {
+  role = aws_iam_role.execution.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameters"]
+      Resource = "arn:aws:ssm:us-east-1:123456789012:parameter/api-livros/*"
+    }]
+  })
+}
+
+resource "aws_iam_role" "task" {
+  name               = "api-livros-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_tasks.json
+}
+```
+
+<Callout type="warning" title="Permissão na role errada">
+O erro mais comum no ECS: a task não sobe com `AccessDeniedException` ao buscar um segredo, e você adiciona a permissão na task role. Não adianta. Quem lê segredos injetados, baixa a imagem e escreve logs é a execution role. Já o `AccessDenied` que aparece no log da sua API, ao chamar S3 ou SQS pelo SDK, se resolve na task role. Leia a mensagem e veja quem está pedindo.
+</Callout>
+
+## A task definition
+
+A task definition junta tudo: imagem, recursos, porta, variáveis, segredos e logs. O campo `container_definitions` é JSON, e `jsonencode` deixa você escrevê-lo em HCL:
+
+```hcl
+variable "image_tag" {
+  type = string
+}
+
+resource "aws_ecs_task_definition" "api" {
+  family                   = "api-livros"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 256 # 0.25 vCPU
+  memory                   = 512 # MiB
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "X86_64"
+  }
+
+  container_definitions = jsonencode([{
+    name      = "api"
+    image     = "${aws_ecr_repository.api.repository_url}:${var.image_tag}"
+    essential = true
+    portMappings = [{ containerPort = 3000, protocol = "tcp" }]
+    environment = [
+      { name = "NODE_ENV", value = "production" },
+      { name = "PORT", value = "3000" }
+    ]
+    secrets = [
+      { name = "DATABASE_URL", valueFrom = "arn:aws:ssm:us-east-1:123456789012:parameter/api-livros/database-url" }
+    ]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.api.name
+        awslogs-region        = "us-east-1"
+        awslogs-stream-prefix = "api"
+      }
+    }
+  }])
+}
+```
+
+O `secrets` faz o ECS buscar o valor no Parameter Store no momento em que a task sobe e entregá-lo como variável de ambiente. O valor nunca aparece no Terraform, no estado nem no console da task. Crie o parâmetro uma vez pela CLI:
+
+```bash
+aws ssm put-parameter --name /api-livros/database-url --type SecureString \
+  --value "postgres://usuario:senha@host:5432/livros"
+```
+
+Com `network_mode = "awsvpc"`, cada task ganha a própria interface de rede e IP na VPC. Por isso o target group do ALB precisa ser do tipo `ip`, e não `instance`.
+
+## Balanceador e service
+
+```hcl
+resource "aws_lb" "api" {
+  name               = "api-livros"
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = module.vpc.public_subnets
+}
+
+resource "aws_lb_target_group" "api" {
+  name        = "api-livros"
+  port        = 3000
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = module.vpc.vpc_id
+
+  health_check {
+    path    = "/health"
+    matcher = "200"
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.api.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+}
+```
+
+Os security groups seguem o padrão do capítulo de infraestrutura elástica: o do ALB aceita a porta 80 da internet, e o das tasks (`aws_security_group.tasks`) aceita a 3000 só do ALB. O service liga tudo:
+
+```hcl
+resource "aws_ecs_service" "api" {
+  name            = "api-livros"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = 2
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = module.vpc.private_subnets
+    security_groups  = [aws_security_group.tasks.id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 3000
+  }
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  depends_on = [aws_lb_listener.http]
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+}
+```
+
+Leia as opções de deploy juntas: com mínimo de 100% e máximo de 200%, o ECS sobe as tasks novas antes de derrubar as antigas (rolling sem perder capacidade). O circuit breaker observa o deploy; se as tasks novas não conseguem ficar saudáveis, ele para e volta para a revisão anterior sozinho. O `ignore_changes` em `desired_count` existe porque o autoscaling vai mexer nesse número, e o Terraform não deve desfazer.
+
+## Autoscaling do service
+
+A escala de services ECS usa o Application Auto Scaling, com a mesma ideia de target tracking do capítulo anterior:
+
+```hcl
+resource "aws_appautoscaling_target" "api" {
+  service_namespace  = "ecs"
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.api.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  min_capacity       = 2
+  max_capacity       = 10
+}
+
+resource "aws_appautoscaling_policy" "cpu" {
+  name               = "cpu-60"
+  service_namespace  = aws_appautoscaling_target.api.service_namespace
+  resource_id        = aws_appautoscaling_target.api.resource_id
+  scalable_dimension = aws_appautoscaling_target.api.scalable_dimension
+  policy_type        = "TargetTrackingScaling"
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+    target_value       = 60
+    scale_in_cooldown  = 120
+    scale_out_cooldown = 60
+  }
+}
+```
+
+Uma task Fargate sobe em dezenas de segundos, bem mais rápido que uma EC2 com `user_data`. Isso permite cooldowns curtos e reação rápida a picos.
+
+## Subindo e publicando versões
+
+O fluxo completo, do zero:
+
+```bash
+terraform init
+terraform apply -target=aws_ecr_repository.api   # o repositório precisa existir antes da imagem
+
+ECR=$(terraform output -raw ecr_url)
+aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
+docker build -t "$ECR:v1.0.0" . && docker push "$ECR:v1.0.0"
+
+terraform apply -var="image_tag=v1.0.0"
+```
+
+Para a versão seguinte, publique `v1.1.0` e rode `terraform apply -var="image_tag=v1.1.0"`: o Terraform registra uma revisão nova da task definition e atualiza o service, que faz o rolling. Acompanhe com:
+
+```bash
+aws ecs wait services-stable --cluster api-livros --services api-livros
+aws ecs describe-services --cluster api-livros --services api-livros \
+  --query "services[0].deployments[].[status,taskDefinition,runningCount,rolloutState]" --output table
+```
+
+Em times maiores, é comum separar responsabilidades: o Terraform cria a infraestrutura e a primeira revisão, e o pipeline de CI registra revisões novas com a imagem nova (com `ignore_changes = [task_definition]` no service). É exatamente o que o capítulo de deploy no ECS da sequência de integração contínua faz.
+
+Para depurar uma task em execução sem SSH, ative `enable_execute_command = true` no service (com as permissões de SSM na task role) e use `aws ecs execute-command --interactive --command "sh"`.
+
+## Na entrevista
+
+**Qual a diferença entre task definition, task e service?** A task definition é a receita versionada; a task é uma execução dela; o service mantém um número desejado de tasks, substitui as que falham e as registra no balanceador.
+
+**Execution role versus task role?** A execution role é do agente do ECS (pull da imagem, logs, segredos injetados). A task role é da aplicação (chamadas ao S3, SQS e afins pelo SDK).
+
+**Por que o target group precisa ser do tipo ip no Fargate?** Com `awsvpc`, cada task tem IP próprio na VPC, e não há instância para registrar.
+
+**Como o ECS evita um deploy quebrado derrubar o serviço?** Rolling com mínimo saudável de 100% e circuit breaker com rollback automático quando as tasks novas não estabilizam.
+
+## Pratique
+
+Suba a API de livros no ECS Fargate com Terraform e entregue:
+
+1. VPC com o módulo da comunidade, subnets privadas para as tasks e públicas para o ALB.
+2. ECR, cluster, task definition com `DATABASE_URL` vindo do Parameter Store e logs no CloudWatch.
+3. Service com circuit breaker e autoscaling por CPU (2 a 10 tasks).
+4. Uma demonstração do circuit breaker: publique uma imagem cujo `/health` devolve 500 e mostre, com `describe-services`, o deploy falhando e voltando sozinho para a revisão anterior.
+
+Lembre do `terraform destroy` no fim: NAT gateway e ALB são cobrados por hora.
+
+<Quiz question="A task não sobe e o evento do service diz AccessDenied ao buscar um parâmetro do SSM declarado em secrets. Onde falta permissão?" options={["Na task role","Na execution role","Na role do usuário que rodou o terraform apply","No security group das tasks"]} answer={1} explanation="Os segredos de secrets são buscados pelo agente do ECS antes de o contêiner iniciar, usando a execution role." />
+<Quiz question="Por que usar ignore_changes em desired_count no aws_ecs_service?" options={["Porque desired_count não pode ser alterado depois de criado","Para o ECS ignorar o circuit breaker","Para o Terraform não desfazer as mudanças feitas pelo autoscaling","Porque o Fargate define a quantidade sozinho sem autoscaling"]} answer={2} explanation="O Application Auto Scaling ajusta o número de tasks. Sem ignore_changes, cada apply voltaria ao valor do código." />
+<Quiz question="Com deployment_minimum_healthy_percent = 100 e deployment_maximum_percent = 200, como o deploy acontece?" options={["As tasks antigas são paradas e depois as novas sobem","Metade das tasks é trocada por vez, reduzindo a capacidade","Só uma task é trocada por vez","As tasks novas sobem antes de as antigas serem paradas"]} answer={3} explanation="O mínimo de 100% impede reduzir a capacidade, e o máximo de 200% permite dobrar temporariamente, então as novas sobem primeiro." />
+
+## Base no CodeForge
+
+- [Amazon ECS: Gerenciando Docker na nuvem da AWS](/learn/carreira-nodejs/amazon-ecs-gerenciando-docker-nuvem-aws): o ECS pelo console, antes do código.
+- [Infraestrutura como código: Docker e Elastic Beanstalk na AWS](/learn/carreira-nodejs/infraestrutura-como-codigo-docker-elastic-beanstalk-aws): a imagem e o ECR usados aqui.
+- [Integração Contínua: Automatize o deploy no Amazon ECS](/learn/carreira-nodejs/integracao-continua-automatize-deploy-amazon-ecs): o pipeline que publica revisões neste service.
+- [Sub-redes e CIDR](/learn/redes/subredes-e-cidr): para entender os blocos da VPC.
+
+## Referências
+
+- [AWS Fargate para Amazon ECS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)
+- [ECS deployment circuit breaker](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
+- [Terraform: aws_ecs_service](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/ecs_service)
+- [Módulo terraform-aws-modules/vpc](https://registry.terraform.io/modules/terraform-aws-modules/vpc/aws/latest)

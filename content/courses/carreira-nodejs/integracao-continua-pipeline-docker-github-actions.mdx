@@ -1,0 +1,286 @@
+---
+title: "Integração Contínua: Pipeline Docker no GitHub Actions"
+kind: lesson
+---
+
+O pipeline do capítulo anterior prova que o código está correto. Mas o que vai para produção não é o código: é uma imagem Docker construída a partir dele. Se cada pessoa constrói a imagem na própria máquina, com o próprio Docker e o próprio cache, você não sabe exatamente o que está rodando. O passo seguinte da integração contínua é fazer o pipeline produzir o artefato: construir a imagem uma única vez, testá-la de verdade, marcá-la com tags rastreáveis e publicá-la num registro, pronta para qualquer ambiente.
+
+**Você vai aprender:**
+
+- Escrever um Dockerfile multi-stage pensado para CI
+- Construir com Buildx e cache do GitHub Actions
+- Testar a imagem construída antes de publicá-la
+- Gerar tags rastreáveis com `docker/metadata-action` e publicar no GHCR
+- Publicar só a partir da `main` e de tags de versão, nunca de PR
+
+## Um Dockerfile pensado para o pipeline
+
+Num pipeline, o tempo de build é dominado por uma coisa: quantas camadas podem ser reaproveitadas do cache. A ordem das instruções decide isso. Copie primeiro o que muda pouco (manifesto de dependências) e por último o que muda sempre (código):
+
+```dockerfile
+# Dockerfile
+FROM node:22-slim AS base
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM deps AS build
+COPY . .
+RUN npm run build --if-present
+RUN npm prune --omit=dev
+
+FROM base AS runtime
+ENV NODE_ENV=production
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/src ./src
+COPY package.json ./
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s CMD node -e "fetch('http://localhost:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+CMD ["node", "src/server.js"]
+```
+
+Se só um arquivo de `src/` muda, as camadas de `deps` vêm do cache e o build leva segundos. O estágio final não tem compilador, devDependencies nem código de teste, e roda como `node`, sem root.
+
+O `.dockerignore` é tão importante quanto o Dockerfile:
+
+```text
+node_modules
+.git
+.github
+.env*
+coverage
+test
+*.md
+```
+
+Sem ele, o `COPY . .` manda o `node_modules` da sua máquina e, pior, o seu `.env` para dentro da imagem.
+
+## Buildx e cache no GitHub Actions
+
+Os runners do GitHub são máquinas novas a cada execução, então o cache local do Docker some. A solução é o Buildx (o builder moderno do Docker) com cache exportado para o próprio GitHub Actions:
+
+```yaml
+- uses: docker/setup-buildx-action@v3
+
+- uses: docker/build-push-action@v6
+  with:
+    context: .
+    push: false
+    tags: api-livros:ci
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+```
+
+`cache-from: type=gha` lê camadas salvas por execuções anteriores, e `mode=max` salva também as camadas dos estágios intermediários (como `deps`), que são exatamente as mais caras. A action `build-push-action` usa o próprio repositório como contexto quando você passa `context: .` depois do checkout.
+
+## Testando a imagem, não só o código
+
+Os testes do capítulo anterior rodaram no runner, com o Node do runner. A imagem pode estar quebrada mesmo assim: um arquivo que o Dockerfile esqueceu de copiar, uma dependência que só existia em devDependencies, uma permissão errada. Por isso o pipeline sobe a imagem construída e faz um teste de fumaça antes de publicar:
+
+```yaml
+- uses: docker/build-push-action@v6
+  with:
+    context: .
+    load: true
+    tags: api-livros:ci
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+
+- name: Teste de fumaça da imagem
+  run: |
+    docker run -d --name api -p 3000:3000 api-livros:ci
+    for i in $(seq 1 20); do
+      if curl -fs localhost:3000/health; then echo; echo "imagem saudável"; exit 0; fi
+      sleep 1
+    done
+    echo "a imagem não respondeu em /health"
+    docker logs api
+    exit 1
+```
+
+O `load: true` coloca a imagem construída no Docker do runner para que `docker run` a encontre. Se o teste falha, `docker logs` mostra o motivo direto no log do job.
+
+## Tags que contam uma história
+
+`latest` sozinha não diz nada: qual commit é? Dá para voltar à versão anterior? A action `docker/metadata-action` gera tags e labels a partir do contexto do Git:
+
+```yaml
+- id: meta
+  uses: docker/metadata-action@v5
+  with:
+    images: ghcr.io/${{ github.repository }}
+    tags: |
+      type=sha,format=long
+      type=semver,pattern={{version}}
+      type=semver,pattern={{major}}.{{minor}}
+      type=raw,value=latest,enable={{is_default_branch}}
+```
+
+Com isso:
+
+| Evento | Tags geradas |
+| --- | --- |
+| push na `main` | `sha-<commit>` e `latest` |
+| push da tag Git `v1.4.2` | `sha-<commit>`, `1.4.2` e `1.4` |
+| pull request | `sha-<commit>` (mas não publicamos em PR) |
+
+A tag com o SHA do commit é a que importa para deploy: ela é imutável na prática e liga a imagem ao código exato. `latest` é só conveniência. A action também gera labels OCI (`org.opencontainers.image.source`, `revision`), que fazem o GHCR mostrar de qual repositório e commit a imagem veio.
+
+## O workflow completo
+
+Juntando tudo: o job de imagem depende dos testes, constrói, testa a imagem e publica no GitHub Container Registry só quando não é PR.
+
+```yaml
+# .github/workflows/imagem.yml
+name: Imagem
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  testes:
+    uses: ./.github/workflows/ci.yml
+
+  imagem:
+    needs: testes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build para teste
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: api-livros:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Teste de fumaça
+        run: |
+          docker run -d --name api -p 3000:3000 api-livros:ci
+          for i in $(seq 1 20); do curl -fs localhost:3000/health && exit 0; sleep 1; done
+          docker logs api; exit 1
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+```
+
+Detalhes que valem atenção:
+
+- **`uses: ./.github/workflows/ci.yml`** reaproveita o workflow de testes como workflow reutilizável. Para isso, o `ci.yml` precisa declarar `workflow_call` entre os seus gatilhos em `on`.
+- **`permissions: packages: write`** só no job que publica. O `GITHUB_TOKEN` automático basta para o GHCR; não há senha para guardar nem rotacionar.
+- **O segundo build é quase instantâneo**: todas as camadas já estão no cache do primeiro. Você paga o build uma vez e publica exatamente o que testou.
+- **Imagens do GHCR nascem privadas** quando o repositório é privado. Para o servidor de deploy baixá-las, ele precisa de um token com `read:packages`, ou você torna o pacote público.
+
+O CodeForge faz exatamente isso em `.github/workflows/azure.yml`: o job `deploy` tem `needs: test`, usa `docker/setup-buildx-action`, `docker/login-action` com o `GITHUB_TOKEN` e `docker/build-push-action@v6` com `cache-from: type=gha`, e publica `ghcr.io/...:<sha>` e `:latest`. O deploy usa a tag do SHA, nunca a `latest`.
+
+<Callout type="warning" title="Segredo dentro da imagem é segredo vazado">
+Nunca passe senha ou token por `ARG` ou `ENV` no Dockerfile, nem copie `.env` para a imagem: tudo isso fica gravado nas camadas e qualquer pessoa com acesso à imagem extrai com `docker history` ou abrindo as camadas. Se o build precisa de um token (por exemplo, para instalar pacote privado do npm), use build secrets: `secrets: npm_token=${{ secrets.NPM_TOKEN }}` na `build-push-action` e `RUN --mount=type=secret,id=npm_token` no Dockerfile. Segredo de runtime vai como variável de ambiente no ambiente de execução, não na imagem.
+</Callout>
+
+## Docker Hub ou ECR em vez do GHCR
+
+Trocar de registro muda só o login e o nome da imagem. Para o Docker Hub, use um access token (não a sua senha) guardado em secrets:
+
+```yaml
+- uses: docker/login-action@v3
+  with:
+    username: ${{ vars.DOCKERHUB_USERNAME }}
+    password: ${{ secrets.DOCKERHUB_TOKEN }}
+```
+
+Para o ECR da AWS, o login vem depois de assumir uma role por OIDC, assunto do capítulo de deploy na EC2. O resto do workflow é idêntico.
+
+## Multi-arquitetura
+
+Se a imagem vai rodar em instâncias ARM (Graviton, mais baratas na AWS) e x86, construa as duas de uma vez:
+
+```yaml
+- uses: docker/setup-qemu-action@v3
+- uses: docker/setup-buildx-action@v3
+- uses: docker/build-push-action@v6
+  with:
+    context: .
+    platforms: linux/amd64,linux/arm64
+    push: true
+    tags: ${{ steps.meta.outputs.tags }}
+```
+
+O registro guarda uma lista de manifestos, e cada máquina baixa a variante da sua arquitetura. A emulação com QEMU deixa o build ARM bem mais lento; se isso pesar, use runners ARM nativos (`ubuntu-24.04-arm`) num job de matriz. Note que `load: true` não funciona com várias plataformas, então o teste de fumaça fica num build separado de uma plataforma só.
+
+## Na entrevista
+
+**Por que construir a imagem no CI e não na máquina do desenvolvedor?** Ambiente limpo e reprodutível, artefato rastreável até o commit, e a mesma imagem testada é a que vai para todos os ambientes.
+
+**Por que não fazer deploy usando a tag latest?** Ela muda a cada build, então você não sabe o que está rodando nem consegue voltar para a anterior. A tag do SHA (ou semver) é estável e rastreável.
+
+**Como acelerar builds Docker no GitHub Actions?** Ordenar camadas do que muda menos ao que muda mais, multi-stage, `.dockerignore` e cache do Buildx exportado (`type=gha` ou registro).
+
+**Como usar um token durante o build sem vazá-lo?** Build secrets com `RUN --mount=type=secret`, que não ficam gravados em camadas.
+
+## Pratique
+
+Na API de livros, entregue o workflow `imagem.yml` que:
+
+1. Reaproveita o `ci.yml` como workflow reutilizável e só constrói a imagem se os testes passarem.
+2. Constrói com cache `gha` e faz teste de fumaça da imagem em `/health`.
+3. Publica no GHCR com tags `sha-<commit>`, `latest` (só na `main`) e semver (em tags `v*`), sem publicar nada em PR.
+4. Mostra, no README, o tempo do job no primeiro build e num segundo build mudando só um arquivo de `src/`.
+
+Bônus: adicione `linux/arm64` e rode a imagem num Mac com Apple Silicon ou numa instância Graviton.
+
+<Quiz question="Por que o pipeline faz um teste de fumaça subindo a imagem, se os testes já passaram no runner?" options={["Porque os testes no runner não usam Node","Para validar que a imagem em si funciona, com os arquivos e dependências que o Dockerfile copiou","Porque o GHCR exige um teste antes do push","Para preencher o cache do Buildx"]} answer={1} explanation="Testes no runner validam o código; a imagem pode estar quebrada por arquivo esquecido, dependência faltando ou permissão errada." />
+<Quiz question="Qual tag de imagem é a mais adequada para referenciar num deploy?" options={["latest","main","A tag com o SHA do commit","stable"]} answer={2} explanation="A tag do SHA liga a imagem a um commit exato e não muda, permitindo saber o que roda e voltar para a versão anterior." />
+<Quiz question="Que permissão o job precisa para publicar no GHCR usando o GITHUB_TOKEN?" options={["packages: write","contents: write","id-token: write","actions: write"]} answer={0} explanation="O GITHUB_TOKEN só consegue escrever no GitHub Container Registry se o job declarar packages: write." />
+
+## Base no CodeForge
+
+- [Integração Contínua: Pipelines e testes automatizados com GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipelines-testes-automatizados-github-actions): o workflow de testes reaproveitado aqui.
+- [DevOps: Construindo e gerenciando containers com o Docker](/learn/carreira-nodejs/devops-construindo-gerenciando-containers-docker): camadas, cache e multi-stage em detalhe.
+- [Docker](/learn/system-design-interviews/docker): contêineres em entrevistas de system design.
+- [CI/CD](/learn/system-design/ci-cd): artefato único promovido entre ambientes.
+
+## Referências
+
+- [Docker: GitHub Actions](https://docs.docker.com/build/ci/github-actions/)
+- [docker/build-push-action](https://github.com/docker/build-push-action)
+- [docker/metadata-action](https://github.com/docker/metadata-action)

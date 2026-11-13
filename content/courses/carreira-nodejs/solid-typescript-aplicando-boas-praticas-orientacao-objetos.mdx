@@ -1,0 +1,269 @@
+---
+title: "SOLID com TypeScript: Aplicando boas práticas em orientação a objetos"
+kind: lesson
+---
+
+Código que funciona hoje e é impossível de mudar amanhã é o problema mais caro de um back-end. O sintoma é conhecido: para adicionar uma forma de notificação você mexe em seis arquivos, um teste simples exige subir o banco, e cada correção quebra algo do outro lado. SOLID é um conjunto de cinco princípios que atacam exatamente isso: eles orientam como dividir responsabilidades e como as partes devem depender umas das outras para que a mudança fique local.
+
+**Você vai aprender:**
+
+- O que cada um dos cinco princípios diz, com código antes e depois
+- Como identificar violações reais numa API Node.js com TypeScript
+- Como injeção de dependência e uma raiz de composição juntam tudo
+- Quando aplicar SOLID e quando ele vira complicação desnecessária
+
+## O ponto de partida: um service que faz tudo
+
+O fio condutor é o caso de uso de empréstimo de livros. Esta é a versão "funciona, mas":
+
+```typescript
+import { Pool } from "pg";
+import nodemailer from "nodemailer";
+
+export class EmprestimoService {
+  private db = new Pool({ connectionString: process.env.DATABASE_URL });
+  private mailer = nodemailer.createTransport({ host: "smtp.exemplo.com", port: 587 });
+
+  async emprestar(livroId: string, usuarioId: number, tipoUsuario: string) {
+    if (!livroId || !usuarioId) throw new Error("dados inválidos");
+
+    const { rows } = await this.db.query("select * from livros where id = $1", [livroId]);
+    const livro = rows[0];
+    if (!livro || livro.status !== "disponivel") throw new Error("indisponível");
+
+    let prazo = 14;
+    if (tipoUsuario === "professor") prazo = 30;
+    else if (tipoUsuario === "visitante") prazo = 7;
+
+    const devolucao = new Date(Date.now() + prazo * 86_400_000);
+    await this.db.query(
+      "insert into emprestimos (livro_id, usuario_id, devolucao) values ($1, $2, $3)",
+      [livroId, usuarioId, devolucao],
+    );
+    await this.db.query("update livros set status = 'emprestado' where id = $1", [livroId]);
+
+    const u = await this.db.query("select email from usuarios where id = $1", [usuarioId]);
+    await this.mailer.sendMail({
+      to: u.rows[0].email,
+      subject: "Empréstimo confirmado",
+      text: `Devolva até ${devolucao.toLocaleDateString("pt-BR")}`,
+    });
+  }
+}
+```
+
+Liste os motivos pelos quais essa classe pode mudar: a regra de validação, o SQL, a política de prazo, o provedor de e-mail, o texto da mensagem. Cinco motivos numa classe. E para testar a regra "professor tem 30 dias", você precisa de um PostgreSQL e de um servidor SMTP. Vamos aplicar os princípios um a um.
+
+## S: Single Responsibility (responsabilidade única)
+
+"Uma classe deve ter um, e apenas um, motivo para mudar." Motivo para mudar é um ator ou uma preocupação: o time que define as regras de prazo, o DBA que mexe no schema, quem cuida das notificações.
+
+Separe as preocupações em peças com nome:
+
+```typescript
+// acesso a dados
+export interface LivroRepositorio {
+  buscar(id: string): Promise<Livro | undefined>;
+  marcarEmprestado(id: string): Promise<void>;
+}
+export interface EmprestimoRepositorio {
+  registrar(e: { livroId: string; usuarioId: number; devolucao: Date }): Promise<void>;
+}
+
+// notificação
+export interface Notificador {
+  emprestimoConfirmado(usuarioId: number, devolucao: Date): Promise<void>;
+}
+```
+
+O service fica só com a orquestração do caso de uso. SRP não significa "uma classe, um método"; significa coesão: o que muda junto fica junto, o que muda por razões diferentes fica separado.
+
+## O: Open/Closed (aberto para extensão, fechado para modificação)
+
+O bloco de `if` do prazo é a violação clássica. Cada tipo de usuário novo obriga a editar o service, e cada edição arrisca quebrar os tipos que já funcionavam. O princípio pede que você consiga **adicionar** comportamento sem **alterar** código estável.
+
+Transforme a variação em uma abstração:
+
+```typescript
+export interface PoliticaEmprestimo {
+  readonly tipo: string;
+  prazoEmDias(): number;
+}
+
+export const politicas = {
+  aluno: { tipo: "aluno", prazoEmDias: () => 14 },
+  professor: { tipo: "professor", prazoEmDias: () => 30 },
+  visitante: { tipo: "visitante", prazoEmDias: () => 7 },
+} satisfies Record<string, PoliticaEmprestimo>;
+
+export type TipoUsuario = keyof typeof politicas;
+```
+
+Um tipo novo (`pesquisador` com 60 dias) é uma entrada nova no mapa. O service não muda. O `satisfies` confere que cada entrada cumpre a interface sem perder os tipos literais das chaves, então `TipoUsuario` vira `"aluno" | "professor" | "visitante"` automaticamente.
+
+Note que OCP não proíbe editar código. Ele diz que os pontos de variação previsíveis devem ser extensíveis. Se o prazo nunca muda, um `if` resolve.
+
+## L: Liskov Substitution (substituição de Liskov)
+
+"Se S é subtipo de T, qualquer código que funciona com T deve funcionar com S sem surpresas." Não basta ter os mesmos métodos: o subtipo precisa honrar o contrato, incluindo o que ele aceita, o que devolve e quais erros lança.
+
+Uma violação comum em APIs:
+
+```typescript
+class RepositorioLivrosCache implements LivroRepositorio {
+  constructor(private readonly dados: Map<string, Livro>) {}
+  async buscar(id: string) {
+    return this.dados.get(id);
+  }
+  async marcarEmprestado(_id: string): Promise<void> {
+    throw new Error("cache é somente leitura"); // quebra o contrato
+  }
+}
+```
+
+O compilador aceita: a assinatura bate. Mas o service, que confia que `marcarEmprestado` funciona, vai falhar em produção quando receber essa implementação. O problema não é o cache; é a interface prometer escrita para quem só sabe ler. A correção vem do próximo princípio.
+
+Outros sinais de violação de Liskov: a subclasse exige pré-condições mais fortes (aceita menos entradas que a base), devolve `null` onde a base nunca devolvia, ou tem um `if (obj instanceof Subtipo)` no código cliente para tratar o caso especial.
+
+## I: Interface Segregation (segregação de interfaces)
+
+"Nenhum cliente deve depender de métodos que não usa." Interfaces grandes forçam implementações a fingir que suportam tudo, e foi isso que levou ao `throw` acima.
+
+Divida pelo que cada cliente precisa:
+
+```typescript
+export interface LeitorDeLivros {
+  buscar(id: string): Promise<Livro | undefined>;
+}
+export interface EscritorDeLivros {
+  marcarEmprestado(id: string): Promise<void>;
+}
+export type LivroRepositorio = LeitorDeLivros & EscritorDeLivros;
+```
+
+A rota de consulta depende só de `LeitorDeLivros`, e o cache implementa só essa interface, sem mentir. O caso de uso de empréstimo, que precisa ler e escrever, depende das duas. Em TypeScript, como a tipagem é estrutural, qualquer objeto com os métodos certos satisfaz a interface, o que torna as interfaces pequenas baratas de criar e de usar em testes.
+
+## D: Dependency Inversion (inversão de dependência)
+
+"Módulos de alto nível não devem depender de módulos de baixo nível; ambos devem depender de abstrações." O caso de uso (alto nível, regra de negócio) não deve importar `pg` ou `nodemailer` (baixo nível, detalhe). Ele declara as interfaces de que precisa, e alguém de fora entrega as implementações.
+
+```typescript
+export class EmprestarLivro {
+  constructor(
+    private readonly livros: LeitorDeLivros & EscritorDeLivros,
+    private readonly emprestimos: EmprestimoRepositorio,
+    private readonly notificador: Notificador,
+    private readonly relogio: () => Date = () => new Date(),
+  ) {}
+
+  async executar(livroId: string, usuarioId: number, politica: PoliticaEmprestimo) {
+    const livro = await this.livros.buscar(livroId);
+    if (!livro) throw new LivroNaoEncontrado(livroId);
+    if (livro.status !== "disponivel") throw new LivroIndisponivel(livroId);
+
+    const devolucao = new Date(this.relogio().getTime() + politica.prazoEmDias() * 86_400_000);
+    await this.emprestimos.registrar({ livroId, usuarioId, devolucao });
+    await this.livros.marcarEmprestado(livroId);
+    await this.notificador.emprestimoConfirmado(usuarioId, devolucao);
+    return { devolucao };
+  }
+}
+```
+
+Até o relógio virou dependência: sem isso, testar a data de devolução exigiria manipular o tempo do sistema. A seta de dependência se inverteu: o SQL e o e-mail agora dependem das interfaces definidas pelo domínio, e não o contrário.
+
+### A raiz de composição
+
+Alguém precisa montar o grafo de objetos. Esse lugar é a raiz de composição, normalmente o arquivo de inicialização. É o único ponto que conhece as implementações concretas.
+
+```typescript
+// src/main.ts
+const pool = new Pool({ connectionString: env.DATABASE_URL });
+const livros = new LivroRepositorioPg(pool);
+const emprestimos = new EmprestimoRepositorioPg(pool);
+const notificador = new NotificadorEmail(criarTransporteSmtp(env));
+
+const emprestarLivro = new EmprestarLivro(livros, emprestimos, notificador);
+app.use("/emprestimos", rotasEmprestimo(emprestarLivro));
+```
+
+Frameworks como o Nest.js fazem essa montagem por você, com um contêiner de injeção de dependência. Entender a versão manual é o que faz o contêiner deixar de ser mágica.
+
+### O ganho: testes sem infraestrutura
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+test("professor recebe 30 dias de prazo", async () => {
+  const enviados: Date[] = [];
+  const uc = new EmprestarLivro(
+    {
+      buscar: async () => ({ id: "1", titulo: "Dom Casmurro", status: "disponivel" }),
+      marcarEmprestado: async () => {},
+    },
+    { registrar: async () => {} },
+    { emprestimoConfirmado: async (_u, d) => void enviados.push(d) },
+    () => new Date("2026-03-01T12:00:00Z"),
+  );
+
+  const { devolucao } = await uc.executar("1", 7, politicas.professor);
+  assert.equal(devolucao.toISOString(), "2026-03-31T12:00:00.000Z");
+  assert.equal(enviados.length, 1);
+});
+```
+
+Sem banco, sem SMTP, sem mocks de biblioteca: só objetos literais que satisfazem as interfaces. O teste roda em milissegundos.
+
+<Callout type="warning" title="SOLID não é meta, é ferramenta">
+O erro mais comum depois de aprender SOLID é aplicar tudo em todo lugar: uma interface para cada classe, uma fábrica para cada objeto, cinco arquivos para um CRUD de três campos. Abstração tem custo de leitura. Crie a interface quando existir variação real (duas implementações, ou um teste que precisa substituir a dependência) e mantenha o resto simples. Os princípios servem para reduzir o custo de mudança; se aumentam, algo saiu do ponto.
+</Callout>
+
+## Juntando tudo: como identificar no código
+
+| Sintoma no código | Princípio provavelmente violado |
+|---|---|
+| Classe com `import` de banco, e-mail e HTTP ao mesmo tempo | SRP e DIP |
+| `if` ou `switch` sobre "tipo" que cresce a cada feature | OCP |
+| Método que lança "não suportado" ao implementar uma interface | LSP e ISP |
+| Mock com dez métodos vazios para testar um que importa | ISP |
+| `new` de infraestrutura dentro de regra de negócio | DIP |
+| Teste de regra de negócio que precisa do banco rodando | DIP |
+
+## Na entrevista
+
+**Explique SOLID em uma frase cada.** SRP: um motivo para mudar. OCP: estender sem modificar o que é estável. LSP: subtipos honram o contrato da base. ISP: interfaces pequenas, do tamanho do cliente. DIP: regra de negócio depende de abstrações, e os detalhes as implementam.
+
+**Qual a diferença entre inversão de dependência e injeção de dependência?** Inversão é o princípio de design (depender de abstrações). Injeção é a técnica de entregar as dependências de fora, pelo construtor, por exemplo. A injeção é o jeito mais comum de aplicar a inversão.
+
+**Dê um exemplo de violação de Liskov que compila.** Uma implementação que lança erro num método da interface, ou que devolve `null` onde o contrato garante um valor. O tipo bate; o comportamento não.
+
+**SOLID vale para código funcional?** Sim, adaptado: funções pequenas com uma responsabilidade, dependências passadas como parâmetros e tipos de função como abstrações.
+
+## Pratique
+
+Pegue o `EmprestimoService` do início desta aula (ou um service seu que faça coisas demais) e refatore:
+
+1. Extraia `LeitorDeLivros`, `EscritorDeLivros`, `EmprestimoRepositorio` e `Notificador`.
+2. Troque o `if` de prazo por políticas, e adicione a política `pesquisador` sem editar o caso de uso.
+3. Crie `EmprestarLivro` recebendo tudo pelo construtor, incluindo o relógio.
+4. Escreva cinco testes com `node --test` e dublês literais: livro inexistente, livro indisponível, prazo de aluno, prazo de professor e notificação enviada.
+5. Monte a raiz de composição com implementações em memória e, se tiver PostgreSQL, com `pg`.
+
+Entregue o repositório com o "antes" e o "depois" em commits separados e uma tabela no README mostrando qual princípio cada mudança aplicou.
+
+<Quiz question="Uma classe implementa uma interface mas lança erro 'não suportado' em um dos métodos. Quais princípios isso costuma indicar?" options={["SRP e OCP","LSP e ISP","OCP e DIP","Apenas SRP"]} answer={1} explanation="A implementação não honra o contrato (Liskov), e o motivo usual é uma interface grande demais para esse cliente (segregação de interfaces)." />
+<Quiz question="Qual é o papel da raiz de composição?" options={["Definir as interfaces do domínio","Ser o único lugar que conhece as implementações concretas e monta o grafo de objetos","Guardar as regras de negócio","Substituir o banco nos testes"]} answer={1} explanation="A raiz de composição, em geral o arquivo de inicialização, cria as implementações e as injeta, mantendo o resto do código dependente só de abstrações." />
+<Quiz question="Por que passar o relógio como dependência do caso de uso?" options={["Para melhorar a performance","Para o teste controlar a data e verificar a devolução de forma determinística","Porque new Date() não funciona em TypeScript","Para respeitar o princípio aberto/fechado"]} answer={1} explanation="Tempo é uma dependência externa como qualquer outra. Injetá-lo deixa o teste determinístico sem manipular o relógio do sistema." />
+
+## Base no CodeForge
+
+- [SRP](/learn/lld/srp), [OCP](/learn/lld/ocp), [LSP](/learn/lld/lsp), [ISP](/learn/lld/isp) e [DIP](/learn/lld/dip): cada princípio em capítulo próprio, com mais exemplos.
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia): a técnica que torna a inversão prática.
+- [Quiz de SOLID](/learn/lld/quiz-solid): teste o que você aprendeu.
+- [Padrões de projeto com TypeScript](/learn/carreira-nodejs/padroes-projeto-typescript-aprimorando-api-arquitetura-limpa): o próximo passo, com arquitetura limpa.
+
+## Referências
+
+- [Classes (TypeScript Handbook)](https://www.typescriptlang.org/docs/handbook/2/classes.html)
+- [Object Types (TypeScript Handbook)](https://www.typescriptlang.org/docs/handbook/2/objects.html)

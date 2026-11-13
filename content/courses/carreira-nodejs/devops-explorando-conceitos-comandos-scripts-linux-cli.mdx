@@ -1,0 +1,284 @@
+---
+title: "DevOps: Explorando conceitos, comandos e scripts no Linux CLI"
+kind: lesson
+---
+
+DevOps é a ideia de que quem escreve o código também participa de como ele é entregue e operado, com o máximo possível automatizado. Na prática, para um dev back-end, isso começa num lugar bem concreto: um terminal conectado por SSH a um servidor Linux. É ali que você descobre por que a API não sobe, lê o log do erro, ajusta uma permissão e transforma o que fez à mão num script que o pipeline repete sozinho. Este capítulo junta os conceitos com os comandos que você vai usar todos os dias.
+
+**Você vai aprender:**
+
+- Os princípios de DevOps que justificam automatizar e por onde começar
+- Navegar pela hierarquia do Linux e entender usuários, grupos e permissões
+- Combinar comandos com pipes para investigar logs de uma API
+- Controlar processos e sinais, e fazer o Node.js encerrar com elegância
+- Transformar a preparação de um servidor num script e num serviço do systemd
+
+## DevOps em uma página
+
+DevOps não é um cargo nem uma ferramenta. É um conjunto de práticas para encurtar o caminho entre "o código está pronto" e "está em produção funcionando", sem perder estabilidade. Os pilares que você vai ver em toda vaga:
+
+| Prática | O que significa no dia a dia |
+|---|---|
+| Integração contínua (CI) | Todo push roda lint e testes automaticamente |
+| Entrega contínua (CD) | O artefato aprovado vai para produção por um processo repetível |
+| Infraestrutura como código | Servidores e redes descritos em arquivos versionados |
+| Observabilidade | Logs, métricas e alertas para saber o que está acontecendo |
+| Automação | O que se faz duas vezes vira script |
+
+A regra prática é a última. Toda vez que você digitar a mesma sequência de comandos pela terceira vez, ela merece um script. E todo script é o primeiro passo para algo maior: o script de deploy vira um job de CI, o script de preparação do servidor vira Ansible ou uma imagem Docker. O Linux CLI é a linguagem comum de todas essas ferramentas.
+
+## Onde as coisas ficam no Linux
+
+O Linux organiza tudo numa árvore única a partir de `/`. Você não precisa decorar tudo, mas estes diretórios aparecem sempre:
+
+| Caminho | Conteúdo |
+|---|---|
+| `/etc` | Configurações do sistema (nginx, systemd, usuários) |
+| `/var/log` | Logs do sistema e de serviços |
+| `/opt` ou `/srv` | Aplicações instaladas por você |
+| `/home/usuario` | Arquivos de cada usuário |
+| `/tmp` | Temporários, apagados em reinicializações |
+| `/proc` | Estado do kernel e dos processos, gerado em tempo real |
+
+A navegação básica é rápida de aprender e vale ficar fluente:
+
+```bash
+pwd                       # onde estou
+ls -lah /var/log          # lista com detalhes, ocultos e tamanhos legíveis
+cd /opt/livros-api        # entra no diretório
+cd -                      # volta ao anterior
+find /var/log -name '*.log' -mtime -1     # logs modificados no último dia
+du -sh /var/log/* | sort -h | tail -5     # o que mais ocupa espaço
+```
+
+## Usuários, grupos e permissões
+
+Cada arquivo tem um dono, um grupo e três conjuntos de permissões: do dono, do grupo e dos outros. Cada conjunto combina leitura (`r`), escrita (`w`) e execução (`x`).
+
+```bash
+ls -l /opt/livros-api/.env
+# -rw-r----- 1 livros livros 312 Nov 10 09:12 .env
+```
+
+Lendo da esquerda: `-` é arquivo comum, `rw-` o dono lê e escreve, `r--` o grupo só lê, `---` os outros não fazem nada. Em notação numérica, `r=4`, `w=2`, `x=1`, então esse arquivo é `640`.
+
+```bash
+sudo useradd --system --create-home --shell /usr/sbin/nologin livros
+sudo chown -R livros:livros /opt/livros-api
+chmod 640 /opt/livros-api/.env         # segredo: dono lê e escreve, grupo lê
+chmod +x /opt/livros-api/scripts/*.sh  # scripts executáveis
+```
+
+Para diretórios, `x` significa "pode entrar". Um diretório com `r` mas sem `x` deixa listar os nomes, mas não abrir os arquivos.
+
+<Callout type="warning" title="chmod 777 nunca é a solução">
+Quando aparece "Permission denied", a tentação é rodar `chmod -R 777` e seguir em frente. Isso dá escrita para qualquer usuário do sistema, inclusive um processo invadido, e expõe o `.env` com as senhas do banco. Descubra qual usuário está rodando o processo (`ps -o user= -p PID`), qual é o dono do arquivo (`ls -l`) e ajuste dono ou grupo com `chown`. A API também não deve rodar como root: crie um usuário de sistema só para ela.
+</Callout>
+
+## Pipes: o superpoder do terminal
+
+A filosofia Unix é ter programas pequenos que fazem uma coisa bem feita e se combinam pelo pipe (`|`), que liga a saída de um à entrada do próximo. Com meia dúzia deles, você investiga logs sem abrir nenhum editor.
+
+Suponha que a API grave um log de acesso por linha, assim:
+
+```text
+2026-11-12T10:01:02Z GET /livros 200 35ms
+2026-11-12T10:01:03Z POST /livros 500 120ms
+2026-11-12T10:01:05Z GET /livros/42 404 8ms
+```
+
+Algumas perguntas e as respostas em uma linha:
+
+```bash
+# acompanhar o log em tempo real, só os erros 5xx
+tail -f /var/log/livros/access.log | grep --line-buffered ' 5[0-9][0-9] '
+
+# quantas requisições por código de status
+awk '{print $4}' access.log | sort | uniq -c | sort -rn
+
+# as 5 rotas mais chamadas
+awk '{print $2, $3}' access.log | sort | uniq -c | sort -rn | head -5
+
+# média de tempo de resposta
+awk '{gsub("ms", "", $5); soma += $5; n++} END {printf "%.1f ms\n", soma / n}' access.log
+
+# erros 500 entre 10h e 11h
+grep '^2026-11-12T10' access.log | grep -c ' 500 '
+```
+
+O que cada peça faz: `grep` filtra linhas, `awk` separa colunas (por espaço, por padrão) e calcula, `sort` ordena, `uniq -c` conta linhas iguais consecutivas (por isso vem sempre depois de um `sort`), `head` e `tail` cortam o início e o fim. Os redirecionamentos completam o conjunto: `>` grava a saída num arquivo (sobrescreve), `>>` acrescenta, `2>` redireciona erros e `2>&1` junta erros com a saída normal.
+
+Quando a API roda pelo systemd, o log fica no journal e o comando de entrada muda, mas o resto do pipe é igual:
+
+```bash
+journalctl -u livros-api --since today -o cat | grep -c ' 500 '
+```
+
+## Processos e sinais
+
+Todo programa em execução é um processo com um PID. Você os lista, filtra e encerra:
+
+```bash
+ps aux | grep '[n]ode'          # o [n] evita listar o próprio grep
+pgrep -a node                   # PID e comando dos processos node
+ss -ltnp | grep 3000            # quem está escutando na porta 3000
+kill -TERM 4312                 # pede para o processo encerrar
+kill -KILL 4312                 # força o encerramento (último recurso)
+```
+
+`kill` não "mata": ele envia um sinal. `SIGTERM` (o padrão) é um pedido educado, que o programa pode tratar para fechar conexões antes de sair. `SIGKILL` é o kernel removendo o processo sem aviso, sem chance de limpeza. Docker, Kubernetes e systemd mandam `SIGTERM` primeiro e só depois de um prazo mandam `SIGKILL`. Se a sua API ignora o `SIGTERM`, cada deploy derruba requisições no meio.
+
+O tratamento no Node.js é curto:
+
+```javascript
+import express from "express";
+
+const app = express();
+app.get("/livros", (req, res) => res.json([]));
+
+const server = app.listen(3000, () => console.log("API na porta 3000"));
+
+function encerrar(sinal) {
+  console.log(`${sinal} recebido, encerrando`);
+  server.close(async () => {
+    // feche aqui o pool do banco, filas, etc.
+    process.exit(0);
+  });
+  // se algo travar, não espere para sempre
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on("SIGTERM", () => encerrar("SIGTERM"));
+process.on("SIGINT", () => encerrar("SIGINT"));
+```
+
+`server.close` para de aceitar conexões novas e espera as requisições em andamento terminarem. O `unref()` impede que o próprio timer mantenha o processo vivo.
+
+## Variáveis de ambiente
+
+Configuração de aplicação vem do ambiente, não do código. No shell:
+
+```bash
+export NODE_ENV=production
+echo "$NODE_ENV"
+env | grep NODE              # lista o ambiente atual
+PORT=4000 node server.js     # define só para este comando
+```
+
+O `export` vale para a sessão atual e os processos filhos. Para persistir no seu usuário, coloque no `~/.bashrc`. Para um serviço, use o arquivo de ambiente do systemd (abaixo), nunca o `.bashrc`, que serviços não leem.
+
+## Do passo a passo ao script
+
+Juntando tudo: um script que prepara um servidor Ubuntu limpo para a API. Ele é idempotente, ou seja, rodar duas vezes não quebra nada, o que é a propriedade mais importante de qualquer automação de infraestrutura.
+
+```bash
+#!/usr/bin/env bash
+# setup-servidor.sh: prepara um Ubuntu para a API de livros
+set -euo pipefail
+
+APP_DIR=/opt/livros-api
+APP_USER=livros
+
+if [[ $EUID -ne 0 ]]; then
+  echo "rode com sudo" >&2
+  exit 1
+fi
+
+apt-get update -y
+apt-get install -y curl git ca-certificates
+
+# Node.js 22 só se ainda não estiver instalado
+if ! command -v node > /dev/null || [[ "$(node -v)" != v22* ]]; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get install -y nodejs
+fi
+
+# usuário de sistema, só se não existir
+id "$APP_USER" &> /dev/null || useradd --system --create-home --shell /usr/sbin/nologin "$APP_USER"
+
+mkdir -p "$APP_DIR"
+chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+
+cp ./livros-api.service /etc/systemd/system/livros-api.service
+systemctl daemon-reload
+systemctl enable livros-api
+
+echo "pronto: node $(node -v), usuário $APP_USER, serviço habilitado"
+```
+
+E a unidade do systemd que mantém a API rodando, reinicia em caso de queda e manda o log para o journal:
+
+```ini
+# livros-api.service
+[Unit]
+Description=API de livros
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=livros
+WorkingDirectory=/opt/livros-api
+EnvironmentFile=/opt/livros-api/.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl start livros-api
+systemctl status livros-api
+journalctl -u livros-api -f
+```
+
+Por fim, acesso remoto. Configure login por chave e use o `ssh` para executar comandos sem abrir sessão, o que é exatamente o que um pipeline de deploy simples faz:
+
+```bash
+ssh-keygen -t ed25519 -C "deploy"
+ssh-copy-id deploy@meu-servidor
+scp setup-servidor.sh livros-api.service deploy@meu-servidor:~
+ssh deploy@meu-servidor 'sudo bash ~/setup-servidor.sh'
+```
+
+## Na entrevista
+
+**O que é DevOps?** Uma cultura e um conjunto de práticas (CI, CD, infraestrutura como código, observabilidade) que aproximam desenvolvimento e operação para entregar com frequência e com segurança.
+
+**Qual a diferença entre SIGTERM e SIGKILL?** `SIGTERM` pode ser tratado pelo programa, que fecha conexões e sai; `SIGKILL` encerra na hora, sem limpeza. Orquestradores mandam `SIGTERM`, esperam um prazo e só então `SIGKILL`.
+
+**O que significa permissão 640?** Dono lê e escreve, grupo só lê, outros nada. É o padrão para arquivos de configuração com segredos.
+
+**O que é um script idempotente?** Um script que pode rodar várias vezes e chega sempre ao mesmo estado final, sem duplicar usuários ou falhar porque algo já existe.
+
+## Pratique
+
+Numa VM com Ubuntu (local com Multipass ou VirtualBox, ou uma instância barata na nuvem), entregue:
+
+1. O `setup-servidor.sh` adaptado para a sua API, rodando duas vezes seguidas sem erro.
+2. A API rodando como serviço do systemd com usuário próprio e `.env` com permissão 640.
+3. Tratamento de `SIGTERM` na API: prove com `systemctl restart` durante uma requisição lenta (uma rota com `setTimeout` de 5 segundos) que ela termina com sucesso.
+4. Um arquivo `comandos.md` com três pipelines que você usou para investigar o log da API (por status, por rota e por tempo).
+
+<Quiz question="Por que 'sort' aparece antes de 'uniq -c' em pipelines de contagem?" options={["uniq só agrupa linhas iguais vizinhas","sort remove as linhas em branco","uniq exige entrada em ordem alfabética para não falhar","sort converte o texto em números"]} answer={0} explanation="uniq compara cada linha com a anterior, então linhas iguais precisam estar juntas para serem contadas uma vez." />
+
+<Quiz question="O orquestrador vai reiniciar sua API. O que o Node.js deve fazer ao receber SIGTERM?" options={["Ignorar o sinal e continuar rodando","Chamar process.exit imediatamente","Parar de aceitar conexões e terminar as atuais","Reenviar o sinal para o processo pai"]} answer={2} explanation="server.close para de aceitar conexões novas e espera as em andamento, permitindo um encerramento sem requisições perdidas." />
+
+<Quiz question="Um arquivo .env mostra '-rw-r--r--'. Qual o problema?" options={["O dono não consegue ler","Qualquer usuário pode ler os segredos","Ninguém consegue editar o arquivo","O arquivo vai ser executado"]} answer={1} explanation="O último trio r-- dá leitura para todos os usuários do sistema. Para segredos, use 640 ou 600." />
+
+## Base no CodeForge
+
+- [Kernel e chamadas de sistema](/learn/sistemas-operacionais/kernel-e-chamadas-de-sistema): o que acontece quando um comando pede algo ao sistema.
+- [Comunicação entre processos](/learn/sistemas-operacionais/comunicacao-entre-processos): sinais e pipes vistos pelo lado do sistema operacional.
+- [Sistemas de arquivos](/learn/sistemas-operacionais/sistemas-de-arquivos): inodes, diretórios e permissões.
+- [Linux: Criando script de monitoramento de sistema](/learn/carreira-nodejs/linux-criando-script-monitoramento-sistema): o monitoramento do servidor que você acabou de preparar.
+
+## Referências
+
+- [GNU Coreutils manual](https://www.gnu.org/software/coreutils/manual/coreutils.html)
+- [grep(1)](https://man7.org/linux/man-pages/man1/grep.1.html)
+- [chmod(1)](https://man7.org/linux/man-pages/man1/chmod.1.html)
+- [ssh(1)](https://man7.org/linux/man-pages/man1/ssh.1.html)

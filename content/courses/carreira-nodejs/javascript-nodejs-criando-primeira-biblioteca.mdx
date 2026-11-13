@@ -1,0 +1,379 @@
+---
+title: "JavaScript com Node.js: Criando sua primeira biblioteca"
+kind: lesson
+---
+
+Até aqui você escreveu scripts soltos. Um projeto Node.js de verdade tem um `package.json`, divide o código em módulos, lê arquivos do disco, usa pacotes de terceiros e trata os erros que inevitavelmente acontecem. Neste capítulo você constrói uma biblioteca pequena e completa: ela lê arquivos Markdown, extrai os links e verifica quais estão quebrados. No caminho, aprende o esqueleto que toda API Node.js do resto da carreira vai reaproveitar.
+
+**Você vai aprender:**
+
+- Criar um projeto com `npm init` e entender o `package.json`
+- Organizar código em módulos ES com `import` e `export`
+- Ler arquivos com `fs/promises` usando `async` e `await`
+- Tratar erros com `try`, `catch` e erros com mensagem útil
+- Expor a biblioteca como comando de terminal (CLI) e testá-la
+
+## Criando o projeto
+
+Crie uma pasta e inicialize:
+
+```bash
+mkdir verifica-links && cd verifica-links
+npm init -y
+```
+
+O `npm init -y` gera o `package.json`, o documento de identidade do projeto. Edite-o para ficar assim:
+
+```json
+{
+  "name": "verifica-links",
+  "version": "1.0.0",
+  "description": "Extrai e valida links de arquivos Markdown",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "verifica-links": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
+```
+
+Os campos que importam agora:
+
+| Campo | Para que serve |
+|---|---|
+| `type: "module"` | Faz os arquivos `.js` usarem módulos ES (`import`/`export`) |
+| `main` | O arquivo que é carregado quando alguém importa sua biblioteca |
+| `bin` | Registra um comando de terminal que aponta para um arquivo |
+| `scripts` | Atalhos: `npm start`, `npm test` |
+| `engines` | A versão mínima do Node que o projeto aceita |
+
+Sem `"type": "module"`, o Node trata `.js` como CommonJS, o sistema antigo com `require` e `module.exports`. Você ainda vai encontrar CommonJS em projetos legados; todo código novo desta carreira usa módulos ES.
+
+## Módulos: dividindo o código
+
+Cada arquivo é um módulo com escopo próprio. O que ele quer oferecer, ele exporta; quem quer usar, importa.
+
+Comece pela parte pura da biblioteca, a que recebe texto e devolve links. Crie `src/extrair.js`:
+
+```javascript
+// src/extrair.js
+const REGEX_LINK = /\[([^\[\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+
+export function extrairLinks(texto) {
+  const links = [];
+  for (const [, rotulo, url] of texto.matchAll(REGEX_LINK)) {
+    links.push({ rotulo, url });
+  }
+  return links;
+}
+```
+
+A expressão regular procura o formato `[texto](http...)` do Markdown. Lendo por partes: `\[([^\[\]]+)\]` captura o rótulo entre colchetes, e `\((https?:\/\/[^\s)]+)\)` captura uma URL que começa com `http://` ou `https://` entre parênteses. `matchAll` devolve cada ocorrência com os grupos capturados, e a desestruturação `[, rotulo, url]` ignora o primeiro item (o trecho inteiro).
+
+Teste rapidamente num arquivo `teste-rapido.js` na raiz:
+
+```javascript
+import { extrairLinks } from "./src/extrair.js";
+
+const md = "Leia a [documentação](https://nodejs.org/api/) e o [guia](https://exemplo.com/guia).";
+console.log(extrairLinks(md));
+// [
+//   { rotulo: 'documentação', url: 'https://nodejs.org/api/' },
+//   { rotulo: 'guia', url: 'https://exemplo.com/guia' }
+// ]
+```
+
+Dois detalhes de módulos ES no Node: o caminho relativo **precisa da extensão** (`./src/extrair.js`, não `./src/extrair`), e módulos nativos do Node são importados com o prefixo `node:` (`node:fs/promises`, `node:path`), o que deixa claro que não são pacotes do npm.
+
+### Export nomeado e default
+
+Existem dois tipos de export. O **nomeado** (como acima) é importado com chaves e o mesmo nome. O **default** é um por arquivo e é importado com o nome que você quiser:
+
+```javascript
+// formatar.js
+export default function formatar(link) {
+  return `${link.rotulo} -> ${link.url}`;
+}
+
+// outro arquivo
+import formatar from "./formatar.js";
+```
+
+Prefira exports nomeados: o nome fica igual em todo o projeto, o editor encontra os usos e a busca por texto funciona.
+
+## Lendo arquivos com fs/promises
+
+Ler do disco é lento comparado a uma conta na memória. O Node não para o programa esperando: a leitura devolve uma **Promise**, um objeto que representa um valor que vai chegar. `await` pausa a função até a Promise terminar, sem travar o resto do servidor.
+
+Crie `src/ler.js`:
+
+```javascript
+// src/ler.js
+import { readFile, readdir } from "node:fs/promises";
+import path from "node:path";
+
+export async function lerArquivo(caminho) {
+  return readFile(caminho, "utf8");
+}
+
+export async function listarMarkdown(pasta) {
+  const nomes = await readdir(pasta);
+  return nomes
+    .filter((nome) => nome.endsWith(".md"))
+    .map((nome) => path.join(pasta, nome));
+}
+```
+
+Toda função que usa `await` precisa ser marcada com `async`, e toda função `async` devolve uma Promise. O `"utf8"` faz `readFile` devolver texto em vez de bytes (um `Buffer`). `path.join` monta caminhos com a barra certa para o sistema operacional, então o mesmo código roda no Windows e no Linux.
+
+Evite as versões síncronas (`readFileSync`) em servidores. Elas bloqueiam a única thread do Node: enquanto um arquivo grande é lido, nenhuma outra requisição é atendida. Em scripts de linha de comando, elas são aceitáveis.
+
+## Tratando erros
+
+E se o arquivo não existir? `readFile` rejeita a Promise, e com `await` isso vira uma exceção que você captura com `try`/`catch`:
+
+```javascript
+import { readFile } from "node:fs/promises";
+
+try {
+  const texto = await readFile("nao-existe.md", "utf8");
+  console.log(texto);
+} catch (erro) {
+  console.log(erro.code);    // ENOENT
+  console.log(erro.message); // ENOENT: no such file or directory, open 'nao-existe.md'
+}
+```
+
+Erros do sistema de arquivos têm um `code` padronizado: `ENOENT` (não existe), `EACCES` (sem permissão), `EISDIR` (é uma pasta, não um arquivo). Use o código para transformar o erro técnico numa mensagem útil para quem usa a biblioteca:
+
+```javascript
+// src/erros.js
+export function explicarErro(erro, caminho) {
+  const mensagens = {
+    ENOENT: `Arquivo ou pasta não encontrado: ${caminho}`,
+    EACCES: `Sem permissão para ler: ${caminho}`,
+    EISDIR: `Esperava um arquivo e recebi uma pasta: ${caminho}`,
+  };
+  return new Error(mensagens[erro.code] ?? `Erro ao ler ${caminho}: ${erro.message}`, {
+    cause: erro,
+  });
+}
+```
+
+A opção `cause` guarda o erro original dentro do novo, para quem precisar investigar. É uma boa prática: a mensagem fica amigável sem perder a informação técnica.
+
+<Callout type="warning" title="Promise sem await">
+Chamar uma função `async` sem `await` devolve a Promise, não o valor. `const texto = lerArquivo("a.md")` deixa em `texto` um objeto `Promise { <pending> }`, e um erro de leitura vira "unhandled rejection", que encerra o processo no Node moderno. Se a função é `async`, quem chama precisa de `await` (ou de `.then` e `.catch`).
+</Callout>
+
+## Validando os links
+
+Agora a parte que conversa com a rede. O Node 22 tem `fetch` embutido, o mesmo do navegador. Para cada link, faça uma requisição e anote o status HTTP.
+
+```javascript
+// src/validar.js
+export async function verificarLink(url) {
+  try {
+    const resposta = await fetch(url, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: AbortSignal.timeout(5000),
+    });
+    return { url, status: resposta.status, ok: resposta.ok };
+  } catch (erro) {
+    return { url, status: null, ok: false, erro: erro.name };
+  }
+}
+
+export async function validarLinks(links) {
+  const resultados = await Promise.all(links.map((l) => verificarLink(l.url)));
+  return links.map((link, i) => ({ ...link, ...resultados[i] }));
+}
+```
+
+Pontos importantes:
+
+- `method: "HEAD"` pede só os cabeçalhos, sem baixar a página inteira.
+- `AbortSignal.timeout(5000)` cancela a requisição depois de 5 segundos. Sem isso, um servidor que não responde trava a ferramenta.
+- `Promise.all` dispara todas as requisições ao mesmo tempo e espera todas. Dez links de um segundo cada levam cerca de um segundo, não dez.
+- `verificarLink` nunca rejeita: ela transforma falhas de rede em resultado. Assim um link quebrado não derruba o `Promise.all` inteiro.
+
+## A interface pública
+
+Junte as peças num ponto de entrada, `src/index.js`. É isso que outros projetos importam:
+
+```javascript
+// src/index.js
+import { stat } from "node:fs/promises";
+import { extrairLinks } from "./extrair.js";
+import { lerArquivo, listarMarkdown } from "./ler.js";
+import { validarLinks } from "./validar.js";
+import { explicarErro } from "./erros.js";
+
+export { extrairLinks };
+
+export async function analisar(caminho, { validar = false } = {}) {
+  let arquivos;
+  try {
+    const info = await stat(caminho);
+    arquivos = info.isDirectory() ? await listarMarkdown(caminho) : [caminho];
+  } catch (erro) {
+    throw explicarErro(erro, caminho);
+  }
+
+  const resultado = {};
+  for (const arquivo of arquivos) {
+    const links = extrairLinks(await lerArquivo(arquivo));
+    resultado[arquivo] = validar ? await validarLinks(links) : links;
+  }
+  return resultado;
+}
+```
+
+A assinatura `analisar(caminho, { validar = false } = {})` usa o padrão de objeto de opções com valores padrão que você viu em funções. O `= {}` no fim permite chamar sem o segundo argumento.
+
+## Transformando em comando de terminal
+
+Crie `src/cli.js`. A primeira linha (shebang) diz ao sistema que o arquivo deve ser executado pelo Node:
+
+```javascript
+#!/usr/bin/env node
+// src/cli.js
+import { analisar } from "./index.js";
+
+const [caminho, ...flags] = process.argv.slice(2);
+
+if (!caminho) {
+  console.error("Uso: verifica-links <arquivo-ou-pasta> [--validar]");
+  process.exit(1);
+}
+
+try {
+  const resultado = await analisar(caminho, { validar: flags.includes("--validar") });
+  let quebrados = 0;
+
+  for (const [arquivo, links] of Object.entries(resultado)) {
+    console.log(`\n${arquivo} (${links.length} links)`);
+    for (const link of links) {
+      const marca = link.ok === false ? "QUEBRADO" : link.status ?? "-";
+      if (link.ok === false) quebrados++;
+      console.log(`  [${marca}] ${link.rotulo}: ${link.url}`);
+    }
+  }
+
+  process.exitCode = quebrados > 0 ? 1 : 0;
+} catch (erro) {
+  console.error(erro.message);
+  process.exitCode = 1;
+}
+```
+
+```bash
+node src/cli.js README.md --validar
+```
+
+```text
+Saída:
+README.md (2 links)
+  [200] documentação: https://nodejs.org/api/
+  [QUEBRADO] guia: https://exemplo.invalido/guia
+```
+
+`console.error` escreve na saída de erro, separada da saída normal. O **código de saída** (`exitCode`) é a forma como programas de terminal dizem se deram certo: 0 é sucesso, qualquer outro número é falha. É ele que faz um pipeline de CI parar quando há link quebrado.
+
+Para usar o comando de qualquer pasta, rode `npm link` dentro do projeto. Ele instala o `bin` globalmente apontando para o seu código:
+
+```bash
+npm link
+verifica-links ./docs --validar
+```
+
+## Usando um pacote do npm
+
+Bibliotecas raramente vivem sozinhas. Para colorir a saída, instale um pacote:
+
+```bash
+npm install chalk
+```
+
+Isso adiciona `chalk` em `dependencies` no `package.json`, baixa o código para `node_modules` e cria o `package-lock.json`, que trava as versões exatas instaladas. Faça commit do `package-lock.json` e **nunca** do `node_modules` (coloque-o no `.gitignore`).
+
+```javascript
+import chalk from "chalk";
+console.log(chalk.red("QUEBRADO"), chalk.green("200"));
+```
+
+Pacotes usados só durante o desenvolvimento (ferramentas de teste, lint) vão com `npm install -D`, em `devDependencies`. A versão no `package.json` aparece como `"^5.4.1"`: o `^` aceita atualizações que não mudam o primeiro número, seguindo o versionamento semântico (major.minor.patch).
+
+## Testando com node:test
+
+A parte pura (`extrairLinks`) é a mais fácil de testar. Crie `src/extrair.test.js`:
+
+```javascript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { extrairLinks } from "./extrair.js";
+
+test("extrai rótulo e url", () => {
+  const links = extrairLinks("Veja [o site](https://exemplo.com).");
+  assert.deepEqual(links, [{ rotulo: "o site", url: "https://exemplo.com" }]);
+});
+
+test("ignora links sem http", () => {
+  assert.deepEqual(extrairLinks("[local](./arquivo.md)"), []);
+});
+
+test("texto sem links devolve array vazio", () => {
+  assert.deepEqual(extrairLinks("nada aqui"), []);
+});
+```
+
+```bash
+npm test
+```
+
+O `node --test` encontra sozinho os arquivos terminados em `.test.js`. Repare que separar a extração (pura) da leitura e da rede (impuras) é o que torna esse teste possível sem arquivos nem internet.
+
+## Na entrevista
+
+- **Qual a diferença entre CommonJS e módulos ES?** CommonJS usa `require` e `module.exports`, carrega de forma síncrona e é o formato histórico do Node. Módulos ES usam `import`/`export`, são o padrão da linguagem, permitem `await` no topo do arquivo e são ativados com `"type": "module"` ou extensão `.mjs`.
+- **Para que serve o `package-lock.json`?** Grava a versão exata de cada dependência (inclusive as indiretas), para que todas as máquinas e o servidor instalem exatamente o mesmo código. Use `npm ci` em CI para instalar a partir dele.
+- **Por que evitar `readFileSync` num servidor?** Porque bloqueia o event loop: enquanto lê, o processo não atende nenhuma outra requisição.
+- **Diferença entre `dependencies` e `devDependencies`?** As primeiras são necessárias para rodar em produção; as segundas só para desenvolver e testar, e não são instaladas com `npm install --omit=dev`.
+
+## Pratique
+
+Evolua a biblioteca:
+
+1. Adicione a flag `--json`, que imprime o resultado como JSON formatado (para outros programas consumirem).
+2. Faça `listarMarkdown` procurar também em subpastas (dica: `readdir(pasta, { recursive: true })`).
+3. Limite a validação a 5 requisições simultâneas, processando os links em lotes com o `emLotes` do capítulo de arrays.
+4. Escreva testes para `explicarErro` cobrindo `ENOENT` e um código desconhecido.
+
+Entregue o repositório com README explicando instalação, uso e exemplos de saída.
+
+<Quiz question="Num projeto com type module no package.json, qual import de um arquivo local está correto?" options={["import { f } from './util'","import { f } from './util.js'","const { f } = require('./util.js')","import f from 'util.js'"]} answer={1} explanation="Em módulos ES no Node, caminhos relativos precisam da extensão do arquivo. require é do CommonJS e não existe em módulos ES." />
+<Quiz question="O que acontece ao chamar uma função async sem await e guardar o retorno?" options={["Recebe o valor final normalmente","Recebe uma Promise, não o valor","O programa espera automaticamente","Gera erro de sintaxe"]} answer={1} explanation="Toda função async devolve uma Promise. Sem await, você guarda a Promise pendente, e não o valor que ela vai produzir." />
+<Quiz question="Qual arquivo deve ir para o controle de versão?" options={["node_modules","package-lock.json","Os dois","Nenhum dos dois"]} answer={1} explanation="O package-lock.json garante instalações idênticas. node_modules é gerado a partir dele e vai no .gitignore." />
+
+## Base no CodeForge
+
+- [Promises](/learn/typescript/promises) e [async/await](/learn/typescript/async-await): o modelo assíncrono que este capítulo usa.
+- [Event loop](/learn/typescript/event-loop): por que operações síncronas travam o Node.
+- [Erros](/learn/typescript/erros): tratamento de erros com mais profundidade.
+- [Node.js: Criando uma API Rest com Express e MongoDB](/learn/carreira-nodejs/nodejs-criando-api-rest-express-mongodb): o próximo passo.
+
+## Referências
+
+- [Node.js: Módulos ES](https://nodejs.org/api/esm.html)
+- [Node.js: File system](https://nodejs.org/api/fs.html)
+- [npm: package.json](https://docs.npmjs.com/cli/v10/configuring-npm/package-json)
+- [Node.js: Test runner](https://nodejs.org/api/test.html)

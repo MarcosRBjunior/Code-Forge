@@ -1,0 +1,333 @@
+---
+title: "Integração Contínua: Pipelines e testes automatizados com GitHub Actions"
+kind: lesson
+---
+
+"Na minha máquina funciona" é o sintoma de um time sem integração contínua. Cada pessoa roda (ou esquece de rodar) os testes do seu jeito, e o erro só aparece depois do merge, quando já quebrou o trabalho dos outros. Integração contínua é a prática de integrar mudanças pequenas com frequência, cada uma verificada automaticamente por um pipeline: instala dependências, checa tipos e estilo, roda os testes e bloqueia o merge se algo falhar. Neste capítulo você monta esse pipeline para a API de livros com GitHub Actions, incluindo testes de integração contra um Postgres de verdade.
+
+**Você vai aprender:**
+
+- A anatomia de um workflow: eventos, jobs, steps e runners
+- Escrever testes da API com o test runner nativo do Node e supertest
+- Rodar lint, typecheck e testes com cache e matriz de versões do Node
+- Subir um Postgres como service container para testes de integração
+- Tornar o pipeline obrigatório no pull request com branch protection
+
+## O que é um pipeline de CI
+
+Um pipeline de CI é uma sequência de verificações que roda num ambiente limpo a cada mudança. Limpo é a palavra importante: nada de `node_modules` antigo, variável esquecida no seu shell ou banco com dados de teste de ontem. Se passa ali, passa em qualquer lugar.
+
+As etapas típicas, da mais barata para a mais cara:
+
+1. Instalar dependências exatamente como no lockfile (`npm ci`).
+2. Lint e typecheck: segundos, e pegam muito erro bobo.
+3. Testes unitários: rápidos, sem rede nem banco.
+4. Testes de integração: com banco real, mais lentos.
+5. Build: garante que o artefato de produção é gerado.
+
+Ordenar assim faz o pipeline falhar cedo e barato. O objetivo de tempo para um pipeline de PR é na casa de poucos minutos; se demora meia hora, as pessoas param de esperar por ele.
+
+## Anatomia de um workflow
+
+Workflows são arquivos YAML em `.github/workflows/`. O mínimo:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+```
+
+Os conceitos:
+
+- **`on`**: os eventos que disparam o workflow. Aqui, todo pull request e todo push na `main`.
+- **`jobs`**: unidades que rodam em paralelo por padrão, cada uma numa máquina nova (o runner). `needs` cria dependência entre jobs.
+- **`steps`**: comandos em sequência dentro do job. `uses` chama uma action pronta; `run` executa shell.
+- **`permissions`**: o que o `GITHUB_TOKEN` automático pode fazer. Comece com só leitura e libere por job o que precisar.
+
+O `actions/setup-node` com `cache: npm` guarda o cache do npm entre execuções, chaveado pelo `package-lock.json`. Isso costuma cortar a instalação de um minuto para poucos segundos.
+
+## Testes que o pipeline vai rodar
+
+Para que a API seja testável sem subir um servidor de verdade, separe a criação do app da chamada a `listen`:
+
+```javascript
+// src/app.js
+import express from "express";
+
+export function criarApp(repo) {
+  const app = express();
+  app.use(express.json());
+
+  app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+  app.get("/livros", async (req, res) => {
+    res.json(await repo.listar());
+  });
+
+  app.post("/livros", async (req, res) => {
+    const { titulo, autor } = req.body ?? {};
+    if (!titulo || !autor) {
+      return res.status(400).json({ erro: "titulo e autor são obrigatórios" });
+    }
+    res.status(201).json(await repo.criar({ titulo, autor }));
+  });
+
+  return app;
+}
+```
+
+Os testes unitários usam um repositório em memória e o test runner nativo do Node (`node:test`), sem dependência extra além do `supertest`:
+
+```javascript
+// test/livros.test.js
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import request from "supertest";
+import { criarApp } from "../src/app.js";
+
+function repoEmMemoria() {
+  const livros = [];
+  return {
+    listar: async () => livros,
+    criar: async (dados) => {
+      const livro = { id: livros.length + 1, ...dados };
+      livros.push(livro);
+      return livro;
+    },
+  };
+}
+
+test("POST /livros cria um livro", async () => {
+  const app = criarApp(repoEmMemoria());
+  const res = await request(app).post("/livros").send({ titulo: "Dom Casmurro", autor: "Machado de Assis" });
+  assert.equal(res.status, 201);
+  assert.equal(res.body.id, 1);
+});
+
+test("POST /livros sem autor devolve 400", async () => {
+  const app = criarApp(repoEmMemoria());
+  const res = await request(app).post("/livros").send({ titulo: "Sem autor" });
+  assert.equal(res.status, 400);
+});
+```
+
+E os scripts no `package.json`, que o pipeline e você usam do mesmo jeito:
+
+```json
+{
+  "type": "module",
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node --test test/",
+    "test:integracao": "node --test test-integracao/",
+    "test:cobertura": "node --test --experimental-test-coverage test/"
+  }
+}
+```
+
+Regra de ouro: o pipeline só chama scripts do `package.json`. Se a lógica de teste vive no YAML, ninguém consegue reproduzi-la localmente.
+
+## Pipeline completo: lint, matriz e integração
+
+Agora o workflow real, com três jobs: verificação rápida, testes unitários em mais de uma versão do Node, e integração com Postgres.
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verificacao:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  unitarios:
+    needs: verificacao
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  integracao:
+    needs: verificacao
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: livros
+          POSTGRES_PASSWORD: livros
+          POSTGRES_DB: livros_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U livros"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://livros:livros@localhost:5432/livros_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run db:migrate
+      - run: npm run test:integracao
+```
+
+O que cada parte resolve:
+
+- **`concurrency`** com `cancel-in-progress` cancela a execução anterior do mesmo branch quando chega um push novo. Sem isso, três pushes seguidos rodam três pipelines inteiros.
+- **`matrix`** roda o mesmo job em Node 22 e 24 em paralelo. `fail-fast: false` deixa as duas terminarem, para você ver se a falha é só numa versão.
+- **`services`** sobe o Postgres como contêiner ao lado do runner. As `options` com `--health-cmd` fazem o job esperar o banco aceitar conexões antes do primeiro step.
+- **`timeout-minutes`** evita que um teste travado consuma seis horas de runner (o limite padrão).
+
+O teste de integração usa o banco de verdade, e cada teste limpa o que criou:
+
+```javascript
+// test-integracao/livros-pg.test.js
+import { test, after, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import pg from "pg";
+import request from "supertest";
+import { criarApp } from "../src/app.js";
+import { repoPostgres } from "../src/repo-postgres.js";
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const app = criarApp(repoPostgres(pool));
+
+beforeEach(() => pool.query("TRUNCATE livros RESTART IDENTITY"));
+after(() => pool.end());
+
+test("livro criado aparece na listagem", async () => {
+  await request(app).post("/livros").send({ titulo: "Vidas Secas", autor: "Graciliano Ramos" }).expect(201);
+  const res = await request(app).get("/livros").expect(200);
+  assert.deepEqual(res.body.map((l) => l.titulo), ["Vidas Secas"]);
+});
+```
+
+<Callout type="warning" title="Teste que passa sozinho e falha no CI">
+O motivo mais comum é dependência de estado: um teste conta com dados que outro criou, ou com a ordem de execução, ou com o fuso horário da sua máquina. No CI tudo começa do zero, roda em UTC e às vezes em paralelo. Cada teste deve preparar e limpar os próprios dados. E nunca aponte o pipeline para um banco compartilhado: use o service container, que nasce e morre com o job.
+</Callout>
+
+## Artefatos e relatórios
+
+Quando um teste falha, você quer mais do que o log. Salve relatórios como artefatos, inclusive em caso de falha:
+
+```yaml
+      - run: npm run test:cobertura -- --test-reporter=spec --test-reporter=lcov --test-reporter-destination=stdout --test-reporter-destination=lcov.info
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cobertura-node-${{ matrix.node }}
+          path: lcov.info
+          retention-days: 7
+```
+
+O `if: always()` faz o step rodar mesmo se o anterior falhou. O nome inclui a versão da matriz porque dois jobs não podem subir artefatos com o mesmo nome.
+
+## Tornando o pipeline obrigatório
+
+Um pipeline que pode ser ignorado é sugestão. Em Settings, Branches (ou Rules, nos rulesets), proteja a `main`:
+
+- Exigir pull request antes do merge.
+- Exigir que os checks `verificacao`, `unitarios (22)`, `unitarios (24)` e `integracao` passem.
+- Exigir que o branch esteja atualizado com a `main` antes do merge.
+
+A partir daí, nada entra na `main` sem passar pelo pipeline. Esse é o contrato que permite, nos próximos capítulos, publicar automaticamente tudo o que chega na `main`.
+
+O próprio CodeForge segue esse modelo: o job `test` de `.github/workflows/azure.yml` roda typecheck, lint e as suítes de teste em todo PR, com o banco substituído por um Postgres em memória (PGlite), e o job de deploy só roda com `needs: test` em push na `main`.
+
+## Segredos e PRs de forks
+
+Testes que precisam de credenciais usam `secrets`, configurados no repositório e lidos com `${{ secrets.NOME }}`. Dois cuidados:
+
+- Segredos não são entregues a workflows disparados por `pull_request` vindo de fork. É uma proteção: senão, qualquer pessoa abriria um PR que imprime suas chaves. Projete os testes de PR para não precisarem de segredo (como o service container acima).
+- Evite `pull_request_target` para rodar código do PR: ele roda com segredos e permissões do repositório base, e combinado com checkout do código do PR é uma porta de entrada clássica de ataques.
+
+## Na entrevista
+
+**O que é integração contínua?** Integrar mudanças pequenas com frequência na branch principal, cada uma validada automaticamente por build e testes, para detectar problemas cedo.
+
+**Como deixar um pipeline rápido?** Cache de dependências, jobs em paralelo, falhar cedo com lint antes dos testes caros, `concurrency` para cancelar execuções obsoletas.
+
+**Como testar contra banco de dados no CI?** Service container com o mesmo banco de produção, migrações aplicadas no início, e cada teste isolando os próprios dados.
+
+**Por que a lógica deve ficar no package.json e não no YAML?** Para qualquer pessoa reproduzir localmente exatamente o que o pipeline roda, e trocar de ferramenta de CI sem reescrever tudo.
+
+## Pratique
+
+No repositório da API de livros, entregue:
+
+1. `src/app.js` separado do `listen`, com testes unitários em `node:test` e supertest.
+2. Um teste de integração contra Postgres que roda no CI com service container.
+3. O workflow `ci.yml` com lint, matriz Node 22 e 24, integração, `concurrency` e `timeout-minutes`.
+4. Branch protection na `main` exigindo os checks. Abra um PR com um teste quebrado de propósito e mostre o merge bloqueado.
+
+<Quiz question="Para que serve o bloco concurrency com cancel-in-progress num workflow de PR?" options={["Rodar jobs da matriz em paralelo","Cancelar a execução anterior do mesmo branch quando chega um push novo","Limitar o número de runners da organização","Impedir dois PRs de fazerem merge ao mesmo tempo"]} answer={1} explanation="O grupo de concorrência por ref garante uma execução por branch; a mais antiga é cancelada para não desperdiçar tempo em código já desatualizado." />
+<Quiz question="Qual a forma recomendada de ter um Postgres nos testes de integração do GitHub Actions?" options={["Apontar para o banco de staging com um segredo","Instalar o Postgres com apt em cada step","Usar um service container com health check","Usar um banco SQLite no lugar"]} answer={2} explanation="O service container é isolado, nasce e morre com o job, usa a mesma engine de produção e o health check garante que está pronto." />
+<Quiz question="Um workflow disparado por pull_request vindo de um fork tenta ler um segredo do repositório. O que acontece?" options={["O segredo chega vazio, por segurança","O segredo é entregue normalmente","O workflow falha antes de começar","O GitHub pede aprovação do dono do segredo"]} answer={0} explanation="Segredos não são passados a workflows de pull_request originados de forks, para que um PR malicioso não consiga extraí-los." />
+
+## Base no CodeForge
+
+- [CI/CD](/learn/system-design/ci-cd): os conceitos de integração e entrega contínuas.
+- [GitHub Action customizável](/learn/projetos-portfolio/github-action): construir a sua própria action.
+- [Node.js: Melhorando o fluxo de desenvolvimento e integração de sua equipe](/learn/carreira-nodejs/nodejs-melhorando-fluxo-desenvolvimento-integracao-equipe): lint, formatação e hooks locais que o pipeline reforça.
+
+## Referências
+
+- [GitHub Actions: Workflow syntax](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions)
+- [Creating PostgreSQL service containers](https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/creating-postgresql-service-containers)
+- [Node.js: Test runner](https://nodejs.org/api/test.html)

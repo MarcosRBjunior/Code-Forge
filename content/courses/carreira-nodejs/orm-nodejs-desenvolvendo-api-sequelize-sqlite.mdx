@@ -1,0 +1,387 @@
+---
+title: "ORM com Node.js: Desenvolvendo uma API com Sequelize e SQLite"
+kind: lesson
+---
+
+Toda API que guarda dados precisa traduzir linhas de tabela em objetos do JavaScript e o contrário. Escrever esse SQL à mão em cada rota funciona no começo, mas logo você repete `INSERT` e `SELECT` por todo lado, esquece de escapar um valor e não sabe mais qual versão do esquema está em produção. Um ORM (Object-Relational Mapper) resolve isso: você descreve as tabelas como modelos, ele gera o SQL e cuida das migrações. Neste capítulo você monta uma API de livros com Express 5, Sequelize 6 e SQLite, o banco mais simples possível para começar.
+
+**Você vai aprender:**
+
+- O que um ORM faz e quando ele ajuda (ou atrapalha)
+- Conectar o Sequelize ao SQLite e definir modelos com validação
+- Versionar o esquema com migrações e popular dados com seeders
+- Montar um CRUD completo com controllers e tratamento de erros do ORM
+
+## O que é um ORM
+
+Banco relacional fala em tabelas, linhas e colunas. JavaScript fala em objetos e arrays. O ORM fica no meio: cada **modelo** representa uma tabela, cada **instância** representa uma linha e os métodos do modelo (`findAll`, `create`, `update`) viram SQL.
+
+| Abordagem | Exemplo | Quando faz sentido |
+|---|---|---|
+| SQL puro | `db.query('SELECT ...')` | Consultas complexas, relatórios, controle total |
+| Query builder | Knex, Kysely | Quer SQL composto em código, sem modelos |
+| ORM | Sequelize, Prisma, TypeORM | CRUD, relacionamentos, validação e migrações num lugar só |
+
+O ORM não substitui saber SQL. Ele economiza código repetitivo, mas você continua precisando entender índices, joins e transações para saber o que ele está gerando. Por isso vale ligar o log de SQL durante o desenvolvimento.
+
+O SQLite guarda o banco inteiro num arquivo, não tem servidor para instalar e é suportado pelo Sequelize. É ótimo para aprender e para testes. Como o Sequelize abstrai o dialeto, trocar para PostgreSQL depois é mudar a configuração de conexão e instalar o driver `pg`.
+
+## Montando o projeto
+
+```bash
+mkdir api-livros && cd api-livros
+npm init -y
+npm pkg set type=module
+npm install express sequelize sqlite3
+npm install -D sequelize-cli
+```
+
+O pacote `sqlite3` é o driver que o Sequelize usa por baixo. O `sequelize-cli` gera e executa migrações. A estrutura que você vai construir:
+
+```text
+api-livros/
+  .sequelizerc
+  src/
+    app.js
+    server.js
+    database/
+      config.cjs
+      index.js
+      migrations/
+      seeders/
+    models/
+      Livro.js
+    controllers/
+      LivroController.js
+    routes/
+      livros.js
+```
+
+## Conectando ao banco
+
+A instância `Sequelize` representa a conexão. Para o SQLite, basta dizer o dialeto e o caminho do arquivo.
+
+```javascript
+// src/database/index.js
+import { Sequelize } from "sequelize";
+
+export const sequelize = new Sequelize({
+  dialect: "sqlite",
+  storage: process.env.DB_STORAGE ?? "./database.sqlite",
+  logging: process.env.NODE_ENV === "development" ? console.log : false,
+});
+
+export async function conectar() {
+  await sequelize.authenticate();
+  console.log("Banco conectado");
+}
+```
+
+`authenticate()` executa uma consulta simples e rejeita a Promise se a conexão falhar. Chame no início do servidor para descobrir o problema na hora, não na primeira requisição.
+
+## Definindo o modelo
+
+Um modelo descreve colunas, tipos e regras. Com classes, você estende `Model` e chama `init`.
+
+```javascript
+// src/models/Livro.js
+import { DataTypes, Model } from "sequelize";
+import { sequelize } from "../database/index.js";
+
+export class Livro extends Model {}
+
+Livro.init(
+  {
+    titulo: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      validate: {
+        notEmpty: { msg: "O título é obrigatório" },
+        len: { args: [2, 200], msg: "O título deve ter entre 2 e 200 caracteres" },
+      },
+    },
+    autor: { type: DataTypes.STRING, allowNull: false },
+    paginas: {
+      type: DataTypes.INTEGER,
+      validate: { min: { args: [1], msg: "Páginas deve ser positivo" } },
+    },
+    preco: { type: DataTypes.DECIMAL(10, 2), allowNull: false, defaultValue: 0 },
+    isbn: { type: DataTypes.STRING(13), unique: true },
+  },
+  { sequelize, modelName: "Livro", tableName: "livros" },
+);
+```
+
+Alguns detalhes que importam:
+
+- **`id`, `createdAt` e `updatedAt`** são criados automaticamente. Você não precisa declarar.
+- **`allowNull: false`** vira `NOT NULL` no banco e também é checado pelo Sequelize antes de enviar o SQL.
+- **`validate`** roda só no JavaScript, antes do `INSERT` ou `UPDATE`. Regras como `len`, `min`, `isEmail` e `notEmpty` já vêm prontas, e você pode passar mensagens próprias com `msg`.
+- **`unique: true`** é uma restrição do banco. Quem barra a duplicata é o SQLite, e o erro volta como `UniqueConstraintError`.
+
+## Migrações: o esquema versionado
+
+O modelo diz como o JavaScript enxerga a tabela. A **migração** é o script que cria ou altera a tabela de verdade, e fica versionada no Git junto com o código. Cada migração tem um `up` (aplicar) e um `down` (desfazer), e o Sequelize registra quais já rodaram na tabela `SequelizeMeta`.
+
+Primeiro, diga ao CLI onde ficam as coisas com um `.sequelizerc` na raiz:
+
+```javascript
+// .sequelizerc
+const path = require("node:path");
+
+module.exports = {
+  config: path.resolve("src", "database", "config.cjs"),
+  "migrations-path": path.resolve("src", "database", "migrations"),
+  "seeders-path": path.resolve("src", "database", "seeders"),
+  "models-path": path.resolve("src", "models"),
+};
+```
+
+```javascript
+// src/database/config.cjs
+module.exports = {
+  development: { dialect: "sqlite", storage: "./database.sqlite" },
+  test: { dialect: "sqlite", storage: ":memory:" },
+  production: { dialect: "sqlite", storage: process.env.DB_STORAGE },
+};
+```
+
+Agora gere a migração:
+
+```bash
+npx sequelize-cli migration:generate --name criar-livros
+```
+
+O CLI cria um arquivo com data no nome, como `20261113120000-criar-livros.js`. Como o projeto usa `"type": "module"`, renomeie para `.cjs` (o CLI aceita essa extensão) e escreva:
+
+```javascript
+// src/database/migrations/20261113120000-criar-livros.cjs
+"use strict";
+
+module.exports = {
+  async up(queryInterface, Sequelize) {
+    await queryInterface.createTable("livros", {
+      id: { type: Sequelize.INTEGER, autoIncrement: true, primaryKey: true, allowNull: false },
+      titulo: { type: Sequelize.STRING, allowNull: false },
+      autor: { type: Sequelize.STRING, allowNull: false },
+      paginas: { type: Sequelize.INTEGER },
+      preco: { type: Sequelize.DECIMAL(10, 2), allowNull: false, defaultValue: 0 },
+      isbn: { type: Sequelize.STRING(13), unique: true },
+      createdAt: { type: Sequelize.DATE, allowNull: false },
+      updatedAt: { type: Sequelize.DATE, allowNull: false },
+    });
+  },
+
+  async down(queryInterface) {
+    await queryInterface.dropTable("livros");
+  },
+};
+```
+
+```bash
+npx sequelize-cli db:migrate          # aplica as pendentes
+npx sequelize-cli db:migrate:status   # mostra o que já rodou
+npx sequelize-cli db:migrate:undo     # desfaz a última
+```
+
+Precisa de uma coluna nova depois? Não edite a migração antiga, que já rodou em outras máquinas. Crie outra com `queryInterface.addColumn("livros", "editora", { type: Sequelize.STRING })` e o `removeColumn` correspondente no `down`.
+
+### Seeders
+
+Seeders inserem dados de exemplo para desenvolvimento.
+
+```bash
+npx sequelize-cli seed:generate --name livros-iniciais
+```
+
+```javascript
+// src/database/seeders/20261113121000-livros-iniciais.cjs
+module.exports = {
+  async up(queryInterface) {
+    const agora = new Date();
+    await queryInterface.bulkInsert("livros", [
+      { titulo: "Dom Casmurro", autor: "Machado de Assis", paginas: 256, preco: 39.9, createdAt: agora, updatedAt: agora },
+      { titulo: "Vidas Secas", autor: "Graciliano Ramos", paginas: 176, preco: 44.5, createdAt: agora, updatedAt: agora },
+    ]);
+  },
+  async down(queryInterface) {
+    await queryInterface.bulkDelete("livros", null, {});
+  },
+};
+```
+
+```bash
+npx sequelize-cli db:seed:all
+```
+
+<Callout type="warning" title="sync() não é migração">
+`sequelize.sync()` cria tabelas a partir dos modelos, e `sync({ alter: true })` tenta ajustar colunas comparando com o modelo. Parece prático, mas não deixa histórico, não tem `down` e pode apagar dados ao recriar uma coluna. Use `sync` só em testes com banco em memória. Em desenvolvimento compartilhado e em produção, o esquema muda apenas por migração.
+</Callout>
+
+## O CRUD com controllers
+
+Com o modelo pronto, cada operação vira uma linha de Sequelize. Um controller agrupa os handlers de um recurso.
+
+```javascript
+// src/controllers/LivroController.js
+import { Op } from "sequelize";
+import { Livro } from "../models/Livro.js";
+
+export class LivroController {
+  static async listar(req, res) {
+    const { autor } = req.query;
+    const where = autor ? { autor: { [Op.like]: `%${autor}%` } } : {};
+    const livros = await Livro.findAll({ where, order: [["titulo", "ASC"]] });
+    res.json(livros);
+  }
+
+  static async buscar(req, res) {
+    const livro = await Livro.findByPk(req.params.id);
+    if (!livro) return res.status(404).json({ erro: "Livro não encontrado" });
+    res.json(livro);
+  }
+
+  static async criar(req, res) {
+    const { titulo, autor, paginas, preco, isbn } = req.body;
+    const livro = await Livro.create({ titulo, autor, paginas, preco, isbn });
+    res.status(201).json(livro);
+  }
+
+  static async atualizar(req, res) {
+    const livro = await Livro.findByPk(req.params.id);
+    if (!livro) return res.status(404).json({ erro: "Livro não encontrado" });
+    const { titulo, autor, paginas, preco } = req.body;
+    await livro.update({ titulo, autor, paginas, preco });
+    res.json(livro);
+  }
+
+  static async remover(req, res) {
+    const removidos = await Livro.destroy({ where: { id: req.params.id } });
+    if (removidos === 0) return res.status(404).json({ erro: "Livro não encontrado" });
+    res.status(204).end();
+  }
+}
+```
+
+Repare que `criar` e `atualizar` desestruturam só os campos permitidos em vez de passar `req.body` inteiro. Isso evita **mass assignment**: alguém mandar `{ "id": 1 }` ou um campo interno que você não queria expor. Outra forma é passar `{ fields: ["titulo", "autor"] }` como segundo argumento de `create`.
+
+O `Op.like` com template string parece perigoso, mas não é: o Sequelize envia o valor como parâmetro, não concatena no SQL. Injeção de SQL só volta a ser risco se você usar `sequelize.query` com strings montadas à mão.
+
+### Rotas e app
+
+```javascript
+// src/routes/livros.js
+import { Router } from "express";
+import { LivroController } from "../controllers/LivroController.js";
+
+export const livrosRouter = Router()
+  .get("/", LivroController.listar)
+  .get("/:id", LivroController.buscar)
+  .post("/", LivroController.criar)
+  .put("/:id", LivroController.atualizar)
+  .delete("/:id", LivroController.remover);
+```
+
+```javascript
+// src/app.js
+import express from "express";
+import { ValidationError, UniqueConstraintError } from "sequelize";
+import { livrosRouter } from "./routes/livros.js";
+
+export const app = express();
+app.use(express.json());
+app.use("/livros", livrosRouter);
+
+// Middleware de erro: quatro parâmetros
+app.use((err, req, res, next) => {
+  if (err instanceof UniqueConstraintError) {
+    return res.status(409).json({ erro: "Registro duplicado", campos: Object.keys(err.fields) });
+  }
+  if (err instanceof ValidationError) {
+    return res.status(400).json({ erros: err.errors.map((e) => ({ campo: e.path, mensagem: e.message })) });
+  }
+  console.error(err);
+  res.status(500).json({ erro: "Erro interno" });
+});
+```
+
+```javascript
+// src/server.js
+import { app } from "./app.js";
+import { conectar } from "./database/index.js";
+
+await conectar();
+const porta = Number(process.env.PORT ?? 3000);
+app.listen(porta, () => console.log(`API em http://localhost:${porta}`));
+```
+
+No Express 5, se um handler `async` rejeitar, o erro vai direto para o middleware de erro. Não precisa de `try/catch` em cada rota nem de pacotes como `express-async-errors`. A ordem dos `if` importa: `UniqueConstraintError` é subclasse de `ValidationError`, então precisa ser testada antes.
+
+Teste com curl:
+
+```bash
+curl -X POST localhost:3000/livros -H "Content-Type: application/json" \
+  -d '{"titulo":"O Cortiço","autor":"Aluísio Azevedo","paginas":304,"preco":29.9}'
+curl "localhost:3000/livros?autor=Machado"
+curl -X POST localhost:3000/livros -H "Content-Type: application/json" -d '{"titulo":"X"}'
+# 400 com a lista de campos inválidos
+```
+
+## Instância versus modelo
+
+Uma confusão comum: métodos estáticos operam na tabela, métodos de instância operam numa linha já carregada.
+
+```javascript
+// Estático: um UPDATE direto, devolve o número de linhas afetadas
+const [afetadas] = await Livro.update({ preco: 50 }, { where: { autor: "Machado de Assis" } });
+
+// Instância: carrega, altera e salva só o que mudou
+const livro = await Livro.findByPk(1);
+livro.preco = 55;
+await livro.save();
+
+// Para mandar para o cliente, toJSON() já é chamado pelo res.json
+console.log(livro.toJSON());
+```
+
+`Livro.update` com `where` é uma única consulta, bom para atualizar em lote. Já o caminho da instância roda as validações do modelo e os hooks de instância. Escolha conforme precisa de validação ou de desempenho.
+
+## Na entrevista
+
+**Qual a diferença entre migração e `sync`?** A migração é um script versionado com `up` e `down`, aplicado em ordem e registrado no banco. O `sync` deriva o esquema dos modelos sem histórico e pode perder dados; serve para testes.
+
+**Onde fica a validação: no modelo ou no banco?** Nos dois, com papéis diferentes. A validação do modelo dá mensagens amigáveis e evita viagens ao banco. As restrições do banco (`NOT NULL`, `UNIQUE`, chaves estrangeiras) são a última linha de defesa, porque valem também para scripts e outros serviços que não passam pelo ORM.
+
+**ORM evita SQL injection?** Os métodos do ORM usam consultas parametrizadas, então sim, desde que você não monte SQL cru com concatenação em `sequelize.query`. Nesse caso use `replacements` ou `bind`.
+
+**Quando você não usaria um ORM?** Em relatórios pesados, consultas com funções de janela ou otimizações finas. Dá para combinar: ORM no CRUD e SQL cru nos pontos críticos.
+
+## Pratique
+
+Monte a API de livros deste capítulo e entregue:
+
+1. Migração inicial e uma segunda migração que adiciona a coluna `editora`.
+2. Seeder com pelo menos cinco livros.
+3. Rotas de CRUD com validação de título, preço não negativo e ISBN único (409 em duplicata).
+4. Filtro por faixa de preço em `GET /livros?precoMin=20&precoMax=50` usando `Op.between` ou `Op.gte` e `Op.lte`.
+5. Um README com os comandos para migrar, popular e subir a API.
+
+<Quiz question="Você precisa adicionar a coluna editora em produção. O que fazer?" options={["Editar a migração que criou a tabela","Criar uma nova migração com addColumn","Rodar sequelize.sync com alter true","Alterar só o modelo Livro"]} answer={1} explanation="Migrações já aplicadas não são editadas. Uma nova migração com addColumn e removeColumn no down mantém o histórico consistente em todas as máquinas." />
+
+<Quiz question="Por que o middleware de erro testa UniqueConstraintError antes de ValidationError?" options={["Porque é mais comum acontecer","Porque UniqueConstraintError herda de ValidationError","Porque o Express exige essa ordem","Porque ValidationError não tem campos"]} answer={1} explanation="UniqueConstraintError é subclasse de ValidationError. Se o teste genérico vier antes, a duplicata seria respondida como 400 em vez de 409." />
+
+<Quiz question="O que acontece com um handler async que rejeita no Express 5?" options={["A requisição fica pendurada","O processo encerra","O erro vai para o middleware de erro","O Express responde 404"]} answer={2} explanation="O Express 5 captura Promises rejeitadas dos handlers e chama next com o erro, levando ao middleware de quatro parâmetros." />
+
+## Base no CodeForge
+
+- [Modelo relacional](/learn/sql/modelo-relacional) e [Tipos e restrições](/learn/sql/tipos-e-restricoes): o que as colunas e restrições do modelo viram no banco.
+- [Migrações de schema](/learn/system-design/migracoes-de-schema): como mudar esquema sem derrubar a aplicação.
+- [Node.js: Criando uma API Rest com Express e MongoDB](/learn/carreira-nodejs/nodejs-criando-api-rest-express-mongodb): a mesma API com banco de documentos.
+- [ORM com Node.js: Avançando nas funcionalidades do Sequelize](/learn/carreira-nodejs/orm-nodejs-avancando-funcionalidades-sequelize): o próximo passo, com associações e transações.
+
+## Referências
+
+- [Sequelize: Getting Started](https://sequelize.org/docs/v6/getting-started/)
+- [Sequelize: Model Basics](https://sequelize.org/docs/v6/core-concepts/model-basics/)
+- [Sequelize: Migrations](https://sequelize.org/docs/v6/other-topics/migrations/)
+- [Express: Error Handling](https://expressjs.com/en/guide/error-handling.html)
