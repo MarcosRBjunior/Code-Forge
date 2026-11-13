@@ -1,0 +1,283 @@
+---
+title: "Amazon EC2: Alta disponibilidade e escalabilidade em uma aplicação"
+kind: lesson
+---
+
+Uma API rodando numa única instância EC2 cai junto com ela: basta uma atualização do sistema, um disco cheio ou uma falha na zona de disponibilidade. E quando o tráfego dobra numa promoção, essa instância também não cresce sozinha. Alta disponibilidade e escalabilidade na AWS se resolvem com a mesma receita: várias instâncias iguais, espalhadas por zonas diferentes, atrás de um balanceador, com um grupo que cria e destrói máquinas conforme a carga.
+
+**Você vai aprender:**
+
+- Por que a escala horizontal exige uma aplicação sem estado
+- Como montar launch template, target group e Application Load Balancer
+- Como criar um Auto Scaling group em várias zonas com health check do balanceador
+- Como configurar políticas de escala e trocar a versão sem derrubar a API
+- Como fazer o Node.js encerrar com elegância quando a instância sai do grupo
+
+## Vertical, horizontal e o que muda na aplicação
+
+Escalar **verticalmente** é trocar a instância por uma maior (de `t3.small` para `m7i.large`, por exemplo). É simples, mas tem teto, exige reiniciar a máquina e não resolve a disponibilidade: continua existindo um ponto único de falha. Escalar **horizontalmente** é adicionar mais instâncias iguais. Não tem teto prático e, de quebra, uma instância a mais numa zona diferente já protege contra a queda de uma delas.
+
+O preço da escala horizontal é uma regra para o código: **nenhuma instância pode guardar algo que as outras precisem**. Sessão em memória, upload salvo em disco local, cache que precisa ser consistente, tarefas agendadas com `setInterval` que rodariam duplicadas. Tudo isso tem de sair da instância:
+
+| Estado | Onde fica numa arquitetura escalável |
+|---|---|
+| Sessão do usuário | Token assinado (JWT) ou Redis (ElastiCache) |
+| Arquivos enviados | S3 |
+| Dados da aplicação | RDS ou DynamoDB |
+| Cache compartilhado | ElastiCache |
+| Tarefas agendadas | EventBridge Scheduler chamando uma rota ou uma fila |
+
+Também é preciso um endpoint que diga se a instância está apta a receber tráfego. O balanceador vai chamá-lo a cada poucos segundos.
+
+```javascript
+// src/server.js
+import express from "express";
+import { pool } from "./db.js";
+
+const app = express();
+let encerrando = false;
+
+app.get("/health", async (req, res) => {
+  if (encerrando) return res.status(503).json({ ok: false });
+  try {
+    await pool.query("SELECT 1");
+    res.json({ ok: true, instancia: process.env.INSTANCE_ID ?? "local" });
+  } catch {
+    res.status(503).json({ ok: false });
+  }
+});
+
+app.get("/livros", async (req, res) => {
+  const { rows } = await pool.query("SELECT id, titulo FROM livros LIMIT 50");
+  res.json(rows);
+});
+
+export const server = app.listen(3000, () => console.log("API na porta 3000"));
+
+// chamada no SIGTERM: o /health passa a responder 503
+export function iniciarEncerramento() {
+  encerrando = true;
+}
+```
+
+Decida com cuidado o que o health check testa. Verificar o banco é útil para detectar uma instância que perdeu a conexão, mas se o banco cair, **todas** as instâncias ficam doentes ao mesmo tempo e o Auto Scaling passa a substituí-las em loop sem resolver nada. Uma alternativa comum é um `/health` leve (só o processo) para o balanceador e um `/health/deep` separado para o monitoramento.
+
+## As peças: AMI, launch template e user data
+
+Cada instância nova do grupo nasce de um **launch template**: AMI, tipo de instância, security group, perfil IAM e o script de inicialização (user data). Existem dois estilos:
+
+- **AMI pronta (golden image):** a imagem já tem Node.js e a aplicação. A instância sobe em segundos. Você gera uma AMI nova a cada versão (com Packer ou pela própria AWS).
+- **AMI genérica com user data:** a instância instala ou baixa tudo no primeiro boot. Mais simples de começar, mas cada instância demora mais para ficar pronta, o que atrasa a reação a picos.
+
+Um meio-termo prático: AMI com Node.js 22 já instalado e um user data que só baixa o pacote da versão do S3 e liga o serviço.
+
+```bash
+#!/bin/bash
+# user-data.sh: roda como root no primeiro boot
+set -euo pipefail
+VERSAO="1.4.0"
+mkdir -p /opt/livros-api
+aws s3 cp "s3://livros-releases/livros-api-${VERSAO}.tgz" /tmp/app.tgz
+tar -xzf /tmp/app.tgz -C /opt/livros-api
+cd /opt/livros-api && npm ci --omit=dev
+
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+echo "INSTANCE_ID=${INSTANCE_ID}" >> /etc/livros-api.env
+
+systemctl enable --now livros-api
+```
+
+O `aws s3 cp` funciona sem chave de acesso porque a instância recebe um **perfil IAM** com permissão de leitura no bucket. Nunca coloque `AWS_ACCESS_KEY_ID` no user data: qualquer um com acesso ao console ou à API de metadados consegue ler esse script.
+
+No launch template, o user data vai codificado em base64:
+
+```bash
+cat > lt.json <<EOF
+{
+  "ImageId": "ami-0123456789abcdef0",
+  "InstanceType": "t3.small",
+  "IamInstanceProfile": { "Name": "livros-api" },
+  "SecurityGroupIds": ["sg-0app000000000000"],
+  "MetadataOptions": { "HttpTokens": "required" },
+  "UserData": "$(base64 -w0 user-data.sh)"
+}
+EOF
+
+aws ec2 create-launch-template \
+  --launch-template-name livros-api \
+  --version-description "v1.4.0" \
+  --launch-template-data file://lt.json
+```
+
+`HttpTokens: required` obriga o uso do IMDSv2 (o fluxo com token que o script usa), o que fecha uma classe inteira de ataques de SSRF contra a API de metadados.
+
+## Target group e Application Load Balancer
+
+O **Application Load Balancer** (ALB) recebe o tráfego HTTP numa porta pública e distribui entre os alvos de um **target group**. O target group é quem define o health check.
+
+```bash
+TG_ARN=$(aws elbv2 create-target-group \
+  --name livros-tg --protocol HTTP --port 3000 \
+  --vpc-id vpc-0abc0000000000000 \
+  --health-check-path /health \
+  --health-check-interval-seconds 15 \
+  --healthy-threshold-count 2 --unhealthy-threshold-count 3 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+ALB_ARN=$(aws elbv2 create-load-balancer \
+  --name livros-alb --type application \
+  --subnets subnet-0pubA000000000000 subnet-0pubB000000000000 \
+  --security-groups sg-0alb000000000000 \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+
+aws elbv2 create-listener --load-balancer-arn "$ALB_ARN" \
+  --protocol HTTP --port 80 \
+  --default-actions Type=forward,TargetGroupArn="$TG_ARN"
+
+# tempo que o ALB espera as requisições em andamento antes de tirar o alvo
+aws elbv2 modify-target-group-attributes --target-group-arn "$TG_ARN" \
+  --attributes Key=deregistration_delay.timeout_seconds,Value=30
+```
+
+Repare nas duas subnets em zonas diferentes: o ALB exige pelo menos duas. Em produção, o listener seria HTTPS na porta 443 com um certificado do ACM, e a porta 80 só redirecionaria. O security group das instâncias deve aceitar a porta 3000 **apenas** a partir do security group do ALB, nunca da internet.
+
+## Auto Scaling group em várias zonas
+
+O **Auto Scaling group** (ASG) mantém o número de instâncias entre um mínimo e um máximo, distribuídas pelas subnets informadas.
+
+```bash
+aws autoscaling create-auto-scaling-group \
+  --auto-scaling-group-name livros-asg \
+  --launch-template 'LaunchTemplateName=livros-api,Version=$Latest' \
+  --min-size 2 --max-size 6 --desired-capacity 2 \
+  --vpc-zone-identifier "subnet-0privA00000000000,subnet-0privB00000000000" \
+  --target-group-arns "$TG_ARN" \
+  --health-check-type ELB \
+  --health-check-grace-period 120
+```
+
+Três detalhes fazem a diferença:
+
+- **`min-size 2` em duas zonas.** Com mínimo 1, uma falha de zona derruba a API até a instância nova subir. Com duas, uma continua atendendo.
+- **`health-check-type ELB`.** Por padrão, o ASG só olha o status da EC2 (a máquina está ligada?). Com `ELB`, ele também substitui instâncias que o target group marcou como doentes, por exemplo quando o processo Node travou mas a máquina segue de pé.
+- **Grace period.** São os segundos que o ASG espera antes de julgar uma instância nova. Se for menor que o tempo de boot, ele mata instâncias saudáveis que só não terminaram de subir.
+
+As instâncias ficam em subnets **privadas**. Só o ALB fica nas públicas. A instância sai para a internet (para baixar pacotes, por exemplo) por um NAT Gateway ou por VPC endpoints.
+
+## Políticas de escala
+
+Com o grupo funcionando, falta dizer **quando** crescer. A política mais usada é **target tracking**: você escolhe uma métrica e um alvo, e a AWS cria os alarmes e calcula quantas instâncias adicionar ou remover.
+
+```bash
+cat > cpu.json <<'EOF'
+{
+  "PredefinedMetricSpecification": {
+    "PredefinedMetricType": "ASGAverageCPUUtilization"
+  },
+  "TargetValue": 50.0
+}
+EOF
+
+aws autoscaling put-scaling-policy \
+  --auto-scaling-group-name livros-asg \
+  --policy-name cpu-50 \
+  --policy-type TargetTrackingScaling \
+  --target-tracking-configuration file://cpu.json
+```
+
+CPU é um bom ponto de partida, mas nem sempre reflete a carga de uma API Node. Uma aplicação que passa a maior parte do tempo esperando o banco pode ficar lenta com CPU em 20%. Nesse caso, `ALBRequestCountPerTarget` (requisições por instância) costuma funcionar melhor; ela exige o campo `ResourceLabel`, que identifica o par balanceador e target group.
+
+| Tipo de política | Quando usar |
+|---|---|
+| Target tracking | Padrão para a maioria das APIs |
+| Step scaling | Quando você quer degraus explícitos (mais 2 instâncias acima de 80%) |
+| Scheduled | Picos previsíveis, como horário comercial ou uma campanha marcada |
+| Predictive | Padrões diários repetitivos, com histórico suficiente |
+
+Lembre que escalar leva minutos: o alarme precisa disparar, a instância precisa subir e passar no health check. Para picos muito abruptos, aumente o mínimo antes (com uma ação agendada) em vez de confiar só na reação.
+
+## Trocando de versão sem derrubar a API
+
+Para publicar a versão nova, crie uma nova versão do launch template e peça um **instance refresh**. O ASG substitui as instâncias aos poucos, respeitando um percentual mínimo saudável.
+
+```bash
+aws ec2 create-launch-template-version \
+  --launch-template-name livros-api \
+  --source-version 1 --version-description "v1.5.0" \
+  --launch-template-data "{\"UserData\":\"$(base64 -w0 user-data-1.5.0.sh)\"}"
+
+aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name livros-asg \
+  --preferences '{"MinHealthyPercentage": 90, "InstanceWarmup": 120}'
+
+aws autoscaling describe-instance-refreshes \
+  --auto-scaling-group-name livros-asg \
+  --query 'InstanceRefreshes[0].[Status,PercentageComplete]'
+```
+
+## Encerramento elegante no Node.js
+
+Quando o ASG remove uma instância (escala para baixo ou refresh), o ALB para de mandar requisições novas e espera o `deregistration_delay`. Depois o sistema desliga, e o systemd envia `SIGTERM` ao processo. Se o Node morrer na hora, requisições em andamento são cortadas. O processo deve parar de aceitar conexões, terminar as que estão abertas e fechar o pool do banco.
+
+```javascript
+// src/shutdown.js
+import { server, iniciarEncerramento } from "./server.js";
+import { pool } from "./db.js";
+
+process.on("SIGTERM", () => {
+  console.log("SIGTERM recebido, encerrando");
+  iniciarEncerramento();
+  server.close(async () => {
+    await pool.end();
+    process.exit(0);
+  });
+  // garante a saída mesmo se alguma conexão keep-alive não fechar
+  setTimeout(() => process.exit(1), 25_000).unref();
+});
+```
+
+Ajuste os tempos para caberem um dentro do outro: o timeout do processo deve ser menor que o tempo que o systemd espera (`TimeoutStopSec`), e o `deregistration_delay` deve cobrir a requisição mais longa da API.
+
+<Callout type="warning" title="Estado local quebra a escala em silêncio">
+O erro mais comum é a aplicação funcionar perfeitamente com uma instância e falhar de forma intermitente com duas: login que some, upload que retorna 404, job que roda em dobro. Antes de criar o Auto Scaling group, procure no código tudo que grava em memória ou em disco e precisa sobreviver entre requisições. Ligar sticky sessions no ALB esconde o problema, mas ele volta na primeira instância removida.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre alta disponibilidade e escalabilidade?** Disponibilidade é continuar respondendo quando algo falha (redundância em zonas diferentes). Escalabilidade é manter o desempenho quando a carga cresce (adicionar capacidade). Um ASG com mínimo 2 em duas zonas entrega as duas coisas.
+
+**Por que usar health check do tipo ELB no Auto Scaling?** Porque o check padrão só vê se a máquina está ligada. Um processo travado ou sem conexão com dependências passa nesse check, mas falha no do target group.
+
+**Como você escalaria uma API que é lenta mas tem CPU baixa?** Mediria antes: provavelmente o gargalo é o banco ou uma dependência externa. Escalar instâncias não ajuda e pode piorar (mais conexões no banco). Se a escala fizer sentido, usaria requisições por alvo como métrica.
+
+**O que acontece com as requisições em andamento quando uma instância sai do grupo?** O ALB para de mandar novas e espera o deregistration delay; a aplicação precisa tratar `SIGTERM` e terminar as que estão abertas.
+
+## Pratique
+
+Suba a API de livros (ou qualquer API Express com `/health`) em um Auto Scaling group com mínimo 2 e máximo 4, em duas zonas, atrás de um ALB. Depois:
+
+1. Gere carga com `npx autocannon -c 200 -d 300 http://<dns-do-alb>/livros` e registre quanto tempo o grupo levou para criar instâncias novas.
+2. Termine uma instância manualmente no console e confirme que a API não ficou fora do ar.
+3. Faça um instance refresh com uma versão que muda a resposta do `/health` e mostre, com um loop de `curl`, que nenhuma requisição falhou.
+
+Entregue um README com os comandos usados, o gráfico de instâncias do ASG durante o teste e os tempos medidos. Destrua tudo ao final.
+
+<Quiz question="Por que o Auto Scaling group deve usar health-check-type ELB numa API?" options={["Para que o ASG crie instâncias mais rápido","Para substituir instâncias cujo processo falha no health check do target group","Para dispensar o grace period nas instâncias novas","Para que o ALB distribua por zonas de disponibilidade"]} answer={1} explanation="O check padrão só verifica se a EC2 está ligada. Com ELB, o ASG também substitui instâncias marcadas como doentes pelo target group." />
+<Quiz question="Uma API funciona com uma instância, mas com duas o login falha às vezes. Qual a causa mais provável?" options={["O ALB está sem certificado HTTPS","A política de escala usa CPU","A sessão está guardada na memória de cada instância","O launch template usa IMDSv2"]} answer={2} explanation="Com sessão em memória, a requisição que cai na outra instância não encontra a sessão. Mova o estado para Redis ou use tokens." />
+<Quiz question="O grace period do ASG é menor que o tempo de boot da instância. O que acontece?" options={["Instâncias saudáveis são substituídas antes de terminar de subir","O ALB ignora o health check até o boot terminar","A política de escala é desativada temporariamente","O ASG reduz o tamanho mínimo do grupo"]} answer={0} explanation="O ASG julga a instância como doente antes de ela ficar pronta e entra num ciclo de substituições." />
+
+## Base no CodeForge
+
+- [Escalabilidade](/learn/system-design/escalabilidade) e [Disponibilidade](/learn/system-design/disponibilidade): a teoria por trás das decisões deste capítulo.
+- [Load balancers](/learn/system-design/load-balancers) e [Algoritmos de balanceamento](/learn/system-design/algoritmos-balanceamento): como o ALB escolhe o alvo.
+- [Ponto único de falha](/learn/system-design/ponto-unico-de-falha): por que mínimo 2 em zonas diferentes.
+- [Amazon VPC: Configurando redes na AWS](/learn/carreira-nodejs/amazon-vpc-configurando-redes-aws): as subnets públicas e privadas usadas aqui.
+
+## Referências
+
+- [What is Amazon EC2 Auto Scaling?](https://docs.aws.amazon.com/autoscaling/ec2/userguide/what-is-amazon-ec2-auto-scaling.html)
+- [What is an Application Load Balancer?](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)
+- [Launch templates](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-launch-templates.html)

@@ -1,0 +1,353 @@
+---
+title: "Infraestrutura como código: Docker e Elastic Beanstalk na AWS"
+kind: lesson
+---
+
+No capítulo anterior você montou à mão (em código, mas peça por peça) um Launch Template, um ALB, um target group, um Auto Scaling Group e uma política de escala. Funciona, mas é muito código para manter só para rodar uma API. O Elastic Beanstalk é a plataforma da AWS que monta exatamente esse conjunto por você: você entrega a aplicação, ele cuida das máquinas, do balanceador, da escala e do deploy. Juntando com Docker, a aplicação vira uma imagem que roda igual no seu notebook e na nuvem, e o Terraform descreve o ambiente inteiro em poucas dezenas de linhas.
+
+**Você vai aprender:**
+
+- O que o Elastic Beanstalk cria por baixo e quando ele faz sentido
+- Empacotar a API de livros numa imagem Docker publicada no ECR
+- Descrever aplicação e ambiente do Beanstalk com Terraform
+- Configurar variáveis, health check, escala e política de deploy
+- Publicar versões novas com a CLI e voltar para a anterior
+
+## O que o Beanstalk é (e o que não é)
+
+O Elastic Beanstalk é uma camada de orquestração sobre serviços que você já conhece. Quando você cria um ambiente, ele gera um stack do CloudFormation com EC2, Auto Scaling Group, Load Balancer, security groups, alarmes e logs. Você não perde acesso a nada disso: as instâncias aparecem no console do EC2 normalmente. O que muda é que você configura tudo por um único conjunto de opções, e o Beanstalk mantém as peças coerentes.
+
+Dois conceitos organizam tudo:
+
+- **Aplicação**: o contêiner lógico (`api-livros`), que guarda as versões publicadas.
+- **Ambiente**: uma instância rodando uma versão (`api-livros-dev`, `api-livros-prod`). Cada ambiente tem seu próprio balanceador e suas próprias máquinas.
+
+E uma **versão** é um pacote (um zip no S3) que você pode implantar em qualquer ambiente. Promover de dev para prod é implantar em prod a mesma versão que já foi validada em dev.
+
+Ele faz sentido quando você quer EC2 com escala sem administrar as peças, e não quer (ainda) a complexidade de ECS ou Kubernetes. O preço é menos controle fino e algumas convenções próprias.
+
+## A imagem Docker da API
+
+A plataforma Docker do Beanstalk (Amazon Linux 2023) roda um contêiner e coloca um nginx na frente. Um Dockerfile enxuto para a API:
+
+```dockerfile
+# Dockerfile
+FROM node:22-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+FROM node:22-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY src ./src
+COPY package.json ./
+USER node
+EXPOSE 3000
+CMD ["node", "src/server.js"]
+```
+
+O primeiro estágio instala dependências; o segundo copia só o necessário e roda como usuário sem privilégio. Teste localmente antes de pensar em nuvem:
+
+```bash
+docker build -t api-livros:dev .
+docker run --rm -p 3000:3000 api-livros:dev
+curl localhost:3000/health
+```
+
+## Publicando a imagem no ECR
+
+O Beanstalk pode construir a imagem a partir do Dockerfile dentro de cada instância, mas isso deixa o deploy lento e faz cada máquina construir algo ligeiramente diferente. O melhor é construir uma vez e publicar num registro. Na AWS, o registro é o ECR, que você também declara no Terraform:
+
+```hcl
+resource "aws_ecr_repository" "api" {
+  name                 = "api-livros"
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+output "ecr_url" {
+  value = aws_ecr_repository.api.repository_url
+}
+```
+
+`IMMUTABLE` impede sobrescrever uma tag já publicada: a `v1.2.0` sempre significa a mesma imagem. Para publicar:
+
+```bash
+ECR=$(terraform output -raw ecr_url)
+aws ecr get-login-password --region us-east-1 \
+  | docker login --username AWS --password-stdin "${ECR%%/*}"
+
+docker build -t "$ECR:v1.0.0" .
+docker push "$ECR:v1.0.0"
+```
+
+## O pacote de versão: Dockerrun.aws.json
+
+Para dizer ao Beanstalk qual imagem rodar, o pacote de versão contém um `Dockerrun.aws.json` (formato versão 1, para um contêiner):
+
+```json
+{
+  "AWSEBDockerrunVersion": "1",
+  "Image": {
+    "Name": "123456789012.dkr.ecr.us-east-1.amazonaws.com/api-livros:v1.0.0",
+    "Update": "true"
+  },
+  "Ports": [{ "ContainerPort": 3000 }]
+}
+```
+
+O `ContainerPort` diz em que porta a API escuta dentro do contêiner; o nginx do Beanstalk recebe na porta 80 e repassa para ela. Com o zip desse arquivo no S3, você tem uma versão implantável.
+
+## Aplicação e ambiente no Terraform
+
+As instâncias do Beanstalk precisam de um perfil IAM com as permissões da plataforma e de leitura no ECR:
+
+```hcl
+resource "aws_iam_role" "eb_ec2" {
+  name = "api-livros-eb-ec2"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "web_tier" {
+  role       = aws_iam_role.eb_ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier"
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_read" {
+  role       = aws_iam_role.eb_ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_instance_profile" "eb_ec2" {
+  name = "api-livros-eb-ec2"
+  role = aws_iam_role.eb_ec2.name
+}
+```
+
+O nome da plataforma muda a cada atualização da AWS, então busque a mais recente em vez de fixar o texto:
+
+```hcl
+data "aws_elastic_beanstalk_solution_stack" "docker" {
+  most_recent = true
+  name_regex  = "^64bit Amazon Linux 2023 (.*) running Docker$"
+}
+
+resource "aws_elastic_beanstalk_application" "api" {
+  name = "api-livros"
+}
+```
+
+O ambiente é um recurso com uma lista de `setting`, cada uma com `namespace`, `name` e `value`. São as mesmas opções que aparecem no console:
+
+```hcl
+resource "aws_elastic_beanstalk_environment" "api" {
+  name                = "api-livros-${var.ambiente}"
+  application         = aws_elastic_beanstalk_application.api.name
+  solution_stack_name = data.aws_elastic_beanstalk_solution_stack.docker.name
+  version_label       = aws_elastic_beanstalk_application_version.inicial.name
+
+  setting {
+    namespace = "aws:autoscaling:launchconfiguration"
+    name      = "IamInstanceProfile"
+    value     = aws_iam_instance_profile.eb_ec2.name
+  }
+  setting {
+    namespace = "aws:autoscaling:launchconfiguration"
+    name      = "InstanceType"
+    value     = var.ambiente == "prod" ? "t3.small" : "t3.micro"
+  }
+  setting {
+    namespace = "aws:elasticbeanstalk:environment"
+    name      = "EnvironmentType"
+    value     = "LoadBalanced"
+  }
+  setting {
+    namespace = "aws:elasticbeanstalk:environment"
+    name      = "LoadBalancerType"
+    value     = "application"
+  }
+  setting {
+    namespace = "aws:autoscaling:asg"
+    name      = "MinSize"
+    value     = "2"
+  }
+  setting {
+    namespace = "aws:autoscaling:asg"
+    name      = "MaxSize"
+    value     = "6"
+  }
+  setting {
+    namespace = "aws:elasticbeanstalk:environment:process:default"
+    name      = "HealthCheckPath"
+    value     = "/health"
+  }
+  setting {
+    namespace = "aws:elasticbeanstalk:healthreporting:system"
+    name      = "SystemType"
+    value     = "enhanced"
+  }
+  setting {
+    namespace = "aws:elasticbeanstalk:command"
+    name      = "DeploymentPolicy"
+    value     = "Immutable"
+  }
+  setting {
+    namespace = "aws:elasticbeanstalk:application:environment"
+    name      = "LOG_LEVEL"
+    value     = var.ambiente == "prod" ? "info" : "debug"
+  }
+
+  lifecycle {
+    ignore_changes = [version_label]
+  }
+}
+
+output "url" {
+  value = "http://${aws_elastic_beanstalk_environment.api.cname}"
+}
+```
+
+E a versão inicial, que o Terraform sobe para o S3 e registra:
+
+```hcl
+resource "aws_s3_bucket" "versoes" {
+  bucket = "api-livros-eb-versoes-123456789012"
+}
+
+resource "aws_s3_object" "inicial" {
+  bucket = aws_s3_bucket.versoes.id
+  key    = "api-livros/v1.0.0.zip"
+  source = "${path.module}/build/v1.0.0.zip"
+}
+
+resource "aws_elastic_beanstalk_application_version" "inicial" {
+  name        = "v1.0.0"
+  application = aws_elastic_beanstalk_application.api.name
+  bucket      = aws_s3_bucket.versoes.id
+  key         = aws_s3_object.inicial.key
+}
+```
+
+Repare no namespace `aws:elasticbeanstalk:application:environment`: cada setting nele vira uma variável de ambiente dentro do contêiner. É lá que vão `NODE_ENV`, `LOG_LEVEL` e o endereço do banco. Segredo de verdade não deve ir em texto puro aqui (ele aparece no console e no estado): guarde no Secrets Manager ou no SSM Parameter Store e leia na inicialização da API.
+
+## Políticas de deploy
+
+A opção `DeploymentPolicy` decide como uma versão nova substitui a antiga:
+
+| Política | Como funciona | Quando usar |
+| --- | --- | --- |
+| `AllAtOnce` | Troca em todas as instâncias ao mesmo tempo | Só em dev; há downtime |
+| `Rolling` | Troca em lotes, reduzindo a capacidade durante o deploy | Pouco tráfego, custo mínimo |
+| `RollingWithAdditionalBatch` | Sobe um lote extra antes, mantendo a capacidade | Quer rolling sem perder capacidade |
+| `Immutable` | Cria instâncias novas num grupo temporário e só troca se todas ficarem saudáveis | Produção: rollback é só descartar as novas |
+| `TrafficSplitting` | Canário: manda parte do tráfego para a versão nova por um tempo | Validar com tráfego real antes de virar tudo |
+
+`Immutable` é a escolha segura para produção: se a versão nova falha no health check, as instâncias antigas nunca foram tocadas.
+
+<Callout type="warning" title="Terraform e deploy brigando pela versão">
+Se o Terraform declara `version_label` e você publica versões novas pela CLI, o próximo `terraform apply` tenta voltar o ambiente para a versão do código. Por isso o `ignore_changes = [version_label]`: o Terraform cria o ambiente e cuida da configuração, e o deploy (manual ou pelo pipeline) cuida da versão. Decida quem é dono de cada coisa e deixe isso explícito.
+</Callout>
+
+## Publicando uma versão nova
+
+Com a infraestrutura de pé, um deploy é: construir a imagem, gerar o `Dockerrun.aws.json`, subir o zip, registrar a versão e atualizar o ambiente.
+
+```bash
+#!/usr/bin/env bash
+# scripts/deploy-eb.sh v1.1.0 prod
+set -euo pipefail
+VERSAO=$1
+AMBIENTE=$2
+ECR=123456789012.dkr.ecr.us-east-1.amazonaws.com/api-livros
+BUCKET=api-livros-eb-versoes-123456789012
+
+docker build -t "$ECR:$VERSAO" .
+docker push "$ECR:$VERSAO"
+
+mkdir -p build
+cat > build/Dockerrun.aws.json <<EOF
+{
+  "AWSEBDockerrunVersion": "1",
+  "Image": { "Name": "$ECR:$VERSAO", "Update": "true" },
+  "Ports": [{ "ContainerPort": 3000 }]
+}
+EOF
+(cd build && zip -q "$VERSAO.zip" Dockerrun.aws.json)
+aws s3 cp "build/$VERSAO.zip" "s3://$BUCKET/api-livros/$VERSAO.zip"
+
+aws elasticbeanstalk create-application-version \
+  --application-name api-livros --version-label "$VERSAO" \
+  --source-bundle S3Bucket="$BUCKET",S3Key="api-livros/$VERSAO.zip"
+
+aws elasticbeanstalk update-environment \
+  --environment-name "api-livros-$AMBIENTE" --version-label "$VERSAO"
+
+aws elasticbeanstalk wait environment-updated \
+  --environment-names "api-livros-$AMBIENTE"
+```
+
+Para voltar atrás, a versão anterior continua registrada: basta outro `update-environment` com o label antigo. Como dev e prod usam a mesma versão registrada, promover é rodar só as duas últimas chamadas apontando para prod.
+
+Se preferir algo mais rápido para experimentar, a EB CLI (`pip install awsebcli`) faz o mesmo fluxo com `eb init`, `eb create` e `eb deploy`. Ela é ótima para explorar, mas para infraestrutura versionada e revisável, o Terraform é a fonte da verdade.
+
+## Investigando problemas
+
+Quando o ambiente fica vermelho, os comandos certos economizam muito tempo:
+
+```bash
+aws elasticbeanstalk describe-environment-health \
+  --environment-name api-livros-prod --attribute-names All
+
+aws elasticbeanstalk describe-events \
+  --environment-name api-livros-prod --max-items 20
+```
+
+A causa mais comum é o contêiner não responder na porta declarada: a API escuta em outra porta, ou só em `127.0.0.1` dentro do contêiner. Express escuta em todas as interfaces por padrão; confirme que você não passou um host fixo para o `listen`.
+
+## Na entrevista
+
+**O que o Elastic Beanstalk cria por baixo?** Um stack de CloudFormation com EC2, Auto Scaling Group, Load Balancer, security groups e alarmes. É PaaS sobre recursos que continuam visíveis na conta.
+
+**Qual a diferença entre aplicação, ambiente e versão?** Aplicação agrupa tudo; versão é um pacote implantável no S3; ambiente é a infraestrutura rodando uma versão.
+
+**Por que publicar a imagem no ECR em vez de mandar o Dockerfile?** Constrói uma vez, roda a mesma imagem em todos os ambientes e deixa o deploy rápido. Construir em cada instância gera artefatos diferentes.
+
+**Qual política de deploy você usaria em produção?** `Immutable` (rollback trivial) ou `TrafficSplitting` para canário. `AllAtOnce` só em dev.
+
+## Pratique
+
+Entregue um repositório com:
+
+1. Dockerfile multi-stage da API de livros, rodando como usuário `node`.
+2. Terraform com ECR (tags imutáveis), aplicação, ambiente `dev` e `prod` (reaproveitando o módulo do capítulo de ambientes), política `Immutable` em prod e `AllAtOnce` em dev.
+3. O script `deploy-eb.sh` que publica uma versão e espera o ambiente estabilizar.
+4. Uma demonstração de rollback: publique uma versão com o `/health` retornando 500 em prod e mostre que as instâncias antigas continuaram servindo.
+
+<Quiz question="Em um ambiente Elastic Beanstalk, como você passa variáveis de ambiente para o contêiner?" options={["Editando o Dockerfile e reconstruindo a imagem","Com settings no namespace aws:elasticbeanstalk:application:environment","Criando um arquivo .env dentro do zip da versão","Pelo user_data do Launch Template"]} answer={1} explanation="Cada setting desse namespace vira uma variável de ambiente do processo. Segredos sensíveis devem vir de Secrets Manager ou Parameter Store." />
+<Quiz question="Por que usar lifecycle ignore_changes em version_label no Terraform?" options={["Para o Terraform não reverter versões publicadas pelo pipeline de deploy","Para impedir que o ambiente seja recriado ao mudar o tipo de instância","Porque version_label é somente leitura no provider","Para o Beanstalk aceitar tags imutáveis do ECR"]} answer={0} explanation="O Terraform cuida da configuração do ambiente e o deploy cuida da versão. Sem ignore_changes, um apply desfaz o último deploy." />
+<Quiz question="Qual política de deploy mantém as instâncias antigas intocadas até a versão nova provar que está saudável?" options={["Rolling","AllAtOnce","RollingWithAdditionalBatch","Immutable"]} answer={3} explanation="Immutable sobe instâncias novas num grupo temporário e só as move para o grupo principal se todas passarem no health check." />
+
+## Base no CodeForge
+
+- [DevOps: Construindo e gerenciando containers com o Docker](/learn/carreira-nodejs/devops-construindo-gerenciando-containers-docker): imagens, camadas e multi-stage.
+- [Infraestrutura como código: Montando uma infraestrutura elástica na AWS](/learn/carreira-nodejs/infraestrutura-como-codigo-montando-infraestrutura-elastica-aws): as peças que o Beanstalk monta por você.
+- [Docker](/learn/system-design-interviews/docker): Docker do ponto de vista de entrevista de system design.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): rolling, imutável e canário.
+
+## Referências
+
+- [Elastic Beanstalk: Deploying Docker applications](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/create_deploy_docker.html)
+- [Elastic Beanstalk: Docker platform configuration](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/single-container-docker-configuration.html)
+- [Terraform: aws_elastic_beanstalk_environment](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elastic_beanstalk_environment)

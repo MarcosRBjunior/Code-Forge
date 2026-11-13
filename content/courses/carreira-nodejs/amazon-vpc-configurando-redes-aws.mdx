@@ -1,0 +1,230 @@
+---
+title: "Amazon VPC: Configurando redes na AWS"
+kind: lesson
+---
+
+Toda instância, banco RDS ou tarefa do ECS mora dentro de uma VPC, a rede privada da sua conta na AWS. Quando a API não conecta no banco, quando a instância não consegue baixar pacotes ou quando o banco ficou exposto na internet, a causa quase sempre está aqui: uma rota que falta, uma subnet errada ou um security group aberto demais. Saber montar uma VPC do zero é o que permite diagnosticar esses problemas em minutos em vez de horas.
+
+**Você vai aprender:**
+
+- Como planejar o bloco CIDR e dividir subnets públicas e privadas em duas zonas
+- O papel do Internet Gateway, das route tables e do NAT Gateway
+- Como encadear security groups para isolar balanceador, API e banco
+- Quando usar VPC endpoints e flow logs
+- Como diagnosticar conectividade a partir do Node.js
+
+## O desenho que você vai construir
+
+A arquitetura padrão para uma API web tem três camadas, cada uma em subnets próprias, repetidas em duas zonas de disponibilidade:
+
+| Camada | Subnet | Acesso à internet | Quem fica lá |
+|---|---|---|---|
+| Pública | 10.0.1.0/24 e 10.0.2.0/24 | Entrada e saída pelo Internet Gateway | ALB, NAT Gateway |
+| Privada de aplicação | 10.0.11.0/24 e 10.0.12.0/24 | Só saída, pelo NAT | Instâncias EC2, tarefas ECS |
+| Privada de dados | 10.0.21.0/24 e 10.0.22.0/24 | Nenhum | RDS, ElastiCache |
+
+O que torna uma subnet "pública" não é uma opção mágica: é ter, na route table associada, uma rota `0.0.0.0/0` apontando para um Internet Gateway. Sem essa rota, a subnet é privada, mesmo que a instância tenha IP público.
+
+## Planejando o CIDR
+
+A VPC recebe um bloco IPv4 entre `/16` (65.536 endereços) e `/28` (16 endereços). Use um `/16` de faixa privada (`10.0.0.0/16`, por exemplo) e reserve espaço: se um dia você conectar essa VPC a outra (peering, Transit Gateway) ou à rede do escritório por VPN, os blocos **não podem se sobrepor**. Escolher `10.0.0.0/16` em todas as contas é o erro que mais dá trabalho para desfazer depois.
+
+Em cada subnet, a AWS reserva 5 endereços: o primeiro (rede), o segundo (roteador da VPC), o terceiro (DNS), o quarto (reservado) e o último. Um `/24` oferece, portanto, 251 IPs utilizáveis. Parece muito, mas tarefas ECS e pods do EKS consomem um IP cada; em clusters grandes, prefira subnets `/20` para a aplicação.
+
+## Criando a VPC e as subnets
+
+Todos os comandos usam a AWS CLI v2 e capturam os IDs em variáveis para os passos seguintes.
+
+```bash
+REGIAO=us-east-1
+VPC=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=livros}]' \
+  --query Vpc.VpcId --output text)
+
+# resolução de nomes internos (necessária para endpoints e RDS)
+aws ec2 modify-vpc-attribute --vpc-id "$VPC" --enable-dns-hostnames
+
+criar_subnet() {
+  aws ec2 create-subnet --vpc-id "$VPC" --cidr-block "$1" \
+    --availability-zone "$2" \
+    --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$3}]" \
+    --query Subnet.SubnetId --output text
+}
+
+PUB_A=$(criar_subnet 10.0.1.0/24  ${REGIAO}a publica-a)
+PUB_B=$(criar_subnet 10.0.2.0/24  ${REGIAO}b publica-b)
+APP_A=$(criar_subnet 10.0.11.0/24 ${REGIAO}a app-a)
+APP_B=$(criar_subnet 10.0.12.0/24 ${REGIAO}b app-b)
+DB_A=$(criar_subnet  10.0.21.0/24 ${REGIAO}a dados-a)
+DB_B=$(criar_subnet  10.0.22.0/24 ${REGIAO}b dados-b)
+```
+
+## Internet Gateway e route table pública
+
+O **Internet Gateway** (IGW) é o portão entre a VPC e a internet. Ele não tem custo por hora e é altamente disponível por padrão. Cada subnet é associada a uma **route table**; se você não associar, ela usa a route table principal da VPC, que só conhece a rota local.
+
+```bash
+IGW=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC"
+
+RT_PUB=$(aws ec2 create-route-table --vpc-id "$VPC" --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id "$RT_PUB" \
+  --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW"
+
+for s in "$PUB_A" "$PUB_B"; do
+  aws ec2 associate-route-table --route-table-id "$RT_PUB" --subnet-id "$s"
+  aws ec2 modify-subnet-attribute --subnet-id "$s" --map-public-ip-on-launch
+done
+```
+
+Toda route table tem uma rota implícita `10.0.0.0/16 -> local`, que permite a comunicação entre todas as subnets da VPC. Ela não pode ser removida. Isolar camadas, portanto, é trabalho dos security groups, não das rotas.
+
+## NAT Gateway para as subnets privadas
+
+As instâncias da camada de aplicação precisam **sair** para a internet (instalar pacotes, chamar uma API de pagamento), mas não devem ser alcançáveis de fora. Esse é o papel do **NAT Gateway**: ele fica numa subnet pública, com um IP elástico, e traduz o endereço das conexões que saem.
+
+```bash
+EIP=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+NAT_A=$(aws ec2 create-nat-gateway --subnet-id "$PUB_A" --allocation-id "$EIP" \
+  --query NatGateway.NatGatewayId --output text)
+aws ec2 wait nat-gateway-available --nat-gateway-ids "$NAT_A"
+
+RT_APP=$(aws ec2 create-route-table --vpc-id "$VPC" --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id "$RT_APP" \
+  --destination-cidr-block 0.0.0.0/0 --nat-gateway-id "$NAT_A"
+for s in "$APP_A" "$APP_B"; do
+  aws ec2 associate-route-table --route-table-id "$RT_APP" --subnet-id "$s"
+done
+
+# subnets de dados: route table sem rota para a internet
+RT_DB=$(aws ec2 create-route-table --vpc-id "$VPC" --query RouteTable.RouteTableId --output text)
+for s in "$DB_A" "$DB_B"; do
+  aws ec2 associate-route-table --route-table-id "$RT_DB" --subnet-id "$s"
+done
+```
+
+Aqui há uma escolha de custo contra disponibilidade. Um NAT Gateway vive numa única zona. Se a zona `a` cair, as instâncias da zona `b` perdem a saída para a internet. Em produção, crie um NAT por zona, cada um com sua route table. Em ambientes de estudo, um só basta. O NAT Gateway é cobrado por hora **e** por gigabyte processado, então ele costuma ser um dos maiores itens da fatura de contas pequenas.
+
+## Security groups encadeados
+
+O **security group** (SG) é um firewall com estado ligado a cada interface de rede. Com estado significa que, se a entrada foi permitida, a resposta sai automaticamente. Ele só tem regras de permissão; tudo que não está liberado é bloqueado.
+
+O truque é usar outro SG como origem em vez de um bloco de IPs. Assim, "a API aceita tráfego do balanceador" continua valendo mesmo quando as instâncias mudam de IP.
+
+```bash
+sg() {
+  aws ec2 create-security-group --vpc-id "$VPC" --group-name "$1" \
+    --description "$2" --query GroupId --output text
+}
+SG_ALB=$(sg livros-alb "Balanceador publico")
+SG_APP=$(sg livros-app "API Node.js")
+SG_DB=$(sg livros-db "PostgreSQL")
+
+aws ec2 authorize-security-group-ingress --group-id "$SG_ALB" \
+  --protocol tcp --port 443 --cidr 0.0.0.0/0
+aws ec2 authorize-security-group-ingress --group-id "$SG_APP" \
+  --protocol tcp --port 3000 --source-group "$SG_ALB"
+aws ec2 authorize-security-group-ingress --group-id "$SG_DB" \
+  --protocol tcp --port 5432 --source-group "$SG_APP"
+```
+
+A cadeia fica: internet, porta 443, ALB; ALB, porta 3000, API; API, porta 5432, banco. Ninguém de fora chega ao banco, nem mesmo se ele tivesse IP público.
+
+Existe também a **network ACL** (NACL), um filtro sem estado no nível da subnet, com regras de permitir e negar avaliadas em ordem numérica. Por ser sem estado, você precisa liberar também as portas efêmeras de retorno (1024 a 65535). Na prática, deixe a NACL padrão (tudo liberado) e controle o acesso com security groups; use NACL quando precisar **bloquear** explicitamente uma faixa de IPs.
+
+| | Security group | Network ACL |
+|---|---|---|
+| Nível | Interface de rede | Subnet |
+| Estado | Com estado | Sem estado |
+| Regras | Só permitir | Permitir e negar |
+| Origem | IP ou outro SG | Só IP |
+
+## VPC endpoints: falando com a AWS sem sair da VPC
+
+Quando a API em subnet privada grava no S3, o tráfego passa pelo NAT Gateway e você paga o processamento de cada gigabyte. Um **gateway endpoint** para S3 ou DynamoDB cria uma rota direta, sem custo adicional, que nunca sai da rede da AWS.
+
+```bash
+aws ec2 create-vpc-endpoint --vpc-id "$VPC" \
+  --service-name com.amazonaws.${REGIAO}.s3 \
+  --route-table-ids "$RT_APP"
+```
+
+Para outros serviços (Secrets Manager, ECR, CloudWatch Logs), existem os **interface endpoints**, que criam uma interface de rede dentro da subnet. Eles têm custo por hora, mas permitem subnets totalmente sem NAT, o que é comum em ambientes com exigência de segurança.
+
+## Diagnosticando conectividade
+
+Quando a API não alcança o banco, o sintoma típico é um timeout, não um "conexão recusada". Timeout quase sempre significa que um pacote foi descartado (security group, NACL ou rota). Recusa significa que o pacote chegou, mas nada escuta naquela porta. Um script pequeno em Node, rodado de dentro da instância, separa os dois casos:
+
+```javascript
+// scripts/testar-porta.js  uso: node testar-porta.js host porta
+import net from "node:net";
+
+const [host, porta] = process.argv.slice(2);
+const inicio = Date.now();
+const socket = net.connect({ host, port: Number(porta), timeout: 3000 });
+
+socket.on("connect", () => {
+  console.log(`conectou em ${Date.now() - inicio} ms: rede e SG ok`);
+  socket.end();
+});
+socket.on("timeout", () => {
+  console.log("timeout: verifique security group, NACL e route table");
+  socket.destroy();
+});
+socket.on("error", (err) => {
+  console.log(`erro ${err.code}: o host respondeu, mas a porta está fechada ou o nome não resolveu`);
+});
+```
+
+Para enxergar o que foi bloqueado, ligue os **flow logs**, que registram metadados de cada fluxo (origem, destino, porta, aceito ou rejeitado):
+
+```bash
+aws ec2 create-flow-logs --resource-type VPC --resource-ids "$VPC" \
+  --traffic-type REJECT \
+  --log-destination-type cloud-watch-logs --log-group-name vpc-livros \
+  --deliver-logs-permission-arn arn:aws:iam::123456789012:role/flow-logs
+```
+
+O console também oferece o **Reachability Analyzer**, que simula o caminho entre duas interfaces e aponta qual componente bloqueia.
+
+<Callout type="warning" title="Banco em subnet pública com 0.0.0.0/0">
+Para conseguir conectar do notebook, muita gente coloca o RDS numa subnet pública, marca como publicamente acessível e libera a porta 5432 para qualquer IP. Bots varrem essas portas o tempo todo. Mantenha o banco em subnet de dados, sem rota para a internet, e acesse por um bastion, pelo Session Manager com port forwarding ou por uma VPN.
+</Callout>
+
+## Na entrevista
+
+**O que torna uma subnet pública?** Uma rota `0.0.0.0/0` para um Internet Gateway na route table associada a ela. Ter IP público na instância não basta.
+
+**Diferença entre security group e NACL?** SG é com estado, no nível da interface, só permite e aceita outro SG como origem. NACL é sem estado, no nível da subnet, permite e nega, e exige liberar as portas de retorno.
+
+**Por que um NAT Gateway por zona?** Porque ele vive numa zona só. Se ela cair, as subnets privadas das outras zonas que dependem dele perdem a saída para a internet.
+
+**Timeout ou conexão recusada: o que cada um indica?** Timeout: pacote descartado no caminho (SG, NACL, rota). Recusado: chegou ao host, mas nenhum processo escuta na porta.
+
+## Pratique
+
+Monte a VPC deste capítulo por script, do zero, num arquivo `vpc.sh` idempotente o suficiente para ser destruído e recriado. Depois:
+
+1. Suba uma EC2 na subnet de aplicação e um RDS PostgreSQL na de dados.
+2. Rode `testar-porta.js` da EC2 para o banco e confirme a conexão.
+3. Remova a regra de entrada do SG do banco, rode de novo e localize a rejeição nos flow logs.
+4. Escreva um `destroy.sh` que apague tudo na ordem certa (NAT e IP elástico primeiro).
+
+Entregue os dois scripts e um diagrama simples das subnets e rotas no README.
+
+<Quiz question="Uma instância numa subnet privada não consegue instalar pacotes da internet. O que falta?" options={["Um IP público na instância","Uma rota 0.0.0.0/0 para um NAT Gateway","Uma regra de entrada liberando a porta 443","Uma network ACL que negue o tráfego local"]} answer={1} explanation="Subnets privadas saem para a internet por um NAT Gateway numa subnet pública. Sem essa rota, o pacote não tem para onde ir." />
+<Quiz question="Por que liberar a porta do banco usando o security group da API como origem?" options={["Porque é mais rápido que liberar por IP","Porque o NACL exige essa forma","Porque a regra continua válida quando as instâncias mudam de IP","Porque permite tráfego de saída automático"]} answer={2} explanation="Instâncias de Auto Scaling ou tarefas ECS trocam de IP o tempo todo. Referenciar o SG mantém a regra correta sem manutenção." />
+<Quiz question="Quantos IPs utilizáveis tem uma subnet /24 na AWS?" options={["256","254","251","248"]} answer={2} explanation="A AWS reserva 5 endereços em toda subnet: 256 menos 5 dá 251." />
+
+## Base no CodeForge
+
+- [Sub-redes e CIDR](/learn/redes/subredes-e-cidr) e [IP e endereçamento](/learn/redes/ip-e-enderecamento): a matemática por trás dos blocos.
+- [NAT](/learn/redes/nat) e [Roteamento](/learn/redes/roteamento): o que o NAT Gateway e as route tables fazem por baixo.
+- [Diagnóstico de rede](/learn/redes/diagnostico): ferramentas para investigar conectividade.
+- [Amazon EC2: Alta disponibilidade e escalabilidade](/learn/carreira-nodejs/amazon-ec2-alta-disponibilidade-escalabilidade-aplicacao): a aplicação que roda dentro desta VPC.
+
+## Referências
+
+- [What is Amazon VPC?](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html)
+- [NAT gateways](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)
+- [Security groups](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-security-groups.html)

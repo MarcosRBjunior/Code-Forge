@@ -1,0 +1,261 @@
+---
+title: "JavaScript I: Algoritmos de ordenação"
+kind: lesson
+---
+
+Ordenar parece resolvido: existe `array.sort()`. Mesmo assim, ordenação é a fonte de alguns dos bugs mais silenciosos de uma API Node.js: números ordenados como texto, nomes com acento fora do lugar, um array compartilhado alterado sem querer. Entender como os algoritmos de ordenação funcionam por dentro também é pré-requisito de entrevista e explica por que o `sort` do JavaScript se comporta como se comporta. Neste capítulo você implementa os algoritmos clássicos à mão e depois usa o que aprendeu para ordenar dados de verdade numa API.
+
+**Você vai aprender:**
+
+- As armadilhas do `Array.prototype.sort` e como escrever comparadores corretos
+- Implementar selection sort e insertion sort, e medir o custo de cada um
+- O que é estabilidade e por que ela importa para ordenar por vários campos
+- Ordenar texto em português com `Intl.Collator`
+- Expor ordenação numa rota de API com segurança
+
+## O sort do JavaScript e suas surpresas
+
+Comece pelo comportamento padrão, que surpreende quase todo mundo uma vez:
+
+```javascript
+const precos = [100, 25, 9, 1000];
+precos.sort();
+console.log(precos); // [ 100, 1000, 25, 9 ]
+```
+
+Sem argumento, o `sort` converte cada elemento em string e compara pela ordem dos códigos Unicode. Como texto, `"100"` vem antes de `"25"` porque `"1"` vem antes de `"2"`. Para números, você precisa de um comparador.
+
+O comparador é uma função `(a, b)` que devolve:
+
+- um número negativo se `a` deve vir antes de `b`;
+- um número positivo se `a` deve vir depois;
+- zero se tanto faz.
+
+```javascript
+const precos = [100, 25, 9, 1000];
+precos.sort((a, b) => a - b);   // crescente: [ 9, 25, 100, 1000 ]
+precos.sort((a, b) => b - a);   // decrescente: [ 1000, 100, 25, 9 ]
+```
+
+A subtração funciona para números porque já devolve o sinal certo. Para outros tipos, escreva a comparação explicitamente. Um erro comum é devolver booleano (`(a, b) => a > b`): `true` vira 1 e `false` vira 0, nunca negativo, e o resultado depende do algoritmo interno.
+
+A segunda surpresa: `sort` ordena **no lugar**. Ele altera o array original e devolve a mesma referência.
+
+```javascript
+const livros = [{ titulo: "Dom Casmurro", ano: 1899 }, { titulo: "Iracema", ano: 1865 }];
+const porAno = livros.sort((a, b) => a.ano - b.ano);
+console.log(porAno === livros); // true: o original mudou
+
+const copia = livros.toSorted((a, b) => b.ano - a.ano); // Node 20+
+console.log(copia === livros);  // false
+```
+
+Numa API, isso importa quando o array vem de um cache em memória: ordenar a resposta de uma requisição altera o cache para todas as próximas. Use `toSorted` (ou `[...lista].sort(...)`) sempre que o array não for seu.
+
+## Selection sort: a ideia mais simples
+
+Para entender o que um algoritmo de ordenação faz, implemente o mais intuitivo. O selection sort percorre o array, encontra o menor elemento do trecho ainda não ordenado e o troca com a primeira posição desse trecho.
+
+```javascript
+function selectionSort(lista) {
+  const a = [...lista];
+  for (let i = 0; i < a.length - 1; i++) {
+    let menor = i;
+    for (let j = i + 1; j < a.length; j++) {
+      if (a[j] < a[menor]) menor = j;
+    }
+    if (menor !== i) [a[i], a[menor]] = [a[menor], a[i]];
+  }
+  return a;
+}
+
+console.log(selectionSort([5, 2, 8, 1, 9])); // [ 1, 2, 5, 8, 9 ]
+```
+
+Conte as comparações: na primeira volta, `n - 1`; na segunda, `n - 2`; e assim por diante. A soma é cerca de `n²/2`, então o custo é O(n²), e ele faz isso sempre, mesmo que o array já esteja ordenado. A vantagem é fazer no máximo `n - 1` trocas, o que só importa quando trocar é muito caro.
+
+## Insertion sort: o que funciona bem em listas quase ordenadas
+
+O insertion sort imita o jeito de organizar cartas na mão: pega o próximo elemento e o desliza para a esquerda até a posição certa entre os já ordenados.
+
+```javascript
+function insertionSort(lista, comparar = (x, y) => x - y) {
+  const a = [...lista];
+  for (let i = 1; i < a.length; i++) {
+    const atual = a[i];
+    let j = i - 1;
+    while (j >= 0 && comparar(a[j], atual) > 0) {
+      a[j + 1] = a[j];   // empurra o maior uma casa para a direita
+      j--;
+    }
+    a[j + 1] = atual;
+  }
+  return a;
+}
+
+console.log(insertionSort([5, 2, 8, 1, 9])); // [ 1, 2, 5, 8, 9 ]
+```
+
+No pior caso (array invertido) ele também é O(n²). Mas em um array já quase ordenado, o `while` quase não roda e o custo cai para perto de O(n). É por isso que algoritmos de produção, como o TimSort que o V8 usa no `Array.prototype.sort`, usam insertion sort para trechos pequenos e para aproveitar sequências já ordenadas.
+
+Repare que essa versão recebe um comparador com o mesmo contrato do `sort` nativo. Isso deixa o algoritmo genérico: ele ordena números, strings ou objetos.
+
+### Medindo na prática
+
+Teoria de complexidade fica concreta quando você mede. Use `performance.now()` (global no Node):
+
+```javascript
+function aleatorios(n) {
+  return Array.from({ length: n }, () => Math.floor(Math.random() * 1e6));
+}
+
+function medir(nome, fn, dados) {
+  const inicio = performance.now();
+  fn(dados);
+  console.log(`${nome}: ${(performance.now() - inicio).toFixed(1)} ms`);
+}
+
+for (const n of [1_000, 10_000, 20_000]) {
+  const dados = aleatorios(n);
+  console.log(`n = ${n}`);
+  medir("selection", selectionSort, dados);
+  medir("insertion", insertionSort, dados);
+  medir("nativo   ", (d) => d.toSorted((a, b) => a - b), dados);
+}
+```
+
+Você vai ver os dois algoritmos quadráticos ficarem cerca de 4 vezes mais lentos quando `n` dobra, enquanto o nativo, que é O(n log n), quase não sente. Para dados aleatórios grandes, sempre use o nativo. Implementar à mão serve para entender, e para entrevistas.
+
+## Estabilidade e ordenação por vários campos
+
+Um algoritmo é **estável** quando elementos considerados iguais pelo comparador mantêm a ordem relativa em que estavam. Desde o ES2019, a especificação exige que `Array.prototype.sort` seja estável, e o insertion sort acima também é (ele só move quando `comparar` é estritamente positivo). O selection sort, com trocas a distância, não é.
+
+Estabilidade permite ordenar por vários critérios. Mas o jeito mais claro é um único comparador que desempata:
+
+```javascript
+const livros = [
+  { titulo: "Memórias Póstumas", autor: "Machado", ano: 1881 },
+  { titulo: "Iracema", autor: "Alencar", ano: 1865 },
+  { titulo: "Dom Casmurro", autor: "Machado", ano: 1899 },
+  { titulo: "O Guarani", autor: "Alencar", ano: 1857 },
+];
+
+const ordenados = livros.toSorted(
+  (a, b) => a.autor.localeCompare(b.autor) || a.ano - b.ano
+);
+// Alencar 1857, Alencar 1865, Machado 1881, Machado 1899
+```
+
+O `||` funciona porque, quando os autores são iguais, `localeCompare` devolve 0 (falso) e a expressão passa para o próximo critério.
+
+## Texto em português: acentos e maiúsculas
+
+Comparar strings com `<` ou `>` usa códigos Unicode, e aí `"Ágape"` vai para depois de `"Zebra"`, e minúsculas ficam depois de maiúsculas. Para ordem alfabética de verdade, use as regras do idioma:
+
+```javascript
+const titulos = ["iracema", "Ágape", "Zebra", "Ana", "árvore", "item 10", "item 2"];
+
+console.log(titulos.toSorted());
+// [ 'Ana', 'Zebra', 'iracema', 'item 10', 'item 2', 'Ágape', 'árvore' ]
+
+const collator = new Intl.Collator("pt-BR", { sensitivity: "base", numeric: true });
+console.log(titulos.toSorted(collator.compare));
+// [ 'Ágape', 'Ana', 'árvore', 'iracema', 'item 2', 'item 10', 'Zebra' ]
+```
+
+`sensitivity: "base"` ignora acentos e caixa na comparação, e `numeric: true` compara sequências de dígitos como números (`"item 2"` antes de `"item 10"`). Crie o `Intl.Collator` uma vez e reutilize: chamar `localeCompare` com opções dentro do comparador recria a configuração a cada comparação e fica muito mais lento em listas grandes.
+
+<Callout type="warning" title="O sort sem comparador em números">
+O erro mais comum de ordenação em JavaScript é `ids.sort()` ou `precos.sort()` sem comparador. Funciona nos testes com números de um dígito e quebra em produção quando aparece o 10. Para números, sempre `(a, b) => a - b`; para texto visível ao usuário, sempre `Intl.Collator`.
+</Callout>
+
+## Ordenação numa rota de API
+
+Na maioria das vezes, quem deve ordenar é o banco de dados (com `ORDER BY` e um índice), porque ele ordena antes de paginar. Ordenar em memória faz sentido em listas pequenas, dados que vêm de uma API externa ou resultados já carregados num cache. Em qualquer caso, nunca use o parâmetro do cliente direto: valide contra uma lista de campos permitidos.
+
+```javascript
+import express from "express";
+
+const app = express();
+const collator = new Intl.Collator("pt-BR", { sensitivity: "base", numeric: true });
+
+const livros = [
+  { id: 1, titulo: "Iracema", ano: 1865 },
+  { id: 2, titulo: "Dom Casmurro", ano: 1899 },
+  { id: 3, titulo: "O Cortiço", ano: 1890 },
+];
+
+const comparadores = {
+  titulo: (a, b) => collator.compare(a.titulo, b.titulo),
+  ano: (a, b) => a.ano - b.ano,
+};
+
+// ?ordem=-ano,titulo  (o sinal de menos inverte)
+function montarComparador(param = "titulo") {
+  const criterios = param.split(",").map((campo) => {
+    const desc = campo.startsWith("-");
+    const nome = desc ? campo.slice(1) : campo;
+    const cmp = comparadores[nome];
+    if (!cmp) throw new Error(`campo de ordenação inválido: ${nome}`);
+    return desc ? (a, b) => cmp(b, a) : cmp;
+  });
+  return (a, b) => {
+    for (const cmp of criterios) {
+      const r = cmp(a, b);
+      if (r !== 0) return r;
+    }
+    return 0;
+  };
+}
+
+app.get("/livros", (req, res) => {
+  try {
+    res.json(livros.toSorted(montarComparador(req.query.ordem)));
+  } catch (erro) {
+    res.status(400).json({ erro: erro.message });
+  }
+});
+
+app.listen(3000);
+```
+
+Teste com `curl 'localhost:3000/livros?ordem=-ano'` e `curl 'localhost:3000/livros?ordem=preco'` (que devolve 400). O comparador composto é a versão genérica do `||` da seção anterior. E o `toSorted` garante que o array em memória não muda entre requisições.
+
+## Na entrevista
+
+**Por que `[10, 9, 1].sort()` devolve `[1, 10, 9]`?** Porque sem comparador os elementos são convertidos em string e comparados como texto.
+
+**O que é uma ordenação estável e o `sort` do JavaScript é estável?** É a que preserva a ordem relativa de elementos iguais. Sim, desde o ES2019 a especificação exige estabilidade.
+
+**Quando o insertion sort é uma boa escolha?** Em arrays pequenos ou quase ordenados, onde ele se aproxima de O(n). Por isso aparece dentro de algoritmos híbridos como o TimSort.
+
+**Qual a complexidade do selection sort no melhor caso?** O(n²): ele sempre percorre todo o trecho restante para achar o mínimo, mesmo com o array já ordenado.
+
+## Pratique
+
+Crie um módulo `ordenacao.js` e um arquivo de teste com o test runner do Node (`node --test`). Entregue:
+
+1. `selectionSort`, `insertionSort` e `bubbleSort` (este você implementa sozinho), todos recebendo um comparador opcional e sem alterar a entrada.
+2. Testes que comparam cada função com `toSorted` em 100 arrays aleatórios, incluindo vazios, com um elemento e com repetidos.
+3. Um teste de estabilidade: ordene objetos `{ chave, posicaoOriginal }` por `chave` e verifique que a `posicaoOriginal` fica crescente entre chaves iguais. Descubra qual dos três algoritmos falha.
+4. A rota `/livros?ordem=` da seção final, com teste para campo inválido.
+
+<Quiz question="Qual o resultado de [3, 20, 100].sort() em JavaScript?" options={["[3, 20, 100]","[100, 20, 3]","[3, 100, 20]","[20, 3, 100]"]} answer={1} explanation="Sem comparador a comparação é textual: como string, 100 vem antes de 20, que vem antes de 3." />
+
+<Quiz question="Qual a vantagem de toSorted sobre sort numa resposta de API que lê um cache?" options={["toSorted é sempre mais rápido","toSorted não altera o array original","toSorted ordena texto com acentos","toSorted não precisa de comparador"]} answer={1} explanation="sort ordena no lugar e altera o cache compartilhado; toSorted devolve uma cópia ordenada." />
+
+<Quiz question="Em qual entrada o insertion sort se aproxima de O(n)?" options={["Array em ordem inversa","Array totalmente aleatório","Array já quase ordenado","Array com todos os valores negativos"]} answer={2} explanation="Com poucos elementos fora do lugar, o laço interno quase não executa e cada elemento é inserido com poucas comparações." />
+
+## Base no CodeForge
+
+- [Introdução à ordenação](/learn/dsa/intro-ordenacao): a visão geral dos algoritmos e suas complexidades.
+- [Big O](/learn/dsa/big-o): a notação usada para comparar os algoritmos deste capítulo.
+- [Ordenação e paginação em SQL](/learn/sql/ordenacao-e-paginacao): quando quem deve ordenar é o banco.
+- [Algoritmos com JavaScript II](/learn/carreira-nodejs/algoritmos-javascript-ii-aprofundando-algoritmos-ordenacao-busca): merge sort, quick sort e busca, o próximo capítulo.
+
+## Referências
+
+- [MDN: Array.prototype.sort()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/sort)
+- [MDN: Array.prototype.toSorted()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/toSorted)
+- [MDN: Intl.Collator](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Collator)
+- [V8: Getting things sorted](https://v8.dev/blog/array-sort)

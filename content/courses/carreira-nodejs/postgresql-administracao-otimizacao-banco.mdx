@@ -1,0 +1,258 @@
+---
+title: "PostgreSQL: Administração e otimização do banco"
+kind: lesson
+---
+
+Uma API Node.js raramente fica lenta por causa do JavaScript. Quase sempre o gargalo está no banco: uma consulta sem índice que piorou com o crescimento da tabela, conexões esgotadas, uma transação esquecida aberta segurando locks, uma tabela inchada que o autovacuum não deu conta. Em times pequenos não existe DBA, então quem cuida disso é o dev back-end. Este capítulo é o kit de sobrevivência: usuários e permissões, conexões, monitoramento, índices, manutenção e backup.
+
+**Você vai aprender:**
+
+- Criar um usuário de aplicação com o mínimo de privilégios
+- Dimensionar conexões entre o pool do Node.js e o PostgreSQL
+- Encontrar as consultas mais caras com `pg_stat_statements` e `pg_stat_activity`
+- Criar e remover índices sem travar a produção
+- Entender VACUUM, ANALYZE e fazer backup e restauração confiáveis
+
+## Ambiente com as extensões de diagnóstico
+
+Para seguir os exemplos, suba um PostgreSQL com a extensão `pg_stat_statements` pré-carregada (ela precisa disso para coletar estatísticas):
+
+```bash
+docker run --name pg-admin -e POSTGRES_PASSWORD=senha -p 5432:5432 -d postgres:17 \
+  -c shared_preload_libraries=pg_stat_statements \
+  -c log_min_duration_statement=500
+docker exec -it pg-admin psql -U postgres
+```
+
+O `log_min_duration_statement=500` grava no log toda consulta que levar mais de 500 ms, a forma mais barata de descobrir lentidão em produção.
+
+## Usuários, papéis e permissões
+
+No PostgreSQL, usuários e grupos são a mesma coisa: papéis (roles). O erro mais comum é a API conectar como `postgres`, o superusuário. Se houver uma falha de SQL injection, o atacante pode apagar o banco inteiro ou ler outros bancos. A regra é o menor privilégio: a aplicação só faz o que precisa.
+
+```sql
+CREATE DATABASE livros;
+\c livros
+
+-- dono do schema: quem roda as migrações
+CREATE ROLE livros_owner LOGIN PASSWORD 'troque-me-1';
+-- usuário da API: só lê e escreve dados
+CREATE ROLE livros_app LOGIN PASSWORD 'troque-me-2';
+-- leitura para relatórios e BI
+CREATE ROLE livros_leitura LOGIN PASSWORD 'troque-me-3';
+
+CREATE SCHEMA app AUTHORIZATION livros_owner;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+
+GRANT USAGE ON SCHEMA app TO livros_app, livros_leitura;
+
+-- vale para as tabelas que o livros_owner criar daqui em diante
+ALTER DEFAULT PRIVILEGES FOR ROLE livros_owner IN SCHEMA app
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO livros_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE livros_owner IN SCHEMA app
+  GRANT USAGE, SELECT ON SEQUENCES TO livros_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE livros_owner IN SCHEMA app
+  GRANT SELECT ON TABLES TO livros_leitura;
+
+-- ninguém da aplicação espera mais que 5 s por uma consulta
+ALTER ROLE livros_app SET statement_timeout = '5s';
+ALTER ROLE livros_app SET idle_in_transaction_session_timeout = '30s';
+```
+
+Repare no `ALTER DEFAULT PRIVILEGES`: um `GRANT ... ON ALL TABLES` só vale para as tabelas que já existem. Sem os privilégios padrão, toda tabela nova criada por migração quebra a API com "permission denied" até alguém lembrar de dar o `GRANT`.
+
+Os dois tempos limite por papel são proteções baratas. O `statement_timeout` cancela consultas que fugiram do controle. O `idle_in_transaction_session_timeout` derruba sessões que abriram uma transação e pararam de responder, o caso clássico de um `BEGIN` sem `COMMIT` por causa de um erro no código.
+
+## Conexões: o pool e o limite do servidor
+
+Cada conexão no PostgreSQL é um processo do sistema operacional, com memória própria. O padrão `max_connections = 100` existe por um bom motivo: centenas de conexões ativas disputam CPU e pioram tudo. Do lado do Node.js, o `Pool` do `pg` mantém um número fixo de conexões reaproveitadas:
+
+```javascript
+import pg from "pg";
+
+export const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,                        // conexões por instância da API
+  idleTimeoutMillis: 30_000,      // fecha conexões ociosas
+  connectionTimeoutMillis: 5_000, // falha rápido se o pool estiver cheio
+  statement_timeout: 5_000,       // reforço do lado do cliente
+  application_name: "livros-api", // aparece no pg_stat_activity
+});
+
+pool.on("error", (erro) => console.error("erro em conexão ociosa", erro));
+```
+
+A conta que você precisa fazer: **instâncias da API × `max` do pool** tem de ficar abaixo de `max_connections`, com folga para migrações, administração e réplicas. Com 4 instâncias e `max: 10`, são 40 conexões. Se você escalar para 20 instâncias, chega a 200 e o banco começa a recusar. A partir daí, a solução é um pooler na frente do banco, como o PgBouncer em modo de transação (os serviços gerenciados de nuvem costumam oferecer um pronto).
+
+Um pool maior raramente deixa a API mais rápida. Se as consultas são lentas, mais conexões só colocam mais consultas lentas brigando pelo mesmo disco e CPU.
+
+<Callout type="warning" title="Conexão que não volta para o pool">
+Ao usar `pool.connect()` para uma transação, você precisa chamar `cliente.release()` num `finally`. Se uma exceção pular o `release`, aquela conexão fica presa para sempre. Depois de alguns erros, o pool esgota e toda requisição espera até o `connectionTimeoutMillis`, e a API parece "travada" sem nenhum erro no banco. Para consultas avulsas, use `pool.query()`, que pega e devolve a conexão sozinho.
+</Callout>
+
+## O que está acontecendo agora: pg_stat_activity
+
+Quando a API fica lenta de repente, a primeira consulta a rodar é esta:
+
+```sql
+SELECT pid, usename, application_name, state,
+       now() - xact_start  AS tempo_transacao,
+       now() - query_start AS tempo_consulta,
+       wait_event_type, left(query, 80) AS consulta
+FROM pg_stat_activity
+WHERE datname = current_database() AND pid <> pg_backend_pid()
+ORDER BY xact_start NULLS LAST;
+```
+
+Leia as colunas assim: `state = 'active'` está executando; `idle in transaction` abriu transação e não faz nada (suspeito); `wait_event_type = 'Lock'` está esperando outra sessão liberar um lock. Uma transação aberta há minutos costuma ser a causa de tudo. Para resolver:
+
+```sql
+SELECT pg_cancel_backend(12345);    -- cancela a consulta atual, mantém a conexão
+SELECT pg_terminate_backend(12345); -- encerra a conexão inteira
+```
+
+E para ver quem está bloqueando quem:
+
+```sql
+SELECT pid, pg_blocking_pids(pid) AS bloqueado_por, left(query, 60)
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+## As consultas mais caras: pg_stat_statements
+
+O `pg_stat_activity` mostra o agora. Para o histórico, a extensão `pg_stat_statements` agrupa todas as consultas executadas (com os valores trocados por `$1`, `$2`) e soma tempo e chamadas:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT calls,
+       round(total_exec_time::numeric, 0) AS total_ms,
+       round(mean_exec_time::numeric, 1)  AS media_ms,
+       rows,
+       left(query, 90) AS consulta
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+Ordene por `total_exec_time`, não pela média. Uma consulta de 2 ms chamada um milhão de vezes por dia pesa muito mais que um relatório de 3 segundos que roda uma vez. Na prática, as cinco primeiras linhas desse resultado são onde está quase todo o ganho possível. Depois de otimizar, zere as estatísticas com `SELECT pg_stat_statements_reset();` e compare.
+
+## Índices em produção
+
+Com a consulta cara identificada, rode `EXPLAIN (ANALYZE, BUFFERS)` nela. Se aparecer `Seq Scan` numa tabela grande com um filtro seletivo, falta índice. Num banco em uso, crie com `CONCURRENTLY`:
+
+```sql
+CREATE INDEX CONCURRENTLY livros_autor_criado_idx
+  ON app.livros (autor_id, criado_em DESC);
+```
+
+Sem `CONCURRENTLY`, o `CREATE INDEX` bloqueia escritas na tabela durante toda a construção, o que numa tabela grande significa minutos de API fora do ar. A versão concorrente demora mais, não pode rodar dentro de uma transação (atenção ao seu executor de migrações) e, se falhar, deixa um índice marcado como inválido que você precisa apagar e recriar.
+
+Índice também custa: cada `INSERT` e `UPDATE` atualiza todos os índices da tabela. Encontre os que nunca são usados:
+
+```sql
+SELECT relname AS tabela, indexrelname AS indice, idx_scan,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS tamanho
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+ORDER BY pg_relation_size(indexrelid) DESC;
+```
+
+Antes de apagar um deles, confirme que não é o índice de uma restrição `UNIQUE` ou de chave primária, e que as estatísticas cobrem um período representativo (um relatório mensal pode usar um índice uma vez por mês).
+
+## VACUUM e ANALYZE
+
+O PostgreSQL usa MVCC: um `UPDATE` não sobrescreve a linha, cria uma versão nova e marca a antiga como morta, para que transações em andamento ainda vejam a versão antiga. Um `DELETE` também só marca. As linhas mortas ocupam espaço até o `VACUUM` liberá-lo para reuso. O autovacuum faz isso sozinho, mas tabelas com muita escrita podem ficar para trás, e aí elas incham (bloat) e as consultas pioram.
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS pct_mortas,
+       last_autovacuum, last_autoanalyze
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC
+LIMIT 10;
+```
+
+Se uma tabela tem muitas linhas mortas e o autovacuum quase nunca roda, ajuste-o só para ela:
+
+```sql
+ALTER TABLE app.eventos SET (autovacuum_vacuum_scale_factor = 0.02);
+VACUUM (VERBOSE, ANALYZE) app.eventos;   -- execução manual imediata
+```
+
+O `ANALYZE` atualiza as estatísticas que o planejador usa para escolher entre índice e varredura. Depois de uma carga grande de dados, rode-o manualmente: com estatísticas velhas, o planejador acha que a tabela ainda tem cem linhas e escolhe planos ruins. Um detalhe: uma transação aberta por horas impede o VACUUM de limpar qualquer linha morta criada depois dela, e por isso o `idle_in_transaction_session_timeout` da seção de papéis também é uma proteção contra bloat.
+
+## Configuração básica
+
+Os padrões do PostgreSQL são conservadores, pensados para rodar em qualquer máquina. Três parâmetros dão a maior parte do ganho num servidor próprio:
+
+| Parâmetro | Ponto de partida | O que controla |
+|---|---|---|
+| `shared_buffers` | 25% da RAM | Cache de páginas do próprio PostgreSQL |
+| `effective_cache_size` | 50 a 75% da RAM | Quanto cache o planejador supõe existir (não aloca nada) |
+| `work_mem` | 16 a 64 MB | Memória por operação de ordenação ou hash, por consulta |
+
+```sql
+SHOW shared_buffers;
+ALTER SYSTEM SET work_mem = '32MB';
+SELECT pg_reload_conf();   -- shared_buffers exige reiniciar o servidor
+```
+
+Cuidado com o `work_mem`: ele vale por operação, e uma consulta pode ter várias. Com 100 conexões e consultas complexas, um valor alto pode esgotar a memória. Em bancos gerenciados (RDS, Azure, Cloud SQL), esses parâmetros ficam em grupos de parâmetros do provedor.
+
+## Backup e restauração
+
+O `pg_dump` faz um backup lógico consistente sem parar o banco. Use o formato custom (`-Fc`): ele é compactado e permite restaurar só partes e em paralelo.
+
+```bash
+pg_dump -Fc -h localhost -U livros_owner -d livros -f livros-$(date +%F).dump
+
+# restaura num banco novo, com 4 processos em paralelo
+createdb -h localhost -U postgres livros_restaurado
+pg_restore -h localhost -U postgres -d livros_restaurado -j 4 --no-owner livros-2026-11-13.dump
+
+# lista o conteúdo do arquivo sem restaurar
+pg_restore -l livros-2026-11-13.dump | head
+```
+
+Para bancos grandes ou recuperação a um ponto exato no tempo, o caminho é backup físico com arquivamento contínuo do WAL (o que os bancos gerenciados oferecem como "point-in-time recovery"). Em qualquer caso, teste a restauração periodicamente.
+
+## Na entrevista
+
+**A API ficou lenta de repente. Por onde você começa?** `pg_stat_activity` para ver o que está rodando, esperando lock ou parado em transação; depois `pg_stat_statements` para as consultas mais caras e `EXPLAIN ANALYZE` nelas.
+
+**Por que não aumentar o pool para 100 conexões por instância?** Porque cada conexão é um processo no servidor e o limite é compartilhado por todas as instâncias. Mais conexões que núcleos e discos dão conta só aumentam a contenção.
+
+**O que é o VACUUM e por que ele existe?** O MVCC deixa versões antigas de linhas após `UPDATE` e `DELETE`. O VACUUM libera esse espaço para reuso e evita inchaço; o autovacuum faz isso automaticamente.
+
+**Como criar um índice numa tabela grande em produção?** Com `CREATE INDEX CONCURRENTLY`, que não bloqueia escritas, fora de uma transação, verificando depois se o índice ficou válido.
+
+## Pratique
+
+Popule a tabela de livros com um milhão de linhas usando `generate_series` e entregue um relatório curto (um `OTIMIZACAO.md` no repositório) com:
+
+1. A criação dos papéis `owner`, `app` e `leitura`, e a prova de que `livros_app` não consegue rodar `DROP TABLE`.
+2. As três consultas mais caras do `pg_stat_statements` depois de rodar um teste de carga na API (com `autocannon`, por exemplo).
+3. O `EXPLAIN (ANALYZE, BUFFERS)` de cada uma antes e depois do índice criado com `CONCURRENTLY`, com o tempo médio comparado.
+4. Um `UPDATE` em 30% das linhas, a porcentagem de linhas mortas antes e depois do `VACUUM`, e um backup restaurado num banco novo com contagem de linhas igual.
+
+<Quiz question="A API conecta como livros_app. Tabelas criadas pelas migrações novas dão 'permission denied'. Qual a correção duradoura?" options={["Conectar a API como postgres","GRANT em cada tabela nova à mão","ALTER DEFAULT PRIVILEGES para o dono das tabelas","Desligar o statement_timeout do papel"]} answer={2} explanation="Os privilégios padrão valem para objetos futuros criados por aquele papel, então as próximas tabelas já nascem com acesso." />
+
+<Quiz question="Com 6 instâncias da API e pool max 20, quantas conexões o banco pode receber só da API?" options={["20","26","120","6"]} answer={2} explanation="Cada instância tem o próprio pool: 6 vezes 20 dá 120, acima do padrão de 100 max_connections." />
+
+<Quiz question="Por que ordenar pg_stat_statements por total_exec_time e não por mean_exec_time?" options={["Porque a média sempre vem zerada","Porque mostra o que mais consome o banco no total","Porque total_exec_time ignora cache","Porque a média só existe em réplicas"]} answer={1} explanation="Uma consulta rápida chamada milhões de vezes pode custar mais que uma lenta rara; o total mostra o peso real." />
+
+## Base no CodeForge
+
+- [Índices](/learn/sql/indices) e [EXPLAIN](/learn/sql/explain): como ler o plano e escolher o índice certo.
+- [Locks no banco](/learn/sql/locks-no-banco) e [Níveis de isolamento](/learn/sql/niveis-de-isolamento): o que está por trás das esperas no `pg_stat_activity`.
+- [Desnormalização](/learn/sql/desnormalizacao): quando mudar o modelo é a otimização certa.
+- [PostgreSQL: Comandos DML e DDL](/learn/carreira-nodejs/postgresql-comandos-dml-ddl): a estrutura e as migrações que este capítulo administra.
+
+## Referências
+
+- [PostgreSQL: pg_stat_statements](https://www.postgresql.org/docs/current/pgstatstatements.html)
+- [PostgreSQL: The Cumulative Statistics System](https://www.postgresql.org/docs/current/monitoring-stats.html)
+- [PostgreSQL: Routine Vacuuming](https://www.postgresql.org/docs/current/routine-vacuuming.html)
+- [PostgreSQL: Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)

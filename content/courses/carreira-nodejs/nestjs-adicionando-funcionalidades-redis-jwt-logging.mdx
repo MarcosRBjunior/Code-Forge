@@ -1,0 +1,357 @@
+---
+title: "Nest.js: Adicionando funcionalidades com Redis, JWT e logging"
+kind: lesson
+---
+
+A API de livros já persiste dados, tem migrações e trata erros. Faltam três coisas que toda API em produção precisa: responder rápido as consultas repetidas sem castigar o banco, saber quem está chamando e o que essa pessoa pode fazer, e deixar um rastro legível quando algo dá errado às três da manhã. No Nest, cada uma dessas peças é um módulo: cache com Redis, autenticação com JWT e logging estruturado com pino. Esta aula liga as três e mostra onde cada uma costuma morder.
+
+**Você vai aprender:**
+
+- Como configurar cache com Redis no Nest, de forma automática e manual, e como invalidar
+- Como emitir e validar JWT com um guard global e rotas públicas por decorator
+- Como lidar com expiração, refresh token e logout usando o Redis
+- Como trocar o logger padrão por logs estruturados em JSON, com id de requisição e dados sensíveis mascarados
+
+## Subindo o Redis
+
+```yaml
+# compose.yaml (acrescente ao serviço do PostgreSQL)
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+```
+
+```bash
+docker compose up -d redis
+npm i @nestjs/cache-manager cache-manager keyv @keyv/redis
+npm i @nestjs/jwt argon2
+npm i nestjs-pino pino-http
+npm i -D pino-pretty
+```
+
+```bash
+# .env
+REDIS_URL=redis://localhost:6379
+JWT_SECRET=troque-por-um-valor-aleatorio-de-pelo-menos-32-bytes
+JWT_EXPIRES_IN=15m
+```
+
+Gere o segredo com `node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"`. Um segredo curto ou previsível permite a qualquer um forjar tokens.
+
+## Cache com Redis
+
+O `@nestjs/cache-manager` usa a biblioteca `cache-manager`, que nas versões atuais guarda os dados através do Keyv. O adaptador `@keyv/redis` aponta o cache para o Redis, compartilhado entre todas as réplicas da API.
+
+```typescript
+// src/app.module.ts (trecho)
+import { CacheModule } from "@nestjs/cache-manager";
+import { createKeyv } from "@keyv/redis";
+
+CacheModule.registerAsync({
+  isGlobal: true,
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    stores: [createKeyv(config.getOrThrow<string>("REDIS_URL"), { namespace: "api-livros" })],
+    ttl: 60_000, // milissegundos
+  }),
+}),
+```
+
+O TTL é em **milissegundos** nas versões atuais do `cache-manager`. Código antigo, de quando era em segundos, configura sem querer um cache de 60 ms.
+
+### Cache automático com o interceptor
+
+O `CacheInterceptor` guarda a resposta de rotas `GET` usando a URL como chave:
+
+```typescript
+import { CacheInterceptor, CacheTTL } from "@nestjs/cache-manager";
+
+@Controller("livros")
+@UseInterceptors(CacheInterceptor)
+export class LivrosController {
+  @Get()
+  @CacheTTL(30_000)
+  listar(@Query() q: ListarLivrosDto) {
+    return this.livros.listar(q);
+  }
+}
+```
+
+<Callout type="warning" title="Cache automático não sabe quem é o usuário">
+O `CacheInterceptor` usa a URL como chave. Se a rota devolve dados que dependem do usuário (`GET /me/emprestimos`), a primeira pessoa a chamar define a resposta que todas as outras vão receber até o TTL expirar: um vazamento de dados criado pelo cache. Use o interceptor só em rotas públicas e iguais para todos. Para dados por usuário, faça cache manual com o id do usuário na chave, ou não faça cache.
+</Callout>
+
+### Cache manual e invalidação
+
+Para controlar a chave e invalidar quando os dados mudam, injete o cache no service. É o padrão cache-aside: tenta o cache, se não tiver busca no banco e guarda.
+
+```typescript
+import { CACHE_MANAGER } from "@nestjs/cache-manager";
+import type { Cache } from "cache-manager";
+
+@Injectable()
+export class LivrosService {
+  constructor(
+    @InjectRepository(Livro) private readonly repo: Repository<Livro>,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
+
+  async buscar(id: string): Promise<Livro> {
+    const chave = `livro:${id}`;
+    const emCache = await this.cache.get<Livro>(chave);
+    if (emCache) return emCache;
+
+    const livro = await this.repo.findOne({ where: { id }, relations: { autor: true } });
+    if (!livro) throw new NotFoundException(`Livro ${id} não encontrado`);
+    await this.cache.set(chave, livro, 5 * 60_000);
+    return livro;
+  }
+
+  async atualizar(id: string, dto: UpdateLivroDto) {
+    const livro = await this.repo.preload({ id, ...dto });
+    if (!livro) throw new NotFoundException(`Livro ${id} não encontrado`);
+    const salvo = await this.repo.save(livro);
+    await this.cache.del(`livro:${id}`); // invalida depois de escrever
+    return salvo;
+  }
+}
+```
+
+Dois detalhes: o objeto volta do Redis como JSON, então campos `Date` chegam como string e métodos de classe não existem; e a invalidação vem **depois** da escrita no banco, senão uma leitura entre os dois passos põe o valor antigo de volta no cache. Mesmo assim, o TTL é a rede de segurança: se uma invalidação falhar, o dado velho dura no máximo esse tempo.
+
+## Autenticação com JWT
+
+O fluxo: o cliente envia e-mail e senha para `/auth/login`; a API confere a senha e devolve um token assinado com o id e o papel do usuário; nas próximas requisições, o cliente manda o token no header `Authorization: Bearer ...`, e um guard valida a assinatura antes de o controller rodar.
+
+```typescript
+// src/auth/auth.module.ts
+@Module({
+  imports: [
+    UsuariosModule,
+    JwtModule.registerAsync({
+      global: true,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        secret: config.getOrThrow<string>("JWT_SECRET"),
+        signOptions: { expiresIn: config.get("JWT_EXPIRES_IN", "15m") },
+      }),
+    }),
+  ],
+  controllers: [AuthController],
+  providers: [AuthService, { provide: APP_GUARD, useClass: AuthGuard }],
+})
+export class AuthModule {}
+```
+
+```typescript
+// src/auth/auth.service.ts
+import * as argon2 from "argon2";
+import { randomUUID } from "node:crypto";
+
+export type JwtPayload = { sub: string; papel: "leitor" | "bibliotecario"; jti: string };
+
+@Injectable()
+export class AuthService {
+  constructor(private readonly usuarios: UsuariosService, private readonly jwt: JwtService) {}
+
+  async login(email: string, senha: string) {
+    const usuario = await this.usuarios.porEmail(email);
+    const ok = usuario ? await argon2.verify(usuario.senhaHash, senha) : false;
+    if (!usuario || !ok) throw new UnauthorizedException("credenciais inválidas");
+
+    const payload: JwtPayload = { sub: usuario.id, papel: usuario.papel, jti: randomUUID() };
+    return { accessToken: await this.jwt.signAsync(payload) };
+  }
+}
+```
+
+O payload carrega o mínimo: `sub` (o id do usuário, nome padrão da especificação), o papel e um `jti` (id único do token, útil para revogar). O JWT é assinado, não criptografado: qualquer um que tenha o token lê o conteúdo em Base64. Nada de senha, CPF ou e-mail ali.
+
+### O guard global e rotas públicas
+
+Proteger tudo por padrão e marcar as exceções é mais seguro do que lembrar de proteger cada rota nova.
+
+```typescript
+// src/auth/publico.decorator.ts
+import { SetMetadata } from "@nestjs/common";
+export const ROTA_PUBLICA = "rotaPublica";
+export const Publico = () => SetMetadata(ROTA_PUBLICA, true);
+```
+
+```typescript
+// src/auth/auth.guard.ts
+@Injectable()
+export class AuthGuard implements CanActivate {
+  constructor(
+    private readonly jwt: JwtService,
+    private readonly reflector: Reflector,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
+
+  async canActivate(ctx: ExecutionContext): Promise<boolean> {
+    const publico = this.reflector.getAllAndOverride<boolean>(ROTA_PUBLICA, [
+      ctx.getHandler(),
+      ctx.getClass(),
+    ]);
+    if (publico) return true;
+
+    const req = ctx.switchToHttp().getRequest<Request & { usuario?: JwtPayload }>();
+    const [tipo, token] = req.headers.authorization?.split(" ") ?? [];
+    if (tipo !== "Bearer" || !token) throw new UnauthorizedException();
+
+    let payload: JwtPayload;
+    try {
+      payload = await this.jwt.verifyAsync<JwtPayload>(token);
+    } catch {
+      throw new UnauthorizedException("token inválido ou expirado");
+    }
+    if (await this.cache.get(`revogado:${payload.jti}`)) throw new UnauthorizedException("token revogado");
+
+    req.usuario = payload;
+    return true;
+  }
+}
+```
+
+```typescript
+// src/auth/auth.controller.ts
+@Controller("auth")
+export class AuthController {
+  constructor(private readonly auth: AuthService) {}
+
+  @Publico()
+  @Post("login")
+  @HttpCode(200)
+  login(@Body() dto: LoginDto) {
+    return this.auth.login(dto.email, dto.senha);
+  }
+}
+```
+
+`getAllAndOverride` procura a marca no método e depois na classe, permitindo marcar um controller inteiro como público. `verifyAsync` confere a assinatura e a expiração (`exp`); token adulterado ou vencido lança exceção.
+
+Para autorização por papel, o mesmo padrão: um decorator `@Papeis("bibliotecario")` grava a lista com `SetMetadata`, e um segundo guard compara com `req.usuario.papel`, respondendo 403 se não bater.
+
+### Expiração, refresh e logout com Redis
+
+Um JWT é válido até expirar, e a API não guarda estado sobre ele. Isso é bom para escalar e ruim para revogar. A combinação usual:
+
+- **Access token curto** (15 minutos), usado em toda requisição.
+- **Refresh token longo** (dias), usado só em `/auth/refresh` para obter um access token novo. Guarde-o no Redis (ou no banco) para poder invalidá-lo, e troque-o a cada uso (rotação).
+- **Logout**: apague o refresh token e coloque o `jti` do access token atual numa lista de revogados no Redis, com TTL igual ao tempo que falta para ele expirar.
+
+```typescript
+async logout(payload: JwtPayload & { exp: number }) {
+  const restanteMs = payload.exp * 1000 - Date.now();
+  if (restanteMs > 0) await this.cache.set(`revogado:${payload.jti}`, true, restanteMs);
+}
+```
+
+A lista de revogados nunca cresce sem limite: cada entrada some sozinha quando o token já não seria aceito de qualquer forma.
+
+## Logging estruturado
+
+O `Logger` padrão do Nest escreve texto colorido no terminal, ótimo para desenvolvimento e ruim para produção. Ferramentas de logs (CloudWatch, Datadog, Loki, Azure Monitor) funcionam melhor com JSON: uma linha por evento, com campos que você filtra e agrega. O `nestjs-pino` troca o logger do Nest pelo pino, um dos loggers mais rápidos do ecossistema Node.
+
+```typescript
+// src/app.module.ts (trecho)
+import { LoggerModule } from "nestjs-pino";
+import { randomUUID } from "node:crypto";
+
+LoggerModule.forRoot({
+  pinoHttp: {
+    level: process.env.NODE_ENV === "production" ? "info" : "debug",
+    transport: process.env.NODE_ENV === "production" ? undefined : { target: "pino-pretty" },
+    genReqId: (req, res) => {
+      const id = req.headers["x-request-id"] ?? randomUUID();
+      res.setHeader("x-request-id", id);
+      return id;
+    },
+    redact: ["req.headers.authorization", "req.headers.cookie", "req.body.senha"],
+    customProps: (req) => ({ usuarioId: (req as { usuario?: { sub: string } }).usuario?.sub }),
+  },
+}),
+```
+
+```typescript
+// src/main.ts
+import { Logger } from "nestjs-pino";
+
+const app = await NestFactory.create(AppModule, { bufferLogs: true });
+app.useLogger(app.get(Logger));
+```
+
+`bufferLogs` guarda as mensagens da inicialização até o pino assumir, para que nada saia no formato antigo. Cada requisição gera automaticamente uma linha com método, URL, status e tempo de resposta, e o `x-request-id` permite seguir uma requisição por vários serviços. `redact` substitui os valores sensíveis por `[Redacted]`.
+
+Nos services, continue usando o `Logger` do `@nestjs/common`, que agora escreve pelo pino. Para logs com o contexto da requisição (o `reqId` incluso automaticamente), injete o `PinoLogger`:
+
+```typescript
+import { InjectPinoLogger, PinoLogger } from "nestjs-pino";
+
+@Injectable()
+export class EmprestimosService {
+  constructor(@InjectPinoLogger(EmprestimosService.name) private readonly logger: PinoLogger) {}
+
+  async emprestar(livroId: string, usuarioId: string) {
+    this.logger.info({ livroId, usuarioId }, "empréstimo solicitado");
+    // ...
+  }
+}
+```
+
+```json
+{"level":30,"time":1763030400000,"reqId":"5f0c...","context":"EmprestimosService","livroId":"a1...","usuarioId":"u9...","msg":"empréstimo solicitado"}
+```
+
+Boas práticas de log que valem para qualquer stack:
+
+| Nível | Quando usar |
+|---|---|
+| `error` | falha que exige atenção: exceção inesperada, dependência fora |
+| `warn` | algo anormal mas tratado: retry, token revogado usado |
+| `info` | eventos de negócio e o log de cada requisição |
+| `debug` | detalhes para investigar, desligado em produção |
+
+Registre dados como campos (`{ livroId }`), não interpolados na mensagem: assim dá para filtrar por `livroId` na ferramenta de logs.
+
+## Na entrevista
+
+**Como você invalida cache quando o dado muda?** Apagando a chave depois de gravar no banco (cache-aside com invalidação na escrita) e mantendo um TTL como limite caso a invalidação falhe.
+
+**Como revogar um JWT, já que ele é sem estado?** Access token curto, refresh token guardado no servidor e removido no logout, e uma lista de `jti` revogados no Redis com TTL até a expiração do token.
+
+**O que não pode ir no payload de um JWT?** Nada sigiloso. O token é só assinado; o conteúdo é legível por qualquer um que o tenha.
+
+**Por que log estruturado?** Porque JSON com campos pode ser filtrado, agregado e correlacionado (pelo id da requisição) nas ferramentas de observabilidade; texto livre exige expressões regulares frágeis.
+
+## Pratique
+
+Na API de livros em Nest:
+
+1. Redis no `compose.yaml` e `CacheModule` global com `@keyv/redis`.
+2. Cache manual em `GET /livros/:id` com invalidação em `PATCH` e `DELETE`, e cache automático só em `GET /categorias`.
+3. Login com senha em Argon2, guard global com `@Publico()`, guard de papéis e `POST /auth/logout` revogando o token no Redis.
+4. Refresh token com rotação guardado no Redis.
+5. `nestjs-pino` com `x-request-id`, `redact` e o id do usuário em cada linha.
+
+Entregue o repositório com testes e2e cobrindo: rota protegida sem token (401), token válido (200), token após logout (401) e leitor tentando apagar livro (403). No README, mostre uma linha de log real e o tempo de `GET /livros/:id` com e sem cache.
+
+<Quiz question="Qual o risco de usar CacheInterceptor em GET /me/emprestimos?" options={["O cache nunca expira","Usuários diferentes recebem a resposta cacheada do primeiro, pois a chave é só a URL","O Redis não aceita JSON","O guard deixa de rodar"]} answer={1} explanation="O interceptor monta a chave pela URL, sem considerar o usuário. Respostas que dependem de quem chama vazam para outras pessoas." />
+<Quiz question="Como a lista de tokens revogados no Redis evita crescer para sempre?" options={["Apagando tudo à meia-noite","Cada jti é gravado com TTL igual ao tempo restante até a expiração do token","Limitando a mil entradas","Guardando só o último token por usuário"]} answer={1} explanation="Depois que o token expira, ele já seria recusado de qualquer forma; a entrada some sozinha com o TTL." />
+<Quiz question="Para que serve a opção redact do pino?" options={["Comprimir os logs","Substituir valores sensíveis, como o header authorization, por um marcador","Remover logs de debug","Enviar logs ao Redis"]} answer={1} explanation="redact mascara caminhos configurados no objeto de log, evitando que tokens e senhas apareçam nas ferramentas de log." />
+
+## Base no CodeForge
+
+- [Estratégias de cache](/learn/system-design/estrategias-de-cache), [Invalidação de cache](/learn/system-design/invalidacao-de-cache) e [Cache distribuído](/learn/system-design/cache-distribuido): a teoria do cache-aside e da invalidação.
+- [JWT](/learn/system-design/jwt) e [Sessão vs token](/learn/system-design/sessao-vs-token): os trade-offs da autenticação sem estado.
+- [Logging](/learn/system-design/logging) e [Os três pilares da observabilidade](/learn/system-design/tres-pilares): o que fazer com os logs depois.
+- [Node.js: Criptografia e tokens JWT](/learn/carreira-nodejs/nodejs-criptografia-tokens-jwt): o JWT por dentro, sem framework.
+
+## Referências
+
+- [Caching (documentação do Nest)](https://docs.nestjs.com/techniques/caching)
+- [Authentication (documentação do Nest)](https://docs.nestjs.com/security/authentication)
+- [Logger (documentação do Nest)](https://docs.nestjs.com/techniques/logger)
+- [pino](https://getpino.io/)

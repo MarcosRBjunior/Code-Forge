@@ -1,0 +1,312 @@
+---
+title: "WebSockets: Implemente comunicações em tempo real com Socket.IO e MongoDB"
+kind: lesson
+---
+
+HTTP funciona no modelo pergunta e resposta: o cliente pede, o servidor responde e pronto. Isso não serve quando o servidor precisa avisar o cliente de algo que aconteceu agora, como uma mensagem nova no chat, alguém editando o mesmo documento ou o status de um pedido mudando. Ficar perguntando a cada segundo desperdiça recursos e ainda chega atrasado. WebSockets mantêm uma conexão aberta nos dois sentidos, e o Socket.IO adiciona sobre ela salas, reconexão automática e confirmações. Neste capítulo você constrói um chat com salas em Node.js, com histórico persistido no MongoDB.
+
+**Você vai aprender:**
+
+- Quando usar WebSocket, polling ou Server-Sent Events
+- Montar servidor e cliente Socket.IO e trocar eventos nos dois sentidos
+- Organizar usuários em salas e escolher para quem emitir
+- Persistir e carregar histórico com Mongoose
+- Usar confirmações (acks) e validar o que chega do cliente
+
+## Opções para tempo real
+
+| Técnica | Como funciona | Quando usar |
+|---|---|---|
+| Polling | Cliente pergunta a cada N segundos | Atualizações raras, simplicidade máxima |
+| Long polling | Servidor segura a resposta até ter novidade | Legado, ambientes que bloqueiam WebSocket |
+| Server-Sent Events | Servidor envia um fluxo de eventos sobre HTTP, só em um sentido | Notificações, painéis, streaming de respostas |
+| WebSocket | Conexão TCP persistente, nos dois sentidos | Chat, colaboração, jogos, presença online |
+
+O WebSocket começa como uma requisição HTTP com o header `Upgrade: websocket`. O servidor responde `101 Switching Protocols` e, daí em diante, a mesma conexão TCP carrega mensagens em qualquer direção, com pouco overhead por mensagem.
+
+## Por que Socket.IO e não WebSocket puro
+
+O WebSocket nativo entrega só "mande bytes, receba bytes". Em produção você precisa de mais, e o Socket.IO traz:
+
+- **Eventos com nome** e argumentos serializados: `emit("mensagem", { texto })`.
+- **Reconexão automática** com espera crescente quando a rede cai.
+- **Salas** para enviar a grupos de conexões.
+- **Acks**: confirmação de recebimento com resposta, como uma chamada de função remota.
+- **Fallback** para long polling quando o WebSocket é bloqueado por proxy.
+- **Adapters** para escalar em vários servidores (assunto do próximo capítulo).
+
+O preço: Socket.IO tem protocolo próprio. Um cliente WebSocket puro não conversa com um servidor Socket.IO, e o contrário também não. Os dois lados usam a biblioteca.
+
+## O servidor
+
+```bash
+npm install express socket.io mongoose
+```
+
+O Socket.IO se acopla ao mesmo servidor HTTP do Express, na mesma porta.
+
+```javascript
+// src/server.js
+import { createServer } from "node:http";
+import express from "express";
+import { Server } from "socket.io";
+import mongoose from "mongoose";
+import { registrarChat } from "./chat.js";
+
+const app = express();
+app.use(express.static("public"));
+
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: process.env.ORIGEM_FRONT ?? "http://localhost:5173" },
+});
+
+io.on("connection", (socket) => {
+  console.log("conectou", socket.id);
+  registrarChat(io, socket);
+  socket.on("disconnect", (motivo) => console.log("saiu", socket.id, motivo));
+});
+
+await mongoose.connect(process.env.MONGODB_URI ?? "mongodb://localhost:27017/chat");
+httpServer.listen(3000, () => console.log("http://localhost:3000"));
+```
+
+Cada cliente conectado é um objeto `socket`, com um `socket.id` único por conexão (muda a cada reconexão). O `io` representa o servidor inteiro.
+
+## Emitindo eventos
+
+Há quatro formas básicas de emitir, e escolher a errada é a fonte de metade dos bugs de tempo real:
+
+```javascript
+socket.emit("evento", dados);              // só para este cliente
+socket.broadcast.emit("evento", dados);    // para todos, menos este cliente
+io.emit("evento", dados);                  // para todos os conectados
+io.to("sala").emit("evento", dados);       // para todos numa sala
+socket.to("sala").emit("evento", dados);   // para a sala, menos este cliente
+```
+
+Os dados podem ser qualquer coisa serializável: objetos, arrays, números, `Buffer`. Não envie instâncias de classe esperando métodos do outro lado; chega só o JSON.
+
+## Persistência com Mongoose
+
+O histórico fica no MongoDB, que combina bem com mensagens: documentos independentes, gravação rápida e consulta por sala e data.
+
+```javascript
+// src/models/Mensagem.js
+import mongoose from "mongoose";
+
+const mensagemSchema = new mongoose.Schema(
+  {
+    sala: { type: String, required: true, trim: true, maxlength: 50 },
+    autor: { type: String, required: true, trim: true, maxlength: 40 },
+    texto: { type: String, required: true, trim: true, maxlength: 2000 },
+  },
+  { timestamps: true },
+);
+
+// A consulta principal: últimas mensagens de uma sala
+mensagemSchema.index({ sala: 1, createdAt: -1 });
+
+export const Mensagem = mongoose.model("Mensagem", mensagemSchema);
+```
+
+O índice composto existe para a consulta que roda toda vez que alguém entra numa sala. Sem ele, o MongoDB lê a coleção inteira para achar as mensagens daquela sala.
+
+## Salas e o chat
+
+```javascript
+// src/chat.js
+import { Mensagem } from "./models/Mensagem.js";
+
+const NOME_SALA = /^[a-z0-9-]{1,50}$/;
+
+export function registrarChat(io, socket) {
+  socket.on("entrar", async ({ sala, autor } = {}, responder) => {
+    if (typeof responder !== "function") return;
+    if (!NOME_SALA.test(sala ?? "") || typeof autor !== "string" || !autor.trim()) {
+      return responder({ ok: false, erro: "Sala ou nome inválido" });
+    }
+
+    // Um socket por sala neste chat: sai das anteriores
+    for (const anterior of socket.rooms) {
+      if (anterior !== socket.id) {
+        socket.leave(anterior);
+        socket.to(anterior).emit("sistema", `${socket.data.autor} saiu`);
+      }
+    }
+
+    socket.data.autor = autor.trim().slice(0, 40);
+    socket.data.sala = sala;
+    socket.join(sala);
+
+    const ultimas = await Mensagem.find({ sala }).sort({ createdAt: -1 }).limit(50).lean();
+    responder({ ok: true, historico: ultimas.reverse() });
+
+    socket.to(sala).emit("sistema", `${socket.data.autor} entrou`);
+    io.to(sala).emit("online", (await io.in(sala).fetchSockets()).length);
+  });
+
+  socket.on("mensagem", async ({ texto } = {}, responder) => {
+    const { sala, autor } = socket.data;
+    if (!sala) return responder?.({ ok: false, erro: "Entre em uma sala primeiro" });
+    if (typeof texto !== "string" || !texto.trim() || texto.length > 2000) {
+      return responder?.({ ok: false, erro: "Mensagem vazia ou longa demais" });
+    }
+
+    try {
+      const salva = await Mensagem.create({ sala, autor, texto });
+      io.to(sala).emit("mensagem", {
+        id: salva._id.toString(),
+        autor: salva.autor,
+        texto: salva.texto,
+        criadaEm: salva.createdAt,
+      });
+      responder?.({ ok: true, id: salva._id.toString() });
+    } catch (erro) {
+      console.error(erro);
+      responder?.({ ok: false, erro: "Não foi possível salvar" });
+    }
+  });
+
+  socket.on("digitando", () => {
+    if (socket.data.sala) socket.to(socket.data.sala).emit("digitando", socket.data.autor);
+  });
+
+  socket.on("disconnecting", () => {
+    for (const sala of socket.rooms) {
+      if (sala !== socket.id) socket.to(sala).emit("sistema", `${socket.data.autor} saiu`);
+    }
+  });
+}
+```
+
+Alguns detalhes que fazem diferença:
+
+- **`socket.data`** guarda informações da conexão (nome, sala atual). Fica no servidor; o cliente não consegue alterar diretamente.
+- **`socket.rooms`** é um `Set` com as salas do socket. Todo socket entra automaticamente numa sala com o próprio id, por isso o filtro `anterior !== socket.id`.
+- **`disconnecting`** dispara antes de o socket sair das salas, então ainda dá para saber onde ele estava. Em `disconnect`, `socket.rooms` já está vazio.
+- **Salvar antes de emitir**: a mensagem só é distribuída depois de gravada. Se o banco falhar, ninguém vê uma mensagem que some ao recarregar.
+- **`digitando`** não é salvo nem confirmado: é um evento efêmero. Se perder um, ninguém nota.
+
+## Acks: confirmação com resposta
+
+O último argumento de `emit` pode ser uma função. Do outro lado ela chega como o último parâmetro do handler, e chamá-la envia a resposta de volta. É o que `responder` faz acima.
+
+No cliente, a versão com Promise e tempo limite é a mais prática:
+
+```javascript
+try {
+  const resposta = await socket.timeout(5000).emitWithAck("mensagem", { texto: "Olá" });
+  if (!resposta.ok) mostrarErro(resposta.erro);
+} catch {
+  mostrarErro("Servidor não respondeu");
+}
+```
+
+Sem `timeout`, se o servidor nunca chamar o callback, a Promise fica pendente para sempre.
+
+## O cliente
+
+```html
+<!-- public/index.html -->
+<form id="entrar"><input name="sala" placeholder="sala" /><input name="autor" placeholder="seu nome" /><button>Entrar</button></form>
+<p id="online"></p>
+<ul id="mensagens"></ul>
+<form id="enviar"><input name="texto" autocomplete="off" /><button>Enviar</button></form>
+<script type="module" src="/chat.js"></script>
+```
+
+```javascript
+// public/chat.js
+import { io } from "https://cdn.socket.io/4.8.1/socket.io.esm.min.js";
+
+const socket = io(); // mesma origem; em outro domínio: io("https://api.exemplo.com")
+const lista = document.querySelector("#mensagens");
+
+function adicionar(texto) {
+  const li = document.createElement("li");
+  li.textContent = texto; // textContent, nunca innerHTML com dado de outra pessoa
+  lista.append(li);
+}
+
+// Handlers registrados UMA vez, no topo do módulo
+socket.on("mensagem", (m) => adicionar(`${m.autor}: ${m.texto}`));
+socket.on("sistema", (texto) => adicionar(`* ${texto}`));
+socket.on("online", (n) => (document.querySelector("#online").textContent = `${n} online`));
+
+document.querySelector("#entrar").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const dados = Object.fromEntries(new FormData(e.target));
+  const resposta = await socket.timeout(5000).emitWithAck("entrar", dados);
+  if (!resposta.ok) return alert(resposta.erro);
+  lista.replaceChildren();
+  resposta.historico.forEach((m) => adicionar(`${m.autor}: ${m.texto}`));
+});
+
+document.querySelector("#enviar").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const campo = e.target.texto;
+  const resposta = await socket.timeout(5000).emitWithAck("mensagem", { texto: campo.value });
+  if (resposta.ok) campo.value = "";
+});
+
+socket.on("connect", () => console.log("conectado", socket.id));
+socket.on("disconnect", (motivo) => console.log("desconectado", motivo));
+```
+
+Em React ou outro framework, use o pacote `socket.io-client` do npm em vez do CDN.
+
+Abra duas abas, entre na mesma sala com nomes diferentes e converse. Recarregue uma aba: o histórico volta do MongoDB.
+
+<Callout type="warning" title="Handlers registrados mais de uma vez">
+O bug mais comum no cliente é registrar `socket.on("mensagem", ...)` dentro de algo que roda várias vezes: dentro do handler de `connect` (que dispara a cada reconexão), dentro de um clique ou num `useEffect` sem limpeza. A cada execução um novo ouvinte é adicionado, e cada mensagem passa a aparecer duas, três, dez vezes. Registre ouvintes uma vez só e, em componentes, remova no desmonte com `socket.off("mensagem", handler)`.
+</Callout>
+
+## Confiança: o cliente mente
+
+Todo dado que chega por socket vem de um cliente que você não controla. As mesmas regras de uma API REST valem aqui:
+
+- **Valide tipo e tamanho** de cada campo, como o `NOME_SALA` e o limite de 2000 caracteres. Um `texto` com 50 MB derruba o servidor; ajuste também `maxHttpBufferSize` nas opções do `Server` (o padrão é 1 MB).
+- **Não confie em identidade enviada pelo cliente.** Neste capítulo o nome vem do formulário, o que serve para um chat anônimo. Em qualquer sistema real, a identidade vem de autenticação no handshake, que é o assunto do próximo capítulo.
+- **Escape na exibição.** O servidor guarda o texto como veio; quem exibe usa `textContent`. Um `innerHTML` com a mensagem de outra pessoa é XSS.
+- **Limite a frequência.** Um cliente pode emitir milhares de eventos por segundo. Conte eventos por socket e desconecte quem abusar.
+
+## Na entrevista
+
+**Qual a diferença entre WebSocket e Socket.IO?** WebSocket é um protocolo padrão de comunicação bidirecional sobre TCP. Socket.IO é uma biblioteca que usa WebSocket (com fallback para long polling) e acrescenta eventos nomeados, salas, acks, reconexão automática e adapters para escalar. Os dois não são compatíveis diretamente.
+
+**Quando usar SSE em vez de WebSocket?** Quando só o servidor precisa enviar dados, como notificações, painéis ou streaming de respostas. SSE roda sobre HTTP comum, reconecta sozinho e passa por proxies com facilidade.
+
+**Como enviar uma mensagem só para os participantes de uma conversa?** Colocando os sockets numa sala com o id da conversa (`socket.join`) e emitindo com `io.to(sala).emit`. Para enviar a um usuário em todas as abas, cada usuário entra numa sala com o próprio id.
+
+**O que é um ack?** Uma função de retorno passada no `emit`. O destinatário a chama com uma resposta, o que confirma o recebimento e permite fluxos de requisição e resposta sobre o socket.
+
+## Pratique
+
+Construa o chat deste capítulo e entregue:
+
+1. Servidor Socket.IO com salas, histórico das últimas 50 mensagens e contador de pessoas online.
+2. Modelo Mongoose com índice composto e um endpoint REST `GET /salas/:sala/mensagens?antes=<data>` para carregar mensagens mais antigas (paginação por cursor).
+3. Indicador "fulano está digitando" que some após 3 segundos sem eventos.
+4. Validação de todos os eventos e `maxHttpBufferSize` configurado.
+5. Um teste automatizado com `socket.io-client` que conecta dois clientes, envia uma mensagem e confere que o outro recebeu.
+
+<Quiz question="Qual chamada envia um evento para todos na sala, exceto quem enviou?" options={["io.to(sala).emit","socket.to(sala).emit","socket.emit com sala","io.emit com filtro"]} answer={1} explanation="socket.to(sala).emit exclui o próprio socket. io.to(sala).emit envia para todos na sala, inclusive quem originou." />
+
+<Quiz question="Por que tratar o evento disconnecting em vez de disconnect para avisar a sala?" options={["Porque disconnect não existe no servidor","Porque em disconnecting o socket ainda está nas salas","Porque disconnecting é mais rápido","Porque disconnect só dispara no cliente"]} answer={1} explanation="Em disconnecting, socket.rooms ainda contém as salas. Quando disconnect dispara, o socket já saiu de todas." />
+
+<Quiz question="Cada mensagem aparece três vezes no cliente. Causa mais provável?" options={["O servidor emitiu para três salas","Handlers socket.on registrados várias vezes","O MongoDB gravou em triplicado","O ack foi chamado três vezes"]} answer={1} explanation="Registrar ouvintes dentro de connect, cliques ou efeitos sem limpeza acumula handlers. Cada um processa a mesma mensagem." />
+
+## Base no CodeForge
+
+- [WebSockets](/learn/redes/websockets) e [Sockets](/learn/redes/sockets): o protocolo por baixo do Socket.IO.
+- [WebSockets em system design](/learn/system-design/websockets), [Long polling](/learn/system-design/long-polling) e [Server-Sent Events](/learn/system-design/server-sent-events): as alternativas e seus custos.
+- [Chat](/learn/system-design-interviews/chat): o mesmo problema em escala de entrevista.
+- [Node.js: Criando uma API Rest com Express e MongoDB](/learn/carreira-nodejs/nodejs-criando-api-rest-express-mongodb): Mongoose e modelagem no MongoDB.
+
+## Referências
+
+- [Socket.IO: Documentação v4](https://socket.io/docs/v4/)
+- [Socket.IO: Rooms](https://socket.io/docs/v4/rooms/)
+- [Socket.IO: Emitting events](https://socket.io/docs/v4/emitting-events/)
+- [Mongoose](https://mongoosejs.com/docs/)

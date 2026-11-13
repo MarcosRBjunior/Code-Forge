@@ -1,0 +1,385 @@
+---
+title: "Integração Contínua: Automatizando a entrega no Kubernetes"
+kind: lesson
+---
+
+No capítulo de Terraform e Kubernetes, você criou o cluster EKS e viu que o Deployment da aplicação não combina com `terraform apply` a cada commit. Este capítulo fecha a carreira com a peça que faltava: o pipeline que leva cada commit da API de livros até o cluster. Ele publica a imagem, atualiza os manifestos com a tag nova, aplica no namespace certo, espera o rollout terminar e desfaz se algo der errado. No fim, você também vai ver o modelo GitOps, em que o pipeline nem toca no cluster.
+
+**Você vai aprender:**
+
+- Organizar os manifestos da API com Kustomize: uma base e um overlay por ambiente
+- Dar ao pipeline acesso ao EKS por OIDC e access entry com escopo de namespace
+- Aplicar, acompanhar e reverter um rollout a partir do GitHub Actions
+- Configurar o Deployment para atualizações sem downtime
+- Comparar o modelo push (pipeline aplica) com o modelo GitOps (cluster puxa)
+
+## Manifestos com Kustomize
+
+Os mesmos objetos do capítulo de Terraform, agora em YAML, que é a forma nativa do Kubernetes. Para não duplicar tudo entre staging e produção, o Kustomize (embutido no `kubectl`) usa uma base e overlays que só declaram as diferenças:
+
+```text
+k8s/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── hpa.yaml
+└── overlays/
+    ├── staging/
+    │   └── kustomization.yaml
+    └── production/
+        ├── kustomization.yaml
+        └── recursos.yaml
+```
+
+```yaml
+# k8s/base/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-livros
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: api-livros
+  template:
+    metadata:
+      labels:
+        app: api-livros
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: api-livros
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+          envFrom:
+            - secretRef:
+                name: api-livros-segredos
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+```
+
+```yaml
+# k8s/base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+images:
+  - name: api-livros
+    newName: 123456789012.dkr.ecr.us-east-1.amazonaws.com/api-livros
+    newTag: dev
+```
+
+```yaml
+# k8s/overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: livros
+resources:
+  - ../../base
+patches:
+  - path: recursos.yaml
+```
+
+```yaml
+# k8s/overlays/production/recursos.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-livros
+spec:
+  minReplicas: 3
+  maxReplicas: 20
+```
+
+O overlay de staging é igual, com `namespace: livros-staging` e sem o patch. Para ver o resultado final sem aplicar nada, rode `kubectl kustomize k8s/overlays/production`. É exatamente o que o cluster vai receber.
+
+Repare na estratégia do Deployment: `maxUnavailable: 0` e `maxSurge: 1` fazem o Kubernetes subir um pod novo, esperar a readiness probe passar e só então derrubar um antigo. Junto com o `terminationGracePeriodSeconds` e o tratamento de `SIGTERM` na API (do capítulo de infraestrutura elástica), o rollout não derruba nenhuma requisição.
+
+O `secretRef` aponta para um Secret criado fora do pipeline (pelo External Secrets Operator lendo do Secrets Manager, por exemplo). O repositório nunca tem o valor.
+
+## Acesso do pipeline ao cluster
+
+O pipeline assume uma role por OIDC, como nos capítulos de EC2 e ECS. Mas no EKS há duas camadas de permissão: o IAM decide se a role pode falar com a API da AWS (`eks:DescribeCluster`, para montar o kubeconfig), e as **access entries** do EKS decidem o que essa role pode fazer **dentro** do cluster. Dê a ela edição só nos namespaces da aplicação:
+
+```hcl
+resource "aws_eks_access_entry" "deploy" {
+  cluster_name  = "livros"
+  principal_arn = aws_iam_role.deploy.arn
+}
+
+resource "aws_eks_access_policy_association" "deploy" {
+  cluster_name  = "livros"
+  principal_arn = aws_iam_role.deploy.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+
+  access_scope {
+    type       = "namespace"
+    namespaces = ["livros", "livros-staging"]
+  }
+}
+
+resource "aws_iam_role_policy" "deploy_eks" {
+  role = aws_iam_role.deploy.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["eks:DescribeCluster"]
+      Resource = "arn:aws:eks:us-east-1:123456789012:cluster/livros"
+    }]
+  })
+}
+```
+
+Com escopo de namespace, mesmo que o workflow seja comprometido, ele não consegue mexer em `kube-system`, ler segredos de outros times ou criar recursos de cluster. A permissão de push no ECR é a mesma do capítulo de ECS.
+
+## O workflow de entrega
+
+```yaml
+# .github/workflows/deploy-k8s.yml
+name: Deploy Kubernetes
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER: livros
+  ROLE_ARN: arn:aws:iam::123456789012:role/github-deploy-api-livros
+
+jobs:
+  testes:
+    uses: ./.github/workflows/ci.yml
+
+  imagem:
+    needs: testes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/api-livros:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  staging:
+    needs: imagem
+    uses: ./.github/workflows/deploy-k8s-ambiente.yml
+    with:
+      overlay: staging
+      namespace: livros-staging
+
+  production:
+    needs: staging
+    uses: ./.github/workflows/deploy-k8s-ambiente.yml
+    with:
+      overlay: production
+      namespace: livros
+```
+
+```yaml
+# .github/workflows/deploy-k8s-ambiente.yml
+name: Deploy em um namespace
+
+on:
+  workflow_call:
+    inputs:
+      overlay:
+        type: string
+        required: true
+      namespace:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.overlay }}
+    concurrency:
+      group: k8s-${{ inputs.overlay }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy-api-livros
+          aws-region: us-east-1
+
+      - name: Configurar kubectl
+        run: aws eks update-kubeconfig --name livros --region us-east-1
+
+      - name: Fixar a imagem do commit
+        working-directory: k8s/overlays/${{ inputs.overlay }}
+        run: |
+          kustomize edit set image \
+            api-livros=123456789012.dkr.ecr.us-east-1.amazonaws.com/api-livros:${{ github.sha }}
+
+      - name: Mostrar o diff
+        run: kubectl diff -k k8s/overlays/${{ inputs.overlay }} || true
+
+      - name: Aplicar
+        run: kubectl apply -k k8s/overlays/${{ inputs.overlay }}
+
+      - name: Esperar o rollout
+        run: |
+          if ! kubectl -n ${{ inputs.namespace }} rollout status deployment/api-livros --timeout=180s; then
+            kubectl -n ${{ inputs.namespace }} get pods -l app=api-livros
+            kubectl -n ${{ inputs.namespace }} describe deployment api-livros | tail -20
+            kubectl -n ${{ inputs.namespace }} rollout undo deployment/api-livros
+            kubectl -n ${{ inputs.namespace }} rollout status deployment/api-livros --timeout=180s
+            exit 1
+          fi
+```
+
+O que cada etapa faz:
+
+- **`aws eks update-kubeconfig`** escreve um kubeconfig que obtém tokens do IAM com as credenciais temporárias da role. Nada de kubeconfig com token fixo em secrets.
+- **`kustomize edit set image`** reescreve a tag no `kustomization.yaml` do overlay (só na cópia do runner, nada é commitado). O `kustomize` já vem instalado nos runners `ubuntu-latest`.
+- **`kubectl diff`** registra no log o que vai mudar, útil para auditoria e para entender um incidente depois.
+- **`kubectl rollout status`** é o que transforma o deploy num teste: ele espera todos os pods novos ficarem prontos. Se estoura o tempo, o pipeline mostra o estado dos pods, desfaz com `rollout undo` (voltando ao ReplicaSet anterior, guardado graças ao `revisionHistoryLimit`) e falha.
+
+O environment `production` tem revisores obrigatórios, então o job para antes do deploy e espera aprovação. Staging recebe todo commit; produção recebe o mesmo SHA, já validado.
+
+<Callout type="warning" title="kubectl apply verde não significa deploy feito">
+`kubectl apply` só envia o manifesto para a API do Kubernetes e termina com sucesso na hora, mesmo que os pods novos fiquem em `CrashLoopBackOff` ou `ImagePullBackOff`. Pipeline sem `rollout status` mostra deploy verde com a aplicação quebrada (felizmente, com `maxUnavailable: 0`, os pods antigos continuam servindo). Sempre espere o rollout e falhe o job se ele não completar.
+</Callout>
+
+## Migrações como Job
+
+Assim como no ECS, a migração deve rodar uma vez, antes de os pods novos receberem tráfego. No Kubernetes, isso é um `Job` com a mesma imagem e outro comando. O pipeline aplica o Job, espera terminar e só então aplica o Deployment:
+
+```yaml
+# k8s/jobs/migracao.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: migracao-
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migracao
+          image: IMAGEM
+          command: ["npm", "run", "db:migrate"]
+          envFrom:
+            - secretRef:
+                name: api-livros-segredos
+```
+
+```bash
+JOB=$(sed "s|IMAGEM|$REGISTRO/api-livros:$GITHUB_SHA|" k8s/jobs/migracao.yaml \
+  | kubectl -n livros create -f - -o name)
+kubectl -n livros wait --for=condition=complete "$JOB" --timeout=300s
+```
+
+`generateName` cria um nome único a cada execução, e `ttlSecondsAfterFinished` limpa o Job uma hora depois. Se a migração falha, o `wait` estoura e o deploy não acontece.
+
+## Push versus GitOps
+
+Tudo até aqui é o modelo **push**: o pipeline tem credenciais do cluster e aplica as mudanças. Funciona bem e é fácil de entender. O modelo **GitOps** inverte a direção:
+
+1. Os manifestos ficam num repositório (o mesmo ou um de configuração).
+2. Um agente dentro do cluster (Argo CD ou Flux) observa esse repositório e aplica o que estiver lá, continuamente.
+3. O pipeline da aplicação só constrói a imagem e faz um commit trocando a tag no overlay.
+
+| | Push (kubectl no pipeline) | GitOps (Argo CD, Flux) |
+| --- | --- | --- |
+| Credenciais do cluster | No pipeline | Só dentro do cluster |
+| Fonte da verdade | O último apply | O repositório Git |
+| Drift (mudança manual no cluster) | Fica até o próximo deploy | Corrigido automaticamente |
+| Rollback | `rollout undo` ou redeploy | `git revert` |
+| Complexidade inicial | Baixa | Média (instalar e operar o agente) |
+
+Para um time pequeno com um cluster, o modelo push deste capítulo é suficiente. Com vários clusters, muitos times ou exigência de auditoria forte, o GitOps passa a compensar: o histórico do Git vira o registro de tudo o que esteve em produção.
+
+## Na entrevista
+
+**Como você garante que o pipeline só considera o deploy pronto quando a aplicação está de pé?** Com `kubectl rollout status` com timeout, apoiado em readiness probes; se falha, `rollout undo` e job vermelho.
+
+**Como dar acesso ao cluster para o pipeline com o mínimo de privilégio?** OIDC para uma role IAM, access entry no EKS com política de edição limitada aos namespaces da aplicação, e `eks:DescribeCluster` só para aquele cluster.
+
+**Qual configuração de rolling update evita perder capacidade?** `maxUnavailable: 0` com `maxSurge` maior que zero, para os pods novos subirem e ficarem prontos antes de os antigos saírem.
+
+**Qual a diferença entre o modelo push e GitOps?** No push o pipeline aplica no cluster; no GitOps um agente no cluster sincroniza com o Git, que vira a fonte da verdade e corrige drift.
+
+## Pratique
+
+Feche a carreira com o pipeline completo da API de livros no EKS. Entregue:
+
+1. Manifestos em `k8s/` com base e overlays `staging` e `production` (HPA diferente em cada).
+2. Access entry da role de deploy limitada aos dois namespaces.
+3. Os workflows `deploy-k8s.yml` e `deploy-k8s-ambiente.yml`, com migração em Job, `rollout status` e `rollout undo` automático.
+4. Uma demonstração: publique uma versão com a readiness probe falhando e mostre no log do job o timeout, o estado dos pods e o rollback, com os pods antigos servindo o tempo todo.
+
+Bônus: instale o Argo CD no cluster, aponte-o para o overlay de staging e troque o passo de deploy de staging por um commit que atualiza a tag.
+
+<Quiz question="Por que o pipeline precisa de kubectl rollout status depois do kubectl apply?" options={["Porque o apply não envia nada até o rollout status ser chamado","Porque o apply termina com sucesso mesmo se os pods novos não ficarem prontos","Para liberar o lock do namespace","Porque o EKS exige confirmação do rollout"]} answer={1} explanation="O apply só envia o manifesto para a API. O rollout status espera os pods novos ficarem prontos e falha se o tempo estourar." />
+<Quiz question="Qual combinação de rollingUpdate garante que a capacidade nunca cai durante o deploy?" options={["maxSurge 0 e maxUnavailable 1","maxSurge 1 e maxUnavailable 1","maxSurge 0 e maxUnavailable 0","maxSurge 1 e maxUnavailable 0"]} answer={3} explanation="Com maxUnavailable 0, nenhum pod antigo sai antes de um novo estar pronto; maxSurge 1 permite criar o pod extra." />
+<Quiz question="Qual é a principal característica do modelo GitOps em relação ao modelo push?" options={["Um agente no cluster sincroniza o estado com o repositório Git, sem o pipeline ter credenciais do cluster","O pipeline aplica os manifestos com kubectl mais rápido","Os manifestos deixam de ser versionados","O rollback passa a ser feito com rollout undo"]} answer={0} explanation="No GitOps o Git é a fonte da verdade e o agente no cluster puxa as mudanças, corrigindo drift; o pipeline só altera o repositório." />
+
+## Base no CodeForge
+
+- [Infraestrutura como código: Terraform e Kubernetes](/learn/carreira-nodejs/infraestrutura-como-codigo-terraform-kubernetes): o cluster EKS que recebe este deploy.
+- [Integração Contínua: Automatize o deploy no Amazon ECS](/learn/carreira-nodejs/integracao-continua-automatize-deploy-amazon-ecs): o mesmo fluxo no ECS, com migração em task avulsa.
+- [Kubernetes](/learn/system-design-interviews/kubernetes): os objetos do Kubernetes em entrevistas.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): rolling, blue/green e canary.
+
+## Referências
+
+- [Kubernetes: Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+- [Kubernetes: Declarative management with Kustomize](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/)
+- [EKS: Connect kubectl with a kubeconfig file](https://docs.aws.amazon.com/eks/latest/userguide/create-kubeconfig.html)
+- [EKS: access entries](https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html)

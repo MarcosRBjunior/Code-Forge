@@ -1,0 +1,324 @@
+---
+title: "Integração Contínua: Pipeline de entrega e implementação contínua na EC2"
+kind: lesson
+---
+
+Você já tem um pipeline que testa o código e publica uma imagem rastreável. Falta a última milha: colocar essa imagem para rodar nos servidores. Feito à mão, o deploy vira um ritual de SSH, comandos copiados de um documento e torcida. Neste capítulo o pipeline assume essa etapa para a API de livros em instâncias EC2: autentica na AWS sem nenhuma chave guardada (OIDC), publica a imagem no ECR, atualiza staging automaticamente e produção com aprovação, verifica a saúde e volta atrás se algo der errado.
+
+**Você vai aprender:**
+
+- A diferença entre entrega contínua e implantação contínua
+- Autenticar o GitHub Actions na AWS com OIDC, sem chaves de acesso
+- Publicar a imagem no ECR e atualizar instâncias EC2 pelo SSM, sem SSH
+- Usar environments do GitHub para aprovação manual e segredos por ambiente
+- Fazer smoke test e rollback a partir do pipeline
+
+## Entrega contínua versus implantação contínua
+
+As duas siglas CD se confundem, e a diferença é uma só:
+
+- **Entrega contínua (continuous delivery)**: todo commit que passa no pipeline gera um artefato **pronto** para produção, e o deploy em produção é um clique (uma aprovação).
+- **Implantação contínua (continuous deployment)**: todo commit que passa no pipeline **vai** para produção, sem intervenção humana.
+
+O fluxo que você vai montar faz implantação contínua em staging e entrega contínua em produção. É o meio-termo mais comum: staging sempre reflete a `main`, e alguém decide quando promover. Com testes e monitoramento maduros, remover a aprovação de produção é só apagar uma regra.
+
+O princípio que vale para os dois: **construa uma vez, promova o mesmo artefato**. A imagem que passou em staging é exatamente a que vai para produção, identificada pelo SHA do commit. Nunca reconstrua para produção.
+
+## OIDC: credenciais sem chaves
+
+O jeito antigo de autenticar um pipeline na AWS era criar um usuário IAM, gerar `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY` e guardá-las em secrets. Essas chaves não expiram, vazam em logs e raramente são rotacionadas.
+
+Com OpenID Connect, o GitHub emite para cada execução um token assinado que diz "sou o workflow do repositório X, na branch Y, no environment Z". A AWS confia no emissor do GitHub e troca esse token por credenciais temporárias de uma role, válidas por uma hora. Não há segredo de longo prazo em lugar nenhum.
+
+Declare a confiança em Terraform, no mesmo repositório de infraestrutura dos capítulos anteriores:
+
+```hcl
+resource "aws_iam_openid_connect_provider" "github" {
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+}
+
+data "aws_iam_policy_document" "deploy_trust" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values = [
+        "repo:minha-org/api-livros:ref:refs/heads/main",
+        "repo:minha-org/api-livros:environment:staging",
+        "repo:minha-org/api-livros:environment:production",
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "deploy" {
+  name               = "github-deploy-api-livros"
+  assume_role_policy = data.aws_iam_policy_document.deploy_trust.json
+}
+```
+
+A condição sobre `sub` é a parte que protege você. Ela diz quais workflows podem assumir a role: só os deste repositório, rodando na `main` ou num dos dois environments. Quando um job declara `environment`, o `sub` do token passa a ser `repo:org/repo:environment:nome`, por isso os dois formatos aparecem.
+
+A role recebe só o necessário: push no repositório ECR da API, `ssm:SendCommand` no documento `AWS-RunShellScript` restrito às instâncias com a tag do projeto, e leitura de `ec2:DescribeInstances` e do resultado dos comandos.
+
+<Callout type="warning" title="Trust policy aberta demais">
+Uma condição como `repo:minha-org/*` ou, pior, nenhuma condição sobre `sub`, permite que qualquer workflow de qualquer repositório da organização (ou de qualquer conta do GitHub, sem a condição) assuma a sua role de deploy. Sempre fixe o repositório e, para produção, o environment. Revise isso com o mesmo cuidado de uma regra de firewall.
+</Callout>
+
+No workflow, o job pede o token com `permissions: id-token: write` e usa a action oficial:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/github-deploy-api-livros
+      aws-region: us-east-1
+```
+
+O CodeForge faz o mesmo na Azure: o job de deploy em `.github/workflows/azure.yml` tem `id-token: write` e usa `azure/login@v2` com client, tenant e subscription IDs, que são identificadores e não senhas. A ideia é idêntica, só muda a nuvem.
+
+## Preparando as instâncias para receber deploy
+
+O pipeline não vai entrar por SSH. Em vez disso, usa o SSM Run Command: a instância roda o agente do Systems Manager (já vem nas AMIs da Amazon e do Ubuntu), e a AWS entrega comandos a ele por uma conexão de saída. Não há porta 22 aberta nem chave privada no GitHub.
+
+As instâncias precisam de um perfil IAM com `AmazonSSMManagedInstanceCore` (para receber comandos) e `AmazonEC2ContainerRegistryReadOnly` (para baixar a imagem). E de um script de deploy local, instalado pelo Ansible ou pelo `user_data` dos capítulos de infraestrutura:
+
+```bash
+#!/usr/bin/env bash
+# /opt/api-livros/deploy.sh <tag>
+set -euo pipefail
+TAG=$1
+REGISTRO=123456789012.dkr.ecr.us-east-1.amazonaws.com
+IMAGEM=$REGISTRO/api-livros
+
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$REGISTRO"
+docker pull "$IMAGEM:$TAG"
+
+ANTERIOR=$(docker inspect --format '{{.Config.Image}}' api 2>/dev/null || true)
+
+docker rm -f api 2>/dev/null || true
+docker run -d --name api --restart unless-stopped -p 3000:3000 \
+  --env-file /etc/api-livros.env "$IMAGEM:$TAG"
+
+for i in $(seq 1 30); do
+  if curl -fs localhost:3000/health > /dev/null; then
+    echo "ok: $TAG saudável"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "falhou: $TAG não ficou saudável, voltando para $ANTERIOR"
+docker logs --tail 50 api || true
+docker rm -f api
+if [ -n "$ANTERIOR" ]; then
+  docker run -d --name api --restart unless-stopped -p 3000:3000 \
+    --env-file /etc/api-livros.env "$ANTERIOR"
+fi
+exit 1
+```
+
+O script é o coração do deploy: troca o contêiner, espera o `/health` e, se a versão nova não sobe, volta para a anterior antes de sair com erro. O pipeline só precisa chamá-lo com a tag. Os segredos ficam em `/etc/api-livros.env` na máquina (ou vêm do Parameter Store), nunca no workflow.
+
+Com duas ou mais instâncias atrás de um ALB, o deploy vai uma máquina por vez (`--max-concurrency 1` no SSM) para a API nunca ficar inteira fora do ar. Com uma instância só, há alguns segundos de indisponibilidade na troca; para eliminar isso, você precisa de mais de uma instância ou de um orquestrador, como nos próximos capítulos.
+
+## O workflow de entrega
+
+```yaml
+# .github/workflows/deploy-ec2.yml
+name: Deploy EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "SHA da imagem para reimplantar (rollback)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ROLE_ARN: arn:aws:iam::123456789012:role/github-deploy-api-livros
+
+jobs:
+  testes:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
+  imagem:
+    needs: testes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/api-livros:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  staging:
+    needs: imagem
+    if: always() && (needs.imagem.result == 'success' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/deploy-ambiente.yml
+    with:
+      ambiente: staging
+      tag: ${{ inputs.tag || needs.imagem.outputs.tag }}
+
+  production:
+    needs: [imagem, staging]
+    if: always() && needs.staging.result == 'success'
+    uses: ./.github/workflows/deploy-ambiente.yml
+    with:
+      ambiente: production
+      tag: ${{ inputs.tag || needs.imagem.outputs.tag }}
+```
+
+E o workflow reutilizável que faz o deploy num ambiente:
+
+```yaml
+# .github/workflows/deploy-ambiente.yml
+name: Deploy em um ambiente
+
+on:
+  workflow_call:
+    inputs:
+      ambiente:
+        type: string
+        required: true
+      tag:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.ambiente }}
+      url: ${{ vars.APP_URL }}
+    concurrency:
+      group: deploy-${{ inputs.ambiente }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy-api-livros
+          aws-region: us-east-1
+
+      - name: Rodar deploy.sh nas instâncias
+        run: |
+          IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Ambiente,Values=${{ inputs.ambiente }}" "Name=tag:Projeto,Values=api-livros" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+          echo "instâncias: $IDS"
+
+          CMD=$(aws ssm send-command --instance-ids $IDS \
+            --document-name AWS-RunShellScript --max-concurrency 1 --max-errors 0 \
+            --parameters commands="/opt/api-livros/deploy.sh ${{ inputs.tag }}" \
+            --query Command.CommandId --output text)
+
+          for id in $IDS; do
+            aws ssm wait command-executed --command-id "$CMD" --instance-id "$id" || {
+              aws ssm get-command-invocation --command-id "$CMD" --instance-id "$id" \
+                --query StandardOutputContent --output text
+              exit 1
+            }
+          done
+
+      - name: Smoke test pelo balanceador
+        run: |
+          for i in $(seq 1 10); do
+            curl -fs "${{ vars.APP_URL }}/health" && exit 0
+            sleep 5
+          done
+          exit 1
+```
+
+Peças importantes:
+
+- **Environments** (`staging` e `production`, criados em Settings, Environments) carregam variáveis próprias (`vars.APP_URL`), segredos próprios e regras de proteção. Em `production`, marque *Required reviewers*: o job para e espera alguém aprovar no GitHub. Esse clique é a entrega contínua.
+- **`concurrency` com `cancel-in-progress: false`** enfileira deploys do mesmo ambiente em vez de cancelar um que está no meio. Interromper um deploy pela metade é pior que esperar.
+- **`--max-errors 0`** com `--max-concurrency 1` faz o SSM parar na primeira instância que falhar, deixando as outras na versão anterior.
+- **O smoke test** valida pelo caminho do usuário (balanceador e DNS), não só dentro da máquina.
+
+## Rollback
+
+Como cada imagem é identificada pelo SHA e continua no ECR, voltar atrás é reimplantar uma tag anterior. O `workflow_dispatch` com o input `tag` faz exatamente isso: em Actions, Deploy EC2, Run workflow, cole o SHA da última versão boa. Os jobs `testes` e `imagem` são pulados, e os deploys usam a tag informada.
+
+```bash
+gh workflow run deploy-ec2.yml -f tag=3f9c2a1e5b7d...
+```
+
+Mantenha uma política de ciclo de vida no ECR que preserve pelo menos as últimas 20 imagens, para que o rollback sempre tenha para onde voltar. E lembre que rollback de código não desfaz migração de banco: faça migrações compatíveis com a versão anterior (adicione coluna antes de usar, remova só depois que nenhuma versão a lê).
+
+## Na entrevista
+
+**Qual a diferença entre entrega contínua e implantação contínua?** Na entrega, todo commit aprovado fica pronto para produção e o deploy depende de uma decisão; na implantação, todo commit aprovado vai para produção automaticamente.
+
+**Por que OIDC em vez de chaves de acesso no pipeline?** Credenciais temporárias por execução, sem segredo de longa duração para vazar ou rotacionar, e a trust policy restringe exatamente quais repositórios, branches e environments podem assumir a role.
+
+**Como fazer deploy em EC2 sem abrir SSH?** SSM Run Command (ou CodeDeploy): o agente na instância recebe comandos por conexão de saída, com permissões e auditoria pelo IAM e CloudTrail.
+
+**Como você faz rollback?** Reimplanto a imagem anterior pelo SHA, que continua no registro. Para isso o artefato precisa ser imutável e as migrações compatíveis com a versão anterior.
+
+## Pratique
+
+Entregue para a API de livros:
+
+1. Terraform com o provider OIDC do GitHub e a role de deploy com `sub` restrito ao repositório e aos environments.
+2. O `deploy.sh` instalado nas instâncias (via Ansible ou `user_data`) com health check e volta automática para a imagem anterior.
+3. Os workflows `deploy-ec2.yml` e `deploy-ambiente.yml`, com staging automático e produção com aprovação obrigatória.
+4. Uma demonstração de falha: publique uma versão cujo `/health` devolve 500 e mostre o `deploy.sh` voltando para a anterior e o pipeline falhando em staging, sem chegar à aprovação de produção.
+
+<Quiz question="O que diferencia entrega contínua de implantação contínua?" options={["Entrega contínua não roda testes automatizados","Na implantação contínua o deploy em produção acontece sem aprovação humana","Entrega contínua só funciona com contêineres","Implantação contínua dispensa o ambiente de staging"]} answer={1} explanation="Nas duas, todo commit aprovado gera um artefato pronto. Na implantação contínua ele segue para produção automaticamente; na entrega, alguém decide quando." />
+<Quiz question="Qual condição na trust policy da role de deploy é a mais segura para produção?" options={["sub igual a repo:minha-org/*","Nenhuma condição sobre sub, só sobre aud","sub igual a repo:minha-org/api-livros:environment:production","aud igual a repo:minha-org/api-livros"]} answer={2} explanation="Fixar repositório e environment garante que só jobs desse repositório, rodando no environment protegido por aprovação, assumam a role." />
+<Quiz question="Por que usar cancel-in-progress: false no grupo de concorrência do deploy?" options={["Para não interromper um deploy no meio quando outro é disparado","Para rodar dois deploys em paralelo e terminar mais rápido","Porque environments não aceitam cancel-in-progress true","Para pular a aprovação manual"]} answer={0} explanation="Cancelar um deploy pela metade pode deixar instâncias em versões diferentes. Com false, o próximo espera na fila." />
+
+## Base no CodeForge
+
+- [Integração Contínua: Pipeline Docker no GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipeline-docker-github-actions): o build da imagem reaproveitado aqui.
+- [Infraestrutura como código: Montando uma infraestrutura elástica na AWS](/learn/carreira-nodejs/infraestrutura-como-codigo-montando-infraestrutura-elastica-aws): as instâncias e o ALB que recebem o deploy.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): rolling, blue/green e canary.
+- [CI/CD](/learn/system-design/ci-cd): entrega e implantação contínuas no panorama de system design.
+
+## Referências
+
+- [Configuring OpenID Connect in Amazon Web Services](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
+- [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)
+- [Using environments for deployment](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment)
+- [AWS Systems Manager Run Command](https://docs.aws.amazon.com/systems-manager/latest/userguide/run-command.html)

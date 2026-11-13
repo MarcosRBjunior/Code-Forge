@@ -1,0 +1,340 @@
+---
+title: "Nest.js: Lidando com migrações, relacionamentos ORM e erros em uma API"
+kind: lesson
+---
+
+Uma API com uma tabela só é um exercício. As de verdade têm autores com muitos livros, livros em várias categorias, empréstimos que ligam usuários a exemplares, e um schema que muda toda semana com dados de produção que não podem se perder. Esta aula pega a API de livros em Nest com TypeORM e acrescenta as três coisas que separam um protótipo de um sistema em produção: migrações versionadas, relacionamentos bem modelados e erros do banco traduzidos em respostas HTTP corretas.
+
+**Você vai aprender:**
+
+- Como configurar o CLI do TypeORM e gerar, rodar e reverter migrações
+- Como escrever migrações seguras para um banco com dados
+- Como mapear relacionamentos um-para-muitos e muitos-para-muitos, e quando criar uma entidade de ligação
+- Como carregar relações sem cair no problema N+1
+- Como traduzir erros do PostgreSQL e do domínio em respostas com exception filters
+
+## Migrações: o schema como código versionado
+
+Uma migração é um arquivo com duas funções: `up`, que aplica uma mudança no schema, e `down`, que a desfaz. As migrações ficam no repositório, rodam em ordem e o banco guarda numa tabela (`migrations`) quais já foram aplicadas. Assim, qualquer ambiente chega ao mesmo schema rodando as mesmas migrações, e a mudança passa por code review como qualquer código.
+
+O primeiro passo é desligar o `synchronize` e criar um arquivo de `DataSource` que o CLI do TypeORM consiga ler fora do Nest:
+
+```typescript
+// src/database/data-source.ts
+import "dotenv/config";
+import { DataSource, type DataSourceOptions } from "typeorm";
+
+export const opcoesBanco: DataSourceOptions = {
+  type: "postgres",
+  url: process.env.DATABASE_URL,
+  entities: [__dirname + "/../**/*.entity.{ts,js}"],
+  migrations: [__dirname + "/migrations/*.{ts,js}"],
+  synchronize: false,
+};
+
+export default new DataSource(opcoesBanco);
+```
+
+```typescript
+// src/app.module.ts (trecho)
+TypeOrmModule.forRoot({ ...opcoesBanco, autoLoadEntities: true, migrationsRun: false }),
+```
+
+O mesmo objeto de opções serve ao Nest e ao CLI, o que evita duas configurações divergentes. Projetos Nest compilam para CommonJS por padrão, por isso `__dirname` está disponível e o CLI usado é o `typeorm-ts-node-commonjs`:
+
+```json
+{
+  "scripts": {
+    "typeorm": "typeorm-ts-node-commonjs -d src/database/data-source.ts",
+    "migration:generate": "npm run typeorm -- migration:generate",
+    "migration:run": "npm run typeorm -- migration:run",
+    "migration:revert": "npm run typeorm -- migration:revert",
+    "migration:show": "npm run typeorm -- migration:show"
+  }
+}
+```
+
+```bash
+npm i -D ts-node dotenv
+npm run migration:generate -- src/database/migrations/CriaLivros
+npm run migration:run
+npm run migration:show     # lista as migrações e marca as aplicadas com [X]
+```
+
+`migration:generate` compara as entidades com o schema atual do banco e escreve o SQL da diferença. É um rascunho, não uma verdade: **leia sempre o arquivo gerado**.
+
+```typescript
+// src/database/migrations/1731500000000-CriaLivros.ts
+import type { MigrationInterface, QueryRunner } from "typeorm";
+
+export class CriaLivros1731500000000 implements MigrationInterface {
+  name = "CriaLivros1731500000000";
+
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(`
+      CREATE TABLE "livros" (
+        "id" uuid NOT NULL DEFAULT gen_random_uuid(),
+        "titulo" varchar(200) NOT NULL,
+        "isbn" char(13) NOT NULL,
+        CONSTRAINT "UQ_livros_isbn" UNIQUE ("isbn"),
+        CONSTRAINT "PK_livros" PRIMARY KEY ("id")
+      )`);
+  }
+
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(`DROP TABLE "livros"`);
+  }
+}
+```
+
+### Migrações seguras com dados em produção
+
+O gerador não sabe que a tabela tem milhões de linhas nem que a versão antiga da API continua rodando durante o deploy. Algumas regras:
+
+- **Renomear coluna**: o gerador produz `DROP` e `ADD`, perdendo os dados. Troque à mão por `ALTER TABLE ... RENAME COLUMN`.
+- **Coluna nova obrigatória**: adicione com `DEFAULT`, ou em etapas (adiciona nula, preenche, depois `SET NOT NULL`).
+- **Remover ou renomear algo que o código usa**: faça em duas entregas (expandir e contrair). Primeiro, o código para de depender da coluna antiga; só no deploy seguinte a migração a remove. Durante o deploy, versões antiga e nova da API rodam juntas e ambas precisam funcionar com o schema.
+- **Migração de dados** (preencher uma coluna a partir de outra) pode ficar na própria migração, com SQL, desde que seja rápida. Atualizações grandes vão em lotes, num script separado.
+
+Rode as migrações como um passo do deploy, antes de subir a nova versão (no pipeline ou num job de inicialização), e não com `migrationsRun: true` em cada réplica, para evitar várias instâncias migrando ao mesmo tempo.
+
+<Callout type="warning" title="Nunca edite uma migração já aplicada">
+O TypeORM registra a migração pelo nome. Se você alterar um arquivo que já rodou em algum ambiente, ele não roda de novo ali, e os ambientes passam a ter schemas diferentes sem nenhum aviso. Errou numa migração já aplicada? Crie uma nova que corrige. Editar só é seguro enquanto a migração existe apenas na sua máquina.
+</Callout>
+
+## Relacionamentos
+
+O novo modelo da biblioteca:
+
+- Um **autor** escreve muitos **livros** (um-para-muitos).
+- Um livro pertence a várias **categorias**, e cada categoria tem vários livros (muitos-para-muitos).
+- Um **usuário** faz **empréstimos** de livros, com data de retirada e devolução (muitos-para-muitos com atributos, que vira uma entidade própria).
+
+### Um-para-muitos
+
+O lado "muitos" (o livro) é o dono da relação: é nele que fica a chave estrangeira.
+
+```typescript
+// src/autores/autor.entity.ts
+@Entity("autores")
+export class Autor {
+  @PrimaryGeneratedColumn("uuid") id: string;
+  @Column({ length: 120 }) nome: string;
+
+  @OneToMany(() => Livro, (livro) => livro.autor)
+  livros: Livro[];
+}
+
+// src/livros/entities/livro.entity.ts (trecho)
+@Entity("livros")
+export class Livro {
+  @PrimaryGeneratedColumn("uuid") id: string;
+  @Column({ length: 200 }) titulo: string;
+
+  @ManyToOne(() => Autor, (autor) => autor.livros, { nullable: false, onDelete: "RESTRICT" })
+  @JoinColumn({ name: "autor_id" })
+  autor: Autor;
+
+  @Column({ name: "autor_id" })
+  autorId: string;
+
+  @ManyToMany(() => Categoria, (c) => c.livros)
+  @JoinTable({
+    name: "livros_categorias",
+    joinColumn: { name: "livro_id" },
+    inverseJoinColumn: { name: "categoria_id" },
+  })
+  categorias: Categoria[];
+}
+```
+
+Declarar também a coluna `autorId` permite criar um livro só com o id do autor (`{ titulo, autorId }`), sem carregar o objeto `Autor`. O `onDelete: "RESTRICT"` impede apagar um autor que ainda tem livros; `CASCADE` apagaria os livros junto, e `SET NULL` deixaria órfãos. Escolha conscientemente: o padrão do banco é o que você declarar.
+
+### Muitos-para-muitos
+
+`@JoinTable` fica em um dos lados e cria a tabela de ligação `livros_categorias` com as duas chaves. Para associar:
+
+```typescript
+const livro = await this.livros.findOne({ where: { id }, relations: { categorias: true } });
+livro.categorias = await this.categorias.findBy({ id: In(dto.categoriaIds) });
+await this.livros.save(livro); // o TypeORM sincroniza a tabela de ligação
+```
+
+### Quando a ligação tem dados: entidade própria
+
+Um empréstimo liga usuário e livro, mas tem datas e status. `@ManyToMany` não guarda colunas extras. Crie a entidade de ligação explicitamente, com dois `@ManyToOne`:
+
+```typescript
+@Entity("emprestimos")
+@Index(["livroId"], { unique: true, where: `"devolvido_em" IS NULL` })
+export class Emprestimo {
+  @PrimaryGeneratedColumn("uuid") id: string;
+
+  @ManyToOne(() => Usuario, { nullable: false })
+  @JoinColumn({ name: "usuario_id" })
+  usuario: Usuario;
+  @Column({ name: "usuario_id" }) usuarioId: string;
+
+  @ManyToOne(() => Livro, { nullable: false })
+  @JoinColumn({ name: "livro_id" })
+  livro: Livro;
+  @Column({ name: "livro_id" }) livroId: string;
+
+  @CreateDateColumn({ name: "retirado_em", type: "timestamptz" }) retiradoEm: Date;
+  @Column({ name: "devolucao_prevista", type: "date" }) devolucaoPrevista: string;
+  @Column({ name: "devolvido_em", type: "timestamptz", nullable: true }) devolvidoEm: Date | null;
+}
+```
+
+O índice único parcial garante no banco que um livro só tem um empréstimo em aberto. Regras de integridade no banco valem mesmo quando duas requisições chegam ao mesmo tempo, coisa que uma checagem só no código não garante.
+
+## Carregando relações sem N+1
+
+Relações não vêm por padrão. Há três formas de trazê-las:
+
+```typescript
+// 1. relations no find: um JOIN
+const livros = await this.livros.find({
+  relations: { autor: true, categorias: true },
+  order: { titulo: "ASC" },
+  take: 20,
+});
+
+// 2. QueryBuilder: controle total do JOIN e dos campos
+const daCategoria = await this.livros
+  .createQueryBuilder("l")
+  .innerJoin("l.categorias", "c", "c.slug = :slug", { slug: "romance" })
+  .leftJoinAndSelect("l.autor", "a")
+  .getMany();
+
+// 3. eager: true na relação: carrega sempre, em todo find (use com moderação)
+```
+
+O problema N+1 aparece quando você carrega a lista e depois busca a relação de cada item num laço:
+
+```typescript
+// N+1: 1 consulta para os livros + 1 por livro para o autor
+const livros = await this.livros.find({ take: 50 });
+for (const l of livros) {
+  l.autor = await this.autores.findOneByOrFail({ id: l.autorId }); // 50 consultas
+}
+```
+
+Com 50 livros, são 51 idas ao banco em vez de uma. Ligue `logging: ["query"]` em desenvolvimento e conte as consultas de cada endpoint: é o jeito mais rápido de achar N+1. Cuidado também com `take` junto de JOIN em relações "muitos": o TypeORM precisa de uma consulta extra para paginar corretamente pelo livro, e não pelas linhas do JOIN.
+
+## Erros: do banco à resposta HTTP
+
+As exceções HTTP do Nest (`NotFoundException`, `ConflictException`) já viram respostas certas. O problema são os erros que vêm de baixo. Uma violação de unicidade no PostgreSQL chega como `QueryFailedError` e, sem tratamento, vira 500, embora seja um erro do cliente (ISBN repetido).
+
+Um **exception filter** captura um tipo de exceção e decide a resposta:
+
+```typescript
+// src/common/filters/typeorm-exception.filter.ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpStatus, Logger } from "@nestjs/common";
+import type { Response } from "express";
+import { QueryFailedError } from "typeorm";
+
+const MAPA: Record<string, { status: number; mensagem: string }> = {
+  "23505": { status: HttpStatus.CONFLICT, mensagem: "registro duplicado" },
+  "23503": { status: HttpStatus.CONFLICT, mensagem: "referência a registro inexistente ou em uso" },
+  "23502": { status: HttpStatus.BAD_REQUEST, mensagem: "campo obrigatório ausente" },
+  "22P02": { status: HttpStatus.BAD_REQUEST, mensagem: "valor em formato inválido" },
+};
+
+@Catch(QueryFailedError)
+export class TypeOrmExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(TypeOrmExceptionFilter.name);
+
+  catch(exception: QueryFailedError, host: ArgumentsHost) {
+    const res = host.switchToHttp().getResponse<Response>();
+    const erroPg = exception.driverError as { code?: string; detail?: string; constraint?: string };
+    const mapeado = erroPg.code ? MAPA[erroPg.code] : undefined;
+
+    if (!mapeado) {
+      this.logger.error(exception.message, exception.stack);
+      res.status(500).json({ statusCode: 500, message: "erro interno" });
+      return;
+    }
+    res.status(mapeado.status).json({
+      statusCode: mapeado.status,
+      message: mapeado.mensagem,
+      constraint: erroPg.constraint,
+    });
+  }
+}
+```
+
+```typescript
+// src/app.module.ts (trecho)
+import { APP_FILTER } from "@nestjs/core";
+
+providers: [{ provide: APP_FILTER, useClass: TypeOrmExceptionFilter }],
+```
+
+Registrar com `APP_FILTER` (em vez de `app.useGlobalFilters` no `main.ts`) faz o filtro participar da injeção de dependência e valer também nos testes e2e que montam o módulo. O nome da constraint (`UQ_livros_isbn`) ajuda o cliente a saber qual campo conflitou sem expor o SQL. Nunca devolva `exception.message` direto: ele contém a consulta.
+
+### Erros de domínio
+
+Regras de negócio devem falhar com exceções do domínio, não com erros do banco por acaso. O service checa o que pode checar e lança a exceção do Nest correspondente, ou uma exceção própria:
+
+```typescript
+export class LivroIndisponivelException extends ConflictException {
+  constructor(livroId: string) {
+    super({ codigo: "livro_indisponivel", message: `Livro ${livroId} já está emprestado` });
+  }
+}
+
+async emprestar(livroId: string, usuarioId: string) {
+  const livro = await this.livros.findOneBy({ id: livroId });
+  if (!livro) throw new NotFoundException(`Livro ${livroId} não encontrado`);
+  try {
+    return await this.emprestimos.save(this.emprestimos.create({ livroId, usuarioId, devolucaoPrevista: daquiA(14) }));
+  } catch (err) {
+    if (err instanceof QueryFailedError && (err.driverError as { code?: string }).code === "23505") {
+      throw new LivroIndisponivelException(livroId); // o índice parcial barrou a corrida
+    }
+    throw err;
+  }
+}
+```
+
+A checagem prévia (`findOneBy`) dá uma mensagem clara no caso comum; o índice único resolve a corrida entre duas requisições simultâneas, e o `catch` traduz esse caso para a mesma resposta.
+
+## Na entrevista
+
+**Por que migrações em vez de `synchronize`?** Migrações são versionadas, revisáveis, reversíveis e aplicadas igual em todos os ambientes. `synchronize` muda o schema sem revisão e pode perder dados.
+
+**Como renomear uma coluna sem derrubar a aplicação?** Em etapas: adicionar a nova, escrever nas duas, migrar os dados, ler da nova, e só então remover a antiga, cada passo num deploy. A versão antiga e a nova do código precisam conviver com o schema.
+
+**O que é o problema N+1 e como evitar?** Uma consulta para a lista e uma para cada item ao buscar a relação. Evita-se carregando a relação com JOIN (`relations` ou `leftJoinAndSelect`) ou buscando todas de uma vez com `IN`.
+
+**Muitos-para-muitos com atributos extras?** Vira uma entidade de ligação com dois `ManyToOne`, porque a tabela gerada por `ManyToMany` só guarda as duas chaves.
+
+## Pratique
+
+Evolua a API de livros em Nest:
+
+1. Desligue `synchronize`, crie o `data-source.ts` e gere a migração inicial a partir das entidades atuais.
+2. Adicione `Autor` (um-para-muitos com `Livro`) e `Categoria` (muitos-para-muitos), cada um com sua migração revisada à mão.
+3. Crie `Emprestimo` como entidade de ligação, com o índice único parcial, e os endpoints de emprestar e devolver.
+4. Faça uma migração de renomear coluna (`titulo` para `nome`) preservando os dados, e teste o `migration:revert`.
+5. Registre o `TypeOrmExceptionFilter` e escreva testes e2e para ISBN duplicado (409), autor inexistente (409), id inválido (400) e empréstimo duplo (409).
+
+Entregue o repositório e, no README, a saída de `migration:show` e o número de consultas do endpoint `GET /livros` com `logging` ligado, antes e depois de corrigir um N+1.
+
+<Quiz question="O migration:generate produziu DROP COLUMN titulo e ADD COLUMN nome. O que fazer?" options={["Rodar como está, o TypeORM copia os dados","Trocar à mão por ALTER TABLE ... RENAME COLUMN para não perder dados","Ligar synchronize para corrigir","Apagar a tabela e recriar"]} answer={1} explanation="O gerador não sabe que é um renome. DROP e ADD perdem os dados da coluna; RENAME COLUMN preserva." />
+<Quiz question="Um empréstimo liga usuário e livro e tem datas de retirada e devolução. Como mapear?" options={["ManyToMany com JoinTable","Uma entidade Emprestimo com dois ManyToOne","OneToOne entre usuário e livro","Um array de ids no usuário"]} answer={1} explanation="A tabela de um ManyToMany só guarda as chaves. Atributos extras exigem uma entidade de ligação própria." />
+<Quiz question="Sem tratamento, uma violação de unicidade do PostgreSQL chega ao cliente como qual status?" options={["409","400","500","404"]} answer={2} explanation="O QueryFailedError não é uma HttpException, então o Nest responde 500. Um exception filter traduz o código 23505 em 409." />
+
+## Base no CodeForge
+
+- [Migrações de schema](/learn/system-design/migracoes-de-schema): expandir e contrair, e migrações sem downtime.
+- [Modelagem ER](/learn/sql/modelagem-er), [Normalização](/learn/sql/normalizacao) e [Tipos e restrições](/learn/sql/tipos-e-restricoes): a modelagem por trás das entidades.
+- [Nest.js: Persistindo dados com TypeORM e PostgreSQL](/learn/carreira-nodejs/nestjs-persistindo-dados-typeorm-postgresql): a base desta API.
+- [Nest.js: Adicionando funcionalidades com Redis, JWT e logging](/learn/carreira-nodejs/nestjs-adicionando-funcionalidades-redis-jwt-logging): o próximo passo.
+
+## Referências
+
+- [Migrations (TypeORM)](https://typeorm.io/docs/migrations/why)
+- [Relations (TypeORM)](https://typeorm.io/docs/relations/relations)
+- [Exception filters (documentação do Nest)](https://docs.nestjs.com/exception-filters)

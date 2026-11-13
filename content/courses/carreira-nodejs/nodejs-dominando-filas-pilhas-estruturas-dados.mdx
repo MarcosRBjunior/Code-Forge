@@ -1,0 +1,328 @@
+---
+title: "Node.js: Dominando filas, pilhas e estruturas de dados"
+kind: lesson
+---
+
+Filas e pilhas parecem assunto de faculdade até você precisar processar dez mil e-mails sem derrubar o provedor, limitar quantas chamadas simultâneas a API faz a um serviço externo ou guardar em memória os resultados mais usados sem estourar a RAM. Esses problemas são resolvidos com estruturas de dados simples, mas a escolha errada (como usar `array.shift()` numa fila grande) transforma uma rotina de segundos numa de minutos. Neste capítulo você implementa as estruturas que um back-end Node.js mais usa e as aplica em problemas reais.
+
+**Você vai aprender:**
+
+- Implementar pilha e fila em JavaScript com operações O(1) de verdade
+- Usar pilha para percorrer estruturas aninhadas sem recursão
+- Construir uma fila de tarefas assíncronas com limite de concorrência
+- Implementar uma fila de prioridade com heap binário
+- Montar um cache LRU com `Map` e saber quando partir para uma fila persistente
+
+## Pilha: o último a entrar é o primeiro a sair
+
+Uma pilha (LIFO, last in, first out) só permite mexer no topo: empilhar (`push`) e desempilhar (`pop`). Em JavaScript, o próprio array já é uma pilha eficiente, porque `push` e `pop` mexem no fim e custam O(1). Encapsular numa classe deixa a intenção clara e impede o uso errado:
+
+```javascript
+class Pilha {
+  #itens = [];
+  empilhar(x) { this.#itens.push(x); }
+  desempilhar() { return this.#itens.pop(); }
+  topo() { return this.#itens.at(-1); }
+  get tamanho() { return this.#itens.length; }
+  vazia() { return this.#itens.length === 0; }
+}
+```
+
+Você usa pilhas o tempo todo sem perceber: a pilha de chamadas que aparece em todo stack trace é uma, e o botão "desfazer" de qualquer editor também. Num back-end, o uso mais comum é percorrer algo aninhado.
+
+### Percorrendo uma árvore sem recursão
+
+A API de livros tem categorias aninhadas (Literatura, dentro dela Brasileira, dentro dela Romance...). Para listar todas as categorias abaixo de uma, a recursão é natural, mas uma árvore muito profunda (ou um ciclo por erro de dados) estoura a pilha de chamadas do V8 com `RangeError: Maximum call stack size exceeded`. Com uma pilha explícita, o limite passa a ser a memória, e detectar ciclos fica fácil:
+
+```javascript
+const categorias = {
+  id: 1, nome: "Literatura", filhas: [
+    { id: 2, nome: "Brasileira", filhas: [
+      { id: 4, nome: "Romance", filhas: [] },
+      { id: 5, nome: "Poesia", filhas: [] },
+    ] },
+    { id: 3, nome: "Estrangeira", filhas: [] },
+  ],
+};
+
+function todasAbaixo(raiz) {
+  const pilha = new Pilha();
+  const vistos = new Set();
+  const resultado = [];
+  pilha.empilhar(raiz);
+  while (!pilha.vazia()) {
+    const atual = pilha.desempilhar();
+    if (vistos.has(atual.id)) continue; // protege contra ciclos
+    vistos.add(atual.id);
+    resultado.push(atual.nome);
+    // empilha ao contrário para visitar na ordem original
+    for (let i = atual.filhas.length - 1; i >= 0; i--) pilha.empilhar(atual.filhas[i]);
+  }
+  return resultado;
+}
+
+console.log(todasAbaixo(categorias));
+// [ 'Literatura', 'Brasileira', 'Romance', 'Poesia', 'Estrangeira' ]
+```
+
+Isso é uma busca em profundidade (DFS). Troque a pilha por uma fila e você tem a busca em largura (BFS), que visita nível por nível.
+
+## Fila: o primeiro a entrar é o primeiro a sair
+
+Uma fila (FIFO) adiciona no fim e remove do começo. A tentação é usar `push` e `shift`:
+
+```javascript
+const fila = [];
+fila.push("a");
+fila.shift(); // remove o primeiro... e move todos os outros uma posição
+```
+
+O problema é que `shift` precisa reindexar todos os elementos restantes, o que custa O(n). Com 100 mil itens, esvaziar a fila custa algo na ordem de 5 bilhões de movimentações. A solução é não mover nada: guarde um índice para a cabeça e só avance esse índice.
+
+```javascript
+class Fila {
+  #itens = [];
+  #cabeca = 0;
+
+  enfileirar(x) { this.#itens.push(x); }
+
+  desenfileirar() {
+    if (this.vazia()) return undefined;
+    const x = this.#itens[this.#cabeca];
+    this.#itens[this.#cabeca] = undefined; // libera a referência para o GC
+    this.#cabeca++;
+    // de tempos em tempos, compacta para não crescer para sempre
+    if (this.#cabeca > 1024 && this.#cabeca * 2 > this.#itens.length) {
+      this.#itens = this.#itens.slice(this.#cabeca);
+      this.#cabeca = 0;
+    }
+    return x;
+  }
+
+  espiar() { return this.#itens[this.#cabeca]; }
+  get tamanho() { return this.#itens.length - this.#cabeca; }
+  vazia() { return this.tamanho === 0; }
+}
+```
+
+A compactação acontece raramente e copia só a metade viva, então o custo amortizado por operação continua O(1). Compare:
+
+```javascript
+function medir(nome, fn) {
+  const t = performance.now();
+  fn();
+  console.log(nome, (performance.now() - t).toFixed(0), "ms");
+}
+
+const N = 200_000;
+medir("array.shift", () => {
+  const a = [];
+  for (let i = 0; i < N; i++) a.push(i);
+  while (a.length) a.shift();
+});
+medir("Fila       ", () => {
+  const f = new Fila();
+  for (let i = 0; i < N; i++) f.enfileirar(i);
+  while (!f.vazia()) f.desenfileirar();
+});
+```
+
+Os números exatos dependem da versão do V8 (ele tem otimizações para arrays pequenos), mas, à medida que `N` cresce, a versão com `shift` se afasta rapidamente da classe `Fila`.
+
+## Fila de tarefas com limite de concorrência
+
+O uso mais importante de fila num back-end Node.js: você tem mil tarefas assíncronas (enviar e-mails, gerar miniaturas, chamar uma API de terceiros) e não pode disparar todas de uma vez com `Promise.all`, porque o serviço do outro lado limita a taxa ou o seu pool de conexões esgota. A solução é uma fila com no máximo N tarefas rodando ao mesmo tempo.
+
+```javascript
+class FilaDeTarefas {
+  #fila = new Fila();
+  #rodando = 0;
+
+  constructor(concorrencia = 4) {
+    this.concorrencia = concorrencia;
+  }
+
+  adicionar(tarefa) {
+    return new Promise((resolve, reject) => {
+      this.#fila.enfileirar({ tarefa, resolve, reject });
+      this.#proxima();
+    });
+  }
+
+  #proxima() {
+    while (this.#rodando < this.concorrencia && !this.#fila.vazia()) {
+      const { tarefa, resolve, reject } = this.#fila.desenfileirar();
+      this.#rodando++;
+      Promise.resolve()
+        .then(tarefa)
+        .then(resolve, reject)
+        .finally(() => {
+          this.#rodando--;
+          this.#proxima();
+        });
+    }
+  }
+}
+
+// uso: 20 envios, no máximo 3 ao mesmo tempo
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+const fila = new FilaDeTarefas(3);
+
+const envios = Array.from({ length: 20 }, (_, i) =>
+  fila.adicionar(async () => {
+    await esperar(100); // simula a chamada ao provedor de e-mail
+    return `email ${i} enviado`;
+  })
+);
+
+const resultados = await Promise.allSettled(envios);
+console.log(resultados.filter((r) => r.status === "fulfilled").length, "enviados");
+```
+
+Pontos de projeto que valem para qualquer fila assim:
+
+- Cada `adicionar` devolve uma Promise, então quem chamou sabe quando a sua tarefa terminou e se falhou.
+- O `finally` libera a vaga mesmo em caso de erro. Sem isso, uma tarefa que falha "vaza" uma vaga e, depois de N falhas, a fila trava para sempre.
+- `Promise.resolve().then(tarefa)` transforma até um erro síncrono da tarefa numa rejeição, em vez de quebrar o laço.
+
+<Callout type="warning" title="Fila em memória some quando o processo cai">
+A fila acima vive na memória do processo. Se a API reiniciar num deploy ou cair, todas as tarefas pendentes são perdidas sem aviso, e com mais de uma instância cada uma tem a sua fila. Para trabalho que não pode se perder (e-mail de confirmação, cobrança), use uma fila persistente: BullMQ sobre Redis, Amazon SQS ou RabbitMQ. A fila em memória serve para limitar concorrência dentro de uma requisição ou de um script.
+</Callout>
+
+## Fila de prioridade com heap binário
+
+Às vezes a ordem não é de chegada: um agendador quer sempre a próxima tarefa com horário mais cedo, ou um sistema de suporte quer o chamado mais urgente. Ordenar o array a cada inserção custa O(n log n). Um heap binário faz inserção e remoção em O(log n).
+
+O heap mínimo é uma árvore guardada num array, onde todo pai é menor ou igual aos filhos. Para o índice `i`, os filhos estão em `2i + 1` e `2i + 2`, e o pai em `(i - 1) >> 1`. A raiz, no índice 0, é sempre o menor.
+
+```javascript
+class FilaPrioridade {
+  #heap = [];
+  constructor(comparar = (a, b) => a - b) { this.comparar = comparar; }
+
+  get tamanho() { return this.#heap.length; }
+  espiar() { return this.#heap[0]; }
+
+  inserir(x) {
+    const h = this.#heap;
+    h.push(x);
+    let i = h.length - 1;
+    while (i > 0) {                       // sobe enquanto for menor que o pai
+      const pai = (i - 1) >> 1;
+      if (this.comparar(h[i], h[pai]) >= 0) break;
+      [h[i], h[pai]] = [h[pai], h[i]];
+      i = pai;
+    }
+  }
+
+  remover() {
+    const h = this.#heap;
+    if (h.length === 0) return undefined;
+    const topo = h[0];
+    const ultimo = h.pop();
+    if (h.length > 0) {
+      h[0] = ultimo;
+      let i = 0;
+      while (true) {                      // desce trocando com o menor filho
+        const e = 2 * i + 1, d = e + 1;
+        let menor = i;
+        if (e < h.length && this.comparar(h[e], h[menor]) < 0) menor = e;
+        if (d < h.length && this.comparar(h[d], h[menor]) < 0) menor = d;
+        if (menor === i) break;
+        [h[i], h[menor]] = [h[menor], h[i]];
+        i = menor;
+      }
+    }
+    return topo;
+  }
+}
+
+const agenda = new FilaPrioridade((a, b) => a.executarEm - b.executarEm);
+agenda.inserir({ nome: "relatório", executarEm: 3000 });
+agenda.inserir({ nome: "lembrete", executarEm: 1000 });
+agenda.inserir({ nome: "backup", executarEm: 2000 });
+
+while (agenda.tamanho) console.log(agenda.remover().nome);
+// lembrete, backup, relatório
+```
+
+Com isso, um agendador simples só precisa olhar o topo: se o horário dele chegou, remove e executa; se não, agenda um `setTimeout` para a diferença.
+
+## Cache LRU com Map
+
+O último padrão do dia a dia: guardar em memória respostas caras (uma consulta pesada, uma chamada externa), mas com um limite de itens. Quando enche, sai o usado há mais tempo (LRU, least recently used). O `Map` do JavaScript mantém a ordem de inserção, e isso basta para um LRU elegante:
+
+```javascript
+class CacheLRU {
+  #mapa = new Map();
+  constructor(limite = 100) { this.limite = limite; }
+
+  get(chave) {
+    if (!this.#mapa.has(chave)) return undefined;
+    const valor = this.#mapa.get(chave);
+    this.#mapa.delete(chave);      // reinsere no fim: agora é o mais recente
+    this.#mapa.set(chave, valor);
+    return valor;
+  }
+
+  set(chave, valor) {
+    this.#mapa.delete(chave);
+    this.#mapa.set(chave, valor);
+    if (this.#mapa.size > this.limite) {
+      const maisAntiga = this.#mapa.keys().next().value; // o primeiro é o mais antigo
+      this.#mapa.delete(maisAntiga);
+    }
+  }
+}
+
+const cache = new CacheLRU(2);
+cache.set("livro:1", { titulo: "Iracema" });
+cache.set("livro:2", { titulo: "Dom Casmurro" });
+cache.get("livro:1");                 // livro:1 vira o mais recente
+cache.set("livro:3", { titulo: "O Cortiço" }); // expulsa livro:2
+console.log(cache.get("livro:2"));    // undefined
+```
+
+Todas as operações são O(1). Em produção você ainda adicionaria tempo de expiração por item, e, com várias instâncias da API, moveria o cache para o Redis.
+
+## As filas que o Node.js já tem
+
+Vale fechar ligando com o runtime. O event loop do Node.js é, ele próprio, um conjunto de filas: a fila de microtarefas (callbacks de Promises e `queueMicrotask`) é esvaziada inteira antes de o loop seguir para a fila de timers e de I/O. Por isso um laço que gera microtarefas infinitas trava o servidor, mesmo sendo "assíncrono". Os streams usam uma fila interna com limite (o `highWaterMark`): quando ela enche, `write` devolve `false` e você deve esperar o evento `drain`. Isso se chama backpressure, e é a mesma ideia da `FilaDeTarefas`: não aceitar trabalho mais rápido do que se consegue processar.
+
+## Na entrevista
+
+**Por que `array.shift()` é ruim para filas grandes?** Porque remove do início e reindexa todos os elementos, custando O(n) por operação. Uma fila com índice de cabeça ou buffer circular faz em O(1).
+
+**Como limitar a concorrência de mil Promises?** Com uma fila de tarefas que só inicia uma nova quando uma das N em andamento termina, liberando a vaga no `finally`.
+
+**Qual a complexidade de inserir e remover num heap binário?** O(log n), porque o elemento sobe ou desce no máximo a altura da árvore. Consultar o mínimo é O(1).
+
+**Como implementar um cache LRU em JavaScript?** Com um `Map`, que preserva a ordem de inserção: no acesso, remove e reinsere a chave; quando passa do limite, apaga a primeira chave.
+
+## Pratique
+
+Crie um script `importar-livros.js` que lê um CSV com 5 mil ISBNs e, para cada um, busca os dados numa API pública de livros. Entregue:
+
+1. Uso da `FilaDeTarefas` com concorrência configurável e uma nova tentativa (até 3) para erros 429 e 5xx.
+2. Um `CacheLRU` para não repetir a busca de ISBNs duplicados no arquivo.
+3. Um relatório no fim: total processado, falhas, tempo total e o tempo com concorrência 1, 5 e 20.
+4. Testes com `node --test` para `Fila`, `FilaPrioridade` e `CacheLRU`, incluindo os casos de estrutura vazia.
+
+<Quiz question="Qual o custo de esvaziar uma fila de n itens usando push e shift num array?" options={["O(1) no total","O(n) no total","O(n log n) no total","O(n²) no total"]} answer={3} explanation="Cada shift reindexa os itens restantes, custando O(n), e são n remoções." />
+
+<Quiz question="Na FilaDeTarefas, por que liberar a vaga no finally e não no then?" options={["Para executar mais rápido","Para liberar a vaga também quando a tarefa falha","Para manter a ordem das tarefas","Para evitar usar Promise.all"]} answer={1} explanation="Se a vaga só fosse liberada no sucesso, cada falha reduziria a concorrência até a fila travar." />
+
+<Quiz question="Num heap mínimo guardado em array, onde estão os filhos do elemento no índice 3?" options={["Índices 4 e 5","Índices 6 e 7","Índices 7 e 8","Índices 1 e 2"]} answer={2} explanation="Os filhos de i ficam em 2i + 1 e 2i + 2, ou seja, 7 e 8." />
+
+## Base no CodeForge
+
+- [Introdução a filas](/learn/dsa/intro-filas) e [Introdução a pilhas](/learn/dsa/intro-pilhas): os conceitos e os problemas clássicos de entrevista.
+- [Introdução a heaps](/learn/dsa/intro-heaps): a teoria e os exercícios de fila de prioridade.
+- [LRU cache](/learn/dsa/lru-cache): a versão com lista duplamente ligada cobrada em entrevista.
+- [Análise amortizada](/learn/dsa/analise-amortizada): por que a compactação da `Fila` continua O(1).
+
+## Referências
+
+- [Node.js: Stream (backpressure e highWaterMark)](https://nodejs.org/api/stream.html)
+- [Node.js: Events](https://nodejs.org/api/events.html)
+- [MDN: Map](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map)

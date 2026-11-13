@@ -1,0 +1,358 @@
+---
+title: "Infraestrutura como código: Preparando máquinas na AWS com Ansible e Terraform"
+kind: lesson
+---
+
+Criar uma EC2 clicando no console e depois entrar por SSH para instalar Node.js funciona uma vez. Na segunda máquina você esquece um passo, na terceira a versão do Node já é outra, e ninguém sabe reconstruir o servidor se ele sumir. Infraestrutura como código resolve isso descrevendo tudo em arquivos versionados no Git. Duas ferramentas dividem o trabalho: o **Terraform** cria os recursos na AWS (instância, security group, chave), e o **Ansible** entra nas máquinas e as configura (pacotes, usuário, aplicação, serviço).
+
+**Você vai aprender:**
+
+- A diferença entre provisionar infraestrutura e configurar máquinas
+- Como criar uma EC2 com security group e chave SSH usando Terraform
+- O ciclo `init`, `plan`, `apply` e `destroy`, e o papel do state
+- Como escrever um playbook Ansible idempotente que instala Node.js 22 e sobe a API
+- Como ligar as duas ferramentas e guardar o state com segurança
+
+## Provisionar e configurar são coisas diferentes
+
+| | Terraform | Ansible |
+|---|---|---|
+| Foco | Criar e destruir recursos na nuvem | Configurar o que roda dentro das máquinas |
+| Estilo | Declarativo: você descreve o estado final | Procedural com módulos idempotentes |
+| Como sabe o que existe | Arquivo de state | Consulta a máquina a cada execução |
+| Conexão | API da AWS | SSH até cada máquina |
+
+Os dois podem invadir o território do outro (o Terraform tem `user_data`, o Ansible tem módulos da AWS), mas a divisão acima é a mais fácil de manter. A tendência moderna é reduzir a configuração em máquinas usando imagens prontas e containers; mesmo assim, Ansible continua muito presente para servidores, bastions e ambientes legados.
+
+## Terraform: descrevendo a máquina
+
+O Terraform lê todos os arquivos `.tf` da pasta. O primeiro define o provider e as versões:
+
+```hcl
+# infra/main.tf
+terraform {
+  required_version = ">= 1.10"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.regiao
+  default_tags {
+    tags = {
+      projeto    = "livros"
+      ambiente   = "dev"
+      gerenciado = "terraform"
+    }
+  }
+}
+
+variable "regiao" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "meu_ip" {
+  description = "Seu IP público em CIDR, para liberar o SSH (ex.: 203.0.113.10/32)"
+  type        = string
+}
+```
+
+O `default_tags` marca todos os recursos com as tags de custo de uma vez. Agora a máquina e o que ela precisa:
+
+```hcl
+# infra/ec2.tf
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+}
+
+resource "aws_key_pair" "dev" {
+  key_name   = "livros-dev"
+  public_key = file(pathexpand("~/.ssh/livros.pub"))
+}
+
+resource "aws_security_group" "api" {
+  name        = "livros-api-dev"
+  description = "SSH do meu IP e HTTP da API"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "ssh" {
+  security_group_id = aws_security_group.api.id
+  cidr_ipv4         = var.meu_ip
+  from_port         = 22
+  to_port           = 22
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "api" {
+  security_group_id = aws_security_group.api.id
+  cidr_ipv4         = "0.0.0.0/0"
+  from_port         = 3000
+  to_port           = 3000
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_egress_rule" "tudo" {
+  security_group_id = aws_security_group.api.id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+}
+
+resource "aws_instance" "api" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t3.micro"
+  key_name               = aws_key_pair.dev.key_name
+  vpc_security_group_ids = [aws_security_group.api.id]
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  tags = { Name = "livros-api-dev" }
+}
+
+output "ip_publico" {
+  value = aws_instance.api.public_ip
+}
+```
+
+Alguns conceitos aparecem aqui:
+
+- **`data`** consulta algo que já existe (a AMI mais recente do Ubuntu 24.04) sem criar nada.
+- **`resource`** declara algo que o Terraform cria e gerencia.
+- **Referências** como `aws_security_group.api.id` criam dependências: o Terraform descobre sozinho que o security group vem antes da instância.
+- **`output`** expõe valores para você ou para outras ferramentas, como o IP para o Ansible.
+
+Sem `subnet_id`, a instância vai para a VPC padrão da conta, o que basta para estudar. Num projeto real, você passaria as subnets da VPC criada também em Terraform.
+
+## O ciclo do Terraform e o state
+
+```bash
+cd infra
+ssh-keygen -t ed25519 -f ~/.ssh/livros -N ""      # par de chaves local
+
+terraform init                                   # baixa o provider
+terraform fmt && terraform validate              # formata e valida
+terraform plan -var "meu_ip=$(curl -s https://checkip.amazonaws.com)/32" -out plano.tfplan
+terraform apply plano.tfplan
+terraform output -raw ip_publico
+```
+
+O `plan` mostra o que vai mudar com símbolos: `+` criar, `~` alterar no lugar, `-/+` destruir e recriar. Leia sempre antes de aplicar. Uma mudança inocente, como trocar a AMI, aparece como `-/+` na instância: a máquina será destruída e recriada com outro IP.
+
+Depois do `apply`, o Terraform grava o **state** (`terraform.tfstate`): o mapa entre o que está no código e os IDs reais na AWS. É por ele que o próximo `plan` sabe o que já existe. O state local serve para estudo; em time, ele vai para um backend remoto, para todos verem a mesma versão e para que duas pessoas não apliquem ao mesmo tempo:
+
+```hcl
+# infra/backend.tf
+terraform {
+  backend "s3" {
+    bucket       = "minha-conta-tfstate"
+    key          = "livros/dev/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true # trava nativa no S3, sem tabela DynamoDB
+  }
+}
+```
+
+## Ansible: configurando a máquina
+
+O Ansible precisa de um **inventário** (quais máquinas) e de um **playbook** (o que fazer nelas). Ele só exige SSH e Python na máquina de destino; nada é instalado lá.
+
+```bash
+# gera o inventário a partir da saída do Terraform
+IP=$(terraform -chdir=infra output -raw ip_publico)
+cat > ansible/inventario.ini <<EOF
+[api]
+$IP ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/livros
+EOF
+
+cat > ansible/ansible.cfg <<'EOF'
+[defaults]
+inventory = inventario.ini
+host_key_checking = False
+EOF
+
+cd ansible && ansible api -m ping
+```
+
+`host_key_checking = False` evita a pergunta de confirmação da chave do host em máquinas recém-criadas; é aceitável em ambiente de estudo, mas em produção prefira registrar as chaves conhecidas.
+
+O playbook descreve o estado desejado da máquina em tarefas, cada uma usando um **módulo** idempotente:
+
+```yaml
+# ansible/api.yml
+- name: Preparar servidor da API de livros
+  hosts: api
+  become: true
+  vars:
+    app_dir: /opt/livros-api
+    node_major: 22
+
+  tasks:
+    - name: Baixar o script de repositório do NodeSource
+      ansible.builtin.get_url:
+        url: "https://deb.nodesource.com/setup_{{ node_major }}.x"
+        dest: /tmp/nodesource_setup.sh
+        mode: "0755"
+
+    - name: Configurar o repositório do Node.js
+      ansible.builtin.command: /tmp/nodesource_setup.sh
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.sources
+
+    - name: Instalar Node.js
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+        update_cache: true
+
+    - name: Criar usuário de serviço
+      ansible.builtin.user:
+        name: livros
+        system: true
+        shell: /usr/sbin/nologin
+
+    - name: Copiar a aplicação
+      ansible.builtin.copy:
+        src: ../dist/
+        dest: "{{ app_dir }}/"
+        owner: livros
+        group: livros
+      notify: Reiniciar API
+
+    - name: Instalar dependências de produção
+      ansible.builtin.command: npm ci --omit=dev
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: livros
+      changed_when: false
+
+    - name: Instalar unidade do systemd
+      ansible.builtin.template:
+        src: livros-api.service.j2
+        dest: /etc/systemd/system/livros-api.service
+        mode: "0644"
+      notify: Reiniciar API
+
+    - name: Garantir que a API está ativa no boot
+      ansible.builtin.systemd_service:
+        name: livros-api
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: Reiniciar API
+      ansible.builtin.systemd_service:
+        name: livros-api
+        state: restarted
+        daemon_reload: true
+```
+
+```ini
+# ansible/livros-api.service.j2
+[Unit]
+Description=API de livros
+After=network-online.target
+
+[Service]
+User=livros
+WorkingDirectory={{ app_dir }}
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+ansible-playbook api.yml --check --diff   # simula e mostra as diferenças
+ansible-playbook api.yml
+curl "http://$IP:3000/health"
+```
+
+## Idempotência: rodar de novo não pode estragar
+
+Um playbook bem escrito pode rodar cem vezes: na segunda, todas as tarefas aparecem como `ok`, nenhuma como `changed`. Isso permite usá-lo tanto para criar quanto para corrigir desvios. Os módulos (`apt`, `user`, `copy`, `template`) já são idempotentes: eles verificam o estado antes de agir. Os pontos de atenção são os comandos soltos:
+
+- **`creates`** pula o `command` se o arquivo já existe (como no script do NodeSource).
+- **`changed_when`** diz ao Ansible quando considerar que houve mudança.
+- **Handlers** só rodam quando uma tarefa que os notifica mudou algo. A API só reinicia se o código ou a unidade mudaram, não a cada execução.
+
+As variáveis entre chaves duplas são **Jinja2**, o motor de templates do Ansible. Os mesmos valores servem às tarefas e aos templates, e podem vir de arquivos por ambiente (`group_vars/dev.yml`, `group_vars/prod.yml`), assunto do próximo capítulo desta trilha.
+
+## Juntando tudo num comando
+
+```bash
+#!/bin/bash
+# subir.sh
+set -euo pipefail
+npm run build                                       # gera dist/
+terraform -chdir=infra apply -auto-approve \
+  -var "meu_ip=$(curl -s https://checkip.amazonaws.com)/32"
+IP=$(terraform -chdir=infra output -raw ip_publico)
+printf '[api]\n%s ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/livros\n' "$IP" \
+  > ansible/inventario.ini
+sleep 30                                            # espera o SSH da instância nova
+(cd ansible && ansible-playbook api.yml)
+echo "API em http://$IP:3000"
+```
+
+E para não pagar por uma máquina esquecida: `terraform -chdir=infra destroy`.
+
+<Callout type="warning" title="State e segredos no Git">
+O `terraform.tfstate` guarda os atributos de todos os recursos, às vezes com senhas e chaves em texto puro. Ele nunca deve ir para o repositório. Coloque `*.tfstate*`, `.terraform/` e `*.tfplan` no `.gitignore` desde o primeiro commit, use backend remoto criptografado e mantenha segredos do Ansible no Ansible Vault ou num gerenciador de segredos, nunca em `vars` em texto puro.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre Terraform e Ansible?** Terraform provisiona recursos de forma declarativa e guarda o estado; Ansible configura máquinas por SSH com módulos idempotentes, sem estado próprio. Usados juntos: Terraform cria a EC2, Ansible instala e configura a aplicação.
+
+**Para que serve o state do Terraform?** Mapeia os recursos do código para os IDs reais. Sem ele, o Terraform não sabe o que já criou. Em time, fica em backend remoto com trava para evitar aplicações simultâneas.
+
+**O que é idempotência num playbook?** Executá-lo várias vezes leva ao mesmo estado final, sem efeitos colaterais na repetição. Módulos verificam antes de agir; comandos soltos precisam de `creates` ou `changed_when`.
+
+**O que você olha num terraform plan antes de aplicar?** Principalmente recursos marcados para destruir ou recriar (`-/+`), porque indicam perda de dados ou troca de IP.
+
+## Pratique
+
+Monte a pasta `infra/` e a pasta `ansible/` da API de livros:
+
+1. Terraform criando a EC2 Ubuntu 24.04, security group com SSH só do seu IP e o par de chaves, com `default_tags`.
+2. Playbook Ansible que instala Node.js 22, cria o usuário de serviço, copia a aplicação e a sobe pelo systemd.
+3. Prova de idempotência: a segunda execução do playbook deve terminar com `changed=0`.
+4. Script `subir.sh` que faz tudo em um comando e `descer.sh` que destrói.
+
+Entregue o repositório com `.gitignore` correto e um README com a saída do `terraform plan` e das duas execuções do playbook.
+
+<Quiz question="Num terraform plan, um recurso aparece com -/+. O que isso significa?" options={["Será alterado sem interrupção","Será destruído e recriado","Será importado para o state","Será ignorado nesta execução"]} answer={1} explanation="-/+ indica substituição. Numa instância, isso significa máquina nova, com outro IP e disco." />
+<Quiz question="Por que a tarefa que roda o script do NodeSource usa creates?" options={["Para executar o script com permissão de root","Para baixar o script só na primeira vez","Para pular o comando quando o repositório já existe","Para reiniciar a API depois de instalar"]} answer={2} explanation="command não é idempotente por si. creates faz o Ansible pular a tarefa se o arquivo indicado já existir." />
+<Quiz question="Qual a função de um handler no Ansible?" options={["Executar uma ação só quando uma tarefa notificante mudou algo","Tratar erros de conexão SSH automaticamente","Rodar tarefas em paralelo em várias máquinas","Guardar segredos criptografados no playbook"]} answer={0} explanation="Handlers rodam ao final e apenas se alguma tarefa que os notificou terminou como changed." />
+
+## Base no CodeForge
+
+- [Infraestrutura como código: Separando ambientes na AWS com Ansible](/learn/carreira-nodejs/infraestrutura-como-codigo-separando-ambientes-aws-ansible): o próximo passo, com dev e prod separados.
+- [Amazon VPC: Configurando redes na AWS](/learn/carreira-nodejs/amazon-vpc-configurando-redes-aws): a rede que você vai querer descrever em Terraform.
+- [AWS: Entendendo e controlando os custos dos serviços](/learn/carreira-nodejs/aws-entendendo-controlando-custos-servicos): as tags aplicadas pelo `default_tags`.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): onde guardar o que não pode ir para o Git.
+
+## Referências
+
+- [Terraform documentation](https://developer.hashicorp.com/terraform/docs)
+- [Terraform AWS provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)
+- [Ansible getting started](https://docs.ansible.com/ansible/latest/getting_started/index.html)
+- [Intro to playbooks](https://docs.ansible.com/ansible/latest/playbook_guide/playbooks_intro.html)

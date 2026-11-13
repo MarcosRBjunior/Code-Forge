@@ -1,0 +1,311 @@
+---
+title: "MongoDB: Modelagem de dados"
+kind: lesson
+---
+
+"O MongoDB não tem esquema" é meia verdade perigosa. O banco não obriga um esquema, mas a sua aplicação sempre tem um, e decidir a forma dos documentos é a decisão que mais pesa no desempenho e na simplicidade do código. Num banco relacional, a normalização dá uma resposta quase única para qualquer domínio. No MongoDB, a pergunta muda: como esses dados serão lidos e escritos? Este capítulo ensina a responder a ela usando a livraria como exemplo: quando embutir, quando referenciar, os padrões de modelagem mais usados e como fazer o banco validar a estrutura.
+
+**Você vai aprender:**
+
+- Modelar a partir dos padrões de acesso, e não das entidades
+- Decidir entre embutir e referenciar pela cardinalidade e pelo crescimento
+- Aplicar os padrões de referência estendida, subconjunto, valor calculado e bucket
+- Validar documentos com `$jsonSchema` e com esquemas do Mongoose
+- Juntar coleções com `$lookup` e `populate`, e saber quando usar transações
+
+## Comece pelas consultas
+
+No modelo relacional, você desenha as entidades e os relacionamentos, normaliza e depois escreve as consultas. No MongoDB, a ordem se inverte: primeiro liste o que a aplicação faz, com que frequência, e só então desenhe os documentos para que as operações mais frequentes leiam **um documento**, de preferência.
+
+Para a livraria, a lista de operações poderia ser esta:
+
+| Operação | Frequência | O que precisa |
+|---|---|---|
+| Página do livro | Altíssima | Título, preço, autor, nota média, últimas avaliações |
+| Listagem por categoria | Alta | Título, preço, autor, nota média |
+| Página do autor | Média | Dados do autor e seus livros |
+| Fechar pedido | Média | Cliente, itens com preço, baixa de estoque |
+| Histórico de pedidos do cliente | Média | Pedidos com itens e totais |
+| Todas as avaliações de um livro | Baixa | Lista paginada |
+
+Essa tabela é o seu documento de projeto. Toda decisão a seguir volta a ela.
+
+## Embutir ou referenciar
+
+As duas ferramentas básicas são:
+
+- **Embutir:** colocar os dados relacionados dentro do documento (um subdocumento ou um array).
+- **Referenciar:** guardar o `_id` do outro documento, como uma chave estrangeira, e buscá-lo quando necessário.
+
+```javascript
+// embutido: o endereço vive dentro do cliente
+{ _id: ObjectId("..."), nome: "Ana Souza",
+  enderecos: [{ rotulo: "casa", cidade: "São Paulo", cep: "01000-000" }] }
+
+// referenciado: o livro aponta para o autor
+{ _id: ObjectId("..."), titulo: "Dom Casmurro", autorId: ObjectId("a1...") }
+```
+
+A decisão segue algumas perguntas:
+
+| Pergunta | Se sim, tende a |
+|---|---|
+| Os dados são sempre lidos juntos? | Embutir |
+| O relacionamento é "um para poucos" (dezenas, não milhares)? | Embutir |
+| O filho só existe no contexto do pai? | Embutir |
+| O lado "muitos" cresce sem limite? | Referenciar |
+| O dado relacionado é lido ou atualizado sozinho, com frequência? | Referenciar |
+| O mesmo dado é compartilhado por muitos documentos e muda muito? | Referenciar |
+
+Aplicando à livraria: endereços do cliente são poucos, lidos com o cliente e não existem sem ele, então ficam embutidos. Livros e autores se relacionam como "um para muitos" e o autor tem página própria, então o livro referencia o autor. Avaliações de um livro best-seller podem passar de cem mil, um array sem limite, então ficam numa coleção própria.
+
+<Callout type="warning" title="Arrays que crescem sem limite">
+O erro de modelagem mais caro no MongoDB é embutir algo que cresce para sempre: todas as avaliações dentro do livro, todos os eventos dentro do usuário, todas as mensagens dentro do chat. O documento incha, cada leitura traz megabytes que a tela não usa, cada atualização reescreve tudo e, ao chegar a 16 MB, as escritas começam a falhar em produção. Se você não consegue dizer qual é o tamanho máximo de um array, ele deveria ser uma coleção separada (ou embutido só em parte, com o padrão de subconjunto abaixo).
+</Callout>
+
+## Os padrões de modelagem
+
+Os padrões a seguir têm nome na documentação do MongoDB e aparecem em quase todo projeto.
+
+### Referência estendida
+
+O pedido referencia o cliente e os livros, mas a tela do histórico precisa do nome do cliente e do título de cada item. Em vez de buscar três coleções, o pedido guarda a referência **mais** os campos que a leitura precisa:
+
+```javascript
+{
+  _id: ObjectId("..."),
+  cliente: { _id: ObjectId("c1..."), nome: "Ana Souza", email: "ana@exemplo.com" },
+  itens: [
+    { livroId: ObjectId("l1..."), titulo: "Dom Casmurro", preco: Decimal128("39.90"), quantidade: 1 },
+    { livroId: ObjectId("l7..."), titulo: "Libertinagem", preco: Decimal128("32.00"), quantidade: 2 }
+  ],
+  total: Decimal128("103.90"),
+  status: "enviado",
+  feitoEm: ISODate("2026-01-10T14:32:00Z")
+}
+```
+
+Aqui a duplicação é desejada: o preço e o título são uma "foto" do momento da compra e **não devem** mudar se o livro mudar amanhã. Os itens são embutidos porque um pedido tem poucos itens e nunca é lido sem eles. O critério para duplicar um campo: ele é necessário na leitura frequente e muda pouco (ou não deve mudar). Se o cliente trocar de e-mail, o pedido antigo pode manter o antigo, ou você atualiza em lote, sabendo que vai ter esse custo.
+
+### Subconjunto
+
+A página do livro mostra as 5 avaliações mais recentes, mas o livro pode ter milhares. Embuta só as recentes e guarde todas numa coleção própria:
+
+```javascript
+// coleção livros: só as 5 últimas, sempre com tamanho limitado
+db.livros.updateOne(
+  { _id: livroId },
+  { $push: { ultimasAvaliacoes: { $each: [novaAvaliacao], $position: 0, $slice: 5 } } }
+);
+
+// coleção avaliacoes: o histórico completo, paginado quando alguém pede
+db.avaliacoes.insertOne({ livroId, usuario: "ana", nota: 5, texto: "...", em: new Date() });
+```
+
+O `$slice: 5` corta o array a cada inserção, então ele nunca passa de cinco itens. A leitura mais frequente (página do livro) continua sendo um documento.
+
+### Valor calculado
+
+A nota média aparece em toda listagem. Calcular com agregação sobre a coleção de avaliações a cada leitura seria caro. Mantenha o resultado no próprio livro e atualize na escrita, que é bem menos frequente:
+
+```javascript
+db.livros.updateOne(
+  { _id: livroId },
+  { $inc: { "avaliacao.soma": novaNota, "avaliacao.quantidade": 1 } }
+);
+
+// a média é calculada na leitura com dois números já prontos
+db.livros.aggregate([
+  { $match: { categorias: "romance" } },
+  { $project: {
+      titulo: 1, preco: 1,
+      notaMedia: { $round: [{ $divide: ["$avaliacao.soma", "$avaliacao.quantidade"] }, 1] },
+  } },
+]);
+```
+
+Guardar soma e quantidade, em vez da média, permite atualizar com `$inc` atômico, sem ler o documento antes. (Para livros ainda sem avaliação, trate a divisão por zero com `$cond` ou guarde a média só quando houver avaliações.)
+
+### Bucket
+
+Para dados que chegam em fluxo, como visualizações de cada livro por hora, um documento por evento gera bilhões de documentos minúsculos, e um array único por livro cresce sem limite. O meio-termo é agrupar em baldes de tamanho fixo, por exemplo um documento por livro por dia:
+
+```javascript
+db.visualizacoes.updateOne(
+  { livroId, dia: "2026-11-13" },
+  { $inc: { total: 1, [`porHora.${new Date().getUTCHours()}`]: 1 } },
+  { upsert: true }
+);
+// { livroId, dia: "2026-11-13", total: 812, porHora: { "9": 40, "10": 77, ... } }
+```
+
+O documento tem no máximo 24 contadores, e relatórios por dia ou semana leem poucos documentos. Para séries temporais pesadas, o MongoDB também tem coleções time series, que aplicam essa ideia automaticamente.
+
+## Juntando coleções: $lookup e populate
+
+Referenciar significa que, às vezes, você precisa juntar. No pipeline de agregação, o estágio `$lookup` faz um left join:
+
+```javascript
+db.autores.aggregate([
+  { $match: { nome: "Machado de Assis" } },
+  { $lookup: {
+      from: "livros",
+      localField: "_id",
+      foreignField: "autorId",
+      as: "livros",
+  } },
+  { $project: { nome: 1, "livros.titulo": 1, "livros.preco": 1 } },
+]);
+```
+
+Garanta um índice no campo usado no `foreignField` (aqui, `livros.autorId`), senão cada autor dispara uma varredura completa na coleção de livros. Se você se pega fazendo `$lookup` em toda leitura frequente, é sinal de que o modelo está relacional demais e algum dado deveria estar embutido ou duplicado.
+
+## Validação: o esquema que o banco garante
+
+Flexibilidade não precisa significar bagunça. O MongoDB valida documentos na escrita com `$jsonSchema`:
+
+```javascript
+db.createCollection("pedidos", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["cliente", "itens", "total", "status", "feitoEm"],
+      properties: {
+        status: { enum: ["pago", "enviado", "cancelado"] },
+        total: { bsonType: "decimal" },
+        feitoEm: { bsonType: "date" },
+        itens: {
+          bsonType: "array",
+          minItems: 1,
+          items: {
+            bsonType: "object",
+            required: ["livroId", "titulo", "preco", "quantidade"],
+            properties: { quantidade: { bsonType: "int", minimum: 1 } },
+          },
+        },
+      },
+    },
+  },
+  validationAction: "error",
+});
+```
+
+Agora um pedido sem itens ou com status inventado é recusado pelo banco, venha de onde vier. Para coleções que já existem, use `db.runCommand({ collMod: "pedidos", validator: ... })`.
+
+### Com Mongoose
+
+Na API, o Mongoose descreve o mesmo esquema em JavaScript, com validação, valores padrão e referências:
+
+```javascript
+import mongoose from "mongoose";
+
+const autorSchema = new mongoose.Schema({
+  nome: { type: String, required: true, trim: true },
+  nacionalidade: String,
+});
+
+const livroSchema = new mongoose.Schema(
+  {
+    titulo: { type: String, required: true },
+    autor: { type: mongoose.Schema.Types.ObjectId, ref: "Autor", required: true, index: true },
+    categorias: { type: [String], index: true },
+    preco: { type: mongoose.Schema.Types.Decimal128, required: true },
+    estoque: { type: Number, min: 0, default: 0 },
+    avaliacao: {
+      soma: { type: Number, default: 0 },
+      quantidade: { type: Number, default: 0 },
+    },
+    ultimasAvaliacoes: [{ usuario: String, nota: { type: Number, min: 1, max: 5 }, em: Date }],
+  },
+  { timestamps: true }
+);
+
+export const Autor = mongoose.model("Autor", autorSchema);
+export const Livro = mongoose.model("Livro", livroSchema);
+
+// populate busca o autor referenciado (uma consulta extra, feita pelo Mongoose)
+const livro = await Livro.findOne({ titulo: "Dom Casmurro" }).populate("autor", "nome");
+console.log(livro.autor.nome);
+```
+
+O `populate` não é um join no banco: o Mongoose faz uma segunda consulta com os ids encontrados e monta o resultado. É prático, mas numa listagem com 50 livros e três campos populados, são quatro consultas por requisição. Para leituras muito frequentes, prefira a referência estendida.
+
+A validação do Mongoose só vale para escritas feitas pelo Mongoose. Scripts, outras linguagens ou um `updateOne` direto no driver passam por fora. Use o Mongoose para a ergonomia na API e o `$jsonSchema` para as regras que não podem ser quebradas nunca.
+
+## Transações multi-documento
+
+Uma escrita num único documento é sempre atômica, e um bom modelo resolve a maioria dos casos assim (os itens dentro do pedido, por exemplo). Quando uma operação precisa alterar vários documentos de forma consistente, como criar o pedido e baixar o estoque de cada livro, use uma transação. Ela exige que o MongoDB rode como replica set (os serviços gerenciados, como o Atlas, já rodam assim).
+
+```javascript
+const session = await mongoose.startSession();
+try {
+  await session.withTransaction(async () => {
+    for (const item of itens) {
+      const r = await Livro.updateOne(
+        { _id: item.livroId, estoque: { $gte: item.quantidade } },
+        { $inc: { estoque: -item.quantidade } },
+        { session }
+      );
+      if (r.modifiedCount === 0) throw new Error(`sem estoque: ${item.livroId}`);
+    }
+    await Pedido.create([{ cliente, itens, total, status: "pago", feitoEm: new Date() }], { session });
+  });
+} finally {
+  await session.endSession();
+}
+```
+
+O `withTransaction` faz commit no fim, aborta se a função lançar erro e repete automaticamente em erros transitórios. Toda operação dentro dela precisa receber `{ session }`; uma que esquecer roda fora da transação. Transações têm custo, então se você precisa delas em quase toda operação, reveja se o modelo não está fragmentado demais.
+
+## Índices pensados com o modelo
+
+O modelo só é bom se as consultas frequentes tiverem índice. Para índices compostos, a regra prática é ESR: primeiro os campos de **igualdade**, depois os de **ordenação** e por último os de **intervalo**.
+
+```javascript
+// listagem: categoria = X, preço até Y, ordenada por título
+db.livros.find({ categorias: "romance", preco: { $lte: 45 } }).sort({ titulo: 1 });
+db.livros.createIndex({ categorias: 1, titulo: 1, preco: 1 });   // E, S, R
+
+// histórico do cliente, mais recentes primeiro
+db.pedidos.createIndex({ "cliente._id": 1, feitoEm: -1 });
+```
+
+## Na entrevista
+
+**Quando embutir e quando referenciar?** Embute-se o que é lido junto, pertence ao pai e tem tamanho limitado. Referencia-se o que cresce sem limite, é acessado de forma independente ou é compartilhado e muda com frequência.
+
+**Duplicar dados no MongoDB é errado?** Não, se for uma decisão consciente: duplica-se o que é lido com frequência e muda pouco (referência estendida), aceitando o custo de atualizar as cópias quando mudar.
+
+**Qual a diferença entre `$lookup` e `populate`?** `$lookup` é um estágio de agregação executado no servidor; `populate` é do Mongoose e faz consultas adicionais a partir da aplicação.
+
+**O que é a regra ESR?** Uma ordem para campos de índices compostos: igualdade, ordenação e intervalo, para que o índice filtre e já entregue os resultados na ordem pedida.
+
+## Pratique
+
+Modele e implemente o catálogo e os pedidos da livraria com Mongoose. Entregue:
+
+1. Um `MODELO.md` com a tabela de operações e frequências, e a justificativa de cada decisão de embutir ou referenciar.
+2. As coleções `autores`, `livros` (com valor calculado da nota e subconjunto das 5 últimas avaliações), `avaliacoes` e `pedidos` (com referência estendida para cliente e itens).
+3. Validação `$jsonSchema` em `pedidos` e um teste que tenta inserir um pedido inválido direto pelo driver e confirma a recusa.
+4. A rota `POST /pedidos` com transação e a rota `POST /livros/:id/avaliacoes` que grava na coleção completa, atualiza o subconjunto e incrementa soma e quantidade.
+5. Os índices de cada consulta frequente, com `explain` mostrando `IXSCAN`.
+
+<Quiz question="Um livro pode receber centenas de milhares de avaliações. Qual modelo é mais adequado?" options={["Embutir todas as avaliações no livro","Coleção de avaliações e só as recentes no livro","Um banco separado para cada livro","Guardar as avaliações dentro do autor"]} answer={1} explanation="Um array sem limite incha o documento até 16 MB; o padrão de subconjunto mantém as recentes no livro e o histórico numa coleção." />
+
+<Quiz question="Por que o pedido guarda o título e o preço de cada livro, além do livroId?" options={["Porque o MongoDB não aceita referências","Para registrar os dados da compra e evitar joins","Para o índice do livroId funcionar","Porque o populate exige esses campos"]} answer={1} explanation="É a referência estendida: os campos ficam como foto do momento da compra e a leitura do histórico não precisa juntar coleções." />
+
+<Quiz question="Pela regra ESR, qual a ordem de um índice para filtro por categoria, ordenação por título e faixa de preço?" options={["preco, titulo, categorias","titulo, preco, categorias","categorias, titulo, preco","categorias, preco, titulo"]} answer={2} explanation="Igualdade (categorias), depois ordenação (titulo), por último o intervalo (preco)." />
+
+## Base no CodeForge
+
+- [MongoDB: Conhecendo um banco de dados NoSQL](/learn/carreira-nodejs/mongodb-conhecendo-banco-dados-nosql): o CRUD e o pipeline de agregação usados aqui.
+- [Normalização](/learn/sql/normalizacao) e [Desnormalização](/learn/sql/desnormalizacao): a mesma tensão entre duplicar e referenciar, vista no modelo relacional.
+- [Modelagem ER](/learn/sql/modelagem-er): cardinalidade de relacionamentos, o ponto de partida da decisão de embutir.
+- [Transações e ACID](/learn/sql/transacoes-e-acid): as garantias que a transação multi-documento oferece.
+
+## Referências
+
+- [MongoDB: Data Modeling](https://www.mongodb.com/docs/manual/data-modeling/)
+- [MongoDB: Schema Validation](https://www.mongodb.com/docs/manual/core/schema-validation/)
+- [MongoDB: Transactions](https://www.mongodb.com/docs/manual/core/transactions/)
+- [Mongoose: Populate](https://mongoosejs.com/docs/populate.html)

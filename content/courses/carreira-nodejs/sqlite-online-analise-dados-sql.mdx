@@ -1,0 +1,376 @@
+---
+title: "SQLite online: Análise de dados com SQL"
+kind: lesson
+---
+
+Cedo ou tarde alguém do negócio pergunta: "quanto vendemos por mês?", "qual categoria puxa a receita?", "quais clientes pararam de comprar?". Exportar tudo para uma planilha funciona uma vez; responder pelo SQL funciona sempre, com dados atualizados, e vira uma rota de dashboard na API. Este é o último capítulo da sequência sobre o banco da livraria. Aqui você usa o que já sabe (filtros, agregação, joins) e acrescenta as ferramentas de análise: CTEs, funções de janela e tabelas dinâmicas com `CASE`.
+
+**Você vai aprender:**
+
+- Preparar uma base limpa de vendas com uma view, separando regra de negócio de análise
+- Calcular métricas de negócio: receita, ticket médio, participação e ranking
+- Organizar análises em etapas com CTEs (`WITH`)
+- Usar funções de janela para acumulados, variação mês a mês e top N por grupo
+- Segmentar clientes e expor os indicadores numa rota Node.js
+
+## O banco de exemplo
+
+Se precisar recriar a livraria dos capítulos anteriores, rode este script num editor de SQLite no navegador (como o SQLite Online), no `sqlite3` ou no Node.js:
+
+```sql
+PRAGMA foreign_keys = ON;
+CREATE TABLE clientes (id INTEGER PRIMARY KEY, nome TEXT NOT NULL, email TEXT NOT NULL UNIQUE, cidade TEXT, criado_em TEXT NOT NULL);
+CREATE TABLE livros (id INTEGER PRIMARY KEY, titulo TEXT NOT NULL, autor TEXT NOT NULL, categoria TEXT NOT NULL, preco REAL NOT NULL CHECK (preco >= 0), estoque INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE pedidos (id INTEGER PRIMARY KEY, cliente_id INTEGER NOT NULL REFERENCES clientes (id), feito_em TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pago' CHECK (status IN ('pago', 'enviado', 'cancelado')));
+CREATE TABLE itens_pedido (pedido_id INTEGER NOT NULL REFERENCES pedidos (id), livro_id INTEGER NOT NULL REFERENCES livros (id), quantidade INTEGER NOT NULL CHECK (quantidade > 0), preco_unitario REAL NOT NULL, PRIMARY KEY (pedido_id, livro_id));
+
+INSERT INTO clientes VALUES
+  (1, 'Ana Souza', 'ana@exemplo.com', 'São Paulo', '2026-01-05'),
+  (2, 'Bruno Lima', 'bruno@exemplo.com', 'Recife', '2026-01-12'),
+  (3, 'Carla Dias', 'carla@exemplo.com', 'São Paulo', '2026-02-03'),
+  (4, 'Diego Rocha', 'diego@exemplo.com', 'Curitiba', '2026-02-20'),
+  (5, 'Elisa Melo', 'elisa@exemplo.com', NULL, '2026-03-01');
+INSERT INTO livros VALUES
+  (1, 'Dom Casmurro', 'Machado de Assis', 'Romance', 39.90, 12),
+  (2, 'Memórias Póstumas de Brás Cubas', 'Machado de Assis', 'Romance', 42.50, 8),
+  (3, 'O Cortiço', 'Aluísio Azevedo', 'Romance', 35.00, 0),
+  (4, 'Iracema', 'José de Alencar', 'Romance', 29.90, 5),
+  (5, 'Sagarana', 'Guimarães Rosa', 'Contos', 54.90, 3),
+  (6, 'A Hora da Estrela', 'Clarice Lispector', 'Romance', 44.90, 7),
+  (7, 'Libertinagem', 'Manuel Bandeira', 'Poesia', 32.00, 4),
+  (8, 'Claro Enigma', 'Carlos Drummond de Andrade', 'Poesia', 48.00, 0);
+INSERT INTO pedidos VALUES
+  (1, 1, '2026-01-10', 'enviado'), (2, 2, '2026-01-15', 'enviado'), (3, 1, '2026-01-28', 'enviado'),
+  (4, 3, '2026-02-05', 'enviado'), (5, 4, '2026-02-21', 'cancelado'), (6, 2, '2026-02-25', 'enviado'),
+  (7, 3, '2026-03-02', 'pago'), (8, 1, '2026-03-10', 'pago'), (9, 4, '2026-03-15', 'pago');
+INSERT INTO itens_pedido VALUES
+  (1, 1, 1, 39.90), (1, 7, 2, 32.00), (2, 5, 1, 54.90), (3, 2, 1, 42.50), (3, 6, 1, 44.90),
+  (4, 1, 2, 39.90), (5, 4, 1, 29.90), (6, 6, 1, 44.90), (6, 7, 1, 32.00), (7, 5, 1, 54.90),
+  (7, 2, 1, 42.50), (8, 1, 1, 39.90), (9, 6, 2, 44.90);
+```
+
+## Primeiro passo: uma base de vendas confiável
+
+Toda análise começa definindo o que conta. Aqui, "venda" é cada item de um pedido que não foi cancelado, valendo quantidade vezes o preço pago. Se cada consulta repetir esse filtro, cedo ou tarde uma delas vai esquecer o `status <> 'cancelado'` e dois relatórios vão mostrar números diferentes para a mesma pergunta. Coloque a regra numa view:
+
+```sql
+CREATE VIEW vendas AS
+SELECT p.id                            AS pedido_id,
+       p.feito_em,
+       strftime('%Y-%m', p.feito_em)   AS mes,
+       p.cliente_id,
+       l.id                            AS livro_id,
+       l.titulo,
+       l.categoria,
+       i.quantidade,
+       i.quantidade * i.preco_unitario AS receita
+FROM pedidos p
+JOIN itens_pedido i ON i.pedido_id = p.id
+JOIN livros l       ON l.id = i.livro_id
+WHERE p.status <> 'cancelado';
+```
+
+Repare na granularidade: a view tem **uma linha por item vendido**, não por pedido. Isso importa para cada métrica que vem a seguir. Contar pedidos nela exige `count(DISTINCT pedido_id)`, porque um pedido com dois livros aparece em duas linhas.
+
+## Métricas de negócio com agregação
+
+### Receita e ticket médio por mês
+
+```sql
+SELECT mes,
+       count(DISTINCT pedido_id)                              AS pedidos,
+       sum(quantidade)                                        AS livros,
+       round(sum(receita), 2)                                 AS receita,
+       round(sum(receita) / count(DISTINCT pedido_id), 2)     AS ticket_medio
+FROM vendas
+GROUP BY mes
+ORDER BY mes;
+```
+
+```text
+mes     | pedidos | livros | receita | ticket_medio
+2026-01 | 3       | 6      | 246.2   | 82.07
+2026-02 | 2       | 4      | 156.7   | 78.35
+2026-03 | 3       | 5      | 227.1   | 75.7
+```
+
+O ticket médio é a receita dividida pelo número de **pedidos**. Se você escrever `avg(receita)`, o resultado é a média por **item**, outra métrica, menor e enganosa. Esse é o erro de granularidade mais comum em relatórios.
+
+### Os campeões de venda
+
+```sql
+SELECT titulo, sum(quantidade) AS unidades, round(sum(receita), 2) AS receita
+FROM vendas
+GROUP BY livro_id
+ORDER BY receita DESC
+LIMIT 3;
+```
+
+```text
+titulo            | unidades | receita
+A Hora da Estrela | 4        | 179.6
+Dom Casmurro      | 4        | 159.6
+Sagarana          | 2        | 109.8
+```
+
+### Tabela dinâmica com CASE
+
+Para transformar valores de uma coluna em colunas (o "pivot" das planilhas), some um `CASE` que vale 1 ou 0:
+
+```sql
+SELECT strftime('%Y-%m', feito_em) AS mes,
+       count(*)                                          AS total,
+       sum(CASE WHEN status = 'pago'      THEN 1 ELSE 0 END) AS pagos,
+       sum(CASE WHEN status = 'enviado'   THEN 1 ELSE 0 END) AS enviados,
+       sum(CASE WHEN status = 'cancelado' THEN 1 ELSE 0 END) AS cancelados
+FROM pedidos
+GROUP BY mes;
+```
+
+```text
+mes     | total | pagos | enviados | cancelados
+2026-01 | 3     | 0     | 3        | 0
+2026-02 | 3     | 0     | 2        | 1
+2026-03 | 3     | 3     | 0        | 0
+```
+
+Aqui a consulta vai direto em `pedidos`, porque a pergunta é justamente sobre todos os status, inclusive os cancelados.
+
+## CTEs: análise em etapas
+
+Análises reais têm várias etapas: primeiro agrega por mês, depois compara os meses. Uma CTE (Common Table Expression) dá nome a um resultado intermediário com `WITH`, e a consulta principal o usa como se fosse uma tabela. É o equivalente a quebrar uma função longa em funções menores.
+
+```sql
+WITH mensal AS (
+  SELECT mes, round(sum(receita), 2) AS receita
+  FROM vendas
+  GROUP BY mes
+)
+SELECT * FROM mensal WHERE receita > 200;
+```
+
+Você pode encadear várias CTEs separadas por vírgula, e cada uma pode usar as anteriores. Em consultas longas, isso é muito mais legível que subconsultas aninhadas.
+
+## Funções de janela
+
+Uma função de agregação comum "esmaga" as linhas de um grupo numa só. Uma **função de janela** calcula sobre um conjunto de linhas, mas devolve o resultado em cada linha, sem agrupar. A sintaxe é a função seguida de `OVER (...)`, onde você define a janela: `PARTITION BY` (divide em grupos) e `ORDER BY` (a ordem dentro do grupo).
+
+### Participação no total
+
+```sql
+SELECT categoria,
+       round(sum(receita), 2) AS receita,
+       round(100.0 * sum(receita) / sum(sum(receita)) OVER (), 1) AS pct
+FROM vendas
+GROUP BY categoria
+ORDER BY receita DESC;
+```
+
+```text
+categoria | receita | pct
+Romance   | 424.2   | 67.3
+Contos    | 109.8   | 17.4
+Poesia    | 96.0    | 15.2
+```
+
+O `sum(sum(receita)) OVER ()` parece estranho, mas lê-se assim: o `sum` de dentro é a agregação do `GROUP BY` (receita por categoria); o de fora é uma janela vazia `OVER ()`, que soma essas receitas de todas as linhas do resultado. O `100.0` com ponto garante divisão decimal: no SQLite, `3 / 4` entre inteiros dá `0`, porque descarta as casas.
+
+### Acumulado e variação mês a mês
+
+```sql
+WITH mensal AS (
+  SELECT mes, round(sum(receita), 2) AS receita
+  FROM vendas
+  GROUP BY mes
+)
+SELECT mes,
+       receita,
+       round(sum(receita) OVER (ORDER BY mes), 2) AS acumulado,
+       lag(receita) OVER (ORDER BY mes)           AS mes_anterior,
+       round(100.0 * (receita - lag(receita) OVER (ORDER BY mes))
+             / lag(receita) OVER (ORDER BY mes), 1) AS variacao_pct
+FROM mensal
+ORDER BY mes;
+```
+
+```text
+mes     | receita | acumulado | mes_anterior | variacao_pct
+2026-01 | 246.2   | 246.2     |              |
+2026-02 | 156.7   | 402.9     | 246.2        | -36.4
+2026-03 | 227.1   | 630.0     | 156.7        | 44.9
+```
+
+Com `ORDER BY` dentro do `OVER`, o `sum` vira soma acumulada até a linha atual. O `lag` pega o valor da linha anterior na ordem da janela (e `lead`, da próxima). No primeiro mês não há anterior, e o resultado é `NULL`.
+
+### Ranking e top N por grupo
+
+```sql
+WITH por_livro AS (
+  SELECT categoria, titulo, sum(quantidade) AS unidades,
+         row_number() OVER (
+           PARTITION BY categoria
+           ORDER BY sum(quantidade) DESC, titulo
+         ) AS posicao
+  FROM vendas
+  GROUP BY livro_id
+)
+SELECT categoria, titulo, unidades
+FROM por_livro
+WHERE posicao = 1
+ORDER BY categoria;
+```
+
+```text
+categoria | titulo            | unidades
+Contos    | Sagarana          | 2
+Poesia    | Libertinagem      | 3
+Romance   | A Hora da Estrela | 4
+```
+
+`PARTITION BY categoria` reinicia a numeração em cada categoria. Há três funções de ranking, que só diferem nos empates: `row_number` numera sem repetir (1, 2, 3), `rank` repete e pula (1, 1, 3) e `dense_rank` repete sem pular (1, 1, 2). Aqui "A Hora da Estrela" e "Dom Casmurro" empataram em 4 unidades; o `titulo` no `ORDER BY` desempata de forma determinística. O filtro `posicao = 1` precisa ficar fora, na consulta de cima: funções de janela são calculadas depois do `WHERE`, então não podem ser filtradas no mesmo nível.
+
+<Callout type="warning" title="Somar no nível errado">
+O erro mais comum em análise com SQL é misturar granularidades: fazer um join de pedidos com itens e depois somar uma coluna do pedido (frete, desconto), ou tirar a média por item achando que é por pedido. O número sai plausível e errado. Antes de cada métrica, pergunte "o que é uma linha aqui?" e, se precisar, agregue primeiro numa CTE no nível certo e só depois junte com o resto.
+</Callout>
+
+## Segmentando clientes
+
+Uma análise clássica de relacionamento: quando cada cliente comprou pela primeira e pela última vez, quantos pedidos fez e há quanto tempo está sem comprar. Isso alimenta campanhas como "volte a comprar" para quem sumiu.
+
+```sql
+WITH resumo AS (
+  SELECT cliente_id,
+         min(feito_em) AS primeira_compra,
+         max(feito_em) AS ultima_compra,
+         count(*)      AS pedidos
+  FROM pedidos
+  WHERE status <> 'cancelado'
+  GROUP BY cliente_id
+)
+SELECT c.nome, r.primeira_compra, r.ultima_compra, coalesce(r.pedidos, 0) AS pedidos,
+       CAST(julianday('2026-03-31') - julianday(r.ultima_compra) AS INTEGER) AS dias_sem_comprar,
+       CASE
+         WHEN r.pedidos IS NULL THEN 'sem compras'
+         WHEN r.pedidos >= 3    THEN 'fiel'
+         WHEN r.pedidos = 2     THEN 'recorrente'
+         ELSE 'novo'
+       END AS perfil
+FROM clientes c
+LEFT JOIN resumo r ON r.cliente_id = c.id
+ORDER BY pedidos DESC;
+```
+
+```text
+nome        | primeira_compra | ultima_compra | pedidos | dias_sem_comprar | perfil
+Ana Souza   | 2026-01-10      | 2026-03-10    | 3       | 21               | fiel
+Bruno Lima  | 2026-01-15      | 2026-02-25    | 2       | 34               | recorrente
+Carla Dias  | 2026-02-05      | 2026-03-02    | 2       | 29               | recorrente
+Diego Rocha | 2026-03-15      | 2026-03-15    | 1       | 16               | novo
+Elisa Melo  |                 |               | 0       |                  | sem compras
+```
+
+O `LEFT JOIN` mantém a Elisa, que se cadastrou e nunca comprou, um público importante. A data fixa `'2026-03-31'` representa o "hoje" do conjunto de dados; num sistema real, use `date('now')`.
+
+Outra análise que cruza vendas com estoque, útil para compras e reposição:
+
+```sql
+SELECT l.titulo, l.estoque, coalesce(sum(v.quantidade), 0) AS vendidos
+FROM livros l
+LEFT JOIN vendas v ON v.livro_id = l.id
+GROUP BY l.id
+ORDER BY vendidos DESC, l.estoque;
+```
+
+Ela mostra, por exemplo, que "Iracema" tem 5 exemplares parados e nenhuma venda válida, enquanto "Libertinagem" vendeu 3 e só restam 4.
+
+## Exportando e servindo os números
+
+No terminal, o `sqlite3` exporta qualquer consulta para CSV, que abre direto numa planilha:
+
+```bash
+sqlite3 -header -csv livraria.db "SELECT * FROM vendas" > vendas.csv
+```
+
+E numa API, as mesmas consultas viram uma rota de dashboard. Mantenha o SQL em constantes nomeadas e devolva um JSON pronto para o front-end montar os gráficos:
+
+```javascript
+import express from "express";
+import { DatabaseSync } from "node:sqlite";
+
+const db = new DatabaseSync("livraria.db", { readOnly: true });
+const app = express();
+
+const RECEITA_MENSAL = db.prepare(`
+  WITH mensal AS (
+    SELECT mes, round(sum(receita), 2) AS receita, count(DISTINCT pedido_id) AS pedidos
+    FROM vendas
+    WHERE feito_em >= ? AND feito_em < ?
+    GROUP BY mes
+  )
+  SELECT mes, receita, pedidos,
+         round(receita / pedidos, 2)                AS ticket_medio,
+         round(sum(receita) OVER (ORDER BY mes), 2) AS acumulado
+  FROM mensal ORDER BY mes`);
+
+const POR_CATEGORIA = db.prepare(`
+  SELECT categoria, round(sum(receita), 2) AS receita,
+         round(100.0 * sum(receita) / sum(sum(receita)) OVER (), 1) AS pct
+  FROM vendas
+  WHERE feito_em >= ? AND feito_em < ?
+  GROUP BY categoria ORDER BY receita DESC`);
+
+app.get("/dashboard", (req, res) => {
+  const desde = req.query.desde ?? "2026-01-01";
+  const ate = req.query.ate ?? "2027-01-01";
+  res.json({
+    periodo: { desde, ate },
+    mensal: RECEITA_MENSAL.all(desde, ate),
+    categorias: POR_CATEGORIA.all(desde, ate),
+  });
+});
+
+app.listen(3000);
+```
+
+Com volumes grandes, essas consultas ficam caras para rodar a cada requisição. Os caminhos usuais são guardar o resultado em cache por alguns minutos ou pré-calcular as agregações numa tabela atualizada periodicamente (no PostgreSQL, uma view materializada).
+
+## Na entrevista
+
+**Qual a diferença entre uma função de agregação e uma função de janela?** A agregação junta as linhas do grupo numa só; a função de janela calcula sobre um conjunto de linhas mas mantém cada linha no resultado.
+
+**Diferença entre `row_number`, `rank` e `dense_rank`?** Só nos empates: `row_number` nunca repete, `rank` repete e pula posições, `dense_rank` repete sem pular.
+
+**Como calcular a variação de um mês para o anterior em SQL?** Agregando por mês numa CTE e usando `lag(valor) OVER (ORDER BY mes)` para trazer o valor anterior para a mesma linha.
+
+**Para que servem CTEs?** Para nomear resultados intermediários e escrever a consulta em etapas legíveis; também permitem recursão com `WITH RECURSIVE`.
+
+## Pratique
+
+Crie um arquivo `analises.sql` e a rota `/dashboard` completa. Entregue consultas que respondam:
+
+1. Receita, pedidos e ticket médio por mês, com a variação percentual do ticket em relação ao mês anterior.
+2. Os 2 livros mais vendidos (por unidades) em cada categoria, usando `dense_rank` para não esconder empates.
+3. A participação de cada cidade na receita total, com "não informada" para clientes sem cidade.
+4. A taxa de cancelamento por mês (pedidos cancelados divididos pelo total, em porcentagem).
+5. Clientes há mais de 30 dias sem comprar, em ordem do maior gasto histórico para o menor.
+
+Para cada consulta, anote numa linha de comentário qual é a granularidade da tabela que ela agrega.
+
+<Quiz question="Na view vendas (uma linha por item), qual expressão calcula o ticket médio por pedido?" options={["avg(receita)","sum(receita) / count(*)","sum(receita) / count(DISTINCT pedido_id)","max(receita) / count(pedido_id)"]} answer={2} explanation="Como cada pedido pode ter várias linhas, é preciso dividir a receita pelo número de pedidos distintos." />
+
+<Quiz question="Qual função traz para a linha atual o valor da linha anterior na ordem da janela?" options={["lead","lag","first_value","row_number"]} answer={1} explanation="lag acessa a linha anterior dentro da janela; lead acessa a próxima." />
+
+<Quiz question="Dois livros empatam em 1º lugar. O que dense_rank atribui ao livro seguinte?" options={["1","2","3","NULL"]} answer={1} explanation="dense_rank repete a posição nos empates e não pula números, então o próximo recebe 2. Com rank, receberia 3." />
+
+## Base no CodeForge
+
+- [CTEs](/learn/sql/ctes) e [Funções de janela](/learn/sql/funcoes-de-janela): a fundo, com exercícios de entrevista.
+- [LAG e LEAD](/learn/sql/lag-e-lead), [Ranking](/learn/sql/ranking) e [Top N por grupo](/learn/sql/top-n-por-grupo): os padrões de janela deste capítulo.
+- [Retenção e cohort](/learn/sql/retencao-e-cohort): o próximo passo da segmentação de clientes.
+- [Realizando consultas com SQL: Joins, Views e transações](/learn/carreira-nodejs/realizando-consultas-sql-joins-views-transacoes): o capítulo anterior da sequência.
+
+## Referências
+
+- [SQLite: Window Functions](https://www.sqlite.org/windowfunctions.html)
+- [SQLite: SELECT (inclui WITH)](https://www.sqlite.org/lang_select.html)
+- [SQLite: Date And Time Functions](https://www.sqlite.org/lang_datefunc.html)

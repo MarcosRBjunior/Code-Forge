@@ -1,0 +1,299 @@
+---
+title: "Linux: Criando script de monitoramento de sistema"
+kind: lesson
+---
+
+Sua API Node.js caiu às três da manhã e você só soube às nove, quando os clientes reclamaram. Na maioria das vezes o motivo é banal: disco cheio de logs, memória esgotada por um vazamento, um processo que travou a CPU. Ferramentas como Prometheus e Datadog resolvem isso em escala, mas antes delas (e em qualquer VPS pequena) um script de monitoramento em Bash, rodando a cada cinco minutos, já avisa a tempo. Escrever esse script também ensina onde o Linux guarda cada número que um painel de monitoramento mostra.
+
+**Você vai aprender:**
+
+- Ler carga de CPU, memória e disco direto do `/proc` e de comandos padrão
+- Checar se a API está de pé, respondendo pela porta e pelo endpoint de saúde
+- Comparar métricas com limites e disparar alertas sem repetir o mesmo aviso
+- Registrar o resultado em log e agendar a execução com cron ou com um timer do systemd
+
+## De onde vêm os números
+
+No Linux, o kernel expõe o estado do sistema como arquivos de texto dentro de `/proc`. Comandos como `uptime`, `free` e `top` só leem e formatam esses arquivos. Saber disso tem uma vantagem prática: o seu script pode ler a fonte direto, sem depender do formato de saída de cada comando (que muda entre distribuições).
+
+```bash
+cat /proc/loadavg
+# 0.42 0.38 0.31 2/415 12873
+
+grep -E 'MemTotal|MemAvailable' /proc/meminfo
+# MemTotal:        4015628 kB
+# MemAvailable:    1873412 kB
+
+nproc
+# 2
+```
+
+Os três primeiros números de `/proc/loadavg` são a carga média de 1, 5 e 15 minutos: quantos processos, em média, estavam rodando ou esperando CPU (e também os que esperavam disco). Por isso a carga só faz sentido comparada ao número de núcleos: carga 2 numa máquina com 2 núcleos é uso total; numa com 8, é folga.
+
+Para memória, o número que importa é `MemAvailable`, e não `MemFree`. O Linux usa a memória livre como cache de disco, e essa memória é devolvida quando um processo precisa. Uma máquina saudável costuma ter `MemFree` baixo e `MemAvailable` alto.
+
+## Coletando cada métrica
+
+Vamos montar o script por partes, cada uma numa função que imprime um único número. Funções pequenas são fáceis de testar isoladamente no terminal.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+carga_por_nucleo() {
+  local load1 _
+  read -r load1 _ < /proc/loadavg
+  awk -v l="$load1" -v n="$(nproc)" 'BEGIN { printf "%.2f", l / n }'
+}
+
+memoria_usada_pct() {
+  awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2}
+       END { printf "%d", (t - a) * 100 / t }' /proc/meminfo
+}
+
+disco_usado_pct() {
+  local ponto="${1:-/}"
+  df -P "$ponto" | awk 'NR == 2 { gsub("%", "", $5); print $5 }'
+}
+
+echo "carga/núcleo: $(carga_por_nucleo)"
+echo "memória: $(memoria_usada_pct)%"
+echo "disco /: $(disco_usado_pct /)%"
+```
+
+Algumas escolhas aqui merecem explicação:
+
+- O Bash só faz aritmética com inteiros. A carga é um número decimal, então a divisão vai para o `awk`, que trabalha com ponto flutuante.
+- O `-P` do `df` força o formato POSIX, uma linha por sistema de arquivos, mesmo com nomes de dispositivo longos. Sem ele, a linha pode quebrar em duas e o `awk` lê a coluna errada.
+- O `NR == 2` pula o cabeçalho do `df`, e o `gsub` tira o `%` para sobrar só o número.
+
+### Os processos que mais consomem
+
+Quando um alerta dispara, a primeira pergunta é "quem está consumindo?". O `ps` responde com as colunas que você escolher, ordenado:
+
+```bash
+top_processos() {
+  ps -eo pid,user,comm,%cpu,%mem,rss --sort=-%mem | head -n 6
+}
+top_processos
+#     PID USER     COMMAND  %CPU %MEM   RSS
+#    1234 app      node     12.3 38.1 1530112
+#     811 postgres postgres  1.2  6.4  258000
+```
+
+O `RSS` é a memória física ocupada pelo processo, em KB. Se o processo `node` cresce sem parar entre uma execução e outra, você provavelmente tem um vazamento de memória na aplicação, e o log do monitoramento vira a prova.
+
+## A API está de pé?
+
+Métricas de máquina não dizem se a aplicação responde. Faça duas checagens: se há algo escutando na porta e se o endpoint de saúde devolve 200 dentro de um tempo razoável.
+
+```bash
+porta_escutando() {
+  ss -ltn | awk '{print $4}' | grep -qE "[:.]$1\$"
+}
+
+checar_http() {
+  local url="$1"
+  curl -sS -o /dev/null -m 5 -w '%{http_code} %{time_total}' "$url" || echo "000 0"
+}
+
+if porta_escutando 3000; then
+  read -r codigo tempo <<< "$(checar_http http://localhost:3000/health)"
+  echo "health: HTTP $codigo em ${tempo}s"
+else
+  echo "nada escutando na porta 3000"
+fi
+```
+
+O `ss -ltn` lista sockets TCP em modo de escuta, com números em vez de nomes. O `-m 5` do `curl` limita a espera a cinco segundos: sem limite, uma API travada prende o script indefinidamente. O `-w` imprime o código HTTP e o tempo total, e o `|| echo "000 0"` garante uma resposta mesmo quando a conexão é recusada (o que, com `set -e`, encerraria o script).
+
+Um bom endpoint de saúde na API testa as dependências de verdade, por exemplo fazendo um `SELECT 1` no banco, e não só devolve "ok" fixo:
+
+```javascript
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ status: "ok", uptime: process.uptime() });
+  } catch {
+    res.status(503).json({ status: "degradado" });
+  }
+});
+```
+
+## Limites, alertas e o problema da repetição
+
+Agora as métricas viram decisões. Os limites ficam em variáveis com valor padrão, assim dá para ajustar por servidor sem editar o código.
+
+```bash
+LIMITE_CARGA="${LIMITE_CARGA:-1.5}"
+LIMITE_MEM="${LIMITE_MEM:-90}"
+LIMITE_DISCO="${LIMITE_DISCO:-85}"
+WEBHOOK_URL="${WEBHOOK_URL:-}"
+ESTADO_DIR="${ESTADO_DIR:-/var/tmp/monitor}"
+INTERVALO_ALERTA=1800   # 30 minutos entre alertas iguais
+
+mkdir -p "$ESTADO_DIR"
+
+alertar() {
+  local chave="$1" mensagem="$2" arquivo agora ultimo
+  arquivo="$ESTADO_DIR/$chave"
+  agora="$(date +%s)"
+  ultimo="$(cat "$arquivo" 2>/dev/null || echo 0)"
+
+  if (( agora - ultimo < INTERVALO_ALERTA )); then
+    return 0   # já avisamos há pouco tempo
+  fi
+  echo "$agora" > "$arquivo"
+
+  logger -t monitor -p user.warning "$mensagem"
+  if [[ -n "$WEBHOOK_URL" ]]; then
+    curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+      -d "$(printf '{"text": "[%s] %s"}' "$(hostname)" "$mensagem")" \
+      "$WEBHOOK_URL" > /dev/null || true
+  fi
+}
+
+normalizar() { rm -f "$ESTADO_DIR/$1"; }
+```
+
+Sem o controle de estado, um disco a 90% gera um alerta a cada cinco minutos, e em uma hora o time inteiro silenciou o canal. Guardar o horário do último aviso por tipo de problema resolve isso. O `normalizar` apaga o estado quando a métrica volta ao normal, para o próximo problema ser avisado na hora.
+
+O `logger` grava no log do sistema (no journal do systemd ou no syslog), onde você consulta depois com `journalctl -t monitor`. O webhook funciona com Slack, Discord, Teams e similares: todos recebem um POST com JSON.
+
+## O script completo
+
+Juntando as funções numa rotina principal:
+
+```bash
+principal() {
+  local carga mem disco codigo tempo
+  carga="$(carga_por_nucleo)"
+  mem="$(memoria_usada_pct)"
+  disco="$(disco_usado_pct /)"
+  read -r codigo tempo <<< "$(checar_http "${HEALTH_URL:-http://localhost:3000/health}")"
+
+  printf '%s carga=%s mem=%s%% disco=%s%% http=%s tempo=%ss\n' \
+    "$(date -Is)" "$carga" "$mem" "$disco" "$codigo" "$tempo"
+
+  if awk -v c="$carga" -v l="$LIMITE_CARGA" 'BEGIN { exit !(c > l) }'; then
+    alertar carga "Carga alta: $carga por núcleo"
+  else
+    normalizar carga
+  fi
+
+  if (( mem >= LIMITE_MEM )); then
+    alertar memoria "Memória em $mem%. Top: $(top_processos | sed -n 2p)"
+  else
+    normalizar memoria
+  fi
+
+  if (( disco >= LIMITE_DISCO )); then
+    alertar disco "Disco / em $disco%"
+  else
+    normalizar disco
+  fi
+
+  if [[ "$codigo" != "200" ]]; then
+    alertar api "API fora do ar ou degradada: HTTP $codigo"
+  else
+    normalizar api
+  fi
+}
+
+principal
+```
+
+A linha impressa a cada execução, com data em ISO 8601 e pares `chave=valor`, é fácil de filtrar depois com `grep` e `awk`, e fácil de importar numa planilha se você quiser ver a evolução da memória ao longo de uma semana.
+
+## Agendando a execução
+
+### Com cron
+
+O cron é o agendador clássico. Edite a tabela do usuário com `crontab -e` e adicione uma linha:
+
+```bash
+# min hora dia mês dia-da-semana comando
+*/5 * * * * WEBHOOK_URL=https://hooks.exemplo.com/abc /opt/monitor/monitor.sh >> /var/log/monitor.log 2>&1
+```
+
+O `2>&1` junta erros e saída normal no mesmo arquivo. Sem redirecionamento, o cron tenta mandar a saída por e-mail local e ela simplesmente some.
+
+<Callout type="warning" title="O cron não tem o seu ambiente">
+O erro mais comum: o script funciona no terminal e falha no cron. O cron roda com um `PATH` mínimo (geralmente só `/usr/bin:/bin`), sem as variáveis do seu `.bashrc` e a partir do diretório home. Use caminhos absolutos para tudo, defina as variáveis no próprio script ou na linha do crontab, e sempre redirecione a saída para um log para enxergar o erro.
+</Callout>
+
+### Com um timer do systemd
+
+Em distribuições modernas, um timer do systemd é mais robusto: a saída vai para o journal automaticamente, dá para ver a última execução e o status de erro, e o timer pode compensar execuções perdidas com a máquina desligada.
+
+```ini
+# /etc/systemd/system/monitor.service
+[Unit]
+Description=Monitoramento da API de livros
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/monitor.env
+ExecStart=/opt/monitor/monitor.sh
+```
+
+```ini
+# /etc/systemd/system/monitor.timer
+[Unit]
+Description=Roda o monitoramento a cada 5 minutos
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now monitor.timer
+systemctl list-timers monitor.timer
+journalctl -u monitor.service --since "1 hour ago"
+```
+
+O `EnvironmentFile` guarda segredos como a URL do webhook fora do script, com permissão restrita (`chmod 600 /etc/monitor.env`).
+
+## Na entrevista
+
+**O que significa load average 4 numa máquina?** É a média de processos rodando ou esperando CPU (e I/O). O número só tem sentido dividido pelos núcleos: com 4 núcleos é ocupação total, com 16 é tranquilo.
+
+**Por que `MemFree` baixo não indica problema?** Porque o Linux usa memória livre como cache de disco e devolve quando precisa. O indicador certo é `MemAvailable`.
+
+**Como evitar que um monitoramento gere alertas em excesso?** Guardando estado: registrar quando o último alerta de cada tipo saiu, só repetir após um intervalo e limpar o estado quando a métrica normaliza.
+
+**Cron ou timer do systemd?** Cron é simples e universal. O timer do systemd dá logs no journal, histórico de execução, dependências entre serviços e recuperação de execuções perdidas.
+
+## Pratique
+
+Monte o `monitor.sh` completo para uma VPS (ou uma VM local com Ubuntu) onde roda uma API Node.js sua. Entregue:
+
+1. O script com as quatro checagens (carga, memória, disco, HTTP) e limites configuráveis por variável de ambiente.
+2. Alerta por webhook para um canal seu do Discord ou Slack, com controle de repetição de 30 minutos.
+3. Um timer do systemd rodando a cada 5 minutos.
+4. Um teste de fogo: encha o disco com `fallocate -l 2G /tmp/lixo` (ajuste ao tamanho do disco) até passar do limite, confirme que o alerta chegou só uma vez, apague o arquivo e confirme que o estado foi limpo.
+
+<Quiz question="Uma máquina com 4 núcleos mostra load average '3.9 3.7 3.5'. O que isso indica?" options={["A CPU está quase toda ocupada há um tempo","Faltam 4 GB de memória para o sistema","Há 3 processos travados esperando rede","O disco está quase cheio no momento"]} answer={0} explanation="A carga dividida pelos núcleos fica perto de 1, e os valores de 5 e 15 minutos mostram que a ocupação é sustentada." />
+
+<Quiz question="Qual campo de /proc/meminfo indica melhor quanta memória uma nova aplicação ainda pode usar?" options={["MemFree","MemAvailable","Cached","SwapTotal"]} answer={1} explanation="MemAvailable estima a memória utilizável sem swap, incluindo o cache que o kernel pode liberar." />
+
+<Quiz question="O script roda certo no terminal, mas no cron falha com 'command not found'. Causa mais provável?" options={["O cron roda com PATH mínimo","O cron não executa scripts Bash","Faltou usar sudo na linha","O cron só aceita arquivos .sh"]} answer={0} explanation="O cron não carrega o seu perfil de shell, então comandos fora de /usr/bin e /bin não são encontrados sem caminho absoluto." />
+
+## Base no CodeForge
+
+- [Processos e PCB](/learn/sistemas-operacionais/processos-e-pcb) e [Estados de processo](/learn/sistemas-operacionais/estados-de-processo): o que é cada linha do `ps` e por que um processo espera.
+- [Memória virtual](/learn/sistemas-operacionais/memoria-virtual): por que RSS e memória virtual de um processo são números diferentes.
+- [Sistemas de arquivos](/learn/sistemas-operacionais/sistemas-de-arquivos): o que o `df` está medindo.
+- [Scripting: Automatizando tarefas com Bash e Docker](/learn/carreira-nodejs/scripting-automatizando-tarefas-bash-docker): a base de Bash seguro usada aqui.
+
+## Referências
+
+- [proc(5): o sistema de arquivos /proc](https://man7.org/linux/man-pages/man5/proc.5.html)
+- [ps(1)](https://man7.org/linux/man-pages/man1/ps.1.html)
+- [crontab(5)](https://man7.org/linux/man-pages/man5/crontab.5.html)
+- [systemd.timer](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html)

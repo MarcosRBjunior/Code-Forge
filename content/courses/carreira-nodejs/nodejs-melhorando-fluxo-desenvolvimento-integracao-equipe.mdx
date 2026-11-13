@@ -1,0 +1,380 @@
+---
+title: "Node.js: Melhorando o fluxo de desenvolvimento e integração de sua equipe"
+kind: lesson
+---
+
+Quando a API sai do seu computador e passa a ter mais gente mexendo, aparecem os problemas de fluxo: "na minha máquina funciona", um colega com outra versão do Node, uma variável de ambiente que ninguém documentou, um commit com `console.log` esquecido, mensagens de commit como "ajustes". Nada disso é difícil de resolver, mas cada um custa horas quando acontece. Este capítulo monta o kit que deixa um projeto Node.js fácil de clonar, rodar e contribuir: scripts padronizados, reinício automático, configuração por ambiente, ganchos de Git, commits convencionais e um ambiente de desenvolvimento com Docker Compose.
+
+**Você vai aprender:**
+
+- Padronizar comandos com scripts npm e fixar a versão do Node
+- Recarregar a API automaticamente com `node --watch` e carregar `.env` sem bibliotecas
+- Validar variáveis de ambiente na inicialização
+- Barrar código fora do padrão com Husky, lint-staged e commitlint
+- Subir API e banco para desenvolvimento com Docker Compose
+
+## O objetivo: clonar e rodar em três comandos
+
+Um bom teste do fluxo do seu projeto é este: uma pessoa nova clona o repositório e consegue rodar a API sem perguntar nada a ninguém.
+
+```bash
+git clone git@github.com:time/api-livros.git && cd api-livros
+cp .env.example .env
+docker compose up
+```
+
+Tudo o que vem a seguir serve para chegar nesse ponto e manter o projeto nele.
+
+## Scripts npm como interface do projeto
+
+Os scripts do `package.json` são a interface do projeto: ninguém deveria precisar lembrar flags.
+
+```json
+{
+  "name": "api-livros",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/server.js",
+    "start": "node src/server.js",
+    "lint": "eslint . --max-warnings 0",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "test": "node --test",
+    "db:migrate": "sequelize-cli db:migrate",
+    "db:seed": "sequelize-cli db:seed:all",
+    "check": "npm run lint && npm test",
+    "prepare": "husky"
+  }
+}
+```
+
+Algumas convenções úteis:
+
+- **`dev` e `start` separados.** `dev` recarrega e lê `.env`; `start` é o que roda em produção, onde as variáveis vêm do ambiente.
+- **`check`** roda tudo o que o CI vai rodar. Antes de abrir um pull request, `npm run check`.
+- **`prepare`** é executado automaticamente após `npm install`. É ali que o Husky instala os ganchos de Git.
+- **Scripts `pre` e `post`**: `pretest` roda antes de `test`, se existir. Use com moderação, porque esconde passos.
+
+Execute com `npm run dev`. Para `start` e `test`, o `run` é opcional.
+
+### Fixando a versão do Node
+
+Diferença de versão do Node causa bugs sutis (um método que não existe, um comportamento diferente de `fetch`). Fixe em dois lugares:
+
+```bash
+echo "22" > .nvmrc       # nvm use, fnm use e o setup-node do CI leem este arquivo
+```
+
+O campo `engines` documenta a versão mínima. Com `engine-strict=true` num `.npmrc` do projeto, o `npm install` falha se a versão não bater, em vez de só avisar.
+
+## Recarga automática: node --watch e nodemon
+
+Reiniciar o servidor a cada alteração é perda de tempo. O Node 22 já faz isso nativamente:
+
+```bash
+node --watch src/server.js
+node --watch-path=src --watch-path=config src/server.js   # só observa essas pastas
+```
+
+O `--watch` acompanha os arquivos importados pelo ponto de entrada e reinicia o processo quando algum muda. Para a maioria das APIs, isso substitui o `nodemon`. O `nodemon` ainda é útil quando você precisa observar extensões não importadas (templates, `.graphql`), atrasar o reinício ou rodar um comando que não é Node:
+
+```json
+{
+  "watch": ["src"],
+  "ext": "js,json,graphql",
+  "ignore": ["src/**/*.test.js"],
+  "exec": "node --env-file=.env src/server.js"
+}
+```
+
+Esse é um `nodemon.json`. Rode com `npx nodemon`.
+
+## Variáveis de ambiente
+
+Configuração que muda entre ambientes (porta, URL do banco, segredos) vem de variáveis de ambiente, nunca do código. É um dos princípios do Twelve-Factor App.
+
+Desde o Node 20.6, a flag `--env-file` carrega um arquivo `.env` sem instalar `dotenv`:
+
+```bash
+# .env (NÃO vai para o Git)
+PORT=3000
+DATABASE_URL=postgres://livros:livros@localhost:5432/livros
+JWT_SECRET=troque-isto-por-um-valor-longo-e-aleatorio
+LOG_LEVEL=debug
+```
+
+```bash
+# .env.example (vai para o Git, sem valores secretos)
+PORT=3000
+DATABASE_URL=postgres://usuario:senha@localhost:5432/livros
+JWT_SECRET=
+LOG_LEVEL=info
+```
+
+```bash
+# .gitignore
+node_modules/
+.env
+.env.*
+!.env.example
+coverage/
+```
+
+Também existe `process.loadEnvFile()` para carregar por código, se precisar.
+
+### Validando na inicialização
+
+Variável faltando deveria derrubar a API ao iniciar, com uma mensagem clara, e não causar um erro estranho na primeira requisição três horas depois. Centralize a leitura num módulo de configuração e valide com um schema:
+
+```javascript
+// src/config/env.js
+import { z } from "zod";
+
+const Esquema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  PORT: z.coerce.number().int().positive().default(3000),
+  DATABASE_URL: z.string().url(),
+  JWT_SECRET: z.string().min(32, "JWT_SECRET precisa ter ao menos 32 caracteres"),
+  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+});
+
+const resultado = Esquema.safeParse(process.env);
+
+if (!resultado.success) {
+  console.error("Configuração inválida:");
+  for (const issue of resultado.error.issues) {
+    console.error(`  ${issue.path.join(".")}: ${issue.message}`);
+  }
+  process.exit(1);
+}
+
+export const config = Object.freeze(resultado.data);
+```
+
+O resto do código importa `config` e recebe tipos já convertidos (`config.PORT` é número). Se você fez a regra de ESLint do capítulo anterior, ela garante que ninguém leia `process.env` fora daqui.
+
+<Callout type="warning" title="O .env que vazou">
+O acidente mais comum desse fluxo é commitar o `.env` com senhas reais, às vezes porque o `.gitignore` foi criado depois do primeiro commit. Remover o arquivo num commit seguinte não adianta: ele continua no histórico. Se acontecer, **troque as credenciais imediatamente** e só depois limpe o histórico. Para prevenir, crie o `.gitignore` antes do primeiro commit e considere um verificador de segredos (como o secret scanning do GitHub) no repositório.
+</Callout>
+
+## Ganchos de Git com Husky e lint-staged
+
+Lint e testes no CI pegam problemas, mas tarde: o pull request já foi aberto. Ganchos de Git rodam verificações no seu computador antes do commit. O **Husky** gerencia esses ganchos dentro do repositório (versionados, para todo o time), e o **lint-staged** roda os comandos só nos arquivos que estão no commit, o que mantém o gancho rápido.
+
+```bash
+npm install -D husky lint-staged
+npx husky init
+```
+
+O `husky init` cria a pasta `.husky/`, adiciona o script `prepare` e um gancho `pre-commit` de exemplo. Troque o conteúdo do gancho:
+
+```bash
+# .husky/pre-commit
+npx lint-staged
+```
+
+E configure o lint-staged no `package.json`:
+
+```json
+{
+  "lint-staged": {
+    "*.js": ["eslint --fix --max-warnings 0", "prettier --write"],
+    "*.{json,md,yml,yaml}": "prettier --write"
+  }
+}
+```
+
+Agora `git commit` roda ESLint e Prettier nos arquivos preparados, aplica as correções automáticas e bloqueia o commit se sobrar erro. O lint-staged adiciona de volta ao commit o que foi corrigido.
+
+Mantenha o pré-commit leve, em segundos. Testes completos no pré-commit fazem as pessoas usarem `git commit --no-verify` para pular, o que anula o propósito. Se quiser testes antes de enviar, use um gancho `pre-push` com `npm test`.
+
+## Commits convencionais
+
+Mensagens de commit padronizadas deixam o histórico legível e permitem gerar changelog e versão automaticamente. O padrão mais usado é o **Conventional Commits**:
+
+```text
+<tipo>(<escopo opcional>): <descrição>
+
+<corpo opcional>
+
+<rodapé opcional>
+```
+
+| Tipo | Quando |
+|---|---|
+| `feat` | Nova funcionalidade |
+| `fix` | Correção de bug |
+| `docs` | Só documentação |
+| `refactor` | Mudança de código sem alterar comportamento |
+| `test` | Testes |
+| `chore` | Tarefas de manutenção, dependências |
+| `ci` | Pipeline de integração |
+
+Exemplos:
+
+```text
+feat(emprestimos): limita a 3 empréstimos ativos por leitor
+fix(livros): devolve 409 quando o ISBN já existe
+refactor!: troca sequelize.sync por migrações
+
+BREAKING CHANGE: o banco agora precisa de npm run db:migrate antes de subir
+```
+
+O `!` ou o rodapé `BREAKING CHANGE` indicam mudança incompatível. Ferramentas de versionamento semântico leem isso: `fix` sobe o patch, `feat` sobe o minor, quebra sobe o major.
+
+Para garantir o padrão, o **commitlint** verifica a mensagem num gancho `commit-msg`:
+
+```bash
+npm install -D @commitlint/cli @commitlint/config-conventional
+```
+
+```javascript
+// commitlint.config.js
+export default {
+  extends: ["@commitlint/config-conventional"],
+  rules: {
+    "scope-enum": [2, "always", ["livros", "emprestimos", "auth", "db", "deps", "ci"]],
+  },
+};
+```
+
+```bash
+# .husky/commit-msg
+npx --no -- commitlint --edit "$1"
+```
+
+Um commit com a mensagem "ajustes" é recusado com a explicação do que falta.
+
+## Ambiente de desenvolvimento com Docker Compose
+
+Instalar PostgreSQL, Redis e afins na máquina de cada pessoa, cada uma numa versão, é a origem de muito "na minha máquina funciona". Com Docker Compose, a infraestrutura de desenvolvimento vira um arquivo versionado.
+
+```yaml
+# compose.yaml
+services:
+  api:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://livros:livros@db:5432/livros
+    volumes:
+      - ./src:/app/src
+    depends_on:
+      db:
+        condition: service_healthy
+    command: node --watch src/server.js
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: livros
+      POSTGRES_PASSWORD: livros
+      POSTGRES_DB: livros
+    ports:
+      - "5432:5432"
+    volumes:
+      - dados-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U livros"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  dados-db:
+```
+
+```dockerfile
+# Dockerfile
+FROM node:22-alpine AS base
+WORKDIR /app
+COPY package*.json ./
+
+FROM base AS dev
+RUN npm ci
+COPY . .
+CMD ["node", "--watch", "src/server.js"]
+
+FROM base AS producao
+ENV NODE_ENV=production
+RUN npm ci --omit=dev
+COPY src ./src
+USER node
+CMD ["node", "src/server.js"]
+```
+
+Pontos que fazem diferença:
+
+- **Bind mount de `./src`** faz o código editado no seu editor aparecer dentro do container, e o `--watch` reinicia a API. Montar só `src` evita sobrescrever o `node_modules` do container com o da sua máquina (que pode ter binários de outro sistema operacional).
+- **`depends_on` com `service_healthy`** espera o PostgreSQL aceitar conexões, não só o container iniciar.
+- **Dentro da rede do Compose**, o host do banco é o nome do serviço (`db`), não `localhost`. Por isso `DATABASE_URL` é sobrescrita em `environment`.
+- **O mesmo Dockerfile** tem um estágio de desenvolvimento e um de produção, então o ambiente local fica próximo do real.
+
+```bash
+docker compose up -d                       # sobe tudo em segundo plano
+docker compose logs -f api                 # acompanha os logs da API
+docker compose exec api npm run db:migrate # roda comandos dentro do container
+docker compose down                        # para (os dados ficam no volume)
+docker compose down -v                     # para e apaga o volume do banco
+```
+
+## Fechando o ciclo no time
+
+As peças se encaixam assim:
+
+| Momento | Ferramenta | Pega |
+|---|---|---|
+| Enquanto edita | ESLint no editor, `node --watch` | Erros na hora |
+| `git commit` | Husky + lint-staged + commitlint | Lint, formatação, mensagem |
+| `git push` (opcional) | Husky `pre-push` | Testes |
+| Pull request | CI rodando `npm run check` | Tudo, em ambiente limpo |
+| Revisão | Template de PR e pessoas | Design e regra de negócio |
+
+Os ganchos locais podem ser pulados com `--no-verify`; o CI não. Por isso o CI é a garantia, e os ganchos são conforto: eles evitam ida e volta.
+
+Complete com um `README.md` que diga como rodar, um `.editorconfig` para indentação e fim de linha, e um template de pull request em `.github/pull_request_template.md` com um checklist curto.
+
+## Na entrevista
+
+**Por que validar variáveis de ambiente na inicialização?** Para falhar rápido e com mensagem clara. Sem validação, uma variável faltando aparece como erro confuso só quando aquele trecho de código roda, às vezes em produção.
+
+**Para que serve o lint-staged se já existe CI?** O CI é a garantia final, mas dá retorno tarde. O lint-staged roda só nos arquivos do commit, em segundos, e evita abrir PR que vai falhar por formatação.
+
+**O que são Conventional Commits e qual o ganho?** Um padrão de mensagem com tipo, escopo e descrição. O histórico fica legível e ferramentas geram changelog e decidem a próxima versão semântica a partir dos tipos.
+
+**Por que usar Docker Compose em desenvolvimento?** Para que todos usem as mesmas versões de banco e serviços, definidos num arquivo versionado, e para subir tudo com um comando.
+
+## Pratique
+
+Prepare a API de livros para receber um novo colega e entregue:
+
+1. Scripts `dev`, `start`, `lint`, `test`, `check` e `db:migrate`, com `.nvmrc` e `engines`.
+2. `src/config/env.js` validando as variáveis com mensagem clara e `.env.example` completo.
+3. Husky com `pre-commit` (lint-staged) e `commit-msg` (commitlint com escopos do projeto).
+4. `compose.yaml` com API e PostgreSQL, recarga automática e healthcheck.
+5. README com a seção "Como rodar" em no máximo três comandos. Peça para alguém seguir e anote onde travou.
+
+<Quiz question="Qual a vantagem do lint-staged sobre rodar eslint . no pré-commit?" options={["Corrige mais tipos de erro","Roda só nos arquivos do commit e fica rápido","Dispensa a configuração do ESLint","Funciona sem Git"]} answer={1} explanation="O lint-staged limita os comandos aos arquivos preparados para o commit. O gancho fica rápido e as pessoas não são tentadas a pular com no-verify." />
+
+<Quiz question="Dentro da rede do Docker Compose, como a API acessa o PostgreSQL?" options={["Por localhost na porta 5432","Pelo nome do serviço, como db","Pelo IP da máquina host","Só por um volume compartilhado"]} answer={1} explanation="O Compose cria uma rede onde cada serviço é resolvido pelo nome. Dentro do container da API, localhost é o próprio container." />
+
+<Quiz question="Qual mensagem segue Conventional Commits e indica mudança incompatível?" options={["feat!: remove a rota /v1/livros","Removida rota antiga (breaking)","BREAKING: rota removida","update: remove rota /v1"]} answer={0} explanation="O tipo seguido de ! sinaliza quebra de compatibilidade. O rodapé BREAKING CHANGE é a outra forma aceita." />
+
+## Base no CodeForge
+
+- [DevOps: Construindo e gerenciando containers com o Docker](/learn/carreira-nodejs/devops-construindo-gerenciando-containers-docker): o básico de imagens e containers usado no Compose.
+- [ESLint: Padronizando código com regras personalizadas](/learn/carreira-nodejs/eslint-padronizando-codigo-regras-personalizadas): o lint que roda no pré-commit.
+- [Git e GitHub: Compartilhando e colaborando em projetos](/learn/carreira-nodejs/git-github-compartilhando-colaborando-projetos): branches e pull requests.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): para onde os segredos vão quando saem do `.env`.
+
+## Referências
+
+- [Node.js: Command-line options](https://nodejs.org/api/cli.html)
+- [Husky](https://typicode.github.io/husky/)
+- [lint-staged](https://github.com/lint-staged/lint-staged)
+- [Conventional Commits](https://www.conventionalcommits.org/pt-br/v1.0.0/)

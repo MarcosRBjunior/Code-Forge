@@ -1,0 +1,305 @@
+---
+title: "JavaScript: Programação Orientada a Objetos"
+kind: lesson
+---
+
+Quando uma API cresce, as regras de negócio começam a se espalhar: o cálculo de multa de um empréstimo aparece no controller, depois no job noturno, depois num script de relatório, cada um com uma pequena diferença. Orientação a objetos é uma forma de juntar dados e as regras que valem para eles num lugar só, e de proteger esse lugar contra uso errado. Em Node.js você vai encontrar classes em services, repositórios, erros customizados e em frameworks inteiros, como o Nest.js.
+
+**Você vai aprender:**
+
+- Como objetos e protótipos funcionam por baixo da sintaxe de `class`
+- Como escrever classes com construtor, métodos, getters, campos privados e membros estáticos
+- Herança com `extends` e `super`, e polimorfismo na prática
+- Por que composição costuma ser melhor que herança
+- A armadilha do `this` perdido em callbacks
+
+## Objetos e protótipos: o que está por baixo
+
+Em JavaScript, todo objeto tem uma ligação interna para outro objeto, o seu protótipo. Quando você acessa uma propriedade que o objeto não tem, a busca sobe para o protótipo, depois para o protótipo do protótipo, até chegar em `null`. Isso é a cadeia de protótipos, e é assim que métodos são compartilhados sem serem copiados.
+
+```javascript
+const livroBase = {
+  descrever() {
+    return `${this.titulo} (${this.ano})`;
+  },
+};
+
+const livro = Object.create(livroBase);
+livro.titulo = "Dom Casmurro";
+livro.ano = 1899;
+
+console.log(livro.descrever());                          // Dom Casmurro (1899)
+console.log(Object.hasOwn(livro, "descrever"));          // false
+console.log(Object.getPrototypeOf(livro) === livroBase); // true
+```
+
+`descrever` não está em `livro`; está no protótipo. Dentro do método, `this` é o objeto pelo qual você chamou (`livro`), não o objeto onde o método mora. Guarde essa ideia: ela explica quase todo comportamento estranho de `this`.
+
+A palavra-chave `class`, que chegou no ES2015, é uma sintaxe mais clara para exatamente esse mecanismo. Os métodos declarados na classe vão para o objeto `Classe.prototype`, e cada instância aponta para ele.
+
+## Classes: construtor, métodos e getters
+
+O fio condutor desta aula é o domínio de uma biblioteca: livros e empréstimos.
+
+```javascript
+export class Livro {
+  constructor({ isbn, titulo, autor, ano, exemplares = 1 }) {
+    if (!isbn || !titulo) throw new Error("isbn e titulo são obrigatórios");
+    this.isbn = isbn;
+    this.titulo = titulo;
+    this.autor = autor;
+    this.ano = ano;
+    this.exemplares = exemplares;
+  }
+
+  get idade() {
+    return new Date().getFullYear() - this.ano;
+  }
+
+  descrever() {
+    return `${this.titulo}, de ${this.autor} (${this.ano})`;
+  }
+}
+
+const livro = new Livro({ isbn: "978-85", titulo: "Dom Casmurro", autor: "Machado", ano: 1899 });
+console.log(livro.descrever());
+console.log(livro.idade);                  // acessado como propriedade, sem ()
+console.log(typeof Livro);                 // function
+console.log(livro instanceof Livro);       // true
+```
+
+O construtor é o lugar de garantir que o objeto nasce válido. Se um livro sem título não faz sentido no seu domínio, ele não deve conseguir existir. Um getter (`get idade`) é um método que se lê como propriedade: útil para valores derivados que não precisam ser armazenados.
+
+## Encapsulamento com campos privados
+
+No exemplo acima, qualquer código pode fazer `livro.exemplares = -5`. Encapsular é esconder o estado e expor só operações que mantêm as regras válidas. JavaScript tem campos realmente privados, com `#`: o acesso de fora da classe é erro de sintaxe, não só uma convenção.
+
+```javascript
+export class Acervo {
+  #exemplares;
+  #emprestados = 0;
+
+  constructor(exemplares) {
+    if (!Number.isInteger(exemplares) || exemplares < 0) {
+      throw new RangeError("exemplares deve ser inteiro não negativo");
+    }
+    this.#exemplares = exemplares;
+  }
+
+  get disponiveis() {
+    return this.#exemplares - this.#emprestados;
+  }
+
+  emprestar() {
+    if (this.disponiveis === 0) throw new Error("nenhum exemplar disponível");
+    this.#emprestados++;
+  }
+
+  devolver() {
+    if (this.#emprestados === 0) throw new Error("nada a devolver");
+    this.#emprestados--;
+  }
+}
+
+const acervo = new Acervo(2);
+acervo.emprestar();
+console.log(acervo.disponiveis); // 1
+// acervo.#emprestados = 0;      // SyntaxError: campo privado fora da classe
+console.log(acervo.emprestados); // undefined: não existe propriedade pública
+```
+
+Repare que não existe um setter para `disponiveis`. O único jeito de mudar o estado é pelas operações `emprestar` e `devolver`, que conferem as regras. Esse é o ponto do encapsulamento: o objeto é responsável por nunca ficar inválido.
+
+Métodos também podem ser privados (`#calcularMulta()`), e campos privados não aparecem em `JSON.stringify` nem em `Object.keys`. Se você precisa serializar a entidade numa resposta da API, crie um método `toJSON()` que devolve só o que deve sair.
+
+## Membros estáticos
+
+Membros `static` pertencem à classe, não às instâncias. São úteis para fábricas e constantes.
+
+```javascript
+export class Emprestimo {
+  static PRAZO_DIAS = 14;
+  static MULTA_POR_DIA = 1.5;
+
+  constructor(isbn, usuarioId, retirada = new Date()) {
+    this.isbn = isbn;
+    this.usuarioId = usuarioId;
+    this.retirada = retirada;
+  }
+
+  static aPartirDoBanco(linha) {
+    return new Emprestimo(linha.isbn, linha.usuario_id, new Date(linha.retirada));
+  }
+
+  get vencimento() {
+    const d = new Date(this.retirada);
+    d.setDate(d.getDate() + Emprestimo.PRAZO_DIAS);
+    return d;
+  }
+
+  multa(devolucao = new Date()) {
+    const atraso = Math.ceil((devolucao - this.vencimento) / 86_400_000);
+    return atraso > 0 ? atraso * Emprestimo.MULTA_POR_DIA : 0;
+  }
+}
+
+const e = Emprestimo.aPartirDoBanco({ isbn: "978-85", usuario_id: 7, retirada: "2026-01-01" });
+console.log(e.multa(new Date("2026-01-20"))); // 7.5 (5 dias de atraso)
+```
+
+`aPartirDoBanco` é um construtor nomeado: ele traduz o formato da tabela (com `usuario_id` em snake_case) para o objeto do domínio. A regra da multa agora mora em um lugar só.
+
+## Herança e polimorfismo
+
+Herança cria uma classe a partir de outra. A subclasse herda os métodos e pode sobrescrevê-los. `super(...)` chama o construtor da classe pai e precisa vir antes de qualquer uso de `this`.
+
+```javascript
+class EmprestimoProfessor extends Emprestimo {
+  static PRAZO_DIAS = 30;
+
+  get vencimento() {
+    const d = new Date(this.retirada);
+    d.setDate(d.getDate() + EmprestimoProfessor.PRAZO_DIAS);
+    return d;
+  }
+
+  multa(devolucao) {
+    return super.multa(devolucao) / 2; // professores pagam metade
+  }
+}
+
+const emprestimos = [
+  new Emprestimo("978-85", 1, new Date("2026-01-01")),
+  new EmprestimoProfessor("978-86", 2, new Date("2026-01-01")),
+];
+
+const hoje = new Date("2026-02-10");
+for (const emp of emprestimos) {
+  console.log(emp.constructor.name, emp.multa(hoje));
+}
+// Emprestimo 39
+// EmprestimoProfessor 7.5
+```
+
+Isso é polimorfismo: o laço chama `multa` sem saber qual é o tipo concreto, e cada objeto responde do seu jeito. O código que usa os empréstimos não tem nenhum `if (tipo === "professor")`.
+
+O mesmo mecanismo serve para erros customizados, que você vai usar em toda API:
+
+```javascript
+export class ErroDeDominio extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.name = this.constructor.name;
+    this.status = status;
+  }
+}
+export class NaoEncontrado extends ErroDeDominio {
+  constructor(recurso) {
+    super(`${recurso} não encontrado`, 404);
+  }
+}
+
+try {
+  throw new NaoEncontrado("Livro");
+} catch (err) {
+  console.log(err instanceof ErroDeDominio, err.name, err.status); // true NaoEncontrado 404
+}
+```
+
+Um middleware de erro no Express pode então checar `err instanceof ErroDeDominio` e responder com `err.status`, sem conhecer cada tipo de erro.
+
+## Composição em vez de herança
+
+Herança é uma relação forte: a subclasse depende dos detalhes da classe pai, e hierarquias profundas ficam frágeis. Se amanhã surgir "empréstimo de professor com renovação automática" e "empréstimo de aluno com renovação automática", a herança começa a se multiplicar.
+
+Composição resolve isso montando o objeto a partir de peças. Em vez de a subclasse decidir a regra de prazo e multa, o empréstimo **recebe** uma política:
+
+```javascript
+const politicaPadrao = { prazoDias: 14, multaDia: 1.5, desconto: 0 };
+const politicaProfessor = { prazoDias: 30, multaDia: 1.5, desconto: 0.5 };
+
+class EmprestimoComPolitica {
+  #politica;
+  constructor(isbn, retirada, politica = politicaPadrao) {
+    this.isbn = isbn;
+    this.retirada = retirada;
+    this.#politica = politica;
+  }
+  multa(devolucao) {
+    const { prazoDias, multaDia, desconto } = this.#politica;
+    const venc = new Date(this.retirada);
+    venc.setDate(venc.getDate() + prazoDias);
+    const atraso = Math.ceil((devolucao - venc) / 86_400_000);
+    return atraso > 0 ? atraso * multaDia * (1 - desconto) : 0;
+  }
+}
+
+const emp = new EmprestimoComPolitica("978-86", new Date("2026-01-01"), politicaProfessor);
+console.log(emp.multa(new Date("2026-02-10"))); // 7.5
+```
+
+Uma política nova é só um objeto novo, sem tocar na classe. A regra prática: use herança quando a relação for genuinamente "é um" e estável (`NaoEncontrado` é um `ErroDeDominio`); use composição quando quiser variar comportamento.
+
+## A armadilha do this perdido
+
+`this` é decidido na hora da chamada, não na hora da definição. Ao passar um método como callback, você passa só a função, sem o objeto.
+
+<Callout type="warning" title="Método de classe como handler do Express">
+`app.get("/livros", controller.listar)` passa a função solta. Quando o Express a chama, `this` é `undefined` (classes rodam em modo estrito) e `this.service` explode com TypeError. Corrija com `controller.listar.bind(controller)`, com uma arrow function no lugar (`(req, res) => controller.listar(req, res)`) ou declarando o método como campo arrow na classe (`listar = async (req, res) => { ... }`).
+</Callout>
+
+```javascript
+class LivroController {
+  constructor(service) {
+    this.service = service;
+  }
+  // campo arrow: o this fica preso à instância
+  listar = async (req, res) => {
+    res.json(await this.service.listar());
+  };
+}
+
+const controller = new LivroController({ listar: async () => [{ titulo: "Dom Casmurro" }] });
+const handler = controller.listar;          // separado do objeto
+handler({}, { json: (d) => console.log(d) }); // funciona: [ { titulo: 'Dom Casmurro' } ]
+```
+
+A diferença de custo: métodos normais ficam no protótipo (um por classe), campos arrow são criados em cada instância. Para controllers, que têm uma instância só, isso não importa.
+
+## Na entrevista
+
+**O que é a cadeia de protótipos?** Cada objeto aponta para um protótipo; a busca por propriedade sobe por essa cadeia até `null`. Classes são açúcar sintático sobre isso: métodos ficam em `Classe.prototype`.
+
+**Qual a diferença entre `#campo` e `_campo`?** `_campo` é só convenção e continua acessível. `#campo` é privado de verdade, garantido pela linguagem.
+
+**Herança ou composição?** Herança para relações "é um" estáveis e rasas; composição para variar comportamento, porque acopla menos e combina peças sem explodir a hierarquia.
+
+**Por que `this` vira `undefined` num callback?** Porque `this` depende de como a função é chamada. Passar `obj.metodo` desconecta a função do objeto. Use `bind`, arrow function ou campo arrow.
+
+## Pratique
+
+Modele o domínio da biblioteca em classes, num projeto Node.js com ESM:
+
+1. `Livro` com validação no construtor e `toJSON()`.
+2. `Acervo` com campos privados e operações `emprestar` e `devolver` que lançam erro em estado inválido.
+3. `Emprestimo` que recebe uma política (composição) e calcula a multa; três políticas: aluno, professor e visitante.
+4. Hierarquia de erros: `ErroDeDominio`, `NaoEncontrado`, `ConflitoDeEstado`.
+5. Testes com `node --test` cobrindo: multa zero no prazo, multa com atraso para cada política, empréstimo sem exemplar disponível.
+
+Entregue o repositório com os testes passando e um parágrafo no README explicando por que você usou composição para as políticas.
+
+<Quiz question="Uma classe declara o método descrever(). Onde esse método fica guardado?" options={["Copiado em cada instância","No objeto Classe.prototype","Numa variável global","No construtor"]} answer={1} explanation="Métodos de classe ficam no protótipo e são compartilhados por todas as instâncias através da cadeia de protótipos." />
+<Quiz question="O que acontece ao executar acervo.#emprestados = 0 fora da classe Acervo?" options={["Cria uma propriedade pública nova","Altera o campo privado normalmente","Erro de sintaxe","Nada, a atribuição é ignorada"]} answer={2} explanation="Campos com # são privados pela linguagem. Referenciar um campo privado fora do corpo da classe é SyntaxError." />
+<Quiz question="Você registra app.get('/livros', controller.listar) e recebe TypeError ao ler this.service. Por quê?" options={["O Express não aceita classes","O método foi passado sem o objeto e this ficou undefined","O service não foi exportado","Falta async no método"]} answer={1} explanation="this é definido na chamada. Passar a função solta perde o vínculo com a instância; use bind, arrow function ou campo arrow." />
+
+## Base no CodeForge
+
+- [Classes e objetos](/learn/lld/classes-e-objetos), [Encapsulamento](/learn/lld/encapsulamento), [Herança](/learn/lld/heranca) e [Polimorfismo](/learn/lld/polimorfismo): os conceitos de OO com mais exemplos.
+- [Composição sobre herança](/learn/lld/composicao-sobre-heranca): o argumento completo.
+- [Classes em TypeScript](/learn/typescript/classes): o mesmo assunto com tipos, base para os próximos capítulos.
+
+## Referências
+
+- [Classes (MDN, em português)](https://developer.mozilla.org/pt-BR/docs/Web/JavaScript/Reference/Classes)
+- [Private elements (MDN)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Classes/Private_elements)
+- [Inheritance and the prototype chain (MDN)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Inheritance_and_the_prototype_chain)

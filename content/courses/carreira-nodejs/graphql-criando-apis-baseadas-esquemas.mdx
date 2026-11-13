@@ -1,0 +1,280 @@
+---
+title: "GraphQL: Criando APIs baseadas em esquemas"
+kind: lesson
+---
+
+Numa API REST, a tela de detalhes de um livro pode precisar de três chamadas (livro, autor, avaliações) e ainda receber campos que não usa. GraphQL inverte isso: o servidor publica um **esquema** tipado com tudo que existe, e o cliente pede exatamente os campos que quer, numa única requisição. O esquema vira o contrato entre front-end e back-end, com documentação e validação de graça. Para o dev Node.js, construir uma API GraphQL é escrever esse esquema e as funções (resolvers) que buscam cada campo.
+
+**Você vai aprender:**
+
+- Como descrever a API em SDL: tipos, consultas, mutações, inputs e nulabilidade
+- Como implementar resolvers e servir a API com GraphQL Yoga em Node.js
+- Como passar autenticação pelo contexto e tratar erros
+- Como evitar o problema N+1 com DataLoader
+- Como publicar eventos em tempo real com subscriptions
+
+## O esquema é o contrato
+
+O esquema é escrito em **SDL** (Schema Definition Language). Cada tipo lista seus campos e o tipo de cada um. O `!` significa "nunca nulo", e colchetes indicam lista.
+
+```graphql
+type Autor {
+  id: ID!
+  nome: String!
+  livros: [Livro!]!
+}
+
+type Livro {
+  id: ID!
+  titulo: String!
+  ano: Int
+  genero: Genero!
+  autor: Autor!
+  mediaNotas: Float
+}
+
+enum Genero {
+  FICCAO
+  TECNICO
+  BIOGRAFIA
+}
+
+input NovoLivroInput {
+  titulo: String!
+  ano: Int
+  genero: Genero!
+  autorId: ID!
+}
+
+type Query {
+  livro(id: ID!): Livro
+  livros(genero: Genero, primeiros: Int = 20): [Livro!]!
+}
+
+type Mutation {
+  criarLivro(dados: NovoLivroInput!): Livro!
+}
+```
+
+Três tipos raiz organizam as operações: **Query** (leitura), **Mutation** (escrita) e **Subscription** (eventos em tempo real). Repare nas decisões de nulabilidade. `livro(id)` devolve `Livro` sem `!` porque o livro pode não existir. Já `livros` devolve `[Livro!]!`: a lista sempre existe (pode ser vazia) e nunca contém nulos. Pense nisso com cuidado, porque se um resolver devolve `null` num campo `!`, o erro sobe e anula o objeto pai inteiro.
+
+Um cliente que quer só título e nome do autor pede:
+
+```graphql
+query DetalheLivro {
+  livro(id: "42") {
+    titulo
+    autor {
+      nome
+    }
+  }
+}
+```
+
+## Resolvers
+
+Para cada campo do esquema, o servidor executa um **resolver**: uma função que recebe `(pai, argumentos, contexto, info)` e devolve o valor (ou uma Promise). Se você não escrever um resolver para um campo, o padrão é ler a propriedade de mesmo nome do objeto pai. Por isso só campos calculados ou relacionamentos precisam de resolver explícito.
+
+```javascript
+// src/resolvers.js
+import { GraphQLError } from "graphql";
+
+export const resolvers = {
+  Query: {
+    livro: (_, { id }, { db }) => db.livros.porId(id),
+    livros: (_, { genero, primeiros }, { db }) =>
+      db.livros.listar({ genero, limite: Math.min(primeiros, 100) }),
+  },
+  Mutation: {
+    criarLivro: async (_, { dados }, { db, usuario }) => {
+      if (!usuario) {
+        throw new GraphQLError("Faça login para criar livros", {
+          extensions: { code: "UNAUTHENTICATED" },
+        });
+      }
+      if (dados.titulo.trim().length < 2) {
+        throw new GraphQLError("Título muito curto", {
+          extensions: { code: "BAD_USER_INPUT", campo: "titulo" },
+        });
+      }
+      return db.livros.criar(dados);
+    },
+  },
+  Livro: {
+    autor: (livro, _, { loaders }) => loaders.autor.load(livro.autorId),
+    mediaNotas: (livro, _, { db }) => db.avaliacoes.media(livro.id),
+  },
+  Autor: {
+    livros: (autor, _, { db }) => db.livros.listar({ autorId: autor.id }),
+  },
+};
+```
+
+## Servindo com GraphQL Yoga
+
+O **GraphQL Yoga** é um servidor GraphQL completo, baseado na Fetch API, que roda em cima do `node:http`, Express, Fastify ou ambientes serverless. Ele já inclui o GraphiQL (uma interface para testar consultas no navegador) e suporte a subscriptions.
+
+```javascript
+// src/server.js
+import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
+import { createSchema, createYoga } from "graphql-yoga";
+import { resolvers } from "./resolvers.js";
+import { db } from "./db.js";
+import { criarLoaders } from "./loaders.js";
+import { usuarioDoToken } from "./auth.js";
+
+const typeDefs = readFileSync(new URL("./schema.graphql", import.meta.url), "utf8");
+
+export const yoga = createYoga({
+  schema: createSchema({ typeDefs, resolvers }),
+  context: async ({ request }) => ({
+    db,
+    usuario: await usuarioDoToken(request.headers.get("authorization")),
+    loaders: criarLoaders(db), // novos a cada requisição
+  }),
+});
+
+const server = createServer(yoga);
+server.listen(4000, () => console.log("GraphQL em http://localhost:4000/graphql"));
+```
+
+```bash
+npm install graphql graphql-yoga dataloader
+node src/server.js
+
+curl -s http://localhost:4000/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"{ livros(primeiros: 2) { titulo autor { nome } } }"}'
+```
+
+Por baixo, GraphQL costuma usar um único endpoint (`/graphql`) com `POST` e um JSON contendo `query`, `variables` e, opcionalmente, `operationName`. A resposta sempre traz `data` e, se algo falhou, `errors`. Uma consulta pode ter sucesso parcial: alguns campos com dados e outros com erro.
+
+O **contexto** é criado a cada requisição e chega como terceiro argumento de todos os resolvers. É o lugar certo para o usuário autenticado, a conexão com o banco e os loaders. Autorização mais fina (só o dono edita o livro) fica nos resolvers ou numa camada de serviço chamada por eles.
+
+Se você preferir o Apollo Server, a estrutura é a mesma: `typeDefs`, `resolvers` e uma função de contexto. Os resolvers deste capítulo funcionam sem mudança nos dois.
+
+## O problema N+1 e o DataLoader
+
+Peça 50 livros com o nome do autor. O resolver `livros` faz 1 consulta, e o resolver `Livro.autor` roda 50 vezes, uma por livro: 51 consultas ao banco. Esse é o **problema N+1**, o gargalo de desempenho mais comum em GraphQL.
+
+O **DataLoader** resolve agrupando: durante um mesmo ciclo do event loop, ele junta todas as chamadas `load(id)` e chama uma única função de lote com a lista de IDs. Ele também guarda em cache cada ID dentro da requisição.
+
+```javascript
+// src/loaders.js
+import DataLoader from "dataloader";
+
+export function criarLoaders(db) {
+  return {
+    autor: new DataLoader(async (ids) => {
+      // uma consulta: SELECT * FROM autores WHERE id = ANY($1)
+      const autores = await db.autores.porIds(ids);
+      const porId = new Map(autores.map((a) => [String(a.id), a]));
+      // a função de lote deve devolver na MESMA ordem dos ids recebidos
+      return ids.map((id) => porId.get(String(id)) ?? new Error(`autor ${id} não existe`));
+    }),
+  };
+}
+```
+
+As 51 consultas viram 2. Crie os loaders **por requisição** (no contexto, como acima). Um loader global compartilharia cache entre usuários diferentes e serviria dados desatualizados.
+
+## Subscriptions
+
+Subscriptions mantêm uma conexão aberta e empurram eventos ao cliente. O Yoga usa Server-Sent Events por padrão, sem configuração extra, e oferece um pub/sub em memória para começar.
+
+```graphql
+type Subscription {
+  livroCriado: Livro!
+}
+```
+
+```javascript
+// trechos em src/server.js e src/resolvers.js
+import { createPubSub } from "graphql-yoga";
+export const pubSub = createPubSub();
+
+// na mutação, depois de criar:
+//   const livro = await db.livros.criar(dados);
+//   pubSub.publish("livroCriado", livro);
+//   return livro;
+
+export const subscriptionResolvers = {
+  Subscription: {
+    livroCriado: {
+      subscribe: () => pubSub.subscribe("livroCriado"),
+      resolve: (livro) => livro,
+    },
+  },
+};
+```
+
+O pub/sub em memória só funciona com uma instância do servidor. Com várias réplicas, troque por um pub/sub distribuído (Redis, por exemplo), senão o cliente conectado à réplica A não recebe o evento publicado na B.
+
+## Testando e protegendo
+
+O Yoga expõe `yoga.fetch`, que executa uma requisição sem abrir porta, ideal para testes com `node:test`:
+
+```javascript
+// test/livros.test.js
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { yoga } from "../src/server.js";
+
+test("lista livros com autor", async () => {
+  const res = await yoga.fetch("http://teste/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ query: "{ livros(primeiros: 1) { titulo autor { nome } } }" }),
+  });
+  const { data, errors } = await res.json();
+  assert.equal(errors, undefined);
+  assert.equal(data.livros.length, 1);
+});
+```
+
+Como o cliente monta a consulta, ele também pode montar uma consulta abusiva: autor, livros do autor, autor de cada livro, e assim por diante, dez níveis abaixo. Defesas comuns:
+
+- **Limite de profundidade e de custo** da consulta, com plugins do ecossistema (Envelop no Yoga).
+- **Limite de paginação** nos argumentos (o `Math.min(primeiros, 100)` acima).
+- **Operações persistidas:** em produção, aceitar só consultas previamente registradas pelo seu front-end.
+- **Introspecção** desligada em APIs privadas, se o esquema não deve ser público.
+
+<Callout type="warning" title="N+1 escondido atrás de um esquema bonito">
+Tudo funciona no desenvolvimento com 5 livros. Em produção, uma lista de 100 itens com dois relacionamentos dispara centenas de consultas por requisição, e o banco é o primeiro a sentir. Use DataLoader em todo resolver de relacionamento desde o início e ative o log de consultas do ORM ou do driver para contar quantas uma operação dispara.
+</Callout>
+
+## Na entrevista
+
+**Quais as vantagens e desvantagens de GraphQL frente a REST?** Vantagens: o cliente pede só o que precisa, uma requisição para dados relacionados, esquema tipado e autodocumentado. Desvantagens: cache HTTP mais difícil (tudo é POST num endpoint), risco de N+1 e de consultas caras, e mais complexidade no servidor.
+
+**O que é o problema N+1 e como resolver?** Um resolver de relacionamento executado uma vez por item da lista, gerando N consultas extras. Resolve-se com DataLoader, que agrupa as chaves em uma consulta de lote por requisição.
+
+**Como você trata erros em GraphQL?** Erros de negócio viram `GraphQLError` com um código em `extensions`. A resposta pode ter `data` parcial e `errors`. Erros inesperados devem ser mascarados para não vazar detalhes internos (o Yoga faz isso por padrão).
+
+## Pratique
+
+Construa a API GraphQL de livros com Yoga:
+
+1. Esquema com `Livro`, `Autor`, `Avaliacao`, consultas paginadas e as mutações `criarLivro` e `avaliarLivro`.
+2. Autenticação por JWT no contexto; só usuários logados fazem mutações.
+3. DataLoader para autor e avaliações, com um teste que conta as consultas ao banco numa lista de 50 livros (deve ser no máximo 3).
+4. Subscription `avaliacaoCriada(livroId: ID!)` filtrando por livro.
+
+Entregue o repositório com o `schema.graphql`, os testes com `yoga.fetch` e exemplos de consultas no README.
+
+<Quiz question="O campo livros tem tipo [Livro!]!. O que isso garante?" options={["A lista pode ser nula, mas os itens não","A lista sempre existe e nunca contém itens nulos","A lista nunca está vazia","Cada livro tem todos os campos preenchidos"]} answer={1} explanation="O ! externo garante que a lista não é nula, e o interno que nenhum item é nulo. Uma lista vazia continua válida." />
+<Quiz question="Por que criar os DataLoaders a cada requisição, no contexto?" options={["Porque o DataLoader não funciona com módulos ESM","Para evitar compartilhar cache entre usuários e servir dados velhos","Porque o Yoga exige um loader por resolver","Para que as subscriptions funcionem via SSE"]} answer={1} explanation="O cache do DataLoader vive enquanto o loader existir. Por requisição, ele agrupa chamadas sem vazar dados entre usuários." />
+<Quiz question="Sua API tem 3 réplicas e usa createPubSub em memória. O que acontece com as subscriptions?" options={["Funcionam normalmente em todas as réplicas","Cada evento chega três vezes ao cliente","O cliente só recebe eventos publicados na réplica em que está conectado","O Yoga sincroniza as réplicas automaticamente"]} answer={2} explanation="O pub/sub em memória é local ao processo. Com várias réplicas é preciso um pub/sub distribuído como Redis." />
+
+## Base no CodeForge
+
+- [GraphQL](/learn/system-design/graphql) e [Estilos de API](/learn/system-design/estilos-de-api): onde GraphQL se encaixa entre REST e gRPC.
+- [Node.js: Serviços RPC escaláveis e transmissão de dados](/learn/carreira-nodejs/nodejs-servicos-rpc-escalaveis-transmissao-dados): a outra alternativa a REST desta carreira.
+- [Server-Sent Events](/learn/system-design/server-sent-events): o transporte das subscriptions no Yoga.
+
+## Referências
+
+- [Learn GraphQL](https://graphql.org/learn/)
+- [GraphQL Yoga docs](https://the-guild.dev/graphql/yoga-server/docs)
+- [Apollo Server docs](https://www.apollographql.com/docs/apollo-server/)

@@ -1,0 +1,376 @@
+---
+title: "WebSockets: Implemente autenticação e avance no Socket.IO"
+kind: lesson
+---
+
+O chat do capítulo anterior aceita qualquer nome digitado no formulário. Isso serve para uma demonstração, mas num produto real você precisa saber quem está do outro lado de cada conexão, impedir que um usuário comum emita eventos de administrador e continuar funcionando quando a aplicação roda em várias instâncias. Conexões WebSocket ficam abertas por horas, o que traz problemas que APIs REST não têm: o token pode expirar no meio da conexão, a rede cai e volta, e duas pessoas podem estar conectadas em servidores diferentes. Este capítulo resolve cada um deles com os recursos do Socket.IO.
+
+**Você vai aprender:**
+
+- Autenticar no handshake com JWT e tratar falhas no cliente
+- Autorizar por evento e separar áreas com namespaces
+- Enviar mensagens para um usuário em todas as abas, e lidar com token que expira
+- Recuperar eventos perdidos numa reconexão curta
+- Escalar para várias instâncias com adapter e sticky sessions
+
+## Autenticação no handshake
+
+Toda conexão Socket.IO começa com um handshake. É nele que o cliente envia credenciais, e é nele que o servidor decide se aceita. No cliente, o campo `auth`:
+
+```javascript
+// cliente
+import { io } from "socket.io-client";
+
+const socket = io("https://api.exemplo.com", {
+  auth: (cb) => cb({ token: localStorage.getItem("tokenAcesso") }),
+});
+
+socket.on("connect_error", (erro) => {
+  console.log("recusado:", erro.message, erro.data);
+  if (erro.message === "token_expirado") {
+    renovarToken().then(() => socket.connect());
+  }
+});
+```
+
+Passar `auth` como função (e não como objeto fixo) faz o cliente ler o token atual a cada tentativa de conexão. Com objeto, uma reconexão depois de renovar o token ainda mandaria o antigo.
+
+No servidor, um **middleware** de conexão roda antes do evento `connection`. Se chamar `next(erro)`, a conexão é recusada e o cliente recebe `connect_error`.
+
+```javascript
+// src/socket/auth.js
+import { validarToken } from "../seguranca/tokens.js";
+import { Usuario } from "../models/Usuario.js";
+
+export async function autenticarSocket(socket, next) {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next(new Error("nao_autenticado"));
+
+  try {
+    const payload = validarToken(token); // jwt.verify com algoritmo fixo, iss e aud
+    const usuario = await Usuario.findByPk(payload.sub);
+    if (!usuario || !usuario.ativo) return next(new Error("nao_autenticado"));
+
+    socket.data.usuario = { id: usuario.id, nome: usuario.nome };
+    socket.data.expiraEm = payload.exp * 1000;
+    next();
+  } catch (erro) {
+    const e = new Error(erro.name === "TokenExpiredError" ? "token_expirado" : "nao_autenticado");
+    e.data = { detalhe: "Faça login novamente" };
+    next(e);
+  }
+}
+```
+
+```javascript
+// src/socket/index.js
+import { Server } from "socket.io";
+import { autenticarSocket } from "./auth.js";
+
+export function criarSocket(httpServer) {
+  const io = new Server(httpServer, {
+    cors: { origin: ["https://app.exemplo.com"], credentials: true },
+    maxHttpBufferSize: 100_000,
+  });
+
+  io.use(autenticarSocket);
+
+  io.on("connection", (socket) => {
+    const { id, nome } = socket.data.usuario;
+    socket.join(`usuario:${id}`);
+    console.log(`${nome} conectou (${socket.id})`);
+  });
+
+  return io;
+}
+```
+
+Os middlewares de conexão rodam **a cada conexão**, inclusive nas reconexões automáticas. Um token revogado é barrado na próxima vez que o cliente reconectar.
+
+### Por que não na query string
+
+Você vai ver exemplos com `io(url, { query: { token } })`. Evite: a query string aparece em logs de proxy, de balanceador e de acesso. O campo `auth` vai no corpo do pacote de handshake, não na URL.
+
+### Alternativa: cookie de sessão
+
+Se o front e a API estão no mesmo site e você já usa cookie `HttpOnly`, o handshake carrega o cookie automaticamente (com `withCredentials: true` no cliente quando há domínios diferentes). No servidor, leia de `socket.request.headers.cookie`, ou reaproveite os middlewares do Express com `io.engine.use(sessionMiddleware)`, que deixa `socket.request.session` disponível.
+
+## Um usuário, várias conexões
+
+O `socket.id` identifica uma **conexão**, não uma pessoa. A mesma pessoa com o app no celular e duas abas no computador tem três sockets. Para notificar a pessoa, use a sala `usuario:ID`, criada no `connection` acima:
+
+```javascript
+// Em qualquer lugar do back-end, inclusive numa rota REST
+export function notificarUsuario(io, usuarioId, evento, dados) {
+  io.to(`usuario:${usuarioId}`).emit(evento, dados);
+}
+
+// Ex.: quando um empréstimo é aprovado
+app.post("/emprestimos/:id/aprovar", autenticarJwt, exigir("emprestimos:gerenciar"), async (req, res) => {
+  const emprestimo = await aprovar(req.params.id);
+  notificarUsuario(req.app.get("io"), emprestimo.leitorId, "emprestimo:aprovado", { id: emprestimo.id });
+  res.json(emprestimo);
+});
+```
+
+Guarde a instância com `app.set("io", io)` na inicialização. Esse padrão (REST para comandos, socket para notificações) é comum e mantém a lógica de negócio nas rotas que você já testa.
+
+Para presença online, conte as conexões da sala do usuário: `(await io.in("usuario:7").fetchSockets()).length > 0`.
+
+## Autorização por evento
+
+Autenticar a conexão diz quem é a pessoa. Cada evento ainda precisa verificar se ela pode fazer aquilo. Para regras gerais, há middleware por pacote com `socket.use`, que recebe cada evento recebido:
+
+```javascript
+// Eventos que exigem permissão, no formato evento -> permissão
+const REGRAS = {
+  "sala:criar": "salas:gerenciar",
+  "mensagem:apagar": "mensagens:moderar",
+};
+
+io.on("connection", async (socket) => {
+  const acesso = await permissoesDo(socket.data.usuario.id);
+  socket.data.permissoes = acesso.permissoes;
+
+  socket.use(([evento, ...args], next) => {
+    const necessaria = REGRAS[evento];
+    if (necessaria && !socket.data.permissoes.has(necessaria)) {
+      return next(new Error("sem_permissao"));
+    }
+    next();
+  });
+
+  socket.on("error", (erro) => {
+    socket.emit("erro", { mensagem: erro.message });
+  });
+});
+```
+
+Quando o `next` recebe um erro, o handler do evento não roda e o erro vai para o evento `error` do socket.
+
+Regras que dependem do recurso continuam no handler, como no REST. Para entrar numa sala privada, confira se a pessoa é membro:
+
+```javascript
+socket.on("sala:entrar", async ({ salaId } = {}, responder) => {
+  const membro = await Participante.exists({ salaId, usuarioId: socket.data.usuario.id });
+  if (!membro) return responder?.({ ok: false, erro: "Você não participa desta sala" });
+  socket.join(`sala:${salaId}`);
+  responder?.({ ok: true });
+});
+```
+
+<Callout type="warning" title="Autenticar e esquecer de autorizar">
+Ter um middleware de conexão dá uma falsa sensação de segurança. O erro clássico é aceitar `socket.join(salaId)` com qualquer id vindo do cliente: o usuário está autenticado, então entra em qualquer conversa e passa a receber mensagens privadas dos outros. Todo evento que recebe um id (sala, documento, pedido) precisa conferir se aquele usuário tem acesso àquele recurso, exatamente como uma rota REST.
+</Callout>
+
+## Token que expira com a conexão aberta
+
+O JWT de acesso vale 15 minutos, mas a conexão pode durar horas. Como o middleware só roda no handshake, uma conexão aberta continuaria funcionando depois de o token expirar. Duas abordagens:
+
+**Desconectar na expiração.** O cliente reconecta automaticamente com o token novo, graças ao `auth` como função.
+
+```javascript
+io.on("connection", (socket) => {
+  const restante = socket.data.expiraEm - Date.now();
+  const timer = setTimeout(() => socket.disconnect(true), Math.max(restante, 0));
+  socket.on("disconnect", () => clearTimeout(timer));
+});
+```
+
+```javascript
+// cliente: se o servidor desconectou, renova e reconecta
+socket.on("disconnect", async (motivo) => {
+  if (motivo === "io server disconnect") {
+    await renovarToken();
+    socket.connect();
+  }
+});
+```
+
+Quando o servidor desconecta com `disconnect(true)`, o cliente **não** reconecta sozinho (o motivo é `io server disconnect`), por isso o `socket.connect()` explícito.
+
+**Renovar pela própria conexão.** O cliente emite `auth:renovar` com o token novo antes do vencimento, e o servidor valida e atualiza `socket.data.expiraEm`. Evita a reconexão, mas exige mais código. Comece pela primeira.
+
+Para revogação imediata (usuário banido, senha trocada), desconecte todas as conexões da pessoa: `io.in("usuario:7").disconnectSockets(true)`.
+
+## Namespaces
+
+Namespaces dividem o servidor em canais independentes sobre a mesma conexão física, cada um com seus middlewares, salas e eventos. Use para separar áreas com regras diferentes.
+
+```javascript
+const admin = io.of("/admin");
+
+admin.use(autenticarSocket);
+admin.use(async (socket, next) => {
+  const acesso = await permissoesDo(socket.data.usuario.id);
+  return acesso?.permissoes.has("admin:painel") ? next() : next(new Error("sem_permissao"));
+});
+
+admin.on("connection", (socket) => {
+  socket.on("metricas", async (responder) => {
+    responder({ conectados: io.engine.clientsCount });
+  });
+});
+```
+
+```javascript
+// cliente
+const painel = io("https://api.exemplo.com/admin", { auth: (cb) => cb({ token: pegarToken() }) });
+```
+
+Middlewares registrados com `io.use` valem só para o namespace principal (`/`). Cada namespace precisa dos seus.
+
+## Reconexão sem perder eventos
+
+Quando a rede cai por alguns segundos, o cliente reconecta sozinho, mas os eventos emitidos nesse intervalo se perdem. O recurso **connection state recovery** guarda por um tempo os pacotes e as salas da conexão e os entrega na volta:
+
+```javascript
+const io = new Server(httpServer, {
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000,
+    skipMiddlewares: true,
+  },
+});
+
+io.on("connection", (socket) => {
+  if (socket.recovered) {
+    // id, salas e socket.data foram restaurados, e os eventos perdidos reenviados
+    return;
+  }
+  // conexão nova (ou recuperação falhou): carregue o estado do zero
+});
+```
+
+Isso cobre quedas curtas. Para garantia de verdade, o dado continua no banco: o cliente pede ao reconectar "mensagens depois do id X", como fez com o histórico no capítulo anterior. Não trate o socket como fonte da verdade.
+
+`skipMiddlewares: true` pula os middlewares na recuperação. Considere deixar `false` se o token puder ter expirado durante a queda.
+
+## Escalando para várias instâncias
+
+Com uma instância, `io.to("sala").emit` alcança todos. Com três atrás de um balanceador, cada instância só conhece os próprios sockets: a mensagem emitida na instância A não chega a quem está conectado em B.
+
+O **adapter** resolve: cada instância publica os eventos de sala num canal compartilhado, e as outras repassam aos seus sockets. Com Redis:
+
+```bash
+npm install @socket.io/redis-adapter redis
+```
+
+```javascript
+import { createClient } from "redis";
+import { createAdapter } from "@socket.io/redis-adapter";
+
+const pub = createClient({ url: process.env.REDIS_URL });
+const sub = pub.duplicate();
+await Promise.all([pub.connect(), sub.connect()]);
+
+const io = new Server(httpServer, { adapter: createAdapter(pub, sub) });
+```
+
+Como o histórico deste chat já está no MongoDB, também existe `@socket.io/mongo-adapter`, que usa uma coleção limitada (capped) como canal. Redis é a escolha mais comum e de menor latência.
+
+O segundo requisito são **sticky sessions**: se o transporte de long polling estiver ativo, as várias requisições HTTP de uma mesma conexão precisam ir para a mesma instância. No Nginx, `ip_hash`; no AWS ALB, ative stickiness no target group. Se todos os seus clientes suportam WebSocket, `transports: ["websocket"]` no cliente elimina o polling e a necessidade de sticky sessions, ao custo de perder o fallback.
+
+Com várias instâncias, `fetchSockets()` e `disconnectSockets()` funcionam entre servidores (o adapter consulta os outros), e `io.serverSideEmit` permite que instâncias conversem entre si.
+
+## Limitando abuso
+
+Um cliente autenticado ainda pode inundar o servidor. Um limitador simples por socket:
+
+```javascript
+io.on("connection", (socket) => {
+  let tokens = 10;
+  const recarga = setInterval(() => (tokens = Math.min(10, tokens + 2)), 1000);
+
+  socket.use((pacote, next) => {
+    if (tokens <= 0) return next(new Error("muitas_mensagens"));
+    tokens -= 1;
+    next();
+  });
+
+  socket.on("disconnect", () => clearInterval(recarga));
+});
+```
+
+Com várias instâncias, o contador vai para o Redis. Combine com `maxHttpBufferSize` baixo e validação de cada evento.
+
+## Testando
+
+Com `socket.io-client` dá para testar o fluxo inteiro sem navegador:
+
+```javascript
+import { describe, it, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { io as cliente } from "socket.io-client";
+import { criarSocket } from "../src/socket/index.js";
+import { emitirToken } from "../src/seguranca/tokens.js";
+
+describe("socket", () => {
+  let httpServer, url;
+
+  before(async () => {
+    httpServer = createServer();
+    criarSocket(httpServer);
+    await new Promise((ok) => httpServer.listen(0, ok));
+    url = `http://localhost:${httpServer.address().port}`;
+  });
+
+  after(() => httpServer.close());
+
+  it("recusa conexão sem token", async () => {
+    const c = cliente(url, { reconnection: false });
+    const erro = await new Promise((ok) => c.on("connect_error", ok));
+    assert.equal(erro.message, "nao_autenticado");
+    c.close();
+  });
+
+  it("aceita conexão com token válido", async () => {
+    const c = cliente(url, { auth: { token: emitirToken({ id: 1, papel: "leitor" }) }, reconnection: false });
+    await new Promise((ok, falha) => { c.on("connect", ok); c.on("connect_error", falha); });
+    assert.ok(c.connected);
+    c.close();
+  });
+});
+```
+
+O segundo teste depende de existir um usuário ativo com id 1 no banco de teste. Prepare-o num `before`, como nos testes de API.
+
+## Na entrevista
+
+**Como autenticar conexões WebSocket?** No handshake: o cliente envia o token (no campo `auth` do Socket.IO ou em cookie) e um middleware de conexão valida antes de aceitar. Evita-se a query string porque aparece em logs. Depois, cada evento ainda passa por autorização.
+
+**O que acontece quando o token expira com a conexão aberta?** Nada, a menos que você trate. O servidor pode agendar a desconexão para o horário de expiração, forçando reconexão com token novo, ou aceitar a renovação por um evento.
+
+**Como escalar Socket.IO horizontalmente?** Com um adapter (Redis, por exemplo) que propaga emissões de sala entre instâncias, e sticky sessions no balanceador quando o long polling estiver habilitado.
+
+**Para que servem namespaces e salas?** Namespaces separam canais com middlewares e eventos próprios, como uma área de administração. Salas agrupam sockets dentro de um namespace para emitir a um subconjunto, como uma conversa ou um usuário.
+
+## Pratique
+
+Evolua o chat do capítulo anterior e entregue:
+
+1. Autenticação no handshake com o JWT da API de livros, `connect_error` tratado no cliente com renovação de token.
+2. Sala `usuario:ID` e uma rota REST que notifica o usuário em todas as abas.
+3. Salas privadas com checagem de participação e `socket.use` para eventos de moderação.
+4. Desconexão na expiração do token e connection state recovery habilitado.
+5. Duas instâncias da API atrás de um Nginx com Redis adapter, num `compose.yaml`, provando que uma mensagem enviada pela instância A chega a um cliente conectado na B.
+
+<Quiz question="Onde o cliente Socket.IO deve enviar o token de acesso?" options={["Na query string da URL","No campo auth do handshake","Em um evento login após conectar","No nome do namespace"]} answer={1} explanation="O campo auth vai no pacote de handshake e é validado pelo middleware antes da conexão. A query string acaba registrada em logs." />
+
+<Quiz question="Com três instâncias, uma mensagem para a sala não chega a todos. O que falta?" options={["Aumentar o maxHttpBufferSize","Um adapter como o Redis adapter","Usar namespaces diferentes","Habilitar connection state recovery"]} answer={1} explanation="Cada instância só conhece seus sockets. O adapter propaga as emissões entre instâncias por um canal compartilhado." />
+
+<Quiz question="O servidor chamou socket.disconnect(true). O que o cliente faz por padrão?" options={["Reconecta imediatamente","Reconecta após o token expirar","Não reconecta sozinho","Troca para long polling"]} answer={2} explanation="Desconexão iniciada pelo servidor tem o motivo io server disconnect, e o cliente não tenta reconectar automaticamente. É preciso chamar socket.connect." />
+
+## Base no CodeForge
+
+- [WebSockets: Implemente comunicações em tempo real com Socket.IO e MongoDB](/learn/carreira-nodejs/websockets-implemente-comunicacoes-tempo-real-socketio-mongodb): o chat que este capítulo evolui.
+- [Node.js: Criando API Rest com autenticação, perfis de usuários e permissões](/learn/carreira-nodejs/nodejs-criando-api-rest-autenticacao-perfis-usuarios): tokens e permissões reaproveitados.
+- [Presença online](/learn/system-design-interviews/presenca-online) e [Atualizações em tempo real](/learn/system-design-interviews/atualizacoes-em-tempo-real): os mesmos problemas em escala.
+- [Pub/Sub](/learn/system-design/pub-sub): o mecanismo por trás do adapter.
+
+## Referências
+
+- [Socket.IO: Middlewares](https://socket.io/docs/v4/middlewares/)
+- [Socket.IO: Namespaces](https://socket.io/docs/v4/namespaces/)
+- [Socket.IO: Connection state recovery](https://socket.io/docs/v4/connection-state-recovery)
+- [Socket.IO: Redis adapter](https://socket.io/docs/v4/redis-adapter/)

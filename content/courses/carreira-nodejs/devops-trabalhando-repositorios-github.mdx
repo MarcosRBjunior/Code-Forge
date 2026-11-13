@@ -1,0 +1,255 @@
+---
+title: "DevOps: Trabalhando com repositórios no GitHub"
+kind: lesson
+---
+
+Um repositório não é só um lugar para guardar código. Numa equipe, ele é onde as regras do processo moram: quem pode mexer na `main`, o que precisa passar antes de um merge, quem revisa cada parte do código e como dependências são atualizadas. Quando essas regras estão no repositório, e não na memória das pessoas, o processo funciona igual às três da tarde e às duas da manhã. É isso que o "DevOps" do título significa aqui: tratar o fluxo de entrega como código.
+
+**Você vai aprender:**
+
+- Como estruturar um repositório Node.js que qualquer pessoa consegue clonar e rodar
+- Como proteger a `main` com rulesets: PR obrigatório, revisão e checks verdes
+- Como usar CODEOWNERS, templates de PR e issue forms para padronizar a colaboração
+- Como montar um CI mínimo no GitHub Actions e manter dependências em dia com o Dependabot
+- Como operar tudo isso pelo terminal com o GitHub CLI
+
+## A estrutura de um repositório saudável
+
+O fio condutor desta aula é uma API de livros em Node.js. Antes de qualquer automação, o repositório precisa explicar a si mesmo. A estrutura mínima:
+
+```text
+api-livros/
+├── .github/
+│   ├── workflows/ci.yml
+│   ├── ISSUE_TEMPLATE/bug.yml
+│   ├── pull_request_template.md
+│   ├── dependabot.yml
+│   └── CODEOWNERS
+├── src/
+├── test/
+├── .editorconfig
+├── .gitignore
+├── .nvmrc
+├── .env.example
+├── LICENSE
+├── package.json
+└── README.md
+```
+
+Cada arquivo tem um motivo. O `.nvmrc` fixa a versão do Node (`22`), e o `package.json` repete isso em `engines`. O `.env.example` lista as variáveis que a aplicação lê, sem valores reais. O `README.md` responde em poucos minutos: o que é, como rodar, como testar, como fazer deploy.
+
+```json
+{
+  "name": "api-livros",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "lint": "eslint ."
+  }
+}
+```
+
+Os scripts são o contrato do repositório. O CI vai chamar exatamente `npm run lint` e `npm test`, então quem roda isso localmente vê o mesmo resultado que o pipeline.
+
+## Protegendo a main com rulesets
+
+Sem proteção, qualquer pessoa com acesso de escrita pode dar `push --force` na `main` e apagar o histórico. Rulesets (o sucessor das antigas regras de proteção de branch) definem o que é permitido numa branch ou num padrão de branches. Você configura em **Settings > Rules > Rulesets**. Para a `main` de uma API, as regras usuais são:
+
+| Regra | Efeito |
+|---|---|
+| Restrict deletions | ninguém apaga a `main` |
+| Block force pushes | o histórico só cresce |
+| Require a pull request before merging | todo código entra por PR |
+| Required approvals: 1 | pelo menos uma revisão aprovada |
+| Require review from Code Owners | o dono da área precisa aprovar |
+| Require status checks to pass | o job de CI precisa estar verde |
+| Require linear history | só squash ou rebase merge, sem commits de merge |
+
+Os rulesets podem ser exportados e importados em JSON, o que permite repetir a mesma configuração em vários repositórios. Também podem ter uma lista de bypass (por exemplo, administradores em emergências), e o GitHub registra quem usou.
+
+Uma decisão que vale tomar cedo é o tipo de merge. **Squash merge** transforma o PR inteiro num commit na `main`, com o título do PR como mensagem. Isso deixa a `main` com um commit por mudança, fácil de reverter. Em **Settings > General > Pull Requests**, deixe só o squash habilitado e marque "Automatically delete head branches" para apagar a branch depois do merge.
+
+<Callout type="warning" title="Check obrigatório com nome errado trava todos os PRs">
+O status check exigido no ruleset é identificado pelo nome do job no workflow. Se você renomear o job de `test` para `testes` e esquecer de atualizar o ruleset, todo PR fica esperando um check que nunca vai rodar. Escolha nomes estáveis para os jobs e atualize o ruleset na mesma mudança que os renomeia.
+</Callout>
+
+## CODEOWNERS: quem revisa o quê
+
+O arquivo `.github/CODEOWNERS` liga caminhos a pessoas ou times. Quando um PR toca esses caminhos, o GitHub pede revisão automaticamente. Combinado com a regra "Require review from Code Owners", o dono passa a ser obrigatório.
+
+```text
+# A última regra que casa com o caminho vence.
+*                       @org/backend
+/src/auth/              @org/seguranca
+/.github/workflows/     @org/plataforma
+/migrations/            @org/backend @ana-dba
+```
+
+A ordem importa: o GitHub usa a **última** linha que casa com o arquivo, não a primeira. Por isso a regra genérica fica no topo e as específicas embaixo. Proteja também o próprio `CODEOWNERS` e a pasta de workflows; senão, um PR pode trocar o dono e se aprovar.
+
+## Templates: PRs e issues que se explicam
+
+Um template de PR transforma a descrição em checklist. Ele mora em `.github/pull_request_template.md` e aparece pré-preenchido em todo PR novo.
+
+```markdown
+## O que muda
+
+## Por que
+
+## Como testar
+- [ ] `npm test` passa localmente
+- [ ] Testei o endpoint com o `curl` abaixo
+
+## Checklist
+- [ ] Migração de banco é reversível (se houver)
+- [ ] Variáveis novas estão no `.env.example`
+```
+
+Para issues, os issue forms em YAML são melhores que templates em Markdown, porque têm campos obrigatórios:
+
+```yaml
+# .github/ISSUE_TEMPLATE/bug.yml
+name: Bug
+description: Algo não funciona como deveria
+labels: ["bug"]
+body:
+  - type: textarea
+    id: passos
+    attributes:
+      label: Passos para reproduzir
+    validations:
+      required: true
+  - type: input
+    id: versao
+    attributes:
+      label: Versão da API (tag ou commit)
+    validations:
+      required: true
+```
+
+## CI mínimo com GitHub Actions
+
+O ruleset exige um check verde. Esse check vem de um workflow:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+```
+
+Três detalhes fazem diferença. `npm ci` instala exatamente o que está no `package-lock.json` e falha se ele estiver dessincronizado. `permissions: contents: read` reduz o que o token do workflow pode fazer, seguindo o princípio do menor privilégio. `concurrency` cancela a execução anterior quando você envia outro commit para o mesmo PR, economizando minutos.
+
+O nome do job (`test`) é o que você seleciona como status check obrigatório no ruleset.
+
+## Segredos e ambientes
+
+Tokens e senhas nunca vão para o repositório. Eles ficam em **Settings > Secrets and variables > Actions** e são lidos no workflow com a sintaxe `secrets.NOME`. O GitHub mascara os valores nos logs.
+
+Para deploy, use **Environments** (`staging`, `production`). Cada ambiente tem os próprios segredos e pode exigir aprovação manual de alguém antes de o job rodar. Um job declara o ambiente com `environment: production`, e só então tem acesso aos segredos dele.
+
+Ative também, em **Settings > Code security**, o secret scanning com push protection. Ele bloqueia o push quando detecta um padrão conhecido de chave (AWS, Stripe, tokens do GitHub e outros) antes de o segredo chegar ao remoto.
+
+## Dependabot: dependências em dia sem esforço
+
+Uma API Node.js tem centenas de dependências transitivas. O Dependabot abre PRs de atualização e, com os alertas de segurança ativados, avisa quando uma versão instalada tem vulnerabilidade conhecida.
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      dev-dependencies:
+        dependency-type: development
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+```
+
+`groups` junta várias atualizações num PR só, o que evita a enxurrada de vinte PRs na segunda-feira. O segundo bloco mantém as próprias actions atualizadas. Como cada PR do Dependabot passa pelo CI, você só faz merge do que continua verde.
+
+## Operando pelo terminal com o GitHub CLI
+
+O `gh` faz pelo terminal o que você faria na interface. Depois de `gh auth login`:
+
+```bash
+gh repo create api-livros --private --source=. --push
+gh issue create --title "Paginação na listagem" --label enhancement
+gh pr create --fill --base main          # usa título e corpo dos commits
+gh pr checks --watch                     # acompanha o CI
+gh pr merge --squash --delete-branch
+gh run list --workflow=ci.yml --limit 5
+gh release create v1.0.0 --generate-notes
+```
+
+`gh release create --generate-notes` monta as notas da versão a partir dos PRs mergeados desde a última tag. Com Conventional Commits nos títulos dos PRs, essas notas já saem organizadas.
+
+## Na entrevista
+
+**Como você impede que código quebrado chegue à main?** Ruleset na `main` exigindo PR, pelo menos uma aprovação e status check de CI verde, com force push bloqueado.
+
+**Para que serve o CODEOWNERS?** Para atribuir revisores automaticamente por caminho e, com a regra correspondente, exigir aprovação do dono daquela área. A última regra que casa vence.
+
+**Onde ficam as credenciais usadas no deploy?** Em secrets do repositório ou, melhor, de um environment com aprovação obrigatória. Nunca no código, e o token do workflow deve ter só as permissões necessárias.
+
+**Por que usar `npm ci` no pipeline em vez de `npm install`?** Porque instala exatamente o lockfile, falha se houver divergência e é reproduzível.
+
+## Pratique
+
+Pegue a API de livros (ou qualquer projeto Node.js seu) e configure o repositório completo:
+
+1. Arquivos de base: `README` com como rodar e testar, `.nvmrc`, `.env.example`, `LICENSE`.
+2. Workflow de CI com lint e testes, rodando em PR e na `main`.
+3. Ruleset na `main`: PR obrigatório, 1 aprovação, check `test` obrigatório, force push bloqueado.
+4. `CODEOWNERS`, template de PR e um issue form de bug.
+5. `dependabot.yml` para npm e para actions.
+
+Para provar que funciona, abra um PR com um teste quebrando de propósito e tire um print do merge bloqueado. Depois corrija, faça o squash merge com `gh pr merge` e publique uma release com notas geradas.
+
+<Quiz question="No CODEOWNERS, duas linhas casam com o arquivo src/auth/login.js. Qual vale?" options={["A primeira linha do arquivo","A última linha que casa","A linha mais específica, onde quer que esteja","As duas, somando os donos"]} answer={1} explanation="O GitHub usa a última regra que casa com o caminho, por isso regras genéricas ficam no topo e específicas embaixo." />
+<Quiz question="Por que declarar permissions: contents: read no workflow de CI?" options={["Para o checkout funcionar mais rápido","Para limitar o token do workflow ao mínimo necessário","Para liberar acesso aos secrets","Para ativar o cache do npm"]} answer={1} explanation="É o princípio do menor privilégio: se um passo for comprometido, o token não consegue escrever no repositório." />
+<Quiz question="Um PR fica esperando um status check obrigatório que nunca roda. Qual a causa mais provável?" options={["O Dependabot está desativado","O job foi renomeado e o ruleset ainda exige o nome antigo","O repositório é privado","Falta o template de PR"]} answer={1} explanation="O check obrigatório é identificado pelo nome do job. Renomear o job sem atualizar o ruleset deixa o PR esperando para sempre." />
+
+## Base no CodeForge
+
+- [Git e GitHub: Dominando controle de versão de código](/learn/carreira-nodejs/git-github-dominando-controle-versao-codigo): o modelo de commits e branches que estas regras protegem.
+- [Integração Contínua: Pipelines e testes automatizados com GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipelines-testes-automatizados-github-actions): o CI deste capítulo levado adiante.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos) e [CI/CD](/learn/system-design/ci-cd): a teoria por trás de secrets, ambientes e pipelines.
+- [GitHub Action customizável](/learn/projetos-portfolio/github-action): construa sua própria action.
+
+## Referências
+
+- [About rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)
+- [About code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
+- [Dependabot options reference](https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference)
+- [Manual do GitHub CLI](https://cli.github.com/manual/)

@@ -1,0 +1,264 @@
+---
+title: "Amazon ECS: Gerenciando Docker na nuvem da AWS"
+kind: lesson
+---
+
+Rodar um container na sua máquina é `docker run`. Rodar dez containers em produção exige mais: reiniciar os que caem, distribuir entre zonas, registrar no balanceador, trocar a versão sem derrubar nada e escalar com a carga. O Amazon ECS é o orquestrador de containers da AWS que faz esse trabalho, e com o Fargate você nem gerencia as máquinas por baixo. Para uma API Node.js já empacotada em Docker, é o caminho mais curto do `Dockerfile` à produção.
+
+**Você vai aprender:**
+
+- Os conceitos do ECS: cluster, task definition, tarefa e serviço
+- Como publicar a imagem no ECR
+- Como escrever uma task definition com logs, segredos e health check
+- Como criar um serviço Fargate atrás de um ALB, com rollback automático
+- Como escalar o serviço e entrar num container em execução
+
+## Os conceitos
+
+| Conceito | O que é | Analogia com Docker |
+|---|---|---|
+| Cluster | Agrupamento lógico onde as tarefas rodam | O host (ou conjunto de hosts) |
+| Task definition | Modelo versionado: imagem, CPU, memória, portas, variáveis, logs | Um `docker-compose.yml` de um serviço |
+| Tarefa (task) | Uma instância em execução da task definition | Um `docker run` |
+| Serviço | Mantém N tarefas rodando, integra com ALB e faz deploys | O que reinicia e escala os containers |
+
+Sobre **onde** as tarefas rodam, existem dois modos:
+
+- **Fargate:** a AWS fornece a capacidade. Você declara CPU e memória da tarefa e paga por isso, sem ver instâncias. É o padrão para APIs.
+- **EC2:** as tarefas rodam em instâncias suas, registradas no cluster. Dá mais controle (GPU, tipos específicos, densidade) e pode sair mais barato em escala, mas você volta a cuidar de AMI, patches e capacidade.
+
+## Imagem pronta para produção
+
+Uma imagem de produção para Node.js deve ser pequena, rodar como usuário sem privilégios e não carregar dependências de desenvolvimento.
+
+```dockerfile
+# Dockerfile
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY src ./src
+COPY package.json ./
+USER node
+EXPOSE 3000
+CMD ["node", "src/server.js"]
+```
+
+Repare no `CMD` em forma de array chamando `node` direto. Se você usar `npm start`, o `SIGTERM` que o ECS envia ao parar a tarefa pode não chegar ao processo Node, e o container é morto à força depois do timeout.
+
+## Publicando no ECR
+
+O **Elastic Container Registry** (ECR) é o registro de imagens privado da AWS. O ECS puxa dele usando o papel IAM da tarefa, sem senha.
+
+```bash
+REGIAO=us-east-1
+CONTA=$(aws sts get-caller-identity --query Account --output text)
+REGISTRO="$CONTA.dkr.ecr.$REGIAO.amazonaws.com"
+
+aws ecr create-repository --repository-name livros-api \
+  --image-scanning-configuration scanOnPush=true
+
+aws ecr get-login-password --region "$REGIAO" \
+  | docker login --username AWS --password-stdin "$REGISTRO"
+
+VERSAO=$(git rev-parse --short HEAD)
+docker buildx build --platform linux/amd64 -t "$REGISTRO/livros-api:$VERSAO" --push .
+```
+
+Use como tag o hash do commit, não `latest`. Com tags imutáveis, cada task definition aponta para exatamente uma imagem, e o rollback é só voltar para a revisão anterior.
+
+## A task definition
+
+A task definition é um JSON que você registra e que ganha um número de revisão a cada mudança (`livros-api:1`, `livros-api:2`).
+
+```json
+{
+  "family": "livros-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "runtimePlatform": { "cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX" },
+  "executionRoleArn": "arn:aws:iam::123456789012:role/livros-execution",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/livros-task",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/livros-api:a1b2c3d",
+      "essential": true,
+      "portMappings": [{ "containerPort": 3000, "protocol": "tcp" }],
+      "environment": [{ "name": "PORT", "value": "3000" }],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:livros/db-AbCdEf"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/livros-api",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "api",
+          "awslogs-create-group": "true"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      },
+      "stopTimeout": 30
+    }
+  ]
+}
+```
+
+Os dois papéis IAM confundem no começo, e a diferença importa:
+
+- **Execution role:** usado pelo **agente do ECS** para preparar a tarefa: puxar a imagem do ECR, criar o grupo de logs, ler os segredos listados em `secrets`. A aplicação nunca usa esse papel.
+- **Task role:** usado pela **sua aplicação** quando ela chama a AWS pelo SDK (gravar no S3, ler do DynamoDB). O SDK v3 encontra essas credenciais sozinho, sem nenhuma configuração no código.
+
+Os valores em `secrets` chegam ao container como variáveis de ambiente comuns. A aplicação lê `process.env.DATABASE_URL` normalmente, e o segredo nunca aparece no JSON nem no console.
+
+```bash
+aws ecs register-task-definition --cli-input-json file://taskdef.json
+```
+
+## O serviço Fargate atrás do ALB
+
+Com `awsvpc`, cada tarefa recebe sua própria interface de rede e IP privado, com security group próprio. Por isso o target group precisa ser do tipo `ip`, não `instance`.
+
+```bash
+aws ecs create-cluster --cluster-name livros
+
+TG_ARN=$(aws elbv2 create-target-group --name livros-ecs-tg \
+  --protocol HTTP --port 3000 --target-type ip \
+  --vpc-id vpc-0abc0000000000000 --health-check-path /health \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+# (o listener do ALB passa a encaminhar para este target group)
+
+aws ecs create-service --cluster livros --service-name livros-api \
+  --task-definition livros-api --desired-count 2 \
+  --launch-type FARGATE \
+  --network-configuration 'awsvpcConfiguration={subnets=[subnet-0privA00000000000,subnet-0privB00000000000],securityGroups=[sg-0app000000000000],assignPublicIp=DISABLED}' \
+  --load-balancers "targetGroupArn=$TG_ARN,containerName=api,containerPort=3000" \
+  --health-check-grace-period-seconds 30 \
+  --deployment-configuration 'deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100' \
+  --enable-execute-command
+```
+
+O que cada opção de deploy faz:
+
+- **`minimumHealthyPercent=100` e `maximumPercent=200`:** durante o deploy, o ECS sobe as tarefas novas **antes** de matar as antigas. Nunca há menos de 2 tarefas atendendo.
+- **Circuit breaker com rollback:** se as tarefas novas não conseguem ficar saudáveis (crash no boot, health check falhando), o ECS desiste e volta para a revisão anterior sozinho.
+
+As tarefas ficam em subnets privadas sem IP público. Para puxar a imagem do ECR, elas precisam de saída: um NAT Gateway ou VPC endpoints de interface para ECR e CloudWatch Logs, mais o gateway endpoint do S3 (as camadas da imagem ficam no S3).
+
+## Publicando uma versão nova
+
+O fluxo de deploy é: construir a imagem, registrar uma nova revisão da task definition apontando para ela e atualizar o serviço.
+
+```bash
+VERSAO=$(git rev-parse --short HEAD)
+docker buildx build --platform linux/amd64 -t "$REGISTRO/livros-api:$VERSAO" --push .
+
+jq --arg img "$REGISTRO/livros-api:$VERSAO" \
+  '.containerDefinitions[0].image = $img' taskdef.json > taskdef.novo.json
+REV=$(aws ecs register-task-definition --cli-input-json file://taskdef.novo.json \
+  --query 'taskDefinition.taskDefinitionArn' --output text)
+
+aws ecs update-service --cluster livros --service livros-api --task-definition "$REV"
+aws ecs wait services-stable --cluster livros --services livros-api
+```
+
+O `wait services-stable` bloqueia até o deploy terminar, o que é exatamente o que você quer num pipeline de CI: o job só passa se a versão nova ficou de pé.
+
+## Escalando o serviço
+
+A escala do ECS usa o **Application Auto Scaling**. Você registra o serviço como alvo escalável e cria uma política de target tracking.
+
+```bash
+aws application-autoscaling register-scalable-target \
+  --service-namespace ecs \
+  --resource-id service/livros/livros-api \
+  --scalable-dimension ecs:service:DesiredCount \
+  --min-capacity 2 --max-capacity 10
+
+aws application-autoscaling put-scaling-policy \
+  --service-namespace ecs \
+  --resource-id service/livros/livros-api \
+  --scalable-dimension ecs:service:DesiredCount \
+  --policy-name cpu-60 --policy-type TargetTrackingScaling \
+  --target-tracking-scaling-policy-configuration \
+  '{"TargetValue":60.0,"PredefinedMetricSpecification":{"PredefinedMetricType":"ECSServiceAverageCPUUtilization"},"ScaleInCooldown":120,"ScaleOutCooldown":60}'
+```
+
+Uma tarefa Fargate sobe em menos de um minuto, bem mais rápido que uma EC2 nova. Lembre-se só do banco: dez tarefas com pool de 10 conexões cada abrem 100 conexões no PostgreSQL. Dimensione o `max` do pool com a capacidade máxima em mente.
+
+## Depurando tarefas
+
+```bash
+# por que a tarefa parou?
+aws ecs describe-tasks --cluster livros --tasks <id-da-tarefa> \
+  --query 'tasks[0].[lastStatus,stoppedReason,containers[0].exitCode]'
+
+# logs da aplicação (CLI v2)
+aws logs tail /ecs/livros-api --follow
+
+# shell dentro do container (exige --enable-execute-command e permissões SSM no task role)
+aws ecs execute-command --cluster livros --task <id-da-tarefa> \
+  --container api --interactive --command "/bin/sh"
+```
+
+O `stoppedReason` responde a maioria dos mistérios: `CannotPullContainerError` (sem rota até o ECR ou execution role sem permissão), `ResourceInitializationError` (segredo inacessível), `Essential container in task exited` (a aplicação caiu, veja o exit code e os logs).
+
+<Callout type="warning" title="Imagem ARM numa tarefa x86">
+Quem desenvolve num Mac com Apple Silicon gera imagens `arm64` por padrão. Publicada numa tarefa Fargate `X86_64`, a tarefa morre na hora com `exec format error` nos logs. Construa com `--platform linux/amd64` ou, melhor, declare `ARM64` em `runtimePlatform` e use Fargate Graviton, que costuma ter melhor custo. O importante é que imagem e task definition concordem.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre task role e execution role?** A execution role é do agente do ECS (puxar imagem, gravar logs, ler segredos para injetar). A task role é da aplicação, usada pelo SDK nas chamadas à AWS.
+
+**Fargate ou EC2 como capacidade do ECS?** Fargate por padrão: sem servidores para manter e escala rápida. EC2 quando há necessidade específica (GPU, custo em grande escala com instâncias reservadas, daemon por host).
+
+**Como o ECS faz deploy sem downtime?** Com rolling update: sobe tarefas novas até o `maximumPercent`, espera ficarem saudáveis no target group, drena e remove as antigas, sem cair abaixo do `minimumHealthyPercent`. O circuit breaker faz rollback se as novas não ficarem saudáveis.
+
+**ECS ou EKS?** ECS é mais simples e integrado à AWS. EKS vale quando o time já usa Kubernetes, precisa do ecossistema dele ou quer portabilidade entre nuvens.
+
+## Pratique
+
+Publique a API de livros no ECS Fargate:
+
+1. Dockerfile multi-stage com usuário `node` e `CMD` direto no `node`.
+2. Repositório ECR com scan ativado.
+3. Task definition com `DATABASE_URL` vindo do Secrets Manager e logs no CloudWatch.
+4. Serviço com 2 tarefas atrás de um ALB, circuit breaker ligado e escala de 2 a 6 por CPU.
+5. Um script `deploy.sh` que constrói, publica, registra a revisão e espera o serviço estabilizar.
+
+Para provar o rollback, publique uma versão cujo `/health` sempre retorna 500 e mostre no README os eventos do serviço voltando para a revisão anterior.
+
+<Quiz question="Num serviço Fargate com awsvpc atrás de um ALB, qual o tipo correto do target group?" options={["instance","ip","lambda","alb"]} answer={1} explanation="Com awsvpc cada tarefa tem seu próprio IP. O target group precisa registrar IPs, por isso o tipo ip." />
+<Quiz question="A aplicação precisa gravar arquivos no S3. Onde vai a permissão?" options={["Na execution role","No security group da tarefa","Na task role","Na política do repositório ECR"]} answer={2} explanation="A task role é o papel que o SDK usa dentro do container. A execution role serve só ao agente do ECS." />
+<Quiz question="Para que serve o deployment circuit breaker com rollback?" options={["Voltar à revisão anterior se as tarefas novas não ficarem saudáveis","Bloquear deploys fora do horário comercial definido","Limitar o número de tarefas durante picos de tráfego","Impedir que o serviço escale acima do máximo"]} answer={0} explanation="Se as tarefas novas falham repetidamente, o circuit breaker interrompe o deploy e restaura a revisão estável." />
+
+## Base no CodeForge
+
+- [DevOps: Construindo e gerenciando containers com Docker](/learn/carreira-nodejs/devops-construindo-gerenciando-containers-docker): a base de imagens e containers.
+- [Amazon VPC: Configurando redes na AWS](/learn/carreira-nodejs/amazon-vpc-configurando-redes-aws): subnets privadas, NAT e endpoints que as tarefas usam.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy) e [Rolling](/learn/system-design/rolling): o que o ECS faz a cada update.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): por que segredos não vão no JSON.
+
+## Referências
+
+- [What is Amazon Elastic Container Service?](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html)
+- [Amazon ECS task definitions](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definitions.html)
+- [What is Amazon ECR?](https://docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html)

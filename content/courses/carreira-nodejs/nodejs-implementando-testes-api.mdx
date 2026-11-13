@@ -1,0 +1,356 @@
+---
+title: "Node.js: Implementando testes em uma API"
+kind: lesson
+---
+
+Sem testes, cada mudança na API é uma aposta: você corrige a paginação e quebra o cadastro sem perceber, e quem descobre é o usuário. Testes automatizados transformam "acho que funciona" em um comando que responde em segundos. Neste capítulo você testa a API de livros em três níveis (funções puras, serviços com dependências falsas e rotas HTTP com banco de verdade) usando o test runner nativo do Node.js e o Supertest, e vê como fazer o mesmo com Vitest.
+
+**Você vai aprender:**
+
+- Os tipos de teste e quanto de cada um escrever
+- Usar o `node:test` com `describe`, `it`, hooks e asserções
+- Testar rotas Express com Supertest e um banco SQLite em memória
+- Substituir dependências com mocks sem acoplar o teste à implementação
+- Medir cobertura e rodar tudo no CI
+
+## Tipos de teste
+
+| Tipo | O que exercita | Velocidade | Quando quebra, aponta para |
+|---|---|---|---|
+| Unitário | Uma função ou classe isolada | Milissegundos | A função exata |
+| Integração | Várias partes juntas: rota, controller, ORM, banco | Dezenas de ms | Um fluxo |
+| Ponta a ponta (E2E) | O sistema rodando como em produção | Segundos | "Algo no caminho" |
+
+A pirâmide de testes sugere muitos unitários, uma boa camada de integração e poucos E2E. Em APIs, a camada de integração costuma dar o melhor retorno: um teste que faz `POST /livros` e confere o banco cobre rota, validação, controller e modelo de uma vez, e ainda roda rápido com SQLite em memória.
+
+## Preparando a API para ser testada
+
+O passo mais importante acontece antes do primeiro teste: **separar o app do servidor**. O `app.js` monta e exporta o Express; o `server.js` conecta no banco e chama `listen`. O teste importa só o `app`, sem abrir porta.
+
+```javascript
+// src/app.js
+import express from "express";
+import { livrosRouter } from "./routes/livros.js";
+import { tratarErros } from "./middlewares/erros.js";
+
+export const app = express();
+app.use(express.json());
+app.use("/livros", livrosRouter);
+app.use(tratarErros);
+```
+
+```javascript
+// src/server.js
+import { app } from "./app.js";
+import { sequelize } from "./database/index.js";
+
+await sequelize.authenticate();
+app.listen(Number(process.env.PORT ?? 3000));
+```
+
+O banco também precisa ser configurável. No capítulo de Sequelize, a conexão já lê `DB_STORAGE` do ambiente; nos testes você aponta para `:memory:`.
+
+```json
+{
+  "scripts": {
+    "test": "NODE_ENV=test DB_STORAGE=:memory: node --test",
+    "test:watch": "NODE_ENV=test DB_STORAGE=:memory: node --test --watch",
+    "test:coverage": "NODE_ENV=test DB_STORAGE=:memory: node --test --experimental-test-coverage"
+  }
+}
+```
+
+No Windows sem Git Bash, use `cross-env` na frente das variáveis, ou um arquivo `.env.test` carregado com `node --env-file=.env.test --test`.
+
+Sem argumentos, `node --test` procura arquivos como `*.test.js`, `*.spec.js` e qualquer `.js` dentro de pastas `test`.
+
+## Testes unitários com node:test
+
+Comece pelo que é puro: entrada e saída, sem banco nem rede.
+
+```javascript
+// src/utils/paginacao.js
+export function calcularPaginacao({ pagina, limite }, maximo = 50) {
+  const p = Math.max(1, Number.parseInt(pagina, 10) || 1);
+  const l = Math.min(maximo, Math.max(1, Number.parseInt(limite, 10) || 10));
+  return { limite: l, offset: (p - 1) * l, pagina: p };
+}
+```
+
+```javascript
+// test/unit/paginacao.test.js
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { calcularPaginacao } from "../../src/utils/paginacao.js";
+
+describe("calcularPaginacao", () => {
+  it("usa página 1 e limite 10 por padrão", () => {
+    assert.deepEqual(calcularPaginacao({}), { limite: 10, offset: 0, pagina: 1 });
+  });
+
+  it("calcula o offset a partir da página", () => {
+    assert.equal(calcularPaginacao({ pagina: "3", limite: "20" }).offset, 40);
+  });
+
+  it("limita o tamanho máximo da página", () => {
+    assert.equal(calcularPaginacao({ limite: "9999" }).limite, 50);
+  });
+
+  it("trata valores inválidos como padrão", () => {
+    assert.deepEqual(calcularPaginacao({ pagina: "abc", limite: "-5" }), { limite: 1, offset: 0, pagina: 1 });
+  });
+});
+```
+
+Use sempre `node:assert/strict`: nele `equal` compara com `===` e `deepEqual` não aceita `1` igual a `"1"`. Para erros, `assert.throws(() => fn())` em código síncrono e `await assert.rejects(promessa, /mensagem/)` em assíncrono.
+
+Repare no último teste: ao escrevê-lo, você descobre que `limite: "-5"` vira `1`, não `10`. Talvez seja o comportamento desejado, talvez não. Testes forçam essas decisões a ficarem explícitas.
+
+## Testes de integração com Supertest
+
+O Supertest recebe o `app`, sobe um servidor efêmero numa porta aleatória e oferece uma API fluente para requisições.
+
+```bash
+npm install -D supertest
+```
+
+```javascript
+// test/integracao/livros.test.js
+import { describe, it, before, beforeEach, after } from "node:test";
+import assert from "node:assert/strict";
+import request from "supertest";
+import { app } from "../../src/app.js";
+import { sequelize } from "../../src/database/index.js";
+import { Autor, Livro } from "../../src/models/associacoes.js";
+
+describe("API /livros", () => {
+  let autor;
+
+  before(async () => {
+    await sequelize.sync({ force: true });
+  });
+
+  beforeEach(async () => {
+    await Livro.destroy({ where: {}, truncate: true });
+    await Autor.destroy({ where: {} });
+    autor = await Autor.create({ nome: "Machado de Assis" });
+  });
+
+  after(async () => {
+    await sequelize.close();
+  });
+
+  it("POST cria um livro e devolve 201", async () => {
+    const resposta = await request(app)
+      .post("/livros")
+      .send({ titulo: "Dom Casmurro", autorId: autor.id, preco: 39.9 })
+      .expect("Content-Type", /json/)
+      .expect(201);
+
+    assert.equal(resposta.body.titulo, "Dom Casmurro");
+    assert.ok(resposta.body.id);
+
+    const noBanco = await Livro.findByPk(resposta.body.id);
+    assert.equal(noBanco.titulo, "Dom Casmurro");
+  });
+
+  it("POST sem título devolve 400 com o campo inválido", async () => {
+    const resposta = await request(app).post("/livros").send({ autorId: autor.id, preco: 10 }).expect(400);
+    assert.ok(resposta.body.erros.some((e) => e.campo === "titulo"));
+  });
+
+  it("GET /livros/:id inexistente devolve 404", async () => {
+    await request(app).get("/livros/999").expect(404);
+  });
+
+  it("GET /livros pagina os resultados", async () => {
+    await Livro.bulkCreate(
+      Array.from({ length: 15 }, (_, i) => ({ titulo: `Livro ${i + 1}`, autorId: autor.id, preco: 10 })),
+    );
+
+    const resposta = await request(app).get("/livros?pagina=2&limite=10").expect(200);
+    assert.equal(resposta.body.dados.length, 5);
+    assert.equal(resposta.body.total, 15);
+  });
+});
+```
+
+Aqui o `sync({ force: true })` é aceitável: o banco existe só na memória deste processo de teste. Cada teste começa de um estado conhecido graças ao `beforeEach`, e nenhum depende da ordem dos outros.
+
+<Callout type="warning" title="Testes que dependem uns dos outros">
+O erro mais comum em testes de API é o estado vazar: o teste B só passa porque o teste A criou um registro antes. Rodado sozinho, ou em outra ordem, B falha, e ninguém entende o motivo. Cada teste deve preparar o que precisa e não contar com sobras. Limpe as tabelas no `beforeEach` (ou rode cada teste dentro de uma transação desfeita no final) e nunca aponte a suíte para o banco de desenvolvimento, muito menos o de produção.
+</Callout>
+
+### Isolamento entre arquivos
+
+O `node --test` roda cada arquivo de teste em um processo separado, em paralelo. Com SQLite em memória isso é ótimo, porque cada processo tem seu próprio banco. Com um PostgreSQL compartilhado, dois arquivos limpando a mesma tabela ao mesmo tempo causam falhas aleatórias. Nesse caso, use um banco por arquivo (por exemplo, um schema com o id do processo) ou rode em série com `--test-concurrency=1`.
+
+## Mocks: substituindo dependências
+
+Nem toda dependência deve ser real no teste. Envio de e-mail, gateway de pagamento e APIs externas são lentos, custam dinheiro ou não existem no CI. O `node:test` traz `mock` para isso.
+
+Considere um serviço que avisa o leitor quando um empréstimo é criado:
+
+```javascript
+// src/services/EmprestimoService.js
+export class EmprestimoService {
+  constructor({ repositorio, notificador }) {
+    this.repositorio = repositorio;
+    this.notificador = notificador;
+  }
+
+  async emprestar({ livroId, leitor }) {
+    const emprestimo = await this.repositorio.criar({ livroId, leitorId: leitor.id });
+    await this.notificador.enviar(leitor.email, `Empréstimo ${emprestimo.id} confirmado`);
+    return emprestimo;
+  }
+}
+```
+
+Como as dependências chegam pelo construtor, o teste passa versões falsas:
+
+```javascript
+// test/unit/emprestimo-service.test.js
+import { it, mock } from "node:test";
+import assert from "node:assert/strict";
+import { EmprestimoService } from "../../src/services/EmprestimoService.js";
+
+it("cria o empréstimo e notifica o leitor", async () => {
+  const repositorio = { criar: mock.fn(async (dados) => ({ id: 42, ...dados })) };
+  const notificador = { enviar: mock.fn(async () => {}) };
+  const servico = new EmprestimoService({ repositorio, notificador });
+
+  const resultado = await servico.emprestar({ livroId: 1, leitor: { id: 7, email: "ana@exemplo.com" } });
+
+  assert.equal(resultado.id, 42);
+  assert.equal(notificador.enviar.mock.callCount(), 1);
+  assert.deepEqual(notificador.enviar.mock.calls[0].arguments, ["ana@exemplo.com", "Empréstimo 42 confirmado"]);
+});
+
+it("não notifica se a gravação falhar", async () => {
+  const repositorio = { criar: mock.fn(async () => { throw new Error("banco fora"); }) };
+  const notificador = { enviar: mock.fn() };
+  const servico = new EmprestimoService({ repositorio, notificador });
+
+  await assert.rejects(servico.emprestar({ livroId: 1, leitor: { id: 7 } }), /banco fora/);
+  assert.equal(notificador.enviar.mock.callCount(), 0);
+});
+```
+
+Para um objeto que você não controla, `mock.method(objeto, "nome", implementacao)` substitui o método e `mock.restoreAll()` devolve o original. Para tempo, `mock.timers.enable({ apis: ["Date", "setTimeout"] })` permite avançar o relógio com `mock.timers.tick(ms)`.
+
+Mocke as **fronteiras** (rede, e-mail, relógio), não cada classe interna. Teste que verifica "o controller chamou o service com tais argumentos" quebra a cada refatoração sem pegar bug nenhum.
+
+## Requisições externas com fetch
+
+Se o código chama uma API externa com `fetch`, substitua o `fetch` global no teste:
+
+```javascript
+import { it, mock, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import { buscarCapa } from "../../src/services/capas.js";
+
+afterEach(() => mock.restoreAll());
+
+it("devolve null quando a API de capas responde 404", async () => {
+  mock.method(globalThis, "fetch", async () => new Response(null, { status: 404 }));
+  assert.equal(await buscarCapa("9788535914849"), null);
+});
+```
+
+## Cobertura
+
+```bash
+npm run test:coverage
+```
+
+O Node imprime, por arquivo, a porcentagem de linhas, ramos e funções executadas. Cobertura mostra o que **não** foi testado; ela não prova que o que foi executado está correto. Um alvo como 80% de linhas é razoável como piso, mas olhe principalmente os ramos de erro: é ali que os bugs de API moram.
+
+## O mesmo com Vitest
+
+Vitest (e Jest) tem API parecida, com `expect` no lugar de `assert`, modo watch interativo e mocks de módulo. Se o projeto já usa Vite ou TypeScript sem compilação, ele é uma boa escolha.
+
+```javascript
+// test/integracao/livros.test.js (versão Vitest)
+import { describe, it, expect, beforeAll } from "vitest";
+import request from "supertest";
+import { app } from "../../src/app.js";
+import { sequelize } from "../../src/database/index.js";
+
+beforeAll(() => sequelize.sync({ force: true }));
+
+describe("API /livros", () => {
+  it("GET /livros/:id inexistente devolve 404", async () => {
+    const resposta = await request(app).get("/livros/999");
+    expect(resposta.status).toBe(404);
+    expect(resposta.body).toMatchObject({ erro: expect.any(String) });
+  });
+});
+```
+
+```bash
+npm install -D vitest
+npx vitest run --coverage
+```
+
+A escolha entre `node:test` e Vitest importa menos que ter os testes. O nativo não adiciona dependência; o Vitest tem ergonomia melhor e mocks de módulo mais simples.
+
+## No CI
+
+Um workflow mínimo do GitHub Actions que roda os testes em todo pull request:
+
+```yaml
+# .github/workflows/testes.yml
+name: Testes
+on: [push, pull_request]
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+```
+
+## Na entrevista
+
+**Qual a diferença entre teste unitário e de integração?** O unitário isola uma unidade, substituindo dependências. O de integração exercita várias partes reais juntas, como rota, ORM e banco. Unitário é mais rápido e preciso no diagnóstico; integração dá mais confiança de que o conjunto funciona.
+
+**Mock, stub e spy?** Stub devolve uma resposta pronta. Spy registra como foi chamado. Mock combina os dois e permite verificar as chamadas. No `node:test`, `mock.fn` faz as três coisas.
+
+**Como você testa uma rota que grava no banco?** Separo app de servidor, uso um banco isolado (SQLite em memória ou um container só para testes), limpo o estado antes de cada teste e verifico tanto a resposta HTTP quanto o que ficou gravado.
+
+**100% de cobertura garante ausência de bugs?** Não. Cobertura mede o que executou, não se as asserções são boas. Um teste sem `assert` também conta como coberto.
+
+## Pratique
+
+Na API de livros, entregue:
+
+1. Separação entre `app.js` e `server.js`, e scripts `test`, `test:watch` e `test:coverage`.
+2. Testes unitários para paginação e para o serviço de empréstimo, com o notificador mockado.
+3. Testes de integração com Supertest para todo o CRUD de livros, incluindo 400, 404 e 409.
+4. Um teste de transação: emprestar o último exemplar duas vezes e verificar que a segunda falha e o estoque fica zero.
+5. Cobertura acima de 80% de linhas e o workflow de CI rodando no GitHub.
+
+<Quiz question="Por que separar app.js de server.js?" options={["Para o servidor iniciar mais rápido","Para o teste importar o Express sem abrir porta nem conectar","Porque o Express 5 exige","Para usar dois bancos diferentes"]} answer={1} explanation="O app exportado pode ser passado ao Supertest, que cria um servidor efêmero. O server.js com listen fica fora dos testes." />
+
+<Quiz question="Um teste só passa quando roda depois de outro. Qual a causa mais provável?" options={["O test runner está desatualizado","Estado compartilhado que não é limpo entre testes","Falta de mocks no fetch","Cobertura abaixo do mínimo"]} answer={1} explanation="Dependência de ordem indica estado vazando, como registros criados por um teste e usados por outro. Cada teste deve preparar e limpar o próprio estado." />
+
+<Quiz question="O que deve ser mockado em testes de uma API?" options={["Todas as classes internas","Só o banco de dados","As fronteiras externas como rede, e-mail e relógio","Nada, mocks escondem bugs"]} answer={2} explanation="Mockar fronteiras deixa o teste rápido e determinístico. Mockar cada classe interna acopla o teste à implementação e quebra a cada refatoração." />
+
+## Base no CodeForge
+
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia): o que torna o serviço testável com dependências falsas.
+- [CI/CD](/learn/system-design/ci-cd): onde os testes entram no caminho até produção.
+- [ORM com Node.js: Desenvolvendo uma API com Sequelize e SQLite](/learn/carreira-nodejs/orm-nodejs-desenvolvendo-api-sequelize-sqlite): a API testada aqui.
+- [Integração Contínua: Pipelines e testes automatizados com GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipelines-testes-automatizados-github-actions): o pipeline completo.
+
+## Referências
+
+- [Node.js: Test runner](https://nodejs.org/api/test.html)
+- [Supertest](https://github.com/ladjs/supertest)
+- [Vitest: Getting Started](https://vitest.dev/guide/)

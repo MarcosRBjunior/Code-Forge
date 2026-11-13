@@ -1,0 +1,360 @@
+---
+title: "Node.js: Criando uma API Rest com Express e MongoDB"
+kind: lesson
+---
+
+Uma API é a porta de entrada do seu back-end: o front-end, o app de celular e outros serviços conversam com ela por HTTP, e ela guarda e busca os dados num banco. Neste capítulo você constrói, do zero, uma API REST de livros com Express 5 e MongoDB (via Mongoose 8), organizada em rotas, controllers e models. É o projeto que os próximos capítulos vão evoluir com filtros, paginação e tratamento de erros.
+
+**Você vai aprender:**
+
+- O que torna uma API REST: recursos, verbos HTTP e códigos de status
+- Criar um servidor com Express 5 e ler parâmetros, query e corpo da requisição
+- Conectar no MongoDB com Mongoose e modelar dados com schemas
+- Implementar o CRUD completo, organizado em rotas, controllers e models
+- Relacionar documentos (livro e autor) com referência ou embutindo
+
+## REST em cinco minutos
+
+REST é um estilo de desenhar APIs sobre HTTP. A ideia central: a API expõe **recursos** (livros, autores) identificados por URLs, e o **verbo HTTP** diz o que fazer com eles.
+
+| Verbo e rota | Ação | Resposta de sucesso |
+|---|---|---|
+| `GET /livros` | Listar livros | 200 com array |
+| `GET /livros/:id` | Buscar um livro | 200 com o livro, ou 404 |
+| `POST /livros` | Criar livro | 201 com o livro criado |
+| `PUT /livros/:id` | Substituir livro | 200 com o livro |
+| `PATCH /livros/:id` | Alterar alguns campos | 200 com o livro |
+| `DELETE /livros/:id` | Remover livro | 204 sem corpo |
+
+As URLs usam substantivos no plural, nunca verbos (`/livros`, não `/criarLivro`). O código de status comunica o resultado: 2xx sucesso, 4xx erro de quem chamou (dados inválidos, recurso inexistente), 5xx erro do servidor.
+
+## Servidor mínimo com Express
+
+```bash
+mkdir api-livros && cd api-livros
+npm init -y
+npm pkg set type=module
+npm install express mongoose
+```
+
+```javascript
+// src/server.js
+import express from "express";
+
+const app = express();
+app.use(express.json());
+
+app.get("/", (req, res) => {
+  res.send("API de livros");
+});
+
+const PORT = process.env.PORT ?? 3000;
+app.listen(PORT, () => console.log(`Servidor em http://localhost:${PORT}`));
+```
+
+```bash
+node --watch src/server.js
+```
+
+`express()` cria a aplicação. `app.get(caminho, handler)` registra uma rota: quando chega um `GET /`, o Express chama o handler com dois objetos, `req` (a requisição) e `res` (a resposta). `app.use(express.json())` instala um **middleware** que lê o corpo das requisições em JSON e coloca o resultado em `req.body`; sem ele, `req.body` fica `undefined`. O `--watch` reinicia o servidor a cada alteração de arquivo.
+
+### Lendo a requisição
+
+Três lugares trazem dados do cliente:
+
+```javascript
+// GET /livros/42?formato=resumo
+app.get("/livros/:id", (req, res) => {
+  console.log(req.params.id);      // "42"  (parte da rota)
+  console.log(req.query.formato);  // "resumo"  (depois do ?)
+  res.json({ id: req.params.id });
+});
+
+// POST /livros com corpo {"titulo": "Dom Casmurro"}
+app.post("/livros", (req, res) => {
+  console.log(req.body.titulo);    // "Dom Casmurro"
+  res.status(201).json(req.body);
+});
+```
+
+Tudo que vem em `params` e `query` é **string**. `res.json()` serializa o objeto e define o cabeçalho `Content-Type: application/json`; `res.status(201)` define o código antes de enviar.
+
+## Conectando no MongoDB
+
+MongoDB é um banco de **documentos**: em vez de tabelas com colunas fixas, ele guarda documentos parecidos com objetos JavaScript (em formato BSON) dentro de **coleções**. Para desenvolver, rode um MongoDB local com Docker ou crie um cluster gratuito no MongoDB Atlas.
+
+```bash
+docker run -d --name mongo -p 27017:27017 mongo:8
+```
+
+Guarde a string de conexão num arquivo `.env` (e coloque `.env` no `.gitignore`):
+
+```bash
+# .env
+MONGODB_URI=mongodb://localhost:27017/livraria
+PORT=3000
+```
+
+O Node 22 lê esse arquivo sozinho com `--env-file`, sem pacote extra:
+
+```json
+"scripts": {
+  "dev": "node --watch --env-file=.env src/server.js",
+  "start": "node --env-file=.env src/server.js"
+}
+```
+
+```javascript
+// src/config/db.js
+import mongoose from "mongoose";
+
+export async function conectarBanco() {
+  await mongoose.connect(process.env.MONGODB_URI);
+  console.log("MongoDB conectado");
+}
+```
+
+## Modelando com Mongoose
+
+O MongoDB aceita qualquer formato de documento. O Mongoose adiciona um **schema**: a definição dos campos, tipos e validações, aplicada no lado da aplicação.
+
+```javascript
+// src/models/Livro.js
+import mongoose from "mongoose";
+
+const livroSchema = new mongoose.Schema(
+  {
+    titulo: { type: String, required: [true, "O título é obrigatório"], trim: true },
+    editora: { type: String, trim: true },
+    preco: { type: Number, min: [0, "O preço não pode ser negativo"] },
+    paginas: { type: Number, min: 1 },
+    autor: { type: mongoose.Schema.Types.ObjectId, ref: "Autor", required: true },
+  },
+  { timestamps: true, versionKey: false }
+);
+
+export const Livro = mongoose.model("Livro", livroSchema);
+```
+
+```javascript
+// src/models/Autor.js
+import mongoose from "mongoose";
+
+const autorSchema = new mongoose.Schema(
+  {
+    nome: { type: String, required: true, trim: true },
+    nacionalidade: String,
+  },
+  { timestamps: true, versionKey: false }
+);
+
+export const Autor = mongoose.model("Autor", autorSchema);
+```
+
+`mongoose.model("Livro", ...)` cria o **model**, a classe que você usa para consultar e gravar. A coleção no banco recebe o nome no plural e em minúsculas (`livros`). `timestamps: true` adiciona `createdAt` e `updatedAt` automaticamente. Todo documento ganha um `_id` do tipo `ObjectId`, um identificador de 12 bytes gerado pelo próprio driver.
+
+## O CRUD em camadas
+
+Colocar tudo no `server.js` funciona por uma tarde. Depois vira um arquivo de mil linhas. A organização mais comum separa:
+
+- **models**: formato dos dados e acesso ao banco.
+- **controllers**: o que fazer em cada operação.
+- **routes**: qual URL e verbo chamam qual controller.
+
+```text
+src/
+  config/db.js
+  models/Livro.js
+  models/Autor.js
+  controllers/livroController.js
+  routes/livrosRoutes.js
+  routes/index.js
+  app.js
+  server.js
+```
+
+### Controller
+
+```javascript
+// src/controllers/livroController.js
+import { Livro } from "../models/Livro.js";
+
+export async function listarLivros(req, res) {
+  const livros = await Livro.find().populate("autor", "nome");
+  res.status(200).json(livros);
+}
+
+export async function buscarLivroPorId(req, res) {
+  const livro = await Livro.findById(req.params.id).populate("autor");
+  if (!livro) {
+    return res.status(404).json({ mensagem: "Livro não encontrado" });
+  }
+  res.status(200).json(livro);
+}
+
+export async function cadastrarLivro(req, res) {
+  const novo = await Livro.create(req.body);
+  res.status(201).json(novo);
+}
+
+export async function atualizarLivro(req, res) {
+  const livro = await Livro.findByIdAndUpdate(req.params.id, req.body, {
+    new: true,
+    runValidators: true,
+  });
+  if (!livro) {
+    return res.status(404).json({ mensagem: "Livro não encontrado" });
+  }
+  res.status(200).json(livro);
+}
+
+export async function excluirLivro(req, res) {
+  const livro = await Livro.findByIdAndDelete(req.params.id);
+  if (!livro) {
+    return res.status(404).json({ mensagem: "Livro não encontrado" });
+  }
+  res.status(204).end();
+}
+```
+
+Os métodos do model devolvem Promises, por isso cada controller é `async` e usa `await`. Repare:
+
+- `findById` devolve `null` quando não encontra. Esse é o 404.
+- `findByIdAndUpdate` devolve, por padrão, o documento **antes** da alteração. `new: true` pede o documento atualizado, e `runValidators: true` aplica as validações do schema também na atualização (por padrão, elas só rodam no `create` e no `save`).
+- `204` significa sucesso sem corpo, por isso `end()` em vez de `json()`.
+
+### Rotas
+
+```javascript
+// src/routes/livrosRoutes.js
+import { Router } from "express";
+import * as livros from "../controllers/livroController.js";
+
+const router = Router();
+
+router.get("/livros", livros.listarLivros);
+router.get("/livros/:id", livros.buscarLivroPorId);
+router.post("/livros", livros.cadastrarLivro);
+router.patch("/livros/:id", livros.atualizarLivro);
+router.delete("/livros/:id", livros.excluirLivro);
+
+export default router;
+```
+
+```javascript
+// src/app.js
+import express from "express";
+import livrosRoutes from "./routes/livrosRoutes.js";
+import autoresRoutes from "./routes/autoresRoutes.js";
+
+export const app = express();
+app.use(express.json());
+app.use(livrosRoutes);
+app.use(autoresRoutes);
+```
+
+```javascript
+// src/server.js
+import { app } from "./app.js";
+import { conectarBanco } from "./config/db.js";
+
+await conectarBanco();
+const PORT = process.env.PORT ?? 3000;
+app.listen(PORT, () => console.log(`API em http://localhost:${PORT}`));
+```
+
+Separar `app.js` (a configuração) de `server.js` (o `listen`) parece detalhe, mas é o que permite testar a API sem subir um servidor de verdade, como você vai ver no capítulo de testes. O controller e as rotas de autores seguem exatamente o mesmo molde.
+
+### Testando com curl
+
+```bash
+curl -X POST http://localhost:3000/autores \
+  -H "Content-Type: application/json" \
+  -d '{"nome": "Machado de Assis", "nacionalidade": "brasileira"}'
+# {"nome":"Machado de Assis","nacionalidade":"brasileira","_id":"6735...a1", ...}
+
+curl -X POST http://localhost:3000/livros \
+  -H "Content-Type: application/json" \
+  -d '{"titulo": "Dom Casmurro", "preco": 39.9, "paginas": 256, "autor": "6735...a1"}'
+
+curl http://localhost:3000/livros
+curl -X PATCH http://localhost:3000/livros/<id> -H "Content-Type: application/json" -d '{"preco": 34.9}'
+curl -i -X DELETE http://localhost:3000/livros/<id>
+# HTTP/1.1 204 No Content
+```
+
+Ferramentas gráficas como Insomnia, Postman ou o cliente HTTP do VS Code fazem o mesmo com menos digitação.
+
+<Callout type="warning" title="Erros que somem em silêncio">
+Se o MongoDB recusar um documento (campo obrigatório faltando, por exemplo), `Livro.create` rejeita a Promise. No Express 5, uma Promise rejeitada dentro do handler é encaminhada automaticamente para o tratador de erros, que responde 500 com HTML. No Express 4 ela não era capturada, e a requisição ficava pendurada até dar timeout. Em qualquer versão, a resposta padrão não serve para quem consome a API: no próximo capítulo você cria um middleware de erros que devolve 400 com a mensagem de validação. Até lá, nunca deixe uma rota sem pensar no caminho de erro.
+</Callout>
+
+Um caso específico: `GET /livros/abc` com um id que não tem formato de ObjectId faz o Mongoose lançar `CastError`. Isso não é "não encontrado" (404), é requisição inválida (400). Tratar isso também é assunto do próximo capítulo.
+
+## Referência ou documento embutido
+
+No modelo acima, o livro guarda só o `_id` do autor (**referência**), e `populate("autor")` faz uma segunda consulta para trazer os dados:
+
+```json
+{
+  "_id": "6735f0...",
+  "titulo": "Dom Casmurro",
+  "autor": { "_id": "6735a1...", "nome": "Machado de Assis" }
+}
+```
+
+A alternativa é **embutir** os dados do autor dentro do livro:
+
+```javascript
+const livroSchema = new mongoose.Schema({
+  titulo: String,
+  autor: {
+    nome: String,
+    nacionalidade: String,
+  },
+});
+```
+
+| Critério | Referência (`ref` + `populate`) | Embutido |
+|---|---|---|
+| Leitura | Duas consultas | Uma consulta |
+| Atualizar o autor | Um lugar só | Em todos os livros dele |
+| Bom quando | Dado compartilhado e que muda | Dado que pertence ao pai e é lido junto |
+
+Regra prática do MongoDB: modele pelo jeito como os dados são **lidos**. Os itens de um pedido são embutidos (só existem dentro do pedido). O autor, compartilhado por muitos livros, vira referência. No Nível 2 há um capítulo inteiro sobre modelagem no MongoDB.
+
+## Na entrevista
+
+- **Qual a diferença entre PUT e PATCH?** PUT substitui o recurso inteiro pelo corpo enviado; PATCH altera só os campos enviados. Ambos devem ser idempotentes na prática (repetir a mesma chamada dá o mesmo resultado), diferente de POST.
+- **O que é um middleware no Express?** Uma função `(req, res, next)` que roda no caminho da requisição e pode ler e alterar `req` e `res`, responder ou chamar `next()` para passar adiante. `express.json()` é um exemplo.
+- **Quando embutir e quando referenciar no MongoDB?** Embuta o que é lido junto e pertence ao documento pai; referencie dados compartilhados por muitos documentos ou que crescem sem limite.
+- **Qual status para um POST que criou um recurso? E para um DELETE?** 201 Created (idealmente com o recurso no corpo) e 204 No Content.
+
+## Pratique
+
+Complete a API:
+
+1. Crie o controller e as rotas de autores com o CRUD completo.
+2. Adicione `GET /autores/:id/livros`, que lista os livros de um autor.
+3. Impeça excluir um autor que tem livros cadastrados, respondendo 409 Conflict com uma mensagem clara.
+4. Adicione um campo `isbn` único no livro (`unique: true`) e veja o erro que o MongoDB devolve ao duplicar.
+
+Entregue o repositório com um arquivo `requests.http` (ou uma coleção exportada) contendo uma requisição de exemplo para cada rota, e um README com os passos para rodar com `docker run` e `npm run dev`.
+
+<Quiz question="Qual código de status é o mais adequado para um POST que criou um livro?" options={["200 OK","201 Created","204 No Content","202 Accepted"]} answer={1} explanation="201 indica que um novo recurso foi criado. É comum devolver o recurso criado no corpo." />
+<Quiz question="Sem a opção new: true, o que findByIdAndUpdate devolve?" options={["O documento já atualizado","O documento como era antes","Apenas o número de alterados","Sempre null"]} answer={1} explanation="Por padrão o Mongoose devolve o documento anterior à atualização. new: true pede a versão nova." />
+<Quiz question="Sem app.use(express.json()), o que vale req.body num POST com JSON?" options={["O objeto já convertido","Uma string com o JSON","undefined","Um Buffer com os bytes"]} answer={2} explanation="O Express não lê o corpo sozinho. É o middleware express.json() que interpreta o JSON e preenche req.body." />
+
+## Base no CodeForge
+
+- [REST](/learn/system-design/rest) e [O que é uma API](/learn/system-design/o-que-e-api): os princípios por trás das rotas.
+- [Bancos de documentos](/learn/system-design/bancos-de-documentos) e [SQL vs NoSQL](/learn/system-design/sql-vs-nosql): quando o MongoDB é boa escolha.
+- [Idempotência](/learn/system-design/idempotencia): por que PUT e DELETE podem ser repetidos com segurança.
+- [Node.js: Lidando com buscas, filtros, paginação e erros em uma API](/learn/carreira-nodejs/nodejs-lidando-buscas-filtros-paginacao-erros-api): a continuação desta API.
+
+## Referências
+
+- [Express 5: API](https://expressjs.com/en/5x/api.html)
+- [Express: Migrando para o Express 5](https://expressjs.com/en/guide/migrating-5.html)
+- [Mongoose: Schemas](https://mongoosejs.com/docs/guide.html)
+- [Mongoose: Queries](https://mongoosejs.com/docs/queries.html)

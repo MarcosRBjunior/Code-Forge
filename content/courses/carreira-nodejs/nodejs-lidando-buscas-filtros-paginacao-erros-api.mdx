@@ -1,0 +1,380 @@
+---
+title: "Node.js: Lidando com buscas, filtros, paginação e erros em uma API"
+kind: lesson
+---
+
+Uma API que só tem `GET /livros` devolvendo tudo funciona com dez registros e cai com cem mil. E uma API que responde 500 com HTML quando alguém manda um id malformado deixa o front-end sem saber o que fazer. Este capítulo pega a API de livros do capítulo anterior e a deixa pronta para uso real: erros tratados num lugar só, buscas por vários critérios, paginação e ordenação controladas pelo cliente.
+
+**Você vai aprender:**
+
+- Centralizar o tratamento de erros num middleware do Express
+- Criar classes de erro que já carregam o código HTTP certo
+- Montar filtros do MongoDB a partir da query string, com segurança
+- Paginar e ordenar com `skip`, `limit` e `sort`, devolvendo metadados
+- Transformar a paginação num middleware reaproveitável
+
+## O middleware de erros
+
+O Express trata como **middleware de erros** qualquer função com **quatro** parâmetros: `(erro, req, res, next)`. Quando um handler lança uma exceção, chama `next(erro)` ou (no Express 5) devolve uma Promise rejeitada, o Express pula as rotas restantes e vai direto para esse middleware.
+
+```javascript
+// src/middlewares/manipuladorDeErros.js
+export function manipuladorDeErros(erro, req, res, next) {
+  console.error(erro);
+  res.status(500).json({ mensagem: "Erro interno do servidor" });
+}
+```
+
+```javascript
+// src/app.js
+import express from "express";
+import routes from "./routes/index.js";
+import { manipuladorDeErros } from "./middlewares/manipuladorDeErros.js";
+
+export const app = express();
+app.use(express.json());
+app.use(routes);
+app.use(manipuladorDeErros); // sempre o último
+```
+
+A ordem importa: o Express executa os middlewares na ordem do `app.use`. O de erros vem depois de todas as rotas.
+
+Com o Express 5, os controllers ficam limpos: não precisam de `try`/`catch` só para repassar o erro.
+
+```javascript
+export async function buscarLivroPorId(req, res) {
+  const livro = await Livro.findById(req.params.id); // se lançar, vai para o manipulador
+  res.json(livro);
+}
+```
+
+No Express 4 isso não funcionava: era preciso envolver cada handler em `try { ... } catch (e) { next(e) }`. Se você encontrar esse padrão em código antigo, é por isso.
+
+## Classes de erro com status
+
+Responder sempre 500 esconde a causa. O ideal é que cada tipo de erro saiba seu código HTTP. Crie uma hierarquia de classes:
+
+```javascript
+// src/erros/ErroBase.js
+export class ErroBase extends Error {
+  constructor(mensagem = "Erro interno do servidor", status = 500) {
+    super(mensagem);
+    this.name = this.constructor.name;
+    this.status = status;
+  }
+
+  enviarResposta(res) {
+    res.status(this.status).json({ mensagem: this.message, status: this.status });
+  }
+}
+
+// src/erros/RequisicaoIncorreta.js
+import { ErroBase } from "./ErroBase.js";
+export class RequisicaoIncorreta extends ErroBase {
+  constructor(mensagem = "Um ou mais dados fornecidos estão incorretos") {
+    super(mensagem, 400);
+  }
+}
+
+// src/erros/NaoEncontrado.js
+import { ErroBase } from "./ErroBase.js";
+export class NaoEncontrado extends ErroBase {
+  constructor(mensagem = "Recurso não encontrado") {
+    super(mensagem, 404);
+  }
+}
+
+// src/erros/ErroValidacao.js
+import { RequisicaoIncorreta } from "./RequisicaoIncorreta.js";
+export class ErroValidacao extends RequisicaoIncorreta {
+  constructor(erroMongoose) {
+    const detalhes = Object.values(erroMongoose.errors).map((e) => e.message);
+    super(`Erros de validação: ${detalhes.join("; ")}`);
+    this.detalhes = detalhes;
+  }
+}
+```
+
+Agora o manipulador traduz os erros conhecidos e deixa o 500 só para o inesperado:
+
+```javascript
+// src/middlewares/manipuladorDeErros.js
+import mongoose from "mongoose";
+import { ErroBase } from "../erros/ErroBase.js";
+import { RequisicaoIncorreta } from "../erros/RequisicaoIncorreta.js";
+import { ErroValidacao } from "../erros/ErroValidacao.js";
+
+export function manipuladorDeErros(erro, req, res, next) {
+  if (erro instanceof mongoose.Error.CastError) {
+    return new RequisicaoIncorreta(`Valor inválido para ${erro.path}: ${erro.value}`).enviarResposta(res);
+  }
+  if (erro instanceof mongoose.Error.ValidationError) {
+    return new ErroValidacao(erro).enviarResposta(res);
+  }
+  if (erro instanceof ErroBase) {
+    return erro.enviarResposta(res);
+  }
+  if (erro.type === "entity.parse.failed") {
+    return new RequisicaoIncorreta("JSON malformado no corpo da requisição").enviarResposta(res);
+  }
+
+  console.error(erro);
+  new ErroBase().enviarResposta(res);
+}
+```
+
+- `CastError`: o Mongoose não conseguiu converter um valor, como `GET /livros/abc` (não é um ObjectId). É 400, não 404 nem 500.
+- `ValidationError`: o documento não passou nas regras do schema. `erro.errors` tem um item por campo inválido.
+- `entity.parse.failed`: o `express.json()` recebeu um corpo que não é JSON válido.
+
+Nos controllers, o "não encontrado" vira uma linha:
+
+```javascript
+import { NaoEncontrado } from "../erros/NaoEncontrado.js";
+
+export async function buscarLivroPorId(req, res) {
+  const livro = await Livro.findById(req.params.id).populate("autor", "nome");
+  if (!livro) throw new NaoEncontrado("Livro não encontrado");
+  res.json(livro);
+}
+```
+
+### Rota inexistente
+
+Requisições para URLs que nenhuma rota atende recebem por padrão um 404 em HTML. Para responder JSON, adicione um middleware **depois** das rotas e **antes** do manipulador:
+
+```javascript
+// src/middlewares/manipulador404.js
+import { NaoEncontrado } from "../erros/NaoEncontrado.js";
+
+export function manipulador404(req, res, next) {
+  next(new NaoEncontrado(`Rota ${req.method} ${req.path} não existe`));
+}
+```
+
+```javascript
+app.use(routes);
+app.use(manipulador404);
+app.use(manipuladorDeErros);
+```
+
+Agora toda resposta de erro da API tem o mesmo formato, `{ mensagem, status }`, e o front-end pode tratá-las de um jeito só.
+
+<Callout type="warning" title="Vazar detalhes internos no 500">
+Mandar `erro.message` ou `erro.stack` de um erro inesperado na resposta expõe nomes de coleções, caminhos de arquivos e até trechos de consultas para qualquer pessoa. No caso genérico, registre o erro completo no log do servidor e responda só uma mensagem neutra. Detalhes vão na resposta apenas para erros que você mesmo criou e sabe que são seguros.
+</Callout>
+
+## Buscas e filtros pela query string
+
+Filtros vêm na query string: `GET /livros/busca?editora=Companhia&titulo=casmurro&minPaginas=100`. O trabalho do controller é transformar esses parâmetros num **objeto de filtro** do MongoDB.
+
+```javascript
+// src/controllers/livroController.js
+function escaparRegex(texto) {
+  return texto.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function montarFiltro(query) {
+  const { editora, titulo, minPaginas, maxPaginas, nomeAutor } = query;
+  const filtro = {};
+
+  if (editora) filtro.editora = editora;
+  if (titulo) filtro.titulo = { $regex: escaparRegex(titulo), $options: "i" };
+
+  if (minPaginas || maxPaginas) {
+    filtro.paginas = {};
+    if (minPaginas) filtro.paginas.$gte = Number(minPaginas);
+    if (maxPaginas) filtro.paginas.$lte = Number(maxPaginas);
+  }
+
+  if (nomeAutor) {
+    const autor = await Autor.findOne({ nome: nomeAutor });
+    if (!autor) return null; // nenhum livro pode bater
+    filtro.autor = autor._id;
+  }
+
+  return filtro;
+}
+
+export async function buscarLivros(req, res) {
+  const filtro = await montarFiltro(req.query);
+  if (filtro === null) return res.json([]);
+  const livros = await Livro.find(filtro).populate("autor", "nome");
+  res.json(livros);
+}
+```
+
+O filtro final, para a URL do exemplo, fica assim:
+
+```json
+{
+  "editora": "Companhia",
+  "titulo": { "$regex": "casmurro", "$options": "i" },
+  "paginas": { "$gte": 100 }
+}
+```
+
+Os operadores do MongoDB começam com `$`: `$gte` (maior ou igual), `$lte` (menor ou igual), `$in` (está na lista), `$regex` (casa com expressão regular). A opção `"i"` torna a busca insensível a maiúsculas.
+
+Três decisões de segurança e desempenho estão nesse código:
+
+1. **Lista branca de campos.** O controller lê só os parâmetros que conhece. Repassar `req.query` direto para `find` permitiria a qualquer cliente filtrar por campos internos ou injetar operadores.
+2. **Escapar o regex.** Sem `escaparRegex`, alguém pode mandar `titulo=.*.*.*.*!` e montar uma expressão que consome CPU por segundos (ReDoS). Escapando, o texto é tratado literalmente.
+3. **Converter tipos.** Query string é sempre texto; `"100"` precisa virar `100` para `$gte` comparar números.
+
+Busca por regex sem âncora (`casmurro` em qualquer posição do título) não usa índice e varre a coleção. Para coleções grandes, use um índice de texto (`livroSchema.index({ titulo: "text" })` com o operador `$text`) ou um serviço de busca dedicado.
+
+## Paginação
+
+Devolver todos os documentos de uma vez sobrecarrega o banco, a rede e o front-end. Paginar significa devolver um pedaço por vez, controlado pelo cliente: `GET /livros?pagina=2&limite=10`.
+
+A conta é a mesma do `slice` em arrays: pular `(pagina - 1) * limite` documentos e pegar `limite`.
+
+```javascript
+export async function listarLivros(req, res) {
+  const pagina = Number(req.query.pagina ?? 1);
+  const limite = Number(req.query.limite ?? 10);
+
+  if (!Number.isInteger(pagina) || pagina < 1 || !Number.isInteger(limite) || limite < 1) {
+    throw new RequisicaoIncorreta("pagina e limite devem ser inteiros positivos");
+  }
+  const limiteSeguro = Math.min(limite, 100);
+
+  const [livros, total] = await Promise.all([
+    Livro.find()
+      .sort({ _id: -1 })
+      .skip((pagina - 1) * limiteSeguro)
+      .limit(limiteSeguro)
+      .populate("autor", "nome"),
+    Livro.countDocuments(),
+  ]);
+
+  res.json({
+    dados: livros,
+    paginacao: {
+      pagina,
+      limite: limiteSeguro,
+      total,
+      totalPaginas: Math.ceil(total / limiteSeguro),
+    },
+  });
+}
+```
+
+Detalhes que fazem diferença:
+
+- **Teto no limite.** Sem `Math.min(limite, 100)`, um cliente pede `limite=1000000` e a paginação perde o sentido.
+- **Ordenação estável.** Sem `sort`, o MongoDB não garante a ordem, e o mesmo documento pode aparecer em duas páginas. Ordene sempre, de preferência por um campo único como `_id`.
+- **Metadados.** O front-end precisa de `total` e `totalPaginas` para desenhar a navegação. `countDocuments` roda em paralelo com a busca via `Promise.all`.
+
+## Ordenação escolhida pelo cliente
+
+Um formato simples é `ordenacao=campo:direcao`, como `?ordenacao=titulo:1` ou `?ordenacao=createdAt:-1`. Valide contra uma lista de campos permitidos:
+
+```javascript
+// src/utils/ordenacao.js
+import { RequisicaoIncorreta } from "../erros/RequisicaoIncorreta.js";
+
+const CAMPOS_ORDENAVEIS = new Set(["titulo", "paginas", "preco", "createdAt", "_id"]);
+
+export function lerOrdenacao(texto = "_id:-1") {
+  const [campo, direcao = "1"] = texto.split(":");
+  if (!CAMPOS_ORDENAVEIS.has(campo) || !["1", "-1"].includes(direcao)) {
+    throw new RequisicaoIncorreta(`Ordenação inválida: ${texto}`);
+  }
+  if (campo === "_id") return { _id: Number(direcao) };
+  return { [campo]: Number(direcao), _id: 1 }; // _id desempata
+}
+```
+
+O `_id` como segundo critério desempata livros com o mesmo título, mantendo a ordem estável entre páginas.
+
+## Paginação como middleware
+
+Repetir esse código em cada listagem (livros, autores, editoras) é pedir para errar em uma delas. A saída é separar **montar a consulta** de **paginar a consulta**. O controller não executa a busca: ele guarda a consulta do Mongoose em `req.resultado` e chama `next()`. Um middleware genérico pagina e responde.
+
+```javascript
+// src/middlewares/paginar.js
+import { RequisicaoIncorreta } from "../erros/RequisicaoIncorreta.js";
+import { lerOrdenacao } from "../utils/ordenacao.js"; // a função da seção anterior, exportada
+
+export async function paginar(req, res, next) {
+  const pagina = Number(req.query.pagina ?? 1);
+  const limite = Math.min(Number(req.query.limite ?? 10), 100);
+  if (!Number.isInteger(pagina) || pagina < 1 || !Number.isInteger(limite) || limite < 1) {
+    throw new RequisicaoIncorreta("pagina e limite devem ser inteiros positivos");
+  }
+
+  const consulta = req.resultado;
+  const filtro = consulta.getFilter();
+
+  const [dados, total] = await Promise.all([
+    consulta.sort(lerOrdenacao(req.query.ordenacao)).skip((pagina - 1) * limite).limit(limite),
+    consulta.model.countDocuments(filtro),
+  ]);
+
+  res.json({ dados, paginacao: { pagina, limite, total, totalPaginas: Math.ceil(total / limite) } });
+}
+```
+
+```javascript
+// controllers
+export async function listarLivros(req, res, next) {
+  req.resultado = Livro.find().populate("autor", "nome"); // sem await: é só a consulta
+  next();
+}
+
+export async function buscarLivros(req, res, next) {
+  const filtro = await montarFiltro(req.query);
+  req.resultado = Livro.find(filtro ?? { _id: null }).populate("autor", "nome");
+  next();
+}
+
+// rotas
+router.get("/livros", livros.listarLivros, paginar);
+router.get("/livros/busca", livros.buscarLivros, paginar);
+router.get("/livros/:id", livros.buscarLivroPorId);
+```
+
+A chave do truque: uma consulta do Mongoose (`Livro.find()`) só vai ao banco quando é aguardada com `await` (ou `.exec()`). Antes disso, é um objeto que ainda aceita `sort`, `skip` e `limit`. Repare também na ordem das rotas: `/livros/busca` vem antes de `/livros/:id`, senão o Express trataria `busca` como um id.
+
+## Uma armadilha do Express 5
+
+No Express 5, `req.query` é calculado a cada acesso e não pode ser reatribuído (`req.query = algo` não tem efeito). Se precisar normalizar a query, guarde o resultado em outra propriedade, como `req.filtros`. Além disso, o parser padrão do Express 5 é o "simple", que não monta objetos aninhados: `?preco[gte]=10` chega como a chave literal `"preco[gte]"`. Prefira nomes planos como `minPreco` e `maxPreco`, que são mais fáceis de validar.
+
+## Na entrevista
+
+- **Como funciona o tratamento de erros centralizado no Express?** Um middleware com quatro parâmetros, registrado depois das rotas, recebe tudo o que for passado para `next(erro)` ou lançado nos handlers (com promessas rejeitadas tratadas automaticamente no Express 5) e decide status e corpo da resposta.
+- **Qual o problema de paginar com `skip` em coleções enormes?** O banco ainda percorre os documentos pulados, então páginas profundas ficam lentas. A alternativa é paginação por cursor: `find({ _id: { $lt: ultimoId } }).limit(n)`, que usa índice.
+- **Por que não passar `req.query` direto para `find`?** Permite injeção de operadores do MongoDB (`?senha[$ne]=x`) e filtros por campos que o cliente não deveria acessar. Use lista branca e converta tipos.
+- **Qual a diferença entre 400, 404 e 422?** 400 é requisição malformada; 404 é recurso inexistente; 422 é requisição bem formada mas com dados que violam regras de negócio. Muitas APIs usam 400 para os dois primeiros casos de validação; o importante é ser consistente.
+
+## Pratique
+
+Na sua API de livros:
+
+1. Implemente as classes de erro, o `manipulador404` e o `manipuladorDeErros`.
+2. Crie `GET /livros/busca` com filtros por `editora`, `titulo` (parcial, sem diferenciar maiúsculas), `minPaginas`, `maxPaginas` e `nomeAutor`.
+3. Aplique o middleware `paginar` em `/livros`, `/livros/busca` e `/autores`.
+4. Adicione `ordenacao` com lista branca de campos.
+5. Escreva no README uma tabela com cada erro possível, seu status e um exemplo de corpo de resposta.
+
+Teste com curl: id malformado (400), id inexistente (404), corpo com JSON quebrado (400), livro sem título (400 com detalhes) e `limite=500` (deve devolver no máximo 100).
+
+<Quiz question="Como o Express identifica um middleware de tratamento de erros?" options={["Pelo nome da função","Por ter quatro parâmetros","Por ser registrado com app.error","Por ser uma função async"]} answer={1} explanation="O Express verifica a aridade da função: com quatro parâmetros (erro, req, res, next) ela é tratada como middleware de erros." />
+<Quiz question="GET /livros/abc, onde abc não é um ObjectId válido, deve responder com qual status?" options={["200 com null","400 Bad Request","404 Not Found","500 Internal Server Error"]} answer={1} explanation="O id nem tem formato válido, então a requisição está incorreta. O Mongoose lança CastError, que deve ser traduzido para 400." />
+<Quiz question="Por que ordenar a consulta ao paginar?" options={["Para deixar a resposta mais bonita","Porque o skip só funciona com sort","Sem ordem definida, documentos podem repetir ou sumir entre páginas","Porque o MongoDB exige sort com limit"]} answer={2} explanation="Sem sort, o banco não garante a ordem dos resultados, e a mesma consulta paginada pode trazer itens repetidos ou pular itens." />
+
+## Base no CodeForge
+
+- [Ordenação e paginação](/learn/sql/ordenacao-e-paginacao): o mesmo problema no mundo SQL, com paginação por cursor.
+- [Índices](/learn/system-design/indices): por que filtros e ordenação precisam de índice para escalar.
+- [Rate limiting](/learn/system-design/rate-limiting): o próximo passo para proteger rotas de busca.
+- [Erros](/learn/typescript/erros): classes de erro e `instanceof` em detalhe.
+
+## Referências
+
+- [Express: Tratamento de erros](https://expressjs.com/en/guide/error-handling.html)
+- [Mongoose: Validação](https://mongoosejs.com/docs/validation.html)
+- [MongoDB: Operadores de consulta](https://www.mongodb.com/docs/manual/reference/operator/query/)
+- [MongoDB: cursor.skip](https://www.mongodb.com/docs/manual/reference/method/cursor.skip/)

@@ -1,0 +1,275 @@
+---
+title: "Node.js: Serviços RPC escaláveis e transmissão de dados"
+kind: lesson
+---
+
+Quando um serviço interno chama outro milhares de vezes por segundo, JSON sobre HTTP/1.1 começa a pesar: texto grande para serializar, uma conexão por requisição em andamento e nenhum contrato que impeça o outro time de renomear um campo. O gRPC resolve isso com chamadas de procedimento remoto (RPC) descritas num arquivo `.proto`, serializadas em binário com Protocol Buffers e transportadas por HTTP/2, que multiplexa muitas chamadas numa só conexão. De quebra, ele suporta streaming nos dois sentidos, ideal para transmitir grandes volumes de dados sem carregar tudo na memória.
+
+**Você vai aprender:**
+
+- Como definir um serviço e suas mensagens em Protocol Buffers
+- Como implementar servidor e cliente em Node.js com `@grpc/grpc-js`
+- Os quatro tipos de chamada: unária, streaming do servidor, do cliente e bidirecional
+- Como usar deadlines, códigos de status, metadados e backpressure
+- Como balancear carga e evoluir o contrato sem quebrar clientes
+
+## O contrato em Protocol Buffers
+
+Tudo começa no arquivo `.proto`: as mensagens (estruturas de dados) e o serviço (os métodos). Cada campo tem um **número**, que é o que de fato vai no binário; o nome só existe no código.
+
+```proto
+// proto/catalogo.proto
+syntax = "proto3";
+
+package livros.v1;
+
+message Livro {
+  string id = 1;
+  string titulo = 2;
+  string autor = 3;
+  int32 ano = 4;
+}
+
+message BuscarLivroRequest { string id = 1; }
+message ListarLivrosRequest { string autor = 1; }
+message ResumoImportacao { int32 recebidos = 1; int32 rejeitados = 2; }
+message Mensagem { string usuario = 1; string texto = 2; }
+
+service Catalogo {
+  // unária: uma requisição, uma resposta
+  rpc BuscarLivro (BuscarLivroRequest) returns (Livro);
+  // streaming do servidor: uma requisição, muitas respostas
+  rpc ListarLivros (ListarLivrosRequest) returns (stream Livro);
+  // streaming do cliente: muitas requisições, uma resposta
+  rpc ImportarLivros (stream Livro) returns (ResumoImportacao);
+  // bidirecional: os dois lados enviam quando quiserem
+  rpc Conversar (stream Mensagem) returns (stream Mensagem);
+}
+```
+
+O pacote `livros.v1` já prevê versionamento. Em proto3, todos os campos são opcionais na prática: se o cliente não envia `ano`, o servidor lê `0`. Isso é o que permite evoluir o contrato sem quebrar ninguém, desde que você siga regras simples (veja a seção de evolução).
+
+## O servidor em Node.js
+
+Há duas formas de usar o `.proto` em Node: gerar código antes (com `protoc` ou `buf`) ou carregar em tempo de execução com `@grpc/proto-loader`. A segunda é a mais direta para começar.
+
+```bash
+npm install @grpc/grpc-js @grpc/proto-loader
+```
+
+```javascript
+// src/proto.js
+import * as grpc from "@grpc/grpc-js";
+import * as protoLoader from "@grpc/proto-loader";
+
+const definicao = protoLoader.loadSync("proto/catalogo.proto", {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+});
+
+export const { livros } = grpc.loadPackageDefinition(definicao);
+export { grpc };
+```
+
+```javascript
+// src/servidor.js
+import { once } from "node:events";
+import { grpc, livros } from "./proto.js";
+import { repo } from "./repo.js";
+
+const servidor = new grpc.Server();
+
+servidor.addService(livros.v1.Catalogo.service, {
+  async BuscarLivro(call, callback) {
+    const livro = await repo.porId(call.request.id);
+    if (!livro) {
+      return callback({ code: grpc.status.NOT_FOUND, details: `livro ${call.request.id} não existe` });
+    }
+    callback(null, livro);
+  },
+
+  async ListarLivros(call) {
+    // repo.cursor devolve um iterador assíncrono que lê do banco em lotes
+    for await (const livro of repo.cursor({ autor: call.request.autor })) {
+      if (call.cancelled) return; // cliente desistiu ou estourou o deadline
+      if (!call.write(livro)) await once(call, "drain"); // backpressure
+    }
+    call.end();
+  },
+
+  ImportarLivros(call, callback) {
+    let recebidos = 0;
+    let rejeitados = 0;
+    call.on("data", (livro) => {
+      if (!livro.titulo) rejeitados++;
+      else { recebidos++; repo.enfileirar(livro); }
+    });
+    call.on("end", () => callback(null, { recebidos, rejeitados }));
+  },
+
+  Conversar(call) {
+    call.on("data", (msg) => call.write({ usuario: "servidor", texto: `eco: ${msg.texto}` }));
+    call.on("end", () => call.end());
+  },
+});
+
+servidor.bindAsync("0.0.0.0:50051", grpc.ServerCredentials.createInsecure(), (err, porta) => {
+  if (err) throw err;
+  console.log(`gRPC na porta ${porta}`);
+});
+```
+
+O que observar:
+
+- **Unária:** recebe `call.request` e responde pelo `callback(erro, resposta)`.
+- **Streaming do servidor:** `call` é um stream de escrita do Node. Cada `write` envia uma mensagem; `end` encerra.
+- **Streaming do cliente:** `call` é um stream de leitura; a resposta única vai no `callback` quando o cliente termina.
+- **Bidirecional:** `call` é um `Duplex`, lê e escreve ao mesmo tempo.
+
+## Backpressure: transmitir sem estourar a memória
+
+`ListarLivros` pode devolver um milhão de registros. Se o servidor lê do banco mais rápido do que a rede entrega, as mensagens se acumulam no buffer e a memória cresce até o processo cair. O `call.write` devolve `false` quando o buffer interno passou do limite; nesse momento o servidor deve **parar** e esperar o evento `drain`. É exatamente o contrato dos streams do Node, e o `await once(call, "drain")` do código acima o cumpre.
+
+O mesmo vale do lado do banco: use cursores ou paginação por chave para ler em lotes, nunca um `SELECT` que traz tudo para um array. Assim, o consumo de memória fica constante, seja qual for o tamanho do resultado.
+
+## O cliente
+
+```javascript
+// src/cliente.js
+import { grpc, livros } from "./proto.js";
+
+const cliente = new livros.v1.Catalogo(
+  "localhost:50051",
+  grpc.credentials.createInsecure(),
+);
+
+// unária com deadline e metadados, embrulhada em Promise
+function buscarLivro(id, { timeoutMs = 2000, token } = {}) {
+  const meta = new grpc.Metadata();
+  if (token) meta.set("authorization", `Bearer ${token}`);
+  return new Promise((resolve, reject) => {
+    cliente.BuscarLivro({ id }, meta, { deadline: Date.now() + timeoutMs }, (err, livro) =>
+      err ? reject(err) : resolve(livro),
+    );
+  });
+}
+
+try {
+  console.log(await buscarLivro("42"));
+} catch (err) {
+  if (err.code === grpc.status.NOT_FOUND) console.log("não encontrado");
+  else if (err.code === grpc.status.DEADLINE_EXCEEDED) console.log("demorou demais");
+  else throw err;
+}
+
+// streaming do servidor: o retorno é um Readable, dá para usar for await
+const stream = cliente.ListarLivros({ autor: "Machado de Assis" });
+for await (const livro of stream) console.log(livro.titulo);
+
+// streaming do cliente
+const importacao = cliente.ImportarLivros((err, resumo) => {
+  if (err) return console.error(err.details);
+  console.log("importação:", resumo);
+});
+for (const titulo of ["Dom Casmurro", "Quincas Borba", ""]) {
+  importacao.write({ titulo, autor: "Machado de Assis" });
+}
+importacao.end();
+```
+
+## Deadlines, status e metadados
+
+**Deadline** é o instante limite da chamada, propagado ao servidor. Sem deadline, uma chamada a um serviço travado espera para sempre e prende recursos do cliente; em cascata, isso derruba sistemas inteiros. Defina deadline em **toda** chamada, com valor coerente com o orçamento de tempo da requisição original.
+
+Os erros usam **códigos de status** do gRPC, não códigos HTTP. Os mais usados:
+
+| Código | Quando usar |
+|---|---|
+| `INVALID_ARGUMENT` | Dados de entrada inválidos |
+| `NOT_FOUND` | Recurso inexistente |
+| `ALREADY_EXISTS` | Conflito ao criar |
+| `PERMISSION_DENIED` e `UNAUTHENTICATED` | Autorização e autenticação |
+| `UNAVAILABLE` | Serviço indisponível, o cliente pode tentar de novo |
+| `DEADLINE_EXCEEDED` | O tempo acabou |
+
+**Metadados** são os cabeçalhos do gRPC: pares chave e valor enviados junto com a chamada. Use para token de autenticação, ID de correlação e informações de tracing. No servidor, leia com `call.metadata.get("authorization")`.
+
+Em produção, troque `createInsecure` por TLS (`grpc.credentials.createSsl` no cliente e `grpc.ServerCredentials.createSsl` no servidor) ou deixe a criptografia a cargo de um service mesh.
+
+## Escalando: balanceamento com HTTP/2
+
+Aqui mora a pegadinha. O cliente gRPC abre **uma** conexão HTTP/2 e multiplexa todas as chamadas nela por muito tempo. Um balanceador de camada 4 (TCP), que distribui **conexões**, manda tudo para uma única réplica, e as outras ficam ociosas mesmo com o Auto Scaling criando instâncias.
+
+Duas soluções:
+
+- **Balanceador de camada 7 que entende gRPC:** o ALB da AWS (com target group de protocolo gRPC), Envoy, NGINX ou um service mesh distribuem por **chamada**, não por conexão.
+- **Balanceamento no cliente:** o cliente resolve o DNS, obtém os IPs de todas as réplicas (num Service headless do Kubernetes, por exemplo) e distribui em round robin.
+
+```javascript
+const clienteBalanceado = new livros.v1.Catalogo(
+  "dns:///catalogo.livros.svc.cluster.local:50051",
+  grpc.credentials.createInsecure(),
+  {
+    "grpc.service_config": JSON.stringify({ loadBalancingConfig: [{ round_robin: {} }] }),
+    "grpc.keepalive_time_ms": 30_000,
+  },
+);
+```
+
+Para que orquestradores e balanceadores saibam se a réplica está pronta, implemente o protocolo padrão de health check do gRPC (o pacote `grpc-health-check` oferece uma implementação).
+
+## Evoluindo o contrato
+
+O formato binário depende dos números dos campos. As regras para não quebrar clientes antigos:
+
+- **Pode:** adicionar campos novos com números novos; adicionar métodos novos ao serviço.
+- **Não pode:** mudar o número ou o tipo de um campo existente; reutilizar o número de um campo removido.
+- **Ao remover:** marque o número e o nome como reservados (`reserved 4; reserved "ano";`).
+- **Mudança incompatível de verdade:** crie `livros.v2` e mantenha a `v1` até todos os clientes migrarem.
+
+Ferramentas como o `buf` verificam essas regras automaticamente no CI, comparando o `.proto` novo com o da branch principal.
+
+<Callout type="warning" title="Uma réplica sobrecarregada e as outras paradas">
+O sintoma clássico de gRPC atrás de um balanceador TCP (como um NLB ou um Service do Kubernetes comum com clientes de conexão longa) é uma réplica com CPU em 100% enquanto as demais ficam ociosas. Escalar não ajuda, porque as conexões existentes não migram. Use um balanceador de camada 7 com suporte a gRPC ou balanceamento no cliente, e configure `max_connection_age` no servidor para forçar reconexões periódicas.
+</Callout>
+
+## Na entrevista
+
+**Quando escolher gRPC em vez de REST?** Para comunicação entre serviços internos com alto volume, contrato forte entre times, streaming ou baixa latência. Para APIs públicas consumidas por navegadores, REST ou GraphQL continuam mais práticos (gRPC no browser exige gRPC-Web ou um proxy).
+
+**Quais os quatro tipos de chamada do gRPC?** Unária, streaming do servidor, streaming do cliente e bidirecional. Exemplos: buscar por ID, exportar uma lista grande, upload em partes, chat ou telemetria contínua.
+
+**Por que o balanceamento de gRPC é diferente?** Porque HTTP/2 multiplexa todas as chamadas numa conexão longa. Balanceamento por conexão concentra tudo numa réplica; é preciso balancear por chamada (L7) ou no cliente.
+
+**Como evoluir um .proto sem quebrar clientes?** Só adicionar campos com números novos, nunca reutilizar ou alterar números, reservar os removidos e criar um pacote novo para mudanças incompatíveis.
+
+## Pratique
+
+Construa um serviço gRPC de exportação de livros:
+
+1. `ExportarLivros` com streaming do servidor, lendo do PostgreSQL com cursor e respeitando backpressure. Prove, medindo `process.memoryUsage().rss`, que a memória fica estável exportando 1 milhão de linhas.
+2. `ImportarLivros` com streaming do cliente que valida cada item e devolve o resumo.
+3. Um gateway REST em Express (`GET /livros/export`) que consome o stream gRPC e o repassa como NDJSON para o navegador, com deadline em cada chamada.
+4. Duas réplicas do serviço e um cliente com `round_robin`, mostrando nos logs que as chamadas se dividem.
+
+Entregue o `.proto`, os serviços e um README com as medições de memória e tempo.
+
+<Quiz question="No streaming do servidor, call.write devolveu false. O que o servidor deve fazer?" options={["Encerrar o stream com erro","Esperar o evento drain antes de continuar","Repetir o write em loop até dar true","Ignorar, o gRPC descarta o excedente"]} answer={1} explanation="false indica buffer cheio. Continuar escrevendo acumula memória; esperar o drain é o backpressure correto." />
+<Quiz question="Qual mudança num .proto quebra clientes antigos?" options={["Adicionar um campo novo com número 5","Adicionar um método novo ao serviço","Mudar o número do campo titulo de 2 para 7","Reservar o número de um campo removido"]} answer={2} explanation="O binário identifica campos pelo número. Trocá-lo faz clientes antigos lerem o valor no campo errado." />
+<Quiz question="Por que gRPC atrás de um balanceador TCP pode sobrecarregar uma réplica só?" options={["Porque protobuf não pode ser balanceado","Porque o cliente multiplexa as chamadas numa conexão HTTP/2 longa","Porque o gRPC desativa o keepalive por padrão","Porque deadlines impedem a troca de réplica"]} answer={1} explanation="O balanceador L4 distribui conexões. Com uma conexão longa por cliente, todas as chamadas vão para a mesma réplica." />
+
+## Base no CodeForge
+
+- [gRPC](/learn/system-design/grpc) e [Estilos de API](/learn/system-design/estilos-de-api): onde o RPC se encaixa no desenho de sistemas.
+- [HTTP/2](/learn/redes/http-2): a multiplexação que dá velocidade ao gRPC e complica o balanceamento.
+- [Formatos de dados](/learn/system-design/formatos-de-dados): JSON, Protobuf e outros formatos binários.
+- [GraphQL: Criando APIs baseadas em esquemas](/learn/carreira-nodejs/graphql-criando-apis-baseadas-esquemas): a outra forma de API com contrato tipado.
+
+## Referências
+
+- [gRPC Basics tutorial for Node](https://grpc.io/docs/languages/node/basics/)
+- [Protocol Buffers language guide (proto3)](https://protobuf.dev/programming-guides/proto3/)
+- [@grpc/grpc-js](https://github.com/grpc/grpc-node/tree/master/packages/grpc-js)

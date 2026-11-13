@@ -1,0 +1,333 @@
+---
+title: "SQLite Online: Executando consultas SQL"
+kind: lesson
+---
+
+Guardar dados é metade do trabalho; a outra metade é perguntar coisas a eles. "Quais livros estão acabando?", "Qual o preço médio por categoria?", "Quem comprou mais de uma vez?". Cada rota `GET` de uma API com filtros, ordenação e paginação vira, no fim, uma consulta `SELECT`. Este é o segundo capítulo da sequência sobre o banco da livraria: aqui você aprende a escrever consultas de verdade, combinando filtros, ordenação, cálculos, agrupamentos e subconsultas.
+
+**Você vai aprender:**
+
+- Filtrar com operadores combinados, `LIKE`, `IN`, `BETWEEN` e tratar `NULL` corretamente
+- Ordenar, limitar e paginar resultados
+- Criar colunas calculadas com expressões, funções e `CASE`
+- Resumir dados com funções de agregação, `GROUP BY` e `HAVING`
+- Usar subconsultas e levar tudo isso para uma rota Node.js
+
+## O banco de exemplo
+
+Se você não fez o capítulo anterior, cole este script num editor de SQLite no navegador (como o SQLite Online), no `sqlite3` ou no Node.js. Ele cria a livraria com clientes, livros, pedidos e os itens de cada pedido.
+
+```sql
+PRAGMA foreign_keys = ON;
+CREATE TABLE clientes (id INTEGER PRIMARY KEY, nome TEXT NOT NULL, email TEXT NOT NULL UNIQUE, cidade TEXT, criado_em TEXT NOT NULL);
+CREATE TABLE livros (id INTEGER PRIMARY KEY, titulo TEXT NOT NULL, autor TEXT NOT NULL, categoria TEXT NOT NULL, preco REAL NOT NULL CHECK (preco >= 0), estoque INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE pedidos (id INTEGER PRIMARY KEY, cliente_id INTEGER NOT NULL REFERENCES clientes (id), feito_em TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pago' CHECK (status IN ('pago', 'enviado', 'cancelado')));
+CREATE TABLE itens_pedido (pedido_id INTEGER NOT NULL REFERENCES pedidos (id), livro_id INTEGER NOT NULL REFERENCES livros (id), quantidade INTEGER NOT NULL CHECK (quantidade > 0), preco_unitario REAL NOT NULL, PRIMARY KEY (pedido_id, livro_id));
+
+INSERT INTO clientes VALUES
+  (1, 'Ana Souza', 'ana@exemplo.com', 'São Paulo', '2026-01-05'),
+  (2, 'Bruno Lima', 'bruno@exemplo.com', 'Recife', '2026-01-12'),
+  (3, 'Carla Dias', 'carla@exemplo.com', 'São Paulo', '2026-02-03'),
+  (4, 'Diego Rocha', 'diego@exemplo.com', 'Curitiba', '2026-02-20'),
+  (5, 'Elisa Melo', 'elisa@exemplo.com', NULL, '2026-03-01');
+INSERT INTO livros VALUES
+  (1, 'Dom Casmurro', 'Machado de Assis', 'Romance', 39.90, 12),
+  (2, 'Memórias Póstumas de Brás Cubas', 'Machado de Assis', 'Romance', 42.50, 8),
+  (3, 'O Cortiço', 'Aluísio Azevedo', 'Romance', 35.00, 0),
+  (4, 'Iracema', 'José de Alencar', 'Romance', 29.90, 5),
+  (5, 'Sagarana', 'Guimarães Rosa', 'Contos', 54.90, 3),
+  (6, 'A Hora da Estrela', 'Clarice Lispector', 'Romance', 44.90, 7),
+  (7, 'Libertinagem', 'Manuel Bandeira', 'Poesia', 32.00, 4),
+  (8, 'Claro Enigma', 'Carlos Drummond de Andrade', 'Poesia', 48.00, 0);
+INSERT INTO pedidos VALUES
+  (1, 1, '2026-01-10', 'enviado'), (2, 2, '2026-01-15', 'enviado'), (3, 1, '2026-01-28', 'enviado'),
+  (4, 3, '2026-02-05', 'enviado'), (5, 4, '2026-02-21', 'cancelado'), (6, 2, '2026-02-25', 'enviado'),
+  (7, 3, '2026-03-02', 'pago'), (8, 1, '2026-03-10', 'pago'), (9, 4, '2026-03-15', 'pago');
+INSERT INTO itens_pedido VALUES
+  (1, 1, 1, 39.90), (1, 7, 2, 32.00), (2, 5, 1, 54.90), (3, 2, 1, 42.50), (3, 6, 1, 44.90),
+  (4, 1, 2, 39.90), (5, 4, 1, 29.90), (6, 6, 1, 44.90), (6, 7, 1, 32.00), (7, 5, 1, 54.90),
+  (7, 2, 1, 42.50), (8, 1, 1, 39.90), (9, 6, 2, 44.90);
+```
+
+## A ordem das cláusulas
+
+Um `SELECT` completo tem as cláusulas sempre nesta ordem de escrita:
+
+```sql
+SELECT   colunas e expressões
+FROM     tabela
+WHERE    filtro das linhas
+GROUP BY agrupamento
+HAVING   filtro dos grupos
+ORDER BY ordenação
+LIMIT    quantidade  OFFSET  deslocamento;
+```
+
+A ordem em que o banco **executa** é outra, e entender isso explica muitos erros: primeiro `FROM`, depois `WHERE`, `GROUP BY`, `HAVING`, então o `SELECT` calcula as colunas, e por fim `ORDER BY` e `LIMIT`. É por isso que um apelido criado no `SELECT` pode ser usado no `ORDER BY`, mas não no `WHERE` de outros bancos (o SQLite é tolerante com isso, o PostgreSQL não).
+
+## Filtrando com WHERE
+
+O `WHERE` aceita comparações (`=`, `<>`, `<`, `<=`, `>`, `>=`) combinadas com `AND`, `OR` e `NOT`. Atalhos tornam as condições mais legíveis:
+
+```sql
+-- romances entre 35 e 45 reais (BETWEEN inclui os extremos)
+SELECT titulo, autor, preco FROM livros
+WHERE categoria = 'Romance' AND preco BETWEEN 35 AND 45
+ORDER BY preco DESC;
+```
+
+```text
+titulo                           | autor             | preco
+A Hora da Estrela                | Clarice Lispector | 44.9
+Memórias Póstumas de Brás Cubas  | Machado de Assis  | 42.5
+Dom Casmurro                     | Machado de Assis  | 39.9
+O Cortiço                        | Aluísio Azevedo   | 35.0
+```
+
+```sql
+-- autor começa com Machado OU categoria é Poesia ou Contos
+SELECT titulo FROM livros
+WHERE autor LIKE 'Machado%' OR categoria IN ('Poesia', 'Contos');
+
+-- busca por trecho do título
+SELECT titulo FROM livros WHERE titulo LIKE '%estrela%';
+```
+
+No `LIKE`, `%` representa qualquer sequência de caracteres e `_` exatamente um. No SQLite, o `LIKE` ignora maiúsculas e minúsculas, mas só para letras sem acento: `'%ESTRELA%'` encontra "Estrela", e `'%cortiço%'` não encontraria "CORTIÇO". Quando misturar `AND` e `OR`, use parênteses: o `AND` tem precedência e `a OR b AND c` significa `a OR (b AND c)`.
+
+### NULL não é igual a nada
+
+`NULL` representa ausência de valor, e qualquer comparação com ele resulta em "desconhecido", que o `WHERE` trata como falso:
+
+```sql
+SELECT nome FROM clientes WHERE cidade = NULL;   -- nenhuma linha!
+SELECT nome FROM clientes WHERE cidade IS NULL;  -- Elisa Melo
+SELECT nome, coalesce(cidade, 'não informada') AS cidade FROM clientes;
+```
+
+`IS NULL` e `IS NOT NULL` são o jeito certo de testar, e `coalesce` devolve o primeiro valor não nulo da lista, útil para exibir um padrão.
+
+<Callout type="warning" title="NOT IN com NULL na lista">
+`WHERE id NOT IN (SELECT ...)` não devolve **nenhuma** linha se a subconsulta trouxer um único `NULL`, porque `x <> NULL` é desconhecido. Isso acontece com colunas opcionais e é um bug difícil de perceber, já que a consulta roda sem erro. Filtre os nulos dentro da subconsulta (`WHERE coluna IS NOT NULL`) ou use `NOT EXISTS`, que não tem esse problema.
+</Callout>
+
+## Ordenando e paginando
+
+```sql
+-- os 3 livros mais caros
+SELECT titulo, preco FROM livros ORDER BY preco DESC LIMIT 3;
+
+-- a "página 2" com 3 itens por página
+SELECT titulo, preco FROM livros ORDER BY preco DESC LIMIT 3 OFFSET 3;
+
+-- vários critérios: categoria A-Z e, dentro dela, mais caro primeiro
+SELECT categoria, titulo, preco FROM livros ORDER BY categoria, preco DESC;
+
+-- valores distintos
+SELECT DISTINCT categoria FROM livros ORDER BY categoria;
+```
+
+`ORDER BY` é crescente (`ASC`) por padrão. Sem `ORDER BY`, a ordem do resultado não é garantida, nem com `LIMIT`. Numa API, toda paginação precisa de uma ordenação estável: se dois livros têm o mesmo preço, desempate pelo `id` (`ORDER BY preco DESC, id`), senão um item pode aparecer em duas páginas e outro em nenhuma.
+
+## Colunas calculadas e funções
+
+O `SELECT` não só lê colunas: ele calcula. Dê nomes às colunas novas com `AS`.
+
+```sql
+SELECT titulo, preco, estoque,
+       round(preco * estoque, 2) AS valor_em_estoque,
+       CASE
+         WHEN estoque = 0 THEN 'esgotado'
+         WHEN estoque < 5 THEN 'últimas unidades'
+         ELSE 'disponível'
+       END AS situacao
+FROM livros
+ORDER BY valor_em_estoque DESC;
+```
+
+```text
+titulo                           | preco | estoque | valor_em_estoque | situacao
+Dom Casmurro                     | 39.9  | 12      | 478.8            | disponível
+Memórias Póstumas de Brás Cubas  | 42.5  | 8       | 340.0            | disponível
+A Hora da Estrela                | 44.9  | 7       | 314.3            | disponível
+Sagarana                         | 54.9  | 3       | 164.7            | últimas unidades
+...
+```
+
+O `CASE` é o "if" do SQL: avalia as condições em ordem e devolve o valor da primeira verdadeira. Sem o `round`, a primeira linha mostraria `478.79999999999995`, efeito do ponto flutuante (`REAL`), o mesmo que faz `0.1 + 0.2` dar `0.30000000000000004` em JavaScript.
+
+Algumas funções do SQLite que você vai usar sempre:
+
+```sql
+SELECT length(titulo) AS letras,
+       substr(autor, 1, instr(autor, ' ') - 1) AS primeiro_nome,
+       lower(categoria) AS cat,
+       titulo || ' (' || autor || ')' AS rotulo     -- || concatena texto
+FROM livros WHERE id <= 3;
+
+-- datas guardadas como texto AAAA-MM-DD
+SELECT id, feito_em,
+       strftime('%m', feito_em) AS mes,
+       julianday('2026-03-31') - julianday(feito_em) AS dias_ate_fim_do_mes
+FROM pedidos
+WHERE feito_em >= '2026-03-01';
+```
+
+Como as datas estão em formato ISO, comparar com `>=` funciona como texto. `strftime` extrai partes (`%Y` ano, `%m` mês, `%d` dia) e `julianday` converte para número de dias, o que permite subtrair datas. Atenção: `upper` e `lower` no SQLite só convertem letras sem acento.
+
+## Agregação: resumindo muitas linhas em uma
+
+Funções de agregação transformam um conjunto de linhas num único valor: `count`, `sum`, `avg`, `min` e `max`.
+
+```sql
+SELECT count(*)               AS total,
+       count(cidade)          AS com_cidade,
+       count(DISTINCT cidade) AS cidades
+FROM clientes;
+-- 5 | 4 | 3
+```
+
+`count(*)` conta linhas; `count(coluna)` conta só os valores não nulos (por isso 4: a Elisa não tem cidade); `count(DISTINCT coluna)` conta valores diferentes.
+
+Com `GROUP BY`, a agregação é feita por grupo:
+
+```sql
+SELECT categoria,
+       count(*)             AS qtd,
+       round(avg(preco), 2) AS preco_medio,
+       min(preco)           AS mais_barato,
+       max(preco)           AS mais_caro,
+       sum(estoque)         AS estoque
+FROM livros
+GROUP BY categoria
+ORDER BY qtd DESC;
+```
+
+```text
+categoria | qtd | preco_medio | mais_barato | mais_caro | estoque
+Romance   | 5   | 38.44       | 29.9        | 44.9      | 32
+Poesia    | 2   | 40.0        | 32.0        | 48.0      | 4
+Contos    | 1   | 54.9        | 54.9        | 54.9      | 3
+```
+
+A regra de ouro: toda coluna no `SELECT` que não está dentro de uma função de agregação deve estar no `GROUP BY`. O SQLite deixa você quebrar essa regra e devolve um valor de uma linha qualquer do grupo, um resultado silenciosamente errado; o PostgreSQL recusa a consulta.
+
+Para filtrar **grupos**, use `HAVING`, que roda depois da agregação (o `WHERE` roda antes e filtra linhas):
+
+```sql
+SELECT autor, count(*) AS livros
+FROM livros
+WHERE estoque > 0          -- filtra linhas antes de agrupar
+GROUP BY autor
+HAVING count(*) > 1;       -- filtra grupos depois
+-- Machado de Assis | 2
+```
+
+## Subconsultas
+
+Uma subconsulta é um `SELECT` dentro de outro. Ela permite usar o resultado de uma pergunta como entrada de outra:
+
+```sql
+-- livros acima do preço médio (a média é 40.89)
+SELECT titulo, preco FROM livros
+WHERE preco > (SELECT avg(preco) FROM livros)
+ORDER BY preco;
+
+-- livros que nunca foram vendidos
+SELECT titulo FROM livros
+WHERE id NOT IN (SELECT livro_id FROM itens_pedido);
+-- O Cortiço, Claro Enigma
+
+-- clientes com dois ou mais pedidos não cancelados
+SELECT nome FROM clientes
+WHERE id IN (
+  SELECT cliente_id FROM pedidos
+  WHERE status <> 'cancelado'
+  GROUP BY cliente_id
+  HAVING count(*) >= 2
+);
+-- Ana Souza, Bruno Lima, Carla Dias
+```
+
+A primeira é uma subconsulta escalar (devolve um único valor). As outras devolvem uma lista usada com `IN` e `NOT IN`. Muitas subconsultas podem ser reescritas com `JOIN`, que é o assunto do próximo capítulo.
+
+## Consultas numa rota Node.js
+
+Tudo isso vira uma rota de busca. O cuidado é o mesmo de sempre: valores do usuário entram como parâmetros (`?`), nunca concatenados. Colunas de ordenação não podem ser parâmetros, então são validadas contra uma lista fixa.
+
+```javascript
+import express from "express";
+import { DatabaseSync } from "node:sqlite";
+
+const db = new DatabaseSync("livraria.db");
+const app = express();
+
+const ORDENS = { preco: "preco", titulo: "titulo", estoque: "estoque" };
+
+app.get("/livros", (req, res) => {
+  const { q = "", categoria, precoMax, ordem = "titulo" } = req.query;
+  const pagina = Math.max(1, Number(req.query.pagina) || 1);
+  const porPagina = 5;
+
+  const filtros = ["titulo LIKE ?"];
+  const params = [`%${q}%`];
+  if (categoria) { filtros.push("categoria = ?"); params.push(categoria); }
+  if (precoMax)  { filtros.push("preco <= ?");    params.push(Number(precoMax)); }
+
+  const coluna = ORDENS[ordem] ?? "titulo";
+  const sql = `
+    SELECT id, titulo, autor, preco, estoque
+    FROM livros
+    WHERE ${filtros.join(" AND ")}
+    ORDER BY ${coluna}, id
+    LIMIT ? OFFSET ?`;
+
+  const itens = db.prepare(sql).all(...params, porPagina, (pagina - 1) * porPagina);
+  res.json({ pagina, itens });
+});
+
+app.listen(3000);
+```
+
+Teste com `curl 'localhost:3000/livros?categoria=Romance&precoMax=40&ordem=preco'`. Repare que o texto do SQL é montado, mas só com pedaços fixos escritos por você (os filtros e a coluna validada); todo valor vindo da requisição passa pelos `?`.
+
+## Na entrevista
+
+**Qual a diferença entre WHERE e HAVING?** `WHERE` filtra linhas antes do agrupamento; `HAVING` filtra os grupos depois da agregação e pode usar funções como `count(*)`.
+
+**Qual a diferença entre `count(*)` e `count(coluna)`?** `count(*)` conta todas as linhas; `count(coluna)` ignora as linhas em que a coluna é `NULL`.
+
+**Por que `WHERE cidade = NULL` não retorna nada?** Porque comparar com `NULL` resulta em desconhecido, nunca verdadeiro. O teste correto é `IS NULL`.
+
+**Por que paginar com OFFSET fica lento em páginas altas?** O banco precisa ler e descartar todas as linhas anteriores. Para listas grandes, a paginação por cursor (`WHERE id > ultimo_id ORDER BY id LIMIT n`) é mais eficiente.
+
+## Pratique
+
+Usando o banco da livraria, escreva um arquivo `consultas.sql` com uma consulta para cada pergunta, e um comentário com o resultado esperado:
+
+1. Livros de Romance ou Poesia com estoque entre 1 e 7, do mais barato ao mais caro.
+2. Clientes cujo e-mail termina em `@exemplo.com` e que não têm cidade cadastrada.
+3. Para cada status de pedido, quantos pedidos existem e a data do mais recente.
+4. Categorias cujo preço médio passa de 39 reais.
+5. Títulos dos livros que aparecem em pedidos cancelados (com subconsulta).
+
+Depois, acrescente à rota `/livros` um filtro `?autor=` e um parâmetro `?ordem=-preco` para ordem decrescente, sem abrir brecha para SQL injection.
+
+<Quiz question="Qual cláusula filtra resultados depois do agrupamento, usando count(*)?" options={["WHERE","HAVING","ORDER BY","LIMIT"]} answer={1} explanation="HAVING é avaliado depois do GROUP BY e pode usar funções de agregação; WHERE filtra linhas antes." />
+
+<Quiz question="Na tabela clientes, 5 linhas e uma com cidade NULL. Quanto dá count(cidade)?" options={["5","4","1","0"]} answer={1} explanation="count(coluna) ignora valores NULL, então conta apenas as 4 linhas com cidade preenchida." />
+
+<Quiz question="Por que incluir id no ORDER BY de uma paginação por preço?" options={["Para a consulta rodar mais rápido","Para desempatar e manter páginas estáveis","Porque LIMIT exige a chave primária","Para ordenar os ids em ordem decrescente"]} answer={1} explanation="Sem desempate, linhas com o mesmo preço podem trocar de lugar entre consultas e pular ou repetir entre páginas." />
+
+## Base no CodeForge
+
+- [SELECT e WHERE](/learn/sql/select-e-where) e [Operadores e NULL](/learn/sql/operadores-e-null): os mesmos fundamentos em formato de entrevista.
+- [Funções de agregação](/learn/sql/funcoes-de-agregacao) e [GROUP BY e HAVING](/learn/sql/group-by-e-having): agregação com mais exercícios.
+- [Ordenação e paginação](/learn/sql/ordenacao-e-paginacao): paginação por cursor em detalhe.
+- [SQLite online: Conhecendo instruções SQL](/learn/carreira-nodejs/sqlite-online-conhecendo-instrucoes-sql) e [Realizando consultas com SQL: Joins, Views e transações](/learn/carreira-nodejs/realizando-consultas-sql-joins-views-transacoes): o capítulo anterior e o próximo da sequência.
+
+## Referências
+
+- [SQLite: SELECT](https://www.sqlite.org/lang_select.html)
+- [SQLite: Aggregate Functions](https://www.sqlite.org/lang_aggfunc.html)
+- [SQLite: Date And Time Functions](https://www.sqlite.org/lang_datefunc.html)

@@ -1,0 +1,362 @@
+---
+title: "Infraestrutura como código: Montando uma infraestrutura elástica na AWS"
+kind: lesson
+---
+
+Até aqui a API de livros roda em máquinas com nome e IP conhecidos: você as cria, o Ansible as configura, e se uma cai alguém precisa agir. Isso não aguenta um pico de tráfego na Black Friday nem uma máquina que morre às três da manhã. Uma infraestrutura elástica troca máquinas de estimação por um grupo de máquinas descartáveis, atrás de um balanceador, que cresce e encolhe sozinho conforme a carga. Neste capítulo você monta isso inteiro com Terraform: modelo de lançamento, Auto Scaling Group, Application Load Balancer e política de escala.
+
+**Você vai aprender:**
+
+- Por que máquinas elásticas precisam se configurar sozinhas ao nascer
+- Criar um Launch Template com `user_data` que instala e sobe a API
+- Montar Application Load Balancer, target group e health check
+- Criar um Auto Scaling Group com escala por alvo de CPU
+- Testar a elasticidade com carga e trocar a versão sem derrubar o serviço
+
+## De máquinas de estimação a gado
+
+No modelo anterior, cada máquina era configurada depois de criada, por um `ansible-playbook` que você rodava. Num grupo elástico, a AWS cria e destrói máquinas sem perguntar: quando a CPU sobe, uma instância nova aparece; quando uma falha no health check, ela é substituída. Ninguém vai rodar Ansible nessa hora.
+
+Então a regra muda: **cada instância precisa sair pronta, sem intervenção**. Há dois jeitos:
+
+1. **Configurar no boot.** O `user_data` é um script que roda na primeira inicialização (via cloud-init). Ele instala o Node, baixa o código e sobe o serviço. Simples, mas o boot fica lento.
+2. **Imagem pronta (AMI).** Você gera uma imagem com tudo instalado (com Packer, que pode até rodar o seu playbook Ansible por dentro) e o boot só inicia o serviço. Mais rápido e reprodutível.
+
+Comece pelo primeiro, que cabe num arquivo. A consequência importante vale para os dois: a máquina não guarda estado. Upload de arquivo vai para o S3, sessão vai para o banco ou o Redis, log vai para o CloudWatch. Se algo só existe no disco de uma instância, vai sumir quando ela for trocada.
+
+## Preparando a API para viver atrás de um balanceador
+
+O balanceador precisa saber se cada instância está saudável. Dê a ele uma rota barata e sem autenticação. E como o Auto Scaling vai encerrar instâncias, trate o `SIGTERM` para terminar as requisições em andamento antes de sair.
+
+```javascript
+// src/server.js (Express 5, Node 22)
+import express from "express";
+
+const app = express();
+app.use(express.json());
+
+let encerrando = false;
+
+app.get("/health", (req, res) => {
+  if (encerrando) return res.status(503).json({ status: "encerrando" });
+  res.json({ status: "ok", instancia: process.env.INSTANCE_ID ?? "local" });
+});
+
+app.get("/livros", (req, res) => {
+  res.json([{ id: 1, titulo: "Dom Casmurro" }]);
+});
+
+const server = app.listen(process.env.PORT ?? 3000, () => {
+  console.log("API ouvindo na porta", server.address().port);
+});
+
+process.on("SIGTERM", () => {
+  encerrando = true;
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 25_000).unref();
+});
+```
+
+Devolver `503` no health check durante o encerramento faz o balanceador parar de mandar tráfego antes de a instância sumir.
+
+## Rede: usando a VPC padrão
+
+Para focar na elasticidade, use a VPC padrão da conta, que já tem uma subnet pública por zona de disponibilidade. Em produção você criaria a sua VPC com subnets privadas para as instâncias (o capítulo de VPC da carreira cobre isso).
+
+```hcl
+data "aws_vpc" "padrao" {
+  default = true
+}
+
+data "aws_subnets" "padrao" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.padrao.id]
+  }
+}
+```
+
+Dois security groups: o do balanceador aceita a internet na porta 80; o das instâncias aceita a porta 3000 **só vindo do balanceador**.
+
+```hcl
+resource "aws_security_group" "alb" {
+  name   = "api-livros-alb"
+  vpc_id = data.aws_vpc.padrao.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "app" {
+  name   = "api-livros-app"
+  vpc_id = data.aws_vpc.padrao.id
+
+  ingress {
+    from_port       = 3000
+    to_port         = 3000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+```
+
+## Launch Template: a receita de cada instância
+
+O Launch Template diz como criar uma instância: AMI, tipo, security group, perfil IAM e o script de boot. O script é um template com variáveis, renderizado pelo `templatefile`:
+
+```bash
+#!/bin/bash
+# templates/user_data.sh.tftpl
+set -euxo pipefail
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs git
+
+useradd --system --create-home api || true
+git clone --depth 1 --branch ${versao} ${repo} /opt/api-livros
+cd /opt/api-livros && npm ci --omit=dev
+chown -R api:api /opt/api-livros
+
+cat > /etc/systemd/system/api-livros.service <<EOF
+[Unit]
+Description=API de livros
+After=network.target
+
+[Service]
+User=api
+WorkingDirectory=/opt/api-livros
+Environment=NODE_ENV=production PORT=3000
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now api-livros
+```
+
+```hcl
+resource "aws_launch_template" "api" {
+  name_prefix   = "api-livros-"
+  image_id      = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+
+  vpc_security_group_ids = [aws_security_group.app.id]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.api.name # com AmazonSSMManagedInstanceCore
+  }
+
+  user_data = base64encode(templatefile("${path.module}/templates/user_data.sh.tftpl", {
+    repo   = "https://github.com/minha-org/api-livros.git"
+    versao = var.versao_app
+  }))
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "api-livros", Projeto = "api-livros" }
+  }
+}
+```
+
+O perfil IAM com `AmazonSSMManagedInstanceCore` permite entrar na máquina pelo Session Manager quando precisar investigar algo, sem abrir a porta 22. O `data.aws_ami.ubuntu` é o mesmo do capítulo anterior.
+
+## Application Load Balancer
+
+O ALB recebe as requisições e distribui entre as instâncias registradas num target group. O health check do target group é o que decide quem recebe tráfego.
+
+```hcl
+resource "aws_lb" "api" {
+  name               = "api-livros"
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = data.aws_subnets.padrao.ids
+}
+
+resource "aws_lb_target_group" "api" {
+  name                 = "api-livros"
+  port                 = 3000
+  protocol             = "HTTP"
+  vpc_id               = data.aws_vpc.padrao.id
+  deregistration_delay = 30
+
+  health_check {
+    path                = "/health"
+    matcher             = "200"
+    interval            = 15
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.api.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+}
+
+output "url" {
+  value = "http://${aws_lb.api.dns_name}"
+}
+```
+
+O `deregistration_delay` de 30 segundos dá tempo de a instância terminar as requisições abertas antes de sair, casando com o tratamento de `SIGTERM` na API. Em produção, adicione um listener HTTPS na porta 443 com certificado do ACM e redirecione o 80 para ele.
+
+## Auto Scaling Group
+
+O ASG mantém o número de instâncias entre um mínimo e um máximo, distribuídas pelas zonas, e as registra sozinho no target group.
+
+```hcl
+resource "aws_autoscaling_group" "api" {
+  name                      = "api-livros"
+  min_size                  = 2
+  max_size                  = 6
+  desired_capacity          = 2
+  vpc_zone_identifier       = data.aws_subnets.padrao.ids
+  target_group_arns         = [aws_lb_target_group.api.arn]
+  health_check_type         = "ELB"
+  health_check_grace_period = 120
+
+  launch_template {
+    id      = aws_launch_template.api.id
+    version = aws_launch_template.api.latest_version
+  }
+
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "api-livros"
+    propagate_at_launch = true
+  }
+}
+```
+
+Três detalhes fazem diferença:
+
+- `min_size = 2` em zonas diferentes garante que uma zona inteira pode cair sem tirar a API do ar.
+- `health_check_type = "ELB"` faz o ASG substituir instâncias que falham no health check da aplicação, não só as que travaram no nível da máquina.
+- `health_check_grace_period` dá tempo ao `user_data` de instalar tudo antes de a instância ser julgada. Se for curto demais, o ASG mata a instância antes de ela ficar pronta, e cria outra, e mata de novo.
+
+<Callout type="warning" title="O loop de instâncias que nunca ficam saudáveis">
+Se o `user_data` falha (um pacote que não instala, uma porta errada), cada instância nova falha no health check e é substituída, para sempre, e você paga por cada uma. Antes de subir o ASG, teste o script numa instância avulsa e leia o log em `/var/log/cloud-init-output.log`. Confira também se a porta do target group é a mesma em que a API escuta.
+</Callout>
+
+## Política de escala por alvo
+
+A forma mais simples e robusta de escalar é a target tracking: você define um alvo para uma métrica e a AWS adiciona ou remove instâncias para mantê-la perto do alvo.
+
+```hcl
+resource "aws_autoscaling_policy" "cpu" {
+  name                   = "cpu-50"
+  autoscaling_group_name = aws_autoscaling_group.api.name
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 50
+  }
+}
+```
+
+Com CPU média acima de 50%, o grupo cresce; abaixo, encolhe, sempre dentro de `min_size` e `max_size`. Para APIs que esperam muito por I/O (banco, outros serviços), a CPU pode ficar baixa mesmo sob carga. Nesse caso use `ALBRequestCountPerTarget` como métrica, com um `resource_label` apontando para o ALB e o target group.
+
+## Testando a elasticidade
+
+Aplique, espere as instâncias ficarem saudáveis e gere carga:
+
+```bash
+terraform apply
+URL=$(terraform output -raw url)
+curl "$URL/health"
+
+npx autocannon -c 200 -d 300 "$URL/livros"
+```
+
+Acompanhe no console do EC2 (aba Activity do ASG) ou pela CLI:
+
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names api-livros \
+  --query "AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState,HealthStatus]" \
+  --output table
+```
+
+Alguns minutos de CPU alta disparam a criação de instâncias; quando a carga para, o grupo volta ao mínimo depois de um período de estabilização. Repetir `curl "$URL/health"` mostra o `instancia` mudando, prova de que o balanceador está distribuindo.
+
+## Trocando a versão sem downtime
+
+Para publicar uma versão nova, mude `var.versao_app` e aplique. O Terraform cria uma nova versão do Launch Template, e o bloco `instance_refresh` faz o ASG substituir as instâncias aos poucos, mantendo pelo menos 50% saudáveis. É um rolling deploy declarado em código.
+
+```bash
+terraform apply -var="versao_app=v1.3.0"
+aws autoscaling describe-instance-refreshes --auto-scaling-group-name api-livros
+```
+
+## Na entrevista
+
+**O que é um Auto Scaling Group e por que ele precisa de health check do ELB?** É um grupo que mantém um número de instâncias entre mínimo e máximo. Com health check do ELB, ele troca instâncias cuja aplicação parou de responder, não só as que pararam no nível do hardware.
+
+**Por que instâncias de um grupo elástico não podem guardar estado?** Porque podem ser destruídas a qualquer momento por escala ou falha. Estado vai para serviços gerenciados (S3, RDS, ElastiCache).
+
+**Qual a diferença entre target tracking e step scaling?** Target tracking mantém uma métrica perto de um alvo e calcula sozinho quanto escalar. Step scaling exige que você defina alarmes e degraus manualmente.
+
+**Como fazer deploy sem downtime nesse modelo?** Nova versão do Launch Template e instance refresh em rolling, com health check e `deregistration_delay` para drenar conexões.
+
+## Pratique
+
+Monte a infraestrutura elástica da API de livros e entregue:
+
+1. Código Terraform com Launch Template, ALB, target group, ASG (mínimo 2, máximo 6) e política de CPU a 50%.
+2. A API com rota `/health` e tratamento de `SIGTERM`.
+3. Um print ou saída da CLI mostrando o grupo crescendo durante um teste com `autocannon` e voltando ao mínimo depois.
+4. Um rolling deploy de `v1` para `v2` com `instance_refresh`, e um `curl` em loop durante a troca sem nenhuma resposta diferente de 200.
+
+Destrua tudo com `terraform destroy` no fim: ALB parado também é cobrado.
+
+<Quiz question="Por que o health_check_grace_period importa num ASG com user_data?" options={["Ele define quanto tempo o ALB espera por uma resposta","Ele dá tempo de a instância terminar o boot antes de ser julgada saudável ou não","Ele limita quantas instâncias podem ser criadas por minuto","Ele controla o intervalo entre verificações do health check"]} answer={1} explanation="Sem um período de carência suficiente, o ASG considera a instância doente enquanto o user_data ainda instala dependências e a substitui num loop." />
+<Quiz question="Qual regra de security group é a mais segura para as instâncias atrás do ALB?" options={["Porta 3000 aberta para 0.0.0.0/0","Porta 3000 aberta só para a VPC inteira","Porta 3000 aberta só para o security group do ALB","Todas as portas abertas para o security group do ALB"]} answer={2} explanation="Referenciar o security group do balanceador garante que só ele alcança a aplicação, e só na porta necessária." />
+<Quiz question="Uma API que passa a maior parte do tempo esperando o banco está lenta, mas a CPU média está em 20%. Que métrica de escala faz mais sentido?" options={["ASGAverageCPUUtilization com alvo de 10%","ALBRequestCountPerTarget","ASGAverageNetworkIn","Nenhuma, escala só funciona com CPU"]} answer={1} explanation="Para cargas presas em I/O, requisições por alvo refletem melhor a carga real do que a CPU." />
+
+## Base no CodeForge
+
+- [Infraestrutura como código: Separando ambientes na AWS com Ansible e Terraform](/learn/carreira-nodejs/infraestrutura-como-codigo-separando-ambientes-aws-ansible): o módulo e o estado remoto que este capítulo pressupõe.
+- [Amazon EC2: Alta disponibilidade e escalabilidade](/learn/carreira-nodejs/amazon-ec2-alta-disponibilidade-escalabilidade-aplicacao): os mesmos conceitos feitos pelo console.
+- [Balanceamento via DNS](/learn/system-design/dns-load-balancing): como a carga é distribuída entre servidores.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): rolling, blue/green e canary.
+
+## Referências
+
+- [Amazon EC2 Auto Scaling: o que é](https://docs.aws.amazon.com/autoscaling/ec2/userguide/what-is-amazon-ec2-auto-scaling.html)
+- [Target tracking scaling policies](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
+- [Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html)
+- [Terraform: aws_autoscaling_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/autoscaling_group)

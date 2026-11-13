@@ -1,0 +1,364 @@
+---
+title: "Swagger: Documentando APIs REST com OpenAPI"
+kind: lesson
+---
+
+Uma API sem documentação obriga o time de front-end, o parceiro que vai integrar e você mesmo daqui a seis meses a ler o código para descobrir quais campos mandar e o que volta. Documentação escrita à mão num wiki fica desatualizada na primeira mudança. O OpenAPI resolve isso com um contrato em YAML ou JSON que descreve cada rota, parâmetro e resposta, e que ferramentas conseguem ler: o Swagger UI gera uma página interativa, validadores checam requisições e geradores criam clientes tipados. Neste capítulo você documenta a API de livros e coloca esse contrato para trabalhar.
+
+**Você vai aprender:**
+
+- A diferença entre OpenAPI (a especificação) e Swagger (as ferramentas)
+- A estrutura de um documento OpenAPI 3.1: `paths`, `components` e `$ref`
+- Servir o Swagger UI numa API Express
+- Documentar autenticação, erros e paginação
+- Usar o contrato para validar requisições e gerar tipos
+
+## OpenAPI e Swagger
+
+**OpenAPI** é a especificação: um formato padronizado para descrever APIs HTTP. **Swagger** é o nome original dela e hoje é a marca de um conjunto de ferramentas (Swagger UI, Swagger Editor). Quando alguém diz "o Swagger da API", quase sempre quer dizer "o documento OpenAPI exibido no Swagger UI".
+
+A versão atual é a 3.1, alinhada com o JSON Schema. Você ainda vai encontrar muito 3.0 e alguns projetos antigos em 2.0 (que se chamava Swagger 2.0). A estrutura de alto nível é:
+
+| Chave | Para que serve |
+|---|---|
+| `openapi` | Versão da especificação, como `3.1.0` |
+| `info` | Título, versão da API, descrição, contato |
+| `servers` | URLs base (local, homologação, produção) |
+| `paths` | Cada rota e cada método HTTP |
+| `components` | Peças reutilizáveis: schemas, parâmetros, respostas, esquemas de segurança |
+| `security` | Autenticação exigida por padrão |
+| `tags` | Agrupamento das rotas na interface |
+
+## Design-first ou code-first
+
+Há duas formas de chegar ao documento:
+
+- **Design-first:** você escreve o `openapi.yaml` primeiro, discute com quem vai consumir e só então implementa. O contrato é a fonte da verdade.
+- **Code-first:** você anota o código (comentários JSDoc com `swagger-jsdoc`, decorators no Nest.js) e uma ferramenta gera o documento.
+
+Code-first é cômodo, mas espalha YAML em comentários e tende a documentar o que o código faz, não o que deveria fazer. Design-first combina melhor com validação automática, que você verá adiante. Este capítulo segue design-first.
+
+## Um documento mínimo
+
+```yaml
+# openapi.yaml
+openapi: 3.1.0
+info:
+  title: API de Livros
+  version: 1.0.0
+  description: Catálogo e empréstimos de livros.
+servers:
+  - url: http://localhost:3000
+    description: Local
+tags:
+  - name: Livros
+paths:
+  /livros/{id}:
+    get:
+      tags: [Livros]
+      summary: Busca um livro pelo id
+      operationId: buscarLivro
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Livro encontrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  titulo: { type: string }
+                  preco: { type: number }
+        "404":
+          description: Livro não encontrado
+```
+
+Cada operação tem um `operationId` único (geradores de cliente usam como nome de função), parâmetros com `in` (`path`, `query`, `header` ou `cookie`) e respostas indexadas pelo código HTTP entre aspas. Repare que as chaves das respostas são strings: `"200"`, não `200`.
+
+## Reaproveitando com components e $ref
+
+Repetir o schema do livro em cada rota é pedir para as cópias divergirem. Declare uma vez em `components` e aponte com `$ref`.
+
+```yaml
+components:
+  schemas:
+    Livro:
+      type: object
+      required: [id, titulo, preco]
+      properties:
+        id: { type: integer, readOnly: true, examples: [1] }
+        titulo: { type: string, minLength: 2, maxLength: 200, examples: [Dom Casmurro] }
+        autorId: { type: integer }
+        paginas: { type: integer, minimum: 1 }
+        preco: { type: number, minimum: 0, examples: [39.9] }
+        isbn: { type: [string, "null"], pattern: "^[0-9]{13}$" }
+    LivroEntrada:
+      type: object
+      required: [titulo, autorId, preco]
+      additionalProperties: false
+      properties:
+        titulo: { $ref: "#/components/schemas/Livro/properties/titulo" }
+        autorId: { type: integer }
+        paginas: { type: integer, minimum: 1 }
+        preco: { type: number, minimum: 0 }
+        isbn: { type: string, pattern: "^[0-9]{13}$" }
+    Erro:
+      type: object
+      required: [erro]
+      properties:
+        erro: { type: string }
+        detalhes:
+          type: array
+          items:
+            type: object
+            properties:
+              campo: { type: string }
+              mensagem: { type: string }
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+  responses:
+    NaoEncontrado:
+      description: Recurso não encontrado
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Erro" }
+    EntradaInvalida:
+      description: Corpo ou parâmetros inválidos
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Erro" }
+```
+
+Dois schemas para o mesmo recurso não é exagero: o que entra (`LivroEntrada`, sem `id`, com `additionalProperties: false` para recusar campos extras) é diferente do que sai (`Livro`, com `id` somente leitura). No OpenAPI 3.1, campo anulável é escrito como tipo em lista, `[string, "null"]`. No 3.0 era `nullable: true`.
+
+Com isso as rotas ficam curtas:
+
+```yaml
+paths:
+  /livros:
+    get:
+      tags: [Livros]
+      summary: Lista livros com paginação
+      operationId: listarLivros
+      parameters:
+        - name: pagina
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: limite
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+      responses:
+        "200":
+          description: Página de livros
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dados:
+                    type: array
+                    items: { $ref: "#/components/schemas/Livro" }
+                  total: { type: integer }
+                  pagina: { type: integer }
+    post:
+      tags: [Livros]
+      summary: Cadastra um livro
+      operationId: criarLivro
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LivroEntrada" }
+      responses:
+        "201":
+          description: Criado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Livro" }
+        "400": { $ref: "#/components/responses/EntradaInvalida" }
+        "401": { description: Token ausente ou inválido }
+  /livros/{id}:
+    parameters:
+      - $ref: "#/components/parameters/IdPath"
+    get:
+      tags: [Livros]
+      operationId: buscarLivro
+      responses:
+        "200":
+          description: Livro encontrado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Livro" }
+        "404": { $ref: "#/components/responses/NaoEncontrado" }
+```
+
+Parâmetros declarados no nível do caminho (`/livros/{id}`) valem para todos os métodos dele.
+
+## Documentando autenticação
+
+O esquema de segurança é declarado em `components.securitySchemes` e referenciado por nome.
+
+```yaml
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+# Opcional: exigir em todas as rotas por padrão
+security:
+  - bearerAuth: []
+```
+
+Com `security` global, rotas públicas sobrescrevem com uma lista vazia (`security: []`). No Swagger UI aparece o botão **Authorize**, onde você cola o token e todas as chamadas de teste passam a enviá-lo. Outros tipos comuns são `apiKey` (em header, query ou cookie) e `oauth2` com os fluxos descritos.
+
+## Servindo o Swagger UI no Express
+
+```bash
+npm install swagger-ui-express yaml
+```
+
+```javascript
+// src/docs.js
+import fs from "node:fs";
+import { parse } from "yaml";
+import swaggerUi from "swagger-ui-express";
+import { Router } from "express";
+
+const especificacao = parse(fs.readFileSync(new URL("../openapi.yaml", import.meta.url), "utf8"));
+
+export const docsRouter = Router();
+docsRouter.get("/openapi.json", (req, res) => res.json(especificacao));
+docsRouter.use("/docs", swaggerUi.serve, swaggerUi.setup(especificacao, {
+  swaggerOptions: { persistAuthorization: true },
+}));
+```
+
+```javascript
+// src/app.js
+import { docsRouter } from "./docs.js";
+app.use(docsRouter);
+```
+
+Abra `http://localhost:3000/docs`: cada rota aparece agrupada pela tag, com o botão **Try it out** para chamar a API de verdade. Expor também `/openapi.json` permite que outras ferramentas (Postman, Insomnia, geradores de cliente) importem o contrato direto da URL.
+
+<Callout type="warning" title="Documentação que mente é pior que nenhuma">
+O erro mais comum é o contrato descrever uma coisa e a API fazer outra: um campo renomeado no código e esquecido no YAML, um 422 que nunca foi documentado. Quem consome confia no documento e quebra em produção. Ligue o contrato ao código: valide requisições contra ele, rode um linter no CI e, se possível, teste respostas reais contra os schemas.
+</Callout>
+
+## O contrato trabalhando por você
+
+### Validação automática de requisições
+
+O pacote `express-openapi-validator` lê o documento e rejeita requisições que não batem com ele, antes de chegar ao seu controller.
+
+```bash
+npm install express-openapi-validator
+```
+
+```javascript
+import * as OpenApiValidator from "express-openapi-validator";
+
+app.use(express.json());
+app.use(
+  OpenApiValidator.middleware({
+    apiSpec: "./openapi.yaml",
+    validateRequests: true,
+    validateResponses: process.env.NODE_ENV !== "production",
+  }),
+);
+// ... rotas
+
+app.use((err, req, res, next) => {
+  if (err.status && err.errors) {
+    return res.status(err.status).json({
+      erro: err.message,
+      detalhes: err.errors.map((e) => ({ campo: e.path, mensagem: e.message })),
+    });
+  }
+  next(err);
+});
+```
+
+Agora um `POST /livros` sem `titulo`, com `preco` negativo ou com um campo não previsto volta 400 automaticamente, e o documento passa a ser a fonte da verdade de fato. Validar respostas em desenvolvimento e teste pega o caso em que o código devolve algo fora do contrato.
+
+### Lint do documento
+
+O Redocly CLI verifica se o YAML é válido e aponta problemas como `operationId` duplicado, resposta sem descrição ou `$ref` quebrado.
+
+```bash
+npx @redocly/cli lint openapi.yaml
+```
+
+Coloque esse comando no CI. Um contrato inválido não chega à `main`.
+
+### Tipos para o cliente
+
+Com `openapi-typescript`, o front-end gera tipos TypeScript a partir do contrato e passa a ter autocompletar e erro de compilação quando a API muda.
+
+```bash
+npx openapi-typescript http://localhost:3000/openapi.json -o src/api/schema.d.ts
+```
+
+```typescript
+import type { components } from "./api/schema";
+
+type Livro = components["schemas"]["Livro"];
+```
+
+## Boas práticas de documentação
+
+- **Descreva os erros**, não só o caminho feliz. 400, 401, 403, 404, 409 e 422 são parte do contrato.
+- **Dê exemplos** com `examples`. Eles aparecem no Swagger UI e facilitam o primeiro teste.
+- **Versione a API** em `info.version` e, quando houver mudança incompatível, no caminho (`/v2`) ou num header.
+- **Divida arquivos grandes** com `$ref` externo (`$ref: "./schemas/livro.yaml"`) e junte com `npx @redocly/cli bundle openapi.yaml -o dist/openapi.yaml`.
+- **Decida se a doc fica pública.** Em APIs internas, proteja `/docs` atrás de autenticação ou só sirva fora de produção.
+
+## Na entrevista
+
+**Qual a diferença entre OpenAPI e Swagger?** OpenAPI é a especificação do formato. Swagger é o nome antigo da especificação e hoje nomeia ferramentas como o Swagger UI, que exibe um documento OpenAPI.
+
+**Design-first ou code-first?** Design-first define o contrato antes, facilita trabalho em paralelo entre front e back e permite validar requisições pelo contrato. Code-first gera a doc do código, é mais rápido no início mas tende a documentar a implementação, não a intenção.
+
+**Como garantir que a documentação não fica desatualizada?** Fazer o contrato ser usado em runtime (validação de requisições), testar respostas contra os schemas e rodar lint no CI. Documento que nada consome envelhece.
+
+## Pratique
+
+Documente a API de livros dos capítulos anteriores e entregue:
+
+1. `openapi.yaml` em 3.1 cobrindo `GET/POST /livros`, `GET/PUT/DELETE /livros/{id}` e `POST /emprestimos`.
+2. Schemas separados de entrada e saída, resposta de erro padronizada e paginação descrita.
+3. `bearerAuth` aplicado nas rotas de escrita.
+4. Swagger UI em `/docs` e `express-openapi-validator` rejeitando corpo inválido.
+5. Um script `npm run docs:lint` com o Redocly e uma captura de tela do Swagger UI no README.
+
+<Quiz question="Como declarar um campo que pode ser texto ou nulo no OpenAPI 3.1?" options={["nullable true junto de type string","type com a lista string e null","required false no campo","format nullable no schema"]} answer={1} explanation="O 3.1 segue o JSON Schema: o tipo vira uma lista com string e null. nullable true é a forma do OpenAPI 3.0." />
+
+<Quiz question="Para que serve o operationId?" options={["Define a ordem das rotas na interface","Identifica a operação de forma única, usado como nome em geradores","Liga a rota a um esquema de segurança","Indica a versão da operação"]} answer={1} explanation="O operationId é um identificador único da operação. Geradores de clientes e SDKs costumam usá-lo como nome do método." />
+
+<Quiz question="Uma rota pública num documento com security global de bearerAuth deve declarar o quê?" options={["security com lista vazia","bearerAuth com escopo público","Nada, rotas GET são públicas","Um securityScheme do tipo none"]} answer={0} explanation="Uma lista vazia em security na operação sobrescreve o requisito global e marca a rota como pública." />
+
+## Base no CodeForge
+
+- [REST](/learn/system-design/rest) e [O que é uma API](/learn/system-design/o-que-e-api): os princípios que o contrato descreve.
+- [Estilos de API](/learn/system-design/estilos-de-api): onde OpenAPI se encaixa ao lado de GraphQL e gRPC.
+- [Node.js: Lidando com buscas, filtros, paginação e erros em uma API](/learn/carreira-nodejs/nodejs-lidando-buscas-filtros-paginacao-erros-api): a paginação e os erros que você documentou aqui.
+
+## Referências
+
+- [OpenAPI Specification 3.1.0](https://spec.openapis.org/oas/v3.1.0)
+- [Swagger: What is OpenAPI](https://swagger.io/docs/specification/v3_0/about/)
+- [swagger-ui-express](https://github.com/scottie1984/swagger-ui-express)

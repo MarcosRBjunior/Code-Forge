@@ -1,0 +1,307 @@
+---
+title: "Cloud: Realize o deploy de aplicações na AWS"
+kind: lesson
+---
+
+Enquanto a API roda só em `localhost`, ela não existe para ninguém. Fazer deploy é colocar o código num servidor acessível, com banco, segredos e um jeito de atualizar sem dor. A AWS é a nuvem mais usada no mercado e aparece em boa parte das vagas back-end, mas o catálogo de centenas de serviços assusta. Neste capítulo você faz o primeiro deploy da API de livros na AWS do jeito mais transparente possível (uma máquina virtual EC2 rodando o container da API, com banco no RDS) e conhece a alternativa gerenciada com Elastic Beanstalk.
+
+**Você vai aprender:**
+
+- Escolher entre EC2, Elastic Beanstalk, ECS e Lambda para uma API Node.js
+- Configurar a AWS CLI com credenciais seguras
+- Subir uma instância EC2, liberar portas com security groups e rodar a API em container
+- Criar um PostgreSQL no RDS e guardar segredos no Parameter Store
+- Controlar custos e apagar o que não usa
+
+## Onde rodar uma API Node.js na AWS
+
+| Serviço | O que você gerencia | Bom para |
+|---|---|---|
+| EC2 | A máquina inteira: sistema, Node, atualizações | Aprender, controle total, cargas estáveis |
+| Elastic Beanstalk | Só o código; ele cria EC2, balanceador e escalonamento | Subir rápido sem montar infraestrutura |
+| ECS com Fargate | A imagem do container e a definição da tarefa | Containers em produção sem servidores para cuidar |
+| Lambda | Funções que rodam por requisição | Tráfego irregular, eventos, APIs pequenas |
+
+Todas acabam rodando seu código em servidores da AWS. A diferença é quanto trabalho operacional fica com você. Começar pelo EC2 ensina o que os outros serviços automatizam: rede, portas, processos, logs. Os capítulos do Nível 3 desta carreira aprofundam ECS, Beanstalk e infraestrutura como código.
+
+## Conceitos que você vai usar
+
+- **Região** (como `sa-east-1`, São Paulo) é onde os recursos ficam. Quase tudo na AWS é regional.
+- **VPC** é a rede privada da sua conta. Toda conta tem uma VPC padrão com sub-redes públicas, suficiente para começar.
+- **Security group** é um firewall por recurso: lista o que pode entrar (regras de entrada) por porta e origem.
+- **IAM** controla quem pode fazer o quê: usuários, papéis (roles) e políticas.
+- **AMI** é a imagem do sistema operacional usada para criar a instância.
+
+## Preparando a conta e a CLI
+
+Nunca use o usuário raiz (o e-mail de criação da conta) no dia a dia. Ative MFA nele, crie um acesso administrativo pelo IAM Identity Center e use esse acesso na CLI.
+
+```bash
+# Instale a AWS CLI v2 e configure o login por SSO
+aws configure sso
+# Siga o assistente: URL de início, região, conta e permissão; dê um nome ao perfil, ex.: estudos
+
+export AWS_PROFILE=estudos
+aws sts get-caller-identity   # confirma quem você é
+```
+
+Se você só tiver chaves de acesso de um usuário IAM, `aws configure` também funciona, mas chaves de longa duração são o tipo de credencial que mais vaza. Prefira SSO.
+
+Configure também um alerta de custo antes de criar qualquer coisa: no console, **Billing and Cost Management, Budgets**, um orçamento mensal pequeno com aviso por e-mail.
+
+## Preparando a aplicação para a nuvem
+
+Algumas mudanças fazem a diferença entre "roda no meu computador" e "roda em qualquer servidor":
+
+```javascript
+// src/server.js
+import { app } from "./app.js";
+import { sequelize } from "./database/index.js";
+import { config } from "./config/env.js";
+
+app.get("/health", async (req, res) => {
+  try {
+    await sequelize.authenticate();
+    res.json({ status: "ok" });
+  } catch {
+    res.status(503).json({ status: "banco indisponível" });
+  }
+});
+
+await sequelize.authenticate();
+const servidor = app.listen(config.PORT, "0.0.0.0", () => console.log(`Ouvindo na porta ${config.PORT}`));
+
+// Encerramento gracioso: termina as requisições em andamento antes de sair
+process.on("SIGTERM", () => {
+  servidor.close(async () => {
+    await sequelize.close();
+    process.exit(0);
+  });
+});
+```
+
+- **Porta e banco por variável de ambiente**, como no capítulo de fluxo de desenvolvimento. Em produção o banco será PostgreSQL: instale o driver `pg`, crie a conexão com `new Sequelize(config.DATABASE_URL)` e, no `config.cjs` das migrações, use `production: { use_env_variable: "DATABASE_URL", dialect: "postgres" }`.
+- **`/health`** permite que balanceadores e você mesmo saibam se a API está viva.
+- **`SIGTERM`** é o sinal que Docker, ECS e Beanstalk enviam antes de parar o processo.
+- **Nada em disco local.** Uploads vão para o S3 e o banco é externo. A instância pode ser substituída a qualquer momento.
+
+Como a API vai rodar em container, use o estágio `producao` do Dockerfile do capítulo anterior.
+
+## Deploy em EC2
+
+### 1. Security group
+
+```bash
+VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query "Vpcs[0].VpcId" --output text)
+
+SG_API=$(aws ec2 create-security-group --group-name api-livros \
+  --description "API de livros" --vpc-id "$VPC_ID" --query GroupId --output text)
+
+MEU_IP=$(curl -s https://checkip.amazonaws.com)
+
+# SSH só do seu IP; HTTP aberto para o mundo
+aws ec2 authorize-security-group-ingress --group-id "$SG_API" --protocol tcp --port 22 --cidr "$MEU_IP/32"
+aws ec2 authorize-security-group-ingress --group-id "$SG_API" --protocol tcp --port 80 --cidr 0.0.0.0/0
+```
+
+### 2. Par de chaves e instância
+
+```bash
+aws ec2 create-key-pair --key-name api-livros --query KeyMaterial --output text > api-livros.pem
+chmod 400 api-livros.pem
+
+aws ec2 run-instances \
+  --image-id resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --instance-type t3.micro \
+  --key-name api-livros \
+  --security-group-ids "$SG_API" \
+  --user-data file://user-data.sh \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=api-livros}]'
+```
+
+O `resolve:ssm:` busca o id da AMI mais recente do Amazon Linux 2023, sem você precisar procurar o id por região. O `user-data` é um script que roda como root na primeira inicialização:
+
+```bash
+#!/bin/bash
+# user-data.sh
+dnf update -y
+dnf install -y docker git
+systemctl enable --now docker
+usermod -aG docker ec2-user
+```
+
+### 3. Rodando a API
+
+Pegue o IP público e conecte:
+
+```bash
+IP=$(aws ec2 describe-instances --filters Name=tag:Name,Values=api-livros Name=instance-state-name,Values=running \
+  --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+ssh -i api-livros.pem ec2-user@"$IP"
+```
+
+Na instância:
+
+```bash
+git clone https://github.com/voce/api-livros.git && cd api-livros
+docker build --target producao -t api-livros .
+docker run -d --name api --restart unless-stopped \
+  -p 80:3000 \
+  --env-file /home/ec2-user/api.env \
+  api-livros
+curl localhost/health
+```
+
+`--restart unless-stopped` faz o Docker subir a API de novo se ela cair ou se a máquina reiniciar. A porta 80 da instância aponta para a 3000 do container. Acesse `http://IP/livros` do seu computador.
+
+<Callout type="warning" title="Porta 22 aberta e recursos esquecidos">
+Os dois erros mais caros do primeiro deploy: liberar SSH para `0.0.0.0/0` (robôs tentam senhas em qualquer IP público em minutos) e esquecer recursos ligados. Libere a porta 22 só para o seu IP, ou dispense SSH usando o Session Manager do Systems Manager. E ao terminar o estudo, encerre a instância, apague o banco e libere IPs elásticos: recurso parado ainda pode cobrar, como disco e IP reservado sem uso.
+</Callout>
+
+## Banco gerenciado com RDS
+
+Rodar PostgreSQL na mesma instância funciona, mas você passa a cuidar de backup, atualização e disco. O RDS faz isso por você.
+
+```bash
+SG_DB=$(aws ec2 create-security-group --group-name livros-db \
+  --description "Banco da API" --vpc-id "$VPC_ID" --query GroupId --output text)
+
+# Só quem está no security group da API entra na porta 5432
+aws ec2 authorize-security-group-ingress --group-id "$SG_DB" \
+  --protocol tcp --port 5432 --source-group "$SG_API"
+
+aws rds create-db-instance \
+  --db-instance-identifier livros-db \
+  --engine postgres \
+  --db-instance-class db.t4g.micro \
+  --allocated-storage 20 \
+  --master-username livros \
+  --manage-master-user-password \
+  --vpc-security-group-ids "$SG_DB" \
+  --no-publicly-accessible \
+  --backup-retention-period 7
+
+aws rds wait db-instance-available --db-instance-identifier livros-db
+aws rds describe-db-instances --db-instance-identifier livros-db \
+  --query "DBInstances[0].Endpoint.Address" --output text
+```
+
+Três decisões de segurança aparecem aqui:
+
+- **`--no-publicly-accessible`**: o banco não recebe IP público. Só alcança quem está dentro da VPC.
+- **`--source-group`**: a regra de entrada referencia o security group da API, não um IP. Qualquer instância da API entra; o resto da internet não.
+- **`--manage-master-user-password`**: a AWS gera a senha e guarda no Secrets Manager, então ela não aparece no seu terminal nem no histórico.
+
+## Segredos fora do servidor
+
+Escrever a `DATABASE_URL` num arquivo na instância funciona, mas espalha segredos por máquinas. O Parameter Store do Systems Manager guarda valores criptografados, e a instância lê com permissão do IAM.
+
+```bash
+aws ssm put-parameter --name /api-livros/prod/DATABASE_URL --type SecureString \
+  --value "postgres://livros:SENHA@ENDPOINT:5432/livros"
+aws ssm put-parameter --name /api-livros/prod/JWT_SECRET --type SecureString \
+  --value "$(openssl rand -base64 48)"
+```
+
+Para a instância ler, crie um **papel IAM** com permissão `ssm:GetParametersByPath` no caminho `/api-livros/prod`, associe à instância como perfil de instância e, na inicialização, gere o arquivo de ambiente:
+
+```bash
+aws ssm get-parameters-by-path --path /api-livros/prod --with-decryption \
+  --query "Parameters[].[Name,Value]" --output text \
+  | awk '{ n=split($1, p, "/"); print p[n] "=" $2 }' > /home/ec2-user/api.env
+```
+
+Papéis IAM em instâncias entregam credenciais temporárias automaticamente. Nunca copie chaves de acesso para dentro de um servidor.
+
+## Atualizando a versão
+
+O ciclo manual de atualização:
+
+```bash
+ssh -i api-livros.pem ec2-user@"$IP" '
+  cd api-livros && git pull &&
+  docker build --target producao -t api-livros . &&
+  docker run --rm --env-file /home/ec2-user/api.env api-livros npx sequelize-cli db:migrate &&
+  docker rm -f api &&
+  docker run -d --name api --restart unless-stopped -p 80:3000 --env-file /home/ec2-user/api.env api-livros
+'
+```
+
+Note as migrações rodando antes da troca de container. Para isso funcionar na imagem de produção, `sequelize-cli` precisa estar em `dependencies` (não em `devDependencies`) e o Dockerfile precisa copiar também o `.sequelizerc`. Esse script tem segundos de indisponibilidade entre o `rm` e o novo `run`; com um balanceador (ALB) e duas instâncias, você troca uma de cada vez. Automatizar isso com GitHub Actions é assunto dos capítulos de integração contínua.
+
+Para HTTPS, o caminho comum é colocar um Application Load Balancer na frente, com certificado gratuito do AWS Certificate Manager e um domínio no Route 53.
+
+## Alternativa gerenciada: Elastic Beanstalk
+
+Se você quer o resultado sem montar cada peça, o Elastic Beanstalk cria instâncias, balanceador, escalonamento e logs a partir do código.
+
+```bash
+pip install awsebcli   # ou pipx install awsebcli
+eb init api-livros --platform node.js --region sa-east-1
+eb create api-livros-prod --single     # uma instância, sem balanceador
+eb setenv NODE_ENV=production DATABASE_URL=... JWT_SECRET=...
+eb deploy                               # envia a versão atual do Git
+eb logs
+eb status
+```
+
+O Beanstalk executa `npm start` (ou o comando de um arquivo `Procfile`, como `web: node src/server.js`) e passa a porta na variável `PORT`. Por isso ler a porta do ambiente importa.
+
+A troca é controle por conveniência. Quando algo dá errado, você ainda precisa entender EC2, security groups e logs, que é exatamente o que fez acima.
+
+## Custos e limpeza
+
+- Instâncias pequenas como `t3.micro` e `db.t4g.micro` custam pouco por hora, mas 24 horas por 30 dias somam. Pare o que não está usando.
+- **Disco (EBS) e snapshots** cobram mesmo com a instância parada.
+- **IP público** IPv4 é cobrado por hora.
+- Use a **etiqueta (tag)** `Name` ou `Projeto` em tudo para saber o que é de quê no Cost Explorer.
+
+Limpando o exercício:
+
+```bash
+aws rds delete-db-instance --db-instance-identifier livros-db --skip-final-snapshot
+aws ec2 terminate-instances --instance-ids "$(aws ec2 describe-instances \
+  --filters Name=tag:Name,Values=api-livros --query 'Reservations[].Instances[].InstanceId' --output text)"
+aws ec2 delete-key-pair --key-name api-livros
+# depois que tudo terminar: apague os security groups
+```
+
+## Na entrevista
+
+**Qual a diferença entre EC2, Elastic Beanstalk e Lambda?** EC2 é a máquina virtual, você gerencia tudo. Beanstalk é uma plataforma que monta EC2, balanceador e escalonamento a partir do código. Lambda executa funções sob demanda, sem servidor para gerenciar, cobrando por execução.
+
+**Como o banco fica protegido no RDS?** Sem acesso público, numa sub-rede da VPC, com security group que só aceita conexões vindas do security group da aplicação, e credenciais em um gerenciador de segredos.
+
+**Como a aplicação obtém credenciais da AWS?** Por um papel IAM anexado à instância (ou à tarefa, no ECS), que fornece credenciais temporárias e rotacionadas. Chaves fixas no código ou no servidor são má prática.
+
+**O que é security group?** Um firewall com estado associado a recursos, com regras de entrada e saída por porta, protocolo e origem, que pode ser um bloco de IPs ou outro security group.
+
+## Pratique
+
+Faça o deploy da sua API de livros e entregue:
+
+1. Instância EC2 com Amazon Linux 2023 rodando a API em container, SSH restrito ao seu IP.
+2. PostgreSQL no RDS sem acesso público, acessível só pelo security group da API.
+3. `DATABASE_URL` e `JWT_SECRET` no Parameter Store, lidos por um papel IAM da instância.
+4. `GET /health` respondendo pelo IP público e um script `deploy.sh` com o ciclo de atualização.
+5. Um README com o diagrama (texto serve) dos recursos e os comandos de limpeza. Depois, apague tudo.
+
+<Quiz question="Qual a forma recomendada de liberar o banco no RDS só para a API?" options={["Abrir a porta 5432 para 0.0.0.0/0 com senha forte","Regra de entrada que referencia o security group da API","Colocar o banco e a API no mesmo IP público","Usar a porta padrão do PostgreSQL alterada"]} answer={1} explanation="Referenciar o security group da API permite qualquer instância dela e nada mais, sem depender de IPs que mudam." />
+
+<Quiz question="Como uma instância EC2 deve obter credenciais para ler o Parameter Store?" options={["Chaves de acesso em um arquivo na instância","Variáveis de ambiente no user-data","Um papel IAM associado como perfil de instância","O usuário raiz da conta"]} answer={2} explanation="Papéis IAM fornecem credenciais temporárias e rotacionadas automaticamente, sem chaves fixas que possam vazar." />
+
+<Quiz question="Por que tratar SIGTERM na API?" options={["Para impedir que o processo seja parado","Para terminar requisições em andamento antes de encerrar","Porque o Node ignora sinais por padrão","Para reiniciar automaticamente após falhas"]} answer={1} explanation="Docker, ECS e Beanstalk enviam SIGTERM antes de parar o processo. Tratar o sinal permite fechar o servidor e o banco sem cortar requisições." />
+
+## Base no CodeForge
+
+- [Load balancers](/learn/system-design/load-balancers) e [Proxy e reverse proxy](/learn/system-design/proxy-reverse-proxy): o que entra na frente da API para HTTPS e várias instâncias.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): por que segredos não ficam no servidor.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): como trocar versões sem indisponibilidade.
+- [Amazon EC2: Alta disponibilidade e escalabilidade em uma aplicação](/learn/carreira-nodejs/amazon-ec2-alta-disponibilidade-escalabilidade-aplicacao) e [Infraestrutura como código: Docker e Elastic Beanstalk na AWS](/learn/carreira-nodejs/infraestrutura-como-codigo-docker-elastic-beanstalk-aws): os próximos passos na AWS.
+
+## Referências
+
+- [AWS CLI: Instalação](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+- [Amazon EC2: Conceitos](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/concepts.html)
+- [Amazon RDS: User Guide](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html)
+- [Elastic Beanstalk: Node.js](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/create_deploy_nodejs.html)
