@@ -1,0 +1,313 @@
+---
+title: "DevOps: Trabalhando com repositórios no GitHub"
+kind: lesson
+---
+
+Um repositório no GitHub não é só o lugar onde o código fica guardado. Bem configurado, ele é a primeira linha de defesa da qualidade: ninguém empurra direto para a `main`, todo pull request passa pelo build com Maven e pelos testes, as pessoas certas revisam as partes sensíveis, e as dependências do `pom.xml` são atualizadas sem que alguém precise lembrar. Neste capítulo você prepara o repositório da API da clínica do jeito que um time profissional espera, com foco no que é específico de um projeto Java com Maven.
+
+**Você vai aprender:**
+
+- Montar a base do repositório Java: `.gitignore`, Maven Wrapper e README
+- Criar um workflow de CI com `actions/setup-java` que roda `mvn verify`
+- Proteger a branch principal com rulesets (ou branch protection) e checks obrigatórios
+- Padronizar pull requests com template e definir revisores com CODEOWNERS
+- Automatizar atualizações do Maven e das Actions com Dependabot
+
+## A base do repositório
+
+Antes de qualquer automação, o repositório precisa conter o que é necessário para construir o projeto, e nada além disso.
+
+**`.gitignore` para Java e Maven.** O diretório `target/` é gerado a cada build e nunca vai para o Git. Arquivos de IDE também ficam de fora:
+
+```gitignore
+# Build
+target/
+*.class
+*.log
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Ambiente local
+.env
+application-local.yml
+```
+
+**Maven Wrapper.** O `mvnw` (e `mvnw.cmd` no Windows) junto com a pasta `.mvn/wrapper` garante que todo mundo, inclusive o CI, use a mesma versão do Maven. Projetos gerados no Spring Initializr já vêm com ele. Se o seu não tem:
+
+```bash
+mvn wrapper:wrapper
+git add mvnw mvnw.cmd .mvn/wrapper/maven-wrapper.properties
+git update-index --chmod=+x mvnw   # permissão de execução, importante se você usa Windows
+```
+
+Sem o bit de execução, o CI em Linux falha com `Permission denied` ao rodar `./mvnw`. É um erro muito comum de quem desenvolve no Windows.
+
+**README.** O mínimo útil: o que o projeto faz, como rodar localmente (`./mvnw spring-boot:run`, ou Docker Compose para o banco), como rodar os testes e quais variáveis de ambiente existem. Um badge do workflow de CI no topo mostra o estado da `main` de relance.
+
+**Segredos fora do repositório.** Senha de banco, chaves de API e tokens entram por variável de ambiente ou pelos secrets do GitHub, nunca em `application.yml` commitado. Ative o **secret scanning com push protection** nas configurações do repositório (Settings, Advanced Security): o GitHub recusa o push quando detecta uma credencial conhecida.
+
+## O workflow de CI
+
+Branch protegida exige um check para proteger. O workflow mínimo de uma API Spring com Maven:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build e testes
+        run: ./mvnw -B -ntp verify
+```
+
+O que cada parte faz:
+
+- `actions/setup-java` instala o JDK Temurin 21 e, com `cache: maven`, guarda o `~/.m2/repository` entre execuções usando o hash dos `pom.xml` como chave. Isso derruba o tempo de build de minutos para segundos quando as dependências não mudaram.
+- `-B` (batch mode) desliga a interação e as cores do console. `-ntp` (no transfer progress) remove as milhares de linhas de "Downloading...", deixando o log legível.
+- `verify` compila, roda os testes unitários (Surefire), os de integração (Failsafe, se configurado) e qualquer checagem amarrada ao ciclo, como cobertura mínima do JaCoCo ou formatação.
+- `permissions: contents: read` limita o token do workflow ao mínimo necessário.
+
+Se os testes usam Testcontainers, nada extra é necessário: o runner `ubuntu-latest` já tem Docker. O nome do job (`build`) é o que você vai marcar como check obrigatório.
+
+## Protegendo a main: rulesets
+
+Sem proteção, qualquer pessoa com acesso de escrita pode fazer `git push --force` na `main` e apagar o histórico. O GitHub oferece dois mecanismos: a **branch protection** clássica e os **rulesets**, mais novos. Rulesets são o caminho recomendado hoje: valem para várias branches por padrão de nome, podem ficar em modo de avaliação antes de serem aplicados, empilham entre si e aparecem para quem não é administrador, que consegue ver quais regras se aplicam.
+
+Para a `main` de uma API, as regras típicas:
+
+| Regra | Efeito |
+|---|---|
+| Restringir exclusão | Ninguém apaga a branch |
+| Bloquear force push | Histórico não pode ser reescrito |
+| Exigir pull request | Nada entra sem PR |
+| Aprovações obrigatórias (1 ou 2) | Outra pessoa revisa |
+| Descartar aprovações em novos commits | Mudou depois da aprovação, precisa reaprovar |
+| Exigir revisão dos code owners | Dono da área aprova mudanças nela |
+| Resolver conversas | Comentários não ficam esquecidos |
+| Checks obrigatórios (`build`) | CI precisa passar, com a branch atualizada |
+
+Pela interface: Settings, Rules, Rulesets, New branch ruleset. Alvo: a branch padrão. Também dá para criar pela API com o GitHub CLI, o que é útil para padronizar vários repositórios:
+
+```json
+{
+  "name": "Proteção da main",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] }
+  },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": true
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [{ "context": "build" }]
+      }
+    }
+  ]
+}
+```
+
+```bash
+gh api repos/SEU_USUARIO/clinica-api/rulesets --method POST --input ruleset-main.json
+gh api repos/SEU_USUARIO/clinica-api/rulesets   # lista os rulesets ativos
+```
+
+`non_fast_forward` é o nome técnico de "bloquear force push". `strict_required_status_checks_policy` exige que a branch do PR esteja atualizada com a `main` antes do merge, para que o CI tenha rodado sobre o código que realmente vai entrar.
+
+Rulesets e branch protection estão disponíveis em repositórios públicos em qualquer plano. Em repositórios privados, dependem de plano pago (GitHub Pro, Team ou Enterprise).
+
+<Callout type="warning" title="Check obrigatório com nome errado trava todos os PRs">
+O check obrigatório é identificado pelo nome do job (ou `nome-do-workflow / job` em alguns casos). Se você marcar `build` como obrigatório e depois renomear o job para `test`, ou se o workflow só roda em certos caminhos (`paths:`) e um PR não toca neles, o check fica eternamente "esperando" e nenhum PR consegue fazer merge. Depois de criar a regra, abra um PR de teste e confirme que o check aparece e passa. Ao renomear jobs, atualize a regra no mesmo momento.
+</Callout>
+
+## Template de pull request
+
+Um template guia quem abre o PR e acelera a revisão. O GitHub usa automaticamente o arquivo `.github/pull_request_template.md`:
+
+```markdown
+## O que muda
+
+<!-- Uma ou duas frases: o problema e a solução -->
+
+## Como testar
+
+- [ ] `./mvnw verify` passa localmente
+- [ ] Testei manualmente: <!-- endpoint, payload, resultado esperado -->
+
+## Checklist
+
+- [ ] Testes novos ou atualizados cobrem a mudança
+- [ ] Migração Flyway nova, se o schema mudou (nunca editar migração já aplicada)
+- [ ] Sem segredos, dados reais de pacientes ou logs com dados sensíveis
+- [ ] Documentação da API (OpenAPI) atualizada, se o contrato mudou
+
+## Issue relacionada
+
+Closes #
+```
+
+O `Closes #123` fecha a issue automaticamente quando o PR entra na branch padrão. Para formulários de issue (bug, funcionalidade), use arquivos YAML em `.github/ISSUE_TEMPLATE/`.
+
+## CODEOWNERS
+
+O arquivo `.github/CODEOWNERS` diz quem é responsável por cada parte do código. Quando um PR toca esses arquivos, os donos são adicionados como revisores automaticamente, e com a regra "exigir revisão dos code owners" a aprovação deles se torna obrigatória.
+
+```text
+# A última regra que casa com o arquivo é a que vale
+
+# Padrão: o time de back-end revisa tudo
+*                                   @clinica-org/backend
+
+# Migrações de banco exigem alguém de dados
+/src/main/resources/db/migration/   @clinica-org/dba
+
+# Segurança e configuração de autenticação
+/src/main/java/br/com/clinica/api/infra/security/   @clinica-org/seguranca
+
+# Pipeline e build
+/.github/                           @clinica-org/plataforma
+pom.xml                             @clinica-org/plataforma @clinica-org/backend
+```
+
+Os donos podem ser usuários ou times da organização, e precisam ter permissão de escrita no repositório, ou a linha é ignorada (o GitHub mostra um aviso na visualização do arquivo). A precedência funciona como no `.gitignore`: a **última** linha que casa vence. Coloque o padrão genérico no topo e as exceções embaixo.
+
+## Dependabot para Maven e Actions
+
+Dependências desatualizadas acumulam vulnerabilidades. O Dependabot abre PRs de atualização automaticamente, e como cada PR passa pelo CI, você sabe se a atualização quebra algo antes do merge.
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "maven"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      spring:
+        patterns:
+          - "org.springframework*"
+      testes:
+        patterns:
+          - "org.testcontainers*"
+          - "org.mockito*"
+          - "org.assertj*"
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+```
+
+Detalhes que importam num projeto Spring Boot:
+
+- **O parent controla quase tudo.** As dependências gerenciadas pelo BOM do Spring Boot não têm versão no seu `pom.xml`, então o Dependabot atualiza o `spring-boot-starter-parent` e, com ele, dezenas de bibliotecas de uma vez. Dependências com versão explícita (como `springdoc-openapi`) recebem PRs próprios.
+- **Grupos** juntam atualizações relacionadas num único PR, o que reduz o ruído.
+- **Ignorar majors** no fluxo automático é uma escolha comum: um salto de major (Spring Boot 3 para 4, por exemplo) exige migração planejada, não um merge de segunda-feira.
+- O ecossistema `github-actions` atualiza as versões das actions (`actions/checkout`, `actions/setup-java`), e o `docker` atualiza a imagem base do Dockerfile.
+
+Além dos PRs de versão, ative os **Dependabot alerts** e **security updates** em Settings, Advanced Security: eles abrem PRs de correção quando uma vulnerabilidade conhecida afeta uma dependência, independentemente do agendamento.
+
+## O fluxo no dia a dia
+
+Com tudo configurado, o ciclo de uma mudança fica assim:
+
+```bash
+git switch -c feat/validador-antecedencia
+# ... código e testes ...
+./mvnw verify
+git commit -am "feat: valida antecedência mínima de 30 minutos no agendamento"
+git push -u origin feat/validador-antecedencia
+gh pr create --fill
+gh pr checks --watch        # acompanha o CI no terminal
+```
+
+O PR abre com o template, os code owners são marcados, o CI roda, alguém aprova, e o merge só fica disponível com tudo verde. Prefira **squash merge** para manter um commit por PR na `main`, e apague a branch depois do merge (há uma opção nas configurações para isso acontecer sozinho).
+
+## Na entrevista
+
+**Qual a diferença entre branch protection e rulesets?** Ambos protegem branches. Rulesets são mais novos e flexíveis: aplicam-se a várias branches ou tags por padrão, podem ser empilhados, têm modo de avaliação sem bloqueio, e são visíveis para todos com acesso de leitura. A branch protection clássica é uma regra por padrão de branch.
+
+**Para que serve o CODEOWNERS?** Define responsáveis por caminhos do repositório. Eles são pedidos como revisores automaticamente e, com a regra correspondente ativa, a aprovação deles é obrigatória para mesclar mudanças nesses caminhos.
+
+**Por que commitar o Maven Wrapper?** Para que todos os ambientes, incluindo o CI, usem a mesma versão do Maven sem instalação prévia, o que torna o build reproduzível.
+
+**Como o Dependabot lida com o Spring Boot parent?** Atualiza a versão do parent, que por sua vez traz as versões gerenciadas pelo BOM. Dependências com versão explícita no `pom.xml` recebem PRs separados, que podem ser agrupados.
+
+## Pratique
+
+Crie (ou ajuste) o repositório público da API da clínica e entregue:
+
+1. `.gitignore` de Java, Maven Wrapper executável e README com instruções de execução e badge do CI.
+2. Workflow `ci.yml` com `actions/setup-java`, cache do Maven e `./mvnw -B -ntp verify`.
+3. Um ruleset na `main` com PR obrigatório, uma aprovação, revisão de code owners, bloqueio de force push e o check `build` obrigatório.
+4. `pull_request_template.md`, `CODEOWNERS` e `dependabot.yml` para Maven, Actions e Docker.
+5. Um PR de teste mostrando o check rodando e, se possível, um PR do Dependabot aberto e mesclado com CI verde.
+
+<Quiz question="No arquivo CODEOWNERS, qual linha define o dono de um arquivo que casa com várias regras?" options={["A primeira linha que casa","A última linha que casa","Todas as linhas que casam, somadas","A linha com o caminho mais curto"]} answer={1} explanation="A precedência é da última regra que casa com o arquivo. Por isso o padrão genérico fica no topo e as exceções embaixo." />
+
+<Quiz question="O que a opção cache: maven do actions/setup-java guarda entre execuções?" options={["O diretório target com as classes compiladas","O repositório local de dependências do Maven","Os relatórios de teste do Surefire","A imagem Docker da aplicação"]} answer={1} explanation="O cache guarda o ~/.m2/repository, com chave baseada no hash dos pom.xml. Assim as dependências não são baixadas de novo a cada build." />
+
+<Quiz question="Num projeto Spring Boot, por que o Dependabot muitas vezes abre um único PR que muda várias bibliotecas?" options={["Porque ele sempre agrupa tudo por padrão","Porque atualiza o spring-boot-starter-parent, que gerencia as versões de várias dependências","Porque o Maven não permite atualizar dependências separadamente","Porque o GitHub limita a um PR por semana"]} answer={1} explanation="As dependências gerenciadas pelo BOM do Spring Boot não têm versão no pom. Atualizar o parent muda as versões de todas elas de uma vez." />
+
+## Base no CodeForge
+
+- [DevOps: Trabalhando com repositórios no GitHub (Carreira Node.js)](/learn/carreira-nodejs/devops-trabalhando-repositorios-github): o mesmo tema do ponto de vista de um projeto Node.
+- [Git e GitHub: dominando o controle de versão de código](/learn/carreira-nodejs/git-github-dominando-controle-versao-codigo): comandos de Git que este capítulo assume.
+- [CI/CD](/learn/system-design/ci-cd) e [Gestão de segredos](/learn/system-design/gestao-de-segredos): a teoria por trás do pipeline e dos secrets.
+- [Integração Contínua: pipelines e testes automatizados com GitHub Actions](/learn/carreira-java/integracao-continua-pipelines-testes-automatizados-github-actions): o pipeline completo, no Nível 2.
+- [Boas práticas de programação: Automatizando testes com Java](/learn/carreira-java/boas-praticas-programacao-automatizando-testes-java): a suíte que o CI executa.
+
+## Referências
+
+- [GitHub Docs: About rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets)
+- [GitHub Docs: About code owners](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
+- [GitHub Docs: Dependabot options reference](https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference)
+- [GitHub Docs: Creating a pull request template](https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/creating-a-pull-request-template-for-your-repository)

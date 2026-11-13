@@ -1,0 +1,256 @@
+---
+title: "Integração Contínua: Pipeline Docker no GitHub Actions"
+kind: lesson
+---
+
+O pipeline de CI já garante que o serviço de pedidos compila e passa nos testes. Mas o que vai para produção não é o código, é uma imagem de container. Se essa imagem é construída na máquina de alguém, com um `docker build` manual e uma tag `latest`, você perde a ligação entre o commit testado e o que está rodando. Neste capítulo o pipeline passa a gerar a imagem: construída a partir do commit que passou nos testes, otimizada com as camadas do Spring Boot, marcada com tags rastreáveis, verificada contra vulnerabilidades e publicada num registro. Você vai ver dois caminhos, Dockerfile com `docker/build-push-action` e Jib sem Dockerfile.
+
+**Você vai aprender:**
+
+- Escrever um Dockerfile multi-stage para Spring Boot com camadas e JRE enxuto
+- Construir e publicar a imagem no GitHub Container Registry com `build-push-action` e cache
+- Gerar tags rastreáveis (SHA, branch, versão) com `docker/metadata-action`
+- Usar o Jib para gerar a imagem direto do Maven, sem Docker no build
+- Escanear a imagem e encadear o job de imagem depois dos testes
+
+## Uma imagem boa para Spring Boot
+
+Uma imagem de produção precisa ser pequena, rodar sem root e aproveitar o cache de camadas. O ponto principal com Spring Boot: o fat jar mistura dezenas de megabytes de dependências (que mudam raramente) com alguns kilobytes do seu código (que muda a cada commit). Copiado como um arquivo só, qualquer mudança invalida a camada inteira, e cada deploy envia o jar completo.
+
+O Spring Boot resolve isso com o modo `tools` do jar, que extrai o conteúdo em camadas separadas:
+
+```dockerfile
+# pedidos/Dockerfile
+FROM eclipse-temurin:21-jdk-alpine AS build
+WORKDIR /app
+COPY .mvn/ .mvn/
+COPY mvnw pom.xml ./
+RUN ./mvnw -B -ntp dependency:go-offline
+COPY src/ src/
+RUN ./mvnw -B -ntp package -DskipTests \
+ && java -Djarmode=tools -jar target/*.jar extract --layers --launcher --destination extraido
+
+FROM eclipse-temurin:21-jre-alpine
+RUN addgroup -S app && adduser -S app -G app
+USER app
+WORKDIR /app
+COPY --from=build /app/extraido/dependencies/ ./
+COPY --from=build /app/extraido/spring-boot-loader/ ./
+COPY --from=build /app/extraido/snapshot-dependencies/ ./
+COPY --from=build /app/extraido/application/ ./
+EXPOSE 8080
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+Os pontos que importam:
+
+- **Multi-stage:** o JDK e o Maven ficam no estágio `build`. A imagem final tem só o JRE, o que corta centenas de megabytes e a superfície de ataque.
+- **`dependency:go-offline` antes do `COPY src/`:** a camada de dependências do Maven só é refeita quando o `pom.xml` muda.
+- **Camadas do Spring Boot:** `dependencies` primeiro, `application` por último. Num commit típico, só a última camada (o seu código) muda e é enviada ao registro.
+- **Usuário sem privilégio:** o processo não roda como root dentro do container.
+- **`-XX:MaxRAMPercentage=75`:** a JVM moderna respeita o limite de memória do container; esse parâmetro define quanto dele vai para o heap, deixando folga para metaspace, threads e buffers.
+
+O `-DskipTests` aqui é correto: os testes já rodaram no job de CI, e o Testcontainers nem funcionaria dentro do build do Docker.
+
+Adicione um `.dockerignore` com `target/`, `.git/` e `.idea/` para o contexto de build não carregar lixo.
+
+O modo `-Djarmode=tools` existe desde o Spring Boot 3.3. Em versões anteriores, o equivalente era `-Djarmode=layertools -jar app.jar extract`, com o launcher em outro pacote.
+
+## O workflow de imagem
+
+O registro mais simples para começar é o GitHub Container Registry (`ghcr.io`), que usa o próprio token do workflow para autenticar:
+
+```yaml
+# .github/workflows/pedidos.yml (continuação do workflow de CI)
+jobs:
+  build:
+    # ... job de testes do capítulo anterior
+
+  imagem:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/loja-pedidos
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./pedidos
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+O desenho tem três decisões:
+
+1. **`needs: build`:** a imagem só é construída se os testes passarem. Uma imagem publicada é, por definição, uma imagem testada.
+2. **`if` só na `main`:** pull requests rodam testes, mas não publicam. Se quiser validar que o Dockerfile constrói no PR, rode o mesmo step com `push: false`.
+3. **`permissions` no job:** só este job ganha `packages: write`. O token do resto do workflow continua só de leitura.
+
+O Buildx com `cache-from` e `cache-to` do tipo `gha` guarda as camadas no cache do GitHub Actions. Num commit que só mexe em código Java, o estágio de dependências do Maven vem inteiro do cache.
+
+## Tags que contam a história
+
+A `metadata-action` gera as tags a partir do contexto do evento:
+
+| Regra | Exemplo de tag | Para que serve |
+|---|---|---|
+| `type=sha,format=long` | `sha-3f2a9c...` | Ligação exata com o commit, imutável |
+| `type=ref,event=branch` | `main` | "A última da main", útil para ambientes de desenvolvimento |
+| `type=semver,pattern={{version}}` | `1.4.0` | Só em push de tag Git `v1.4.0`, para releases |
+
+Ela também gera labels OCI (`org.opencontainers.image.source`, `revision`, `created`), que ligam a imagem ao repositório e ao commit. No ghcr.io, a label `source` faz o pacote aparecer na página do repositório.
+
+Para publicar uma release, crie a tag Git e adicione `tags: ['v*']` em `on.push`:
+
+```bash
+git tag v1.4.0
+git push origin v1.4.0
+```
+
+<Callout type="warning" title="Fazer deploy da tag latest">
+Tags como `latest` ou `main` são móveis: amanhã apontam para outra imagem. Se a task definition ou o manifesto de deploy referencia `latest`, você não sabe o que está rodando, um reinício pode puxar uma versão nova sem ninguém pedir e rollback vira adivinhação. Faça deploy sempre por uma tag imutável (o SHA do commit ou a versão) ou, melhor ainda, pelo digest `@sha256:...` que o `build-push-action` devolve em `steps.<id>.outputs.digest`.
+</Callout>
+
+## Alternativa: Jib, sem Dockerfile
+
+O Jib, do Google, constrói a imagem a partir do Maven, sem Dockerfile e sem precisar de Docker no build. Ele já separa dependências, recursos e classes em camadas, e gera imagens reprodutíveis (mesmo código, mesmo digest).
+
+```xml
+<plugin>
+  <groupId>com.google.cloud.tools</groupId>
+  <artifactId>jib-maven-plugin</artifactId>
+  <version>3.4.4</version>
+  <configuration>
+    <from>
+      <image>eclipse-temurin:21-jre</image>
+    </from>
+    <to>
+      <image>ghcr.io/minha-org/loja-pedidos</image>
+    </to>
+    <container>
+      <ports><port>8080</port></ports>
+      <user>1000</user>
+      <jvmFlags><jvmFlag>-XX:MaxRAMPercentage=75</jvmFlag></jvmFlags>
+    </container>
+  </configuration>
+</plugin>
+```
+
+```yaml
+  imagem-jib:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      - name: Publica imagem com Jib
+        working-directory: pedidos
+        run: >
+          ./mvnw -B -ntp compile jib:build
+          -Djib.to.tags=${{ github.sha }}
+          -Djib.to.auth.username=${{ github.actor }}
+          -Djib.to.auth.password=${{ secrets.GITHUB_TOKEN }}
+```
+
+`jib:build` publica direto no registro; `jib:dockerBuild` gera a imagem no Docker local, útil para testar.
+
+| Critério | Dockerfile + build-push-action | Jib |
+|---|---|---|
+| Precisa de Docker no build | Sim (Buildx) | Não |
+| Controle da imagem | Total: pacotes do SO, scripts, qualquer coisa | Limitado ao que o plugin expõe |
+| Camadas otimizadas | Você monta (com o modo tools) | Automático |
+| Reprodutibilidade | Depende de você | Por padrão |
+| Funciona para qualquer linguagem | Sim | Só JVM |
+
+Se a imagem precisa de algo além do JRE (um certificado corporativo, uma ferramenta de diagnóstico), o Dockerfile é mais simples. Para um serviço Spring Boot comum, o Jib é menos código para manter. Há ainda uma terceira opção, `./mvnw spring-boot:build-image`, que usa Cloud Native Buildpacks e também não exige Dockerfile, mas precisa de Docker.
+
+## Escaneando vulnerabilidades
+
+A imagem herda os pacotes do sistema da imagem base e as bibliotecas do `pom.xml`, e qualquer um deles pode ter uma CVE conhecida. Um scanner no pipeline avisa antes da produção. O Trivy é uma escolha comum:
+
+```yaml
+      - uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/loja-pedidos:sha-${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+```
+
+Com `exit-code: '1'`, o job falha se houver vulnerabilidade crítica ou alta com correção disponível. O `ignore-unfixed` evita bloquear o pipeline por algo que você não tem como corrigir ainda. A correção quase sempre é atualizar a imagem base ou a versão do Spring Boot; configure o Dependabot para abrir esses pull requests sozinho.
+
+## Usando a imagem fora do pipeline
+
+```bash
+docker pull ghcr.io/minha-org/loja-pedidos:sha-3f2a9c...
+docker run --rm -p 8080:8080 -e SPRING_PROFILES_ACTIVE=local ghcr.io/minha-org/loja-pedidos:sha-3f2a9c...
+docker history ghcr.io/minha-org/loja-pedidos:sha-3f2a9c...   # mostra as camadas e seus tamanhos
+```
+
+O `docker history` é a forma rápida de conferir que a camada da aplicação é pequena e que as dependências estão numa camada separada. Para a AWS, troque o login pelo `aws-actions/configure-aws-credentials` com OIDC e o registro pelo ECR; o resto do workflow é igual. O deploy dessa imagem no ECS é o assunto do Nível 3.
+
+## Na entrevista
+
+**Por que usar build multi-stage?** Para separar o ambiente de build (JDK, Maven, código-fonte) do ambiente de execução. A imagem final fica menor, sobe mais rápido e tem menos pacotes vulneráveis.
+
+**O que são as camadas do Spring Boot e por que importam?** O jar é extraído em dependências, loader, dependências snapshot e aplicação, cada uma numa camada da imagem. Como só a camada da aplicação muda na maioria dos commits, o build aproveita cache e o push envia poucos kilobytes.
+
+**Que tag você usa para fazer deploy?** Uma tag imutável, como o SHA do commit ou a versão semântica, ou o digest. Nunca `latest`, porque ela muda de significado e impede saber o que está rodando.
+
+**Quando escolher Jib em vez de Dockerfile?** Quando o serviço é JVM e a imagem só precisa do JRE e da aplicação: menos código, camadas automáticas e build sem Docker. Dockerfile quando você precisa de controle total sobre o sistema da imagem.
+
+## Pratique
+
+No repositório da loja, entregue:
+
+1. O Dockerfile multi-stage com camadas do Spring Boot e usuário sem root, e um `.dockerignore`.
+2. O job `imagem` com `needs: build`, `metadata-action` e `build-push-action` com cache `gha`, publicando no ghcr.io só a partir da `main`.
+3. O Trivy falhando o job para vulnerabilidades críticas corrigíveis.
+4. A comparação no README: tamanho da imagem e tempo do segundo build (só código mudou) com e sem as camadas do Spring Boot.
+5. Opcional: a mesma imagem gerada com Jib, comparando tamanho e tempo.
+
+<Quiz question="Por que o Dockerfile copia o pom.xml e baixa dependências antes de copiar src?" options={["Porque o Maven exige essa ordem","Para a camada de dependências ser reaproveitada quando só o código muda","Para reduzir o tamanho da imagem final","Para rodar os testes antes do build"]} answer={1} explanation="Camadas são reaproveitadas enquanto suas entradas não mudam. Com o pom.xml separado, mudanças de código não invalidam o download de dependências." />
+
+<Quiz question="Qual tag deve ser usada para implantar uma imagem em produção?" options={["latest","main","O SHA do commit ou o digest","O nome do desenvolvedor"]} answer={2} explanation="SHA e digest são imutáveis e ligam a imagem ao commit testado. Tags móveis como latest e main mudam de alvo e tornam o rollback incerto." />
+
+<Quiz question="O que o Jib dispensa em relação ao build-push-action?" options={["O registro de imagens","O Dockerfile e o Docker no build","O Maven","A imagem base"]} answer={1} explanation="O Jib monta a imagem a partir do Maven e a envia direto ao registro, sem Dockerfile e sem daemon Docker." />
+
+## Base no CodeForge
+
+- [Docker na prática para Backend Java](/learn/carreira-java/docker-pratica-para-backend-java): os fundamentos de imagem e container usados aqui.
+- [Integração Contínua: Pipelines e testes automatizados com GitHub Actions](/learn/carreira-java/integracao-continua-pipelines-testes-automatizados-github-actions): o job de testes do qual este depende.
+- [Integração Contínua: Pipeline Docker no GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipeline-docker-github-actions): o mesmo pipeline com uma imagem Node.
+- [Integração Contínua: Automatize o deploy na Amazon ECS](/learn/carreira-java/integracao-continua-automatize-deploy-amazon-ecs): onde esta imagem é implantada.
+
+## Referências
+
+- [docker/build-push-action](https://github.com/docker/build-push-action)
+- [Spring Boot: Efficient Container Images](https://docs.spring.io/spring-boot/reference/packaging/container-images/efficient-images.html)
+- [Jib Maven Plugin](https://github.com/GoogleContainerTools/jib/tree/master/jib-maven-plugin)

@@ -1,0 +1,322 @@
+---
+title: "Redes e Protocolos: Fundamentos da web"
+kind: lesson
+---
+
+Quando a API da clínica começar a receber requisições, os bugs mais difíceis não vão estar no seu Java: vão estar no caminho. O front recebe erro de CORS e você jura que a API funciona no Postman. O `HttpClient` falha com "PKIX path building failed". A aplicação sobe no container mas ninguém consegue acessar. Os logs mostram o IP do balanceador em vez do IP do cliente. Tudo isso é rede. Este capítulo percorre o caminho de uma requisição do navegador até o seu controller, do ponto de vista de quem constrói APIs, e mostra como enxergar cada etapa com `curl`.
+
+**Você vai aprender:**
+
+- O que acontece entre digitar uma URL e o seu código rodar: DNS, TCP, TLS e HTTP
+- IP, porta e por que `localhost` dentro de um container não é o seu computador
+- A anatomia do HTTP: métodos, status, cabeçalhos e o que cada um significa para uma API
+- Cookies e seus atributos de segurança
+- CORS: por que existe, como funciona o preflight e como liberar no Spring
+
+## O caminho de uma requisição
+
+Quando o front da clínica chama `https://api.clinica.com.br/pacientes/42`, acontece isto, em ordem:
+
+| Etapa | Protocolo | Pergunta que responde |
+|---|---|---|
+| 1. Resolução de nome | DNS | Qual o IP de `api.clinica.com.br`? |
+| 2. Conexão | TCP (sobre IP) | Consigo abrir um canal confiável até esse IP na porta 443? |
+| 3. Segurança | TLS | Esse servidor é mesmo quem diz ser? Como cifrar o que vem a seguir? |
+| 4. Conversa | HTTP | `GET /pacientes/42`, e a resposta |
+
+Cada camada usa a de baixo sem saber dos detalhes dela. Essa separação é o modelo em camadas (TCP/IP), e o curso de [Redes](/learn/redes/modelo-tcp-ip) do CodeForge cobre a teoria. Aqui o foco é o que muda no seu dia a dia.
+
+Veja tudo acontecendo com o modo verboso do `curl`:
+
+```bash
+curl -v https://viacep.com.br/ws/01001000/json/
+```
+
+```text
+* Host viacep.com.br:443 was resolved.
+* IPv4: 104.21.x.x, 172.67.x.x
+*   Trying 104.21.x.x:443...
+* Connected to viacep.com.br (104.21.x.x) port 443
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+* Server certificate:
+*  subject: CN=viacep.com.br
+*  issuer: C=US; O=Google Trust Services; CN=WE1
+> GET /ws/01001000/json/ HTTP/2
+> Host: viacep.com.br
+> User-Agent: curl/8.9.1
+> Accept: */*
+>
+< HTTP/2 200
+< content-type: application/json; charset=utf-8
+< cache-control: max-age=...
+```
+
+As linhas com `*` são DNS, TCP e TLS. As com `>` são o que o cliente enviou; as com `<`, o que o servidor respondeu. Quando algo der errado, a última linha com `*` antes do erro diz em qual etapa parou.
+
+## IP e porta
+
+Um endereço IP identifica uma máquina (ou interface de rede); a porta identifica o processo dentro dela. A sua API Spring escuta na porta 8080 por padrão; HTTPS usa 443; HTTP, 80; PostgreSQL, 5432.
+
+Dois endereços especiais causam muita confusão:
+
+- **`127.0.0.1` (localhost)**: a própria máquina, e só ela. Um processo escutando aqui não aceita conexões de fora.
+- **`0.0.0.0`**: "todas as interfaces". Um servidor escutando aqui aceita conexões de qualquer rede.
+
+O Spring Boot (Tomcat embutido) escuta em todas as interfaces por padrão, o que é o certo para container. Mas o erro clássico é o contrário: dentro de um container Docker, `localhost` é o próprio container. Se a API no container tenta acessar o Postgres em `localhost:5432`, ela procura um banco dentro dela mesma. Use o nome do serviço no Docker Compose (`jdbc:postgresql://db:5432/clinica`).
+
+Para ver quem está escutando numa porta:
+
+```bash
+# Linux e macOS
+lsof -i :8080
+# Windows (PowerShell)
+netstat -ano | findstr :8080
+```
+
+"Address already in use" ao subir o Spring significa que outro processo já ocupa a porta.
+
+## DNS
+
+O DNS traduz nomes em IPs. A resposta tem um TTL (tempo de vida) que diz por quanto tempo ela pode ficar em cache.
+
+```bash
+dig api.github.com +short
+nslookup api.github.com
+```
+
+Tipos de registro que você vai configurar ou ler:
+
+| Registro | Aponta para | Uso típico |
+|---|---|---|
+| A / AAAA | IPv4 / IPv6 | `api.clinica.com.br` para o IP do balanceador |
+| CNAME | Outro nome | `www` apontando para o domínio de um serviço de nuvem |
+| MX | Servidor de e-mail | Envio de e-mails da clínica |
+| TXT | Texto livre | Verificação de domínio, SPF |
+
+Duas consequências práticas: mudança de DNS não é instantânea (os caches respeitam o TTL), e a JVM também guarda resoluções em cache. Sem security manager (o normal hoje), a JVM guarda respostas positivas por 30 segundos, configurável pela propriedade de segurança `networkaddress.cache.ttl`. Se você depende de DNS que muda (failover de banco na nuvem), não aumente esse valor.
+
+## TCP: conexão confiável
+
+TCP entrega bytes em ordem e sem perda, retransmitindo o que se perder. Antes de mandar dados, cliente e servidor fazem o handshake de três vias (SYN, SYN-ACK, ACK), que custa uma ida e volta de rede. Com TLS por cima, são mais uma ou duas.
+
+Por isso, **abrir conexão é caro**, e todo cliente sério reaproveita conexões:
+
+- O `HttpClient` do Java mantém um pool e reutiliza conexões HTTP/1.1 (keep-alive) e multiplexa requisições numa conexão HTTP/2.
+- O HikariCP, pool de conexões que o Spring Boot usa com o banco, mantém conexões TCP abertas com o Postgres para não pagar o handshake a cada consulta.
+
+Os erros de TCP têm nomes que vale reconhecer:
+
+| Erro no Java | O que aconteceu |
+|---|---|
+| `ConnectException: Connection refused` | Chegou na máquina, mas nada escuta naquela porta |
+| `SocketTimeoutException` / `HttpConnectTimeoutException` | Nenhuma resposta: firewall descartando, host fora do ar ou rota errada |
+| `UnknownHostException` | O DNS não resolveu o nome |
+| `Connection reset` | O outro lado fechou a conexão abruptamente |
+
+## TLS: o S do HTTPS
+
+TLS faz duas coisas: prova a identidade do servidor com um certificado assinado por uma autoridade certificadora (CA) confiável, e combina chaves para cifrar o tráfego. A versão atual é a 1.3.
+
+O cliente confia no certificado se ele (1) foi emitido para o nome acessado, (2) não expirou e (3) tem uma cadeia que termina numa CA que o cliente conhece. A JVM guarda as CAs confiáveis no arquivo `cacerts` do JDK.
+
+O erro que todo dev Java encontra um dia:
+
+```text
+javax.net.ssl.SSLHandshakeException: PKIX path building failed:
+unable to find valid certification path to requested target
+```
+
+Significa que a JVM não conseguiu montar a cadeia até uma CA conhecida. Causas comuns: certificado autoassinado num ambiente de homologação, proxy corporativo que intercepta HTTPS com uma CA própria, ou JDK muito antigo. A solução correta é importar a CA certa num truststore. A solução errada, e perigosa, é desligar a verificação de certificado no código.
+
+```bash
+# Ver o certificado que o servidor apresenta
+openssl s_client -connect viacep.com.br:443 -servername viacep.com.br </dev/null | openssl x509 -noout -subject -issuer -dates
+```
+
+Em produção, o TLS geralmente termina no balanceador ou no ingress (que guarda o certificado), e a sua aplicação recebe HTTP simples na rede interna.
+
+## HTTP: a conversa
+
+Uma requisição tem método, caminho, versão, cabeçalhos e, opcionalmente, corpo:
+
+```http
+POST /pacientes HTTP/1.1
+Host: api.clinica.com.br
+Content-Type: application/json
+Accept: application/json
+Authorization: Bearer eyJhbGciOi...
+
+{"nome": "Ana Souza", "cpf": "11111111111", "cep": "01001000"}
+```
+
+E a resposta:
+
+```http
+HTTP/1.1 201 Created
+Location: /pacientes/42
+Content-Type: application/json
+
+{"id": 42, "nome": "Ana Souza"}
+```
+
+### Métodos e suas garantias
+
+| Método | Uso | Seguro (não altera) | Idempotente |
+|---|---|---|---|
+| GET | Ler | Sim | Sim |
+| POST | Criar, ou ação que não se encaixa nos outros | Não | Não |
+| PUT | Substituir o recurso inteiro | Não | Sim |
+| PATCH | Alterar parte | Não | Não necessariamente |
+| DELETE | Remover | Não | Sim |
+
+Idempotente significa que repetir a requisição deixa o servidor no mesmo estado que fazer uma vez. Isso importa porque clientes, proxies e bibliotecas repetem requisições quando a rede falha. Repetir um `PUT /consultas/7` é inofensivo; repetir um `POST /consultas` pode agendar duas consultas. Por isso operações de pagamento costumam aceitar uma chave de idempotência num cabeçalho.
+
+### Status que a sua API deve usar
+
+| Faixa | Significado | Os que você mais vai usar |
+|---|---|---|
+| 2xx | Sucesso | 200 OK, 201 Created, 204 No Content |
+| 3xx | Redirecionamento | 301, 302, 304 Not Modified |
+| 4xx | Erro do cliente | 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 409 Conflict, 422 Unprocessable Content |
+| 5xx | Erro do servidor | 500 Internal Server Error, 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout |
+
+401 é "não sei quem você é" (falta ou expirou a autenticação); 403 é "sei quem você é e você não pode". 409 serve bem para "horário já ocupado". 502 e 504 geralmente vêm do balanceador dizendo que a sua aplicação não respondeu direito ou a tempo.
+
+### Cabeçalhos que importam para APIs
+
+- `Content-Type`: o formato do corpo enviado (`application/json`). Mandar JSON com `text/plain` costuma resultar em 415 no Spring.
+- `Accept`: o formato que o cliente quer receber.
+- `Authorization`: credenciais, normalmente `Bearer <token>`.
+- `Location`: na resposta 201, a URL do recurso criado.
+- `Cache-Control` e `ETag`: controle de cache.
+- `X-Forwarded-For` e `X-Forwarded-Proto`: adicionados por proxies e balanceadores com o IP e o protocolo originais do cliente. Atrás de um balanceador, a sua aplicação vê o IP dele; no Spring Boot, `server.forward-headers-strategy=framework` faz a aplicação respeitar esses cabeçalhos.
+
+HTTP é **sem estado**: cada requisição carrega tudo o que o servidor precisa para atendê-la. Lembrar quem é o usuário entre requisições exige um mecanismo extra, que é o próximo assunto.
+
+## Cookies
+
+O servidor pede ao navegador para guardar um valor com `Set-Cookie`, e o navegador o devolve automaticamente nas próximas requisições ao mesmo site com o cabeçalho `Cookie`.
+
+```http
+HTTP/1.1 200 OK
+Set-Cookie: SESSION=8f3a1c; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600
+```
+
+Os atributos são a parte importante:
+
+| Atributo | Efeito |
+|---|---|
+| `HttpOnly` | JavaScript não lê o cookie (`document.cookie`), o que limita o estrago de um XSS |
+| `Secure` | Só é enviado em HTTPS |
+| `SameSite=Lax` ou `Strict` | Não é enviado em requisições disparadas por outros sites, o que protege contra CSRF |
+| `Max-Age` / `Expires` | Tempo de vida; sem eles, o cookie morre ao fechar o navegador |
+| `Domain` / `Path` | Para quais hosts e caminhos o cookie vale |
+
+Cookie de sessão (um ID que aponta para dados no servidor) e token no cabeçalho `Authorization` (como JWT) são as duas formas de manter o usuário autenticado. Cookies são enviados automaticamente, o que é cômodo e é justamente o que abre espaço para CSRF; tokens no cabeçalho precisam ser anexados pelo código do front. A carreira volta a esse tema com Spring Security.
+
+## CORS
+
+O navegador aplica a política de mesma origem: um script carregado de `https://app.clinica.com.br` não pode ler respostas de `https://api.clinica.com.br` a menos que a API autorize. Origem é a combinação de **esquema, host e porta**; `http://localhost:5173` e `http://localhost:8080` são origens diferentes.
+
+CORS (Cross-Origin Resource Sharing) é o mecanismo pelo qual a API diz quais origens podem ler suas respostas. Para requisições "não simples" (com `Content-Type: application/json`, cabeçalho `Authorization` ou métodos como PUT e DELETE), o navegador primeiro manda um **preflight**:
+
+```http
+OPTIONS /pacientes HTTP/1.1
+Origin: http://localhost:5173
+Access-Control-Request-Method: POST
+Access-Control-Request-Headers: content-type, authorization
+```
+
+E a API precisa responder autorizando:
+
+```http
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: http://localhost:5173
+Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+Access-Control-Allow-Headers: content-type, authorization
+Access-Control-Max-Age: 3600
+```
+
+Só então o navegador envia o `POST` de verdade. No Spring MVC, a configuração global fica assim:
+
+```java
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.servlet.config.annotation.CorsRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+@Configuration
+public class CorsConfig implements WebMvcConfigurer {
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/**")
+                .allowedOrigins("http://localhost:5173", "https://app.clinica.com.br")
+                .allowedMethods("GET", "POST", "PUT", "PATCH", "DELETE")
+                .allowedHeaders("Content-Type", "Authorization")
+                .maxAge(3600);
+    }
+}
+```
+
+<Callout type="warning" title="CORS não é segurança da API">
+CORS é uma regra que o **navegador** aplica para proteger o usuário. `curl`, Postman e outro back-end ignoram CORS completamente. Por isso "funciona no Postman e não no navegador" é quase sempre CORS, e por isso liberar origens não substitui autenticação. Também não combine `allowedOrigins("*")` com cookies ou credenciais: a especificação proíbe, e o Spring recusa essa configuração.
+</Callout>
+
+## Enxergando tudo com curl
+
+Um kit de comandos para depurar a sua API:
+
+```bash
+# Só os cabeçalhos da resposta
+curl -I http://localhost:8080/pacientes
+
+# Mandar JSON
+curl -X POST http://localhost:8080/pacientes \
+  -H "Content-Type: application/json" \
+  -d '{"nome":"Ana Souza","cpf":"11111111111","cep":"01001000"}'
+
+# Simular o preflight de CORS
+curl -i -X OPTIONS http://localhost:8080/pacientes \
+  -H "Origin: http://localhost:5173" \
+  -H "Access-Control-Request-Method: POST"
+
+# Medir onde o tempo foi gasto
+curl -o /dev/null -s -w "dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} total=%{time_total}\n" https://viacep.com.br/ws/01001000/json/
+```
+
+O último é ouro para investigar lentidão: se `dns` é alto, o problema é resolução de nome; se a diferença entre `tls` e `total` é grande, o servidor está demorando para processar.
+
+## Na entrevista
+
+- **O que acontece quando você digita uma URL no navegador?** Resolução DNS do nome, conexão TCP com o IP na porta 443, handshake TLS validando o certificado, envio da requisição HTTP e renderização da resposta, que dispara novas requisições para recursos.
+- **Diferença entre 401 e 403?** 401: não autenticado (credencial ausente ou inválida). 403: autenticado, mas sem permissão para o recurso.
+- **O que é CORS e por que o Postman não é afetado?** É a forma de a API autorizar o navegador a ler respostas de outra origem. É aplicado pelo navegador; ferramentas fora dele não aplicam a política de mesma origem.
+- **Quais métodos HTTP são idempotentes e por que isso importa?** GET, PUT, DELETE (e HEAD, OPTIONS). Repetições por falha de rede não mudam o resultado, então podem ser refeitas com segurança; POST não.
+
+## Pratique
+
+Investigue a rede de uma API real e documente:
+
+1. Com `curl -v`, chame `https://viacep.com.br/ws/01001000/json/` e identifique: IP resolvido, versão do TLS, emissor do certificado, versão do HTTP e o `Content-Type` da resposta.
+2. Com a fórmula do `-w`, meça dns, tcp, tls e total em três execuções seguidas. Explique por que a primeira tende a ser mais lenta.
+3. Suba qualquer aplicação Spring Boot na 8080 e faça um preflight com `curl -X OPTIONS` antes e depois de adicionar a `CorsConfig`. Registre os cabeçalhos das duas respostas.
+4. Escreva um parágrafo explicando por que `localhost:5432` não funciona de dentro de um container.
+
+Entregue um arquivo de anotações com as saídas e as explicações.
+
+<Quiz question="O front em http://localhost:5173 chama a API em http://localhost:8080. São a mesma origem?" options={["Sim, o host é o mesmo","Não, as portas são diferentes","Sim, porque ambos usam http","Depende do método HTTP"]} answer={1} explanation="Origem é esquema, host e porta. Qualquer diferença entre os três torna as origens diferentes." />
+<Quiz question="Qual atributo de cookie impede que JavaScript leia o valor dele?" options={["Secure","SameSite","HttpOnly","Max-Age"]} answer={2} explanation="HttpOnly esconde o cookie de document.cookie, reduzindo o impacto de um ataque XSS." />
+<Quiz question="A JVM lança ConnectException: Connection refused. O que isso indica?" options={["O DNS não resolveu o nome","O certificado TLS é inválido","A máquina respondeu, mas nada escuta naquela porta","O servidor respondeu com status 500"]} answer={2} explanation="Connection refused vem de um host alcançável que recusou a conexão porque nenhum processo escuta na porta." />
+
+## Base no CodeForge
+
+- [Modelo TCP/IP](/learn/redes/modelo-tcp-ip), [DNS](/learn/redes/dns), [Handshake TCP](/learn/redes/handshake-tcp) e [TLS](/learn/redes/tls): a teoria de cada camada.
+- [HTTP/1.1](/learn/redes/http-1) e [HTTP/2](/learn/redes/http-2): o protocolo em detalhe.
+- [O que acontece ao digitar uma URL](/learn/redes/o-que-acontece-ao-digitar-url): a pergunta clássica de entrevista, respondida a fundo.
+- [Sessão vs token](/learn/system-design/sessao-vs-token) e [Proxy e reverse proxy](/learn/system-design/proxy-reverse-proxy).
+
+## Referências
+
+- [MDN: Visão geral do HTTP](https://developer.mozilla.org/pt-BR/docs/Web/HTTP/Overview)
+- [MDN: CORS](https://developer.mozilla.org/pt-BR/docs/Web/HTTP/CORS)
+- [MDN: Cookies HTTP](https://developer.mozilla.org/pt-BR/docs/Web/HTTP/Cookies)
+- [Spring Framework: CORS](https://docs.spring.io/spring-framework/reference/web/webmvc-cors.html)

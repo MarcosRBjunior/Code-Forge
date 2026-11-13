@@ -1,0 +1,382 @@
+---
+title: "Kubernetes para Desenvolvedores Java"
+kind: lesson
+---
+
+Rodar uma API Spring Boot num contêiner é fácil. Rodar dez réplicas dela, trocar a versão sem derrubar requisições, reiniciar só a que travou e crescer quando o tráfego sobe é outra conversa, e é para isso que existe o Kubernetes. Só que o Kubernetes foi pensado para processos genéricos, e a JVM tem manias próprias: demora para subir, reserva memória do jeito dela e precisa de tempo para terminar as requisições em andamento. Neste capítulo você coloca a API de pedidos no Kubernetes do jeito certo para uma aplicação Java, usando o que o Spring Boot já oferece para conversar com o cluster.
+
+**Você vai aprender:**
+
+- Descrever a API com Deployment, Service, ConfigMap e Secret
+- Ligar startup, liveness e readiness probes aos health groups do Actuator
+- Dimensionar requests e limits sem a JVM ser morta por falta de memória
+- Fazer o Spring Boot desligar sem perder requisições durante um rollout
+- Escalar com HPA e decidir se você precisa do Spring Cloud Kubernetes
+
+## Os objetos que importam para quem desenvolve
+
+O cluster tem dezenas de tipos de objeto, mas uma API web usa quase sempre os mesmos cinco:
+
+| Objeto | Papel | Analogia no mundo Spring |
+|---|---|---|
+| Pod | Uma ou mais instâncias de contêiner rodando juntas | Um processo `java -jar` |
+| Deployment | Mantém N pods de uma versão e troca a versão aos poucos | O "serviço" que você implanta |
+| Service | Nome DNS estável e balanceamento entre os pods prontos | O endereço que outros serviços chamam |
+| ConfigMap | Configuração não sensível | `application.yaml` por ambiente |
+| Secret | Configuração sensível | Senha do banco, chave de API |
+
+Você nunca cria pods à mão. Você declara um Deployment, ele cria um ReplicaSet, e o ReplicaSet garante que existam exatamente N pods. Se um pod morre, outro nasce. Se você muda a imagem, o Deployment cria um ReplicaSet novo e migra os pods aos poucos (rolling update).
+
+Os manifestos ficam no repositório da aplicação, numa pasta `k8s/`. Comece pelo Deployment, que é o arquivo mais longo e o que concentra as decisões específicas de Java:
+
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-pedidos
+  labels:
+    app: api-pedidos
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-pedidos
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: api-pedidos
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: api
+          image: ghcr.io/minha-org/api-pedidos:1.4.0
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: api-pedidos-config
+            - secretRef:
+                name: api-pedidos-secrets
+          env:
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=75.0 -XX:ActiveProcessorCount=2"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
+```
+
+O Service dá um nome fixo para os pods. Dentro do cluster, outro serviço chama `http://api-pedidos` (ou `api-pedidos.loja.svc.cluster.local` de outro namespace) e o tráfego vai só para os pods cuja readiness está verde:
+
+```yaml
+# k8s/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-pedidos
+spec:
+  selector:
+    app: api-pedidos
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+Repare que o Service seleciona pods por label (`app: api-pedidos`), não por nome. É por isso que a label do template do Deployment e o `selector` do Service precisam bater. Um erro de digitação aqui gera o sintoma clássico: tudo sobe, nada responde.
+
+## Configuração: ConfigMap, Secret e o binding do Spring
+
+O Spring Boot lê variáveis de ambiente com *relaxed binding*: `SPRING_DATASOURCE_URL` vira `spring.datasource.url`, `APP_PEDIDOS_LIMITE_ITENS` vira `app.pedidos.limite-itens`. Isso permite injetar configuração pelo Kubernetes sem mudar uma linha de código.
+
+```yaml
+# k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-pedidos-config
+data:
+  SPRING_PROFILES_ACTIVE: "prod"
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://postgres:5432/pedidos"
+  SPRING_DATASOURCE_USERNAME: "pedidos"
+  APP_PEDIDOS_LIMITE_ITENS: "50"
+```
+
+```bash
+# o Secret você cria fora do Git (ou via External Secrets / Sealed Secrets)
+kubectl create secret generic api-pedidos-secrets \
+  --from-literal=SPRING_DATASOURCE_PASSWORD='troque-isto'
+```
+
+Do lado Java, nada muda. Um `@ConfigurationProperties` com record recebe os valores tipados e validados:
+
+```java
+@Validated
+@ConfigurationProperties(prefix = "app.pedidos")
+public record PedidosProperties(@Min(1) @Max(500) int limiteItens) {}
+```
+
+Uma alternativa às variáveis de ambiente é montar o Secret como arquivos e usar o `configtree` do Spring Boot. Cada arquivo vira uma propriedade, com o nome do arquivo como chave. A vantagem é que o valor não aparece em `kubectl describe pod` nem em dumps de ambiente:
+
+```yaml
+# trecho do container
+volumeMounts:
+  - name: segredos
+    mountPath: /etc/segredos
+    readOnly: true
+# trecho do spec do pod
+volumes:
+  - name: segredos
+    secret:
+      secretName: api-pedidos-secrets-arquivos  # chave: spring.datasource.password
+```
+
+```yaml
+# application.yaml
+spring:
+  config:
+    import: "optional:configtree:/etc/segredos/"
+```
+
+Lembre que um Secret do Kubernetes é só Base64 dentro do etcd. Ele protege por controle de acesso (RBAC), não por criptografia, a menos que o cluster tenha criptografia em repouso ligada.
+
+## Probes com o Actuator
+
+O Kubernetes decide o destino de cada pod com três perguntas:
+
+- **Startup**: a aplicação já terminou de subir? Enquanto não, as outras probes nem rodam.
+- **Liveness**: o processo está vivo ou travou de um jeito que só reiniciar resolve? Se falhar, o kubelet mata o contêiner.
+- **Readiness**: pode receber tráfego agora? Se falhar, o pod sai do Service, mas continua rodando.
+
+O Spring Boot tem isso pronto. Com o Actuator no classpath, ele expõe `/actuator/health/liveness` e `/actuator/health/readiness` como *health groups*. Os grupos são ligados automaticamente quando o Boot detecta que roda no Kubernetes; declarar explicitamente evita surpresa ao testar localmente:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+```
+
+```yaml
+# application.yaml
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState, db
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+```
+
+Por padrão, o grupo `liveness` olha só o `LivenessState` interno da aplicação, e o `readiness` olha só o `ReadinessState`. A linha `include: readinessState, db` acrescenta o banco na readiness: se o Postgres cair, os pods saem do Service e param de receber requisições que iriam falhar, mas ninguém é reiniciado à toa.
+
+A startup probe resolve o problema da JVM lenta. Uma API Spring com JPA leva de 10 a 40 segundos para subir num contêiner com pouca CPU. Sem startup probe, você teria de colocar um `initialDelaySeconds` enorme na liveness (e esperar esse tempo em todo restart) ou arriscar o kubelet matar a aplicação no meio do boot, num ciclo infinito de `CrashLoopBackOff`. Com `periodSeconds: 5` e `failureThreshold: 30`, o pod tem até 150 segundos para subir; depois disso, a liveness assume com uma janela curta.
+
+Você também pode mudar o estado de prontidão pelo código. Um exemplo comum é segurar o tráfego até um cache local ser aquecido:
+
+```java
+@Component
+class AquecimentoDeCatalogo implements ApplicationListener<ApplicationReadyEvent> {
+
+    private final CatalogoCache cache;
+    private final ApplicationEventPublisher eventos;
+
+    AquecimentoDeCatalogo(CatalogoCache cache, ApplicationEventPublisher eventos) {
+        this.cache = cache;
+        this.eventos = eventos;
+    }
+
+    @Override
+    public void onApplicationEvent(ApplicationReadyEvent evento) {
+        AvailabilityChangeEvent.publish(eventos, this, ReadinessState.REFUSING_TRAFFIC);
+        cache.carregarProdutosMaisVendidos();
+        AvailabilityChangeEvent.publish(eventos, this, ReadinessState.ACCEPTING_TRAFFIC);
+    }
+}
+```
+
+<Callout type="warning" title="Banco de dados na liveness probe">
+O erro mais caro com probes é incluir dependências externas (banco, Redis, outra API) no grupo de liveness, ou apontar a liveness para `/actuator/health` inteiro. Quando o banco oscila, todas as réplicas falham a liveness ao mesmo tempo, o Kubernetes reinicia todas, e cada JVM nova leva 30 segundos subindo e abrindo conexões contra um banco que já estava sofrendo. Uma instabilidade de segundos vira uma queda de minutos. Dependências externas vão na readiness; a liveness responde só se o processo está saudável.
+</Callout>
+
+## Memória e CPU: a JVM dentro do contêiner
+
+`requests` é o que o scheduler reserva para o pod (e o que o HPA usa como base de cálculo). `limits` é o teto: passar do limite de memória faz o kernel matar o processo (`OOMKilled`); passar do limite de CPU faz o processo ser estrangulado (*throttling*), não morto.
+
+Desde o Java 10, a JVM lê os limites do cgroup. O problema é o padrão: sem configuração, o heap máximo é 25% da memória do contêiner. Num pod de 1 GiB, a JVM usaria só 256 MiB de heap e desperdiçaria o resto. O ajuste é `MaxRAMPercentage`:
+
+```bash
+# confira o que a JVM enxerga dentro do pod
+# (a JVM nova herda o JAVA_TOOL_OPTIONS do pod)
+kubectl exec deploy/api-pedidos -- java -XX:+PrintFlagsFinal -version | grep -E 'MaxHeapSize|ActiveProcessorCount'
+```
+
+Por que 75% e não 100%? Porque o heap não é a única memória da JVM. Metaspace (classes do Spring, Hibernate e proxies), code cache do JIT, pilhas das threads, buffers diretos do Netty ou do driver JDBC e o próprio GC ocupam memória fora do heap. Em APIs Spring típicas, isso soma de 150 a 300 MiB. Com `MaxRAMPercentage=100`, o heap cresce até o limite, a memória fora do heap passa dele, e o pod morre com `OOMKilled` sem nenhum `OutOfMemoryError` no log, o que confunde quem só olha a aplicação.
+
+Regras práticas que funcionam para a maioria das APIs:
+
+- **Memória: request igual a limit.** A JVM não devolve heap ao sistema operacional com facilidade, então "usar mais quando sobrar" não ajuda e expõe o pod a ser despejado quando o nó aperta.
+- **Heap entre 60% e 75% do limit**, via `MaxRAMPercentage` em `JAVA_TOOL_OPTIONS` (a JVM lê essa variável sozinha, sem mexer no `ENTRYPOINT`).
+- **CPU: defina request, pense duas vezes antes do limit.** Limit de CPU baixo estrangula o JIT e o GC justamente no boot, e a aplicação sobe mais devagar. Muitos times deixam CPU sem limit.
+- **Se não houver CPU limit, fixe `ActiveProcessorCount`.** Sem limit, a JVM enxerga todos os núcleos do nó e dimensiona GC, pools do `ForkJoinPool` e do Tomcat como se tivesse 32 CPUs só para ela.
+
+Se a imagem for construída com `mvn spring-boot:build-image` (Buildpacks), o próprio buildpack já calcula os parâmetros de memória da JVM na inicialização. Nesse caso, não some um `MaxRAMPercentage` por cima sem entender o que ele calculou.
+
+## Desligando sem perder requisições
+
+Num rolling update, o Kubernetes manda SIGTERM aos pods antigos. Ao mesmo tempo, e não em sequência, ele tira o pod dos endpoints do Service. Essa remoção leva alguns segundos para chegar a todos os nós e ao balanceador. Se a JVM parar de aceitar conexões no instante do SIGTERM, as requisições que ainda estavam a caminho tomam erro 502.
+
+A receita tem três peças:
+
+```yaml
+# application.yaml
+server:
+  shutdown: graceful            # padrão a partir do Spring Boot 3.4, explícito não faz mal
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+```
+
+1. **`preStop` com sleep** (já no Deployment acima): o contêiner espera 10 segundos antes de receber o SIGTERM, tempo para a remoção dos endpoints se propagar. Em clusters 1.30 ou mais novos você pode usar `preStop: sleep: seconds: 10` sem depender de `sh` na imagem.
+2. **Graceful shutdown do Spring**: ao receber SIGTERM, o Boot muda a readiness para `REFUSING_TRAFFIC`, para de aceitar conexões novas e espera as requisições em andamento terminarem, até `timeout-per-shutdown-phase`.
+3. **`terminationGracePeriodSeconds` maior que a soma**: 10 de preStop mais 25 de shutdown pedem pelo menos 35; o exemplo usa 45. Se o prazo estourar, o kubelet manda SIGKILL.
+
+Para tudo isso funcionar, o SIGTERM precisa chegar à JVM. Use `ENTRYPOINT ["java", "-jar", "app.jar"]` na forma exec do Dockerfile. Na forma shell (`ENTRYPOINT java -jar app.jar`), quem recebe o sinal é o `sh`, que não repassa, e a JVM só morre no SIGKILL.
+
+## Escalando com HPA
+
+O HorizontalPodAutoscaler ajusta o número de réplicas pela utilização média em relação ao `request`. Com request de 500m e alvo de 70%, ele adiciona pods quando a média passa de 350m por pod. Ele precisa do metrics-server instalado no cluster.
+
+```yaml
+# k8s/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-pedidos
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-pedidos
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+```
+
+Duas observações específicas de JVM. Primeiro, escalar por memória quase nunca funciona: o heap ocupado não cai quando a carga cai, então o HPA cresceria e nunca encolheria. Use CPU ou uma métrica de negócio (requisições por segundo, tamanho de fila) via adaptador de métricas. Segundo, um pod novo leva tempo para ficar útil (boot mais aquecimento do JIT); por isso `minReplicas: 2` e uma janela longa para reduzir, para não ficar criando e destruindo JVMs.
+
+Remova `replicas` do Deployment quando usar HPA. Senão, cada `kubectl apply` volta o número de réplicas para o valor do arquivo e briga com o autoscaler.
+
+## Spring Cloud Kubernetes: quando vale
+
+O Spring Cloud Kubernetes integra a aplicação à API do cluster: lê ConfigMaps e Secrets direto da API (com recarga quando mudam), faz service discovery via Kubernetes e implementa `DiscoveryClient` para quem já usava Eureka.
+
+Na maioria dos casos, você não precisa dele:
+
+- **Descoberta de serviço** já é o DNS do Service. `http://api-estoque` funciona com `RestClient` ou `WebClient` puros.
+- **Configuração** chega por variáveis de ambiente ou `configtree`, como acima, e um rollout (`kubectl rollout restart`) aplica valores novos.
+
+Ele vale a pena quando você migra de Spring Cloud Netflix e quer manter o código de `DiscoveryClient`, ou quando precisa recarregar configuração sem reiniciar pods. O custo é que o pod passa a precisar de uma ServiceAccount com permissão de leitura na API do Kubernetes, e a aplicação fica acoplada ao cluster.
+
+## Testando localmente com kind
+
+Antes de ter um cluster na nuvem, use o kind (Kubernetes dentro do Docker):
+
+```bash
+kind create cluster --name loja
+./mvnw -q spring-boot:build-image -Dspring-boot.build-image.imageName=api-pedidos:dev
+kind load docker-image api-pedidos:dev --name loja
+
+kubectl apply -f k8s/
+kubectl set image deploy/api-pedidos api=api-pedidos:dev
+kubectl rollout status deploy/api-pedidos --timeout=180s
+kubectl port-forward svc/api-pedidos 8080:80
+curl -s localhost:8080/actuator/health/readiness
+```
+
+Quando algo não sobe, a ordem de investigação é sempre a mesma: `kubectl get pods` (estado), `kubectl describe pod` (eventos: imagem não encontrada, probe falhando, `OOMKilled`) e `kubectl logs --previous` (o log do contêiner que acabou de morrer).
+
+## Na entrevista
+
+**Qual a diferença entre liveness e readiness?** Liveness falhando reinicia o contêiner; readiness falhando só tira o pod do balanceamento. Dependências externas vão na readiness, nunca na liveness, para uma falha no banco não reiniciar todas as réplicas.
+
+**Por que um pod Java é morto com OOMKilled sem OutOfMemoryError no log?** Porque o processo passou do limit do cgroup, e não do heap. Heap mais memória fora do heap (metaspace, threads, code cache, buffers diretos) excederam o limit. A correção é deixar folga, com `MaxRAMPercentage` em torno de 75% ou menos.
+
+**Como evitar erros 502 durante um rolling update de uma API Spring?** Graceful shutdown do Spring Boot, um preStop curto para a remoção dos endpoints se propagar, `terminationGracePeriodSeconds` maior que os dois somados e `maxUnavailable: 0` na estratégia.
+
+**Para que serve a startup probe?** Para aplicações de boot lento, como a JVM: ela desativa liveness e readiness até a aplicação subir, sem precisar de um atraso fixo enorme.
+
+## Pratique
+
+Coloque a API de pedidos num cluster kind e entregue no repositório:
+
+1. A pasta `k8s/` com Deployment, Service, ConfigMap e HPA, e um comando documentado para criar o Secret.
+2. `application.yaml` com probes, grupo de readiness incluindo o banco e graceful shutdown.
+3. Um teste de fumaça: com `kubectl rollout restart` rodando, um loop de `curl` contra o Service não pode registrar nenhum erro.
+4. Um experimento de memória: suba o pod com limit de 512 MiB e `MaxRAMPercentage=100`, gere carga até ele morrer, mostre o `OOMKilled` no `kubectl describe` e explique a correção no README.
+
+<Quiz question="O Postgres ficou fora do ar por 20 segundos. O que deve acontecer com os pods da API?" options={["A liveness falha e todos os pods são reiniciados","A readiness falha e os pods saem do Service sem reiniciar","A startup probe volta a rodar desde o início","O HPA cria novas réplicas para compensar"]} answer={1} explanation="Banco é dependência externa e fica no grupo de readiness. Os pods param de receber tráfego e voltam sozinhos quando o banco volta, sem o custo de reiniciar a JVM." />
+
+<Quiz question="Um pod com limit de memória de 1 GiB e sem flags da JVM terá qual heap máximo por padrão?" options={["1 GiB, todo o limit do contêiner","768 MiB, três quartos do limit","256 MiB, um quarto do limit","A memória total do nó"]} answer={2} explanation="A JVM respeita o cgroup, mas o padrão de MaxRAMPercentage é 25%. Por isso se ajusta para algo entre 60% e 75%, deixando folga para a memória fora do heap." />
+
+<Quiz question="Por que escalar uma API Java pelo uso de memória costuma dar errado?" options={["O HPA não aceita métricas de memória","A memória da JVM não cai quando a carga cai, então o HPA não reduz réplicas","A memória só é medida depois do primeiro GC completo","O metrics-server não coleta memória de contêineres Java"]} answer={1} explanation="O heap ocupado tende a se manter alto mesmo sem carga, porque a JVM não devolve memória ao sistema com facilidade. O HPA cresce e nunca encolhe. CPU ou métricas de negócio são melhores sinais." />
+
+## Base no CodeForge
+
+- [Docker na prática para back-end Java](/learn/carreira-java/docker-pratica-para-backend-java): a imagem que este capítulo coloca no cluster.
+- [Integração Contínua: Automatizando a entrega no Kubernetes](/learn/carreira-java/integracao-continua-automatizando-entrega-kubernetes): o pipeline que aplica estes manifestos a cada commit.
+- [Kubernetes](/learn/system-design-interviews/kubernetes): os objetos do Kubernetes do ponto de vista de entrevista de system design.
+- [Amazon EKS: gerenciando aplicações conteinerizadas](/learn/carreira-nodejs/amazon-eks-gerenciando-aplicacoes-conteinerizadas-kubernetes): o mesmo assunto com Node.js, focado no cluster gerenciado da AWS.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos) e [Rolling](/learn/system-design/rolling): a teoria por trás dos Secrets e do rolling update.
+
+## Referências
+
+- [Spring Boot: Kubernetes Probes](https://docs.spring.io/spring-boot/reference/actuator/endpoints.html#actuator.endpoints.kubernetes-probes)
+- [Spring Boot: Deploying to Kubernetes](https://docs.spring.io/spring-boot/how-to/deployment/cloud.html#howto.deployment.cloud.kubernetes)
+- [Kubernetes: Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+- [Kubernetes: Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)

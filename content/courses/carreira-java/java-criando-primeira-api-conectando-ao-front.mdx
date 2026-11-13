@@ -1,0 +1,462 @@
+---
+title: "Java: Criando sua primeira API e conectando ao front"
+kind: lesson
+---
+
+A clínica já tem entidades, repositórios e um serviço de agendamento, mas ninguém consegue usá-los: falta a porta de entrada. Uma API REST expõe essas operações por HTTP, e qualquer cliente (um front em React, um app mobile, outro sistema) passa a cadastrar médicos e marcar consultas. Este capítulo usa o mesmo projeto do capítulo de Spring Data JPA e constrói a API com Spring MVC: controllers, DTOs em record, validação, códigos de status corretos, erros padronizados e paginação. No fim, uma página HTML simples consome a API pelo navegador, e você resolve o CORS que inevitavelmente aparece.
+
+**Você vai aprender:**
+
+- Criar endpoints REST com `@RestController` e os mapeamentos de método HTTP
+- Separar entrada e saída da API das entidades com DTOs em record
+- Validar dados com Bean Validation e responder 201, 204, 400, 404 e 409 nos momentos certos
+- Padronizar erros com `@RestControllerAdvice` e `ProblemDetail`
+- Paginar listagens e consumir a API com `fetch` num front, com CORS configurado
+
+## Adicionando a camada web
+
+No `pom.xml` do projeto da clínica, adicione:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-validation</artifactId>
+</dependency>
+```
+
+O starter web traz o Tomcat embutido, o Spring MVC e o Jackson já configurado. Rode `./mvnw spring-boot:run` e a aplicação passa a escutar na porta 8080. O `@SpringBootApplication` continua o mesmo; o Spring Boot detecta o Tomcat no classpath e sobe o servidor.
+
+## Desenhando os recursos
+
+REST organiza a API em torno de **recursos** (substantivos) e usa os métodos HTTP como verbos:
+
+| Operação | Método e caminho | Sucesso |
+|---|---|---|
+| Cadastrar médico | `POST /medicos` | 201 Created com `Location` |
+| Listar médicos (paginado) | `GET /medicos?especialidade=CARDIOLOGIA&page=0&size=20` | 200 |
+| Detalhar médico | `GET /medicos/{id}` | 200, ou 404 |
+| Atualizar médico | `PUT /medicos/{id}` | 200 |
+| Desativar médico | `DELETE /medicos/{id}` | 204 No Content |
+| Agendar consulta | `POST /consultas` | 201, ou 409 se o horário estiver ocupado |
+| Cancelar consulta | `POST /consultas/{id}/cancelamento` | 204 |
+
+Caminhos no plural, sem verbos (`/medicos`, não `/cadastrarMedico`). Ações que não cabem em CRUD, como cancelar, viram um sub-recurso (`/cancelamento`) ou uma mudança de estado via `PATCH`.
+
+## DTOs: o contrato da API
+
+Não exponha entidades JPA direto no controller. Os motivos são concretos: a entidade muda por razões de banco e quebraria os clientes; serializar uma associação `LAZY` fora da transação lança `LazyInitializationException`; e aceitar a entidade como entrada permite que o cliente envie campos que não deveria, como `id` ou `ativo` (mass assignment). Use records como DTOs:
+
+```java
+package br.com.clinica.medico;
+
+import jakarta.validation.constraints.*;
+
+public record NovoMedico(
+        @NotBlank @Size(max = 120) String nome,
+        @NotBlank @Pattern(regexp = "[A-Z]{2}\\d{4,6}", message = "formato esperado: UF seguida de 4 a 6 dígitos") String crm,
+        @NotNull Especialidade especialidade) {
+}
+
+public record AtualizacaoMedico(@NotBlank @Size(max = 120) String nome) {
+}
+
+public record MedicoResposta(Long id, String nome, String crm, Especialidade especialidade, boolean ativo) {
+    public static MedicoResposta de(Medico m) {
+        return new MedicoResposta(m.getId(), m.getNome(), m.getCrm(), m.getEspecialidade(), m.isAtivo());
+    }
+}
+```
+
+As anotações de `jakarta.validation` descrevem as regras de formato. O Jackson converte `"CARDIOLOGIA"` em `Especialidade.CARDIOLOGIA` sozinho; um valor inexistente gera erro 400.
+
+## O primeiro controller
+
+```java
+package br.com.clinica.medico;
+
+import jakarta.validation.Valid;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
+
+@RestController
+@RequestMapping("/medicos")
+public class MedicoController {
+    private final MedicoService service;
+
+    public MedicoController(MedicoService service) {
+        this.service = service;
+    }
+
+    @PostMapping
+    public ResponseEntity<MedicoResposta> cadastrar(@RequestBody @Valid NovoMedico dados) {
+        MedicoResposta criado = service.cadastrar(dados);
+        var location = ServletUriComponentsBuilder.fromCurrentRequest()
+                .path("/{id}").buildAndExpand(criado.id()).toUri();
+        return ResponseEntity.created(location).body(criado);
+    }
+
+    @GetMapping
+    public Page<MedicoResposta> listar(@RequestParam(required = false) Especialidade especialidade,
+                                       @PageableDefault(size = 20, sort = "nome") Pageable pageable) {
+        return service.listar(especialidade, pageable);
+    }
+
+    @GetMapping("/{id}")
+    public MedicoResposta detalhar(@PathVariable Long id) {
+        return service.buscar(id);
+    }
+
+    @PutMapping("/{id}")
+    public MedicoResposta atualizar(@PathVariable Long id, @RequestBody @Valid AtualizacaoMedico dados) {
+        return service.atualizar(id, dados);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> desativar(@PathVariable Long id) {
+        service.desativar(id);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+O que cada peça faz:
+
+- `@RestController` combina `@Controller` com `@ResponseBody`: o retorno de cada método vira JSON no corpo da resposta.
+- `@RequestMapping("/medicos")` define o prefixo; `@GetMapping`, `@PostMapping`, `@PutMapping` e `@DeleteMapping` ligam método HTTP e caminho.
+- `@RequestBody` desserializa o JSON do corpo; `@Valid` dispara a validação antes de o método rodar.
+- `@PathVariable` lê `{id}` do caminho; `@RequestParam` lê a query string.
+- `ResponseEntity` dá controle total de status e cabeçalhos. Quando o padrão (200) serve, devolva o objeto direto.
+- `Pageable` é montado pelo Spring a partir de `?page=0&size=20&sort=nome,asc`.
+
+O controller fica fino de propósito: recebe, delega e devolve. Regra de negócio mora no serviço:
+
+```java
+@Service
+public class MedicoService {
+    private final MedicoRepository repositorio;
+
+    public MedicoService(MedicoRepository repositorio) {
+        this.repositorio = repositorio;
+    }
+
+    @Transactional
+    public MedicoResposta cadastrar(NovoMedico dados) {
+        if (repositorio.existsByCrm(dados.crm())) {
+            throw new RegraDeNegocioException("Já existe médico com o CRM " + dados.crm());
+        }
+        var medico = repositorio.save(new Medico(dados.nome(), dados.crm(), dados.especialidade()));
+        return MedicoResposta.de(medico);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<MedicoResposta> listar(Especialidade especialidade, Pageable pageable) {
+        Page<Medico> pagina = especialidade == null
+                ? repositorio.findAll(pageable)
+                : repositorio.findByEspecialidade(especialidade, pageable);
+        return pagina.map(MedicoResposta::de);
+    }
+
+    @Transactional(readOnly = true)
+    public MedicoResposta buscar(Long id) {
+        return MedicoResposta.de(carregar(id));
+    }
+
+    @Transactional
+    public MedicoResposta atualizar(Long id, AtualizacaoMedico dados) {
+        Medico medico = carregar(id);
+        medico.renomear(dados.nome()); // dirty checking faz o UPDATE
+        return MedicoResposta.de(medico);
+    }
+
+    @Transactional
+    public void desativar(Long id) {
+        carregar(id).desativar();
+    }
+
+    private Medico carregar(Long id) {
+        return repositorio.findById(id)
+                .orElseThrow(() -> new RecursoNaoEncontradoException("Médico " + id + " não encontrado"));
+    }
+}
+```
+
+Adicione à entidade `Medico` o método `renomear(String nome)`, que valida e altera o nome: é a mesma ideia de métodos com intenção em vez de setters. O DTO de resposta é montado dentro da transação, então nenhum proxy `LAZY` escapa para a serialização. `RegraDeNegocioException` e `RecursoNaoEncontradoException` são exceções não checadas do domínio, como as do capítulo de consumo de API.
+
+Teste com `curl`:
+
+```bash
+curl -i -X POST http://localhost:8080/medicos \
+  -H "Content-Type: application/json" \
+  -d '{"nome":"Carlos Lima","crm":"SP123456","especialidade":"CARDIOLOGIA"}'
+```
+
+```http
+HTTP/1.1 201
+Location: http://localhost:8080/medicos/1
+Content-Type: application/json
+
+{"id":1,"nome":"Carlos Lima","crm":"SP123456","especialidade":"CARDIOLOGIA","ativo":true}
+```
+
+## Erros padronizados com ProblemDetail
+
+Sem tratamento, uma `RecursoNaoEncontradoException` vira 500, e uma falha de validação devolve uma resposta genérica. Um `@RestControllerAdvice` intercepta as exceções de todos os controllers e as traduz em respostas HTTP. O Spring 6 traz `ProblemDetail`, que implementa o formato padrão de erro da RFC 9457 (`application/problem+json`):
+
+```java
+package br.com.clinica.web;
+
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@RestControllerAdvice
+public class TratadorDeErros {
+
+    @ExceptionHandler(RecursoNaoEncontradoException.class)
+    public ProblemDetail naoEncontrado(RecursoNaoEncontradoException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
+    }
+
+    @ExceptionHandler(RegraDeNegocioException.class)
+    public ProblemDetail regraDeNegocio(RegraDeNegocioException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
+    }
+
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ProblemDetail integridade(DataIntegrityViolationException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT,
+                "Operação viola uma restrição de dados (registro duplicado ou horário ocupado)");
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail validacao(MethodArgumentNotValidException e) {
+        ProblemDetail problema = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Dados inválidos");
+        Map<String, String> campos = e.getBindingResult().getFieldErrors().stream()
+                .collect(Collectors.toMap(f -> f.getField(),
+                        f -> String.valueOf(f.getDefaultMessage()), (a, b) -> a));
+        problema.setProperty("campos", campos);
+        return problema;
+    }
+}
+```
+
+Agora um POST sem nome responde:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Bad Request",
+  "status": 400,
+  "detail": "Dados inválidos",
+  "instance": "/medicos",
+  "campos": { "nome": "must not be blank" }
+}
+```
+
+O front sabe exatamente qual campo destacar. As mensagens das anotações podem ser traduzidas com o atributo `message` ou com um arquivo `ValidationMessages.properties`.
+
+<Callout type="warning" title="Não vaze stack trace nem detalhes internos">
+Um tratador genérico para `Exception` que devolve `e.getMessage()` costuma expor nomes de tabelas, SQL e caminhos de classe ao cliente, o que ajuda um atacante e confunde o usuário. Para erros inesperados, registre a exceção completa no log e responda 500 com uma mensagem neutra. No Spring Boot, mantenha `server.error.include-stacktrace=never` (o padrão) e nunca o ligue em produção.
+</Callout>
+
+## Agendando consultas
+
+O endpoint de consultas usa o `AgendamentoService` do capítulo anterior. A entrada referencia médico e paciente pelo ID, e a data precisa estar no futuro:
+
+```java
+public record NovaConsulta(
+        @NotNull Long medicoId,
+        @NotNull Long pacienteId,
+        @NotNull @Future LocalDateTime dataHora) {
+}
+
+public record ConsultaResposta(Long id, String medico, String paciente, LocalDateTime dataHora,
+                               BigDecimal valor, StatusConsulta status) {
+    public static ConsultaResposta de(Consulta c) {
+        return new ConsultaResposta(c.getId(), c.getMedico().getNome(), c.getPaciente().getNome(),
+                c.getDataHora(), c.getValor(), c.getStatus());
+    }
+}
+
+@RestController
+@RequestMapping("/consultas")
+public class ConsultaController {
+    private final AgendamentoService agendamento;
+
+    public ConsultaController(AgendamentoService agendamento) {
+        this.agendamento = agendamento;
+    }
+
+    @PostMapping
+    public ResponseEntity<ConsultaResposta> agendar(@RequestBody @Valid NovaConsulta dados) {
+        ConsultaResposta criada = agendamento.agendar(dados.medicoId(), dados.pacienteId(), dados.dataHora());
+        return ResponseEntity.created(URI.create("/consultas/" + criada.id())).body(criada);
+    }
+
+    @PostMapping("/{id}/cancelamento")
+    public ResponseEntity<Void> cancelar(@PathVariable Long id) {
+        agendamento.cancelar(id);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+Para isso funcionar, ajuste o `AgendamentoService.agendar` para devolver `ConsultaResposta.de(...)` dentro da transação e para lançar `RegraDeNegocioException` em vez de `IllegalStateException` no horário ocupado. O tratador transforma isso em 409. O JSON de entrada usa o formato ISO: `"dataHora": "2026-12-03T10:00:00"`.
+
+## Conectando ao front
+
+Uma página mínima, servida por qualquer servidor local de arquivos (por exemplo `npx serve` ou o Vite na porta 5173), lista os médicos e cadastra um novo:
+
+```html
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>Clínica</title></head>
+<body>
+  <h1>Médicos</h1>
+  <ul id="lista"></ul>
+
+  <form id="form">
+    <input name="nome" placeholder="Nome">
+    <input name="crm" placeholder="CRM (ex.: SP123456)">
+    <select name="especialidade">
+      <option>CLINICO_GERAL</option><option>CARDIOLOGIA</option>
+      <option>DERMATOLOGIA</option><option>NEUROLOGIA</option>
+    </select>
+    <button>Cadastrar</button>
+  </form>
+  <p id="erro"></p>
+
+  <script>
+    const API = "http://localhost:8080";
+
+    async function carregar() {
+      const resp = await fetch(`${API}/medicos?size=50`);
+      const pagina = await resp.json();
+      document.getElementById("lista").innerHTML = pagina.content
+        .map(m => `<li>${m.nome} (${m.especialidade})</li>`).join("");
+    }
+
+    document.getElementById("form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const dados = Object.fromEntries(new FormData(e.target));
+      const resp = await fetch(`${API}/medicos`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(dados),
+      });
+      if (!resp.ok) {
+        const problema = await resp.json();
+        document.getElementById("erro").textContent =
+          problema.detail + " " + JSON.stringify(problema.campos ?? {});
+        return;
+      }
+      e.target.reset();
+      document.getElementById("erro").textContent = "";
+      carregar();
+    });
+
+    carregar();
+  </script>
+</body>
+</html>
+```
+
+Abra a página e o console do navegador mostra o erro esperado: "has been blocked by CORS policy". A página está em `http://localhost:5173` e a API em `http://localhost:8080`, origens diferentes. O `POST` com `Content-Type: application/json` ainda dispara um preflight `OPTIONS`. Repare que `fetch` não rejeita a promessa para 400 ou 500, assim como o `HttpClient` do Java: o código checa `resp.ok`.
+
+### Liberando o CORS
+
+Libere apenas as origens do seu front, numa configuração global:
+
+```java
+@Configuration
+public class CorsConfig implements WebMvcConfigurer {
+
+    private final String[] origens;
+
+    public CorsConfig(@Value("${clinica.cors.origens}") String[] origens) {
+        this.origens = origens;
+    }
+
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/**")
+                .allowedOrigins(origens)
+                .allowedMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+                .allowedHeaders("Content-Type", "Authorization")
+                .exposedHeaders("Location")
+                .maxAge(3600);
+    }
+}
+```
+
+```properties
+clinica.cors.origens=http://localhost:5173
+```
+
+Em produção, a variável de ambiente `CLINICA_CORS_ORIGENS=https://app.clinica.com.br` substitui o valor sem recompilar. `exposedHeaders("Location")` deixa o JavaScript ler o cabeçalho `Location` da resposta 201, que o navegador esconde por padrão. Quando o Spring Security entrar na carreira, a configuração de CORS passa a ser feita também na cadeia de filtros, porque o preflight precisa passar antes da autenticação.
+
+## Documentação com OpenAPI
+
+Uma API sem documentação obriga o time de front a ler o seu código. Com o springdoc, a especificação OpenAPI é gerada a partir dos controllers:
+
+```xml
+<dependency>
+  <groupId>org.springdoc</groupId>
+  <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+  <version>2.8.9</version>
+</dependency>
+```
+
+Acesse `http://localhost:8080/swagger-ui.html` para testar cada endpoint pelo navegador, e `/v3/api-docs` para o JSON da especificação, que o front pode usar para gerar um cliente tipado.
+
+## Na entrevista
+
+- **Por que usar DTOs em vez de expor entidades?** Desacopla o contrato da API do modelo de banco, evita mass assignment e `LazyInitializationException`, e permite formatos diferentes de entrada e saída.
+- **Qual status devolver ao criar um recurso?** 201 Created com o cabeçalho `Location` apontando para o novo recurso, e normalmente o recurso criado no corpo.
+- **Diferença entre `@Controller` e `@RestController`?** `@RestController` adiciona `@ResponseBody` a todos os métodos, então o retorno é serializado no corpo (JSON) em vez de ser interpretado como nome de uma view.
+- **Como você padroniza erros numa API Spring?** Com `@RestControllerAdvice` e `@ExceptionHandler` traduzindo exceções do domínio em `ProblemDetail` (RFC 9457), com status coerentes: 400 validação, 404 inexistente, 409 conflito de regra.
+
+## Pratique
+
+Complete a API da clínica:
+
+1. CRUD de pacientes: `POST /pacientes` recebe nome, CPF, nascimento e CEP, e preenche o endereço com o `ViaCepClient` (CEP inexistente responde 422; ViaCEP fora do ar responde 503 pelo tratador de erros).
+2. `GET /pacientes/{id}/consultas` paginado, sem N+1.
+3. `GET /medicos/{id}/agenda?dia=2026-12-03` com os horários ocupados e livres do expediente.
+4. Uma página HTML que agenda consulta escolhendo médico e paciente em listas, mostrando o erro 409 de horário ocupado de forma amigável.
+5. Um teste com `@WebMvcTest` para o `MedicoController` cobrindo 201, 400 e 404.
+
+Entregue o código, a página e uma coleção de comandos `curl` (ou arquivo `.http`) que exercita cada endpoint, incluindo os casos de erro.
+
+<Quiz question="Qual combinação é a resposta adequada a um POST /medicos bem-sucedido?" options={["200 OK com o corpo vazio","201 Created com o cabeçalho Location","204 No Content com o recurso no corpo","302 Found apontando para /medicos"]} answer={1} explanation="Criação devolve 201 e o cabeçalho Location com a URL do novo recurso, geralmente com o recurso no corpo." />
+<Quiz question="O que acontece quando um corpo anotado com @Valid viola uma restrição de Bean Validation?" options={["O método do controller roda e recebe null","Uma MethodArgumentNotValidException é lançada e a resposta é 400","O Spring ignora o campo inválido","A transação é desfeita e a resposta é 500"]} answer={1} explanation="A validação ocorre antes do método. A falha lança MethodArgumentNotValidException, que por padrão vira 400 e pode ser personalizada num RestControllerAdvice." />
+<Quiz question="A página em localhost:5173 recebe erro de CORS ao chamar a API em localhost:8080. Onde se corrige?" options={["No front, adicionando mode no-cors","Na API, autorizando a origem do front","No navegador, desativando a segurança","No banco de dados, liberando o usuário"]} answer={1} explanation="Quem autoriza outra origem a ler as respostas é o servidor, com os cabeçalhos Access-Control-Allow-*. O modo no-cors só torna a resposta ilegível para o script." />
+
+## Base no CodeForge
+
+- [REST](/learn/system-design/rest) e [O que é uma API](/learn/system-design/o-que-e-api): os princípios por trás do desenho dos recursos.
+- [Idempotência](/learn/system-design/idempotencia): por que PUT e DELETE podem ser repetidos e POST não.
+- [MVC](/learn/lld/mvc): o padrão que o Spring MVC implementa.
+- [Redes e Protocolos: Fundamentos da web](/learn/carreira-java/redes-protocolos-fundamentos-web): HTTP, status e CORS em detalhe.
+- [Node.js: criando API REST com Express e MongoDB](/learn/carreira-nodejs/nodejs-criando-api-rest-express-mongodb): a mesma ideia em outra stack, para comparar.
+
+## Referências
+
+- [Spring Guide: Building a RESTful Web Service](https://spring.io/guides/gs/rest-service)
+- [Spring Framework: Annotated Controllers](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller.html)
+- [Spring Framework: CORS](https://docs.spring.io/spring-framework/reference/web/webmvc-cors.html)
+- [MDN: Usando Fetch](https://developer.mozilla.org/pt-BR/docs/Web/API/Fetch_API/Using_Fetch)

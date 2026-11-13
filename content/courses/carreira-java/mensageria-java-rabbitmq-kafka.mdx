@@ -1,0 +1,291 @@
+---
+title: "Mensageria com Java: RabbitMQ e Kafka"
+kind: lesson
+---
+
+Quando a API de pedidos chama estoque, pagamento, nota fiscal e e-mail de forma síncrona, qualquer um deles lento ou fora do ar derruba o checkout. Mensageria desacopla isso: o serviço de pedidos publica "pedido criado" e segue a vida, e cada interessado consome no próprio ritmo. RabbitMQ e Kafka são as duas ferramentas que você mais vai encontrar em vagas Java, e elas parecem iguais só de longe. Neste capítulo você entende o modelo de cada uma, quando escolher qual e implementa produtores e consumidores com Spring AMQP e Spring Kafka, cuidando de chaves, partições, offsets e duplicidade.
+
+**Você vai aprender:**
+
+- A diferença de modelo entre um broker de filas (RabbitMQ) e um log distribuído (Kafka)
+- Publicar e consumir mensagens com Spring AMQP
+- Produzir e consumir com Spring Kafka, usando chaves, partições e consumer groups
+- Controlar offsets, tratar erros com dead letter e garantir idempotência
+- O que exactly-once realmente garante no Kafka
+
+## Dois modelos diferentes
+
+**RabbitMQ** é um broker de mensagens clássico. O produtor publica em uma **exchange**, que roteia a mensagem para uma ou mais **filas** segundo regras (bindings e routing keys). O consumidor recebe a mensagem, processa e confirma (ack). Confirmada, a mensagem **sai da fila**. O broker é inteligente (roteamento, prioridades, TTL, filas de dead letter) e o consumidor é simples.
+
+**Kafka** é um log distribuído e persistente. O produtor anexa registros ao final de um **tópico**, dividido em **partições**. Os registros **ficam lá** pelo período de retenção (dias, semanas ou para sempre), consumidos ou não. Cada consumidor guarda a própria posição na partição, o **offset**. O broker é simples e o consumidor controla onde está.
+
+| | RabbitMQ | Kafka |
+|---|---|---|
+| Modelo | Filas, a mensagem some após o ack | Log, o registro fica pela retenção |
+| Roteamento | Rico (direct, topic, fanout, headers) | Por tópico e partição |
+| Reprocessar o passado | Não, a mensagem já saiu | Sim, basta voltar o offset |
+| Ordem | Por fila, com um consumidor | Por partição |
+| Vazão | Alta | Muito alta (milhões por segundo) |
+| Caso típico | Fila de tarefas, comandos, RPC assíncrono | Streaming de eventos, integração de dados, auditoria |
+
+Regra prática: se a mensagem é uma **tarefa** para alguém executar uma vez ("gere a nota fiscal do pedido 42"), RabbitMQ é natural. Se é um **fato** que vários sistemas querem ler, inclusive sistemas que ainda não existem ("o pedido 42 foi criado"), e você quer poder reprocessar o histórico, Kafka é natural.
+
+Para rodar os dois localmente:
+
+```bash
+docker run -d --name rabbit -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker run -d --name kafka -p 9092:9092 apache/kafka:3.8.0
+```
+
+## RabbitMQ com Spring AMQP
+
+Com `spring-boot-starter-amqp`, você declara a topologia como beans e o Spring cria tudo no broker ao subir:
+
+```java
+@Configuration
+class RabbitConfig {
+    static final String EXCHANGE = "pedidos";
+    static final String FILA_NF = "notas-fiscais.gerar";
+
+    @Bean TopicExchange pedidosExchange() { return new TopicExchange(EXCHANGE); }
+
+    @Bean Queue filaNotaFiscal() {
+        return QueueBuilder.durable(FILA_NF)
+                .deadLetterExchange("")                     // exchange padrão
+                .deadLetterRoutingKey(FILA_NF + ".dlq")
+                .build();
+    }
+
+    @Bean Queue dlqNotaFiscal() { return QueueBuilder.durable(FILA_NF + ".dlq").build(); }
+
+    @Bean Binding bindingNotaFiscal() {
+        return BindingBuilder.bind(filaNotaFiscal()).to(pedidosExchange()).with("pedido.pago");
+    }
+
+    @Bean MessageConverter jsonConverter() { return new Jackson2JsonMessageConverter(); }
+}
+```
+
+Publicar e consumir:
+
+```java
+public record PedidoPago(long pedidoId, String clienteEmail, BigDecimal total) {}
+
+@Service
+class PublicadorPedidos {
+    private final RabbitTemplate rabbit;
+    PublicadorPedidos(RabbitTemplate rabbit) { this.rabbit = rabbit; }
+
+    void pedidoPago(PedidoPago evento) {
+        rabbit.convertAndSend(RabbitConfig.EXCHANGE, "pedido.pago", evento);
+    }
+}
+
+@Component
+class GeradorNotaFiscal {
+    @RabbitListener(queues = RabbitConfig.FILA_NF)
+    void gerar(PedidoPago evento) {
+        // se lançar exceção, a mensagem volta ou vai para a DLQ, conforme a configuração
+        notas.emitir(evento.pedidoId(), evento.total());
+    }
+}
+```
+
+O Spring faz o ack automaticamente quando o método termina sem exceção. Para evitar que uma mensagem com erro permanente seja reentregue para sempre, configure retry com limite e rejeite sem reenfileirar no final, para que ela caia na DLQ:
+
+```yaml
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        default-requeue-rejected: false
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 500ms
+          multiplier: 2
+```
+
+## Kafka: tópicos, partições e chaves
+
+O conceito que mais importa no Kafka é a partição. Um tópico com 6 partições é, na prática, 6 logs independentes. A ordem só é garantida **dentro** de uma partição. Para decidir a partição, o produtor usa a **chave** do registro: mesma chave, mesma partição (por hash). Então, se você usa o `pedidoId` como chave, todos os eventos de um pedido (criado, pago, enviado) chegam em ordem para quem consome.
+
+Adicione `spring-kafka` e configure:
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+    consumer:
+      group-id: estoque
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "br.com.loja.eventos"
+```
+
+Declare o tópico como bean (em produção, normalmente quem cria é o time de plataforma, via infraestrutura como código):
+
+```java
+@Bean
+NewTopic pedidosTopic() {
+    return TopicBuilder.name("pedidos.eventos").partitions(6).replicas(1).build();
+}
+```
+
+### Produtor
+
+```java
+package br.com.loja.eventos;
+
+public record PedidoCriado(long pedidoId, long clienteId, List<ItemPedido> itens, Instant criadoEm) {}
+```
+
+```java
+@Service
+class EventosPedido {
+    private static final Logger log = LoggerFactory.getLogger(EventosPedido.class);
+    private final KafkaTemplate<String, Object> kafka;
+
+    EventosPedido(KafkaTemplate<String, Object> kafka) { this.kafka = kafka; }
+
+    void publicar(PedidoCriado evento) {
+        kafka.send("pedidos.eventos", String.valueOf(evento.pedidoId()), evento)
+             .whenComplete((resultado, erro) -> {
+                 if (erro != null) {
+                     log.error("Falha ao publicar pedido {}", evento.pedidoId(), erro);
+                 } else {
+                     var meta = resultado.getRecordMetadata();
+                     log.info("Pedido {} na partição {} offset {}",
+                             evento.pedidoId(), meta.partition(), meta.offset());
+                 }
+             });
+    }
+}
+```
+
+O `send` é assíncrono e devolve um `CompletableFuture`. Com `acks: all`, o broker só confirma depois que todas as réplicas sincronizadas gravaram o registro. Com `enable.idempotence: true`, o produtor numera os envios e o broker descarta duplicatas causadas por retries internos do produtor.
+
+### Consumidor e consumer groups
+
+```java
+@Component
+class ReservaEstoque {
+    private static final Logger log = LoggerFactory.getLogger(ReservaEstoque.class);
+
+    @KafkaListener(topics = "pedidos.eventos", groupId = "estoque", concurrency = "3")
+    void consumir(ConsumerRecord<String, PedidoCriado> registro) {
+        var evento = registro.value();
+        log.info("Reservando pedido {} (partição {}, offset {})",
+                evento.pedidoId(), registro.partition(), registro.offset());
+        estoque.reservar(evento.pedidoId(), evento.itens());
+    }
+}
+```
+
+Um **consumer group** é um conjunto de consumidores que dividem o trabalho: cada partição é atribuída a exatamente um consumidor do grupo. Com 6 partições e `concurrency = "3"` em uma réplica, cada thread lê 2 partições. Subindo uma segunda réplica, o Kafka faz um **rebalance** e cada uma das 6 threads fica com uma partição. Uma sétima thread ficaria ociosa: **o número de partições é o teto de paralelismo de um grupo**.
+
+Grupos diferentes são independentes. O serviço de estoque (grupo `estoque`) e o de e-mail (grupo `notificacoes`) leem o mesmo tópico, cada um com seus offsets. É assim que o Kafka faz pub/sub.
+
+### Offsets e commit
+
+O offset commitado diz ao Kafka até onde o grupo já processou. Se um consumidor cai, quem assume a partição continua do último offset commitado. O Spring Kafka desabilita o auto commit do cliente e commita ele mesmo, depois que o listener retorna sem exceção (por padrão, em lote, após processar os registros de um `poll`).
+
+Isso significa que, se a aplicação cair depois de processar e antes de commitar, os registros serão entregues de novo. A garantia padrão é **at-least-once**: nada se perde, mas pode haver duplicata. Por isso o consumidor precisa ser idempotente.
+
+<Callout type="warning" title="Consumidor que não é idempotente">
+O erro mais comum com mensageria é assumir que cada mensagem chega uma única vez. Rebalances, retries e quedas causam reentrega tanto no Kafka quanto no RabbitMQ. Se o consumidor de estoque baixar o saldo duas vezes para o mesmo pedido, o estoque fica errado. Grave o identificador do evento numa tabela com restrição única, na mesma transação do efeito, ou torne a operação naturalmente idempotente (definir um estado em vez de somar).
+</Callout>
+
+Um consumidor idempotente com uma tabela de controle:
+
+```java
+@Transactional
+@KafkaListener(topics = "pedidos.eventos", groupId = "estoque")
+void consumir(PedidoCriado evento) {
+    int inseridos = jdbc.update("""
+            insert into eventos_processados (consumidor, pedido_id)
+            values ('estoque', ?) on conflict do nothing
+            """, evento.pedidoId());
+    if (inseridos == 0) return; // já processado antes
+    estoque.reservar(evento.pedidoId(), evento.itens());
+}
+```
+
+### Erros e dead letter topic
+
+Uma mensagem que sempre falha (JSON inválido, produto que não existe) não pode travar a partição para sempre. Configure um error handler que tenta algumas vezes e depois publica em um tópico de dead letter (por padrão, o nome do tópico com sufixo `-dlt`):
+
+```java
+@Bean
+DefaultErrorHandler errorHandler(KafkaTemplate<String, Object> template) {
+    var recuperador = new DeadLetterPublishingRecoverer(template);
+    var handler = new DefaultErrorHandler(recuperador, new FixedBackOff(1000L, 2));
+    handler.addNotRetryableExceptions(IllegalArgumentException.class);
+    return handler;
+}
+```
+
+O Spring Boot aplica esse bean aos listeners automaticamente. Monitore o tópico de DLT: mensagem parada lá é um pedido que não foi atendido.
+
+## Exactly-once: o que é verdade
+
+Kafka oferece **exactly-once semantics** com produtor idempotente e transações. Em um fluxo consumir, transformar e produzir **dentro do Kafka**, o commit do offset de entrada e a escrita no tópico de saída acontecem atomicamente, e consumidores com `isolation.level=read_committed` não veem registros de transações abortadas.
+
+```yaml
+spring:
+  kafka:
+    producer:
+      transaction-id-prefix: pedidos-tx-
+    consumer:
+      isolation-level: read_committed
+```
+
+Mas a garantia termina na fronteira do Kafka. Se o consumidor grava no Postgres, chama uma API ou manda e-mail, esses efeitos não fazem parte da transação do Kafka. Para eles, o caminho continua sendo at-least-once com consumidor idempotente. Do lado do produtor, o problema simétrico é gravar o pedido no banco e publicar o evento: se um funcionar e o outro não, os sistemas divergem. O padrão **outbox** resolve isso gravando o evento numa tabela na mesma transação do pedido e publicando depois.
+
+## Na entrevista
+
+**Como o Kafka garante ordem?** Só dentro de uma partição. Para manter a ordem dos eventos de uma mesma entidade, use o identificador dela como chave do registro, que leva todos os eventos para a mesma partição.
+
+**O que acontece se houver mais consumidores no grupo do que partições?** Os excedentes ficam ociosos, porque cada partição é atribuída a um único consumidor do grupo. Para escalar o consumo, aumente o número de partições.
+
+**Quando você escolheria RabbitMQ em vez de Kafka?** Para filas de tarefas com roteamento flexível, prioridades, TTL por mensagem e quando não há necessidade de reprocessar histórico. Kafka faz mais sentido para streams de eventos com muitos consumidores independentes, alta vazão e replay.
+
+**Exactly-once do Kafka evita cobrança duplicada?** Não, se a cobrança é feita numa API externa. A garantia vale para leitura e escrita entre tópicos Kafka. Efeitos externos precisam de idempotência no consumidor.
+
+## Pratique
+
+Monte o fluxo de eventos da API de pedidos:
+
+1. Ao criar um pedido, publique `PedidoCriado` no tópico `pedidos.eventos` com o `pedidoId` como chave, usando uma tabela outbox e um publicador agendado.
+2. Um serviço de estoque com `@KafkaListener` idempotente (tabela `eventos_processados`) e um `DefaultErrorHandler` com DLT.
+3. Um serviço de notificações em outro consumer group lendo o mesmo tópico.
+4. Uma fila RabbitMQ `notas-fiscais.gerar` com DLQ, alimentada quando o pedido é pago.
+5. Testes de integração com Testcontainers (módulos Kafka e RabbitMQ) provando que um evento duplicado não reserva estoque duas vezes e que uma mensagem inválida vai para a DLT.
+
+<Quiz question="Um tópico tem 4 partições e o grupo pagamentos tem 6 consumidores. Quantos ficam ociosos?" options={["Nenhum","2","4","6"]} answer={1} explanation="Cada partição é atribuída a um único consumidor do grupo. Com 4 partições, só 4 consumidores recebem trabalho e 2 ficam parados." />
+
+<Quiz question="Por que usar o pedidoId como chave ao publicar eventos de pedido no Kafka?" options={["Para comprimir melhor as mensagens","Para que eventos do mesmo pedido fiquem na mesma partição e em ordem","Para que o Kafka rejeite eventos duplicados","Para distribuir os eventos aleatoriamente"]} answer={1} explanation="A partição é escolhida pelo hash da chave. Mesma chave, mesma partição, e a ordem é garantida dentro da partição." />
+
+<Quiz question="Qual é a garantia de entrega padrão de um consumidor Spring Kafka que commita depois de processar?" options={["At-most-once","At-least-once","Exactly-once","Nenhuma garantia"]} answer={1} explanation="Se o processo cair entre o processamento e o commit do offset, o registro é entregue de novo. Nada se perde, mas pode haver duplicata, por isso o consumidor deve ser idempotente." />
+
+## Base no CodeForge
+
+- [Filas de mensagens](/learn/system-design/filas-de-mensagens), [Message brokers](/learn/system-design/message-brokers) e [Pub/sub](/learn/system-design/pub-sub): os fundamentos de arquitetura.
+- [Semânticas de entrega](/learn/system-design/semanticas-de-entrega) e [Idempotência](/learn/system-design/idempotencia): at-least-once, exactly-once e como lidar com duplicatas.
+- [Dead letter queues](/learn/system-design/dead-letter-queues) e [Outbox](/learn/system-design/outbox): os dois padrões que todo fluxo de eventos em produção precisa.
+- [Microsserviços na prática: Mensageria com RabbitMQ](/learn/carreira-java/microsservicos-pratica-mensageria-rabbitmq): o primeiro contato com RabbitMQ, no Nível 2.
+
+## Referências
+
+- [Spring for Apache Kafka](https://docs.spring.io/spring-kafka/reference/)
+- [Spring AMQP](https://docs.spring.io/spring-amqp/reference/)
+- [Apache Kafka: Documentation](https://kafka.apache.org/documentation/)
+- [RabbitMQ: Documentation](https://www.rabbitmq.com/docs)

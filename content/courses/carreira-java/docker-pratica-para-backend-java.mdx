@@ -1,0 +1,294 @@
+---
+title: "Docker na prática para Backend Java"
+kind: lesson
+---
+
+"Na minha máquina funciona" deixa de ser desculpa quando a aplicação roda num container: a mesma imagem, com o mesmo JRE e as mesmas dependências, vai do seu notebook para o CI e para produção. Para uma API Spring Boot, porém, o Dockerfile ingênuo gera imagens de 500 MB que demoram para subir no registry, rodam como root e, em versões antigas do Java, ignoram o limite de memória do container até serem mortas pelo kernel. Neste capítulo você constrói a imagem da API da clínica do jeito certo: build multi-stage com Maven, JRE enxuto, camadas do Spring Boot para cache eficiente, usuário sem privilégios, memória da JVM ajustada ao container e um Compose com Postgres para rodar tudo junto.
+
+**Você vai aprender:**
+
+- Escrever um Dockerfile multi-stage que compila com Maven e roda só com o JRE
+- Aproveitar o cache de camadas do Docker com as camadas do Spring Boot
+- Gerar a imagem sem Dockerfile com `spring-boot:build-image`
+- Configurar a memória da JVM para containers
+- Subir API e Postgres juntos com Docker Compose
+
+## O Dockerfile ingênuo e seus problemas
+
+```dockerfile
+FROM eclipse-temurin:21-jdk
+COPY target/clinica-api-0.0.1-SNAPSHOT.jar app.jar
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+Funciona, mas:
+
+1. **Depende de build fora do Docker.** Alguém precisa rodar `mvn package` antes, com a versão certa do JDK. O build não é reproduzível.
+2. **JDK inteiro em produção.** Compilador, ferramentas de diagnóstico e fontes que a aplicação não usa. Mais tamanho e mais superfície de ataque.
+3. **Fat jar numa camada só.** O jar de 60 MB tem 59 MB de dependências que quase nunca mudam e 1 MB do seu código, que muda a cada commit. Qualquer mudança gera uma camada nova de 60 MB para enviar e baixar.
+4. **Roda como root.** Uma falha de segurança na aplicação vira acesso root dentro do container.
+
+Vamos resolver um por um.
+
+## Multi-stage: compilar e rodar em imagens diferentes
+
+Um Dockerfile multi-stage tem vários `FROM`. Os primeiros estágios produzem artefatos; só o último vira a imagem final, e ele copia apenas o que precisa dos anteriores.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# ---------- Estágio 1: build com Maven e JDK ----------
+FROM eclipse-temurin:21-jdk AS build
+WORKDIR /workspace
+
+# Primeiro só o que define dependências: esta camada fica em cache
+COPY mvnw pom.xml ./
+COPY .mvn .mvn
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B -ntp dependency:go-offline
+
+# Depois o código, que muda sempre
+COPY src src
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B -ntp package -DskipTests
+
+# ---------- Estágio 2: runtime só com JRE ----------
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+RUN addgroup -S app && adduser -S app -G app
+COPY --from=build /workspace/target/*.jar app.jar
+USER app
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+A ordem das instruções é a otimização principal. O Docker reaproveita uma camada enquanto nada do que veio antes dela mudou. Copiando primeiro só o `pom.xml` e baixando as dependências, essa etapa lenta fica em cache: quando você muda só uma classe Java, o build recomeça a partir de `COPY src src`.
+
+O `--mount=type=cache` (BuildKit, padrão no Docker atual) mantém o repositório `~/.m2` entre builds, mesmo quando o `pom.xml` muda: só as dependências novas são baixadas.
+
+`-DskipTests` aqui é deliberado: os testes rodam no CI com `./mvnw verify` antes de gerar a imagem. Se você quiser rodá-los no build da imagem, lembre que testes com Testcontainers precisam de Docker dentro do Docker, o que complica bastante.
+
+Crie também um `.dockerignore` para não mandar lixo para o contexto de build:
+
+```text
+target/
+.git/
+.idea/
+*.iml
+.env
+```
+
+## Camadas do Spring Boot
+
+O estágio final ainda copia o fat jar inteiro numa camada só. O Spring Boot resolve isso organizando o conteúdo do jar em **camadas** por frequência de mudança:
+
+| Camada | Conteúdo | Muda |
+|---|---|---|
+| `dependencies` | Bibliotecas com versão estável | Raramente |
+| `spring-boot-loader` | Código que carrega o jar | Raramente |
+| `snapshot-dependencies` | Bibliotecas `-SNAPSHOT` | Às vezes |
+| `application` | Suas classes e recursos | A cada commit |
+
+O jar pode ser extraído nessas camadas, e cada uma vira um `COPY` separado no Dockerfile. A partir do Spring Boot 3.3, a extração usa o modo `tools`:
+
+```dockerfile
+# ---------- Estágio 2: extrair camadas ----------
+FROM eclipse-temurin:21-jre-alpine AS camadas
+WORKDIR /extracao
+COPY --from=build /workspace/target/*.jar app.jar
+RUN java -Djarmode=tools -jar app.jar extract --layers --destination extraido
+
+# ---------- Estágio 3: runtime ----------
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+RUN addgroup -S app && adduser -S app -G app
+
+COPY --from=camadas /extracao/extraido/dependencies/ ./
+COPY --from=camadas /extracao/extraido/spring-boot-loader/ ./
+COPY --from=camadas /extracao/extraido/snapshot-dependencies/ ./
+COPY --from=camadas /extracao/extraido/application/ ./
+
+USER app
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+O `extract` gera um `app.jar` enxuto que referencia as bibliotecas numa pasta `lib/`, e o `--layers` distribui esses arquivos pelas pastas de camada. Agora, quando você muda uma classe, só a camada `application` (algumas centenas de KB) é reconstruída, enviada ao registry e baixada pelo servidor.
+
+Em projetos com Spring Boot anterior a 3.3, o comando é o antigo `layertools`, e o ponto de entrada muda:
+
+```dockerfile
+RUN java -Djarmode=layertools -jar app.jar extract
+# ...
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+(Até o Spring Boot 3.1, a classe era `org.springframework.boot.loader.JarLauncher`, sem o `.launch`.)
+
+Confira as camadas com `docker history clinica-api:dev`: você vai ver uma camada grande de dependências e uma pequena da aplicação.
+
+## Sem Dockerfile: spring-boot:build-image
+
+O plugin Maven do Spring Boot gera uma imagem OCI usando **Cloud Native Buildpacks** (Paketo), sem Dockerfile:
+
+```bash
+./mvnw spring-boot:build-image -Dspring-boot.build-image.imageName=clinica-api:0.1.0
+docker run --rm -p 8080:8080 clinica-api:0.1.0
+```
+
+Ou fixe a configuração no `pom.xml`:
+
+```xml
+<plugin>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-maven-plugin</artifactId>
+    <configuration>
+        <image>
+            <name>ghcr.io/clinica-org/clinica-api:${project.version}</name>
+            <env>
+                <BP_JVM_VERSION>21</BP_JVM_VERSION>
+            </env>
+        </image>
+    </configuration>
+</plugin>
+```
+
+O buildpack já faz tudo que fizemos à mão: usa JRE, separa as camadas do Spring Boot, roda com usuário sem privilégios e inclui uma calculadora de memória que configura heap, metaspace e pilhas a partir do limite do container. Precisa de Docker rodando e baixa as imagens do builder na primeira vez.
+
+Quando escolher cada um: buildpacks dão um resultado bom e padronizado com zero manutenção, ótimo para começar e para times que não querem cuidar de Dockerfile. O Dockerfile próprio dá controle total (imagem base, pacotes extras, flags) e é o que você vai encontrar na maioria dos projetos existentes. Saber os dois é o esperado.
+
+## Memória da JVM em container
+
+A JVM decide o tamanho do heap a partir da memória que enxerga. Antes do Java 10 (e do 8u191), ela enxergava a memória do **host**, não o limite do container: num servidor de 64 GB com container limitado a 512 MB, o heap máximo ia para 16 GB, a aplicação crescia além do limite e o kernel a matava com `OOMKilled`, sem nenhum `OutOfMemoryError` no log.
+
+No Java 21, `-XX:+UseContainerSupport` vem ligado por padrão e a JVM lê o limite do cgroup. Mas o padrão de heap máximo é só **25%** desse limite, conservador demais para um container que só roda a sua aplicação. O ajuste comum:
+
+```dockerfile
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+```
+
+- `MaxRAMPercentage=75.0` dá 75% do limite ao heap. Os outros 25% ficam para o que não é heap: metaspace, pilhas das threads, code cache, buffers diretos e o próprio processo.
+- `ExitOnOutOfMemoryError` faz a JVM encerrar quando o heap estoura, em vez de seguir num estado degradado. O orquestrador reinicia o container.
+- `JAVA_TOOL_OPTIONS` é lido pela JVM automaticamente, então funciona com qualquer `ENTRYPOINT` e pode ser sobrescrito no `docker run` ou no Compose.
+
+Prefira porcentagem a `-Xmx` fixo: se alguém mudar o limite do container, a JVM acompanha. E não suba o percentual para 90%: com muitas threads ou bibliotecas que usam memória fora do heap (Netty, por exemplo), o processo passa do limite mesmo com heap sobrando.
+
+Para conferir o que a JVM decidiu:
+
+```bash
+docker run --rm -m 512m --entrypoint java clinica-api:dev \
+  -XX:MaxRAMPercentage=75.0 -XX:+PrintFlagsFinal -version | grep -E "MaxHeapSize|UseContainerSupport"
+```
+
+<Callout type="warning" title="Limite de memória sem ajuste da JVM">
+Definir `mem_limit` ou `resources.limits.memory` no container e deixar a JVM nos padrões gera dois problemas opostos. Com o padrão de 25%, a aplicação recebe pouco heap e passa o tempo em coleta de lixo. Com `-Xmx` fixo maior que o limite (copiado de um servidor antigo), o container é morto com `OOMKilled` (código de saída 137) sem stack trace nenhum. Sempre combine o limite do container com `MaxRAMPercentage` e confira o heap efetivo com `PrintFlagsFinal`.
+</Callout>
+
+## Healthcheck
+
+Com o Spring Boot Actuator, a aplicação expõe `/actuator/health`. Um `HEALTHCHECK` na imagem (ou no Compose) permite que o Docker saiba quando a API está pronta, e não só quando o processo iniciou:
+
+```dockerfile
+HEALTHCHECK --interval=15s --timeout=3s --start-period=40s --retries=3 \
+  CMD wget -qO- http://localhost:8080/actuator/health || exit 1
+```
+
+A imagem Alpine tem `wget` via BusyBox. Em imagens baseadas em Ubuntu, sem `wget` nem `curl`, prefira configurar o healthcheck no orquestrador. O `start-period` dá tempo para o Spring subir antes de as falhas contarem.
+
+## Docker Compose com Postgres
+
+Para desenvolvimento e para testes manuais, o Compose sobe a API e o banco juntos:
+
+```yaml
+# compose.yaml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: clinica
+      POSTGRES_USER: clinica
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-clinica-dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clinica -d clinica"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    image: clinica-api:dev
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/clinica
+      SPRING_DATASOURCE_USERNAME: clinica
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-clinica-dev}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75.0"
+    ports:
+      - "8080:8080"
+    mem_limit: 768m
+
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up --build -d
+docker compose logs -f api
+curl http://localhost:8080/actuator/health
+docker compose down        # para e remove os containers (o volume continua)
+docker compose down -v     # remove também os dados do banco
+```
+
+Pontos importantes:
+
+- **Dentro da rede do Compose, o host do banco é o nome do serviço** (`db`), não `localhost`. Dentro do container da API, `localhost` é o próprio container.
+- `SPRING_DATASOURCE_URL` sobrescreve `spring.datasource.url` do `application.yml` pelo relaxed binding do Spring Boot. Nada de perfil especial para o Docker.
+- `depends_on` com `condition: service_healthy` espera o Postgres aceitar conexões, não só iniciar. Sem isso, a API sobe primeiro, o Flyway não conecta e a aplicação cai.
+- O volume `pgdata` preserva os dados entre reinícios.
+
+Se você só quer o banco em container e a API rodando na IDE, o módulo `spring-boot-docker-compose` (Spring Boot 3.1+) faz o Spring subir o `compose.yaml` sozinho ao iniciar a aplicação e configurar a conexão a partir dele. Adicione como dependência `developmentOnly` e remova o serviço `api` do arquivo, ou mantenha os dois e use perfis do Compose.
+
+## Na entrevista
+
+**Por que usar build multi-stage?** Para compilar com JDK e Maven num estágio e copiar só o artefato para uma imagem final com JRE. A imagem fica menor, sem ferramentas de build e com menos superfície de ataque, e o build fica reproduzível.
+
+**Para que servem as camadas do Spring Boot?** Separar dependências (que mudam pouco) do código da aplicação (que muda sempre) em camadas diferentes da imagem. Assim, uma mudança de código gera uma camada pequena, e o cache e o registry reaproveitam as de dependências.
+
+**Como a JVM se comporta com limite de memória em container?** Desde o Java 10, com `UseContainerSupport` ligado por padrão, ela respeita o limite do cgroup. O heap máximo padrão é 25% desse limite; em containers costuma-se usar `MaxRAMPercentage` entre 60 e 75 para equilibrar heap e memória fora do heap.
+
+**Qual a diferença entre o Dockerfile e spring-boot:build-image?** O Dockerfile dá controle total sobre a imagem. O `build-image` usa Buildpacks e gera uma imagem otimizada (JRE, camadas, usuário sem privilégios, calculadora de memória) sem Dockerfile para manter.
+
+## Pratique
+
+Conteinerize a API da clínica e entregue:
+
+1. `Dockerfile` multi-stage com cache do Maven, extração de camadas do Spring Boot, JRE Alpine, usuário sem privilégios, `JAVA_TOOL_OPTIONS` com `MaxRAMPercentage` e `HEALTHCHECK`.
+2. `.dockerignore`.
+3. `compose.yaml` com Postgres, healthcheck e `depends_on` por saúde.
+4. Uma tabela no README comparando o tamanho da imagem ingênua (JDK e fat jar), da sua e da gerada por `spring-boot:build-image` (`docker images`).
+5. A prova do cache: mude uma linha de um controller, rode o build de novo e mostre na saída do `docker build` que só a camada `application` foi refeita.
+
+<Quiz question="Num container com limite de 1 GB e Java 21 sem flags extras, qual é aproximadamente o heap máximo?" options={["1 GB","750 MB","256 MB","A memória total do host dividida por 4"]} answer={2} explanation="Com UseContainerSupport ligado por padrão, a JVM lê o limite do container e usa 25% dele como heap máximo padrão." />
+
+<Quiz question="Por que copiar o pom.xml e baixar as dependências antes de copiar a pasta src?" options={["Porque o Maven exige essa ordem","Para que a camada de dependências fique em cache quando só o código muda","Para reduzir o tamanho da imagem final","Para que os testes rodem mais rápido"]} answer={1} explanation="O Docker reaproveita camadas enquanto nada antes delas mudou. Com o pom.xml separado, mudar uma classe não invalida o download das dependências." />
+
+<Quiz question="No Docker Compose, como a API deve se conectar ao Postgres definido no serviço db?" options={["jdbc:postgresql://localhost:5432/clinica","jdbc:postgresql://db:5432/clinica","jdbc:postgresql://127.0.0.1:5432/clinica","jdbc:postgresql://host.docker.internal:5432/clinica"]} answer={1} explanation="Na rede do Compose, cada serviço é alcançado pelo nome. Dentro do container da API, localhost aponta para o próprio container." />
+
+## Base no CodeForge
+
+- [DevOps: construindo e gerenciando containers com Docker](/learn/carreira-nodejs/devops-construindo-gerenciando-containers-docker): os fundamentos de Docker (imagens, containers, volumes, redes) com outra stack.
+- [Pool de conexões](/learn/system-design/pool-de-conexoes): por que o número de conexões do Hikari importa quando você escala containers.
+- [Migrações de schema](/learn/system-design/migracoes-de-schema): o Flyway rodando na subida do container.
+- [Integração Contínua: pipeline Docker com GitHub Actions](/learn/carreira-java/integracao-continua-pipeline-docker-github-actions): gerar e publicar esta imagem no CI.
+- [Kubernetes para desenvolvedores Java](/learn/carreira-java/kubernetes-para-desenvolvedores-java): onde os limites de memória e o healthcheck viram probes.
+
+## Referências
+
+- [Spring Boot: Dockerfiles](https://docs.spring.io/spring-boot/reference/packaging/container-images/dockerfiles.html)
+- [Spring Boot Maven Plugin: Packaging OCI Images](https://docs.spring.io/spring-boot/maven-plugin/build-image.html)
+- [Docker: Multi-stage builds](https://docs.docker.com/build/building/multi-stage/)
+- [Docker Compose](https://docs.docker.com/compose/)

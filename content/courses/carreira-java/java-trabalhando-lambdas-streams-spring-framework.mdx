@@ -1,0 +1,392 @@
+---
+title: "Java: Trabalhando com lambdas, streams e Spring Framework"
+kind: lesson
+---
+
+Dois saltos separam o Java de exercício do Java de mercado. O primeiro é o estilo funcional: lambdas e streams transformam laços de vinte linhas que filtram, agrupam e somam em pipelines de cinco linhas que dizem o que fazer, não como. O segundo é o Spring: em vez de você mesmo criar e ligar cada objeto com `new`, um contêiner monta a aplicação a partir de classes anotadas. Os dois aparecem em toda base de código Spring Boot, e este capítulo leva a clínica até eles: primeiro os relatórios da agenda com streams, depois a mesma lógica organizada como uma aplicação Spring com injeção de dependência e configuração externa.
+
+**Você vai aprender:**
+
+- Escrever lambdas e referências de método e reconhecer as interfaces funcionais do JDK
+- Montar pipelines com `filter`, `map`, `sorted`, `collect` e `groupingBy`
+- Usar `Optional` sem cair nas armadilhas
+- Entender inversão de controle, beans e injeção de dependência no Spring
+- Criar um projeto Spring Boot com serviços, configuração tipada e um `CommandLineRunner`
+
+## Lambdas e interfaces funcionais
+
+Uma lambda é uma função anônima que você passa como valor. Ela só pode ser usada onde se espera uma **interface funcional**, isto é, uma interface com um único método abstrato. O JDK traz as mais comuns em `java.util.function`:
+
+| Interface | Método | Recebe e devolve | Exemplo na clínica |
+|---|---|---|---|
+| `Predicate<T>` | `test` | T, boolean | "a consulta é de cardiologia?" |
+| `Function<T, R>` | `apply` | T, R | consulta para nome do paciente |
+| `Consumer<T>` | `accept` | T, nada | imprimir uma consulta |
+| `Supplier<T>` | `get` | nada, T | gerar o horário atual |
+| `BinaryOperator<T>` | `apply` | T e T, T | somar dois valores |
+
+```java
+Predicate<Consulta> ehCardio = c -> c.especialidade() == Especialidade.CARDIOLOGIA;
+Function<Consulta, String> nomeDoPaciente = c -> c.paciente().nome();
+Consumer<Consulta> imprimir = c -> System.out.println(c.dataHora() + " " + c.medico());
+BinaryOperator<BigDecimal> somar = BigDecimal::add;
+
+Predicate<Consulta> cardioDeIdoso = ehCardio.and(c -> c.paciente().idade() >= 60);
+```
+
+Quando a lambda só chama um método existente, a **referência de método** é mais curta: `c -> c.medico()` vira `Consulta::medico`, e `x -> System.out.println(x)` vira `System.out::println`.
+
+Lambdas podem usar variáveis locais de fora, desde que elas sejam efetivamente finais (não reatribuídas depois). Isso evita que uma lambda executada mais tarde, talvez em outra thread, veja um valor que mudou.
+
+## Streams: pipelines sobre coleções
+
+Usamos o mesmo modelo do capítulo de coleções:
+
+```java
+enum Especialidade { CLINICO_GERAL, CARDIOLOGIA, DERMATOLOGIA, NEUROLOGIA }
+record Paciente(String cpf, String nome, int idade) {}
+record Consulta(Paciente paciente, String medico, Especialidade especialidade,
+                LocalDateTime dataHora, BigDecimal valor) {}
+```
+
+Um stream tem três partes: a **fonte** (`lista.stream()`), operações **intermediárias** (que devolvem outro stream e são preguiçosas) e uma operação **terminal** (que produz o resultado e dispara o processamento).
+
+```java
+List<String> agendaCardio = consultas.stream()                  // fonte
+        .filter(c -> c.especialidade() == Especialidade.CARDIOLOGIA) // intermediária
+        .sorted(Comparator.comparing(Consulta::dataHora))       // intermediária
+        .map(c -> c.dataHora().toLocalTime() + " " + c.paciente().nome()) // intermediária
+        .toList();                                              // terminal
+// [08:00 Carla Dias, 10:00 Ana Souza]
+```
+
+Leia de cima para baixo como uma frase: das consultas, fique com as de cardiologia, ordene por horário, transforme em texto, junte numa lista. Compare com o laço equivalente, que precisaria de lista auxiliar, `if`, `sort` separado e outro laço.
+
+`toList()` (Java 16+) devolve uma lista imutável. Se precisar alterar o resultado, use `collect(Collectors.toCollection(ArrayList::new))`.
+
+### Operações que você vai usar sempre
+
+```java
+// Existe alguma consulta às 8h?
+boolean temCedo = consultas.stream().anyMatch(c -> c.dataHora().getHour() == 8);
+
+// Quantas consultas de idosos?
+long idosos = consultas.stream().filter(c -> c.paciente().idade() >= 60).count();
+
+// Faturamento total (BigDecimal não tem sum: use reduce)
+BigDecimal total = consultas.stream()
+        .map(Consulta::valor)
+        .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+// Pacientes únicos, em ordem alfabética
+List<String> pacientes = consultas.stream()
+        .map(c -> c.paciente().nome())
+        .distinct()
+        .sorted()
+        .toList();
+
+// Média de idade (streams de primitivos têm sum, average, max)
+double mediaIdade = consultas.stream()
+        .mapToInt(c -> c.paciente().idade())
+        .average()
+        .orElse(0);
+```
+
+### Agrupando com Collectors
+
+`Collectors.groupingBy` é o `GROUP BY` do Java. Ele substitui o padrão `computeIfAbsent` do capítulo anterior:
+
+```java
+import static java.util.stream.Collectors.*;
+
+// Médico para lista de consultas
+Map<String, List<Consulta>> porMedico = consultas.stream()
+        .collect(groupingBy(Consulta::medico));
+
+// Médico para quantidade
+Map<String, Long> qtdPorMedico = consultas.stream()
+        .collect(groupingBy(Consulta::medico, counting()));
+
+// Especialidade para faturamento, ordenado pela enum
+Map<Especialidade, BigDecimal> faturamento = consultas.stream()
+        .collect(groupingBy(Consulta::especialidade,
+                () -> new EnumMap<>(Especialidade.class),
+                reducing(BigDecimal.ZERO, Consulta::valor, BigDecimal::add)));
+
+// Índice por CPF (lança exceção se houver CPF repetido)
+Map<String, Paciente> porCpf = consultas.stream()
+        .map(Consulta::paciente)
+        .distinct()
+        .collect(toMap(Paciente::cpf, p -> p));
+
+// Separar em dois grupos
+Map<Boolean, List<Consulta>> idososOuNao = consultas.stream()
+        .collect(partitioningBy(c -> c.paciente().idade() >= 60));
+```
+
+O segundo argumento de `groupingBy` é um coletor aplicado a cada grupo: `counting()`, `reducing(...)`, `mapping(...)`, `toSet()`. Combinando esses blocos você monta praticamente qualquer relatório.
+
+### flatMap
+
+Quando cada elemento vira vários, use `flatMap`. Com uma lista de agendas, cada uma com suas consultas:
+
+```java
+record Agenda(String medico, List<Consulta> consultas) {}
+
+List<Consulta> todas = agendas.stream()
+        .flatMap(a -> a.consultas().stream())
+        .toList();
+```
+
+## Optional
+
+Operações que podem não achar nada (`findFirst`, `max`, `min`) devolvem `Optional`, um contêiner que pode estar vazio. Ele obriga quem chama a decidir o que fazer na ausência:
+
+```java
+Optional<Consulta> proxima = consultas.stream()
+        .filter(c -> c.dataHora().isAfter(agora))
+        .min(Comparator.comparing(Consulta::dataHora));
+
+String mensagem = proxima
+        .map(c -> "Próximo: " + c.paciente().nome())
+        .orElse("Agenda livre");
+
+Consulta obrigatoria = proxima.orElseThrow(() -> new IllegalStateException("Sem consultas"));
+```
+
+<Callout type="warning" title="optional.get() sem checar é um NullPointerException com outro nome">
+`proxima.get()` lança `NoSuchElementException` se o Optional estiver vazio, que é exatamente o problema que ele deveria evitar. Prefira `map`, `orElse`, `orElseGet` e `orElseThrow`. E use `Optional` como **retorno** de método; não como atributo de classe nem como parâmetro, onde ele só adiciona ruído.
+</Callout>
+
+## Cuidados com streams
+
+- **Um stream só pode ser consumido uma vez.** Chamar duas operações terminais no mesmo objeto lança `IllegalStateException`. Crie outro a partir da coleção.
+- **Sem efeitos colaterais nas lambdas.** `forEach(c -> lista.add(c))` funciona, mas é frágil e quebra com stream paralelo. Use `collect`.
+- **Nem tudo precisa de stream.** Um laço simples com `break` antecipado ou com índice costuma ser mais legível que um stream forçado.
+- **`parallelStream()` não é botão de desempenho.** Só compensa com muitos dados e processamento pesado por elemento, sem I/O. Em servidor web, que já atende várias requisições em paralelo, quase nunca vale.
+
+## Spring: por que um framework
+
+Até aqui, a recepção da clínica cria tudo à mão no `main`:
+
+```java
+var http = HttpClient.newHttpClient();
+var mapper = new ObjectMapper();
+var viaCep = new ViaCepClient(http, mapper);
+var relatorios = new RelatorioService(repositorio);
+var cadastro = new CadastroService(viaCep, repositorio, relatorios);
+```
+
+Com dez classes, isso é administrável. Com duzentas, cada `new` é uma decisão de montagem espalhada pelo código, e trocar uma implementação (um repositório em memória por um em banco, um cliente real por um falso no teste) exige mexer em vários lugares.
+
+O Spring inverte isso. Você declara **o que** cada classe precisa (pelo construtor) e o **contêiner de IoC** (inversão de controle) cria os objetos, na ordem certa, e entrega cada dependência a quem pediu. Os objetos que o contêiner gerencia se chamam **beans**. Por padrão cada bean é um singleton: uma instância compartilhada pela aplicação inteira.
+
+## Criando o projeto
+
+Gere o projeto em start.spring.io com Maven, Java 21 e Spring Boot 3.5.x, sem dependências extras por enquanto (o starter básico já traz o contêiner, logging e configuração). O `pom.xml` gerado tem este coração:
+
+```xml
+<parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>3.5.7</version>
+</parent>
+
+<properties>
+  <java.version>21</java.version>
+</properties>
+
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+  </dependency>
+</dependencies>
+```
+
+O `parent` fixa versões compatíveis de todas as bibliotecas do ecossistema; por isso os starters não têm `<version>`. E a classe principal:
+
+```java
+package br.com.clinica;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ClinicaApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ClinicaApplication.class, args);
+    }
+}
+```
+
+`@SpringBootApplication` liga três coisas: configuração, autoconfiguração (o Spring Boot cria beans prontos conforme as bibliotecas presentes no classpath) e **component scan**, que procura classes anotadas no pacote `br.com.clinica` e em todos os subpacotes.
+
+## Beans e injeção pelo construtor
+
+Marque as classes que o Spring deve gerenciar com um estereótipo: `@Component` (genérico), `@Service` (regra de negócio), `@Repository` (acesso a dados), `@Controller`/`@RestController` (web). Funcionalmente são parecidos; o nome documenta a camada.
+
+```java
+package br.com.clinica.consulta;
+
+public interface ConsultaRepository {
+    List<Consulta> doDia(LocalDate dia);
+}
+```
+
+```java
+@Repository
+public class ConsultaRepositoryEmMemoria implements ConsultaRepository {
+    private final List<Consulta> consultas = new CopyOnWriteArrayList<>();
+
+    @Override
+    public List<Consulta> doDia(LocalDate dia) {
+        return consultas.stream()
+                .filter(c -> c.dataHora().toLocalDate().equals(dia))
+                .toList();
+    }
+
+    public void salvar(Consulta consulta) {
+        consultas.add(consulta);
+    }
+}
+```
+
+```java
+@Service
+public class RelatorioService {
+    private final ConsultaRepository repositorio;
+
+    public RelatorioService(ConsultaRepository repositorio) {
+        this.repositorio = repositorio;
+    }
+
+    public Map<String, BigDecimal> faturamentoPorMedico(LocalDate dia) {
+        return repositorio.doDia(dia).stream()
+                .collect(Collectors.groupingBy(Consulta::medico, TreeMap::new,
+                        Collectors.reducing(BigDecimal.ZERO, Consulta::valor, BigDecimal::add)));
+    }
+}
+```
+
+`RelatorioService` pede um `ConsultaRepository` no construtor e nunca usa `new`. O Spring encontra o único bean que implementa essa interface e o injeta. Com um construtor só, nem é preciso `@Autowired`.
+
+Prefira sempre **injeção pelo construtor**: os atributos podem ser `final`, a classe nunca existe pela metade e, no teste unitário, você cria com `new RelatorioService(repositorioFalso)` sem subir o Spring. Injeção em atributo (`@Autowired private ConsultaRepository repo;`) esconde dependências e dificulta testes.
+
+Se houver **duas** implementações da mesma interface, o Spring não sabe qual escolher e falha na inicialização com `NoUniqueBeanDefinitionException`. Resolva com `@Primary` numa delas ou `@Qualifier("nome")` no ponto de injeção.
+
+## Beans de bibliotecas com @Bean
+
+Classes que não são suas (como o `HttpClient`) não podem receber `@Component`. Declare-as num método `@Bean` dentro de uma classe `@Configuration`:
+
+```java
+@Configuration
+public class HttpConfig {
+    @Bean
+    public HttpClient httpClient() {
+        return HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(3))
+                .build();
+    }
+}
+```
+
+Agora o `ViaCepClient` do capítulo anterior vira um bean só com uma anotação, recebendo o `HttpClient` acima e o `ObjectMapper` que o Spring Boot já cria e configura por autoconfiguração quando o Jackson está no classpath (ele vem com o starter web, no próximo capítulo; com o starter básico, adicione `jackson-databind`).
+
+## Configuração externa
+
+Valores que mudam por ambiente (horário de expediente, URLs, timeouts) ficam fora do código, em `src/main/resources/application.properties`:
+
+```properties
+clinica.expediente.inicio=8
+clinica.expediente.fim=18
+clinica.valor-convenio=50.00
+```
+
+E são lidos de forma tipada com um record:
+
+```java
+@ConfigurationProperties(prefix = "clinica")
+public record ClinicaProperties(Expediente expediente, BigDecimal valorConvenio) {
+    public record Expediente(int inicio, int fim) {}
+}
+```
+
+```java
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class ClinicaApplication { ... }
+```
+
+O Spring converte `valor-convenio` (kebab-case) para `valorConvenio`, e o record pode ser injetado em qualquer bean. Em produção, a mesma propriedade pode vir de variável de ambiente (`CLINICA_VALORCONVENIO=60.00`) sem recompilar.
+
+## Rodando a lógica na inicialização
+
+Ainda sem web, um `CommandLineRunner` executa código depois que o contêiner sobe. É útil para scripts, cargas iniciais e para ver a injeção funcionando:
+
+```java
+@Component
+public class RelatorioDoDia implements CommandLineRunner {
+    private final RelatorioService relatorios;
+    private final ClinicaProperties props;
+
+    public RelatorioDoDia(RelatorioService relatorios, ClinicaProperties props) {
+        this.relatorios = relatorios;
+        this.props = props;
+    }
+
+    @Override
+    public void run(String... args) {
+        System.out.println("Expediente: " + props.expediente().inicio() + "h às " + props.expediente().fim() + "h");
+        relatorios.faturamentoPorMedico(LocalDate.now())
+                .forEach((medico, total) -> System.out.println(medico + ": R$ " + total));
+    }
+}
+```
+
+```bash
+./mvnw spring-boot:run
+```
+
+O log de inicialização mostra o Spring subindo, e em seguida a sua saída. Se faltar um bean, a aplicação nem sobe e a mensagem diz exatamente qual parâmetro de qual construtor não pôde ser satisfeito; leia a mensagem inteira, ela é boa.
+
+## Na entrevista
+
+- **O que é uma interface funcional?** Uma interface com um único método abstrato, que pode ser implementada por lambda ou referência de método. `@FunctionalInterface` faz o compilador garantir isso.
+- **Diferença entre operações intermediárias e terminais?** Intermediárias (`filter`, `map`, `sorted`) devolvem um stream e são preguiçosas; terminais (`collect`, `count`, `toList`) produzem o resultado e disparam a execução. Sem terminal, nada roda.
+- **O que é inversão de controle e injeção de dependência?** IoC é o framework controlar a criação e o ciclo de vida dos objetos. DI é a forma de fazer isso: as dependências são entregues de fora, normalmente pelo construtor, em vez de a classe criá-las.
+- **Por que injeção pelo construtor?** Dependências explícitas e obrigatórias, atributos `final`, objeto sempre completo e teste unitário sem o contêiner.
+
+## Pratique
+
+Monte o projeto Spring Boot da clínica sem web:
+
+1. `ConsultaRepositoryEmMemoria` com pelo menos dez consultas carregadas no construtor.
+2. `RelatorioService` com: faturamento por especialidade (`EnumMap`), médico com mais consultas no dia (`Optional`), lista de pacientes idosos sem repetição e consultas fora do expediente configurado em `ClinicaProperties`.
+3. Um `CommandLineRunner` que imprime os quatro relatórios.
+4. Um teste JUnit de `RelatorioService` que cria o serviço com `new` e um repositório falso, sem subir o Spring.
+
+Entregue o projeto e a saída do `spring-boot:run`.
+
+<Quiz question="Qual interface funcional representa uma função que recebe um valor e devolve true ou false?" options={["Function","Supplier","Predicate","Consumer"]} answer={2} explanation="Predicate tem o método test, que recebe T e devolve boolean. É o tipo do argumento de filter." />
+<Quiz question="O que acontece com um stream que só tem filter e map, sem operação terminal?" options={["Processa todos os elementos imediatamente","Não processa nada","Lança exceção de compilação","Processa só o primeiro elemento"]} answer={1} explanation="Operações intermediárias são preguiçosas. O processamento só começa quando uma operação terminal é chamada." />
+<Quiz question="Duas classes @Repository implementam ConsultaRepository e um serviço pede ConsultaRepository no construtor. O que acontece?" options={["O Spring injeta a primeira encontrada","O Spring injeta as duas numa lista","A aplicação falha ao subir com NoUniqueBeanDefinitionException","O serviço recebe null"]} answer={2} explanation="Com duas candidatas, o Spring não escolhe sozinho. Use @Primary ou @Qualifier para desfazer a ambiguidade." />
+
+## Base no CodeForge
+
+- [Lambdas e streams](/learn/java/lambdas-e-streams) e [Optional e null](/learn/java/optional-e-null): a API a fundo, no formato de entrevista.
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia) e [DIP](/learn/lld/dip): o princípio que o Spring automatiza.
+- [Java: Trabalhando com listas e coleções de dados](/learn/carreira-java/java-trabalhando-listas-colecoes-dados): os mesmos relatórios feitos com laços e `Map`.
+- [Java: Persistência de dados e consultas com Spring Data JPA](/learn/carreira-java/java-persistencia-dados-consultas-spring-data-jpa): o repositório em memória vira banco de verdade.
+
+## Referências
+
+- [dev.java: Lambda Expressions](https://dev.java/learn/lambdas/)
+- [Javadoc: java.util.stream (Java 21)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/stream/package-summary.html)
+- [Spring Framework: The IoC Container](https://docs.spring.io/spring-framework/reference/core/beans.html)
+- [Spring Boot Reference](https://docs.spring.io/spring-boot/reference/)

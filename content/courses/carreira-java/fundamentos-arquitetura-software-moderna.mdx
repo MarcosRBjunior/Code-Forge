@@ -1,0 +1,305 @@
+---
+title: "Fundamentos da Arquitetura de Software Moderna"
+kind: lesson
+---
+
+Todo sistema tem uma arquitetura, escolhida de propósito ou não. Quando ninguém decide, ela surge sozinha: controllers que acessam o banco direto, regras de negócio espalhadas em listeners e jobs, um pacote `util` que todos importam. Depois de dois anos, mudar o cálculo de frete exige mexer em oito classes e ninguém sabe o que vai quebrar. Arquitetura é o conjunto de decisões difíceis de mudar depois, e este capítulo ensina a tomá-las de forma consciente: os atributos de qualidade que guiam as escolhas, os estilos mais usados em back-ends Java (camadas, hexagonal, clean), o monólito modular com Spring Modulith e o registro das decisões em ADRs.
+
+**Você vai aprender:**
+
+- O que é arquitetura e como atributos de qualidade orientam as decisões
+- As diferenças práticas entre arquitetura em camadas, hexagonal e clean
+- Organizar um monólito modular e verificar seus limites com Spring Modulith
+- Registrar decisões arquiteturais com ADRs
+- Avaliar trade-offs em vez de seguir modas
+
+## O que é arquitetura
+
+Uma definição útil: arquitetura é a estrutura do sistema (os componentes, como se relacionam e os princípios que guiam sua evolução) mais as decisões que seriam caras de reverter. Escolher entre `ArrayList` e `LinkedList` não é arquitetura. Escolher entre um banco relacional e um de documentos, entre um deploy único e vários serviços, ou entre comunicação síncrona e por eventos, é.
+
+O papel de quem decide arquitetura não é desenhar caixas bonitas. É entender o que o negócio precisa, identificar os riscos, escolher os trade-offs e tornar o caminho certo o mais fácil para o time.
+
+## Atributos de qualidade
+
+Requisitos funcionais dizem **o que** o sistema faz ("criar pedido"). Atributos de qualidade dizem **quão bem**: e são eles que mais moldam a arquitetura.
+
+| Atributo | Pergunta | Exemplo mensurável para a loja |
+|---|---|---|
+| Desempenho | Quão rápido responde? | p99 de `POST /pedidos` abaixo de 300 ms |
+| Escalabilidade | Aguenta mais carga? | 10x de pedidos na Black Friday sem reescrever |
+| Disponibilidade | Fica no ar? | 99,9% ao mês no checkout |
+| Manutenibilidade | Quão fácil é mudar? | Nova forma de pagamento em até uma semana |
+| Testabilidade | Dá para verificar isolado? | Regras de desconto testadas sem banco |
+| Segurança | Resiste a ataques? | Dados de cartão nunca gravados |
+| Observabilidade | Dá para entender em produção? | Rastrear um pedido de ponta a ponta |
+
+Atributos competem entre si. Mais disponibilidade (réplicas em várias regiões) custa dinheiro e complica a consistência. Mais desempenho (cache) complica a invalidação. Por isso o primeiro trabalho é priorizar: para a loja, talvez disponibilidade do checkout e manutenibilidade das regras de preço importem mais que latência do relatório mensal.
+
+Escreva atributos como cenários mensuráveis, não adjetivos. "O sistema deve ser escalável" não orienta decisão nenhuma. "Na Black Friday, com 500 pedidos por segundo, o p99 do checkout fica abaixo de 500 ms" orienta.
+
+## Arquitetura em camadas
+
+O estilo mais comum em projetos Spring é o de camadas: apresentação (controllers), aplicação ou serviço, domínio e persistência. Cada camada só conhece a de baixo.
+
+```text
+br.com.loja.pedidos
+  controller/   PedidoController      -> chama service
+  service/      PedidoService         -> chama repository
+  repository/   PedidoRepository      -> JPA
+  model/        Pedido (@Entity)
+```
+
+É simples, todo mundo entende e funciona bem em sistemas pequenos e CRUDs. Os problemas aparecem com o crescimento:
+
+- O domínio depende da persistência. `Pedido` é uma `@Entity`, e regras de negócio passam a ser moldadas pelo mapeamento JPA.
+- A camada de serviço vira um depósito de regras de negócio procedurais (o "modelo anêmico"), com entidades que são só getters e setters.
+- Organizar por camada técnica espalha uma funcionalidade em vários pacotes. Mudar "pedido" toca todos.
+
+Um ajuste barato que já resolve muito: organizar **por funcionalidade** (`pedido/`, `pagamento/`, `catalogo/`), com camadas dentro de cada pacote se necessário.
+
+## Arquitetura hexagonal (portas e adaptadores)
+
+A ideia de Alistair Cockburn inverte a dependência: o **núcleo** (domínio e casos de uso) fica no centro e não conhece tecnologia nenhuma. Ele define **portas**, interfaces que dizem do que precisa ou o que oferece. **Adaptadores** implementam essas portas para uma tecnologia específica.
+
+- **Portas de entrada** (driving): o que o mundo pode pedir ao núcleo. Exemplo: `CriarPedido`.
+- **Portas de saída** (driven): o que o núcleo precisa do mundo. Exemplo: `Pedidos` (persistência), `Cobranca` (pagamento).
+- **Adaptadores de entrada:** controller REST, listener do RabbitMQ, job agendado.
+- **Adaptadores de saída:** repositório JPA, cliente HTTP do serviço de pagamentos.
+
+```java
+// núcleo: sem Spring, sem JPA
+package br.com.loja.pedidos.dominio;
+
+public record Pedido(PedidoId id, ClienteId cliente, List<Item> itens, Status status) {
+    public Dinheiro total() {
+        return itens.stream().map(Item::subtotal).reduce(Dinheiro.ZERO, Dinheiro::somar);
+    }
+    public Pedido pagar() {
+        if (status != Status.AGUARDANDO_PAGAMENTO) throw new TransicaoInvalida(status, Status.PAGO);
+        return new Pedido(id, cliente, itens, Status.PAGO);
+    }
+}
+```
+
+```java
+// portas
+package br.com.loja.pedidos.aplicacao;
+
+public interface CriarPedido {                 // entrada
+    PedidoId executar(NovoPedido comando);
+}
+
+public interface Pedidos {                     // saída
+    void salvar(Pedido pedido);
+    Optional<Pedido> buscar(PedidoId id);
+}
+
+public interface Cobranca {                    // saída
+    ResultadoCobranca cobrar(PedidoId id, Dinheiro valor, String cartaoToken);
+}
+```
+
+```java
+// caso de uso: depende só das portas
+package br.com.loja.pedidos.aplicacao;
+
+public class CriarPedidoService implements CriarPedido {
+
+    private final Pedidos pedidos;
+    private final Cobranca cobranca;
+
+    public CriarPedidoService(Pedidos pedidos, Cobranca cobranca) {
+        this.pedidos = pedidos;
+        this.cobranca = cobranca;
+    }
+
+    @Override
+    public PedidoId executar(NovoPedido comando) {
+        var pedido = Pedido.novo(comando.cliente(), comando.itens());
+        pedidos.salvar(pedido);
+        var resultado = cobranca.cobrar(pedido.id(), pedido.total(), comando.cartaoToken());
+        pedidos.salvar(resultado.aprovado() ? pedido.pagar() : pedido.recusar());
+        return pedido.id();
+    }
+}
+```
+
+```java
+// adaptador de saída: aqui moram JPA e Spring
+package br.com.loja.pedidos.infra.persistencia;
+
+@Repository
+class PedidosJpa implements Pedidos {
+
+    private final PedidoEntityRepository repo;   // Spring Data, com PedidoEntity (@Entity)
+
+    PedidosJpa(PedidoEntityRepository repo) { this.repo = repo; }
+
+    @Override public void salvar(Pedido pedido) { repo.save(PedidoEntity.de(pedido)); }
+    @Override public Optional<Pedido> buscar(PedidoId id) { return repo.findById(id.valor()).map(PedidoEntity::paraDominio); }
+}
+```
+
+```java
+// a ligação fica numa configuração do Spring
+@Configuration
+class CasosDeUsoConfig {
+    @Bean CriarPedido criarPedido(Pedidos pedidos, Cobranca cobranca) {
+        return new CriarPedidoService(pedidos, cobranca);
+    }
+}
+```
+
+Os ganhos: o domínio e os casos de uso são testados com implementações em memória das portas, em milissegundos. Trocar o pagamento HTTP por mensageria é escrever outro adaptador de `Cobranca`, sem tocar no núcleo. O custo: mais classes, mapeamento entre entidade JPA e objeto de domínio, e mais cerimônia para um CRUD que não tem regra nenhuma.
+
+## Clean Architecture
+
+A Clean Architecture, de Robert C. Martin, é da mesma família que a hexagonal e a arquitetura cebola. Ela desenha círculos concêntricos (entidades, casos de uso, adaptadores de interface, frameworks e drivers) com uma **regra de dependência**: o código só aponta para dentro. Nada no círculo interno conhece o externo.
+
+Na prática, em Java, hexagonal e clean levam ao mesmo código: núcleo puro, interfaces definidas pelo núcleo, implementações na borda. A diferença está no vocabulário e na granularidade (a clean costuma ter um caso de uso por classe, com objetos de entrada e saída próprios). Não perca tempo discutindo qual é "a certa"; o que importa é a regra de dependência.
+
+Para garantir a regra em vez de confiar na disciplina, escreva testes de arquitetura com ArchUnit:
+
+```java
+@AnalyzeClasses(packages = "br.com.loja.pedidos")
+class ArquiteturaTest {
+
+    @ArchTest
+    static final ArchRule dominioNaoDependeDeFramework = noClasses()
+            .that().resideInAPackage("..dominio..")
+            .should().dependOnClassesThat().resideInAnyPackage("org.springframework..", "jakarta.persistence..");
+
+    @ArchTest
+    static final ArchRule aplicacaoNaoConheceInfra = noClasses()
+            .that().resideInAPackage("..aplicacao..")
+            .should().dependOnClassesThat().resideInAPackage("..infra..");
+}
+```
+
+<Callout type="warning" title="Hexagonal em tudo, inclusive no CRUD">
+O erro mais comum depois de aprender hexagonal é aplicá-la em todo lugar. Um cadastro de categorias sem regra nenhuma ganha porta, adaptador, entidade de domínio, entidade JPA e dois mapeadores, e cada campo novo exige mexer em seis arquivos. Use a estrutura completa onde há lógica de negócio que vale proteger (preço, pedido, pagamento) e camadas simples onde não há. Arquitetura é proporcional à complexidade.
+</Callout>
+
+## Monólito modular
+
+Entre o monólito "bola de lama" e os microsserviços existe a opção que mais times deveriam escolher primeiro: o **monólito modular**. Um único deploy, um único processo, mas dividido em módulos com fronteiras explícitas, cada um dono dos seus dados, que se comunicam por APIs públicas ou eventos.
+
+Ele dá boa parte dos benefícios de organização dos microsserviços sem pagar o custo de rede, deploy distribuído e consistência eventual. E, se um módulo precisar escalar separado um dia, extraí-lo é muito mais fácil quando as fronteiras já existem.
+
+O Spring Modulith ajuda a manter essas fronteiras. Por convenção, cada subpacote direto do pacote da aplicação é um módulo; só o pacote raiz do módulo é API pública, e subpacotes são internos:
+
+```text
+br.com.loja
+  LojaApplication.java
+  pedidos/            # módulo: API pública aqui
+    PedidoService.java
+    PedidoCriado.java # evento publicado
+    interno/          # inacessível a outros módulos
+  pagamentos/
+  catalogo/
+```
+
+```java
+class ModularidadeTest {
+
+    @Test
+    void verificaModulos() {
+        ApplicationModules.of(LojaApplication.class).verify();
+    }
+}
+```
+
+O `verify()` falha se um módulo acessar o pacote interno de outro ou se houver dependência cíclica entre módulos. Para comunicação entre módulos sem acoplamento direto, publique eventos de aplicação:
+
+```java
+@Service
+public class PedidoService {
+    private final ApplicationEventPublisher eventos;
+    // ...
+    @Transactional
+    public void pagar(PedidoId id) {
+        // ... altera o pedido
+        eventos.publishEvent(new PedidoPago(id));
+    }
+}
+
+@Component
+class BaixaDeEstoque {
+    @ApplicationModuleListener
+    void aoPagar(PedidoPago evento) { /* reserva estoque, no módulo catalogo */ }
+}
+```
+
+O `@ApplicationModuleListener` executa depois do commit, de forma assíncrona e numa transação própria. Com o registro de publicação de eventos do Modulith, eventos não processados ficam gravados no banco e podem ser reprocessados, o que é o padrão outbox dentro do monólito.
+
+## Registrando decisões: ADR
+
+Daqui a um ano, alguém vai perguntar "por que usamos RabbitMQ e não Kafka?" e ninguém vai lembrar. Um **Architecture Decision Record** é um documento curto, versionado junto com o código, que registra uma decisão, seu contexto e suas consequências.
+
+```markdown
+# ADR 0007: Comunicação entre pedidos e pagamentos por mensageria
+
+Status: aceito (2026-03-10)
+
+## Contexto
+O checkout fica indisponível sempre que o serviço de pagamentos cai.
+Estoque e nota fiscal também precisam saber de pagamentos aprovados.
+O time já opera RabbitMQ; volume esperado: 50 mensagens por segundo no pico.
+
+## Decisão
+Pedidos publica `pagamento.solicitado` numa exchange topic do RabbitMQ.
+Pagamentos publica `pagamento.aprovado` e `pagamento.recusado`.
+Consumidores são idempotentes pelo id da mensagem.
+
+## Consequências
++ Checkout aceita pedidos com pagamentos fora do ar.
++ Novos consumidores sem alterar pagamentos.
+- Status do pedido passa a ser eventualmente consistente; o front precisa de polling.
+- Exige outbox, DLQ e monitoramento de filas.
+
+## Alternativas consideradas
+- HTTP com circuit breaker: mantém o acoplamento temporal.
+- Kafka: retenção e replay não são necessários agora; custo operacional maior.
+```
+
+Guarde em `docs/adr/` com numeração sequencial. ADRs não se editam depois de aceitos: se a decisão mudar, escreva um novo com status "substitui o 0007". Assim o histórico do raciocínio fica preservado, e revisar um ADR num pull request é a forma mais barata de discutir arquitetura em time.
+
+## Na entrevista
+
+**O que são atributos de qualidade e por que importam?** São requisitos sobre como o sistema se comporta (desempenho, disponibilidade, manutenibilidade, segurança). Eles conflitam entre si, e priorizá-los é o que define as escolhas de arquitetura.
+
+**Qual a diferença entre arquitetura em camadas e hexagonal?** Em camadas, cada camada depende da de baixo, e o domínio costuma depender da persistência. Na hexagonal, o núcleo define portas e não depende de tecnologia; adaptadores na borda implementam essas portas, então as dependências apontam para dentro.
+
+**Por que começar com um monólito modular?** Porque dá fronteiras claras e independência de código sem o custo operacional de sistemas distribuídos. Se um módulo precisar ser extraído, as fronteiras já estão prontas.
+
+**O que é um ADR?** Um registro curto de uma decisão arquitetural com contexto, decisão, consequências e alternativas, versionado com o código, para que o raciocínio sobreviva às pessoas.
+
+## Pratique
+
+Reorganize o serviço de pedidos e entregue:
+
+1. O núcleo (`dominio` e `aplicacao`) sem nenhuma dependência de Spring ou JPA, com as portas `Pedidos` e `Cobranca`.
+2. Testes do caso de uso `CriarPedido` com implementações em memória das portas, sem subir o Spring.
+3. Dois adaptadores de `Cobranca` (HTTP e RabbitMQ) selecionados por propriedade.
+4. Uma regra ArchUnit garantindo a regra de dependência.
+5. Três ADRs: o estilo arquitetural escolhido, a comunicação com pagamentos e o banco de dados.
+
+<Quiz question="Na arquitetura hexagonal, quem define a interface Pedidos usada para persistência?" options={["O adaptador JPA","O núcleo da aplicação, como porta de saída","O controller REST","O Spring Data"]} answer={1} explanation="O núcleo define as portas de que precisa. O adaptador JPA implementa a porta, de modo que a dependência aponta da infraestrutura para o núcleo." />
+
+<Quiz question="O que ApplicationModules.of(...).verify() do Spring Modulith verifica?" options={["Se todas as classes têm testes","Se módulos acessam internos de outros ou têm ciclos","Se o banco tem as migrações aplicadas","Se os endpoints estão documentados"]} answer={1} explanation="O verify falha quando um módulo acessa pacotes internos de outro ou quando existem dependências cíclicas entre módulos." />
+
+<Quiz question="Qual é a forma correta de mudar uma decisão já registrada num ADR aceito?" options={["Editar o ADR antigo","Apagar o ADR antigo","Escrever um novo ADR que substitui o anterior","Anotar a mudança num comentário do código"]} answer={2} explanation="ADRs aceitos são imutáveis para preservar o histórico do raciocínio. Um novo ADR registra a mudança e aponta qual decisão ele substitui." />
+
+## Base no CodeForge
+
+- [Arquitetura hexagonal](/learn/system-design/hexagonal), [Monólito](/learn/system-design/monolito) e [Microsserviços](/learn/system-design/microsservicos): os estilos vistos pela ótica de system design.
+- [Inversão de dependência](/learn/lld/dip), [Repository](/learn/lld/repository) e [Acoplamento e coesão](/learn/lld/acoplamento-coesao): os princípios que sustentam portas e adaptadores.
+- [Padrões de projeto com TypeScript: arquitetura limpa](/learn/carreira-nodejs/padroes-projeto-typescript-aprimorando-api-arquitetura-limpa): a mesma ideia em outra stack.
+- [Padrões de Integração em Sistemas Distribuídos](/learn/carreira-java/padroes-integracao-sistemas-distribuidos): o que muda quando os módulos viram serviços.
+
+## Referências
+
+- [Alistair Cockburn: Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)
+- [Spring Modulith Reference](https://docs.spring.io/spring-modulith/reference/)
+- [Architectural Decision Records](https://adr.github.io/)
+- [Martin Fowler: Software Architecture Guide](https://martinfowler.com/architecture/)

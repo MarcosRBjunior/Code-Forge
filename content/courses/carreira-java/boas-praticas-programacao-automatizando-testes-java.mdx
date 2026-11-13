@@ -1,0 +1,401 @@
+---
+title: "Boas práticas de programação: Automatizando testes com Java"
+kind: lesson
+---
+
+Sem testes automatizados, cada mudança na API exige que alguém abra o Postman e clique em vinte requisições, e mesmo assim os bugs escapam. Com uma boa suíte, você muda uma regra de agendamento, roda `./mvnw test` e em segundos sabe se quebrou algo. Testes também são o que permite refatorar sem medo e o que o pipeline de CI usa para barrar um pull request ruim. Neste capítulo você monta a suíte da API da clínica com as ferramentas padrão do ecossistema Java: JUnit 5, AssertJ, Mockito e os testes fatiados do Spring Boot (`@WebMvcTest` e `@DataJpaTest`).
+
+**Você vai aprender:**
+
+- Estruturar testes com JUnit 5: ciclo de vida, nomes, testes aninhados e parametrizados
+- Escrever asserções legíveis com AssertJ, inclusive para exceções
+- Isolar dependências com Mockito: stubs, verificação e captura de argumentos
+- Testar a camada web com `@WebMvcTest` e MockMvc
+- Testar repositórios com `@DataJpaTest` contra um Postgres real via Testcontainers
+
+## A pirâmide e o que testar
+
+Testes diferentes custam e protegem coisas diferentes:
+
+| Tipo | O que exercita | Velocidade | Quantidade |
+|---|---|---|---|
+| Unitário | Uma classe, dependências trocadas por dublês | Milissegundos | Muitos |
+| Fatiado (slice) | Uma camada do Spring: web ou JPA | Segundos | Vários |
+| Integração completa | A aplicação inteira com banco real | Dezenas de segundos | Poucos |
+
+A regra geral: regras de negócio em testes unitários (rápidos e precisos), contratos HTTP e consultas em testes fatiados, e uns poucos fluxos completos de ponta a ponta. Getters, setters e código gerado não precisam de teste.
+
+O `spring-boot-starter-test`, que já vem em todo projeto criado no Spring Initializr, traz JUnit 5, AssertJ, Mockito, MockMvc e o Hamcrest. Para Testcontainers, adicione:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+As versões vêm do BOM do Spring Boot, então não precisa declará-las.
+
+## JUnit 5: o básico bem feito
+
+Um teste é um método anotado com `@Test`, numa classe em `src/test/java`. A estrutura **Arrange, Act, Assert** (preparar, agir, verificar) deixa cada teste legível:
+
+```java
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.Duration;
+
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class ValidadorHorarioFuncionamentoTest {
+
+    private ValidadorHorarioFuncionamento validador;
+
+    @BeforeEach
+    void setUp() {
+        var props = new ClinicaProperties(LocalTime.of(7, 0), LocalTime.of(18, 0), Duration.ofMinutes(30));
+        validador = new ValidadorHorarioFuncionamento(props);
+    }
+
+    private DadosAgendamento agendamentoEm(LocalDateTime data) {
+        return new DadosAgendamento(1L, 1L, data, null);
+    }
+
+    @Nested
+    @DisplayName("Rejeita")
+    class Rejeita {
+
+        @Test
+        @DisplayName("consulta no domingo")
+        void domingo() {
+            var domingo = LocalDateTime.of(2026, 11, 15, 10, 0);
+
+            assertThatThrownBy(() -> validador.validar(agendamentoEm(domingo)))
+                    .isInstanceOf(RegraDeNegocioException.class)
+                    .hasMessageContaining("horário de funcionamento");
+        }
+
+        @Test
+        @DisplayName("consulta antes da abertura")
+        void antesDaAbertura() {
+            var cedo = LocalDateTime.of(2026, 11, 16, 6, 30);
+
+            assertThatThrownBy(() -> validador.validar(agendamentoEm(cedo)))
+                    .isInstanceOf(RegraDeNegocioException.class);
+        }
+    }
+
+    @Test
+    @DisplayName("Aceita consulta numa segunda às 10h")
+    void aceitaHorarioValido() {
+        var segunda = LocalDateTime.of(2026, 11, 16, 10, 0);
+
+        assertThatCode(() -> validador.validar(agendamentoEm(segunda))).doesNotThrowAnyException();
+    }
+}
+```
+
+Pontos a notar: o validador é criado com `new`, sem Spring, graças à injeção por construtor. `@BeforeEach` roda antes de cada teste, então nenhum teste depende do estado deixado por outro. `@Nested` agrupa cenários e `@DisplayName` faz o relatório ler como especificação. E as datas são fixas: teste que depende de `LocalDateTime.now()` passa hoje e falha no domingo.
+
+Para regras com muitos casos, um teste parametrizado evita copiar e colar:
+
+```java
+@ParameterizedTest(name = "{0} deve ser fora do horário")
+@ValueSource(strings = {"2026-11-16T06:59", "2026-11-16T18:01", "2026-11-16T23:00"})
+void foraDoHorario(String dataHora) {
+    var data = LocalDateTime.parse(dataHora);
+    assertThatThrownBy(() -> validador.validar(agendamentoEm(data)))
+            .isInstanceOf(RegraDeNegocioException.class);
+}
+```
+
+## AssertJ: asserções que se leem
+
+O `assertEquals(esperado, atual)` do JUnit funciona, mas é fácil inverter os argumentos e as mensagens de falha são pobres. O AssertJ encadeia verificações a partir do valor real e o autocompletar da IDE mostra o que é possível:
+
+```java
+assertThat(consulta.data()).isAfter(agora).isEqualTo(dataAgendada);
+
+assertThat(medicos)
+        .hasSize(3)
+        .extracting(DadosListagemMedico::nome)
+        .containsExactly("Ana", "Bruno", "Carla");
+
+assertThat(problema.getStatus()).isEqualTo(404);
+assertThat(valor).isEqualByComparingTo("270.00"); // BigDecimal ignorando escala
+```
+
+`isEqualByComparingTo` é importante para `BigDecimal`: `new BigDecimal("270.0")` e `new BigDecimal("270.00")` não são `equals`, mas são iguais em valor.
+
+## Mockito: isolando dependências
+
+Para testar o serviço `AgendaDeConsultas` sem banco, troque os repositórios por mocks. Com `MockitoExtension`, as anotações fazem o trabalho:
+
+```java
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class AgendaDeConsultasTest {
+
+    @Mock ConsultaRepository consultas;
+    @Mock MedicoRepository medicos;
+    @Mock PacienteRepository pacientes;
+    @Mock ValidadorAgendamento validador1;
+    @Mock ValidadorAgendamento validador2;
+
+    AgendaDeConsultas agenda;
+
+    private final LocalDateTime data = LocalDateTime.of(2026, 11, 16, 10, 0);
+
+    @BeforeEach
+    void setUp() {
+        agenda = new AgendaDeConsultas(consultas, medicos, pacientes, List.of(validador1, validador2));
+    }
+
+    @Test
+    void agendaQuandoTodasAsRegrasPassam() {
+        var medico = new Medico(7L, "Ana", Especialidade.CARDIOLOGIA);
+        var paciente = new Paciente(3L, "Rui");
+        when(pacientes.findById(3L)).thenReturn(Optional.of(paciente));
+        when(medicos.findById(7L)).thenReturn(Optional.of(medico));
+        when(consultas.save(any(Consulta.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        agenda.agendar(new DadosAgendamento(7L, 3L, data, null));
+
+        var captor = ArgumentCaptor.forClass(Consulta.class);
+        verify(consultas).save(captor.capture());
+        assertThat(captor.getValue().getMedico()).isEqualTo(medico);
+        assertThat(captor.getValue().getData()).isEqualTo(data);
+        verify(validador1).validar(any());
+        verify(validador2).validar(any());
+    }
+
+    @Test
+    void naoSalvaQuandoUmaRegraFalha() {
+        when(pacientes.findById(3L)).thenReturn(Optional.of(new Paciente(3L, "Rui")));
+        doThrow(new RegraDeNegocioException("fora do horário")).when(validador2).validar(any());
+
+        assertThatThrownBy(() -> agenda.agendar(new DadosAgendamento(7L, 3L, data, null)))
+                .isInstanceOf(RegraDeNegocioException.class);
+
+        verify(consultas, never()).save(any());
+    }
+}
+```
+
+O vocabulário essencial:
+
+- `when(...).thenReturn(...)` define a resposta do mock (stub). `thenAnswer` calcula a resposta a partir dos argumentos.
+- `doThrow(...).when(mock).metodo(...)` é a forma para métodos `void`.
+- `verify(mock).metodo(...)` confirma que a chamada aconteceu; `never()`, `times(2)` ajustam a contagem.
+- `ArgumentCaptor` captura o argumento real para inspecioná-lo com asserções.
+
+O `MockitoExtension` roda em modo estrito: um stub que nenhum código usou faz o teste falhar com `UnnecessaryStubbingException`. Isso mantém os testes enxutos e honestos.
+
+Repare que os mocks são criados para as **dependências** do serviço, e o serviço é real. Mockar a própria classe testada, ou mockar tudo até o teste só verificar que o mock foi chamado, produz testes que passam mesmo com o código errado.
+
+## @WebMvcTest: a camada HTTP
+
+`@WebMvcTest` sobe apenas a camada web (controllers, `@RestControllerAdvice`, conversores JSON, validação), sem serviços nem banco. Os serviços entram como mocks com `@MockitoBean`:
+
+```java
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.http.MediaType;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.MockMvc;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@WebMvcTest(ConsultaController.class)
+class ConsultaControllerTest {
+
+    @Autowired MockMvc mvc;
+    @MockitoBean AgendaDeConsultas agenda;
+
+    @Test
+    void criaConsultaERetorna201ComLocation() throws Exception {
+        var data = LocalDateTime.of(2030, 1, 7, 10, 0);
+        when(agenda.agendar(any())).thenReturn(new DadosDetalhamentoConsulta(42L, 7L, 3L, data));
+
+        mvc.perform(post("/consultas")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"idMedico": 7, "idPaciente": 3, "data": "2030-01-07T10:00:00"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(header().string("Location", "http://localhost/consultas/42"))
+                .andExpect(jsonPath("$.id").value(42));
+    }
+
+    @Test
+    void retorna400QuandoFaltaPaciente() throws Exception {
+        mvc.perform(post("/consultas")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"idMedico": 7, "data": "2030-01-07T10:00:00"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.erros[0].campo").value("idPaciente"));
+    }
+
+    @Test
+    void retorna422QuandoRegraFalha() throws Exception {
+        when(agenda.agendar(any())).thenThrow(new RegraDeNegocioException("Médico já possui consulta nesse horário"));
+
+        mvc.perform(post("/consultas")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"idMedico": 7, "idPaciente": 3, "data": "2030-01-07T10:00:00"}
+                                """))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.detail").value("Médico já possui consulta nesse horário"));
+    }
+}
+```
+
+Esses testes verificam o contrato da API: status, headers, formato do JSON e o tratamento de erros, que é onde muitos bugs moram. Os text blocks (`"""`) deixam o JSON legível.
+
+`@MockitoBean` chegou no Spring Framework 6.2 (Spring Boot 3.4) e substitui o `@MockBean`, que ficou deprecated. Em projetos com Boot anterior a 3.4, use `@MockBean` de `org.springframework.boot.test.mock.mockito`.
+
+## @DataJpaTest: consultas contra um banco real
+
+`@DataJpaTest` sobe só JPA, repositórios e Flyway, e cada teste roda numa transação que sofre rollback no fim. Por padrão ele troca seu banco por um embutido (H2), mas H2 não se comporta igual ao Postgres em tipos, funções e SQL nativo. Com Testcontainers você testa contra o Postgres de verdade, num container descartável:
+
+```java
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Testcontainers
+class ConsultaRepositoryTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired ConsultaRepository consultas;
+    @Autowired TestEntityManager em;
+
+    @Test
+    void detectaConflitoSoComConsultaNaoCancelada() {
+        var medico = em.persist(new Medico(null, "Ana", Especialidade.CARDIOLOGIA));
+        var paciente = em.persist(new Paciente(null, "Rui"));
+        var data = LocalDateTime.of(2030, 1, 7, 10, 0);
+        var consulta = em.persist(new Consulta(medico, paciente, data));
+
+        assertThat(consultas.existsByMedicoIdAndDataAndMotivoCancelamentoIsNull(medico.getId(), data)).isTrue();
+
+        consulta.cancelar(MotivoCancelamento.PACIENTE_DESISTIU);
+        em.flush();
+
+        assertThat(consultas.existsByMedicoIdAndDataAndMotivoCancelamentoIsNull(medico.getId(), data)).isFalse();
+    }
+}
+```
+
+`@ServiceConnection` (Spring Boot 3.1+) lê a URL, o usuário e a senha do container e configura o `DataSource` sozinho. `Replace.NONE` impede a troca pelo H2. As migrações do Flyway rodam no container, então o teste também valida que elas funcionam. É preciso Docker rodando na máquina e no CI.
+
+Teste no repositório só o que você escreveu: consultas derivadas com regra relevante, `@Query` e SQL nativo. Não teste `save` e `findById` do Spring Data, que já são testados por quem os mantém.
+
+<Callout type="warning" title="Teste que não falha não protege nada">
+Um teste que passa com o código certo e também passaria com o código errado é pior do que nenhum, porque dá falsa confiança. Acontece com asserções fracas (`assertThat(resultado).isNotNull()`), com mocks que devolvem exatamente o que o teste verifica, e com testes que dependem de data atual ou de ordem de execução. Um hábito simples resolve boa parte: depois de escrever o teste, quebre de propósito a regra no código de produção e confirme que ele fica vermelho.
+</Callout>
+
+## Rodando no Maven
+
+```bash
+./mvnw test                         # testes unitários e fatiados (plugin Surefire)
+./mvnw test -Dtest=AgendaDeConsultasTest   # uma classe só
+./mvnw verify                       # tudo, incluindo testes *IT do plugin Failsafe
+```
+
+Por convenção, o Surefire roda classes terminadas em `Test` na fase `test`, e o Failsafe (se configurado) roda as terminadas em `IT` na fase `integration-test`, dentro de `verify`. Separar assim deixa os testes lentos fora do ciclo rápido de desenvolvimento, e o pipeline de CI roda `verify`.
+
+Para medir cobertura, o plugin JaCoCo gera um relatório HTML em `target/site/jacoco`. Use a cobertura para achar código sem teste, não como meta: 100% de cobertura com asserções fracas não garante nada.
+
+## Na entrevista
+
+**Qual a diferença entre mock e stub?** Stub fornece respostas prontas para o código testado funcionar (`when(...).thenReturn(...)`). Mock, no sentido estrito, também verifica interações (`verify`). No Mockito, o mesmo objeto faz os dois papéis.
+
+**Quando usar @WebMvcTest, @DataJpaTest ou @SpringBootTest?** `@WebMvcTest` para contrato HTTP, validação e tratamento de erros, com serviços mockados. `@DataJpaTest` para consultas e mapeamento JPA. `@SpringBootTest` para fluxos completos, com todas as camadas reais. Os fatiados sobem mais rápido e falham com mensagens mais precisas.
+
+**Por que Testcontainers em vez de H2?** Porque H2 não reproduz exatamente o dialeto, os tipos e as funções do Postgres. Um teste pode passar no H2 e a consulta falhar em produção. Com Testcontainers, o banco do teste é o mesmo de produção.
+
+**O que torna um teste confiável?** Ser determinístico (sem depender de relógio, rede ou ordem), isolado (sem estado compartilhado), rápido, e falhar quando a regra quebra.
+
+## Pratique
+
+Na API da clínica, entregue uma suíte que roda verde com `./mvnw verify`:
+
+1. Testes unitários de todos os validadores de agendamento, com pelo menos um teste parametrizado.
+2. Teste do serviço `AgendaDeConsultas` com Mockito, cobrindo o caminho feliz, paciente inexistente e regra violada (verificando que nada foi salvo).
+3. `@WebMvcTest` do `ConsultaController` cobrindo 201 com `Location`, 400 com lista de campos, 404 e 422.
+4. `@DataJpaTest` com Testcontainers para cada consulta personalizada do repositório.
+5. Para três testes à sua escolha, quebre a regra correspondente no código e anote no PR que o teste ficou vermelho.
+
+<Quiz question="Num @WebMvcTest, como o serviço usado pelo controller costuma ser fornecido?" options={["É criado normalmente com todas as dependências reais","Como mock registrado com @MockitoBean","O @WebMvcTest sobe o serviço e o banco em memória","Não é necessário, o controller funciona sem ele"]} answer={1} explanation="O @WebMvcTest carrega só a camada web. Dependências como serviços precisam ser fornecidas como mocks, com @MockitoBean (ou @MockBean em versões anteriores)." />
+
+<Quiz question="Por que usar isEqualByComparingTo ao comparar BigDecimal no AssertJ?" options={["Porque equals de BigDecimal considera a escala, e 270.0 difere de 270.00","Porque BigDecimal não implementa equals","Porque é mais rápido que isEqualTo","Porque arredonda os valores automaticamente"]} answer={0} explanation="BigDecimal.equals compara valor e escala. isEqualByComparingTo usa compareTo, que compara só o valor numérico." />
+
+<Quiz question="O que @ServiceConnection faz num teste com Testcontainers?" options={["Cria o schema do banco a partir das entidades","Configura o DataSource com URL e credenciais do container","Substitui o Postgres por H2","Executa os testes em paralelo"]} answer={1} explanation="Com @ServiceConnection, o Spring Boot lê os dados de conexão do container e configura a conexão sem propriedades manuais." />
+
+## Base no CodeForge
+
+- [Boas práticas de programação: Melhore o código de uma API Java](/learn/carreira-java/boas-praticas-programacao-melhore-codigo-api-java): a API testada aqui.
+- [Java e refatoração: Melhorando códigos com boas práticas](/learn/carreira-java/java-refatoracao-melhorando-codigos-boas-praticas): testes de caracterização como rede de segurança.
+- [Testes de integração em Java: garantindo a qualidade dos back-ends](/learn/carreira-java/testes-integracao-java-garantindo-qualidade-back-ends): o próximo passo, com `@SpringBootTest` e fluxos completos.
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia): por que a injeção por construtor facilita testes.
+- [Node.js: Implementando testes em uma API](/learn/carreira-nodejs/nodejs-implementando-testes-api): o mesmo tema em outra stack.
+
+## Referências
+
+- [JUnit 5 User Guide](https://junit.org/junit5/docs/current/user-guide/)
+- [AssertJ](https://assertj.github.io/doc/)
+- [Mockito (Javadoc)](https://javadoc.io/doc/org.mockito/mockito-core/latest/org/mockito/Mockito.html)
+- [Spring Boot: Testing Spring Boot Applications](https://docs.spring.io/spring-boot/reference/testing/spring-boot-applications.html)

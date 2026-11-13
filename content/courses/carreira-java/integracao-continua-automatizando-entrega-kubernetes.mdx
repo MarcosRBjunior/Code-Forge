@@ -1,0 +1,350 @@
+---
+title: "Integração Contínua: Automatizando a entrega no Kubernetes"
+kind: lesson
+---
+
+No capítulo de Kubernetes para desenvolvedores Java, você escreveu os manifestos da API de pedidos e aplicou tudo com `kubectl apply` a partir da sua máquina. Isso não escala: ninguém sabe exatamente o que está rodando em cada ambiente, e um apply esquecido deixa staging e produção diferentes por semanas. Este capítulo fecha a carreira com a entrega automatizada: cada commit gera uma imagem imutável com o Jib, os manifestos são validados (inclusive num cluster descartável dentro do próprio pipeline), e o Argo CD mantém cada ambiente igual ao que está no Git. Promover para produção vira um pull request, e voltar atrás vira um `git revert`.
+
+**Você vai aprender:**
+
+- Organizar manifestos e configuração do Spring por ambiente com Kustomize
+- Publicar a imagem com o Jib e referenciá-la por digest, não por tag mutável
+- Validar manifestos e fazer um teste de fumaça num cluster kind dentro do GitHub Actions
+- Entregar com GitOps: o pipeline faz commit e o Argo CD aplica
+- Promover entre ambientes por pull request e reverter com segurança
+
+## O fluxo completo
+
+Antes do YAML, o desenho. São dois repositórios:
+
+- **`api-pedidos`**: código Java, testes, a base dos manifestos e o pipeline de CI.
+- **`loja-deploy`**: o estado desejado de cada ambiente (que imagem roda em staging, que imagem roda em produção, quantas réplicas). Só o pipeline e as pessoas que aprovam deploys escrevem aqui.
+
+O caminho de uma mudança:
+
+1. Pull request em `api-pedidos`: testes com Maven, validação dos manifestos e teste de fumaça num cluster kind efêmero.
+2. Merge na `main`: o Jib publica a imagem no GHCR e o pipeline abre um commit em `loja-deploy` trocando a imagem do overlay de staging pelo digest novo.
+3. O Argo CD, rodando dentro do cluster, percebe o commit e aplica em staging.
+4. Para produção, o pipeline abre um pull request em `loja-deploy` com a mesma troca no overlay de produção. Aprovar e fazer merge desse PR é o deploy.
+
+Separar os repositórios evita um problema clássico: se o pipeline fizesse commit no mesmo repositório da aplicação, cada commit de deploy dispararia o pipeline de novo. E dá um histórico limpo do que esteve em cada ambiente, separado do histórico do código.
+
+## Manifestos e configuração com Kustomize
+
+O Kustomize (embutido no `kubectl`) monta os manifestos de cada ambiente a partir de uma base e de overlays que só declaram diferenças. O capítulo equivalente da [carreira Node.js](/learn/carreira-nodejs/integracao-continua-automatizando-entrega-kubernetes) detalha a estrutura; aqui o interesse é como ele conversa com a configuração do Spring.
+
+```text
+loja-deploy/api-pedidos/
+├── base/
+│   ├── kustomization.yaml
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── hpa.yaml
+└── overlays/
+    ├── staging/
+    │   ├── kustomization.yaml
+    │   └── application-k8s.yaml
+    └── production/
+        ├── kustomization.yaml
+        └── application-k8s.yaml
+```
+
+Em vez de dezenas de variáveis de ambiente, cada overlay tem um `application-k8s.yaml` com a configuração Spring daquele ambiente, e o `configMapGenerator` o transforma num ConfigMap:
+
+```yaml
+# overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: loja-production
+resources:
+  - ../../base
+configMapGenerator:
+  - name: api-pedidos-config
+    files:
+      - application-k8s.yaml
+images:
+  - name: api-pedidos
+    newName: ghcr.io/minha-org/api-pedidos
+    digest: sha256:4b1c9e0d0f2a7c3b8e5d6f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e
+patches:
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: api-pedidos
+    patch: |
+      - op: replace
+        path: /spec/minReplicas
+        value: 3
+```
+
+```yaml
+# overlays/production/application-k8s.yaml
+spring:
+  datasource:
+    url: jdbc:postgresql://pedidos-prod.xxxx.us-east-1.rds.amazonaws.com:5432/pedidos
+    hikari:
+      maximum-pool-size: 15
+app:
+  pedidos:
+    limite-itens: 50
+logging:
+  level:
+    root: INFO
+```
+
+Na base, o Deployment monta esse ConfigMap e aponta o Spring para ele:
+
+```yaml
+# base/deployment.yaml (trecho)
+containers:
+  - name: api
+    image: api-pedidos
+    env:
+      - name: SPRING_PROFILES_ACTIVE
+        value: k8s
+      - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+        value: "optional:file:/config/"
+    volumeMounts:
+      - name: config
+        mountPath: /config
+        readOnly: true
+volumes:
+  - name: config
+    configMap:
+      name: api-pedidos-config
+```
+
+O detalhe que faz isso valer a pena: o `configMapGenerator` acrescenta ao nome um hash do conteúdo (`api-pedidos-config-7f9k2m`) e atualiza a referência no Deployment. Mudou uma linha do `application-k8s.yaml`, mudou o nome do ConfigMap, mudou o template do pod, e o Kubernetes faz um rolling update. Sem isso, você altera a configuração, ninguém reinicia os pods, e a JVM continua com o valor antigo, que ela leu uma única vez no boot.
+
+O `image: api-pedidos` na base é só um nome lógico. O bloco `images` do overlay o substitui pelo registro e pelo digest reais.
+
+## A imagem: Jib e digest
+
+O Jib publica direto no GitHub Container Registry, usando o token da própria execução, e grava o digest da imagem em `target/jib-image.digest`:
+
+```yaml
+# .github/workflows/ci.yml (job de imagem)
+  imagem:
+    if: github.ref == 'refs/heads/main'
+    needs: testes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.jib.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - id: jib
+        run: |
+          ./mvnw -B -ntp -DskipTests compile jib:build \
+            -Dimage=ghcr.io/minha-org/api-pedidos:${{ github.sha }} \
+            -Djib.to.auth.username=${{ github.actor }} \
+            -Djib.to.auth.password=${{ secrets.GITHUB_TOKEN }}
+          echo "digest=$(cat target/jib-image.digest)" >> "$GITHUB_OUTPUT"
+```
+
+A tag com o SHA serve para humanos encontrarem a imagem. O que vai para o manifesto é o digest (`sha256:...`), o hash do conteúdo. Uma tag pode ser sobrescrita por outro push; um digest, nunca. O manifesto em `loja-deploy` passa a descrever exatamente os bytes que rodam.
+
+<Callout type="warning" title="Tags mutáveis como latest ou main">
+Apontar o Deployment para `api-pedidos:latest` (ou para uma tag que o pipeline reescreve a cada build) quebra a entrega de três jeitos. O manifesto não muda entre versões, então o Kubernetes não vê motivo para fazer rollout e os pods continuam com a imagem antiga. Quando um pod é recriado por outro motivo, ele baixa a imagem nova sem passar pelo deploy, e você passa a ter versões misturadas. E o rollback perde o sentido, porque a revisão anterior aponta para a mesma tag. Use o SHA do commit ou, melhor, o digest.
+</Callout>
+
+## Validando antes do merge
+
+Erros de manifesto são caros de descobrir no cluster: um campo com indentação errada é ignorado em silêncio, uma probe apontando para a porta errada só aparece quando o pod entra em `CrashLoopBackOff`. O pipeline de pull request pega boa parte disso em duas etapas.
+
+A primeira é estática. O `kubectl kustomize` renderiza cada overlay e o kubeconform valida contra os schemas da API do Kubernetes:
+
+```yaml
+  manifestos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+      - name: Validar overlays
+        run: |
+          for ambiente in staging production; do
+            kubectl kustomize "k8s/overlays/$ambiente" | kubeconform -strict -summary
+          done
+```
+
+A segunda é um teste de fumaça de verdade: sobe um cluster kind dentro do runner, carrega a imagem construída no PR e espera o rollout terminar. É aqui que aparecem os problemas específicos de uma aplicação Spring no Kubernetes: startup probe curta demais para o boot da JVM, propriedade com nome errado no ConfigMap, readiness que nunca fica verde.
+
+```yaml
+  fumaca-kind:
+    needs: testes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: ci
+      - name: Imagem local e carga no kind
+        run: |
+          ./mvnw -B -ntp -DskipTests compile jib:dockerBuild -Dimage=api-pedidos:ci
+          kind load docker-image api-pedidos:ci --name ci
+      - name: Aplicar e esperar o rollout
+        run: |
+          kubectl apply -k k8s/overlays/ci
+          kubectl -n loja-ci rollout status deploy/postgres --timeout=120s
+          kubectl -n loja-ci rollout status deploy/api-pedidos --timeout=240s
+      - name: Diagnóstico
+        if: failure()
+        run: |
+          kubectl -n loja-ci get pods
+          kubectl -n loja-ci describe pods -l app=api-pedidos
+          kubectl -n loja-ci logs -l app=api-pedidos --tail=200
+```
+
+O overlay `ci` fica no repositório da aplicação: reaproveita a base, inclui um Postgres simples para a readiness ter um banco de verdade, usa `image: api-pedidos:ci` com `imagePullPolicy: Never` (a imagem já está no nó do kind) e reduz requests para caber no runner. O passo de diagnóstico só roda em falha e coloca no log do Actions exatamente o que você abriria no terminal.
+
+## GitOps com Argo CD
+
+O Argo CD roda dentro do cluster e compara continuamente o que está no Git com o que está aplicado. Cada ambiente é uma `Application`:
+
+```yaml
+# loja-deploy/argocd/api-pedidos-staging.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-pedidos-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/minha-org/loja-deploy.git
+    targetRevision: main
+    path: api-pedidos/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: loja-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+- **`automated`**: aplica sozinho quando o Git muda, sem ninguém clicar em Sync.
+- **`prune`**: remove do cluster o que foi apagado do Git.
+- **`selfHeal`**: desfaz mudanças manuais. Se alguém rodar `kubectl scale` ou `kubectl edit` em produção, o Argo CD volta ao estado do Git. Isso acaba com o *drift*, a diferença silenciosa entre o que está documentado e o que está rodando.
+
+O Argo CD entende a saúde dos recursos: uma `Application` só fica `Healthy` quando o Deployment terminou o rollout, ou seja, quando os pods novos passaram na readiness do Actuator. As probes que você configurou no capítulo de Kubernetes viram o sinal de sucesso do deploy.
+
+O pipeline da aplicação não precisa de nenhuma credencial do cluster. Ele só precisa escrever em `loja-deploy`, com um token de GitHub App de escopo restrito a esse repositório:
+
+```yaml
+  staging:
+    needs: imagem
+    runs-on: ubuntu-latest
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.DEPLOY_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_KEY }}
+          repositories: loja-deploy
+      - uses: actions/checkout@v4
+        with:
+          repository: minha-org/loja-deploy
+          token: ${{ steps.token.outputs.token }}
+      - name: Trocar a imagem de staging
+        env:
+          DIGEST: ${{ needs.imagem.outputs.digest }}
+        run: |
+          cd api-pedidos/overlays/staging
+          kustomize edit set image "api-pedidos=ghcr.io/minha-org/api-pedidos@${DIGEST}"
+          git config user.name "deploy-bot"
+          git config user.email "deploy-bot@users.noreply.github.com"
+          git commit -am "api-pedidos staging: ${GITHUB_SHA::7}"
+          git push
+```
+
+O `kustomize edit set image` reescreve o bloco `images` do overlay (o binário `kustomize` já vem nos runners do GitHub). O commit fica com a mensagem citando o SHA do código, então o histórico de `loja-deploy` mostra o que foi implantado e quando.
+
+## Promoção para produção por pull request
+
+Para produção, em vez de commit direto, o pipeline abre um pull request com a mesma troca no overlay de produção:
+
+```yaml
+      - name: PR de promoção para produção
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          DIGEST: ${{ needs.imagem.outputs.digest }}
+        run: |
+          git switch -c "promover-${GITHUB_SHA::7}"
+          cd api-pedidos/overlays/production
+          kustomize edit set image "api-pedidos=ghcr.io/minha-org/api-pedidos@${DIGEST}"
+          git commit -am "api-pedidos production: ${GITHUB_SHA::7}"
+          git push -u origin HEAD
+          gh pr create --title "Promover api-pedidos ${GITHUB_SHA::7}" \
+            --body "Mesmo digest validado em staging." --base main
+```
+
+Proteja a `main` de `loja-deploy` exigindo aprovação de quem responde por produção. Esse é o mesmo papel do environment com *Required reviewers* dos capítulos de EC2 e ECS, agora com a vantagem de que o diff do PR mostra exatamente o que muda: a linha do digest e, se for o caso, uma mudança de configuração. Se o job de carga do capítulo anterior roda contra staging, coloque-o antes deste passo: só regressão zero abre o PR.
+
+## Rollback e migrações
+
+Voltar uma versão é reverter o commit de promoção em `loja-deploy`:
+
+```bash
+git revert --no-edit 3c8e1fa
+git push
+```
+
+O Argo CD aplica o digest anterior em instantes. Ele também tem um botão de rollback na interface, mas com `selfHeal` ligado o próximo sync voltaria ao que está no Git; por isso, no modelo GitOps, o Git é sempre o caminho. Evite `kubectl rollout undo` em ambientes gerenciados pelo Argo CD pelo mesmo motivo.
+
+Como em qualquer plataforma, o rollback só funciona se o banco aceitar a versão anterior. Se o Flyway roda na inicialização da aplicação, a migração entra junto com o rollout, e toda migração precisa seguir o padrão expand and contract do [capítulo de rollback](/learn/carreira-java/integracao-continua-rollback-teste-carga). O Argo CD permite rodar um Job antes do sync (anotação `argocd.argoproj.io/hook: PreSync`), útil para separar a migração do boot quando ela é demorada; a regra de compatibilidade continua a mesma.
+
+## Na entrevista
+
+**Qual a diferença entre o modelo push e o GitOps?** No push, o pipeline tem credenciais do cluster e aplica as mudanças. No GitOps, um agente dentro do cluster puxa o estado do Git e aplica; o pipeline só faz commit. GitOps tira credenciais do CI, corrige drift sozinho e transforma o Git no histórico de deploys.
+
+**Por que referenciar a imagem por digest?** Porque tag é mutável e digest não. Com digest, o manifesto descreve exatamente o conteúdo que roda, o rollback volta para os mesmos bytes, e um push acidental na mesma tag não muda produção.
+
+**Como uma mudança só de configuração chega aos pods Spring?** A JVM lê a configuração no boot. Com `configMapGenerator`, o nome do ConfigMap muda com o conteúdo, o template do pod muda e o Kubernetes faz rollout. Sem isso, é preciso reiniciar os pods ou usar recarga dinâmica.
+
+**Como testar manifestos no CI?** Validação estática com kubeconform sobre o resultado do Kustomize e um teste de fumaça num cluster kind efêmero, esperando o rollout com as probes reais.
+
+## Pratique
+
+Monte a entrega GitOps da API de pedidos e entregue:
+
+1. O repositório `loja-deploy` com base e overlays de staging e produção, cada um com seu `application-k8s.yaml` via `configMapGenerator`.
+2. O Argo CD instalado num cluster (pode ser kind local) com as duas `Application`, sync automático, `prune` e `selfHeal`.
+3. O pipeline de `api-pedidos` com testes, kubeconform, teste de fumaça no kind, imagem pelo Jib com digest, commit em staging e PR de promoção para produção.
+4. Duas demonstrações: um `kubectl scale` manual em staging desfeito pelo Argo CD, e um rollback de produção feito só com `git revert`.
+
+<Quiz question="Você mudou o maximum-pool-size no application-k8s.yaml e os pods continuam com o valor antigo. Qual mudança faz o Kubernetes recriar os pods automaticamente?" options={["Usar configMapGenerator, que muda o nome do ConfigMap junto com o conteúdo","Aumentar o terminationGracePeriodSeconds","Trocar a imagem para a tag latest","Ativar o HPA"]} answer={0} explanation="O hash no nome muda a referência no template do pod, o que dispara um rolling update. A JVM só lê a configuração no boot." />
+
+<Quiz question="No modelo GitOps com selfHeal, qual é o jeito certo de voltar produção para a versão anterior?" options={["kubectl rollout undo direto no cluster","Reverter o commit de promoção no repositório de deploy","Apagar o Deployment para o Argo CD recriar","Reexecutar o pipeline da aplicação com a tag latest"]} answer={1} explanation="O Git é a fonte da verdade. Mudanças feitas direto no cluster são desfeitas pelo selfHeal; o revert muda o estado desejado e o Argo CD aplica." />
+
+<Quiz question="Por que o pipeline faz commit num repositório de deploy separado em vez do repositório da aplicação?" options={["Porque o Argo CD só lê repositórios com nome terminado em deploy","Para evitar que o commit de deploy dispare o pipeline de CI de novo e para separar o histórico de deploys","Porque o GitHub Actions não consegue fazer commit no próprio repositório","Para não precisar de digest da imagem"]} answer={1} explanation="Commit no próprio repositório reativa o pipeline e mistura deploys com código. O repositório separado tem um histórico limpo do que esteve em cada ambiente." />
+
+## Base no CodeForge
+
+- [Kubernetes para Desenvolvedores Java](/learn/carreira-java/kubernetes-para-desenvolvedores-java): os manifestos, probes e ajustes de JVM que este pipeline entrega.
+- [Integração Contínua: Rollback e teste de carga](/learn/carreira-java/integracao-continua-rollback-teste-carga): migrações compatíveis e o teste de carga entre staging e produção.
+- [Integração Contínua: Automatizando a entrega no Kubernetes (Node.js)](/learn/carreira-nodejs/integracao-continua-automatizando-entrega-kubernetes): o modelo push com kubectl no pipeline e acesso ao EKS por OIDC.
+- [Kubernetes](/learn/system-design-interviews/kubernetes) e [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): os objetos do cluster e as formas de trocar versões.
+
+## Referências
+
+- [Kustomize: images](https://kubectl.docs.kubernetes.io/references/kustomize/kustomization/images/)
+- [Argo CD: Automated Sync Policy](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/)
+- [helm/kind-action](https://github.com/helm/kind-action)
+- [kubeconform](https://github.com/yannh/kubeconform)

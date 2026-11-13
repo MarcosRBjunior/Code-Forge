@@ -1,0 +1,383 @@
+---
+title: "Padrões arquiteturais de software: Escala, resiliência e observabilidade"
+kind: lesson
+---
+
+Um serviço que funciona no seu notebook pode cair em produção por motivos que não estão no código dele: o gateway de pagamento demora 30 segundos para responder, um pico de tráfego esgota as threads, uma réplica fica lenta e ninguém percebe até o cliente reclamar. Os padrões deste capítulo existem para três perguntas que todo back-end sério precisa responder: como atender mais carga (escala), como continuar de pé quando uma dependência falha (resiliência) e como saber o que está acontecendo lá dentro (observabilidade). O fio condutor é a API de pedidos da carreira, que chama um serviço de pagamentos e um de estoque.
+
+**Você vai aprender:**
+
+- Preparar um serviço Spring Boot para escalar horizontalmente, com cache e health checks
+- Proteger chamadas externas com timeout, retry, circuit breaker, bulkhead e rate limiter usando Resilience4j
+- Expor métricas com Micrometer e Actuator, incluindo métricas de negócio
+- Gerar traces distribuídos com OpenTelemetry e correlacioná-los com logs estruturados
+
+## Escala horizontal começa no código
+
+Escalar verticalmente é dar mais CPU e memória para a mesma máquina. Funciona até certo ponto e custa caro. Escalar horizontalmente é rodar várias réplicas do mesmo serviço atrás de um load balancer. Para isso funcionar, cada réplica precisa ser **intercambiável**: qualquer uma atende qualquer requisição.
+
+O que impede isso na prática:
+
+- **Estado em memória.** Sessão HTTP, carrinho em um `HashMap`, contador local. Se a próxima requisição cair em outra réplica, o dado sumiu. Mova esse estado para o banco ou para o Redis.
+- **Arquivos no disco local.** Upload salvo em `/tmp` só existe naquela réplica. Use object storage.
+- **Tarefas agendadas duplicadas.** Um `@Scheduled` roda em todas as réplicas ao mesmo tempo. Use um lock distribuído (ShedLock, por exemplo) ou um job separado.
+- **Operações não idempotentes.** Com várias réplicas e retries, a mesma requisição pode chegar duas vezes. Uma chave de idempotência no `POST /pedidos` evita pedido duplicado.
+
+O orquestrador (Kubernetes, ECS) precisa saber quando a réplica está viva e quando está pronta para receber tráfego. O Actuator expõe isso:
+
+```yaml
+# application.yml
+server:
+  shutdown: graceful            # termina requisições em andamento antes de parar
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true           # /actuator/health/liveness e /actuator/health/readiness
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+```
+
+Liveness responde "o processo está saudável ou precisa ser reiniciado". Readiness responde "posso receber tráfego agora". A diferença importa: se o banco caiu, reiniciar o serviço não resolve nada, então o banco não deve derrubar a liveness.
+
+### Cache: o jeito mais barato de escalar leitura
+
+Grande parte da carga de uma API é leitura repetida: o mesmo produto consultado mil vezes por minuto. O Spring tem uma abstração de cache que funciona com Caffeine (local) ou Redis (compartilhado entre réplicas):
+
+```java
+@Configuration
+@EnableCaching
+class CacheConfig {}
+
+@Service
+class CatalogoService {
+    private final ProdutoRepository repo;
+
+    CatalogoService(ProdutoRepository repo) { this.repo = repo; }
+
+    @Cacheable(cacheNames = "produtos", key = "#sku")
+    public ProdutoDto buscar(String sku) {
+        return repo.findBySku(sku).map(ProdutoDto::de)
+                .orElseThrow(() -> new ProdutoNaoEncontrado(sku));
+    }
+
+    @CacheEvict(cacheNames = "produtos", key = "#sku")
+    public void atualizarPreco(String sku, BigDecimal preco) {
+        repo.atualizarPreco(sku, preco);
+    }
+}
+```
+
+```yaml
+spring:
+  cache:
+    type: redis
+    redis:
+      time-to-live: 10m
+  data:
+    redis:
+      host: localhost
+      port: 6379
+```
+
+Cache local é mais rápido, mas cada réplica tem a sua cópia e a invalidação não se propaga. Cache distribuído é consistente entre réplicas, ao custo de uma ida à rede. Em ambos, defina sempre um TTL: dado sem expiração vira dado errado em algum momento.
+
+## Resiliência: falhas são normais
+
+Em um sistema distribuído, a pergunta não é se a dependência vai falhar, mas quando. O perigo maior nem é a falha rápida, é a **lentidão**: se o serviço de pagamentos passa a responder em 30 segundos, cada requisição da API de pedidos segura uma thread por 30 segundos. Em pouco tempo o pool esgota e a API de pedidos cai junto. Isso é falha em cascata.
+
+O Resilience4j é a biblioteca padrão para isso no ecossistema Spring. Adicione ao `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>io.github.resilience4j</groupId>
+  <artifactId>resilience4j-spring-boot3</artifactId>
+  <version>2.2.0</version>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-aop</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+```
+
+### Timeout primeiro
+
+Nenhum padrão funciona sem timeout. Sem ele, o circuit breaker nunca vê a falha, porque a chamada simplesmente não termina. Configure o cliente HTTP:
+
+```java
+@Configuration
+class ClientesConfig {
+
+    @Bean
+    RestClient pagamentosClient(@Value("${pagamentos.url}") String url) {
+        var http = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(1))
+                .build();
+        var factory = new JdkClientHttpRequestFactory(http);
+        factory.setReadTimeout(Duration.ofSeconds(2));
+        return RestClient.builder()
+                .baseUrl(url)
+                .requestFactory(factory)
+                .build();
+    }
+}
+```
+
+### Retry, circuit breaker, bulkhead e rate limiter
+
+Cada padrão resolve um problema diferente:
+
+| Padrão | Problema que resolve | Ideia |
+|---|---|---|
+| Retry | Falha transitória (rede piscou, 503 momentâneo) | Tentar de novo com espera crescente |
+| Circuit breaker | Dependência fora do ar ou muito lenta | Parar de chamar por um tempo e falhar rápido |
+| Bulkhead | Uma dependência lenta consumindo todos os recursos | Limitar chamadas simultâneas por dependência |
+| Rate limiter | Exceder a cota de um parceiro ou ser sobrecarregado | Limitar chamadas por período |
+
+No código, você anota o método que faz a chamada externa:
+
+```java
+@Service
+class PagamentoGateway {
+    private static final Logger log = LoggerFactory.getLogger(PagamentoGateway.class);
+    private final RestClient client;
+
+    PagamentoGateway(RestClient pagamentosClient) { this.client = pagamentosClient; }
+
+    @Retry(name = "pagamentos")
+    @CircuitBreaker(name = "pagamentos", fallbackMethod = "pagamentoPendente")
+    @Bulkhead(name = "pagamentos")
+    public StatusPagamento cobrar(Cobranca cobranca) {
+        return client.post()
+                .uri("/cobrancas")
+                .body(cobranca)
+                .retrieve()
+                .body(StatusPagamento.class);
+    }
+
+    // mesma assinatura + Throwable no final
+    private StatusPagamento pagamentoPendente(Cobranca cobranca, Throwable erro) {
+        log.warn("Pagamento indisponível para pedido {}: {}", cobranca.pedidoId(), erro.toString());
+        return StatusPagamento.PENDENTE; // pedido segue e o pagamento é reprocessado depois
+    }
+}
+```
+
+E configura os parâmetros no YAML, por instância:
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      pagamentos:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50          # abre com 50% de falhas
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 50        # ou com 50% de chamadas lentas
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+  retry:
+    instances:
+      pagamentos:
+        max-attempts: 3
+        wait-duration: 200ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        retry-exceptions:
+          - org.springframework.web.client.ResourceAccessException
+          - org.springframework.web.client.HttpServerErrorException
+        ignore-exceptions:
+          - org.springframework.web.client.HttpClientErrorException
+  bulkhead:
+    instances:
+      pagamentos:
+        max-concurrent-calls: 20
+        max-wait-duration: 0
+  ratelimiter:
+    instances:
+      parceiroFrete:
+        limit-for-period: 50
+        limit-refresh-period: 1s
+        timeout-duration: 0
+```
+
+O circuit breaker tem três estados. **Fechado**: chamadas passam e o resultado é contado numa janela deslizante. Quando a taxa de falhas ou de chamadas lentas passa do limite, ele vai para **aberto**: as chamadas falham na hora com `CallNotPermittedException`, sem tocar a rede, e o fallback é acionado. Depois do tempo de espera, ele vai para **meio aberto** e deixa passar algumas chamadas de teste. Se elas funcionam, volta a fechar; se falham, abre de novo.
+
+Repare no `ignore-exceptions`: um 400 ou 404 não é falha da dependência, é erro do pedido. Tentar de novo não muda o resultado, e contar isso como falha abre o circuito sem motivo.
+
+Quando você empilha anotações, o Resilience4j aplica uma ordem fixa por padrão: o Retry fica por fora, depois CircuitBreaker, RateLimiter, TimeLimiter e Bulkhead por dentro. Ou seja, cada nova tentativa do retry passa pelo circuit breaker e é contada nele, e quando o circuito abre, o retry recebe `CallNotPermittedException` rapidamente.
+
+<Callout type="warning" title="Retry sem limite vira ataque ao próprio sistema">
+Retry agressivo em uma dependência que já está sobrecarregada multiplica a carga sobre ela: 3 tentativas em 3 camadas de serviços viram 27 chamadas para cada requisição original. Use poucas tentativas, backoff exponencial, retry só para erros transitórios e só em operações idempotentes. Cobrar um cartão duas vezes porque o retry repetiu um POST sem chave de idempotência é um incidente real e caro.
+</Callout>
+
+### Fallback com responsabilidade
+
+Fallback não é esconder o erro. É decidir, como regra de negócio, o que fazer quando a dependência não responde. Para a API de pedidos, registrar o pedido como `PENDENTE` e processar o pagamento depois é aceitável. Para um saque bancário, não: o certo é falhar e avisar o usuário. Pergunte ao time de produto qual é a degradação aceitável antes de escrever o fallback.
+
+## Observabilidade: métricas, traces e logs
+
+Monitoramento responde perguntas que você já sabia fazer ("a CPU passou de 80%?"). Observabilidade permite responder perguntas novas sobre um comportamento que você nunca viu, a partir dos sinais que o sistema emite. Os três sinais clássicos:
+
+- **Métricas**: números agregados no tempo (requisições por segundo, p99 de latência, taxa de erro). Baratos e ótimos para alertas.
+- **Traces**: o caminho de uma requisição por vários serviços, com o tempo de cada etapa. Mostram onde a latência está.
+- **Logs**: eventos detalhados. Contam o que aconteceu em uma requisição específica.
+
+### Métricas com Micrometer e Actuator
+
+O Micrometer é a fachada de métricas do Spring, como o SLF4J é para logs: você instrumenta uma vez e exporta para Prometheus, Datadog, CloudWatch ou outro backend. Com o registry do Prometheus no classpath, o Actuator publica `/actuator/prometheus`:
+
+```xml
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+Você já ganha métricas de JVM, pool de conexões, `http.server.requests` com latência por rota e status, e as métricas do Resilience4j (estado de cada circuit breaker, chamadas permitidas e rejeitadas). O que falta são as **métricas de negócio**, que normalmente são as mais úteis para detectar problemas:
+
+```java
+@Service
+class PedidoService {
+    private final PedidoRepository repo;
+    private final PagamentoGateway pagamentos;
+    private final MeterRegistry registry;
+    private final Timer tempoCheckout;
+
+    PedidoService(PedidoRepository repo, PagamentoGateway pagamentos, MeterRegistry registry) {
+        this.repo = repo;
+        this.pagamentos = pagamentos;
+        this.registry = registry;
+        this.tempoCheckout = Timer.builder("pedidos.checkout")
+                .description("Tempo do checkout completo")
+                .publishPercentileHistogram()
+                .register(registry);
+    }
+
+    public Pedido criar(NovoPedido novo) {
+        return tempoCheckout.record(() -> {
+            var pedido = repo.save(Pedido.de(novo));
+            var status = pagamentos.cobrar(new Cobranca(pedido.getId(), pedido.total()));
+            pedido.registrarPagamento(status);
+            registry.counter("pedidos.criados",
+                    "canal", novo.canal().name(),
+                    "pagamento", status.name()).increment();
+            return pedido;
+        });
+    }
+}
+```
+
+Cuidado com a cardinalidade das tags: `canal` tem 3 valores possíveis, ótimo. Colocar `clienteId` ou `pedidoId` como tag cria uma série temporal por cliente e derruba o servidor de métricas. Identificadores individuais vão para logs e traces, não para métricas.
+
+Com isso, um painel com "pedidos criados por minuto, quebrado por status de pagamento" mostra uma queda de vendas ou um aumento de `PENDENTE` antes de qualquer alerta de CPU.
+
+### Traces com OpenTelemetry
+
+No Spring Boot 3, tracing é feito pelo Micrometer Tracing, com uma ponte para o OpenTelemetry. Adicione:
+
+```xml
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-tracing-bridge-otel</artifactId>
+</dependency>
+<dependency>
+  <groupId>io.opentelemetry</groupId>
+  <artifactId>opentelemetry-exporter-otlp</artifactId>
+</dependency>
+```
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 0.1     # 10% das requisições em produção; 1.0 em dev
+  otlp:
+    tracing:
+      endpoint: http://otel-collector:4318/v1/traces
+```
+
+A partir daí, cada requisição HTTP recebe um `traceId`. Chamadas feitas com `RestClient`, `WebClient` ou `KafkaTemplate` criados pelos builders do Spring propagam o contexto no header `traceparent` (padrão W3C), e o serviço de pagamentos continua o mesmo trace. No Jaeger, Tempo ou outro backend você vê uma linha do tempo: 12 ms no banco, 1.800 ms no pagamento, 3 ms no estoque. A causa da lentidão fica óbvia.
+
+Para criar um span próprio em um trecho importante, use a Observation API, que gera métrica e span ao mesmo tempo:
+
+```java
+var resultado = Observation.createNotStarted("pedidos.calcular-frete", observationRegistry)
+        .lowCardinalityKeyValue("transportadora", transportadora.nome())
+        .observe(() -> frete.calcular(pedido));
+```
+
+### Logs estruturados e correlação
+
+Log em texto livre é ótimo para humanos e péssimo para busca. Em produção, emita JSON: cada campo vira um filtro na ferramenta de logs. Desde o Spring Boot 3.4 isso é uma propriedade:
+
+```yaml
+logging:
+  structured:
+    format:
+      console: ecs        # também aceita logstash e gelf
+```
+
+Com o tracing ativo, o `traceId` e o `spanId` entram no MDC de cada log. Isso fecha o ciclo: o alerta de métrica mostra que o p99 subiu, o trace mostra que o pagamento está lento, e o `traceId` leva aos logs exatos daquela requisição.
+
+```java
+log.info("Pedido criado pedidoId={} total={} status={}", pedido.getId(), pedido.total(), status);
+```
+
+Nunca registre dados sensíveis (número de cartão, senha, token) em logs. Logs são copiados para muitos lugares e ficam guardados por muito tempo.
+
+## Juntando tudo: o que alertar
+
+Alerte sobre sintomas que o usuário sente, não sobre causas. Os quatro sinais dourados são um bom ponto de partida: **latência** (p99 de `http.server.requests`), **tráfego** (requisições por segundo), **erros** (taxa de 5xx) e **saturação** (pool de conexões, threads, fila). Some a isso alertas de negócio (pedidos por minuto abaixo do normal) e o estado do circuit breaker: um circuito aberto por mais de alguns minutos merece alguém olhando.
+
+## Na entrevista
+
+**Qual a diferença entre retry e circuit breaker?** Retry insiste em falhas transitórias, esperando que a próxima tentativa funcione. Circuit breaker desiste temporariamente quando a dependência está claramente com problema, para falhar rápido e não desperdiçar recursos. Eles se complementam: o retry cuida do soluço, o circuit breaker do colapso.
+
+**Por que timeout é obrigatório?** Porque uma dependência lenta prende threads e conexões da sua aplicação. Sem timeout, a lentidão se propaga e derruba quem chama. Também é o timeout que transforma lentidão em falha visível para o circuit breaker.
+
+**O que é cardinalidade em métricas e por que importa?** É o número de combinações distintas de tags. Cada combinação vira uma série temporal guardada pelo backend. Tags com IDs de usuário ou pedido explodem esse número e tornam o sistema de métricas lento e caro.
+
+**Liveness e readiness são a mesma coisa?** Não. Liveness diz se o processo precisa ser reiniciado. Readiness diz se ele deve receber tráfego. Uma dependência fora do ar deve afetar a readiness, nunca a liveness, senão o orquestrador reinicia réplicas sem resolver o problema.
+
+## Pratique
+
+Na API de pedidos, entregue:
+
+1. Um `PagamentoGateway` com timeout de 2 segundos, retry com backoff e circuit breaker configurados no YAML, e um fallback que marca o pedido como `PENDENTE`.
+2. Um teste de integração com WireMock simulando o pagamento respondendo 503 e depois demorando 5 segundos, provando que o circuito abre e o fallback é chamado.
+3. A métrica `pedidos.criados` com tags de canal e status de pagamento, visível em `/actuator/prometheus`.
+4. Um `docker-compose.yml` com a API, Prometheus, Grafana e Jaeger (ou o OpenTelemetry Collector), e um print do trace de um checkout mostrando o span do pagamento.
+5. Logs em JSON com `traceId`, e um parágrafo no README explicando como ir de um alerta de latência ao log da requisição lenta.
+
+<Quiz question="O circuit breaker de pagamentos está aberto. O que acontece com uma nova chamada?" options={["Ela espera o circuito fechar para ser enviada","Ela falha na hora, sem chamar a rede, e o fallback é usado","Ela é enviada com timeout menor que o normal","Ela entra numa fila e é reenviada mais tarde"]} answer={1} explanation="No estado aberto, o circuit breaker rejeita a chamada imediatamente com CallNotPermittedException. Isso protege a dependência e libera os recursos de quem chama. Depois do tempo de espera, ele passa a meio aberto." />
+
+<Quiz question="Qual destas tags de métrica é uma má ideia?" options={["status do pagamento","canal de venda","id do pedido","método HTTP"]} answer={2} explanation="O id do pedido tem cardinalidade ilimitada: cada valor cria uma série temporal nova. Identificadores individuais pertencem a logs e traces." />
+
+<Quiz question="Para qual erro faz sentido configurar retry automático?" options={["400 Bad Request do parceiro","404 de produto inexistente","503 momentâneo do gateway","422 de validação de negócio"]} answer={2} explanation="Um 503 costuma ser transitório e pode funcionar na próxima tentativa. Erros 4xx indicam problema na própria requisição: repetir dá o mesmo resultado." />
+
+## Base no CodeForge
+
+- [Escalabilidade](/learn/system-design/escalabilidade) e [Caching](/learn/system-design/caching): a teoria de escala e cache por trás das escolhas daqui.
+- [Circuit breaker](/learn/system-design/circuit-breaker), [Bulkhead](/learn/system-design/bulkhead) e [Rate limiting](/learn/system-design/rate-limiting): os padrões de resiliência em nível de arquitetura.
+- [Os três pilares](/learn/system-design/tres-pilares), [Métricas](/learn/system-design/metricas) e [Tracing distribuído](/learn/system-design/tracing-distribuido): observabilidade em profundidade.
+- [Idempotência](/learn/system-design/idempotencia): por que retry exige operações idempotentes.
+- [Back-ends Modernos em Java: Reatividade, Observabilidade e Performance](/learn/carreira-java/back-ends-modernos-java-reatividade-observabilidade-performance): o próximo passo, medindo e otimizando o desempenho da JVM.
+
+## Referências
+
+- [Resilience4j: Getting started com Spring Boot 3](https://resilience4j.readme.io/docs/getting-started-3)
+- [Spring Boot: Actuator](https://docs.spring.io/spring-boot/reference/actuator/index.html)
+- [Spring Boot: Observability](https://docs.spring.io/spring-boot/reference/actuator/observability.html)
+- [OpenTelemetry: Java](https://opentelemetry.io/docs/languages/java/)

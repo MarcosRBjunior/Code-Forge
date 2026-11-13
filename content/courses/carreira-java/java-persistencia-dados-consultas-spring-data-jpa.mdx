@@ -1,0 +1,494 @@
+---
+title: "Java: Persistência de dados e consultas com Spring Data JPA"
+kind: lesson
+---
+
+O repositório em memória do capítulo anterior perde tudo quando a aplicação reinicia, e uma clínica não pode esquecer as consultas marcadas. Precisamos de um banco relacional, e em Java o caminho padrão é JPA: você mapeia classes para tabelas e o Hibernate gera o SQL. Por cima dele, o Spring Data JPA elimina o código repetitivo de repositório, a ponto de uma interface vazia já salvar, buscar e paginar. A produtividade é enorme, mas o JPA esconde o SQL, e é aí que moram os problemas clássicos de desempenho. Este capítulo monta a persistência da clínica com PostgreSQL e Flyway, ensina a escrever consultas dos três jeitos que o Spring Data oferece e mostra como enxergar o SQL que realmente vai para o banco.
+
+**Você vai aprender:**
+
+- Como JPA, Hibernate e Spring Data JPA se relacionam
+- Mapear entidades, enums, objetos embutidos e relacionamentos `@ManyToOne`
+- Versionar o esquema com Flyway em vez de deixar o Hibernate criar tabelas
+- Escrever consultas derivadas do nome, JPQL com `@Query` e consultas nativas, com paginação
+- Entender transações, dirty checking e o problema N+1
+
+## As três camadas
+
+| Camada | O que é | Quem fornece |
+|---|---|---|
+| JPA (Jakarta Persistence) | Especificação: anotações (`@Entity`, `@Id`) e a API do `EntityManager` | Pacote `jakarta.persistence` |
+| Hibernate | Implementação da JPA: gera SQL, gerencia cache e estado das entidades | Hibernate ORM 6 |
+| Spring Data JPA | Repositórios prontos a partir de interfaces, consultas pelo nome do método | Spring |
+
+Você escreve anotações JPA e interfaces do Spring Data; o Hibernate faz o trabalho pesado. Em Spring Boot 3, os pacotes são `jakarta.persistence.*`. Tutoriais com `javax.persistence` são anteriores ao Boot 3.
+
+## Montando o projeto
+
+Partindo do projeto da clínica (Spring Boot 3.5, Java 21), adicione:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.postgresql</groupId>
+  <artifactId>postgresql</artifactId>
+  <scope>runtime</scope>
+</dependency>
+<dependency>
+  <groupId>org.flywaydb</groupId>
+  <artifactId>flyway-core</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.flywaydb</groupId>
+  <artifactId>flyway-database-postgresql</artifactId>
+</dependency>
+```
+
+Desde o Flyway 10, o suporte a cada banco vem num módulo separado; sem `flyway-database-postgresql`, a aplicação falha ao subir com "Unsupported Database".
+
+Suba um PostgreSQL local com Docker Compose (`compose.yaml` na raiz do projeto):
+
+```yaml
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: clinica
+      POSTGRES_USER: clinica
+      POSTGRES_PASSWORD: clinica
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up -d
+```
+
+E configure a aplicação em `application.properties`:
+
+```properties
+spring.datasource.url=jdbc:postgresql://localhost:5432/clinica
+spring.datasource.username=clinica
+spring.datasource.password=clinica
+
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.open-in-view=false
+spring.jpa.properties.hibernate.format_sql=true
+logging.level.org.hibernate.SQL=debug
+```
+
+- `ddl-auto=validate`: o Hibernate só confere se as entidades batem com as tabelas; quem cria tabelas é o Flyway.
+- `open-in-view=false`: desliga um padrão do Spring Boot que mantém a sessão do banco aberta durante toda a requisição web e esconde problemas de carregamento. O próprio Boot avisa no log quando ele fica ligado.
+- `logging.level.org.hibernate.SQL=debug`: mostra cada SQL gerado. Deixe ligado em desenvolvimento; é a sua janela para o que o JPA está fazendo.
+
+## Esquema versionado com Flyway
+
+O Flyway executa scripts SQL numerados de `src/main/resources/db/migration`, em ordem, uma única vez cada, e registra o que já rodou na tabela `flyway_schema_history`. Crie `V1__criar_tabelas.sql`:
+
+```sql
+CREATE TABLE medico (
+    id            BIGSERIAL PRIMARY KEY,
+    nome          VARCHAR(120) NOT NULL,
+    crm           VARCHAR(20)  NOT NULL UNIQUE,
+    especialidade VARCHAR(30)  NOT NULL,
+    ativo         BOOLEAN      NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE paciente (
+    id          BIGSERIAL PRIMARY KEY,
+    nome        VARCHAR(120) NOT NULL,
+    cpf         CHAR(11)     NOT NULL UNIQUE,
+    nascimento  DATE         NOT NULL,
+    cep         CHAR(8),
+    logradouro  VARCHAR(200),
+    cidade      VARCHAR(100),
+    uf          CHAR(2)
+);
+
+CREATE TABLE consulta (
+    id          BIGSERIAL PRIMARY KEY,
+    medico_id   BIGINT        NOT NULL REFERENCES medico (id),
+    paciente_id BIGINT        NOT NULL REFERENCES paciente (id),
+    data_hora   TIMESTAMP     NOT NULL,
+    valor       NUMERIC(10,2) NOT NULL,
+    status      VARCHAR(20)   NOT NULL,
+    CONSTRAINT uk_consulta_medico_horario UNIQUE (medico_id, data_hora)
+);
+
+CREATE INDEX idx_consulta_paciente ON consulta (paciente_id);
+```
+
+A restrição `uk_consulta_medico_horario` é a regra "um médico não atende dois pacientes no mesmo horário" garantida pelo banco, que é o único lugar onde ela vale mesmo com duas requisições simultâneas. Nunca edite uma migração que já rodou em algum ambiente: crie `V2__...sql` com a alteração.
+
+## Entidades
+
+```java
+package br.com.clinica.medico;
+
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "medico")
+public class Medico {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 120)
+    private String nome;
+
+    @Column(nullable = false, unique = true)
+    private String crm;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private Especialidade especialidade;
+
+    private boolean ativo = true;
+
+    protected Medico() {
+        // exigido pela JPA
+    }
+
+    public Medico(String nome, String crm, Especialidade especialidade) {
+        this.nome = nome;
+        this.crm = crm;
+        this.especialidade = especialidade;
+    }
+
+    public void desativar() { this.ativo = false; }
+
+    public Long getId() { return id; }
+    public String getNome() { return nome; }
+    public String getCrm() { return crm; }
+    public Especialidade getEspecialidade() { return especialidade; }
+    public boolean isAtivo() { return ativo; }
+}
+```
+
+- `@Entity` marca a classe como persistente; `@Table` liga ao nome da tabela.
+- `@Id` com `IDENTITY` deixa o banco gerar o ID (o `BIGSERIAL`).
+- `@Enumerated(EnumType.STRING)` grava `"CARDIOLOGIA"`. O padrão (`ORDINAL`) grava a posição na enum, e reordenar as constantes corrompe silenciosamente todos os dados.
+- O construtor sem argumentos `protected` é exigido pela JPA, que instancia a classe via reflexão. Records não servem como entidade justamente por isso (e por serem imutáveis).
+- Nomes em camelCase (`dataHora`) viram snake_case (`data_hora`) automaticamente no Spring Boot.
+
+O endereço do paciente, que vem do ViaCEP, é um valor sem identidade própria. Mapeie como `@Embeddable`, que vira colunas na tabela do paciente:
+
+```java
+@Embeddable
+public class Endereco {
+    private String cep;
+    private String logradouro;
+    private String cidade;
+    private String uf;
+
+    protected Endereco() {}
+
+    public Endereco(String cep, String logradouro, String cidade, String uf) {
+        this.cep = cep;
+        this.logradouro = logradouro;
+        this.cidade = cidade;
+        this.uf = uf;
+    }
+    // getters
+}
+
+@Entity
+public class Paciente {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String nome;
+    private String cpf;
+    private LocalDate nascimento;
+
+    @Embedded
+    private Endereco endereco;
+
+    protected Paciente() {}
+    // construtor e getters
+}
+```
+
+### Relacionamentos
+
+Uma consulta pertence a um médico e a um paciente: é `@ManyToOne` (muitas consultas para um médico).
+
+```java
+@Entity
+public class Consulta {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "medico_id")
+    private Medico medico;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "paciente_id")
+    private Paciente paciente;
+
+    private LocalDateTime dataHora;
+    private BigDecimal valor;
+
+    @Enumerated(EnumType.STRING)
+    private StatusConsulta status = StatusConsulta.AGENDADA;
+
+    protected Consulta() {}
+
+    public Consulta(Medico medico, Paciente paciente, LocalDateTime dataHora, BigDecimal valor) {
+        this.medico = medico;
+        this.paciente = paciente;
+        this.dataHora = dataHora;
+        this.valor = valor;
+    }
+
+    public void cancelar() {
+        if (status != StatusConsulta.AGENDADA) {
+            throw new IllegalStateException("Só consultas agendadas podem ser canceladas");
+        }
+        this.status = StatusConsulta.CANCELADA;
+    }
+    // getters
+}
+```
+
+`@ManyToOne` é `EAGER` por padrão, ou seja, carregar uma consulta já busca médico e paciente. Declare `LAZY` sempre: o Hibernate coloca um proxy no lugar e só consulta o banco se você acessar o objeto. Você decide, consulta a consulta, quando trazer junto (com `JOIN FETCH`, adiante).
+
+Evite começar pelo lado `@OneToMany` (`Medico` com `List<Consulta>`). Um médico pode ter milhares de consultas, e carregar a coleção inteira raramente é o que você quer. Busque as consultas pelo repositório, com filtro e paginação.
+
+## Repositórios
+
+```java
+public interface MedicoRepository extends JpaRepository<Medico, Long> {
+}
+```
+
+Só isso. O Spring Data cria a implementação em tempo de execução, e você já tem `save`, `findById` (devolve `Optional`), `findAll`, `findAll(Pageable)`, `count`, `existsById`, `deleteById` e outros.
+
+```java
+var medico = medicos.save(new Medico("Carlos Lima", "SP123456", Especialidade.CARDIOLOGIA));
+System.out.println(medico.getId()); // gerado pelo banco
+Medico achado = medicos.findById(medico.getId()).orElseThrow();
+```
+
+### Consultas derivadas do nome do método
+
+O Spring Data lê o nome do método e gera a consulta:
+
+```java
+public interface MedicoRepository extends JpaRepository<Medico, Long> {
+    List<Medico> findByEspecialidadeAndAtivoTrueOrderByNome(Especialidade especialidade);
+    Optional<Medico> findByCrm(String crm);
+    boolean existsByCrm(String crm);
+    List<Medico> findByNomeContainingIgnoreCase(String trecho);
+}
+
+public interface ConsultaRepository extends JpaRepository<Consulta, Long> {
+    boolean existsByMedicoIdAndDataHora(Long medicoId, LocalDateTime dataHora);
+    List<Consulta> findByPacienteIdOrderByDataHoraDesc(Long pacienteId);
+    long countByMedicoIdAndDataHoraBetween(Long medicoId, LocalDateTime inicio, LocalDateTime fim);
+}
+```
+
+`MedicoId` navega para `medico.id`. As palavras-chave (`And`, `Or`, `Between`, `LessThan`, `Containing`, `IgnoreCase`, `OrderBy`, `True`) estão na documentação. Um nome inválido (um campo que não existe) faz a aplicação falhar na inicialização, o que é ótimo: o erro aparece cedo.
+
+A regra: use nomes derivados para filtros simples. Quando o nome passa de uns 60 caracteres, mude para `@Query`.
+
+### JPQL com @Query
+
+JPQL parece SQL, mas fala de **entidades e atributos**, não de tabelas e colunas:
+
+```java
+@Query("""
+        select c from Consulta c
+        join fetch c.paciente
+        where c.medico.id = :medicoId
+          and c.dataHora >= :inicio and c.dataHora < :fim
+          and c.status = br.com.clinica.consulta.StatusConsulta.AGENDADA
+        order by c.dataHora
+        """)
+List<Consulta> agendaDoMedico(Long medicoId, LocalDateTime inicio, LocalDateTime fim);
+```
+
+O text block deixa a consulta legível. Os parâmetros `:medicoId` são ligados pelo nome dos parâmetros do método (o Spring Boot compila com `-parameters`, então não precisa de `@Param`). O `join fetch` traz o paciente na mesma consulta.
+
+### Projeções em record
+
+Para relatórios, não carregue entidades inteiras. Projete direto num record:
+
+```java
+public record FaturamentoPorMedico(String medico, long consultas, BigDecimal total) {}
+
+@Query("""
+        select new br.com.clinica.consulta.FaturamentoPorMedico(m.nome, count(c), sum(c.valor))
+        from Consulta c join c.medico m
+        where c.status = br.com.clinica.consulta.StatusConsulta.REALIZADA
+          and c.dataHora >= :inicio and c.dataHora < :fim
+        group by m.nome
+        order by sum(c.valor) desc
+        """)
+List<FaturamentoPorMedico> faturamento(LocalDateTime inicio, LocalDateTime fim);
+```
+
+O banco agrega e devolve só três colunas. Fazer isso em Java com streams obrigaria a trazer todas as consultas do mês para a memória.
+
+### Consulta nativa
+
+Quando você precisa de um recurso específico do PostgreSQL, use SQL de verdade:
+
+```java
+@Query(value = """
+        select date_trunc('hour', data_hora) as hora, count(*) as total
+        from consulta
+        where data_hora >= now() - interval '30 days'
+        group by 1 order by 2 desc limit 5
+        """, nativeQuery = true)
+List<Object[]> horariosMaisCheios();
+```
+
+Consultas nativas não são portáveis entre bancos e o Hibernate não valida os nomes. Use quando valer a pena.
+
+### Paginação
+
+Nenhuma listagem de API deve devolver "tudo". Receba um `Pageable`:
+
+```java
+Page<Medico> findByEspecialidade(Especialidade especialidade, Pageable pageable);
+
+var pagina = medicos.findByEspecialidade(Especialidade.CARDIOLOGIA,
+        PageRequest.of(0, 20, Sort.by("nome")));
+pagina.getContent();       // os 20 médicos
+pagina.getTotalElements(); // total geral (custa uma consulta count extra)
+```
+
+Se não precisa do total, devolva `Slice<Medico>` e economize o `count`.
+
+## Transações e dirty checking
+
+Regras que envolvem várias operações ficam num `@Service` com `@Transactional`:
+
+```java
+@Service
+public class AgendamentoService {
+    private final ConsultaRepository consultas;
+    private final MedicoRepository medicos;
+    private final PacienteRepository pacientes;
+
+    public AgendamentoService(ConsultaRepository consultas, MedicoRepository medicos, PacienteRepository pacientes) {
+        this.consultas = consultas;
+        this.medicos = medicos;
+        this.pacientes = pacientes;
+    }
+
+    @Transactional
+    public Consulta agendar(Long medicoId, Long pacienteId, LocalDateTime dataHora) {
+        Medico medico = medicos.findById(medicoId)
+                .orElseThrow(() -> new IllegalArgumentException("Médico não encontrado"));
+        if (!medico.isAtivo()) {
+            throw new IllegalStateException("Médico inativo");
+        }
+        if (consultas.existsByMedicoIdAndDataHora(medicoId, dataHora)) {
+            throw new IllegalStateException("Horário ocupado");
+        }
+        Paciente paciente = pacientes.getReferenceById(pacienteId);
+        return consultas.save(new Consulta(medico, paciente, dataHora, medico.getEspecialidade().valorBase()));
+    }
+
+    @Transactional
+    public void cancelar(Long consultaId) {
+        Consulta consulta = consultas.findById(consultaId).orElseThrow();
+        consulta.cancelar();
+        // sem save: o Hibernate detecta a mudança e faz o UPDATE no commit
+    }
+
+    @Transactional(readOnly = true)
+    public List<Consulta> agendaDoDia(Long medicoId, LocalDate dia) {
+        return consultas.agendaDoMedico(medicoId, dia.atStartOfDay(), dia.plusDays(1).atStartOfDay());
+    }
+}
+```
+
+Dentro de uma transação, toda entidade carregada fica **gerenciada**: o Hibernate guarda uma cópia do estado original e, no commit, compara e gera `UPDATE` para o que mudou. Isso é dirty checking, e é por isso que `cancelar` não chama `save`. Se uma exceção não checada escapar do método, a transação inteira sofre rollback.
+
+`getReferenceById` devolve um proxy sem ir ao banco, útil quando você só precisa do ID para a chave estrangeira. E a checagem `existsBy...` não basta sob concorrência: duas requisições podem passar por ela ao mesmo tempo. Quem garante de fato é a `UNIQUE` do banco; trate a `DataIntegrityViolationException` resultante como "horário ocupado".
+
+<Callout type="warning" title="O problema N+1">
+Liste 50 consultas com `findAll()` e, para cada uma, chame `consulta.getPaciente().getNome()`. Com `LAZY`, o Hibernate faz 1 consulta para as consultas e mais 50, uma por paciente. Com 5 mil registros, a tela que era rápida em desenvolvimento derruba o banco em produção. Com o log de SQL ligado, você vê a rajada de `select ... from paciente where id=?`. A correção é buscar o que vai usar na mesma consulta: `join fetch` no JPQL, `@EntityGraph(attributePaths = "paciente")` no método do repositório, ou uma projeção em record.
+</Callout>
+
+## Testando o repositório
+
+`@DataJpaTest` sobe só a camada JPA. Com Testcontainers, o teste roda num PostgreSQL real descartável, com as mesmas migrações Flyway:
+
+```java
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Testcontainers
+class ConsultaRepositoryTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17");
+
+    @Autowired MedicoRepository medicos;
+    @Autowired PacienteRepository pacientes;
+    @Autowired ConsultaRepository consultas;
+
+    @Test
+    void detectaHorarioOcupado() {
+        var medico = medicos.save(new Medico("Carlos Lima", "SP123456", Especialidade.CARDIOLOGIA));
+        var paciente = pacientes.save(new Paciente("Ana Souza", "11111111111", LocalDate.of(1959, 3, 2), null));
+        var horario = LocalDateTime.of(2026, 12, 3, 10, 0);
+        consultas.save(new Consulta(medico, paciente, horario, new BigDecimal("320.00")));
+
+        assertThat(consultas.existsByMedicoIdAndDataHora(medico.getId(), horario)).isTrue();
+    }
+}
+```
+
+`@ServiceConnection` (Spring Boot 3.1+) configura a URL, usuário e senha do container automaticamente. Precisa das dependências `spring-boot-testcontainers` e `org.testcontainers:postgresql` em escopo de teste.
+
+## Na entrevista
+
+- **Qual a diferença entre JPA, Hibernate e Spring Data JPA?** JPA é a especificação; Hibernate é a implementação que gera o SQL; Spring Data JPA cria repositórios a partir de interfaces por cima do JPA.
+- **O que é o problema N+1 e como resolver?** Uma consulta para a lista mais uma para cada item ao acessar uma associação LAZY. Resolve com `join fetch`, `@EntityGraph` ou projeções que trazem só o necessário.
+- **LAZY ou EAGER?** LAZY por padrão em todas as associações, e buscar junto explicitamente quando o caso de uso precisa. EAGER carrega dados que ninguém pediu e não dá para desligar por consulta.
+- **Por que `EnumType.STRING`?** `ORDINAL` grava a posição; adicionar ou reordenar constantes muda o significado dos dados já gravados.
+
+## Pratique
+
+Complete a persistência da clínica:
+
+1. Migração `V2__` que adiciona a coluna `observacoes TEXT` em `consulta` e mapeie o campo.
+2. No `ConsultaRepository`: as consultas de um paciente num período com o médico carregado junto (sem N+1), paginadas; e uma projeção em record com o total de consultas por especialidade no mês.
+3. No `AgendamentoService`: método `remarcar(consultaId, novoHorario)` com `@Transactional`, que valida horário livre e trata a violação da `UNIQUE` como "horário ocupado".
+4. Testes com `@DataJpaTest` e Testcontainers para as duas consultas novas.
+
+Entregue o código, as migrações e um trecho do log mostrando o SQL gerado para a consulta com `join fetch`.
+
+<Quiz question="Qual o efeito de spring.jpa.hibernate.ddl-auto=validate?" options={["O Hibernate cria as tabelas que faltam","O Hibernate apaga e recria o esquema","O Hibernate só confere se as entidades batem com o esquema","O Flyway é desativado"]} answer={2} explanation="validate não altera o banco: falha na inicialização se faltar tabela ou coluna. Quem cria o esquema é o Flyway." />
+<Quiz question="Dentro de um método @Transactional, você altera um atributo de uma entidade carregada e não chama save. O que acontece no commit?" options={["Nada, a alteração se perde","O Hibernate gera o UPDATE por dirty checking","Uma exceção é lançada","Um INSERT duplicado é feito"]} answer={1} explanation="Entidades carregadas na transação são gerenciadas. O Hibernate compara o estado e faz o UPDATE do que mudou no commit." />
+<Quiz question="Qual destas é a melhor forma de evitar N+1 ao listar consultas com o nome do paciente?" options={["Trocar LAZY por EAGER em todas as associações","Usar join fetch ou uma projeção na consulta","Chamar findById para cada paciente","Aumentar o pool de conexões"]} answer={1} explanation="join fetch ou projeções trazem os dados necessários numa única consulta. EAGER global só move o problema para outros lugares." />
+
+## Base no CodeForge
+
+- [Inner join](/learn/sql/inner-join), [Índices](/learn/sql/indices) e [Transações e ACID](/learn/sql/transacoes-e-acid): o SQL por trás do JPA.
+- [Ordenação e paginação](/learn/sql/ordenacao-e-paginacao) e [EXPLAIN](/learn/sql/explain): para entender o custo das consultas geradas.
+- [Repository](/learn/lld/repository): o padrão que o Spring Data implementa.
+- [Pool de conexões](/learn/system-design/pool-de-conexoes) e [Migrações de esquema](/learn/system-design/migracoes-de-schema).
+- [Java: Criando sua primeira API e conectando ao front](/learn/carreira-java/java-criando-primeira-api-conectando-ao-front): o próximo capítulo expõe estes repositórios numa API REST.
+
+## Referências
+
+- [Spring Data JPA Reference](https://docs.spring.io/spring-data/jpa/reference/)
+- [Spring Data JPA: Query Methods](https://docs.spring.io/spring-data/jpa/reference/jpa/query-methods.html)
+- [Spring Boot: SQL Databases](https://docs.spring.io/spring-boot/reference/data/sql.html)
+- [Flyway Documentation](https://documentation.red-gate.com/fd)

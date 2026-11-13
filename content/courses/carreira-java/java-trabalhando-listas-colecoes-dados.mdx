@@ -1,0 +1,343 @@
+---
+title: "Java: Trabalhando com listas e coleções de dados"
+kind: lesson
+---
+
+Uma clínica não tem um paciente: tem milhares, cada um com várias consultas, e a recepção precisa listar a agenda do dia em ordem, achar um paciente pelo CPF, evitar duplicados e atender uma fila de espera. Em back-end, quase todo método recebe ou devolve uma coleção: o resultado de uma consulta ao banco é uma `List`, um cache é um `Map`, um conjunto de permissões é um `Set`. Escolher a coleção certa e usá-la sem as armadilhas clássicas é o que separa código que funciona com dez registros de código que funciona em produção.
+
+**Você vai aprender:**
+
+- Como o Collections Framework se organiza e qual implementação escolher
+- Usar `List` para sequências, ordenar com `Comparator` e remover com segurança
+- Usar `Set` e `Map`, e por que `equals` e `hashCode` precisam andar juntos
+- Montar índices e agrupamentos com `computeIfAbsent` e `merge`
+- Proteger o estado do objeto com coleções imutáveis
+
+## O mapa das coleções
+
+Tudo fica em `java.util`. As interfaces dizem **o que** a coleção faz; as classes dizem **como**.
+
+| Interface | Para quê | Implementação padrão | Alternativas |
+|---|---|---|---|
+| `List` | Sequência com ordem e índice, aceita repetidos | `ArrayList` | `LinkedList` (raramente vale a pena) |
+| `Set` | Sem repetidos | `HashSet` | `LinkedHashSet` (ordem de inserção), `TreeSet` (ordenado) |
+| `Map` | Chave para valor | `HashMap` | `LinkedHashMap`, `TreeMap` (chaves ordenadas) |
+| `Deque` | Fila e pilha | `ArrayDeque` | `PriorityQueue` (fila por prioridade, implementa `Queue`) |
+
+Declare a variável pelo tipo da interface e escolha a implementação só no `new`. Assim, trocar `HashMap` por `TreeMap` depois é mudar uma linha.
+
+```java
+List<Consulta> agenda = new ArrayList<>();   // bom
+ArrayList<Consulta> agenda2 = new ArrayList<>(); // evite expor a implementação
+```
+
+O `<Consulta>` é um generic: diz ao compilador o tipo dos elementos, e ele recusa colocar um `Paciente` na lista de consultas. O `<>` vazio à direita (diamond) deixa o compilador inferir.
+
+## O modelo deste capítulo
+
+Para os exemplos ficarem curtos, usamos versões em record do domínio da clínica:
+
+```java
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+
+enum Especialidade { CLINICO_GERAL, CARDIOLOGIA, DERMATOLOGIA, NEUROLOGIA }
+
+record Paciente(String cpf, String nome, int idade) {}
+
+record Consulta(Paciente paciente, String medico, Especialidade especialidade,
+                LocalDateTime dataHora, BigDecimal valor) {}
+```
+
+E alguns dados:
+
+```java
+var ana = new Paciente("11111111111", "Ana Souza", 67);
+var bruno = new Paciente("22222222222", "Bruno Reis", 34);
+var carla = new Paciente("33333333333", "Carla Dias", 45);
+var dia = LocalDateTime.of(2026, 12, 3, 0, 0);
+
+List<Consulta> consultas = new ArrayList<>(List.of(
+    new Consulta(ana, "Dr. Carlos", Especialidade.CARDIOLOGIA, dia.withHour(10), new BigDecimal("256.00")),
+    new Consulta(bruno, "Dra. Lia", Especialidade.DERMATOLOGIA, dia.withHour(9), new BigDecimal("250.00")),
+    new Consulta(carla, "Dr. Carlos", Especialidade.CARDIOLOGIA, dia.withHour(8), new BigDecimal("50.00")),
+    new Consulta(ana, "Dra. Lia", Especialidade.DERMATOLOGIA, dia.withHour(14), new BigDecimal("200.00"))
+));
+```
+
+`List.of(...)` cria uma lista **imutável**. Embrulhar em `new ArrayList<>(...)` copia para uma lista mutável, porque vamos ordenar e remover.
+
+## List: a coleção do dia a dia
+
+Operações básicas:
+
+```java
+consultas.add(novaConsulta);           // no fim
+consultas.get(0);                      // por índice, O(1) no ArrayList
+consultas.size();
+consultas.isEmpty();
+consultas.contains(algumaConsulta);    // usa equals, percorre a lista: O(n)
+
+for (Consulta c : consultas) {
+    System.out.println(c.dataHora().getHour() + "h " + c.paciente().nome());
+}
+```
+
+`ArrayList` guarda os elementos num array interno que cresce quando enche. Acesso por índice e inserção no fim são rápidos; inserir ou remover no meio desloca todos os elementos seguintes. `LinkedList` só ganha em cenários bem específicos e, na prática, perde quase sempre por usar muito mais memória e não aproveitar o cache da CPU.
+
+### Ordenando
+
+Para mostrar a agenda em ordem de horário, passe um `Comparator` para `sort`:
+
+```java
+import java.util.Comparator;
+
+consultas.sort(Comparator.comparing(Consulta::dataHora));
+```
+
+`Comparator.comparing` recebe uma função que extrai a chave de ordenação. Dá para encadear critérios e inverter:
+
+```java
+// Por médico; empate desempata por horário
+consultas.sort(Comparator.comparing(Consulta::medico)
+                         .thenComparing(Consulta::dataHora));
+
+// Mais caras primeiro
+consultas.sort(Comparator.comparing(Consulta::valor).reversed());
+```
+
+`Consulta::dataHora` é uma referência de método, uma forma curta de escrever `c -> c.dataHora()`. Lambdas têm um capítulo próprio adiante; aqui basta saber ler.
+
+### Removendo com segurança
+
+O erro mais clássico de coleções em Java:
+
+```java
+// ERRADO: lança ConcurrentModificationException
+for (Consulta c : consultas) {
+    if (c.valor().signum() == 0) {
+        consultas.remove(c);
+    }
+}
+```
+
+O `for` aprimorado usa um iterador por baixo, e modificar a lista por fora invalida esse iterador. Use `removeIf`:
+
+```java
+consultas.removeIf(c -> c.valor().signum() == 0);
+```
+
+<Callout type="warning" title="List.of e List.copyOf não aceitam alteração nem null">
+`List.of(...)`, `Set.of(...)` e `Map.of(...)` criam coleções imutáveis: `add`, `remove` e `sort` lançam `UnsupportedOperationException`, e passar `null` como elemento lança `NullPointerException`. O erro costuma aparecer longe de onde a lista foi criada, quando outro método tenta alterá-la. Se você precisa modificar, copie para `new ArrayList<>(lista)`.
+</Callout>
+
+## Set: sem duplicados
+
+Quais pacientes foram atendidos hoje, sem repetir a Ana que tem duas consultas?
+
+```java
+Set<Paciente> atendidos = new HashSet<>();
+for (Consulta c : consultas) {
+    atendidos.add(c.paciente()); // add devolve false se já existia
+}
+System.out.println(atendidos.size()); // 3
+```
+
+Funciona porque `Paciente` é um record, e records implementam `equals` e `hashCode` com base em todos os componentes. Com uma classe comum, você precisa sobrescrever os dois.
+
+### O contrato equals e hashCode
+
+`HashSet` e `HashMap` usam `hashCode()` para achar o "balde" e `equals()` para comparar dentro dele. A regra: **objetos iguais por `equals` precisam ter o mesmo `hashCode`**. Se você sobrescreve só o `equals`, dois pacientes iguais caem em baldes diferentes e o `Set` aceita os dois.
+
+Numa classe, defina igualdade pelo que identifica o objeto no negócio. Paciente é identificado pelo CPF:
+
+```java
+import java.util.Objects;
+
+public class PacienteEntidade {
+    private final String cpf;
+    private String nome;
+
+    public PacienteEntidade(String cpf, String nome) {
+        this.cpf = cpf;
+        this.nome = nome;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof PacienteEntidade outro)) return false;
+        return cpf.equals(outro.cpf);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(cpf);
+    }
+}
+```
+
+O `instanceof PacienteEntidade outro` testa o tipo e já declara a variável (pattern matching, Java 16+). Nunca use atributos mutáveis no `hashCode` de um objeto que está dentro de um `Set`: se o valor mudar, o objeto fica perdido no balde errado.
+
+### Variações de Set
+
+```java
+Set<String> medicos = new TreeSet<>();      // ordem alfabética
+Set<String> chegada = new LinkedHashSet<>(); // ordem de inserção
+```
+
+## Map: buscar por chave
+
+Buscar um paciente pelo CPF numa lista é O(n). Com um `Map`, é O(1) em média:
+
+```java
+Map<String, Paciente> porCpf = new HashMap<>();
+for (Consulta c : consultas) {
+    porCpf.put(c.paciente().cpf(), c.paciente());
+}
+
+Paciente p = porCpf.get("22222222222");           // Bruno
+Paciente nada = porCpf.get("99999999999");        // null
+Paciente padrao = porCpf.getOrDefault("999", null);
+boolean existe = porCpf.containsKey("11111111111");
+```
+
+`get` devolve `null` quando a chave não existe. Trate isso explicitamente ou embrulhe em `Optional.ofNullable(...)`.
+
+Para percorrer:
+
+```java
+for (Map.Entry<String, Paciente> e : porCpf.entrySet()) {
+    System.out.println(e.getKey() + " -> " + e.getValue().nome());
+}
+```
+
+### Agrupando com computeIfAbsent
+
+A agenda por médico: um `Map` em que cada valor é uma lista.
+
+```java
+Map<String, List<Consulta>> porMedico = new TreeMap<>();
+for (Consulta c : consultas) {
+    porMedico.computeIfAbsent(c.medico(), m -> new ArrayList<>()).add(c);
+}
+
+porMedico.forEach((medico, lista) ->
+    System.out.println(medico + ": " + lista.size() + " consulta(s)"));
+// Dr. Carlos: 2 consulta(s)
+// Dra. Lia: 2 consulta(s)
+```
+
+`computeIfAbsent` cria a lista só na primeira vez que a chave aparece e devolve a lista existente nas outras. Sem ele, você escreveria um `if (!map.containsKey(...))` para cada grupo.
+
+### Somando com merge
+
+Faturamento por especialidade:
+
+```java
+Map<Especialidade, BigDecimal> faturamento = new EnumMap<>(Especialidade.class);
+for (Consulta c : consultas) {
+    faturamento.merge(c.especialidade(), c.valor(), BigDecimal::add);
+}
+System.out.println(faturamento);
+// {CARDIOLOGIA=306.00, DERMATOLOGIA=450.00}
+```
+
+`merge` coloca o valor se a chave não existe; se existe, combina o valor antigo com o novo usando a função. `EnumMap` é um `Map` otimizado para chaves enum e mantém a ordem de declaração.
+
+### TreeMap para horários
+
+`TreeMap` mantém as chaves ordenadas e responde perguntas de vizinhança, o que cai como uma luva para agenda:
+
+```java
+TreeMap<LocalDateTime, Consulta> agendaCarlos = new TreeMap<>();
+for (Consulta c : porMedico.get("Dr. Carlos")) {
+    agendaCarlos.put(c.dataHora(), c);
+}
+
+var agora = dia.withHour(9);
+var proxima = agendaCarlos.ceilingEntry(agora);  // primeira com horário maior ou igual a 9h
+System.out.println(proxima.getValue().paciente().nome()); // Ana Souza (10h)
+```
+
+`floorKey`, `ceilingKey`, `headMap` e `tailMap` são O(log n) e evitam laços manuais.
+
+## Deque: fila de espera
+
+Pacientes sem hora marcada entram numa fila. `ArrayDeque` é a implementação certa tanto para fila quanto para pilha:
+
+```java
+Deque<Paciente> espera = new ArrayDeque<>();
+espera.offerLast(bruno);   // entra no fim
+espera.offerLast(carla);
+
+Paciente proximo = espera.pollFirst(); // Bruno; devolve null se vazia
+```
+
+Se houver prioridade (idosos primeiro), use `PriorityQueue` com um `Comparator`:
+
+```java
+Queue<Paciente> triagem = new PriorityQueue<>(
+    Comparator.comparing((Paciente p) -> p.idade() < 60).thenComparing(Paciente::nome));
+```
+
+Booleanos ordenam `false` antes de `true`, então quem tem 60 ou mais (`idade < 60` falso) sai primeiro.
+
+## Protegendo o estado
+
+Uma classe que guarda uma lista não deve devolvê-la crua, senão qualquer um altera a agenda por fora:
+
+```java
+public class Agenda {
+    private final List<Consulta> consultas = new ArrayList<>();
+
+    public void agendar(Consulta nova) {
+        boolean ocupado = consultas.stream()
+            .anyMatch(c -> c.medico().equals(nova.medico()) && c.dataHora().equals(nova.dataHora()));
+        if (ocupado) throw new IllegalStateException("Horário ocupado");
+        consultas.add(nova);
+    }
+
+    public List<Consulta> consultas() {
+        return List.copyOf(consultas); // cópia imutável
+    }
+}
+```
+
+Quem chama `agenda.consultas().add(...)` recebe uma exceção, e a única forma de incluir uma consulta é passar pela regra de `agendar`. O mesmo vale ao receber coleções no construtor: copie com `List.copyOf` para que o chamador não altere a sua lista depois.
+
+## Na entrevista
+
+- **ArrayList ou LinkedList?** `ArrayList` em quase todos os casos: acesso por índice O(1), boa localidade de memória. `LinkedList` só ganha com muitas inserções no meio via iterador, e mesmo assim costuma perder na prática.
+- **Por que sobrescrever equals e hashCode juntos?** Coleções baseadas em hash usam `hashCode` para localizar o balde e `equals` para comparar. Objetos iguais com hashes diferentes quebram `HashSet` e `HashMap`.
+- **Como remover itens de uma lista durante a iteração?** Com `removeIf` ou com `Iterator.remove()`. Chamar `list.remove` dentro do for-each lança `ConcurrentModificationException`.
+- **HashMap, LinkedHashMap ou TreeMap?** `HashMap` para busca rápida sem ordem; `LinkedHashMap` para manter ordem de inserção (útil em cache LRU); `TreeMap` para chaves ordenadas e consultas de intervalo em O(log n).
+
+## Pratique
+
+Crie a classe `Recepcao` que recebe uma lista de consultas do dia e oferece:
+
+1. `agendaOrdenada()`: consultas por horário, desempatando pelo nome do médico.
+2. `pacientesUnicos()`: os pacientes atendidos, sem repetição, em ordem alfabética.
+3. `faturamentoPorMedico()`: um `Map` de médico para total em `BigDecimal`.
+4. `proximaConsulta(String medico, LocalDateTime aPartirDe)`: devolve `Optional<Consulta>` usando `TreeMap`.
+5. `cancelarSemValor()`: remove consultas de valor zero sem `ConcurrentModificationException`.
+
+Entregue a classe e um `main` com pelo menos oito consultas, mostrando a saída de cada método.
+
+<Quiz question="O que acontece ao chamar add numa lista criada com List.of?" options={["O elemento é adicionado no fim","Lança UnsupportedOperationException","O elemento substitui o último","Nada acontece, a chamada é ignorada"]} answer={1} explanation="List.of cria uma lista imutável. Para alterar, copie para new ArrayList<>(lista)." />
+<Quiz question="Um HashSet aceita dois objetos que deveriam ser iguais. Qual a causa mais provável?" options={["A classe sobrescreveu equals mas não hashCode","O HashSet foi criado sem capacidade inicial","Os objetos são records","A lista tinha elementos nulos"]} answer={0} explanation="Sem hashCode coerente com equals, objetos iguais caem em baldes diferentes e nunca são comparados." />
+<Quiz question="Qual método de Map cria a lista de um grupo só quando a chave aparece pela primeira vez?" options={["putIfAbsent","computeIfAbsent","getOrDefault","replaceAll"]} answer={1} explanation="computeIfAbsent chama a função só se a chave não existe e devolve o valor associado, pronto para o add." />
+
+## Base no CodeForge
+
+- [ArrayList e LinkedList](/learn/java/listas), [HashMap, TreeMap e conjuntos](/learn/java/mapas-e-conjuntos) e [Pilhas, filas e deques](/learn/java/pilhas-filas-deques): as estruturas a fundo, com complexidade.
+- [Ordenação e comparadores](/learn/java/ordenacao-e-comparadores) e [Generics](/learn/java/generics).
+- [Complexidade das operações da biblioteca](/learn/java/complexidade-da-biblioteca): o custo de cada método.
+- [Java: Trabalhando com lambdas, streams e Spring Framework](/learn/carreira-java/java-trabalhando-lambdas-streams-spring-framework): onde os mesmos agrupamentos ficam mais curtos com streams.
+
+## Referências
+
+- [dev.java: The Collections Framework](https://dev.java/learn/api/collections-framework/)
+- [Javadoc: List (Java 21)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/List.html)
+- [Javadoc: Map (Java 21)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/Map.html)

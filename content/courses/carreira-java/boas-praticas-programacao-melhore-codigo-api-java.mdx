@@ -1,0 +1,362 @@
+---
+title: "Boas práticas de programação: Melhore o código de uma API Java"
+kind: lesson
+---
+
+A primeira versão de uma API Spring costuma nascer com tudo no controller: recebe a entidade JPA direto no corpo da requisição, valida com `if`, chama o repositório, aplica a regra de negócio e devolve a entidade de volta, com senha e relacionamentos lazy junto. Funciona na demonstração e vira um problema no terceiro mês. Este capítulo pega uma API assim, a da clínica, e aplica as boas práticas que um time sério espera ver no código: camadas com responsabilidades claras, DTOs, validação declarativa, injeção por construtor, regras de negócio isoladas e extensíveis, configuração tipada e respostas HTTP corretas. São as mesmas ideias de SOLID, aplicadas onde elas mais rendem.
+
+**Você vai aprender:**
+
+- Separar controller, serviço e repositório, e o que cada camada pode fazer
+- Usar records como DTOs e nunca expor entidades JPA
+- Validar entrada com Bean Validation e regras de negócio com validadores plugáveis
+- Injetar dependências por construtor e tipar configurações com `@ConfigurationProperties`
+- Responder com o status HTTP certo, paginação e logs úteis
+
+## O ponto de partida
+
+```java
+@RestController
+@RequestMapping("/consultas")
+public class ConsultaController {
+
+    @Autowired
+    private ConsultaRepository consultaRepository;
+    @Autowired
+    private MedicoRepository medicoRepository;
+
+    @PostMapping
+    public Consulta agendar(@RequestBody Consulta consulta) {
+        if (consulta.getData() == null) {
+            throw new RuntimeException("data obrigatória");
+        }
+        var hora = consulta.getData().getHour();
+        if (consulta.getData().getDayOfWeek() == DayOfWeek.SUNDAY || hora < 7 || hora > 18) {
+            throw new RuntimeException("fora do horário");
+        }
+        var medico = medicoRepository.findById(consulta.getMedico().getId()).get();
+        if (consultaRepository.existsByMedicoIdAndData(medico.getId(), consulta.getData())) {
+            throw new RuntimeException("médico ocupado");
+        }
+        consulta.setMedico(medico);
+        return consultaRepository.save(consulta);
+    }
+}
+```
+
+Os problemas, em ordem de gravidade:
+
+1. **Entidade como entrada.** O cliente pode mandar `id`, `status` ou qualquer campo da entidade, e o JPA grava (mass assignment).
+2. **Entidade como saída.** A resposta muda sempre que a tabela muda, e relacionamentos lazy geram consultas extras ou `LazyInitializationException`.
+3. **Regra de negócio no controller.** Não dá para reutilizar no agendamento por WhatsApp nem testar sem subir a camada web.
+4. **`Optional.get()` e `RuntimeException` genérica.** Médico inexistente vira 500; regra violada também.
+5. **Injeção por campo.** Dependências escondidas, impossível criar o objeto num teste sem Spring.
+6. **Validação com `if` e números mágicos.** Horário de funcionamento enterrado no meio do método.
+
+## Camadas e responsabilidades
+
+Uma divisão simples, que cobre a maioria das APIs:
+
+| Camada | Faz | Não faz |
+|---|---|---|
+| Controller | Recebe HTTP, valida o formato da entrada, chama o serviço, monta a resposta | Regra de negócio, acesso a banco |
+| Serviço | Orquestra o caso de uso, aplica regras, define a transação | Conhecer HTTP (status, headers) |
+| Repositório | Acessa dados | Regra de negócio |
+| Domínio (entidades, records) | Guarda estado e invariantes | Depender de Spring Web |
+
+Prefira organizar os pacotes **por funcionalidade** (`consulta`, `medico`, `paciente`), cada um com seu controller, serviço, repositório e DTOs, em vez de pacotes por camada (`controllers`, `services`). Quando você mexe em consultas, tudo está junto.
+
+```text
+br.com.clinica.api
+├── consulta
+│   ├── ConsultaController.java
+│   ├── AgendaDeConsultas.java
+│   ├── ConsultaRepository.java
+│   ├── Consulta.java
+│   ├── DadosAgendamento.java
+│   ├── DadosDetalhamentoConsulta.java
+│   └── validacao/
+├── medico
+└── infra
+    └── TratadorDeErros.java
+```
+
+## DTOs com records
+
+Um DTO (Data Transfer Object) é o contrato da API: só os campos que o cliente pode enviar ou receber. Records são ideais: imutáveis, sem boilerplate e com validação declarada nos componentes.
+
+```java
+import jakarta.validation.constraints.Future;
+import jakarta.validation.constraints.NotNull;
+import java.time.LocalDateTime;
+
+public record DadosAgendamento(
+        Long idMedico,
+        @NotNull Long idPaciente,
+        @NotNull @Future LocalDateTime data,
+        Especialidade especialidade) {
+}
+```
+
+```java
+public record DadosDetalhamentoConsulta(Long id, Long idMedico, Long idPaciente, LocalDateTime data) {
+
+    public static DadosDetalhamentoConsulta de(Consulta consulta) {
+        return new DadosDetalhamentoConsulta(
+                consulta.getId(),
+                consulta.getMedico().getId(),
+                consulta.getPaciente().getId(),
+                consulta.getData());
+    }
+}
+```
+
+O método de fábrica `de` concentra a conversão num lugar só. Em projetos maiores, o MapStruct gera esses mapeamentos em tempo de compilação, mas para poucos DTOs o método estático é mais simples e mais fácil de ler.
+
+Para a validação rodar, o parâmetro do controller recebe `@Valid`. Se falhar, o Spring lança `MethodArgumentNotValidException` antes do seu código executar, e o tratador de erros transforma isso em 400 com a lista de campos.
+
+## Injeção por construtor
+
+Troque `@Autowired` em campo por campos `final` recebidos no construtor. Com um único construtor, o Spring injeta sem anotação nenhuma.
+
+```java
+@Service
+public class AgendaDeConsultas {
+
+    private final ConsultaRepository consultas;
+    private final MedicoRepository medicos;
+    private final PacienteRepository pacientes;
+    private final List<ValidadorAgendamento> validadores;
+
+    public AgendaDeConsultas(ConsultaRepository consultas, MedicoRepository medicos,
+                             PacienteRepository pacientes, List<ValidadorAgendamento> validadores) {
+        this.consultas = consultas;
+        this.medicos = medicos;
+        this.pacientes = pacientes;
+        this.validadores = validadores;
+    }
+}
+```
+
+Vantagens: as dependências ficam explícitas, os campos são imutáveis, o objeto nunca existe pela metade, e num teste unitário você faz `new AgendaDeConsultas(mock1, mock2, ...)` sem Spring. E se o construtor passar de cinco ou seis parâmetros, isso é um aviso honesto de que a classe faz coisas demais.
+
+## Regras de negócio plugáveis
+
+As regras de agendamento da clínica são várias e crescem com o tempo: horário de funcionamento, antecedência mínima, médico ativo, médico sem outra consulta no horário, paciente sem duas consultas no mesmo dia. Em vez de um método com dez `if`, cada regra vira uma classe que implementa a mesma interface:
+
+```java
+public interface ValidadorAgendamento {
+    void validar(DadosAgendamento dados);
+}
+```
+
+```java
+@Component
+public class ValidadorHorarioFuncionamento implements ValidadorAgendamento {
+
+    private final ClinicaProperties clinica;
+
+    public ValidadorHorarioFuncionamento(ClinicaProperties clinica) {
+        this.clinica = clinica;
+    }
+
+    @Override
+    public void validar(DadosAgendamento dados) {
+        var data = dados.data();
+        var domingo = data.getDayOfWeek() == DayOfWeek.SUNDAY;
+        var hora = data.toLocalTime();
+        var foraDoHorario = hora.isBefore(clinica.abertura()) || hora.isAfter(clinica.ultimaConsulta());
+        if (domingo || foraDoHorario) {
+            throw new RegraDeNegocioException("Consulta fora do horário de funcionamento da clínica");
+        }
+    }
+}
+```
+
+```java
+@Component
+public class ValidadorMedicoSemConflito implements ValidadorAgendamento {
+
+    private final ConsultaRepository consultas;
+
+    public ValidadorMedicoSemConflito(ConsultaRepository consultas) {
+        this.consultas = consultas;
+    }
+
+    @Override
+    public void validar(DadosAgendamento dados) {
+        if (dados.idMedico() != null
+                && consultas.existsByMedicoIdAndDataAndMotivoCancelamentoIsNull(dados.idMedico(), dados.data())) {
+            throw new RegraDeNegocioException("Médico já possui consulta nesse horário");
+        }
+    }
+}
+```
+
+O Spring injeta **todas** as implementações em `List<ValidadorAgendamento>`. O serviço não conhece nenhuma regra específica:
+
+```java
+@Transactional
+public DadosDetalhamentoConsulta agendar(DadosAgendamento dados) {
+    var paciente = pacientes.findById(dados.idPaciente())
+            .orElseThrow(() -> new RecursoNaoEncontradoException("Paciente", dados.idPaciente()));
+
+    validadores.forEach(v -> v.validar(dados));
+
+    var medico = escolherMedico(dados);
+    var consulta = consultas.save(new Consulta(medico, paciente, dados.data()));
+    return DadosDetalhamentoConsulta.de(consulta);
+}
+```
+
+Isso é SOLID aplicado sem cerimônia. Cada validador tem uma responsabilidade (SRP). Uma regra nova é uma classe nova, sem mexer no serviço (OCP). O serviço depende da abstração `ValidadorAgendamento`, não das classes concretas (DIP). E cada regra se testa isoladamente, com um mock do repositório. Se a ordem importar, anote os validadores com `@Order`.
+
+## Configuração tipada
+
+Horários, limites e URLs não pertencem ao código. Um record com `@ConfigurationProperties` lê o `application.yml` com tipos, validação e autocompletar na IDE:
+
+```yaml
+clinica:
+  abertura: "07:00"
+  ultima-consulta: "18:00"
+  antecedencia-minima: 30m
+```
+
+```java
+import jakarta.validation.constraints.NotNull;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.time.Duration;
+import java.time.LocalTime;
+
+@Validated
+@ConfigurationProperties(prefix = "clinica")
+public record ClinicaProperties(
+        @NotNull LocalTime abertura,
+        @NotNull LocalTime ultimaConsulta,
+        @NotNull Duration antecedenciaMinima) {
+}
+```
+
+```java
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class ClinicaApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ClinicaApplication.class, args);
+    }
+}
+```
+
+O Spring converte `30m` em `Duration` e o hífen de `ultima-consulta` para o componente `ultimaConsulta` (relaxed binding). Se a propriedade faltar, a aplicação não sobe, o que é muito melhor do que descobrir em produção. Segredos (senha do banco, chaves de API) entram por variável de ambiente, nunca no YAML commitado.
+
+## O controller enxuto
+
+```java
+@RestController
+@RequestMapping("/consultas")
+public class ConsultaController {
+
+    private final AgendaDeConsultas agenda;
+
+    public ConsultaController(AgendaDeConsultas agenda) {
+        this.agenda = agenda;
+    }
+
+    @PostMapping
+    public ResponseEntity<DadosDetalhamentoConsulta> agendar(@RequestBody @Valid DadosAgendamento dados,
+                                                             UriComponentsBuilder uriBuilder) {
+        var consulta = agenda.agendar(dados);
+        var uri = uriBuilder.path("/consultas/{id}").buildAndExpand(consulta.id()).toUri();
+        return ResponseEntity.created(uri).body(consulta);
+    }
+
+    @GetMapping
+    public Page<DadosDetalhamentoConsulta> listar(@PageableDefault(size = 20, sort = "data") Pageable paginacao) {
+        return agenda.listar(paginacao);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> cancelar(@PathVariable Long id, @RequestBody @Valid DadosCancelamento dados) {
+        agenda.cancelar(id, dados.motivo());
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+O controller ficou com três linhas por endpoint e só fala HTTP. Os status seguem a semântica: **201 Created** com header `Location` ao criar, **200** com corpo ao ler, **204 No Content** ao remover, **400** para entrada malformada, **404** para recurso inexistente e **422** para regra de negócio violada (esses três últimos vêm do `@RestControllerAdvice`).
+
+Na listagem, nunca devolva `findAll()` sem limite: com 500 mil consultas a resposta derruba a API. `Pageable` lê `?page=0&size=20&sort=data,desc` da URL. Para serializar a página de forma estável, habilite `@EnableSpringDataWebSupport(pageSerializationMode = PageSerializationMode.VIA_DTO)` numa classe de configuração (Spring Data 3.3+), que gera um JSON com `content` e `page` independente da implementação interna.
+
+<Callout type="warning" title="Expor a entidade JPA na API">
+Receber e devolver entidades parece economizar código, mas acopla o contrato público ao esquema do banco. Renomear uma coluna quebra os clientes, um campo novo como `senhaHash` vaza na resposta, o cliente pode alterar campos que não deveria (como `id` ou `ativo`), e relacionamentos lazy disparam consultas extras ou exceções durante a serialização. Use DTOs nas duas direções, sempre.
+</Callout>
+
+## Logs que ajudam
+
+Use SLF4J com placeholders, e não concatenação: a mensagem só é montada se o nível estiver ativo.
+
+```java
+private static final Logger log = LoggerFactory.getLogger(AgendaDeConsultas.class);
+
+log.info("Consulta {} agendada para médico {} em {}", consulta.getId(), medico.getId(), dados.data());
+log.warn("Agendamento recusado para paciente {}: {}", dados.idPaciente(), e.getMessage());
+```
+
+Regras práticas: `info` para eventos de negócio relevantes, `warn` para algo estranho mas tratado, `error` só para falhas que exigem ação (com a exceção como último argumento). E nunca registre dado sensível: CPF, senha, token, conteúdo de prontuário. Em sistema de saúde, isso é questão de LGPD.
+
+## Checklist de revisão
+
+Antes de abrir o pull request, confira:
+
+- Controller sem regra de negócio e sem repositório injetado
+- Entrada e saída com DTO (record), validação com Bean Validation e `@Valid`
+- Dependências por construtor, campos `final`
+- `@Transactional` no serviço, nos métodos que escrevem
+- Nenhum `Optional.get()` sem verificação; `orElseThrow` com exceção de domínio
+- Status HTTP corretos e erros padronizados em `ProblemDetail`
+- Listagens paginadas
+- Configuração em `@ConfigurationProperties`, segredos em variáveis de ambiente
+- Logs com placeholders e sem dados sensíveis
+
+## Na entrevista
+
+**Por que usar DTO em vez de expor a entidade?** Para desacoplar o contrato da API do modelo de persistência, evitar mass assignment e vazamento de campos, e controlar a serialização de relacionamentos.
+
+**Por que injeção por construtor?** Dependências explícitas e imutáveis, objeto sempre completo, testes sem container Spring, e o construtor grande denuncia excesso de responsabilidade.
+
+**Como você organizaria regras de validação de negócio que crescem com o tempo?** Uma interface de validador e uma implementação por regra, injetadas como lista no serviço. Regra nova vira classe nova, sem alterar o serviço (aberto/fechado), e cada uma é testada isoladamente.
+
+**Qual a diferença entre 400 e 422?** 400 indica requisição malformada ou inválida no formato (campo obrigatório ausente, tipo errado). 422 indica que a requisição está bem formada mas viola uma regra de negócio, como agendar fora do horário.
+
+## Pratique
+
+Refatore a API da clínica (ou a primeira API que você construiu no Nível 1) e entregue:
+
+1. Pacotes por funcionalidade, controllers sem repositório injetado, injeção por construtor em todas as classes.
+2. DTOs em record para entrada e saída de médicos, pacientes e consultas.
+3. Pelo menos quatro validadores de agendamento (horário, antecedência mínima vinda do `ClinicaProperties`, médico sem conflito, paciente com no máximo uma consulta por dia), cada um com teste unitário.
+4. POST respondendo 201 com `Location`, DELETE com 204, listagens paginadas.
+5. Um parágrafo no README explicando onde cada princípio SOLID aparece no código.
+
+<Quiz question="Qual a principal vantagem de injetar List<ValidadorAgendamento> no serviço?" options={["Diminui o tempo de inicialização do Spring","Permite adicionar regras novas sem alterar o serviço","Elimina a necessidade de testes por regra","Faz as validações rodarem em paralelo"]} answer={1} explanation="O serviço depende só da interface. Cada regra nova é uma classe anotada com @Component, que o Spring inclui na lista automaticamente." />
+
+<Quiz question="Qual status HTTP é o mais adequado para um POST que criou uma consulta com sucesso?" options={["200 OK sem corpo","201 Created com header Location","204 No Content","202 Accepted"]} answer={1} explanation="201 indica que um recurso foi criado, e o header Location informa a URI dele. 202 é para processamento assíncrono ainda não concluído." />
+
+<Quiz question="Por que receber a entidade JPA diretamente no @RequestBody é arriscado?" options={["O Spring não consegue desserializar entidades","Entidades não aceitam anotações de validação","O cliente pode preencher campos que não deveria, como id ou status","Entidades são sempre mais lentas que records"]} answer={2} explanation="Sem um DTO limitando os campos, qualquer atributo da entidade pode ser enviado e gravado, o que é a vulnerabilidade de mass assignment." />
+
+## Base no CodeForge
+
+- [SRP](/learn/lld/srp), [OCP](/learn/lld/ocp) e [DIP](/learn/lld/dip): os princípios aplicados nos validadores.
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia) e [Repository](/learn/lld/repository): os padrões por trás do Spring.
+- [Separação de responsabilidades](/learn/lld/separacao-de-responsabilidades) e [MVC](/learn/lld/mvc): a teoria das camadas.
+- [REST](/learn/system-design/rest): semântica de métodos e status HTTP.
+- [Java exceções: Aprenda a criar, lançar e controlar exceções](/learn/carreira-java/java-excecoes-aprenda-criar-lancar-controlar-excecoes): o `TratadorDeErros` usado aqui.
+- [Java e refatoração: Melhorando códigos com boas práticas](/learn/carreira-java/java-refatoracao-melhorando-codigos-boas-praticas): como chegar nesta estrutura em passos seguros.
+
+## Referências
+
+- [Spring Framework: Dependency Injection](https://docs.spring.io/spring-framework/reference/core/beans/dependencies/factory-collaborators.html)
+- [Spring Boot: Externalized Configuration](https://docs.spring.io/spring-boot/reference/features/external-config.html)
+- [Jakarta Bean Validation 3.0](https://jakarta.ee/specifications/bean-validation/3.0/)

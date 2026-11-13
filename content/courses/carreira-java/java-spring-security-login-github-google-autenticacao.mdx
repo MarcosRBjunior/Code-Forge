@@ -1,0 +1,423 @@
+---
+title: "Java e Spring Security: Login com GitHub, Google e autenticação de 2 fatores"
+kind: lesson
+---
+
+Senha sozinha é a credencial mais fraca que existe: ela é reutilizada em vários sites, vaza em despejos de bancos e cai em phishing. Duas saídas aparecem em quase todo sistema moderno. A primeira é delegar o login a quem já faz isso bem, com "Entrar com Google" ou "Entrar com GitHub". A segunda é exigir um segundo fator, como o código de seis dígitos de um aplicativo autenticador. Neste capítulo você adiciona as duas coisas ao portal da clínica com Spring Security 6: OAuth2 Login com GitHub e Google, vinculação ao usuário local e 2FA com TOTP.
+
+**Você vai aprender:**
+
+- Como funciona o fluxo authorization code do OAuth2 e o que o OpenID Connect acrescenta
+- Configurar `oauth2Login` com GitHub e Google no Spring Boot
+- Vincular a conta externa a um usuário local com perfis, sem abrir brecha de sequestro de conta
+- Implementar TOTP (RFC 6238) e encaixar o segundo fator no fluxo de login do Spring Security
+
+## OAuth2 e OpenID Connect em cinco passos
+
+OAuth2 é um protocolo de **autorização**: ele permite que a sua aplicação receba um token para agir em nome do usuário num provedor. O OpenID Connect (OIDC) é uma camada por cima que acrescenta **autenticação**: além do token de acesso, o provedor devolve um **ID token**, um JWT assinado que diz quem é o usuário. O Google implementa OIDC; o GitHub implementa só OAuth2, então a aplicação precisa chamar a API do GitHub para saber quem logou.
+
+O fluxo authorization code, que o Spring Security executa por você:
+
+1. O usuário clica em "Entrar com Google" e o navegador vai para `/oauth2/authorization/google` na sua aplicação.
+2. A aplicação redireciona para a tela de login do Google com `client_id`, escopos, um `state` aleatório (contra CSRF) e um desafio PKCE.
+3. O usuário faz login no Google (com o 2FA dele, se tiver) e autoriza.
+4. O Google redireciona de volta para `/login/oauth2/code/google?code=...&state=...`.
+5. A aplicação confere o `state`, troca o `code` por tokens numa chamada servidor a servidor (com o `client_secret`) e obtém os dados do usuário. Pronto: há um usuário autenticado na sessão.
+
+O `code` sozinho não vale nada para quem o interceptar, porque a troca exige o segredo da aplicação. Por isso o segredo nunca vai para o navegador.
+
+## Registrando a aplicação nos provedores
+
+No **GitHub**, em Settings, Developer settings, OAuth Apps, crie um app com a URL de callback `http://localhost:8080/login/oauth2/code/github`. No **Google**, no Google Cloud Console, crie credenciais do tipo "ID do cliente OAuth" para aplicação web, com o URI de redirecionamento `http://localhost:8080/login/oauth2/code/google`. Em produção, cadastre também as URLs com o domínio real e HTTPS. Cada provedor entrega um client ID e um client secret.
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-client</artifactId>
+</dependency>
+```
+
+```yaml
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          github:
+            client-id: ${GITHUB_CLIENT_ID}
+            client-secret: ${GITHUB_CLIENT_SECRET}
+            scope: read:user,user:email
+          google:
+            client-id: ${GOOGLE_CLIENT_ID}
+            client-secret: ${GOOGLE_CLIENT_SECRET}
+            scope: openid,profile,email
+```
+
+GitHub e Google são provedores conhecidos do Spring Security: os endereços de autorização, token e dados do usuário já vêm configurados, e você só informa as credenciais. Para outro provedor OIDC (Keycloak, Microsoft Entra ID), basta acrescentar `provider.<nome>.issuer-uri` e o resto é descoberto.
+
+## Configurando o oauth2Login
+
+O portal mantém o login com senha e ganha os botões sociais:
+
+```java
+@Bean
+SecurityFilterChain web(HttpSecurity http,
+                        OAuth2UserService<OAuth2UserRequest, OAuth2User> githubUsers,
+                        OAuth2UserService<OidcUserRequest, OidcUser> googleUsers,
+                        SegundoFatorSuccessHandler segundoFator) throws Exception {
+    return http
+            .authorizeHttpRequests(req -> req
+                    .requestMatchers("/css/**", "/login", "/error").permitAll()
+                    .requestMatchers("/2fa").hasAuthority("FATOR_PENDENTE")
+                    .anyRequest().hasRole("USUARIO"))
+            .formLogin(form -> form
+                    .loginPage("/login")
+                    .successHandler(segundoFator))
+            .oauth2Login(oauth -> oauth
+                    .loginPage("/login")
+                    .userInfoEndpoint(u -> u
+                            .userService(githubUsers)
+                            .oidcUserService(googleUsers))
+                    .successHandler(segundoFator))
+            .logout(logout -> logout.logoutSuccessUrl("/login?saiu"))
+            .build();
+}
+```
+
+```html
+<a th:href="@{/oauth2/authorization/github}">Entrar com GitHub</a>
+<a th:href="@{/oauth2/authorization/google}">Entrar com Google</a>
+```
+
+Repare em duas coisas. Toda área do sistema exige `ROLE_USUARIO` em vez de só `authenticated()`; isso vai importar para o 2FA. E o mesmo `successHandler` cuida do login com senha e do login social, então a regra de segundo fator vale para os dois.
+
+## Vinculando a conta externa ao usuário local
+
+Por padrão, o usuário logado pelo Google é um `OidcUser` com authorities como `OIDC_USER` e `SCOPE_email`. Ele não tem os perfis da clínica, e a aplicação não tem registro dele. O caminho é interceptar o carregamento do usuário, encontrar ou criar o usuário local e devolver um principal com as roles certas.
+
+A tabela de vínculos guarda o provedor e o identificador estável da conta externa:
+
+```sql
+CREATE TABLE contas_externas (
+    id          BIGSERIAL PRIMARY KEY,
+    usuario_id  BIGINT       NOT NULL REFERENCES usuarios(id),
+    provedor    VARCHAR(20)  NOT NULL,
+    id_externo  VARCHAR(100) NOT NULL,
+    UNIQUE (provedor, id_externo)
+);
+```
+
+```java
+@Configuration
+public class OAuth2UsuariosConfig {
+
+    @Bean
+    OAuth2UserService<OAuth2UserRequest, OAuth2User> githubUsers(ContasService contas) {
+        var padrao = new DefaultOAuth2UserService();
+        return request -> {
+            OAuth2User github = padrao.loadUser(request);
+            String id = String.valueOf(github.getAttributes().get("id"));
+            String nome = github.getAttribute("name");
+            var usuario = contas.vincularOuCriar("github", id, null, nome);
+            return new DefaultOAuth2User(usuario.authorities(), github.getAttributes(), "id");
+        };
+    }
+
+    @Bean
+    OAuth2UserService<OidcUserRequest, OidcUser> googleUsers(ContasService contas) {
+        var padrao = new OidcUserService();
+        return request -> {
+            OidcUser google = padrao.loadUser(request);
+            String emailVerificado = Boolean.TRUE.equals(google.getEmailVerified()) ? google.getEmail() : null;
+            var usuario = contas.vincularOuCriar("google", google.getSubject(), emailVerificado, google.getFullName());
+            return new DefaultOidcUser(usuario.authorities(), google.getIdToken(), google.getUserInfo());
+        };
+    }
+}
+```
+
+```java
+@Service
+public class ContasService {
+
+    private final ContaExternaRepository vinculos;
+    private final UsuarioRepository usuarios;
+
+    public ContasService(ContaExternaRepository vinculos, UsuarioRepository usuarios) {
+        this.vinculos = vinculos;
+        this.usuarios = usuarios;
+    }
+
+    @Transactional
+    public Usuario vincularOuCriar(String provedor, String idExterno, String emailVerificado, String nome) {
+        return vinculos.findByProvedorAndIdExterno(provedor, idExterno)
+                .map(ContaExterna::getUsuario)
+                .orElseGet(() -> {
+                    var usuario = Optional.ofNullable(emailVerificado)
+                            .flatMap(usuarios::findByEmailIgnoreCase)
+                            .orElseGet(() -> usuarios.save(Usuario.novoPaciente(emailVerificado, nome)));
+                    vinculos.save(new ContaExterna(usuario, provedor, idExterno));
+                    return usuario;
+                });
+    }
+
+    public Usuario localDe(Authentication auth) {
+        return switch (auth) {
+            case OAuth2AuthenticationToken t -> vinculos
+                    .findByProvedorAndIdExterno(t.getAuthorizedClientRegistrationId(), t.getName())
+                    .map(ContaExterna::getUsuario)
+                    .orElseThrow();
+            default -> usuarios.findByEmailIgnoreCase(auth.getName()).orElseThrow();
+        };
+    }
+}
+```
+
+O identificador estável é o `sub` do Google e o `id` numérico do GitHub. Nunca use o e-mail ou o login do GitHub como chave: e-mails mudam, logins do GitHub podem ser trocados e reaproveitados por outra pessoa. O `t.getName()` funciona em `localDe` porque os dois principais foram montados com esses identificadores como nome (o atributo `"id"` no GitHub e o `sub`, padrão do `DefaultOidcUser`, no Google). O método `usuario.authorities()` monta as roles a partir dos perfis, sempre incluindo `ROLE_USUARIO`.
+
+Contas novas entram como paciente. Ninguém vira médico ou recepcionista por logar com o Google: perfis com acesso a dados clínicos são atribuídos por um administrador.
+
+<Callout type="warning" title="Vincular contas pelo e-mail sem verificar">
+Juntar a conta externa a um usuário existente só porque o e-mail bate é a receita do sequestro de conta. Vários provedores deixam o usuário declarar um e-mail que ele não controla. Se a aplicação confia nesse e-mail, um atacante cria uma conta no provedor com o e-mail da administradora da clínica, loga e herda os perfis dela. Só vincule automaticamente quando o provedor afirma que o e-mail foi verificado (a claim `email_verified` do OIDC), como no código acima. No GitHub, que não manda essa claim no perfil, o código não vincula por e-mail: a conta nova nasce separada, e o usuário vincula pela tela de perfil, já logado com a senha.
+</Callout>
+
+## TOTP: como o código de seis dígitos funciona
+
+O TOTP (Time-based One-Time Password, RFC 6238) usa um segredo compartilhado entre o servidor e o aplicativo autenticador (Google Authenticator, Microsoft Authenticator, 1Password, Aegis). A cada 30 segundos, os dois calculam o mesmo código:
+
+1. Conte quantos períodos de 30 segundos se passaram desde 1970: `contador = segundos_unix / 30`.
+2. Calcule `HMAC-SHA1(segredo, contador)`, com o contador em 8 bytes big-endian.
+3. Use os 4 bits finais do hash como deslocamento, pegue 4 bytes a partir dali e zere o bit mais alto.
+4. O código é esse número módulo `1.000.000`, com zeros à esquerda.
+
+Não é preciso biblioteca para isso; o JDK tem HMAC e o Apache Commons Codec tem Base32 (o formato em que o segredo vai para o aplicativo):
+
+```java
+@Service
+public class TotpService {
+
+    private static final long PASSO_SEGUNDOS = 30;
+    private static final String EMISSOR = "Clinica";
+    private final SecureRandom random = new SecureRandom();
+    private final Base32 base32 = new Base32();
+
+    public String novoSegredo() {
+        var bytes = new byte[20]; // 160 bits, o tamanho recomendado para SHA-1
+        random.nextBytes(bytes);
+        return base32.encodeToString(bytes).replace("=", "");
+    }
+
+    public String uriParaQrCode(String segredo, String conta) {
+        var rotulo = URLEncoder.encode(EMISSOR + ":" + conta, StandardCharsets.UTF_8);
+        return "otpauth://totp/%s?secret=%s&issuer=%s&digits=6&period=30"
+                .formatted(rotulo, segredo, URLEncoder.encode(EMISSOR, StandardCharsets.UTF_8));
+    }
+
+    public OptionalLong validar(String segredo, String codigo, Instant agora) {
+        if (codigo == null || !codigo.matches("\\d{6}")) return OptionalLong.empty();
+        var chave = base32.decode(segredo);
+        long passoAtual = agora.getEpochSecond() / PASSO_SEGUNDOS;
+        for (long passo = passoAtual - 1; passo <= passoAtual + 1; passo++) {
+            var esperado = gerar(chave, passo).getBytes(StandardCharsets.US_ASCII);
+            if (MessageDigest.isEqual(esperado, codigo.getBytes(StandardCharsets.US_ASCII))) {
+                return OptionalLong.of(passo);
+            }
+        }
+        return OptionalLong.empty();
+    }
+
+    String gerar(byte[] chave, long contador) {
+        try {
+            var mac = Mac.getInstance("HmacSHA1");
+            mac.init(new SecretKeySpec(chave, "HmacSHA1"));
+            var hash = mac.doFinal(ByteBuffer.allocate(8).putLong(contador).array());
+            int desloc = hash[hash.length - 1] & 0x0f;
+            int binario = ((hash[desloc] & 0x7f) << 24)
+                    | ((hash[desloc + 1] & 0xff) << 16)
+                    | ((hash[desloc + 2] & 0xff) << 8)
+                    | (hash[desloc + 3] & 0xff);
+            return "%06d".formatted(binario % 1_000_000);
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+```
+
+Detalhes que importam: a janela de um passo para trás e um para frente tolera relógios levemente fora de sincronia; `MessageDigest.isEqual` compara em tempo constante; e `validar` devolve o passo usado para você guardar e **recusar o mesmo código duas vezes** (proteção contra replay de quem viu o código por cima do ombro).
+
+Teste com o vetor oficial da RFC 6238, que usa o segredo ASCII `12345678901234567890`:
+
+```java
+@Test
+void bateComVetorDaRfc6238() {
+    var chave = "12345678901234567890".getBytes(StandardCharsets.US_ASCII);
+    // RFC: T = 59s, código de 8 dígitos 94287082; com 6 dígitos, 287082
+    assertThat(new TotpService().gerar(chave, 59 / 30)).isEqualTo("287082");
+}
+```
+
+### Ativando o 2FA
+
+A ativação tem de provar que o usuário configurou o aplicativo antes de ligar a exigência, senão ele se tranca fora:
+
+```java
+@PostMapping("/perfil/2fa/iniciar")
+public String iniciar(Authentication auth, Model model, HttpSession sessao) {
+    var segredo = totp.novoSegredo();
+    sessao.setAttribute("segredoEmConfiguracao", segredo);
+    model.addAttribute("otpauth", totp.uriParaQrCode(segredo, contas.localDe(auth).getEmail()));
+    return "perfil/2fa-qrcode"; // a página desenha o QR code a partir da URI
+}
+
+@PostMapping("/perfil/2fa/confirmar")
+public String confirmar(@RequestParam String codigo, Authentication auth, HttpSession sessao) {
+    var segredo = (String) sessao.getAttribute("segredoEmConfiguracao");
+    if (segredo == null || totp.validar(segredo, codigo, Instant.now()).isEmpty()) {
+        return "redirect:/perfil/2fa?erro";
+    }
+    contas.ativarTotp(contas.localDe(auth), segredo); // grava cifrado e gera códigos de recuperação
+    sessao.removeAttribute("segredoEmConfiguracao");
+    return "redirect:/perfil/2fa?ativado";
+}
+```
+
+Guarde o segredo **cifrado** (AES-GCM com chave fora do banco), não com hash: o servidor precisa lê-lo de volta para calcular o código. E gere de 8 a 10 **códigos de recuperação** de uso único, guardados com hash como senhas, para quem perder o celular.
+
+## Encaixando o segundo fator no Spring Security
+
+A ideia: depois que a senha (ou o Google) confere, o usuário ainda não está totalmente autenticado. Ele recebe uma autenticação parcial, com uma única authority `FATOR_PENDENTE`, que só abre a página `/2fa`. Como o resto do sistema exige `ROLE_USUARIO`, nada mais funciona até o código ser validado. A autenticação completa fica guardada na sessão, esperando.
+
+```java
+@Component
+public class SegundoFatorSuccessHandler implements AuthenticationSuccessHandler {
+
+    static final String AUTH_PENDENTE = "auth.pendente";
+    static final String USUARIO_PENDENTE = "auth.usuarioPendente";
+
+    private final AuthenticationSuccessHandler padrao = new SavedRequestAwareAuthenticationSuccessHandler();
+    private final SecurityContextRepository repositorio = new HttpSessionSecurityContextRepository();
+    private final ContasService contas;
+
+    public SegundoFatorSuccessHandler(ContasService contas) {
+        this.contas = contas;
+    }
+
+    @Override
+    public void onAuthenticationSuccess(HttpServletRequest req, HttpServletResponse res, Authentication auth)
+            throws IOException, ServletException {
+        var usuario = contas.localDe(auth);
+        if (!usuario.isTotpAtivo()) {
+            padrao.onAuthenticationSuccess(req, res, auth);
+            return;
+        }
+        var sessao = req.getSession();
+        sessao.setAttribute(AUTH_PENDENTE, auth);
+        sessao.setAttribute(USUARIO_PENDENTE, usuario.getId());
+
+        var parcial = UsernamePasswordAuthenticationToken.authenticated(
+                auth.getName(), null, List.of(new SimpleGrantedAuthority("FATOR_PENDENTE")));
+        var contexto = SecurityContextHolder.createEmptyContext();
+        contexto.setAuthentication(parcial);
+        SecurityContextHolder.setContext(contexto);
+        repositorio.saveContext(contexto, req, res);
+        res.sendRedirect(req.getContextPath() + "/2fa");
+    }
+}
+```
+
+No Spring Security 6, alterar o `SecurityContextHolder` não grava mais nada na sessão sozinho. Por isso a chamada explícita a `saveContext`: sem ela, a troca valeria só para esta requisição.
+
+```java
+@Controller
+public class SegundoFatorController {
+
+    private final SecurityContextRepository repositorio = new HttpSessionSecurityContextRepository();
+    private final TotpService totp;
+    private final ContasService contas;
+
+    public SegundoFatorController(TotpService totp, ContasService contas) {
+        this.totp = totp;
+        this.contas = contas;
+    }
+
+    @GetMapping("/2fa")
+    public String pagina() {
+        return "2fa";
+    }
+
+    @PostMapping("/2fa")
+    public String verificar(@RequestParam String codigo, HttpServletRequest req, HttpServletResponse res) {
+        var sessao = req.getSession();
+        var original = (Authentication) sessao.getAttribute(SegundoFatorSuccessHandler.AUTH_PENDENTE);
+        var usuarioId = (Long) sessao.getAttribute(SegundoFatorSuccessHandler.USUARIO_PENDENTE);
+        if (original == null) return "redirect:/login";
+
+        if (!contas.registrarTentativa2fa(usuarioId)) { // no máximo 5 tentativas
+            sessao.invalidate();
+            return "redirect:/login?bloqueado";
+        }
+        var usuario = contas.porId(usuarioId);
+        var passo = totp.validar(contas.segredoTotp(usuario), codigo, Instant.now());
+        if (passo.isEmpty() || !contas.consumirPasso(usuario, passo.getAsLong())) {
+            return "redirect:/2fa?erro";
+        }
+
+        sessao.removeAttribute(SegundoFatorSuccessHandler.AUTH_PENDENTE);
+        sessao.removeAttribute(SegundoFatorSuccessHandler.USUARIO_PENDENTE);
+        req.changeSessionId(); // novo ID agora que a autenticação está completa
+        var contexto = SecurityContextHolder.createEmptyContext();
+        contexto.setAuthentication(original);
+        SecurityContextHolder.setContext(contexto);
+        repositorio.saveContext(contexto, req, res);
+        return "redirect:/agenda";
+    }
+}
+```
+
+O `consumirPasso` grava o último passo aceito e recusa passos iguais ou anteriores, impedindo o reuso do código. O limite de tentativas é indispensável: com um milhão de códigos possíveis e três aceitos por janela, um robô sem limite acerta em poucas horas.
+
+Uma decisão de produto: exigir o 2FA local também no login pelo Google? Quem loga pelo Google já passou pelo 2FA do Google, se o usuário o ativou, mas a clínica não controla isso. Para perfis com acesso a prontuário, exigir o fator local sempre é a escolha prudente; para pacientes, confiar no provedor reduz atrito. O handler acima aplica a mesma regra aos dois caminhos, e mudar isso é um `if` no `localDe`.
+
+As versões mais novas do Spring Security (a linha 7) trazem suporte nativo a autenticação multifator, que registra quais fatores cada usuário já cumpriu e exige os que faltam. O mecanismo que você montou aqui é o mesmo conceito por dentro, e entender a autenticação parcial ajuda a configurar qualquer uma das duas formas.
+
+## Na entrevista
+
+**Qual a diferença entre OAuth2 e OpenID Connect?** OAuth2 delega autorização: a aplicação recebe um access token para chamar APIs em nome do usuário. OIDC acrescenta autenticação, com um ID token JWT que identifica o usuário de forma padronizada e verificável.
+
+**Para que serve o parâmetro `state` no fluxo authorization code?** Para amarrar o retorno do provedor à requisição que a aplicação iniciou, impedindo que um atacante injete um `code` dele no navegador da vítima (CSRF no login). O PKCE complementa, garantindo que só quem iniciou o fluxo consegue trocar o código.
+
+**Como funciona o TOTP?** Servidor e aplicativo compartilham um segredo. Os dois calculam um HMAC do número de intervalos de 30 segundos desde 1970 e reduzem o resultado a 6 dígitos. Se os códigos batem, o usuário prova que tem o dispositivo com o segredo.
+
+**Por que guardar o segredo TOTP cifrado e não com hash?** Porque o servidor precisa do segredo original para calcular o código esperado. Hash é de mão única; cifra permite ler de volta com a chave, que fica fora do banco.
+
+## Pratique
+
+No portal da clínica, entregue:
+
+1. Login com GitHub e Google funcionando ao lado do login por senha, com credenciais lidas de variáveis de ambiente.
+2. Tabela `contas_externas`, vínculo pelo identificador estável e vínculo por e-mail só quando verificado. Contas novas nascem como paciente.
+3. Tela de ativação do 2FA com QR code, confirmação por código e 10 códigos de recuperação exibidos uma única vez.
+4. Fluxo de login em duas etapas com autenticação parcial `FATOR_PENDENTE`, limite de 5 tentativas e recusa de código repetido.
+5. Testes: vetor da RFC 6238, código fora da janela recusado, usuário com 2FA pendente recebendo 403 em `/agenda`, e acesso liberado após o código certo.
+
+<Quiz question="Qual campo deve ser usado como chave para vincular uma conta do Google ao usuário local?" options={["O e-mail","O nome completo","A claim sub do ID token","A foto de perfil"]} answer={2} explanation="O sub é o identificador estável e único da conta no provedor. E-mails podem mudar ou ser reatribuídos, então servem no máximo para vincular quando verificados." />
+
+<Quiz question="Por que o handler chama securityContextRepository.saveContext depois de trocar a autenticação?" options={["Para gerar o código TOTP","Porque no Spring Security 6 a sessão não é atualizada automaticamente","Para invalidar a sessão antiga","Porque o SecurityContextHolder é imutável"]} answer={1} explanation="Desde o Spring Security 6, mudanças no SecurityContextHolder não são persistidas sozinhas. Sem salvar no repositório, a próxima requisição carregaria o contexto antigo da sessão." />
+
+<Quiz question="O que impede um atacante de testar todos os códigos TOTP possíveis?" options={["O código ter 6 dígitos","Limite de tentativas por login","O HMAC-SHA1","A janela de 30 segundos sozinha"]} answer={1} explanation="Um milhão de combinações é pouco para um robô. A janela curta e o algoritmo não bastam; o limite de tentativas, com bloqueio ou atraso, é o que torna a força bruta inviável." />
+
+## Base no CodeForge
+
+- [Java e Spring Security: Proteja suas aplicações web](/learn/carreira-java/java-spring-security-proteja-aplicacoes-web): o portal com sessão e login por formulário que este capítulo estende.
+- [OAuth 2.0](/learn/system-design/oauth2) e [SSO](/learn/system-design/sso): os protocolos em visão de arquitetura.
+- [Node.js: Autenticação com Passport e OAuth 2.0](/learn/carreira-nodejs/nodejs-autenticacao-passport-oauth-20): o mesmo fluxo em Node.js, bom para comparar.
+- [Autenticação de usuários](/learn/projetos-portfolio/autenticacao-de-usuarios): ideias para transformar isso num projeto de portfólio.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): onde guardar client secrets e a chave que cifra os segredos TOTP.
+
+## Referências
+
+- [Spring Security: OAuth 2.0 Login](https://docs.spring.io/spring-security/reference/servlet/oauth2/login/core.html)
+- [GitHub: Creating an OAuth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+- [RFC 6238: TOTP](https://datatracker.ietf.org/doc/html/rfc6238)
+- [Spring Security: Multi-Factor Authentication](https://docs.spring.io/spring-security/reference/servlet/authentication/mfa.html)

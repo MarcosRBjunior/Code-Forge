@@ -1,0 +1,331 @@
+---
+title: "Integração Contínua: Automatize o deploy no Amazon ECS"
+kind: lesson
+---
+
+No deploy em EC2, quem troca a versão, espera a aplicação subir e volta atrás é um conjunto de scripts seus. No Amazon ECS, o orquestrador já faz isso: você registra uma nova revisão da task definition apontando para a imagem nova, e o service substitui as tasks aos poucos, conferindo a saúde pelo balanceador. O pipeline fica curto, mas uma aplicação Spring Boot traz armadilhas próprias: boot lento que o health check confunde com falha, memória da JVM mal dimensionada no Fargate e migrações do Flyway rodando enquanto a versão antiga ainda atende. Neste capítulo você monta o deploy contínuo da API de pedidos no ECS Fargate e resolve cada uma delas.
+
+**Você vai aprender:**
+
+- Gerar e publicar a imagem no ECR com o Jib, sem Dockerfile e sem Docker no build
+- Escrever uma task definition ajustada para a JVM no Fargate
+- Configurar health check, período de carência e circuit breaker para o boot do Spring
+- Montar o workflow com as actions oficiais da AWS e promoção entre ambientes
+- Rodar migrações do Flyway sem quebrar a versão que ainda está no ar
+
+## O que é um deploy no ECS
+
+Três objetos importam:
+
+- **Task definition**: a receita versionada de uma task (imagem, CPU, memória, variáveis, segredos, logs). Cada alteração gera uma nova revisão: `api-pedidos:41`, `api-pedidos:42`.
+- **Service**: mantém N tasks de uma revisão rodando, registradas num target group do ALB.
+- **Deployment**: a troca de uma revisão por outra dentro do service, por padrão em rolling update.
+
+Fazer deploy, portanto, é: publicar a imagem, registrar uma revisão da task definition com essa imagem e mandar o service usá-la. As actions oficiais `amazon-ecs-render-task-definition` e `amazon-ecs-deploy-task-definition` fazem os dois últimos passos e esperam o service estabilizar.
+
+## A imagem com Jib
+
+O Jib é um plugin do Maven (e do Gradle) que constrói imagens OCI direto das classes compiladas, sem Dockerfile e sem daemon Docker. Ele separa a aplicação em camadas (dependências, recursos, classes), e como as dependências mudam pouco, um deploy comum só envia a camada de classes, de algumas centenas de KB.
+
+```xml
+<plugin>
+  <groupId>com.google.cloud.tools</groupId>
+  <artifactId>jib-maven-plugin</artifactId>
+  <version>3.4.4</version>
+  <configuration>
+    <from>
+      <image>eclipse-temurin:21-jre</image>
+    </from>
+    <container>
+      <ports>
+        <port>8080</port>
+      </ports>
+      <user>1000:1000</user>
+    </container>
+  </configuration>
+</plugin>
+```
+
+```bash
+# publica direto no registro; o destino vem por propriedade
+./mvnw -B compile jib:build -Dimage=123456789012.dkr.ecr.us-east-1.amazonaws.com/api-pedidos:8d1f3c0
+```
+
+O Jib monta o `ENTRYPOINT` na forma exec (`java -cp ... com.minhaloja.pedidos.PedidosApplication`), então a JVM recebe o SIGTERM do ECS diretamente e o graceful shutdown do Spring funciona. Para autenticar no ECR, ele lê as credenciais do `~/.docker/config.json`, que a action `amazon-ecr-login` preenche. Não é preciso ter Docker rodando, só o arquivo de credenciais.
+
+Se o projeto já tem um Dockerfile multi-stage (como no capítulo de Docker desta carreira), ele continua válido: troque o passo do Jib por `docker/build-push-action`. O que importa para o resto do capítulo é que a imagem fique no ECR com o SHA do commit como tag.
+
+## A task definition para a JVM
+
+Versione a task definition no repositório da aplicação, um arquivo por ambiente. Assim, quem muda memória ou adiciona uma variável faz isso por pull request, junto com o código que precisa dela, e o pipeline é o único dono das revisões. (A alternativa, com o Terraform dono da primeira revisão e o pipeline só trocando a imagem, está no capítulo de ECS da carreira Node.js.)
+
+```json
+{
+  "family": "api-pedidos-production",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/api-pedidos-execucao",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/api-pedidos-task",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "definida-pelo-pipeline",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8080, "protocol": "tcp" }],
+      "environment": [
+        { "name": "SPRING_PROFILES_ACTIVE", "value": "prod" },
+        { "name": "JAVA_TOOL_OPTIONS", "value": "-XX:MaxRAMPercentage=75.0" },
+        { "name": "SPRING_DATASOURCE_URL", "value": "jdbc:postgresql://pedidos.xxxx.us-east-1.rds.amazonaws.com:5432/pedidos" }
+      ],
+      "secrets": [
+        {
+          "name": "SPRING_DATASOURCE_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:pedidos/db-AbCdEf:password::"
+        }
+      ],
+      "stopTimeout": 40,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/api-pedidos",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "api"
+        }
+      }
+    }
+  ]
+}
+```
+
+Decisões que vêm da JVM:
+
+- **`MaxRAMPercentage=75.0`**: sem ele, a JVM usa só 25% da memória da task para o heap. Os 25% restantes ficam para metaspace, threads, code cache e buffers diretos. Passar do limite da task mata o contêiner com `OutOfMemoryError: Container killed due to memory usage`, e esse erro aparece no evento da task, não no log da aplicação.
+- **Pelo menos 2 vCPUs e 2 GB**: abaixo disso, a ergonomia da JVM considera a máquina "cliente" e escolhe o Serial GC, que para tudo a cada coleta. Se precisar de uma task de 1 vCPU, force `-XX:+UseG1GC` no `JAVA_TOOL_OPTIONS`. Mais CPU também encurta o boot, porque o JIT e o Spring usam vários núcleos para subir.
+- **`stopTimeout: 40`**: o ECS manda SIGTERM e espera esse tempo antes do SIGKILL (o padrão é 30 segundos). Deixe acima do `spring.lifecycle.timeout-per-shutdown-phase` para o graceful shutdown terminar as requisições em andamento.
+- **`secrets`**: a senha vem do Secrets Manager no momento em que a task sobe, pela execution role. Ela nunca aparece no repositório nem no console do ECS.
+
+## Health check, carência e circuit breaker
+
+O ALB decide se uma task está saudável pelo health check do target group. Aponte-o para a readiness do Actuator, que só responde 200 quando o contexto do Spring subiu e o banco responde:
+
+```bash
+aws elbv2 modify-target-group --target-group-arn "$TG_ARN" \
+  --health-check-path /actuator/health/readiness \
+  --health-check-interval-seconds 10 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3
+
+# o padrão de 300s de espera para tirar uma task do ALB é longo demais para uma API
+aws elbv2 modify-target-group-attributes --target-group-arn "$TG_ARN" \
+  --attributes Key=deregistration_delay.timeout_seconds,Value=30
+```
+
+No service, três configurações trabalham juntas:
+
+```bash
+aws ecs update-service --cluster loja --service api-pedidos \
+  --health-check-grace-period-seconds 120 \
+  --deployment-configuration "minimumHealthyPercent=100,maximumPercent=200,deploymentCircuitBreaker={enable=true,rollback=true}"
+```
+
+- **`minimumHealthyPercent=100` e `maximumPercent=200`**: o ECS sobe as tasks novas antes de derrubar as antigas. A capacidade nunca cai durante o deploy.
+- **Período de carência de 120 segundos**: durante esse tempo, falhas do health check do ALB não matam a task. É o equivalente da startup probe do Kubernetes.
+- **Circuit breaker com rollback**: se as tasks novas falham repetidamente em ficar saudáveis, o ECS para o deploy e volta o service para a última revisão que funcionou.
+
+<Callout type="warning" title="Deploy que entra em loop por causa do boot lento">
+Sem período de carência, o ALB começa a checar a task assim que ela é registrada. Uma API Spring que leva 45 segundos para subir falha três health checks seguidos, o ECS a considera doente, mata e sobe outra, que também leva 45 segundos. O deploy fica girando até o circuit breaker desistir e reverter, e a versão nova, que estava correta, nunca entra. Se o deploy no ECS demora e termina em rollback sem nenhum erro no log da aplicação, confira primeiro o `healthCheckGracePeriodSeconds` contra o tempo real de boot (a linha `Started PedidosApplication in ... seconds` no log).
+</Callout>
+
+## A role de deploy
+
+A role que o GitHub assume por OIDC precisa de três grupos de permissão: enviar imagem ao ECR (`ecr:GetAuthorizationToken`, `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage`, `ecr:BatchGetImage`), registrar a task definition e atualizar o service (`ecs:RegisterTaskDefinition`, `ecs:DescribeTaskDefinition`, `ecs:UpdateService`, `ecs:DescribeServices`) e `iam:PassRole` sobre a execution role e a task role, restrito a `ecs-tasks.amazonaws.com`. O Jib precisa também de `ecr:BatchGetImage` porque confere quais camadas já existem no registro antes de enviar.
+
+## O workflow
+
+```yaml
+# .github/workflows/deploy-ecs.yml
+name: Deploy ECS
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ROLE_ARN: arn:aws:iam::123456789012:role/github-deploy-api-pedidos
+
+jobs:
+  imagem:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      imagem: ${{ steps.publicar.outputs.imagem }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Testes
+        run: ./mvnw -B -ntp verify
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: publicar
+        name: Imagem com Jib
+        env:
+          IMAGEM: ${{ steps.ecr.outputs.registry }}/api-pedidos:${{ github.sha }}
+        run: |
+          ./mvnw -B -ntp -DskipTests compile jib:build -Dimage="$IMAGEM"
+          echo "imagem=$IMAGEM" >> "$GITHUB_OUTPUT"
+
+  staging:
+    needs: imagem
+    uses: ./.github/workflows/deploy-ecs-ambiente.yml
+    with:
+      ambiente: staging
+      imagem: ${{ needs.imagem.outputs.imagem }}
+
+  production:
+    needs: [imagem, staging]
+    uses: ./.github/workflows/deploy-ecs-ambiente.yml
+    with:
+      ambiente: production
+      imagem: ${{ needs.imagem.outputs.imagem }}
+```
+
+```yaml
+# .github/workflows/deploy-ecs-ambiente.yml
+name: Deploy ECS em um ambiente
+
+on:
+  workflow_call:
+    inputs:
+      ambiente:
+        type: string
+        required: true
+      imagem:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.ambiente }}
+    concurrency:
+      group: ecs-${{ inputs.ambiente }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy-api-pedidos
+          aws-region: us-east-1
+
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs/${{ inputs.ambiente }}.json
+          container-name: api
+          image: ${{ inputs.imagem }}
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: loja-${{ inputs.ambiente }}
+          service: api-pedidos
+          wait-for-service-stability: true
+```
+
+Pontos que valem atenção:
+
+- **`-DskipTests` no Jib** não pula teste nenhum de verdade: o `verify` do passo anterior já rodou tudo. O `compile` antes de `jib:build` garante que as classes existem, já que o Jib não roda o `package`.
+- **A mesma imagem** (mesmo SHA, mesmo digest) vai para staging e produção. Só a task definition de cada ambiente muda.
+- **`wait-for-service-stability: true`** faz o job esperar até as tasks novas estarem saudáveis e as antigas drenadas. Se o circuit breaker reverter, o job falha, e produção nem chega a ser tentada.
+- **O environment `production`** com *Required reviewers* pausa o job antes do deploy. Remover a regra transforma entrega contínua em implantação contínua.
+
+## Migrações do Flyway durante o rolling update
+
+O caminho mais simples com Spring Boot é deixar o Flyway rodar na inicialização (`spring.flyway.enabled=true`, o padrão quando a dependência está no classpath). Quando várias tasks sobem ao mesmo tempo, o Flyway usa um lock no banco (no Postgres, um advisory lock), e só uma aplica as migrações; as outras esperam e encontram o schema pronto.
+
+O que o lock não resolve é a convivência. Com `minimumHealthyPercent=100`, existe um intervalo em que as tasks antigas e as novas atendem juntas, e a versão antiga passa a rodar sobre o schema novo. Toda migração, portanto, precisa ser compatível com a versão anterior do código:
+
+```sql
+-- V12__adicionar_canal_venda.sql: seguro, a versão antiga ignora a coluna
+ALTER TABLE pedido ADD COLUMN canal_venda VARCHAR(20) NOT NULL DEFAULT 'SITE';
+
+-- inseguro no mesmo deploy: a versão antiga ainda faz SELECT nesta coluna
+-- ALTER TABLE pedido DROP COLUMN origem;
+```
+
+Renomear ou remover coluna exige dois ou três deploys (o padrão *expand and contract*), assunto do capítulo sobre [rollback e teste de carga](/learn/carreira-java/integracao-continua-rollback-teste-carga). Em sistemas com tabelas grandes, em que uma migração pode demorar minutos, mova o Flyway para um passo separado antes do deploy, para que o boot da aplicação não dependa do tempo da migração.
+
+## Acompanhando e revertendo
+
+Quando um deploy falha no meio, olhe nesta ordem: os eventos do service (`aws ecs describe-services --cluster loja-production --services api-pedidos --query "services[0].events[:10]"`), o motivo de parada das tasks (`stoppedReason`: falha de health check, OOM, segredo inacessível) e só então os logs da aplicação no CloudWatch.
+
+Para voltar manualmente a uma versão anterior, aponte o service para a revisão que funcionava:
+
+```bash
+aws ecs update-service --cluster loja-production --service api-pedidos \
+  --task-definition api-pedidos-production:41
+```
+
+Como cada revisão guarda a imagem com o SHA, essa revisão roda exatamente o código de antes.
+
+## Na entrevista
+
+**Como funciona um deploy sem downtime no ECS?** O service sobe tasks com a revisão nova, espera o ALB considerá-las saudáveis e só então drena e para as antigas. Com `minimumHealthyPercent=100`, a capacidade nunca cai.
+
+**Para que serve o health check grace period?** Para dar tempo à aplicação de subir antes de o health check do balanceador contar. Em aplicações Java, sem ele, o boot lento é confundido com falha e o deploy entra em loop.
+
+**Por que usar Jib em vez de Dockerfile?** Build reprodutível, camadas separadas por frequência de mudança (dependências, recursos, classes) sem configurar nada, e não precisa de daemon Docker no build. A desvantagem é menos controle sobre a imagem final.
+
+**O que acontece com uma task Fargate de 1 vCPU rodando Java sem flags?** A JVM escolhe o Serial GC e usa 25% da memória para heap. As duas escolhas costumam ser ruins para uma API.
+
+## Pratique
+
+Leve a API de pedidos para o ECS Fargate e entregue:
+
+1. O `jib-maven-plugin` configurado no `pom.xml`, com usuário não root.
+2. `ecs/staging.json` e `ecs/production.json` com `MaxRAMPercentage`, segredo do banco no Secrets Manager e `stopTimeout`.
+3. O target group apontando para `/actuator/health/readiness`, e o service com período de carência e circuit breaker com rollback.
+4. Os dois workflows, com produção exigindo aprovação.
+5. Um teste do circuit breaker: publique uma versão com `SPRING_DATASOURCE_URL` errada no arquivo de staging e mostre o deploy sendo revertido e o job falhando antes de produção.
+
+<Quiz question="Uma API Spring leva 50 segundos para subir e o deploy no ECS fica trocando tasks até reverter. Qual ajuste resolve?" options={["Aumentar o maximumPercent para 300","Configurar o health check grace period acima do tempo de boot","Desligar o circuit breaker","Trocar o health check para a porta TCP"]} answer={1} explanation="Sem carência, o ALB conta falhas antes de a aplicação terminar de subir e o ECS mata tasks saudáveis. A carência faz o ECS ignorar essas falhas no início." />
+
+<Quiz question="Por que uma migração que remove uma coluna é perigosa num rolling update no ECS?" options={["O Flyway não consegue remover colunas no Postgres","Tasks antigas continuam atendendo e ainda leem a coluna removida","O ECS bloqueia deploys com migrações","A remoção só é aplicada depois do deploy"]} answer={1} explanation="Durante o rolling update, versões antiga e nova convivem. A antiga ainda usa a coluna e passa a falhar. Por isso a remoção fica para um deploy posterior." />
+
+<Quiz question="Como o Jib se autentica no ECR dentro do GitHub Actions?" options={["Lendo as credenciais do ~/.docker/config.json preenchido pela amazon-ecr-login","Pedindo usuário e senha no pom.xml","Usando o token do GitHub","Por um daemon Docker local obrigatório"]} answer={0} explanation="A action amazon-ecr-login grava as credenciais no arquivo de configuração do Docker, e o Jib usa esse arquivo, sem precisar do daemon." />
+
+## Base no CodeForge
+
+- [Integração Contínua: Pipeline de entrega e implementação contínua na EC2](/learn/carreira-java/integracao-continua-pipeline-entrega-implementacao-continua-ec2): OIDC, environments e o deploy rolling feito por você.
+- [Integração Contínua: Automatize o deploy no Amazon ECS (Node.js)](/learn/carreira-nodejs/integracao-continua-automatize-deploy-amazon-ecs): o mesmo fluxo com o Terraform dono da task definition e migração em task avulsa.
+- [Docker na prática para back-end Java](/learn/carreira-java/docker-pratica-para-backend-java): a alternativa com Dockerfile multi-stage.
+- [Migrações de schema](/learn/system-design/migracoes-de-schema) e [Circuit breaker](/learn/system-design/circuit-breaker): a teoria por trás das migrações compatíveis e da parada automática.
+
+## Referências
+
+- [Jib Maven plugin](https://github.com/GoogleContainerTools/jib/tree/master/jib-maven-plugin)
+- [aws-actions/amazon-ecs-deploy-task-definition](https://github.com/aws-actions/amazon-ecs-deploy-task-definition)
+- [Amazon ECS deployment circuit breaker](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
+- [Spring Boot: Execute Flyway database migrations on startup](https://docs.spring.io/spring-boot/how-to/data-initialization.html#howto.data-initialization.migration-tool.flyway)

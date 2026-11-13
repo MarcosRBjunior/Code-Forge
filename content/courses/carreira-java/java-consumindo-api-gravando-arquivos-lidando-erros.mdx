@@ -1,0 +1,415 @@
+---
+title: "Java: Consumindo API, gravando arquivos e lidando com erros"
+kind: lesson
+---
+
+Nenhum back-end vive sozinho. A API da clínica precisa buscar o endereço do paciente pelo CEP, consultar um convênio, avisar um sistema de pagamentos, exportar a agenda para um arquivo que o financeiro abre no Excel. Cada uma dessas fronteiras pode falhar: a rede cai, o serviço responde 500, o JSON vem diferente do esperado, o disco enche. Este capítulo ensina a fazer as três coisas que aparecem em todo projeto (chamar uma API HTTP, ler e gravar arquivos, tratar erros) usando só a biblioteca padrão do Java 21 e o Jackson.
+
+**Você vai aprender:**
+
+- Fazer requisições com `java.net.http.HttpClient`, com timeout e checagem de status
+- Converter JSON em records e records em JSON com Jackson (e o equivalente no Gson)
+- Ler e gravar arquivos de texto, CSV e JSON com `java.nio.file`
+- Diferenciar exceções checadas e não checadas, usar try-with-resources e criar exceções do domínio
+- Decidir onde capturar um erro e onde deixá-lo subir
+
+## O cenário
+
+Ao cadastrar um paciente, a recepção digita só o CEP e o sistema completa o endereço usando o ViaCEP, um serviço público e gratuito. Faça o teste no terminal:
+
+```bash
+curl https://viacep.com.br/ws/01001000/json/
+```
+
+```json
+{
+  "cep": "01001-000",
+  "logradouro": "Praça da Sé",
+  "complemento": "lado ímpar",
+  "bairro": "Sé",
+  "localidade": "São Paulo",
+  "uf": "SP",
+  "ddd": "11"
+}
+```
+
+Dois comportamentos dessa API vão importar adiante: CEP com formato inválido (`123`) responde **400** com uma página HTML, e CEP bem formado mas inexistente (`99999999`) responde **200** com o corpo `{"erro": "true"}`. APIs reais são assim: o contrato tem cantos estranhos, e o seu código precisa tratar cada um.
+
+## Projeto Maven com Jackson
+
+O Java não tem leitor de JSON na biblioteca padrão. O Jackson é o padrão de mercado (é o que o Spring Boot usa por baixo). Adicione ao `pom.xml`:
+
+```xml
+<dependencies>
+  <dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+    <version>2.18.2</version>
+  </dependency>
+  <dependency>
+    <groupId>com.fasterxml.jackson.datatype</groupId>
+    <artifactId>jackson-datatype-jsr310</artifactId>
+    <version>2.18.2</version>
+  </dependency>
+</dependencies>
+```
+
+O segundo módulo ensina o Jackson a lidar com `LocalDate` e `LocalDateTime`.
+
+## Primeira requisição com HttpClient
+
+O `HttpClient` (Java 11+) faz HTTP/1.1 e HTTP/2, síncrono ou assíncrono. Crie **um** cliente e reutilize: ele mantém um pool de conexões, e criar um por requisição desperdiça conexões TCP e handshakes TLS.
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+
+public class TesteViaCep {
+    public static void main(String[] args) throws Exception {
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(3))
+                .build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("https://viacep.com.br/ws/01001000/json/"))
+                .timeout(Duration.ofSeconds(5))
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        System.out.println(response.statusCode()); // 200
+        System.out.println(response.body());
+    }
+}
+```
+
+Os três objetos têm papéis claros: `HttpClient` é a conexão reutilizável, `HttpRequest` descreve uma chamada (método, URL, cabeçalhos, timeout) e `HttpResponse` traz status, cabeçalhos e corpo. `BodyHandlers.ofString()` lê o corpo inteiro como texto.
+
+Há dois timeouts: o de conexão (no cliente) limita quanto tempo esperar para abrir o TCP; o da requisição limita quanto tempo esperar pela resposta. Sem eles, uma API travada segura a sua thread para sempre.
+
+<Callout type="warning" title="send não lança exceção para 404 ou 500">
+`client.send` só lança exceção quando não há resposta (sem rede, timeout, DNS falhou). Um 404 ou 500 é uma resposta HTTP válida e chega normalmente, com o corpo de erro. Se você não checar `statusCode()`, vai tentar converter uma página HTML de erro em JSON e receber uma exceção confusa do Jackson, longe da causa real. Sempre valide o status antes de ler o corpo.
+</Callout>
+
+## JSON para record com Jackson
+
+Modele só os campos que você usa:
+
+```java
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record Endereco(
+        String cep,
+        String logradouro,
+        String bairro,
+        @JsonProperty("localidade") String cidade,
+        String uf,
+        String erro) {
+}
+```
+
+- `@JsonIgnoreProperties(ignoreUnknown = true)` evita quebrar quando a API devolve campos que você não mapeou (`ibge`, `siafi`...). Sem isso, o Jackson lança `UnrecognizedPropertyException`, e qualquer campo novo na API derruba o seu sistema.
+- `@JsonProperty("localidade")` liga o nome do JSON a um nome melhor no Java.
+- Jackson entende records desde a versão 2.12.
+
+Convertendo:
+
+```java
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+ObjectMapper mapper = new ObjectMapper();
+Endereco endereco = mapper.readValue(response.body(), Endereco.class);
+System.out.println(endereco.cidade() + "/" + endereco.uf()); // São Paulo/SP
+```
+
+Assim como o `HttpClient`, o `ObjectMapper` é caro de criar e seguro entre threads depois de configurado: crie um e reutilize.
+
+### E o Gson?
+
+O Gson, do Google, é a alternativa mais leve. Funciona bem com records a partir da versão 2.10:
+
+```java
+Gson gson = new Gson();
+Endereco e = gson.fromJson(response.body(), Endereco.class);
+```
+
+Ele ignora campos desconhecidos por padrão e usa `@SerializedName` no lugar de `@JsonProperty`. Num projeto Spring, fique com o Jackson, que já vem configurado.
+
+## Exceções: o básico que você precisa
+
+Java separa exceções em dois grupos:
+
+| Tipo | Herda de | O compilador obriga a tratar? | Exemplos |
+|---|---|---|---|
+| Checada | `Exception` | Sim (`try/catch` ou `throws`) | `IOException`, `InterruptedException` |
+| Não checada | `RuntimeException` | Não | `IllegalArgumentException`, `NullPointerException` |
+
+A ideia original: checadas para falhas externas esperadas, das quais quem chama pode se recuperar (arquivo não existe, rede caiu); não checadas para erros de programação ou violação de regra. Na prática, frameworks modernos (Spring incluso) preferem não checadas, porque `throws` em cascata polui todas as assinaturas.
+
+### Exceções do domínio
+
+Em vez de deixar `IOException` e `JsonProcessingException` vazarem para o resto do sistema, traduza para exceções que falam a língua da clínica:
+
+```java
+public class CepNaoEncontradoException extends RuntimeException {
+    public CepNaoEncontradoException(String cep) {
+        super("CEP não encontrado: " + cep);
+    }
+}
+
+public class ServicoCepIndisponivelException extends RuntimeException {
+    public ServicoCepIndisponivelException(String mensagem, Throwable causa) {
+        super(mensagem, causa);
+    }
+}
+```
+
+O construtor com `Throwable causa` é essencial: ele preserva a exceção original no stack trace (aparece como "Caused by"). Quem perde a causa transforma um diagnóstico de cinco minutos numa investigação de uma tarde.
+
+## O cliente completo
+
+```java
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
+import java.time.Duration;
+
+public class ViaCepClient {
+    private final HttpClient http;
+    private final ObjectMapper mapper;
+
+    public ViaCepClient(HttpClient http, ObjectMapper mapper) {
+        this.http = http;
+        this.mapper = mapper;
+    }
+
+    public Endereco buscar(String cep) {
+        String digitos = cep.replaceAll("\\D", "");
+        if (digitos.length() != 8) {
+            throw new IllegalArgumentException("CEP deve ter 8 dígitos: " + cep);
+        }
+
+        var request = HttpRequest.newBuilder()
+                .uri(URI.create("https://viacep.com.br/ws/" + digitos + "/json/"))
+                .timeout(Duration.ofSeconds(5))
+                .header("Accept", "application/json")
+                .build();
+
+        HttpResponse<String> response;
+        try {
+            response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (HttpTimeoutException e) {
+            throw new ServicoCepIndisponivelException("ViaCEP não respondeu a tempo", e);
+        } catch (IOException e) {
+            throw new ServicoCepIndisponivelException("Falha de rede ao chamar o ViaCEP", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ServicoCepIndisponivelException("Chamada interrompida", e);
+        }
+
+        int status = response.statusCode();
+        if (status >= 500) {
+            throw new ServicoCepIndisponivelException("ViaCEP respondeu " + status, null);
+        }
+        if (status != 200) {
+            throw new IllegalArgumentException("Requisição recusada pelo ViaCEP: " + status);
+        }
+
+        try {
+            Endereco endereco = mapper.readValue(response.body(), Endereco.class);
+            if ("true".equals(endereco.erro())) {
+                throw new CepNaoEncontradoException(digitos);
+            }
+            return endereco;
+        } catch (JsonProcessingException e) {
+            throw new ServicoCepIndisponivelException("Resposta inesperada do ViaCEP", e);
+        }
+    }
+}
+```
+
+Repare nas decisões:
+
+- **Validação antes da rede.** CEP malformado é erro de quem chamou (`IllegalArgumentException`), e não vale gastar uma requisição.
+- **Captura da exceção mais específica primeiro.** `HttpTimeoutException` é filha de `IOException`; se o `catch (IOException)` viesse antes, o de timeout nunca rodaria (e o compilador recusa).
+- **`InterruptedException` restaura a flag.** Engolir a interrupção impede que a thread seja encerrada corretamente. Chame `Thread.currentThread().interrupt()` antes de relançar.
+- **O caso estranho do contrato** (200 com `erro: "true"`) vira uma exceção com nome próprio.
+- **`HttpClient` e `ObjectMapper` chegam pelo construtor.** Isso permite reutilizá-los e, nos testes, trocar por versões falsas. É injeção de dependência, que o Spring vai automatizar.
+
+Usando:
+
+```java
+var client = new ViaCepClient(
+        HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build(),
+        new ObjectMapper());
+
+try {
+    Endereco e = client.buscar("01001-000");
+    System.out.println(e.logradouro() + ", " + e.cidade());
+} catch (CepNaoEncontradoException e) {
+    System.out.println("Confira o CEP digitado.");
+} catch (ServicoCepIndisponivelException e) {
+    System.out.println("Serviço de CEP fora do ar. Preencha o endereço manualmente.");
+}
+```
+
+Cada exceção leva a uma ação diferente para o usuário. Esse é o critério para criar uma exceção nova: quem captura precisa reagir de forma diferente.
+
+## Arquivos com java.nio.file
+
+A API moderna de arquivos gira em torno de `Path` (um caminho) e `Files` (operações estáticas).
+
+```java
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+Path pasta = Path.of("dados");
+Files.createDirectories(pasta);               // não falha se já existe
+
+Path arquivo = pasta.resolve("log.txt");
+Files.writeString(arquivo, "Clínica aberta\n", StandardCharsets.UTF_8);
+
+String conteudo = Files.readString(arquivo);
+List<String> linhas = Files.readAllLines(arquivo);
+boolean existe = Files.exists(arquivo);
+```
+
+`writeString` sobrescreve por padrão. Para acrescentar, passe opções:
+
+```java
+import java.nio.file.StandardOpenOption;
+
+Files.writeString(arquivo, "Novo atendimento\n",
+        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+```
+
+Especifique sempre UTF-8 em código que lê ou grava texto. Os métodos de `Files` já usam UTF-8 por padrão, e desde o Java 18 esse também é o padrão do resto da plataforma, mas deixar explícito evita surpresa em código legado.
+
+### Exportando CSV
+
+O financeiro quer a lista de pacientes com endereço. Para arquivos grandes, escreva linha a linha com um `BufferedWriter` dentro de try-with-resources:
+
+```java
+import java.io.BufferedWriter;
+import java.io.IOException;
+
+record PacienteComEndereco(String nome, String cpf, Endereco endereco) {}
+
+static void exportarCsv(List<PacienteComEndereco> pacientes, Path destino) throws IOException {
+    try (BufferedWriter out = Files.newBufferedWriter(destino, StandardCharsets.UTF_8)) {
+        out.write("nome;cpf;cidade;uf");
+        out.newLine();
+        for (var p : pacientes) {
+            out.write(String.join(";", p.nome(), p.cpf(), p.endereco().cidade(), p.endereco().uf()));
+            out.newLine();
+        }
+    }
+}
+```
+
+O `try (recurso)` fecha o arquivo automaticamente ao sair do bloco, mesmo com exceção, e substitui o antigo `finally { out.close(); }`. Funciona com qualquer classe que implemente `AutoCloseable`: arquivos, conexões de banco, `Scanner`. Esquecer de fechar arquivo é vazamento de recurso; em servidor, depois de alguns milhares, o sistema operacional para de abrir arquivos.
+
+Para ler um arquivo grande sem carregar tudo na memória, use `Files.lines`, também com try-with-resources:
+
+```java
+try (var linhas = Files.lines(Path.of("dados/pacientes.csv"))) {
+    long deSp = linhas.skip(1).filter(l -> l.endsWith(";SP")).count();
+    System.out.println(deSp + " pacientes de SP");
+}
+```
+
+### Salvando JSON
+
+Para guardar a agenda do dia e recarregá-la depois, o próprio `ObjectMapper` grava e lê arquivos:
+
+```java
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.fasterxml.jackson.core.type.TypeReference;
+import java.time.LocalDateTime;
+
+record ConsultaAgendada(String paciente, String medico, LocalDateTime dataHora) {}
+
+ObjectMapper mapper = new ObjectMapper()
+        .registerModule(new JavaTimeModule())
+        .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+        .enable(SerializationFeature.INDENT_OUTPUT);
+
+List<ConsultaAgendada> agenda = List.of(
+        new ConsultaAgendada("Ana Souza", "Dr. Carlos", LocalDateTime.of(2026, 12, 3, 10, 0)));
+
+Path json = Path.of("dados/agenda.json");
+mapper.writeValue(json.toFile(), agenda);
+
+List<ConsultaAgendada> lida = mapper.readValue(json.toFile(), new TypeReference<>() {});
+```
+
+Sem o `JavaTimeModule`, o Jackson não sabe serializar `LocalDateTime` e lança exceção. Sem desligar `WRITE_DATES_AS_TIMESTAMPS`, a data sai como array de números em vez de `"2026-12-03T10:00:00"`. O `TypeReference` informa o tipo genérico completo (`List<ConsultaAgendada>`), que o Java apaga em tempo de execução.
+
+## Onde tratar o erro
+
+Uma regra prática que evita os dois extremos (engolir tudo ou deixar tudo explodir):
+
+1. **Capture onde você consegue fazer algo útil**: tentar de novo, usar um valor alternativo, mostrar uma mensagem específica.
+2. **Traduza na fronteira**: o cliente HTTP converte `IOException` em exceção do domínio; o resto do sistema não sabe que existe HTTP.
+3. **Deixe subir o que você não sabe tratar.** Numa API Spring, um tratador global transforma exceções em respostas HTTP; você vai montá-lo nos próximos capítulos.
+4. **Nunca deixe um `catch` vazio.** No mínimo, registre em log com a exceção completa.
+
+```java
+// Nunca faça isso
+try {
+    exportarCsv(pacientes, destino);
+} catch (IOException e) {
+}
+```
+
+## Na entrevista
+
+- **Exceção checada ou não checada?** Checada (`Exception`) obriga quem chama a tratar ou declarar; não checada (`RuntimeException`) não. Uso não checadas para regras de negócio e erros de programação, e traduzo checadas de infraestrutura na fronteira.
+- **Para que serve try-with-resources?** Fecha automaticamente recursos `AutoCloseable` ao fim do bloco, mesmo com exceção, e preserva exceções do `close` como suprimidas em vez de esconder a original.
+- **O HttpClient lança exceção em resposta 404?** Não. Só lança quando não há resposta (rede, timeout). O status precisa ser verificado pelo código.
+- **Por que reutilizar HttpClient e ObjectMapper?** São caros de criar e seguros entre threads; reutilizar aproveita o pool de conexões e os caches internos de serialização.
+
+## Pratique
+
+Monte o importador de pacientes da clínica:
+
+1. Leia `entrada.csv` com as colunas `nome;cpf;cep`.
+2. Para cada linha, busque o endereço com o `ViaCepClient`.
+3. Grave `pacientes.json` com os pacientes completos e `erros.csv` com `linha;cep;motivo` para cada falha (CEP malformado, não encontrado, serviço indisponível).
+4. Uma falha numa linha não pode interromper as outras.
+5. Ao final, imprima quantos foram importados e quantos falharam.
+
+Entregue o código, um `entrada.csv` com pelo menos seis linhas (inclua `123` e `99999999`) e os dois arquivos gerados.
+
+<Quiz question="O ViaCEP responde 500. O que client.send faz?" options={["Lança IOException","Lança HttpTimeoutException","Devolve a resposta normalmente com status 500","Repete a chamada automaticamente"]} answer={2} explanation="Status de erro HTTP é uma resposta válida. Exceções só ocorrem quando não há resposta, como falha de rede ou timeout." />
+<Quiz question="Por que capturar HttpTimeoutException antes de IOException?" options={["Por convenção de estilo apenas","Porque HttpTimeoutException é subclasse de IOException","Porque IOException é não checada","Porque timeout não é exceção"]} answer={1} explanation="Um catch da superclasse antes da subclasse tornaria o segundo inalcançável, e o compilador recusa." />
+<Quiz question="O que o try-with-resources garante?" options={["Que a exceção nunca chegue a quem chamou","Que o recurso seja fechado ao sair do bloco, com ou sem erro","Que o arquivo seja gravado em UTF-8","Que a operação seja repetida em caso de erro"]} answer={1} explanation="Recursos AutoCloseable declarados no try são fechados automaticamente, inclusive quando uma exceção é lançada." />
+
+## Base no CodeForge
+
+- [Exceções](/learn/java/excecoes) e [Optional e null](/learn/java/optional-e-null): a linguagem a fundo.
+- [HTTP/1.1](/learn/redes/http-1) e [TLS](/learn/redes/tls): o que acontece por baixo do `HttpClient`.
+- [Formatos de dados](/learn/system-design/formatos-de-dados): JSON e alternativas.
+- [Java exceções: criar, lançar e controlar](/learn/carreira-java/java-excecoes-aprenda-criar-lancar-controlar-excecoes): o aprofundamento desta carreira.
+
+## Referências
+
+- [Javadoc: HttpClient (Java 21)](https://docs.oracle.com/en/java/javase/21/docs/api/java.net.http/java/net/http/HttpClient.html)
+- [Javadoc: Files (Java 21)](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html)
+- [Jackson Databind](https://github.com/FasterXML/jackson-databind)
+- [dev.java: Exceptions](https://dev.java/learn/exceptions/)

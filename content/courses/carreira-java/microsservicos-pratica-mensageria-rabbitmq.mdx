@@ -1,0 +1,319 @@
+---
+title: "Microsserviços na prática: Mensageria com RabbitMQ"
+kind: lesson
+---
+
+Com a chamada HTTP síncrona, o serviço de pedidos só funciona se o de pagamentos estiver no ar e rápido. Se pagamentos cai por cinco minutos, ninguém compra. E quando outros serviços (estoque, nota fiscal, e-mail) também precisarem saber que um pagamento foi aprovado, o serviço de pagamentos teria de chamar cada um deles. Mensageria resolve os dois problemas: os serviços trocam mensagens por um broker, que guarda o que não pôde ser entregue ainda e distribui para quem tiver interesse. Neste capítulo você liga pedidos e pagamentos pelo RabbitMQ com Spring AMQP, com filas, exchanges, retry, dead letter queue e consumidores idempotentes.
+
+**Você vai aprender:**
+
+- O modelo do RabbitMQ: exchanges, filas, bindings e routing keys
+- Publicar e consumir mensagens JSON com Spring AMQP e `@RabbitListener`
+- Configurar retry com backoff e uma dead letter queue para mensagens que falham
+- Garantir que nada se perde com filas duráveis, publisher confirms e ack manual do container
+- Escrever consumidores idempotentes, porque a entrega é pelo menos uma vez
+
+## O novo fluxo
+
+1. O cliente faz `POST /pedidos`. O serviço de pedidos grava o pedido como `AGUARDANDO_PAGAMENTO`, publica o comando `pagamento.solicitado` e responde `202 Accepted` na hora.
+2. O serviço de pagamentos consome a mensagem, cobra e publica o evento `pagamento.aprovado` ou `pagamento.recusado`.
+3. O serviço de pedidos consome o evento e atualiza o status. Estoque e e-mail também podem consumir `pagamento.aprovado`, sem que pagamentos saiba que eles existem.
+
+Se pagamentos estiver fora do ar, as solicitações ficam na fila e são processadas quando ele voltar. O cliente consulta o status com `GET /pedidos/{id}` ou recebe uma notificação.
+
+## O modelo do RabbitMQ
+
+No RabbitMQ, o produtor **não publica numa fila**. Ele publica numa **exchange**, com uma **routing key**. A exchange decide para quais filas copiar a mensagem, conforme os **bindings**. Consumidores leem de filas.
+
+| Tipo de exchange | Como roteia | Uso típico |
+|---|---|---|
+| `direct` | Routing key igual à do binding | Comandos para um destino específico |
+| `topic` | Padrão com `*` (uma palavra) e `#` (zero ou mais) | Eventos por categoria, como `pagamento.*` |
+| `fanout` | Para todas as filas ligadas, ignora a key | Broadcast |
+| `headers` | Pelos cabeçalhos da mensagem | Raro |
+
+Vamos usar uma exchange `topic` chamada `loja.eventos`. Cada serviço declara a **sua** fila e a liga aos padrões que lhe interessam. Assim, adicionar um consumidor novo não mexe no produtor.
+
+Suba o broker local com a interface de administração:
+
+```bash
+docker run -d --name rabbit -p 5672:5672 -p 15672:15672 rabbitmq:4-management
+# painel em http://localhost:15672 (guest / guest, só funciona em localhost)
+```
+
+## Configurando o Spring AMQP
+
+Adicione `spring-boot-starter-amqp` aos dois serviços e configure a conexão:
+
+```yaml
+spring:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
+    listener:
+      simple:
+        acknowledge-mode: auto
+        prefetch: 20
+        default-requeue-rejected: false
+        retry:
+          enabled: true
+          max-attempts: 4
+          initial-interval: 1s
+          multiplier: 2.0
+          max-interval: 10s
+```
+
+Volte a esse bloco depois de ler as seções de retry e confirmação: cada linha tem um motivo.
+
+A topologia é declarada como beans. O `RabbitAdmin`, que o Spring Boot cria, declara tudo no broker na primeira conexão (e não falha se já existir com os mesmos argumentos):
+
+```java
+// pedidos: br.com.loja.pedidos.mensageria.RabbitConfig
+package br.com.loja.pedidos.mensageria;
+
+import org.springframework.amqp.core.*;
+import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
+import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+class RabbitConfig {
+
+    static final String EXCHANGE = "loja.eventos";
+    static final String DLX = "loja.dlx";
+    static final String FILA_RESULTADO = "pedidos.resultado-pagamento";
+
+    @Bean TopicExchange eventos() { return ExchangeBuilder.topicExchange(EXCHANGE).durable(true).build(); }
+    @Bean DirectExchange dlx() { return ExchangeBuilder.directExchange(DLX).durable(true).build(); }
+
+    @Bean
+    Queue filaResultado() {
+        return QueueBuilder.durable(FILA_RESULTADO)
+                .deadLetterExchange(DLX)
+                .deadLetterRoutingKey(FILA_RESULTADO + ".dlq")
+                .build();
+    }
+
+    @Bean Queue filaResultadoDlq() { return QueueBuilder.durable(FILA_RESULTADO + ".dlq").build(); }
+
+    @Bean
+    Binding resultadoBinding(Queue filaResultado, TopicExchange eventos) {
+        return BindingBuilder.bind(filaResultado).to(eventos).with("pagamento.*");
+    }
+
+    @Bean
+    Binding dlqBinding(Queue filaResultadoDlq, DirectExchange dlx) {
+        return BindingBuilder.bind(filaResultadoDlq).to(dlx).with(FILA_RESULTADO + ".dlq");
+    }
+
+    @Bean
+    MessageConverter jsonConverter() {
+        return new Jackson2JsonMessageConverter();
+    }
+}
+```
+
+Com um bean `MessageConverter`, o Spring Boot o usa automaticamente no `RabbitTemplate` e nos listeners: você publica e recebe records Java, que viajam como JSON. Sem ele, o padrão é serialização Java, que acopla os serviços às mesmas classes e é um risco de segurança.
+
+## Publicando
+
+Os contratos das mensagens são records, cada serviço com sua cópia:
+
+```java
+public record PagamentoSolicitado(UUID mensagemId, UUID pedidoId, BigDecimal valor, String cartaoToken) {}
+public record PagamentoProcessado(UUID mensagemId, UUID pedidoId, String status, UUID pagamentoId) {}
+```
+
+```java
+// pedidos: br.com.loja.pedidos.mensageria.PublicadorPagamentos
+@Component
+class PublicadorPagamentos {
+
+    private final RabbitTemplate rabbit;
+
+    PublicadorPagamentos(RabbitTemplate rabbit) { this.rabbit = rabbit; }
+
+    void solicitar(Pedido pedido, String cartaoToken) {
+        var msg = new PagamentoSolicitado(UUID.randomUUID(), pedido.getId(), pedido.getTotal(), cartaoToken);
+        rabbit.convertAndSend(RabbitConfig.EXCHANGE, "pagamento.solicitado", msg, m -> {
+            m.getMessageProperties().setMessageId(msg.mensagemId().toString());
+            m.getMessageProperties().setDeliveryMode(MessageDeliveryMode.PERSISTENT);
+            return m;
+        });
+    }
+}
+```
+
+O `messageId` explícito será a chave de idempotência do consumidor. O modo persistente, junto com filas duráveis, faz a mensagem sobreviver a um reinício do broker (o `RabbitTemplate` já publica persistente por padrão, mas deixar explícito documenta a intenção).
+
+## Consumindo
+
+```java
+// pagamentos: br.com.loja.pagamentos.mensageria.SolicitacaoListener
+@Component
+class SolicitacaoListener {
+
+    private final PagamentoService service;
+    private final RabbitTemplate rabbit;
+
+    SolicitacaoListener(PagamentoService service, RabbitTemplate rabbit) {
+        this.service = service;
+        this.rabbit = rabbit;
+    }
+
+    @RabbitListener(queues = "pagamentos.solicitacoes")
+    void aoReceber(PagamentoSolicitado msg) {
+        var resultado = service.cobrar(msg.pedidoId(), msg.valor(), msg.cartaoToken());
+        var routingKey = switch (resultado.status()) {
+            case APROVADO -> "pagamento.aprovado";
+            case RECUSADO -> "pagamento.recusado";
+        };
+        rabbit.convertAndSend("loja.eventos", routingKey,
+                new PagamentoProcessado(UUID.randomUUID(), msg.pedidoId(), resultado.status().name(), resultado.id()));
+    }
+}
+```
+
+O serviço de pagamentos declara a fila `pagamentos.solicitacoes`, ligada a `loja.eventos` com a key `pagamento.solicitado`, no seu próprio `RabbitConfig`, do mesmo jeito que pedidos fez.
+
+Com `acknowledge-mode: auto`, o container do Spring confirma (ack) a mensagem ao broker quando o método termina sem exceção. Se lançar exceção, a mensagem não é confirmada. O RabbitMQ só remove a mensagem da fila depois do ack, então um consumidor que cai no meio do processamento não perde nada: a mensagem volta para outro consumidor.
+
+O `prefetch: 20` limita quantas mensagens não confirmadas cada consumidor segura. Valor alto demais concentra mensagens num consumidor lento; valor 1 deixa tudo mais lento por causa das idas e voltas.
+
+## Retry e dead letter queue
+
+O que acontece quando o processamento falha? Depende do tipo de falha:
+
+- **Transitória** (banco fora por um instante, timeout no gateway de cartão): vale tentar de novo, com espera crescente.
+- **Permanente** (JSON inválido, pedido inexistente): tentar de novo nunca vai funcionar.
+
+A configuração `listener.simple.retry` faz o retry **dentro do consumidor**, com backoff exponencial (1s, 2s, 4s), sem devolver a mensagem ao broker. Esgotadas as tentativas, a mensagem é rejeitada. Como `default-requeue-rejected` é `false`, ela não volta para a fila: o RabbitMQ a manda para a **dead letter exchange** configurada na fila, e dali para a DLQ.
+
+A DLQ é onde mensagens problemáticas esperam análise humana, em vez de sumirem ou de travarem a fila. Monitore o tamanho dela e crie alerta: DLQ crescendo é bug ou dependência fora. Depois de corrigir a causa, você reprocessa movendo as mensagens de volta (o painel do RabbitMQ tem a opção "Move messages" com o plugin shovel, ou você escreve um endpoint administrativo que lê da DLQ e republica).
+
+Para falhas permanentes, não gaste tentativas. Lance `AmqpRejectAndDontRequeueException`, e a mensagem vai direto para a DLQ:
+
+```java
+@RabbitListener(queues = "pedidos.resultado-pagamento")
+void aoProcessar(PagamentoProcessado evento) {
+    var pedido = repo.findById(evento.pedidoId())
+            .orElseThrow(() -> new AmqpRejectAndDontRequeueException("Pedido inexistente: " + evento.pedidoId()));
+    // ...
+}
+```
+
+<Callout type="warning" title="Requeue infinito">
+Sem DLQ e com `default-requeue-rejected` ligado (o padrão), uma mensagem que sempre falha volta para o início da fila e é entregue de novo imediatamente, para sempre. É a famosa poison message: o consumidor fica preso nela consumindo CPU, os logs explodem e as mensagens boas atrás dela atrasam. Sempre configure retry limitado, `default-requeue-rejected: false` e uma dead letter exchange em toda fila.
+</Callout>
+
+## Não perder mensagens no envio
+
+Filas duráveis e mensagens persistentes protegem o que já chegou ao broker. Mas e se a publicação não chegar? Para isso servem os **publisher confirms**: com `publisher-confirm-type: correlated`, o broker confirma cada mensagem recebida, e `publisher-returns` com `mandatory: true` devolve mensagens que não tinham rota para nenhuma fila (uma routing key digitada errado, por exemplo).
+
+```java
+@Bean
+RabbitTemplateCustomizer confirmacoes() {
+    return template -> {
+        template.setConfirmCallback((correlacao, ack, causa) -> {
+            if (!ack) log.error("Broker não confirmou a mensagem {}: {}", correlacao, causa);
+        });
+        template.setReturnsCallback(retorno ->
+                log.error("Mensagem sem rota: {} key={}", retorno.getReplyText(), retorno.getRoutingKey()));
+    };
+}
+```
+
+Ainda sobra um buraco: o serviço grava o pedido no banco e cai antes de publicar. O pedido existe, a mensagem não. Gravar e publicar não são atômicos porque são dois sistemas. A solução clássica é o **transactional outbox**: na mesma transação do pedido, grave a mensagem numa tabela `outbox`; um processo separado lê a tabela e publica. O capítulo de padrões de integração detalha esse padrão.
+
+## Consumidor idempotente
+
+O RabbitMQ entrega **pelo menos uma vez**. A mesma mensagem pode chegar duas vezes: o consumidor processou, mas caiu antes do ack; ou o produtor republicou porque não recebeu a confirmação. Cobrar duas vezes o mesmo pedido é inaceitável, então o consumidor precisa ser idempotente.
+
+A forma mais robusta é registrar o id da mensagem processada na mesma transação do efeito, com restrição de unicidade:
+
+```sql
+CREATE TABLE mensagens_processadas (
+    mensagem_id UUID PRIMARY KEY,
+    processada_em TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+```java
+@Service
+class PagamentoService {
+
+    private final JdbcClient jdbc;
+    private final PagamentoRepository repo;
+
+    PagamentoService(JdbcClient jdbc, PagamentoRepository repo) {
+        this.jdbc = jdbc;
+        this.repo = repo;
+    }
+
+    @Transactional
+    Optional<Pagamento> cobrarUmaVez(UUID mensagemId, UUID pedidoId, BigDecimal valor, String token) {
+        int inseridas = jdbc.sql("""
+                INSERT INTO mensagens_processadas (mensagem_id) VALUES (:id)
+                ON CONFLICT (mensagem_id) DO NOTHING
+                """)
+                .param("id", mensagemId)
+                .update();
+        if (inseridas == 0) {
+            return Optional.empty();          // já processada: ignora
+        }
+        return Optional.of(repo.save(Pagamento.cobrar(pedidoId, valor, token)));
+    }
+}
+```
+
+No listener, troque `service.cobrar(...)` por `service.cobrarUmaVez(msg.mensagemId(), ...)` e publique o evento só quando o `Optional` vier preenchido. Se a mensagem for repetida, o `INSERT` não insere nada e o efeito é pulado. Se o processamento falhar, a transação desfaz também o registro, e a próxima tentativa processa normalmente. Uma regra de negócio também ajuda: uma restrição única em `pagamentos(pedido_id)` impede duas cobranças do mesmo pedido mesmo que as mensagens tenham ids diferentes.
+
+## Ordem e concorrência
+
+O RabbitMQ preserva a ordem dentro de uma fila, mas com vários consumidores (ou retry) a ordem de **processamento** não é garantida. Um `pagamento.aprovado` pode ser processado antes de um evento anterior do mesmo pedido. Projete os consumidores para tolerar isso: use uma máquina de estados no pedido que só aceita transições válidas (de `AGUARDANDO_PAGAMENTO` para `PAGO`, nunca de `CANCELADO` para `PAGO`) e ignore eventos que chegam fora de hora.
+
+## Na entrevista
+
+**Qual a diferença entre exchange e fila no RabbitMQ?** A exchange recebe as mensagens e roteia, sem armazenar. A fila armazena até um consumidor confirmar. Produtores publicam em exchanges; consumidores leem de filas.
+
+**O que é uma dead letter queue?** Uma fila para onde vão mensagens rejeitadas, expiradas ou que excederam tentativas. Ela isola mensagens problemáticas para análise e evita que travem a fila principal.
+
+**Como garantir que uma mensagem não seja processada duas vezes?** Não dá para garantir entrega exatamente uma vez na prática. Você garante efeito uma vez: consumidor idempotente, registrando o id da mensagem na mesma transação do efeito ou usando restrições únicas do negócio.
+
+**Quando usar mensageria em vez de HTTP?** Quando o chamador não precisa da resposta na hora, quando vários serviços reagem ao mesmo fato, ou quando você quer absorver picos e indisponibilidade do consumidor. Para consultas que precisam de resposta imediata, HTTP continua sendo mais simples.
+
+## Pratique
+
+Troque a chamada HTTP do capítulo anterior por mensagens e entregue:
+
+1. A topologia completa nos dois serviços: exchange `loja.eventos`, filas com DLX e DLQ.
+2. `POST /pedidos` respondendo `202` e o status mudando para `PAGO` ou `RECUSADO` de forma assíncrona.
+3. Um teste manual mostrando que, com o serviço de pagamentos parado, os pedidos se acumulam na fila e são processados quando ele volta.
+4. Um cartão de teste que faz o consumidor lançar exceção e a prova (print do painel) de que a mensagem foi parar na DLQ depois de 4 tentativas.
+5. A tabela `mensagens_processadas` e um teste que publica a mesma mensagem duas vezes e confirma uma única cobrança.
+
+<Quiz question="No RabbitMQ, onde o produtor publica uma mensagem?" options={["Diretamente numa fila","Numa exchange, com uma routing key","No consumidor, por conexão direta","Num tópico particionado"]} answer={1} explanation="O produtor publica numa exchange. Ela roteia cópias da mensagem para as filas cujos bindings combinam com a routing key." />
+
+<Quiz question="Para que serve default-requeue-rejected: false junto com uma dead letter exchange?" options={["Para descartar mensagens grandes","Para mandar a mensagem rejeitada à DLQ em vez de voltar à fila","Para desligar os publisher confirms","Para processar mensagens em ordem"]} answer={1} explanation="Sem requeue, a mensagem rejeitada é encaminhada pela dead letter exchange para a DLQ, evitando o loop infinito de uma poison message." />
+
+<Quiz question="Por que o consumidor de pagamentos precisa ser idempotente?" options={["Porque o RabbitMQ entrega cada mensagem exatamente uma vez","Porque a entrega é pelo menos uma vez e mensagens podem se repetir","Porque o JSON pode vir com campos em outra ordem","Porque o prefetch reordena as mensagens"]} answer={1} explanation="Falhas antes do ack ou republicações do produtor podem entregar a mesma mensagem de novo. O consumidor precisa produzir o efeito uma única vez." />
+
+## Base no CodeForge
+
+- [Microsserviços na prática: Implementando com Java e Spring](/learn/carreira-java/microsservicos-pratica-implementando-java-spring): a versão síncrona deste mesmo fluxo.
+- [Message brokers](/learn/system-design/message-brokers), [Dead letter queues](/learn/system-design/dead-letter-queues) e [Semânticas de entrega](/learn/system-design/semanticas-de-entrega): a teoria por trás de cada configuração.
+- [Outbox](/learn/system-design/outbox) e [Idempotência](/learn/system-design/idempotencia): como fechar os buracos de consistência.
+- [Padrões de Integração em Sistemas Distribuídos](/learn/carreira-java/padroes-integracao-sistemas-distribuidos) e [Mensageria com Java, RabbitMQ e Kafka](/learn/carreira-java/mensageria-java-rabbitmq-kafka): onde o assunto continua.
+
+## Referências
+
+- [Spring AMQP Reference](https://docs.spring.io/spring-amqp/reference/)
+- [Microservices.io: Idempotent Consumer](https://microservices.io/patterns/communication-style/idempotent-consumer.html)
+- [Microservices.io: Transactional Outbox](https://microservices.io/patterns/data/transactional-outbox.html)

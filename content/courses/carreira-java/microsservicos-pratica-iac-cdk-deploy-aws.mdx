@@ -1,0 +1,317 @@
+---
+title: "Microsserviços na prática: IaC com CDK e deploy na AWS"
+kind: lesson
+---
+
+Os serviços de pedidos e pagamentos rodam no seu Docker Compose. Para irem para produção eles precisam de rede, banco gerenciado, balanceador, permissões, logs e escala, e montar isso clicando no console da AWS gera um ambiente que ninguém consegue reproduzir nem revisar. Infraestrutura como código (IaC) resolve isso: a infraestrutura vira código versionado, revisado em pull request e aplicado de forma repetível. Neste capítulo você usa o AWS CDK v2 em Java, a mesma linguagem dos serviços, para criar VPC, cluster ECS com Fargate, banco RDS Postgres e o deploy dos dois serviços.
+
+**Você vai aprender:**
+
+- O que o CDK faz por baixo (CloudFormation) e o ciclo `synth`, `diff`, `deploy`
+- Criar uma VPC, um cluster ECS e um banco RDS com constructs de alto nível
+- Publicar um serviço Spring Boot no Fargate atrás de um Application Load Balancer
+- Passar segredos do Secrets Manager para o container sem expô-los
+- Organizar stacks por responsabilidade e configurar auto scaling
+
+## CDK em uma página
+
+O CDK é uma biblioteca: você escreve classes Java que descrevem recursos, e o comando `cdk synth` transforma isso num template do CloudFormation. Quem cria os recursos na conta é o CloudFormation, que guarda o estado, calcula as mudanças e faz rollback se algo falhar no meio.
+
+Três conceitos bastam para começar:
+
+| Conceito | O que é | Exemplo |
+|---|---|---|
+| App | O programa inteiro, raiz da árvore | `new App()` |
+| Stack | Uma unidade de deploy (vira uma stack do CloudFormation) | `RedeStack`, `PedidosStack` |
+| Construct | Um bloco de infraestrutura, de um recurso a vários | `Vpc`, `DatabaseInstance` |
+
+Os constructs vêm em níveis. L1 (`CfnBucket`) espelha o CloudFormation campo a campo. L2 (`Vpc`, `DatabaseInstance`) traz padrões sensatos e métodos como `grantRead`. L3, os *patterns*, montam arquiteturas inteiras, como `ApplicationLoadBalancedFargateService`, que cria serviço ECS, task definition, balanceador, target group, listener e security groups numa chamada.
+
+## Preparando o projeto
+
+Pré-requisitos: Node.js (a CLI do CDK é distribuída pelo npm), Java 21, Maven, Docker e a AWS CLI v2 configurada com um perfil.
+
+```bash
+npm install -g aws-cdk
+aws sts get-caller-identity          # confirma conta e credenciais
+mkdir infra && cd infra
+cdk init app --language java
+cdk bootstrap aws://123456789012/us-east-1
+```
+
+O `cdk bootstrap` roda uma vez por conta e região. Ele cria o bucket e o repositório ECR que o CDK usa para enviar assets (o jar do CDK, as imagens Docker dos seus serviços) e as roles do deploy.
+
+O projeto gerado é um projeto Maven comum. O arquivo `cdk.json` diz como executar a app (`mvn -e -q compile exec:java`), e o `pom.xml` depende de `software.amazon.awscdk:aws-cdk-lib`, que traz todos os serviços da AWS num só artefato.
+
+A estrutura que vamos usar:
+
+```text
+loja/
+  pedidos/        # serviço Spring Boot com Dockerfile
+  pagamentos/     # serviço Spring Boot com Dockerfile
+  infra/          # projeto CDK
+    src/main/java/br/com/loja/infra/
+      InfraApp.java
+      RedeStack.java
+      ServicoStack.java
+```
+
+## A stack de rede e o cluster
+
+Rede e cluster mudam pouco e são compartilhados pelos serviços. Ficam numa stack própria:
+
+```java
+// infra: RedeStack.java
+package br.com.loja.infra;
+
+import software.amazon.awscdk.Stack;
+import software.amazon.awscdk.StackProps;
+import software.amazon.awscdk.services.ec2.Vpc;
+import software.amazon.awscdk.services.ecs.Cluster;
+import software.constructs.Construct;
+
+public class RedeStack extends Stack {
+
+    private final Vpc vpc;
+    private final Cluster cluster;
+
+    public RedeStack(Construct escopo, String id, StackProps props) {
+        super(escopo, id, props);
+
+        this.vpc = Vpc.Builder.create(this, "Vpc")
+                .maxAzs(2)
+                .natGateways(1)
+                .build();
+
+        this.cluster = Cluster.Builder.create(this, "Cluster")
+                .vpc(vpc)
+                .containerInsights(true)
+                .build();
+    }
+
+    public Vpc getVpc() { return vpc; }
+    public Cluster getCluster() { return cluster; }
+}
+```
+
+Com essas poucas linhas o L2 `Vpc` cria duas zonas de disponibilidade, sub-redes públicas e privadas em cada uma, internet gateway, tabelas de rota e um NAT gateway. Os containers rodam nas sub-redes privadas e saem para a internet (para baixar imagens, chamar APIs externas) pelo NAT. Um NAT gateway só economiza dinheiro em ambiente de estudo; em produção, use um por zona para não ter ponto único de falha.
+
+## A stack de um serviço
+
+Cada serviço ganha sua stack com banco, task e balanceador. O mesmo código serve para pedidos e pagamentos:
+
+```java
+// infra: ServicoStack.java
+package br.com.loja.infra;
+
+import java.util.Map;
+import software.amazon.awscdk.*;
+import software.amazon.awscdk.services.ec2.*;
+import software.amazon.awscdk.services.ecs.*;
+import software.amazon.awscdk.services.ecs.patterns.*;
+import software.amazon.awscdk.services.elasticloadbalancingv2.HealthCheck;
+import software.amazon.awscdk.services.rds.*;
+import software.constructs.Construct;
+
+public class ServicoStack extends Stack {
+
+    private final String urlInterna;
+
+    public record Config(String nome, String diretorioCodigo, Map<String, String> ambiente) {}
+
+    public ServicoStack(Construct escopo, String id, StackProps props, RedeStack rede, Config cfg) {
+        super(escopo, id, props);
+
+        var banco = DatabaseInstance.Builder.create(this, "Banco")
+                .engine(DatabaseInstanceEngine.postgres(PostgresInstanceEngineProps.builder()
+                        .version(PostgresEngineVersion.VER_16)
+                        .build()))
+                .instanceType(InstanceType.of(InstanceClass.BURSTABLE4_GRAVITON, InstanceSize.MICRO))
+                .vpc(rede.getVpc())
+                .vpcSubnets(SubnetSelection.builder().subnetType(SubnetType.PRIVATE_WITH_EGRESS).build())
+                .credentials(Credentials.fromGeneratedSecret(cfg.nome()))
+                .databaseName(cfg.nome())
+                .allocatedStorage(20)
+                .backupRetention(Duration.days(7))
+                .removalPolicy(RemovalPolicy.SNAPSHOT)
+                .build();
+
+        var jdbcUrl = "jdbc:postgresql://" + banco.getDbInstanceEndpointAddress() + ":5432/" + cfg.nome();
+
+        var ambiente = new java.util.HashMap<>(cfg.ambiente());
+        ambiente.put("SPRING_DATASOURCE_URL", jdbcUrl);
+        ambiente.put("SPRING_PROFILES_ACTIVE", "aws");
+
+        var servico = ApplicationLoadBalancedFargateService.Builder.create(this, "Servico")
+                .cluster(rede.getCluster())
+                .cpu(512)
+                .memoryLimitMiB(1024)
+                .desiredCount(2)
+                .publicLoadBalancer(true)
+                .taskImageOptions(ApplicationLoadBalancedTaskImageOptions.builder()
+                        .image(ContainerImage.fromAsset(cfg.diretorioCodigo()))
+                        .containerPort(8080)
+                        .environment(ambiente)
+                        .secrets(Map.of(
+                                "SPRING_DATASOURCE_USERNAME", Secret.fromSecretsManager(banco.getSecret(), "username"),
+                                "SPRING_DATASOURCE_PASSWORD", Secret.fromSecretsManager(banco.getSecret(), "password")))
+                        .build())
+                .build();
+
+        servico.getTargetGroup().configureHealthCheck(HealthCheck.builder()
+                .path("/actuator/health")
+                .healthyHttpCodes("200")
+                .build());
+
+        banco.getConnections().allowDefaultPortFrom(servico.getService());
+
+        var escala = servico.getService().autoScaleTaskCount(EnableScalingProps.builder()
+                .minCapacity(2)
+                .maxCapacity(6)
+                .build());
+        escala.scaleOnCpuUtilization("Cpu", CpuUtilizationScalingProps.builder()
+                .targetUtilizationPercent(60)
+                .build());
+
+        this.urlInterna = "http://" + servico.getLoadBalancer().getLoadBalancerDnsName();
+
+        CfnOutput.Builder.create(this, "Url").value(urlInterna).build();
+    }
+
+    public String getUrlInterna() { return urlInterna; }
+}
+```
+
+O que cada parte faz:
+
+- **`DatabaseInstance`** cria o Postgres em sub-rede privada. `Credentials.fromGeneratedSecret` gera uma senha aleatória e guarda usuário e senha no Secrets Manager. Ninguém digita senha em lugar nenhum.
+- **`ContainerImage.fromAsset`** aponta para o diretório com o `Dockerfile` do serviço. No deploy, o CDK faz o build da imagem, envia para o ECR criado no bootstrap e usa a tag resultante na task definition.
+- **`secrets`** injeta valores do Secrets Manager como variáveis de ambiente no início do container. O CDK também dá à role de execução da task a permissão de ler aquele segredo. O valor nunca aparece no template.
+- **`allowDefaultPortFrom`** abre a porta 5432 do security group do banco só para o security group do serviço. Nada de `0.0.0.0/0`.
+- **O health check** aponta para o Actuator. O target group só manda tráfego para tasks que respondem 200, e o ECS substitui as que falham.
+
+## Juntando as stacks na App
+
+```java
+// infra: InfraApp.java
+package br.com.loja.infra;
+
+import java.util.Map;
+import software.amazon.awscdk.App;
+import software.amazon.awscdk.Environment;
+import software.amazon.awscdk.StackProps;
+
+public class InfraApp {
+    public static void main(String[] args) {
+        var app = new App();
+        var props = StackProps.builder()
+                .env(Environment.builder()
+                        .account(System.getenv("CDK_DEFAULT_ACCOUNT"))
+                        .region(System.getenv("CDK_DEFAULT_REGION"))
+                        .build())
+                .build();
+
+        var rede = new RedeStack(app, "LojaRede", props);
+
+        var pagamentos = new ServicoStack(app, "LojaPagamentos", props, rede,
+                new ServicoStack.Config("pagamentos", "../pagamentos", Map.of()));
+
+        new ServicoStack(app, "LojaPedidos", props, rede,
+                new ServicoStack.Config("pedidos", "../pedidos", Map.of("PAGAMENTOS_URL", pagamentos.getUrlInterna())));
+
+        app.synth();
+    }
+}
+```
+
+Passar `rede` para as outras stacks cria referências entre stacks: o CDK gera exports e imports no CloudFormation e ordena o deploy sozinho. Passar a URL do balanceador de pagamentos para pedidos funciona igual.
+
+Para simplificar, os dois balanceadores são públicos. Num sistema real, o serviço de pagamentos não deveria ser alcançável da internet: use `publicLoadBalancer(false)` nele (o balanceador fica nas sub-redes privadas e só é visto de dentro da VPC) ou ECS Service Connect para descoberta de serviços interna.
+
+## O ciclo de deploy
+
+```bash
+cd infra
+cdk synth                 # gera os templates em cdk.out, sem tocar na AWS
+cdk diff                  # compara com o que está implantado
+cdk deploy --all          # faz build das imagens, envia e aplica
+cdk deploy LojaPedidos    # só uma stack (e as que ela depende)
+cdk destroy --all         # remove tudo ao terminar de estudar
+```
+
+Leia o `cdk diff` antes de todo deploy, como se fosse um code review da infraestrutura. Ele mostra recursos criados, alterados e, o mais importante, **substituídos**. Trocar certas propriedades do banco (o identificador, por exemplo) exige recriar o recurso, e o diff avisa. Mudanças de IAM e security group pedem confirmação no terminal; em pipeline, use `--require-approval never` só depois de o diff ter sido revisado.
+
+O perfil `aws` do Spring precisa saber que roda atrás de um balanceador. No `application-aws.yml`, ligue `server.forward-headers-strategy: framework` para os links e redirecionamentos usarem o esquema e o host originais, e garanta que o Actuator responde em `/actuator/health` sem autenticação.
+
+<Callout type="warning" title="Esquecer de destruir o ambiente de estudo">
+NAT gateway, balanceador e RDS cobram por hora, ligados ou não. Um ambiente de estudo esquecido por um mês custa bem mais do que parece. Rode `cdk destroy --all` ao terminar, confira no console que o RDS foi removido (com `RemovalPolicy.SNAPSHOT` sobra um snapshot, que também cobra armazenamento) e configure um alerta de orçamento no AWS Budgets antes do primeiro deploy.
+</Callout>
+
+## Testando a infraestrutura
+
+Como é código Java, a infraestrutura pode ter testes JUnit. O módulo `assertions` verifica o template sintetizado:
+
+```java
+import org.junit.jupiter.api.Test;
+import software.amazon.awscdk.App;
+import software.amazon.awscdk.StackProps;
+import software.amazon.awscdk.assertions.Template;
+import java.util.Map;
+
+class ServicoStackTest {
+
+    @Test
+    void bancoNaoEPublicoEUsaPostgres() {
+        var app = new App();
+        var rede = new RedeStack(app, "Rede", StackProps.builder().build());
+        var stack = new ServicoStack(app, "Teste", StackProps.builder().build(), rede,
+                new ServicoStack.Config("pedidos", "../pedidos", Map.of()));
+
+        var template = Template.fromStack(stack);
+        template.hasResourceProperties("AWS::RDS::DBInstance", Map.of(
+                "Engine", "postgres",
+                "PubliclyAccessible", false));
+        template.resourceCountIs("AWS::ECS::Service", 1);
+    }
+}
+```
+
+Esse tipo de teste pega regressões de segurança (alguém deixou o banco público) antes do deploy, e roda no mesmo `mvn verify` do pipeline. Ele faz o build da imagem Docker durante a síntese por causa do `fromAsset`, então rode com o Docker disponível.
+
+## Na entrevista
+
+**O que é infraestrutura como código e por que usar?** É descrever a infraestrutura em arquivos versionados e aplicá-los com uma ferramenta. Dá reprodutibilidade (criar staging igual a produção), revisão em pull request, histórico e recuperação de desastre.
+
+**Qual a diferença entre CDK e Terraform?** O CDK usa linguagens de programação e gera CloudFormation, que guarda o estado na AWS; é focado na AWS. O Terraform usa HCL, guarda o estado num backend que você gerencia e cobre vários provedores. Os dois resolvem o mesmo problema.
+
+**Fargate ou EC2 no ECS?** No Fargate você não gerencia máquinas: paga por vCPU e memória da task. Com EC2 você gerencia as instâncias, o que pode sair mais barato em carga constante e alta, mas dá trabalho de patch e capacidade.
+
+**Como você passa a senha do banco para o container?** Guardando no Secrets Manager e referenciando na task definition como secret. O ECS injeta o valor na inicialização, e a role da task precisa de permissão de leitura. Nunca em variável de ambiente literal no template ou na imagem.
+
+## Pratique
+
+Crie o projeto `infra` e entregue:
+
+1. `RedeStack` e `ServicoStack` como acima, com o serviço de pagamentos atrás de um balanceador **interno**.
+2. Um `cdk diff` comentado no README, explicando três recursos que serão criados.
+3. Um teste com `Template` que falha se o banco ficar público ou se o serviço tiver menos de duas tasks.
+4. O deploy feito, um `curl` em `POST /pedidos` funcionando pelo DNS do balanceador e o `cdk destroy --all` executado no final.
+
+<Quiz question="O que o comando cdk synth faz?" options={["Cria os recursos na conta AWS","Gera os templates CloudFormation sem tocar na conta","Faz bootstrap da conta e da região","Compara o código com o que está implantado"]} answer={1} explanation="synth executa a App e gera os templates em cdk.out. Quem cria recursos é o deploy, e quem compara é o diff." />
+
+<Quiz question="Qual a forma correta de entregar a senha do RDS ao container no ECS?" options={["Variável de ambiente literal na task definition","Senha fixa no application.yml da imagem","Secret do Secrets Manager referenciado na task","Parâmetro passado no comando cdk deploy"]} answer={2} explanation="Com secrets, o ECS lê o valor do Secrets Manager no início da task. A senha nunca aparece no template, na imagem nem no repositório." />
+
+<Quiz question="O que allowDefaultPortFrom faz entre o banco e o serviço?" options={["Abre a porta do banco para toda a VPC","Libera a porta do banco só para o security group do serviço","Torna o banco acessível pela internet","Cria um usuário do banco para o serviço"]} answer={1} explanation="O método adiciona uma regra de entrada no security group do banco permitindo a porta padrão apenas a partir do security group do serviço." />
+
+## Base no CodeForge
+
+- [Microsserviços na prática: Implementando com Java e Spring](/learn/carreira-java/microsservicos-pratica-implementando-java-spring): os serviços que este capítulo implanta.
+- [Amazon ECS: Gerenciando Docker na nuvem AWS](/learn/carreira-nodejs/amazon-ecs-gerenciando-docker-nuvem-aws) e [Amazon VPC: Configurando redes na AWS](/learn/carreira-nodejs/amazon-vpc-configurando-redes-aws): os mesmos serviços da AWS vistos pelo console e pela outra stack.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos) e [Load balancers](/learn/system-design/load-balancers): a teoria dos recursos que o CDK cria.
+- [Microsserviços na prática: Mensageria com RabbitMQ](/learn/carreira-java/microsservicos-pratica-mensageria-rabbitmq): o próximo passo.
+
+## Referências
+
+- [AWS CDK v2 Developer Guide](https://docs.aws.amazon.com/cdk/v2/guide/home.html)
+- [AWS CDK: aws-ecs-patterns](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_ecs_patterns-readme.html)
+- [AWS CDK: assertions](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.assertions-readme.html)

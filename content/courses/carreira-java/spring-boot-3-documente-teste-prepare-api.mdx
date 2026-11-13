@@ -1,0 +1,402 @@
+---
+title: "Spring Boot 3: Documente, teste e prepare uma API para o deploy"
+kind: lesson
+---
+
+A API da clínica já responde com os códigos certos e exige token. Mas ninguém além de você sabe como chamá-la, a única garantia de que ela funciona é você ter testado no Postman, e ela só roda na sua máquina com o banco local. Este capítulo fecha o ciclo: documentação gerada a partir do código, testes automatizados nas camadas que importam e configuração por ambiente para gerar um `.jar` que sobe em produção.
+
+**Você vai aprender:**
+
+- Gerar documentação OpenAPI e Swagger UI com springdoc, incluindo o botão de autenticação JWT
+- Testar regras de negócio com JUnit 5 e Mockito, sem subir o Spring
+- Testar repositories com `@DataJpaTest` e Testcontainers, e controllers com MockMvc
+- Separar configuração por profile e gerar o artefato de deploy com Maven
+
+## Documentação com springdoc
+
+O springdoc lê os seus controllers, DTOs e anotações de validação em tempo de execução e gera uma especificação OpenAPI 3. Uma dependência basta:
+
+```xml
+<dependency>
+    <groupId>org.springdoc</groupId>
+    <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+    <version>2.8.9</version>
+</dependency>
+```
+
+Ao subir a aplicação, dois endereços aparecem: `/v3/api-docs` com o JSON da especificação e `/swagger-ui.html` com a interface interativa. Só que a API está protegida e o Spring Security vai devolver 401 para os dois. Libere-os na `SecurityFilterChain`:
+
+```java
+.authorizeHttpRequests(req -> req
+        .requestMatchers(HttpMethod.POST, "/login").permitAll()
+        .requestMatchers("/v3/api-docs/**", "/swagger-ui.html", "/swagger-ui/**").permitAll()
+        .anyRequest().authenticated())
+```
+
+A interface abre, mas qualquer chamada feita por ela recebe 401, porque ela não sabe mandar o token. Declare o esquema de segurança num bean `OpenAPI` e associe-o aos controllers protegidos:
+
+```java
+@Configuration
+public class OpenApiConfig {
+
+    @Bean
+    OpenAPI openAPI() {
+        return new OpenAPI()
+                .info(new Info()
+                        .title("API Clínica")
+                        .version("v1")
+                        .description("Cadastro de médicos e pacientes e agendamento de consultas"))
+                .components(new Components().addSecuritySchemes("bearer-key",
+                        new SecurityScheme().type(SecurityScheme.Type.HTTP).scheme("bearer").bearerFormat("JWT")));
+    }
+}
+```
+
+```java
+@RestController
+@RequestMapping("/medicos")
+@SecurityRequirement(name = "bearer-key")
+public class MedicoController { /* ... */ }
+```
+
+Agora a interface mostra um botão "Authorize". Você faz login em `POST /login`, copia o token, cola no botão e todas as chamadas seguintes levam o cabeçalho `Authorization`. As anotações de Bean Validation dos records (`@NotBlank`, `@Email`, `@Pattern`) viram restrições na especificação sem esforço extra. Anotações para descrever operações, respostas de erro e exemplos ficam para o capítulo [Swagger: Documentando suas APIs](/learn/carreira-java/swagger-documentando-apis).
+
+## O que testar e em qual camada
+
+Teste tudo pela camada mais barata que ainda prova o comportamento:
+
+| Camada | Ferramenta | O que prova | Velocidade |
+|---|---|---|---|
+| Regra de negócio | JUnit 5 + Mockito | A lógica, isolada de banco e HTTP | Milissegundos |
+| Repository | `@DataJpaTest` + Testcontainers | As consultas JPQL contra um PostgreSQL real | Segundos |
+| Controller | MockMvc | Rotas, status HTTP, JSON, validação e segurança | Segundos |
+| Fluxo completo | `@SpringBootTest` com servidor | Tudo integrado | Mais lento |
+
+O `spring-boot-starter-test` já traz JUnit 5, Mockito, AssertJ e o MockMvc. Para Testcontainers, adicione:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+### Regras de negócio com Mockito
+
+O validador de antecedência mínima não precisa de Spring nenhum. Passe um `Clock` no construtor para controlar o "agora" no teste:
+
+```java
+@Component
+public class ValidadorAntecedencia implements ValidadorAgendamento {
+
+    private final Clock relogio;
+
+    public ValidadorAntecedencia(Clock relogio) {
+        this.relogio = relogio;
+    }
+
+    @Override
+    public void validar(DadosAgendamentoConsulta dados) {
+        var agora = LocalDateTime.now(relogio);
+        if (Duration.between(agora, dados.data()).toMinutes() < 30) {
+            throw new RegraDeNegocioException("Consultas exigem 30 minutos de antecedência");
+        }
+    }
+}
+```
+
+```java
+class ValidadorAntecedenciaTest {
+
+    private final Clock relogio = Clock.fixed(Instant.parse("2026-03-10T13:00:00Z"), ZoneOffset.UTC);
+    private final ValidadorAntecedencia validador = new ValidadorAntecedencia(relogio);
+
+    @Test
+    void recusaConsultaCom20MinutosDeAntecedencia() {
+        var dados = new DadosAgendamentoConsulta(1L, 2L, LocalDateTime.of(2026, 3, 10, 13, 20), null);
+
+        assertThatThrownBy(() -> validador.validar(dados))
+                .isInstanceOf(RegraDeNegocioException.class)
+                .hasMessageContaining("30 minutos");
+    }
+
+    @Test
+    void aceitaConsultaCom1HoraDeAntecedencia() {
+        var dados = new DadosAgendamentoConsulta(1L, 2L, LocalDateTime.of(2026, 3, 10, 14, 0), null);
+
+        assertThatCode(() -> validador.validar(dados)).doesNotThrowAnyException();
+    }
+}
+```
+
+Registre o relógio de produção com um `@Bean Clock clock() { return Clock.systemDefaultZone(); }`. Quando a classe testada depende de um repository, use Mockito:
+
+```java
+@ExtendWith(MockitoExtension.class)
+class ValidadorMedicoAtivoTest {
+
+    @Mock MedicoRepository medicos;
+    @InjectMocks ValidadorMedicoAtivo validador;
+
+    @Test
+    void recusaMedicoInativo() {
+        when(medicos.findAtivoById(7L)).thenReturn(false);
+        var dados = new DadosAgendamentoConsulta(7L, 2L, LocalDateTime.now().plusDays(1), null);
+
+        assertThatThrownBy(() -> validador.validar(dados)).isInstanceOf(RegraDeNegocioException.class);
+        verify(medicos).findAtivoById(7L);
+    }
+}
+```
+
+### Repository com @DataJpaTest e Testcontainers
+
+Consultas JPQL erram de formas que só o banco revela: nome de atributo errado, comparação de data com fuso, `NULL` em subconsulta. Por isso o teste roda contra um PostgreSQL de verdade, num contêiner descartável. Imagine a consulta que escolhe médicos livres:
+
+```java
+public interface MedicoRepository extends JpaRepository<Medico, Long> {
+
+    @Query("""
+            select m from Medico m
+            where m.ativo = true
+              and m.especialidade = :especialidade
+              and m.id not in (select c.medico.id from Consulta c where c.data = :data)
+            order by m.id
+            """)
+    List<Medico> buscarLivres(Especialidade especialidade, LocalDateTime data);
+}
+```
+
+```java
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Testcontainers
+class MedicoRepositoryTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Autowired MedicoRepository repository;
+    @Autowired TestEntityManager em;
+
+    @Test
+    void naoDevolveMedicoQueJaTemConsultaNoHorario() {
+        var data = LocalDateTime.of(2026, 3, 16, 10, 0);
+        var ocupado = em.persist(medico("Ana", "123456", Especialidade.CARDIOLOGIA));
+        var livre = em.persist(medico("Bruno", "654321", Especialidade.CARDIOLOGIA));
+        var paciente = em.persist(paciente("Carla", "12345678900"));
+        em.persist(new Consulta(null, ocupado, paciente, data, null));
+
+        var resultado = repository.buscarLivres(Especialidade.CARDIOLOGIA, data);
+
+        assertThat(resultado).containsExactly(livre);
+    }
+
+    // medico(...) e paciente(...) montam entidades com os construtores do seu modelo
+}
+```
+
+Três peças fazem isso funcionar. `@DataJpaTest` sobe só a camada JPA (entidades, repositories, Flyway) e envolve cada teste numa transação revertida no final. `@AutoConfigureTestDatabase(replace = NONE)` impede o Spring de trocar o seu banco por um H2 em memória. E `@ServiceConnection` (Spring Boot 3.1 ou mais novo) lê host, porta, usuário e senha do contêiner e configura o `DataSource` sozinho, sem `@DynamicPropertySource`. Como o Flyway roda as migrações reais, o teste também prova que elas funcionam.
+
+### Controller com MockMvc
+
+O teste de controller confirma o contrato HTTP: status, JSON, validação e segurança. Use `@SpringBootTest` com `@AutoConfigureMockMvc` para que a cadeia de segurança real participe, e `@WithMockUser` para simular um usuário autenticado sem gerar token:
+
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+@AutoConfigureJsonTesters
+@Import(TestcontainersConfig.class)
+class ConsultaControllerTest {
+
+    @Autowired MockMvc mvc;
+    @Autowired JacksonTester<DadosAgendamentoConsulta> jsonEntrada;
+    @MockitoBean AgendaDeConsultas agenda;
+
+    @Test
+    void semTokenDevolve401() throws Exception {
+        mvc.perform(post("/consultas")).andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @WithMockUser
+    void corpoVazioDevolve400ComProblemDetail() throws Exception {
+        mvc.perform(post("/consultas").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.campos").isArray());
+    }
+
+    @Test
+    @WithMockUser
+    void agendamentoValidoDevolve200() throws Exception {
+        var data = LocalDateTime.now().plusDays(1).withNano(0);
+        var entrada = new DadosAgendamentoConsulta(2L, 5L, data, Especialidade.CARDIOLOGIA);
+        when(agenda.agendar(any())).thenReturn(new DadosDetalhamentoConsulta(10L, 2L, 5L, data));
+
+        mvc.perform(post("/consultas")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(jsonEntrada.write(entrada).getJson()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(10));
+    }
+}
+```
+
+```java
+@TestConfiguration(proxyBeanMethods = false)
+public class TestcontainersConfig {
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer<?> postgres() {
+        return new PostgreSQLContainer<>("postgres:16-alpine");
+    }
+}
+```
+
+`@MockitoBean` (Spring Boot 3.4 ou mais novo, substitui o antigo `@MockBean`) troca o serviço real por um mock no contexto, então o teste foca no que o controller faz com a resposta. Existe também o `@WebMvcTest`, que sobe só a camada web e é mais rápido. Ele registra beans de controller, advice e filtros, mas não seus serviços, então você precisa mockar tudo o que a configuração de segurança usa. Para APIs com JWT, o `@SpringBootTest` costuma dar menos trabalho e testa a configuração real.
+
+<Callout type="warning" title="H2 no teste, PostgreSQL em produção">
+Testar com H2 e rodar com PostgreSQL é a fonte clássica de "passou no CI, quebrou em produção". Os dois divergem em tipos (`TIMESTAMP WITH TIME ZONE`, `JSONB`), em funções, em case de identificadores e em sintaxe de migração. Com Testcontainers o custo é um Docker rodando na máquina e no CI, e você testa o mesmo banco que vai usar.
+</Callout>
+
+## Configuração por ambiente com profiles
+
+A mesma aplicação roda na sua máquina, no CI e em produção, cada um com banco, nível de log e segredos diferentes. Profiles separam isso sem mudar código. O arquivo base tem o que vale em todo lugar; cada `application-<profile>.yml` sobrescreve só o que muda:
+
+```yaml
+# application.yml
+spring:
+  application:
+    name: api-clinica
+  jpa:
+    open-in-view: false
+api:
+  security:
+    token:
+      secret: ${JWT_SECRET}
+```
+
+```yaml
+# application-dev.yml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/clinica
+    username: clinica
+    password: clinica
+  jpa:
+    show-sql: true
+api:
+  security:
+    token:
+      secret: segredo-local-apenas-para-desenvolvimento-32b
+```
+
+```yaml
+# application-prod.yml
+spring:
+  datasource:
+    url: ${DATASOURCE_URL}
+    username: ${DATASOURCE_USERNAME}
+    password: ${DATASOURCE_PASSWORD}
+server:
+  error:
+    include-stacktrace: never
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+```
+
+Ative o profile por variável de ambiente (`SPRING_PROFILES_ACTIVE=prod`), por argumento (`--spring.profiles.active=prod`) ou, no desenvolvimento, pela configuração de execução da IDE. A regra de ouro: segredo de produção nunca entra em arquivo versionado, só em variável de ambiente ou num cofre de segredos lido na inicialização. A propriedade `spring.jpa.open-in-view: false` desliga o padrão que mantém a sessão do Hibernate aberta durante a renderização da resposta, o que esconde consultas N+1 e segura conexões do pool.
+
+Beans também podem depender do profile:
+
+```java
+@Bean
+@Profile("dev")
+CommandLineRunner dadosDeExemplo(MedicoRepository medicos) {
+    return args -> { /* insere médicos fictícios para testar à mão */ };
+}
+```
+
+## Build e execução do artefato
+
+O Spring Boot empacota tudo num jar executável: seu código, as dependências e o Tomcat embutido.
+
+```bash
+./mvnw clean package
+ls target/*.jar
+# target/api-clinica-0.0.1-SNAPSHOT.jar
+
+SPRING_PROFILES_ACTIVE=prod \
+DATASOURCE_URL=jdbc:postgresql://db.interno:5432/clinica \
+DATASOURCE_USERNAME=api \
+DATASOURCE_PASSWORD='...' \
+JWT_SECRET='...' \
+java -Xmx512m -jar target/api-clinica-0.0.1-SNAPSHOT.jar
+```
+
+O `package` roda os testes antes de empacotar, e é isso que você quer. Resista ao `-DskipTests` como hábito: ele existe para emergências, não para "o teste está quebrado, depois eu vejo". No CI, prefira `./mvnw verify`, que vai até a fase de verificação e inclui testes de integração do plugin Failsafe, se você usar.
+
+Antes do deploy, confira três coisas:
+
+- **Health check.** Com `spring-boot-starter-actuator`, `GET /actuator/health` responde `UP` quando a aplicação e o banco estão ok. Orquestradores e load balancers usam isso para decidir se mandam tráfego. Libere essa rota na `SecurityFilterChain`.
+- **Desligamento gracioso.** A partir do Spring Boot 3.4, o servidor para de aceitar requisições novas e espera as em andamento terminarem quando recebe `SIGTERM`. Ajuste o limite com `spring.lifecycle.timeout-per-shutdown-phase`.
+- **Swagger em produção.** Decida conscientemente. Para API interna, deixar a documentação aberta ajuda. Para API pública com dados sensíveis, desligue com `springdoc.swagger-ui.enabled=false` e `springdoc.api-docs.enabled=false` no `application-prod.yml`.
+
+Com o jar pronto, o próximo passo é colocá-lo numa imagem Docker com JRE e camadas separadas para dependências, assunto do capítulo de Docker.
+
+## Na entrevista
+
+**Qual a diferença entre `@SpringBootTest`, `@WebMvcTest` e `@DataJpaTest`?** O primeiro sobe o contexto inteiro. Os outros dois são fatias (slices): `@WebMvcTest` carrega só a camada web e `@DataJpaTest` só JPA, com transação revertida por teste. Fatias são mais rápidas e focadas; o contexto inteiro testa a integração real.
+
+**Por que usar Testcontainers em vez de H2?** Para testar contra o mesmo banco de produção, com os mesmos tipos, funções e migrações. H2 tem modos de compatibilidade, mas não é o PostgreSQL.
+
+**Como você gerencia configuração entre ambientes no Spring Boot?** Arquivo base com o comum, um `application-<profile>.yml` por ambiente, segredos só em variáveis de ambiente ou cofre, e o profile ativado por `SPRING_PROFILES_ACTIVE` no ambiente de execução.
+
+**Como você testa um endpoint protegido sem gerar token?** Com `@WithMockUser` do `spring-security-test`, que coloca um usuário autenticado no contexto do teste. Para JWT há também o pós-processador `jwt()` do MockMvc.
+
+## Pratique
+
+Na API da clínica, entregue:
+
+1. Swagger UI funcionando com o botão "Authorize" e o login documentado.
+2. Testes unitários para dois validadores de agendamento, usando `Clock` fixo e Mockito.
+3. Um `@DataJpaTest` com Testcontainers cobrindo a consulta de médicos livres, incluindo o caso de médico inativo.
+4. Testes de controller cobrindo 401 sem usuário, 400 com corpo inválido e 200 no caminho feliz.
+5. Profiles `dev` e `prod`, e um `README` com o comando exato para gerar o jar e executá-lo com as variáveis de ambiente necessárias.
+
+<Quiz question="O que @ServiceConnection faz num teste com Testcontainers?" options={["Inicia o Docker automaticamente na máquina","Configura o DataSource com os dados do contêiner","Substitui o PostgreSQL por H2","Desliga o Flyway durante os testes"]} answer={1} explanation="A anotação, disponível desde o Spring Boot 3.1, lê URL, usuário e senha do contêiner e cria a conexão, dispensando @DynamicPropertySource." />
+
+<Quiz question="Onde deve ficar a senha do banco de produção?" options={["No application-prod.yml versionado","Numa constante na classe de configuração","Em variável de ambiente ou cofre de segredos","No pom.xml como propriedade"]} answer={2} explanation="Qualquer arquivo versionado expõe o segredo a quem tem acesso ao repositório e ao histórico. O arquivo de profile só referencia a variável, como DATASOURCE_PASSWORD." />
+
+<Quiz question="Por que @DataJpaTest com Replace.NONE?" options={["Para manter o banco configurado em vez de trocar por um embutido","Para não reverter a transação no final","Para carregar os controllers junto","Para pular as migrações do Flyway"]} answer={0} explanation="Por padrão, @DataJpaTest substitui o DataSource por um banco em memória. Replace.NONE preserva o PostgreSQL do contêiner." />
+
+## Base no CodeForge
+
+- [Spring Boot 3: Aplique boas práticas e proteja uma API Rest](/learn/carreira-java/spring-boot-3-aplique-boas-praticas-proteja): o estado da API antes deste capítulo.
+- [Boas práticas de programação: Automatizando testes com Java](/learn/carreira-java/boas-praticas-programacao-automatizando-testes-java): fundamentos de JUnit e Mockito.
+- [Docker na prática para back-end Java](/learn/carreira-java/docker-pratica-para-backend-java): o jar dentro de uma imagem.
+- [Node.js: Implementando testes em uma API](/learn/carreira-nodejs/nodejs-implementando-testes-api): as mesmas camadas de teste em outra stack.
+- [Migrações de schema](/learn/system-design/migracoes-de-schema): por que versionar o banco junto com o código.
+
+## Referências
+
+- [springdoc-openapi](https://springdoc.org/)
+- [Spring Boot: Testing Spring Boot Applications](https://docs.spring.io/spring-boot/reference/testing/spring-boot-applications.html)
+- [Spring Boot: Profiles](https://docs.spring.io/spring-boot/reference/features/profiles.html)
+- [Spring Boot: Externalized Configuration](https://docs.spring.io/spring-boot/reference/features/external-config.html)

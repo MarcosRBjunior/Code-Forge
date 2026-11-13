@@ -1,0 +1,314 @@
+---
+title: "Persistência Poliglota: Arquiteturas e otimização de desempenho"
+kind: lesson
+---
+
+Conforme a API de pedidos cresce, um único banco relacional começa a fazer trabalhos para os quais não foi desenhado: busca textual com erro de digitação no catálogo, carrinhos que expiram sozinhos, produtos com atributos que variam por categoria. Persistência poliglota é usar o banco certo para cada tipo de dado, aceitando o custo de manter mais de um. Mas trocar de banco não conserta consulta mal escrita: antes de adicionar tecnologia, a maioria dos problemas de desempenho se resolve com índice, com o fim do N+1 e com um pool bem dimensionado. Este capítulo cobre as duas coisas, nessa ordem de importância inversa: primeiro a arquitetura, depois a otimização que vale para qualquer arquitetura.
+
+**Você vai aprender:**
+
+- Quando cada modelo de dados (relacional, documento, chave-valor, busca) é a escolha certa
+- Integrar Postgres, MongoDB, Redis e Elasticsearch em uma aplicação Spring
+- Manter vários bancos sincronizados com eventos e aplicar CQRS
+- Encontrar e corrigir N+1 no JPA, usar índices e projeções
+- Dimensionar o pool de conexões e usar cache sem criar inconsistência
+
+## Um banco para cada trabalho
+
+| Modelo | Bom em | Exemplo na loja | Tecnologias |
+|---|---|---|---|
+| Relacional | Transações, integridade, consultas ad hoc com joins | Pedidos, pagamentos, clientes | PostgreSQL, MySQL |
+| Documento | Estruturas aninhadas e esquema flexível, leitura de agregados inteiros | Catálogo com atributos por categoria | MongoDB |
+| Chave-valor | Leitura e escrita em microssegundos por chave, expiração automática | Carrinho, sessão, cache, rate limit | Redis |
+| Busca | Texto livre, relevância, tolerância a erros, filtros facetados | "tenis corrida azul 42" | Elasticsearch, OpenSearch |
+
+O relacional continua sendo o ponto de partida. Pedidos e pagamentos precisam de ACID: um pedido não pode existir com pagamento confirmado e estoque não reservado. Os outros bancos entram quando há uma necessidade concreta que o relacional atende mal, não por curiosidade.
+
+O custo de cada banco novo é real: mais um sistema para operar, monitorar, fazer backup, atualizar e proteger, e principalmente **consistência entre eles**, que deixa de ser garantida por uma transação.
+
+## Integrando no Spring
+
+O Spring Data oferece a mesma abstração de repositório para todos. Cada módulo exige seu starter (`spring-boot-starter-data-jpa`, `-data-mongodb`, `-data-redis`, `-data-elasticsearch`).
+
+### Documento: o catálogo no MongoDB
+
+Um tênis tem tamanho e cor; um notebook tem processador e memória. No relacional, isso vira uma tabela de atributos genérica (EAV) difícil de consultar, ou dezenas de colunas nulas. Num documento, cada produto carrega seus atributos:
+
+```java
+@Document("produtos")
+public record ProdutoCatalogo(
+        @Id String sku,
+        String nome,
+        String categoria,
+        BigDecimal preco,
+        Map<String, Object> atributos,     // {"tamanho": 42, "cor": "azul"}
+        List<String> imagens) {}
+
+public interface CatalogoRepository extends MongoRepository<ProdutoCatalogo, String> {
+    List<ProdutoCatalogo> findByCategoriaAndPrecoLessThan(String categoria, BigDecimal limite);
+
+    @Query("{ 'categoria': ?0, 'atributos.tamanho': ?1 }")
+    List<ProdutoCatalogo> porCategoriaETamanho(String categoria, int tamanho);
+}
+```
+
+A modelagem em documento segue a pergunta "o que é lido junto?". A página de produto lê tudo de uma vez, então nome, preço, atributos e imagens ficam no mesmo documento. Índices continuam sendo necessários: crie um para `categoria` e para os atributos filtrados com frequência.
+
+### Chave-valor: o carrinho no Redis
+
+O carrinho é lido e escrito o tempo todo, pertence a uma sessão e deve sumir se abandonado. Redis com TTL resolve:
+
+```java
+@Repository
+class CarrinhoRepository {
+    private static final Duration VALIDADE = Duration.ofDays(3);
+    private final RedisTemplate<String, Carrinho> redis;
+
+    CarrinhoRepository(RedisTemplate<String, Carrinho> redis) { this.redis = redis; }
+
+    void salvar(long clienteId, Carrinho carrinho) {
+        redis.opsForValue().set("carrinho:" + clienteId, carrinho, VALIDADE);
+    }
+
+    Optional<Carrinho> buscar(long clienteId) {
+        return Optional.ofNullable(redis.opsForValue().get("carrinho:" + clienteId));
+    }
+}
+```
+
+Configure o `RedisTemplate` com um serializador JSON (por exemplo, `Jackson2JsonRedisSerializer`). O padrão do Spring é a serialização Java, que gera bytes ilegíveis e quebra quando a classe muda.
+
+### Busca: o catálogo no Elasticsearch
+
+`LIKE '%tenis%'` no Postgres não usa índice B-tree, não entende "tênis" sem acento nem ordena por relevância. Um motor de busca indexa o texto analisado (minúsculas, sem acento, radicais) e devolve resultados ranqueados:
+
+```java
+@org.springframework.data.elasticsearch.annotations.Document(indexName = "produtos")
+public record ProdutoBusca(
+        @Id String sku,
+        @Field(type = FieldType.Text, analyzer = "brazilian") String nome,
+        @Field(type = FieldType.Keyword) String categoria,
+        @Field(type = FieldType.Double) BigDecimal preco) {}
+
+public interface BuscaRepository extends ElasticsearchRepository<ProdutoBusca, String> {
+    Page<ProdutoBusca> findByNome(String texto, Pageable pagina);
+}
+```
+
+O índice de busca **nunca é a fonte da verdade**. Ele é derivado e pode ser reconstruído a partir do banco principal a qualquer momento.
+
+## Mantendo tudo sincronizado
+
+Com o pedido no Postgres e o catálogo replicado no Mongo e no Elasticsearch, como manter tudo coerente? A tentação é gravar nos três dentro do mesmo método:
+
+```java
+@Transactional
+public void atualizarPreco(String sku, BigDecimal preco) {
+    produtoJpaRepository.atualizarPreco(sku, preco);   // Postgres
+    catalogoRepository.save(...);                      // Mongo: fora da transação
+    buscaRepository.save(...);                         // Elastic: fora da transação
+}
+```
+
+Isso é **dual write** e falha de forma silenciosa: se o Elasticsearch estiver fora, o Postgres faz rollback ou, pior, o Mongo foi gravado e o Postgres não. Não existe transação que abranja os três.
+
+O caminho robusto é ter **uma fonte da verdade** e propagar mudanças por eventos:
+
+1. A escrita acontece só no Postgres, e na mesma transação grava um registro numa tabela **outbox**.
+2. Um publicador (ou CDC com Debezium, lendo o log do Postgres) envia o evento `PrecoAlterado` para o Kafka.
+3. Consumidores idempotentes atualizam o Mongo, o Elasticsearch e invalidam o cache no Redis.
+
+```java
+@Transactional
+public void atualizarPreco(String sku, BigDecimal preco) {
+    var produto = produtos.findBySku(sku).orElseThrow();
+    produto.alterarPreco(preco);
+    outbox.save(Outbox.de("PrecoAlterado", sku, new PrecoAlterado(sku, preco, Instant.now())));
+}
+```
+
+O resultado é **consistência eventual**: por alguns segundos, a busca pode mostrar o preço antigo. Isso precisa ser uma decisão de produto consciente. Para o preço cobrado no checkout, a leitura vem sempre do Postgres.
+
+### CQRS
+
+Esse arranjo tem nome: **CQRS** (Command Query Responsibility Segregation). O lado de escrita (comandos) usa um modelo normalizado e transacional. O lado de leitura (consultas) usa modelos desnormalizados, otimizados para cada tela, atualizados por eventos.
+
+Um exemplo concreto: a tela "meus pedidos" precisa de pedido, itens, nome dos produtos, status de entrega e transportadora. No modelo de escrita isso é um join de cinco tabelas. No modelo de leitura é um documento por pedido, já montado, lido por uma chave. A consulta mais frequente fica trivial.
+
+CQRS não exige bancos diferentes: uma view materializada ou uma tabela de leitura no próprio Postgres já é CQRS. Comece assim e só separe o banco quando a carga justificar.
+
+## Otimização: o que resolve 90% dos casos
+
+### Índices
+
+Uma consulta sem índice adequado lê a tabela inteira. Descubra com `EXPLAIN ANALYZE`:
+
+```sql
+explain analyze
+select id, status, total, criado_em
+from pedidos
+where cliente_id = 4821 and status = 'PAGO'
+order by criado_em desc
+limit 20;
+
+-- Seq Scan on pedidos (rows=2.000.000) ... Execution Time: 812 ms
+
+create index concurrently idx_pedidos_cliente_status_data
+    on pedidos (cliente_id, status, criado_em desc);
+
+-- Index Scan using idx_pedidos_cliente_status_data ... Execution Time: 0.3 ms
+```
+
+A ordem das colunas num índice composto importa: igualdade primeiro (`cliente_id`, `status`), depois a coluna de ordenação ou intervalo. Esse índice também atende consultas só por `cliente_id`, mas não consultas só por `status`. E todo índice tem custo: deixa a escrita mais lenta e ocupa espaço. Crie para as consultas reais, observadas no `pg_stat_statements`, não para todas as colunas. Em produção, `create index concurrently` evita bloquear a tabela.
+
+### O problema N+1 no JPA
+
+É o problema de desempenho mais comum em aplicações Spring:
+
+```java
+@Entity
+class Pedido {
+    @Id Long id;
+    @ManyToOne(fetch = FetchType.LAZY) Cliente cliente;
+    @OneToMany(mappedBy = "pedido") List<ItemPedido> itens;
+    // ...
+}
+
+List<Pedido> pedidos = pedidoRepository.findByStatus(Status.PAGO);   // 1 consulta
+for (var p : pedidos) {
+    System.out.println(p.getCliente().getNome() + " " + p.getItens().size()); // +2 por pedido
+}
+```
+
+Com 100 pedidos, isso gera 1 consulta para a lista, mais 100 para clientes e 100 para itens: 201 idas ao banco onde 1 ou 2 bastariam. No seu notebook, com o banco local, são 40 ms. Em produção, com 2 ms de rede por consulta e 1.000 pedidos, são segundos.
+
+Para ver, ligue as estatísticas do Hibernate em desenvolvimento:
+
+```yaml
+spring:
+  jpa:
+    open-in-view: false
+    properties:
+      hibernate:
+        generate_statistics: true
+        default_batch_fetch_size: 50
+logging:
+  level:
+    org.hibernate.SQL: debug
+```
+
+As correções, da mais pontual à mais geral:
+
+```java
+public interface PedidoRepository extends JpaRepository<Pedido, Long> {
+
+    // 1. JOIN FETCH: traz cliente e itens na mesma consulta
+    @Query("select distinct p from Pedido p join fetch p.cliente join fetch p.itens where p.status = :status")
+    List<Pedido> pagosComDetalhes(@Param("status") Status status);
+
+    // 2. EntityGraph: mesmo efeito, declarativo
+    @EntityGraph(attributePaths = {"cliente", "itens"})
+    List<Pedido> findByStatus(Status status);
+
+    // 3. Projeção em DTO: só as colunas que a tela usa, sem entidades gerenciadas
+    @Query("""
+           select new br.com.loja.pedidos.ResumoPedido(p.id, c.nome, p.total, p.status)
+           from Pedido p join p.cliente c
+           where p.status = :status
+           """)
+    List<ResumoPedido> resumos(@Param("status") Status status);
+}
+
+public record ResumoPedido(Long id, String cliente, BigDecimal total, Status status) {}
+```
+
+`default_batch_fetch_size` é a rede de segurança global: em vez de uma consulta por associação, o Hibernate carrega as associações preguiçosas em lotes com `IN (...)`, transformando 200 consultas em 4 ou 5. Para listagens, a projeção em DTO costuma ser a melhor opção: menos dados trafegados e nenhum risco de lazy loading.
+
+<Callout type="warning" title="JOIN FETCH de coleção com paginação">
+Usar `join fetch` em uma coleção (`p.itens`) junto com `Pageable` faz o Hibernate trazer todas as linhas e paginar em memória, com um aviso no log (HHH90003004) que quase ninguém lê. Com 2 milhões de pedidos, isso derruba a aplicação. Para listas paginadas, pagine os ids primeiro e busque os detalhes numa segunda consulta, use projeção em DTO ou conte com o `default_batch_fetch_size`.
+</Callout>
+
+`open-in-view: false` também é importante: com o padrão ligado, a sessão do Hibernate fica aberta até a renderização da resposta, e lazy loading acidental no serializador JSON gera consultas escondidas, segurando uma conexão do pool durante toda a requisição.
+
+### Escritas em lote
+
+Para inserir muitos registros, habilite o batch do JDBC:
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+```
+
+Com `GenerationType.IDENTITY`, o Hibernate precisa do id de cada linha logo após o insert e **desliga o batch de inserts**. Use `GenerationType.SEQUENCE` com `allocationSize` maior que 1 para aproveitar o batch.
+
+### Pool de conexões
+
+Cada conexão ao Postgres é um processo no servidor, com memória própria. O HikariCP (padrão do Spring Boot) mantém um pool reutilizável. O instinto é aumentar o pool quando a aplicação fica lenta, e quase sempre é o erro: mais conexões disputando os mesmos núcleos do banco aumentam a contenção e a latência de todas.
+
+```yaml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 10
+      connection-timeout: 3000      # falha rápido em vez de esperar 30 s
+      max-lifetime: 1800000
+```
+
+A documentação do HikariCP sugere como ponto de partida algo próximo de `(núcleos do banco * 2) + discos`. Some todas as réplicas: 10 réplicas da API com pool de 20 são 200 conexões, e o `max_connections` padrão do Postgres é 100. Acompanhe as métricas `hikaricp.connections.pending` e `hikaricp.connections.usage` no Actuator: requisições esperando conexão indicam transações longas ou consultas lentas, que é o que precisa ser corrigido.
+
+### Cache
+
+O cache mais rápido é a consulta que não acontece. Use para dados lidos muito mais do que escritos, como o produto por SKU, com o padrão **cache-aside**: lê do cache, se não houver, lê do banco e grava no cache com TTL. O `@Cacheable` do Spring faz isso. Os cuidados:
+
+- Invalide na escrita (`@CacheEvict`) ou pelo evento de mudança, e mantenha TTL mesmo assim, como garantia.
+- Não faça cache de dados que precisam ser exatos no momento (saldo, estoque no checkout).
+- Proteja chaves muito acessadas contra **cache stampede**: quando expiram, milhares de requisições vão ao banco ao mesmo tempo. `@Cacheable(sync = true)` serializa o recarregamento dentro de uma instância.
+
+## Na entrevista
+
+**Quando você usaria MongoDB em vez de Postgres?** Quando os dados são agregados lidos inteiros, com estrutura variável por registro, e a aplicação não depende de transações entre muitas entidades nem de joins ad hoc. Para dados financeiros e relacionais por natureza, Postgres. Hoje o Postgres com JSONB cobre parte dos casos de documento sem um banco extra.
+
+**O que é o problema N+1 e como resolver?** Uma consulta busca N entidades e o acesso a uma associação preguiçosa dispara mais uma consulta por entidade. Resolve-se com `join fetch`, `@EntityGraph`, projeções em DTO ou carregamento em lote com `default_batch_fetch_size`.
+
+**Por que não gravar no banco e no Elasticsearch no mesmo método?** Porque não há transação entre os dois: uma escrita pode falhar e a outra não, e os dados divergem sem aviso. O padrão é ter uma fonte da verdade e propagar a mudança por eventos com outbox ou CDC, aceitando consistência eventual.
+
+**Aumentar o pool de conexões resolve lentidão?** Raramente. O banco tem núcleos finitos, e mais conexões aumentam a contenção. Pool pequeno com consultas rápidas atende mais do que pool grande com consultas lentas.
+
+## Pratique
+
+Evolua a API de pedidos para persistência poliglota:
+
+1. Gere 1 milhão de pedidos no Postgres e meça com `EXPLAIN ANALYZE` a consulta de "pedidos pagos de um cliente, mais recentes primeiro", antes e depois de um índice composto.
+2. Escreva um teste que conta as consultas do Hibernate (via `Statistics`) para listar 50 pedidos com cliente e itens, mostre o N+1 e corrija com `@EntityGraph` e com uma projeção em DTO.
+3. Mova o carrinho para o Redis com TTL de 3 dias e serialização JSON.
+4. Crie o modelo de leitura "meus pedidos" no MongoDB, atualizado por um consumidor Kafka idempotente a partir de uma outbox.
+5. Indexe o catálogo no Elasticsearch com analisador em português e um endpoint de busca que encontre "tenis azul" para o produto "Tênis corrida azul".
+6. Documente no README a fonte da verdade de cada dado e o atraso máximo aceitável de cada modelo de leitura.
+
+<Quiz question="Uma listagem de 100 pedidos acessa p.getCliente() em cada item e gera 101 consultas. Qual é a correção mais direta?" options={["Aumentar o pool de conexões","Usar join fetch ou @EntityGraph para o cliente","Trocar LAZY por EAGER em todas as associações","Colocar um índice na tabela de clientes"]} answer={1} explanation="O join fetch ou o EntityGraph trazem o cliente na mesma consulta. EAGER global piora outras consultas, e pool ou índice não reduzem o número de idas ao banco." />
+
+<Quiz question="Qual é o risco de gravar no Postgres e no Elasticsearch no mesmo método de serviço?" options={["O Elasticsearch fica mais lento","Uma escrita pode falhar e a outra não, divergindo os dados","O Postgres bloqueia a tabela inteira","Nenhum, se o método tiver @Transactional"]} answer={1} explanation="O @Transactional só cobre o banco relacional. Sem uma transação entre os dois sistemas, falhas parciais deixam os dados divergentes; por isso se usa outbox ou CDC." />
+
+<Quiz question="Por que GenerationType.IDENTITY atrapalha inserts em lote no Hibernate?" options={["Porque gera ids repetidos","Porque o Hibernate precisa do id de cada linha logo após o insert","Porque não funciona no PostgreSQL","Porque desliga o cache de segundo nível"]} answer={1} explanation="Com IDENTITY, o id só existe depois do insert, então o Hibernate executa cada insert na hora. Com SEQUENCE e allocationSize, ele reserva ids antes e agrupa os inserts." />
+
+## Base no CodeForge
+
+- [SQL vs NoSQL](/learn/system-design/sql-vs-nosql), [Bancos de documentos](/learn/system-design/bancos-de-documentos), [Chave-valor](/learn/system-design/chave-valor) e [Busca full-text](/learn/system-design/busca-full-text): os modelos de dados em detalhe.
+- [CQRS](/learn/system-design/cqrs), [Outbox](/learn/system-design/outbox) e [CDC](/learn/system-design/cdc): sincronizar vários bancos sem dual write.
+- [Índices](/learn/sql/indices) e [EXPLAIN](/learn/sql/explain): ler planos de execução e criar os índices certos.
+- [Pool de conexões](/learn/system-design/pool-de-conexoes) e [Cache stampede](/learn/system-design/cache-stampede): os dois cuidados de desempenho mais esquecidos.
+- [Java: Persistência de dados e consultas com Spring Data JPA](/learn/carreira-java/java-persistencia-dados-consultas-spring-data-jpa): a base de JPA que este capítulo otimiza.
+
+## Referências
+
+- [PostgreSQL: Indexes](https://www.postgresql.org/docs/current/indexes.html)
+- [HikariCP](https://github.com/brettwooldridge/HikariCP)
+- [Spring Data MongoDB](https://docs.spring.io/spring-data/mongodb/reference/)
+- [Spring Data Redis](https://docs.spring.io/spring-data/redis/reference/)
