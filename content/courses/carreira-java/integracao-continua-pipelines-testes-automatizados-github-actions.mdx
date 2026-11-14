@@ -1,0 +1,267 @@
+---
+title: "Integração Contínua: Pipelines e testes automatizados com GitHub Actions"
+kind: lesson
+---
+
+Você tem uma suíte de testes unitários e de integração que pega bugs de verdade. Ela só vale alguma coisa se rodar sempre, e não apenas quando alguém lembra de rodar `mvn verify` antes do push. Integração contínua (CI) é a prática de integrar mudanças pequenas várias vezes por dia, cada uma verificada por um pipeline automático num ambiente limpo, que bloqueia o merge se algo falhar. Neste capítulo você monta esse pipeline para o serviço de pedidos com GitHub Actions: compilação com Maven, testes unitários e de integração com Testcontainers, cache de dependências, relatórios de teste e cobertura, e regras de proteção de branch.
+
+**Você vai aprender:**
+
+- A anatomia de um workflow: eventos, jobs, steps, runners e permissões
+- Configurar Java 21 com `actions/setup-java` e cache do Maven
+- Rodar `mvn verify` com Testcontainers no runner e publicar relatórios de teste
+- Medir cobertura com JaCoCo e guardar artefatos do build
+- Tornar o pipeline obrigatório e rápido o bastante para ninguém querer pular
+
+## O que o pipeline precisa garantir
+
+Para um serviço Spring Boot, um pipeline de pull request responde a uma pergunta: "se eu fizer merge disto, a branch principal continua compilando, passando nos testes e gerando um artefato implantável?". As etapas, da mais barata para a mais cara:
+
+1. Baixar dependências exatamente como declaradas no `pom.xml`.
+2. Compilar (com avisos tratados como erro, se o time quiser).
+3. Testes unitários (Surefire), em segundos.
+4. Testes de integração (Failsafe), com Postgres e RabbitMQ em containers.
+5. Empacotar o jar e, opcionalmente, verificar cobertura mínima.
+
+No Maven, um único `mvn verify` executa tudo isso na ordem certa, porque as fases do ciclo de vida são cumulativas: `verify` passa por `compile`, `test`, `package` e `integration-test`. Por isso o comando do CI é quase sempre `verify`, e não `install` (que copia o jar para o repositório local, inútil num runner descartável) nem `package` (que pula os testes de integração do Failsafe).
+
+## Anatomia de um workflow
+
+Workflows são arquivos YAML em `.github/workflows/`. O primeiro, completo:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configura Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build e testes
+        run: ./mvnw -B -ntp verify
+```
+
+Linha a linha:
+
+- **`on`**: os eventos que disparam. Em todo pull request e em cada push na `main` (para saber que a branch principal continua verde depois do merge).
+- **`permissions`**: o token automático do workflow só pode ler o repositório. Comece pelo mínimo e libere o que cada job precisar.
+- **`concurrency`**: se você der outro push na mesma branch, a execução anterior é cancelada. Economiza minutos e mostra só o resultado que importa.
+- **`runs-on: ubuntu-latest`**: uma VM nova, limpa, criada para este job e destruída no final. Ela já vem com Docker, o que o Testcontainers precisa.
+- **`timeout-minutes`**: sem isso, um teste travado consome até seis horas de runner.
+- **`actions/setup-java@v4`**: instala o JDK Temurin 21 e, com `cache: maven`, salva e restaura `~/.m2/repository` usando o hash dos `pom.xml` como chave. A segunda execução não baixa a internet inteira de novo.
+- **`./mvnw -B -ntp verify`**: o Maven Wrapper garante a mesma versão do Maven que você usa localmente. `-B` é modo batch (sem cores e prompts) e `-ntp` (`--no-transfer-progress`) tira as milhares de linhas de progresso de download do log.
+
+Garanta que o `mvnw` está versionado com permissão de execução (`git update-index --chmod=+x mvnw`), ou o step falha com "Permission denied" no Linux mesmo funcionando no seu Windows.
+
+## Testcontainers no runner
+
+Os testes do capítulo anterior sobem Postgres e RabbitMQ com Testcontainers. Nos runners Linux hospedados pelo GitHub, o Docker já está disponível e nada precisa mudar no workflow. Isso é uma vantagem sobre a abordagem de `services:` do Actions (containers de serviço declarados no YAML): com Testcontainers, o mesmo teste roda igual na sua máquina e no CI, e cada execução usa a versão de imagem que o código declara.
+
+Duas melhorias de desempenho valem a pena. Fixe as tags das imagens (`postgres:16-alpine`, nunca `latest`) para o comportamento ser reprodutível. E reaproveite o contexto do Spring entre classes de teste (a `ContainersConfig` compartilhada), para os containers subirem uma vez por execução e não uma por classe.
+
+<Callout type="warning" title="Teste que passa local e falha no CI">
+A causa mais comum é dependência de estado do ambiente: fuso horário (o runner usa UTC; seu notebook, `America/Sao_Paulo`), locale (formato de número e data), ordem de execução dos testes ou dados que sobraram de outro teste. Não "conserte" pondo `-DskipTests` ou rodando de novo até passar. Fixe o fuso nos testes que dependem dele (injete um `Clock` em vez de usar `LocalDate.now()` direto), limpe o banco antes de cada teste e trate teste instável como bug.
+</Callout>
+
+## Relatórios de teste
+
+Quando um teste falha, ninguém quer garimpar o log do Maven. O Surefire e o Failsafe gravam relatórios JUnit XML em `target/surefire-reports` e `target/failsafe-reports`. Uma action de relatório lê esses arquivos e mostra os testes que falharam direto no resumo do job e como anotações no pull request:
+
+```yaml
+      - name: Build e testes
+        run: ./mvnw -B -ntp verify
+
+      - name: Relatório de testes
+        if: always()
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: |
+            **/target/surefire-reports/TEST-*.xml
+            **/target/failsafe-reports/TEST-*.xml
+          include_passed: false
+
+      - name: Guarda relatórios
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorios-teste
+          path: |
+            **/target/surefire-reports/
+            **/target/failsafe-reports/
+          retention-days: 7
+```
+
+O `if: always()` é essencial: sem ele, o step de relatório é pulado justamente quando os testes falham, que é quando você precisa dele. A action de relatório cria um check run, então o job precisa de `checks: write` em `permissions` (dentro do job, para não abrir a permissão para todos).
+
+O `upload-artifact` guarda os arquivos brutos (incluindo a saída de cada teste) só quando o build falha, para você baixar e investigar.
+
+## Cobertura com JaCoCo
+
+Cobertura não prova qualidade, mas uma queda brusca num pull request é um sinal útil. O plugin JaCoCo instrumenta os testes e gera o relatório no `verify`:
+
+```xml
+<plugin>
+  <groupId>org.jacoco</groupId>
+  <artifactId>jacoco-maven-plugin</artifactId>
+  <version>0.8.12</version>
+  <executions>
+    <execution>
+      <id>agente</id>
+      <goals><goal>prepare-agent</goal><goal>prepare-agent-integration</goal></goals>
+    </execution>
+    <execution>
+      <id>relatorio</id>
+      <phase>verify</phase>
+      <goals><goal>report</goal><goal>report-integration</goal></goals>
+    </execution>
+    <execution>
+      <id>minimo</id>
+      <phase>verify</phase>
+      <goals><goal>check</goal></goals>
+      <configuration>
+        <rules>
+          <rule>
+            <element>BUNDLE</element>
+            <limits>
+              <limit>
+                <counter>LINE</counter>
+                <value>COVEREDRATIO</value>
+                <minimum>0.70</minimum>
+              </limit>
+            </limits>
+          </rule>
+        </rules>
+      </configuration>
+    </execution>
+  </executions>
+</plugin>
+```
+
+Com a regra `check`, o próprio `mvn verify` falha se a cobertura de linhas cair abaixo de 70%. O limite fica no `pom.xml`, versionado e revisado, e não numa configuração escondida de alguma ferramenta. Comece com o valor atual do projeto e suba aos poucos; um limite irreal só gera testes inúteis.
+
+Publique o HTML como artefato (`target/site/jacoco/`) para quem quiser navegar pelas linhas não cobertas.
+
+## Separando jobs e usando matriz
+
+Um job único é o mais simples e quase sempre suficiente. Quando o pipeline cresce, separar ajuda a ter feedback mais cedo e paralelismo:
+
+```yaml
+jobs:
+  unitarios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      - run: ./mvnw -B -ntp test
+
+  integracao:
+    needs: unitarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      - run: ./mvnw -B -ntp verify -DskipUTs=true
+```
+
+O `needs` faz os testes de integração só rodarem se os unitários passarem. O Maven não tem uma propriedade pronta para pular só o Surefire (`-DskipTests` pula também o Failsafe), então crie a sua: no `maven-surefire-plugin`, configure `<skipTests>${skipUTs}</skipTests>` e declare `<skipUTs>false</skipUTs>` em `properties`. Se a sua biblioteca precisar suportar mais de uma versão do Java, uma matriz roda o mesmo job em paralelo para cada uma:
+
+```yaml
+    strategy:
+      matrix:
+        java: ['17', '21']
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '${{ matrix.java }}', cache: maven }
+```
+
+Para um serviço que roda numa versão só, matriz de Java é desperdício. Use a versão de produção.
+
+## Repositório com vários serviços
+
+Com pedidos e pagamentos no mesmo repositório, não faz sentido testar os dois a cada mudança num deles. O filtro `paths` dispara o workflow só quando o diretório do serviço muda:
+
+```yaml
+on:
+  pull_request:
+    paths: ['pedidos/**', '.github/workflows/pedidos.yml']
+
+defaults:
+  run:
+    working-directory: pedidos
+```
+
+Atenção ao cache: com `pom.xml` fora da raiz, informe `cache-dependency-path: pedidos/pom.xml` no `setup-java`, para a chave do cache considerar o arquivo certo.
+
+## Tornando o pipeline obrigatório
+
+Um pipeline que pode ser ignorado será ignorado. Nas configurações do repositório (Settings, Rules ou Branches), crie uma regra para a `main`:
+
+- Exigir pull request antes do merge, com pelo menos uma aprovação.
+- Exigir que os status checks passem (selecione o job `build`) e que a branch esteja atualizada.
+- Bloquear push direto e force push.
+
+A partir daí, código só chega à `main` testado. Mantenha o pipeline abaixo de dez minutos: acima disso, as pessoas começam a abrir pull requests gigantes para "esperar menos vezes", e a integração deixa de ser contínua.
+
+## Na entrevista
+
+**Qual a diferença entre integração contínua, entrega contínua e deploy contínuo?** CI integra e verifica cada mudança automaticamente. Entrega contínua mantém a branch principal sempre pronta para produção, com o deploy disparado por uma decisão humana. Deploy contínuo leva cada mudança aprovada à produção sem intervenção.
+
+**Por que mvn verify e não mvn install no CI?** `verify` roda todas as fases até os testes de integração e suas verificações. `install` faz o mesmo e ainda copia o artefato para o repositório local, o que não serve para nada num runner descartável.
+
+**Como acelerar um pipeline Java?** Cache do repositório Maven, reaproveitamento do contexto Spring e dos containers nos testes, testes paralelos onde forem independentes, jobs separados para feedback rápido e filtros de caminho em monorepos.
+
+**O que fazer com um teste instável?** Tratar como bug: identificar a fonte de não determinismo (tempo, ordem, concorrência, dados compartilhados) e corrigir. Enquanto isso, isolar o teste com um ticket aberto, nunca ignorar falhas em silêncio.
+
+## Pratique
+
+No repositório da loja, entregue:
+
+1. `.github/workflows/pedidos.yml` com checkout, `setup-java` com cache, `./mvnw -B -ntp verify` e relatório de testes com `if: always()`.
+2. JaCoCo com limite mínimo de cobertura igual à cobertura atual arredondada para baixo.
+3. Filtro de `paths` para o workflow só rodar quando `pedidos/` mudar.
+4. Uma regra de proteção da `main` exigindo o check.
+5. Um pull request de prova com um teste quebrado de propósito, mostrando o bloqueio e a anotação do teste falho, e depois o conserto.
+
+<Quiz question="Qual comando Maven roda testes unitários e de integração do Failsafe num pipeline?" options={["mvn package","mvn test","mvn verify","mvn compile"]} answer={2} explanation="verify percorre test, package e integration-test e ainda verifica o resultado do Failsafe. package e test param antes dos testes de integração." />
+
+<Quiz question="O que cache: maven no actions/setup-java guarda entre execuções?" options={["O diretório target com as classes compiladas","O repositório local de dependências do Maven","A imagem Docker do Postgres","Os relatórios do Surefire"]} answer={1} explanation="A action salva e restaura ~/.m2/repository, com chave baseada no hash dos pom.xml, evitando baixar todas as dependências a cada execução." />
+
+<Quiz question="Por que o step de relatório de testes usa if: always()?" options={["Para rodar antes do build","Para rodar mesmo quando os testes falham","Para rodar só na branch main","Para rodar em paralelo com o build"]} answer={1} explanation="Sem always, steps posteriores a uma falha são pulados. O relatório é mais útil exatamente quando há testes falhando." />
+
+## Base no CodeForge
+
+- [Testes de Integração em Java: Garantindo qualidade em back-ends modernos](/learn/carreira-java/testes-integracao-java-garantindo-qualidade-back-ends): a suíte que este pipeline executa.
+- [Integração Contínua: Pipelines e testes automatizados com GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipelines-testes-automatizados-github-actions): o mesmo tema na carreira Node, com service containers.
+- [CI/CD](/learn/system-design/ci-cd): onde a integração contínua entra no ciclo de entrega.
+- [Integração Contínua: Pipeline Docker no GitHub Actions](/learn/carreira-java/integracao-continua-pipeline-docker-github-actions): o próximo passo, publicar a imagem.
+
+## Referências
+
+- [GitHub Docs: Building and testing Java with Maven](https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-java-with-maven)
+- [actions/setup-java](https://github.com/actions/setup-java)
+- [GitHub Docs: Workflow syntax](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions)
+- [Maven Failsafe Plugin](https://maven.apache.org/surefire/maven-failsafe-plugin/)

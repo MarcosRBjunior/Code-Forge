@@ -1,0 +1,408 @@
+---
+title: "Integração Contínua: Pipeline de entrega e implementação contínua na EC2"
+kind: lesson
+---
+
+Muita aplicação Java em produção não roda em contêiner: roda como um `.jar` executável numa máquina virtual, gerenciado pelo systemd. É simples, barato e previsível, mas o deploy costuma ser o ponto fraco: alguém copia o JAR por SCP, reinicia o serviço e confere o log. Neste capítulo você automatiza esse caminho para a API de pedidos em instâncias EC2: o GitHub Actions testa com Maven, empacota o JAR, publica no S3 e pede ao AWS CodeDeploy para trocar a versão uma instância por vez, com verificação pelo Actuator e rollback automático se a versão nova não ficar saudável.
+
+**Você vai aprender:**
+
+- Rodar uma aplicação Spring Boot como serviço systemd numa EC2
+- Montar um pacote do CodeDeploy com `appspec.yml` e scripts de ciclo de vida
+- Escrever o workflow com `setup-java`, cache do Maven e credenciais por OIDC
+- Separar implantação contínua em staging de entrega contínua em produção
+- Configurar rollback automático e redeploy manual de uma versão anterior
+
+## Entrega contínua, implantação contínua e o artefato único
+
+Recapitulando rapidamente: na **entrega contínua**, todo commit que passa no pipeline gera um artefato pronto para produção, e o deploy depende de uma aprovação. Na **implantação contínua**, o artefato aprovado vai para produção sozinho. O fluxo deste capítulo faz implantação contínua em staging e entrega contínua em produção, que é o arranjo mais comum em times que estão começando a automatizar.
+
+A regra que sustenta as duas: **o JAR é construído uma vez**. O mesmo arquivo, identificado pelo SHA do commit, passa por staging e chega a produção. Se o pipeline rodasse `mvn package` de novo para produção, uma dependência `SNAPSHOT` ou um plugin com versão flutuante poderia gerar um binário diferente do que foi testado. O capítulo equivalente da [carreira Node.js](/learn/carreira-nodejs/integracao-continua-pipeline-entrega-implementacao-continua-ec2) aprofunda esses conceitos com contêineres e SSM; aqui o foco é o caminho do JAR.
+
+## A aplicação como serviço systemd
+
+Antes de automatizar, a instância precisa saber rodar a API. Numa Amazon Linux 2023, instale o Java 21 (Amazon Corretto) e o agente do CodeDeploy pelo `user_data` ou pelo Ansible:
+
+```bash
+#!/usr/bin/env bash
+# user_data da instância
+set -euo pipefail
+dnf install -y java-21-amazon-corretto-headless ruby wget
+useradd --system --home /opt/api-pedidos --shell /sbin/nologin pedidos
+mkdir -p /opt/api-pedidos /etc/api-pedidos
+
+cd /tmp
+wget https://aws-codedeploy-us-east-1.s3.us-east-1.amazonaws.com/latest/install
+chmod +x ./install && ./install auto
+```
+
+O serviço systemd é a peça que transforma `java -jar` num processo gerenciado: sobe no boot, reinicia se cair e recebe as variáveis de ambiente de um arquivo que fica só na máquina.
+
+```ini
+# /etc/systemd/system/api-pedidos.service
+[Unit]
+Description=API de pedidos (Spring Boot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pedidos
+WorkingDirectory=/opt/api-pedidos
+EnvironmentFile=/etc/api-pedidos/api.env
+ExecStart=/usr/bin/java -XX:MaxRAMPercentage=70.0 -jar /opt/api-pedidos/app.jar
+SuccessExitStatus=143
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# /etc/api-pedidos/api.env (permissão 600, dono root)
+SPRING_PROFILES_ACTIVE=prod
+SPRING_DATASOURCE_URL=jdbc:postgresql://pedidos.xxxx.us-east-1.rds.amazonaws.com:5432/pedidos
+SPRING_DATASOURCE_USERNAME=pedidos
+SPRING_DATASOURCE_PASSWORD=vem-do-parameter-store
+```
+
+Dois detalhes são específicos de Java. `SuccessExitStatus=143` existe porque a JVM, ao terminar por SIGTERM, sai com código 143 (128 + 15); sem essa linha, o systemd registra toda parada normal como falha. E `TimeoutStopSec=40` dá tempo ao graceful shutdown do Spring Boot (`server.shutdown=graceful`, padrão desde o Boot 3.4) para terminar as requisições em andamento antes do SIGKILL.
+
+No Maven, o `spring-boot-maven-plugin` gera o JAR executável no `package`. Fixe o nome final para o pipeline não depender da versão do `pom.xml`:
+
+```xml
+<build>
+  <finalName>app</finalName>
+  <plugins>
+    <plugin>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-maven-plugin</artifactId>
+    </plugin>
+  </plugins>
+</build>
+```
+
+## O pacote do CodeDeploy
+
+O CodeDeploy recebe um zip com um `appspec.yml` na raiz. O arquivo diz para onde copiar os arquivos e quais scripts rodar em cada fase do ciclo de vida:
+
+```text
+deploy/
+├── appspec.yml
+└── scripts/
+    ├── parar.sh
+    ├── preparar.sh
+    ├── iniciar.sh
+    └── validar.sh
+```
+
+```yaml
+# deploy/appspec.yml
+version: 0.0
+os: linux
+files:
+  - source: app.jar
+    destination: /opt/api-pedidos
+file_exists_behavior: OVERWRITE
+hooks:
+  ApplicationStop:
+    - location: scripts/parar.sh
+      timeout: 60
+      runas: root
+  AfterInstall:
+    - location: scripts/preparar.sh
+      timeout: 30
+      runas: root
+  ApplicationStart:
+    - location: scripts/iniciar.sh
+      timeout: 30
+      runas: root
+  ValidateService:
+    - location: scripts/validar.sh
+      timeout: 180
+      runas: root
+```
+
+```bash
+# deploy/scripts/parar.sh
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl stop api-pedidos || true
+```
+
+```bash
+# deploy/scripts/preparar.sh
+#!/usr/bin/env bash
+set -euo pipefail
+chown pedidos:pedidos /opt/api-pedidos/app.jar
+chmod 500 /opt/api-pedidos/app.jar
+```
+
+```bash
+# deploy/scripts/iniciar.sh
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl daemon-reload
+systemctl enable --now api-pedidos
+```
+
+```bash
+# deploy/scripts/validar.sh
+#!/usr/bin/env bash
+set -uo pipefail
+for i in $(seq 1 60); do
+  if curl -fs http://localhost:8080/actuator/health/readiness > /dev/null; then
+    echo "API pronta após $((i * 2))s"
+    exit 0
+  fi
+  sleep 2
+done
+echo "API não ficou pronta em 120s"
+journalctl -u api-pedidos -n 80 --no-pager
+exit 1
+```
+
+O `validar.sh` é o que dá segurança ao processo. A JVM com Spring e JPA leva de 15 a 40 segundos para subir; o script espera até 120 segundos pela readiness do Actuator, que só responde 200 quando o contexto subiu e (se você incluiu o `db` no grupo) o banco está acessível. Se falhar, o script imprime o fim do log do serviço, que aparece no console do CodeDeploy, e sai com erro. Esse erro dispara o rollback.
+
+Como o endpoint de readiness precisa existir, a API tem o Actuator com os grupos de probes ligados:
+
+```yaml
+# application-prod.yaml
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState, db
+```
+
+<Callout type="warning" title="O ApplicationStop roda o script da versão anterior">
+O hook `ApplicationStop` acontece antes de o pacote novo ser baixado, então o CodeDeploy executa o `parar.sh` da revisão que está instalada, não o da nova. Duas consequências pegam todo mundo: no primeiro deploy numa instância não existe revisão anterior e o hook é pulado; e se uma versão antiga tinha um `parar.sh` quebrado, todo deploy seguinte falha nele, mesmo com o script corrigido no repositório. Mantenha o `parar.sh` tolerante (`|| true`) e, para destravar uma instância presa, faça o deploy com `--ignore-application-stop-failures` uma única vez.
+</Callout>
+
+## O deployment group: uma instância por vez, atrás do ALB
+
+O CodeDeploy organiza tudo em aplicação e *deployment groups*. Cada ambiente é um grupo que seleciona instâncias por tag e define como trocar a versão:
+
+```bash
+aws deploy create-application --application-name api-pedidos --compute-platform Server
+
+aws deploy create-deployment-group \
+  --application-name api-pedidos \
+  --deployment-group-name production \
+  --service-role-arn arn:aws:iam::123456789012:role/codedeploy-servico \
+  --ec2-tag-filters Key=Ambiente,Value=production,Type=KEY_AND_VALUE \
+  --deployment-config-name CodeDeployDefault.OneAtATime \
+  --deployment-style deploymentType=IN_PLACE,deploymentOption=WITH_TRAFFIC_CONTROL \
+  --load-balancer-info "targetGroupInfoList=[{name=api-pedidos-prod}]" \
+  --auto-rollback-configuration enabled=true,events=DEPLOYMENT_FAILURE
+```
+
+Com `WITH_TRAFFIC_CONTROL` e o target group informado, o CodeDeploy tira a instância do ALB antes de parar a API e só a devolve depois que o `ValidateService` passa. O `OneAtATime` garante que as outras instâncias continuem atendendo. Com duas ou mais instâncias, os usuários não percebem o deploy. Repita o comando para `staging` com a tag e o target group de staging.
+
+O `--auto-rollback-configuration` é o rollback automático: se qualquer instância falhar em qualquer hook, o CodeDeploy cria um novo deploy com a última revisão que funcionou nesse grupo.
+
+## Credenciais do pipeline com OIDC
+
+O pipeline não guarda chave de acesso. Ele troca o token OIDC que o GitHub emite para cada execução por credenciais temporárias de uma role, cuja trust policy só aceita este repositório nos environments `staging` e `production`. A configuração do provider OIDC e da trust policy é a mesma descrita no capítulo de EC2 da carreira Node.js; muda só a política de permissões, que aqui é do S3 e do CodeDeploy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::minha-org-artefatos/api-pedidos/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "codedeploy:CreateDeployment",
+        "codedeploy:GetDeployment",
+        "codedeploy:GetDeploymentConfig",
+        "codedeploy:RegisterApplicationRevision",
+        "codedeploy:GetApplicationRevision"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Em produção, troque o `"Resource": "*"` do CodeDeploy pelas ARNs da aplicação, dos deployment groups e das configurações de deploy. As instâncias, por sua vez, precisam de um perfil IAM com leitura do bucket de artefatos, para o agente baixar o pacote.
+
+## O workflow
+
+```yaml
+# .github/workflows/deploy-ec2.yml
+name: Deploy EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "SHA de um build anterior para reimplantar"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ROLE_ARN: arn:aws:iam::123456789012:role/github-deploy-api-pedidos
+  BUCKET: minha-org-artefatos
+
+jobs:
+  build:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Testes e empacotamento
+        run: ./mvnw -B -ntp verify
+
+      - name: Montar o pacote do CodeDeploy
+        run: |
+          cp target/app.jar deploy/app.jar
+          (cd deploy && zip -qr ../api-pedidos.zip .)
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Publicar no S3
+        run: aws s3 cp api-pedidos.zip "s3://$BUCKET/api-pedidos/${{ github.sha }}.zip"
+
+  staging:
+    needs: build
+    if: always() && (needs.build.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency: deploy-staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy
+        env:
+          SHA: ${{ inputs.sha || github.sha }}
+        run: |
+          ID=$(aws deploy create-deployment \
+            --application-name api-pedidos --deployment-group-name staging \
+            --s3-location bucket=$BUCKET,key=api-pedidos/$SHA.zip,bundleType=zip \
+            --description "commit $SHA" --query deploymentId --output text)
+          echo "deploy $ID"
+          aws deploy wait deployment-successful --deployment-id "$ID"
+
+  production:
+    needs: staging
+    if: always() && needs.staging.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.minhaloja.com.br
+    concurrency: deploy-production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy
+        env:
+          SHA: ${{ inputs.sha || github.sha }}
+        run: |
+          ID=$(aws deploy create-deployment \
+            --application-name api-pedidos --deployment-group-name production \
+            --s3-location bucket=$BUCKET,key=api-pedidos/$SHA.zip,bundleType=zip \
+            --description "commit $SHA" --query deploymentId --output text)
+          aws deploy wait deployment-successful --deployment-id "$ID"
+      - name: Smoke test
+        run: curl -fsS --retry 5 --retry-delay 5 --retry-all-errors https://api.minhaloja.com.br/actuator/health
+```
+
+O que cada parte faz:
+
+- **`setup-java` com `cache: maven`** guarda o `~/.m2/repository` entre execuções, com a chave derivada dos `pom.xml`. O build cai de minutos para segundos quando as dependências não mudam. As flags `-B` (modo batch) e `-ntp` (sem progresso de download) deixam o log legível.
+- **`mvn verify`** roda testes unitários (Surefire) e de integração (Failsafe) e empacota. Se você usa Testcontainers, o runner `ubuntu-latest` já tem Docker. Nada chega ao S3 sem passar por eles.
+- **O zip no S3 com o SHA na chave** é o artefato único e imutável. Configure uma regra de ciclo de vida no bucket que mantenha, por exemplo, 90 dias de pacotes.
+- **`aws deploy wait deployment-successful`** faz o job esperar o deploy terminar e falhar se o CodeDeploy falhar. Sem isso, o pipeline ficaria verde enquanto o deploy quebra em silêncio.
+- **O environment `production`** tem *Required reviewers* configurado no GitHub. O job para e espera aprovação: essa pausa é a entrega contínua. Tire a regra e o mesmo arquivo vira implantação contínua.
+- **`concurrency`** por ambiente impede dois deploys simultâneos no mesmo deployment group (o CodeDeploy recusaria o segundo de qualquer forma, com erro).
+
+## Voltando atrás
+
+Há três níveis de rollback neste desenho, do mais automático ao mais manual:
+
+1. **Durante o deploy**: o `validar.sh` falha, o CodeDeploy marca a instância como falha, para de avançar (as outras continuam na versão antiga) e reimplanta a última revisão boa onde já tinha trocado.
+2. **Depois do deploy, por alarme**: adicione `DEPLOYMENT_STOP_ON_ALARM` aos eventos de rollback e associe um alarme do CloudWatch (taxa de 5xx no ALB, por exemplo) ao deployment group. Se o alarme disparar durante o deploy, ele é interrompido e revertido.
+3. **Manual, pelo pipeline**: em Actions, Deploy EC2, Run workflow, informe o SHA da última versão boa. O job `build` é pulado e o pacote antigo, que continua no S3, é implantado em staging e depois em produção.
+
+```bash
+gh workflow run deploy-ec2.yml -f sha=8d1f3c0b2a...
+```
+
+Em todos os casos, o código volta, mas o banco não. Se a versão nova rodou uma migração do Flyway que removeu ou renomeou uma coluna, o JAR antigo vai quebrar ao subir. As estratégias para isso (migrações compatíveis em duas fases, *expand* e *contract*) estão no capítulo de [rollback e teste de carga](/learn/carreira-java/integracao-continua-rollback-teste-carga).
+
+## Na entrevista
+
+**Como você faz deploy de uma aplicação Spring Boot em EC2 sem downtime?** Com mais de uma instância atrás de um balanceador e um deploy rolling, uma por vez: tira a instância do target group, troca o JAR, espera a readiness do Actuator e devolve ao balanceador. O CodeDeploy com `WITH_TRAFFIC_CONTROL` e `OneAtATime` faz exatamente isso.
+
+**Por que o pipeline não reconstrói o JAR para produção?** Para garantir que o binário em produção é o mesmo que foi testado em staging. Builds repetidos podem divergir por dependências flutuantes ou mudanças no ambiente do runner.
+
+**Por que o systemd precisa de SuccessExitStatus=143 para uma aplicação Java?** Porque a JVM encerrada por SIGTERM sai com código 143, e sem essa configuração o systemd trata toda parada normal como falha.
+
+**O que acontece com o banco num rollback?** Nada, e esse é o problema. Por isso as migrações precisam ser compatíveis com a versão anterior da aplicação.
+
+## Pratique
+
+Monte o deploy da API de pedidos em duas instâncias EC2 atrás de um ALB e entregue:
+
+1. O `user_data` (ou playbook) que instala Corretto 21, o agente do CodeDeploy, o usuário e o serviço systemd.
+2. A pasta `deploy/` com `appspec.yml` e os quatro scripts.
+3. Os deployment groups `staging` e `production` com rollback automático, criados por CLI, Terraform ou CDK.
+4. O workflow `deploy-ec2.yml` com cache do Maven, OIDC e aprovação em produção.
+5. Uma prova de rollback: publique uma versão cuja readiness nunca fica verde (por exemplo, apontando para um banco inexistente) e mostre no console do CodeDeploy a instância falhando no `ValidateService` e o rollback automático.
+
+<Quiz question="Qual hook do appspec.yml deve conferir se a API Spring subiu de verdade antes de devolver a instância ao balanceador?" options={["ApplicationStop","BeforeInstall","AfterInstall","ValidateService"]} answer={3} explanation="O ValidateService roda depois do ApplicationStart. Se ele falha, a instância não volta ao target group e o rollback automático é disparado." />
+
+<Quiz question="O que o cache: maven do actions/setup-java guarda entre execuções?" options={["O diretório target com as classes compiladas","O repositório local de dependências do Maven","O JAR final pronto para o deploy","Os relatórios de teste do Surefire"]} answer={1} explanation="Ele salva o ~/.m2/repository com uma chave baseada nos pom.xml. Quando as dependências não mudam, elas não são baixadas de novo." />
+
+<Quiz question="No primeiro deploy numa instância nova, o que acontece com o hook ApplicationStop?" options={["Ele é pulado, porque não há revisão anterior instalada","Ele roda o script do pacote novo","Ele falha e aborta o deploy","Ele para todas as aplicações Java da máquina"]} answer={0} explanation="O ApplicationStop usa os scripts da revisão já instalada. Sem revisão anterior, não há o que executar, e o deploy segue para as fases seguintes." />
+
+## Base no CodeForge
+
+- [Integração Contínua: Pipelines e testes automatizados com GitHub Actions](/learn/carreira-java/integracao-continua-pipelines-testes-automatizados-github-actions): o workflow de testes com Maven que este pipeline reaproveita.
+- [Integração Contínua: Pipeline de entrega e implementação contínua na EC2 (Node.js)](/learn/carreira-nodejs/integracao-continua-pipeline-entrega-implementacao-continua-ec2): o mesmo objetivo com contêineres e SSM, e o OIDC explicado passo a passo.
+- [CI/CD](/learn/system-design/ci-cd) e [Rolling](/learn/system-design/rolling): os conceitos de entrega contínua e deploy gradual.
+- [Rollbacks](/learn/system-design/rollbacks): por que voltar atrás precisa ser planejado antes do deploy.
+
+## Referências
+
+- [AWS CodeDeploy: AppSpec hooks section](https://docs.aws.amazon.com/codedeploy/latest/userguide/reference-appspec-file-structure-hooks.html)
+- [actions/setup-java](https://github.com/actions/setup-java)
+- [Configuring OpenID Connect in Amazon Web Services](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
+- [AWS CodeDeploy: Redeploy and roll back a deployment](https://docs.aws.amazon.com/codedeploy/latest/userguide/deployments-rollback-and-redeploy.html)

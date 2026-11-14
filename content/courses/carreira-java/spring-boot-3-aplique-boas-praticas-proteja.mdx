@@ -1,0 +1,509 @@
+---
+title: "Spring Boot 3: Aplique boas práticas e proteja uma API Rest"
+kind: lesson
+---
+
+Uma API que só "funciona" ainda não está pronta. Ela responde 200 para tudo, devolve a stack trace quando algo dá errado e aceita qualquer requisição de qualquer pessoa. Neste capítulo você pega a API da clínica (médicos, pacientes e consultas) e faz o que separa um projeto de estudo de um serviço de produção: códigos HTTP corretos, erros padronizados com `ProblemDetail` e autenticação stateless com Spring Security e JWT.
+
+**Você vai aprender:**
+
+- Usar `ResponseEntity` para devolver o código HTTP certo em cada operação
+- Centralizar o tratamento de erros com `@RestControllerAdvice` e `ProblemDetail` (RFC 9457)
+- Configurar o Spring Security 6 com `SecurityFilterChain`, `UserDetailsService` e BCrypt
+- Emitir e validar tokens JWT num filtro stateless
+
+## O ponto de partida
+
+No capítulo anterior a API ganhou entidades JPA, DTOs em `record`, migrações com Flyway e validação com Bean Validation. Um controller típico estava assim:
+
+```java
+@RestController
+@RequestMapping("/medicos")
+public class MedicoController {
+
+    private final MedicoRepository repository;
+
+    public MedicoController(MedicoRepository repository) {
+        this.repository = repository;
+    }
+
+    @PostMapping
+    @Transactional
+    public void cadastrar(@RequestBody @Valid DadosCadastroMedico dados) {
+        repository.save(new Medico(dados));
+    }
+
+    @DeleteMapping("/{id}")
+    @Transactional
+    public void excluir(@PathVariable Long id) {
+        repository.getReferenceById(id).inativar();
+    }
+}
+```
+
+Funciona, mas tem três problemas. O cadastro responde 200 sem corpo, quando o cliente precisa saber o ID e o endereço do recurso criado. A exclusão de um ID inexistente estoura uma exceção que vira um 500 genérico. E qualquer um na internet pode chamar os dois métodos.
+
+## ResponseEntity e os códigos HTTP certos
+
+`ResponseEntity` representa a resposta inteira: status, cabeçalhos e corpo. Com ele o controller diz exatamente o que aconteceu.
+
+| Operação | Código | Corpo | Observação |
+|---|---|---|---|
+| Criar (POST) | 201 Created | Recurso criado | Cabeçalho `Location` com a URI nova |
+| Listar, detalhar (GET) | 200 OK | Dados | Lista paginada ou um item |
+| Atualizar (PUT, PATCH) | 200 OK | Recurso atualizado | Ou 204 se não devolver corpo |
+| Excluir (DELETE) | 204 No Content | Vazio | Repetir o DELETE deve dar o mesmo resultado |
+| Não encontrado | 404 Not Found | Problema | ID que não existe |
+| Entrada inválida | 400 Bad Request | Problema com os campos | Falha do Bean Validation |
+| Regra de negócio violada | 422 Unprocessable Content | Problema | Ex.: consulta fora do horário |
+
+O controller reescrito:
+
+```java
+@RestController
+@RequestMapping("/medicos")
+public class MedicoController {
+
+    private final MedicoRepository repository;
+
+    public MedicoController(MedicoRepository repository) {
+        this.repository = repository;
+    }
+
+    @PostMapping
+    @Transactional
+    public ResponseEntity<DadosDetalhamentoMedico> cadastrar(
+            @RequestBody @Valid DadosCadastroMedico dados,
+            UriComponentsBuilder uriBuilder) {
+        var medico = repository.save(new Medico(dados));
+        var uri = uriBuilder.path("/medicos/{id}").buildAndExpand(medico.getId()).toUri();
+        return ResponseEntity.created(uri).body(new DadosDetalhamentoMedico(medico));
+    }
+
+    @GetMapping
+    public ResponseEntity<Page<DadosListagemMedico>> listar(
+            @PageableDefault(size = 10, sort = "nome") Pageable paginacao) {
+        return ResponseEntity.ok(repository.findAllByAtivoTrue(paginacao).map(DadosListagemMedico::new));
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<DadosDetalhamentoMedico> detalhar(@PathVariable Long id) {
+        var medico = repository.findById(id)
+                .orElseThrow(() -> new RecursoNaoEncontradoException("Médico %d não encontrado".formatted(id)));
+        return ResponseEntity.ok(new DadosDetalhamentoMedico(medico));
+    }
+
+    @DeleteMapping("/{id}")
+    @Transactional
+    public ResponseEntity<Void> excluir(@PathVariable Long id) {
+        var medico = repository.findById(id)
+                .orElseThrow(() -> new RecursoNaoEncontradoException("Médico %d não encontrado".formatted(id)));
+        medico.inativar();
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+```java
+public record DadosDetalhamentoMedico(Long id, String nome, String email, String crm,
+                                      Especialidade especialidade, boolean ativo) {
+    public DadosDetalhamentoMedico(Medico m) {
+        this(m.getId(), m.getNome(), m.getEmail(), m.getCrm(), m.getEspecialidade(), m.isAtivo());
+    }
+}
+```
+
+Dois detalhes importam. O `UriComponentsBuilder` injetado já conhece o host e a porta da requisição, então a URI do `Location` fica certa em qualquer ambiente. E a resposta é sempre um DTO, nunca a entidade: devolver `Medico` direto expõe campos internos, acopla o contrato da API ao modelo do banco e pode disparar carregamento preguiçoso (lazy loading) de relacionamentos durante a serialização.
+
+Repare também que `getReferenceById` virou `findById`. O primeiro devolve um proxy sem consultar o banco e só falha quando você toca num atributo, longe do ponto de origem. Quando você precisa responder 404, busque de verdade.
+
+## Tratamento de erros centralizado
+
+Espalhar `try/catch` pelos controllers repete código e gera respostas diferentes para o mesmo erro. O Spring oferece um ponto único: uma classe com `@RestControllerAdvice` cujos métodos `@ExceptionHandler` interceptam exceções lançadas por qualquer controller.
+
+O formato da resposta também tem padrão. A RFC 9457 (sucessora da RFC 7807) define o "Problem Details": um JSON com `type`, `title`, `status`, `detail` e `instance`, servido com `Content-Type: application/problem+json`. O Spring Framework 6 implementa isso na classe `ProblemDetail`.
+
+```java
+public class RecursoNaoEncontradoException extends RuntimeException {
+    public RecursoNaoEncontradoException(String mensagem) { super(mensagem); }
+}
+
+public class RegraDeNegocioException extends RuntimeException {
+    public RegraDeNegocioException(String mensagem) { super(mensagem); }
+}
+```
+
+```java
+@RestControllerAdvice
+public class TratadorDeErros {
+
+    private static final Logger log = LoggerFactory.getLogger(TratadorDeErros.class);
+
+    @ExceptionHandler(RecursoNaoEncontradoException.class)
+    public ProblemDetail naoEncontrado(RecursoNaoEncontradoException ex) {
+        var problema = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+        problema.setTitle("Recurso não encontrado");
+        return problema;
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail validacao(MethodArgumentNotValidException ex) {
+        var problema = ex.getBody(); // já vem com status 400
+        problema.setTitle("Dados inválidos");
+        problema.setDetail("Um ou mais campos não passaram na validação");
+        var campos = ex.getFieldErrors().stream()
+                .map(e -> new ErroDeCampo(e.getField(), e.getDefaultMessage()))
+                .toList();
+        problema.setProperty("campos", campos);
+        return problema;
+    }
+
+    @ExceptionHandler(RegraDeNegocioException.class)
+    public ProblemDetail regraDeNegocio(RegraDeNegocioException ex) {
+        var problema = ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage());
+        problema.setTitle("Regra de negócio violada");
+        return problema;
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail inesperado(Exception ex) {
+        log.error("Erro não tratado", ex);
+        var problema = ProblemDetail.forStatus(HttpStatus.INTERNAL_SERVER_ERROR);
+        problema.setTitle("Erro interno");
+        problema.setDetail("Tente novamente mais tarde");
+        return problema;
+    }
+
+    record ErroDeCampo(String campo, String mensagem) {}
+}
+```
+
+Uma requisição com CRM vazio agora recebe:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Dados inválidos",
+  "status": 400,
+  "detail": "Um ou mais campos não passaram na validação",
+  "instance": "/medicos",
+  "campos": [{ "campo": "crm", "mensagem": "must not be blank" }]
+}
+```
+
+Algumas decisões do código acima. `MethodArgumentNotValidException` já implementa `ErrorResponse` no Spring 6, então `ex.getBody()` devolve um `ProblemDetail` pronto para enriquecer. O tratador genérico de `Exception` registra a stack trace no log, mas nunca a manda ao cliente: mensagem de exceção interna pode revelar nome de tabela, versão de biblioteca ou caminho de arquivo. E as mensagens de validação saem traduzidas se você criar `src/main/resources/ValidationMessages.properties` ou usar o atributo `message` das anotações.
+
+Se você só quer o formato padrão para as exceções do próprio Spring (método não suportado, JSON malformado), a propriedade `spring.mvc.problemdetails.enabled=true` liga isso sem nenhum código.
+
+### Regras de negócio fora do controller
+
+O 422 aparece quando a entrada é bem formada, mas viola uma regra: agendar consulta com médico inativo, fora do horário da clínica ou com menos de 30 minutos de antecedência. Essas regras moram num serviço, não no controller:
+
+```java
+@Service
+public class AgendaDeConsultas {
+
+    private final List<ValidadorAgendamento> validadores;
+    private final ConsultaRepository consultas;
+
+    public AgendaDeConsultas(List<ValidadorAgendamento> validadores, ConsultaRepository consultas) {
+        this.validadores = validadores;
+        this.consultas = consultas;
+    }
+
+    @Transactional
+    public DadosDetalhamentoConsulta agendar(DadosAgendamentoConsulta dados) {
+        validadores.forEach(v -> v.validar(dados)); // cada um lança RegraDeNegocioException
+        // ... escolhe médico, cria e salva a consulta
+    }
+}
+
+public interface ValidadorAgendamento {
+    void validar(DadosAgendamentoConsulta dados);
+}
+
+@Component
+class ValidadorHorarioFuncionamento implements ValidadorAgendamento {
+    public void validar(DadosAgendamentoConsulta dados) {
+        var data = dados.data();
+        var domingo = data.getDayOfWeek() == DayOfWeek.SUNDAY;
+        var foraDoHorario = data.getHour() < 7 || data.getHour() > 18;
+        if (domingo || foraDoHorario) {
+            throw new RegraDeNegocioException("Consulta fora do horário de funcionamento");
+        }
+    }
+}
+```
+
+O Spring injeta todas as implementações de `ValidadorAgendamento` na lista. Uma regra nova é uma classe nova, sem mexer em `AgendaDeConsultas`: é o princípio aberto/fechado na prática, e cada validador se testa isoladamente.
+
+## Spring Security: o que muda ao adicionar o starter
+
+Adicione a dependência e a do JWT:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>com.auth0</groupId>
+    <artifactId>java-jwt</artifactId>
+    <version>4.4.0</version>
+</dependency>
+```
+
+Só com o starter, todas as rotas passam a exigir login, aparece um formulário em `/login` e um usuário `user` com senha impressa no log. Isso é o padrão seguro, mas não é o que uma API REST quer: ela não tem formulário nem sessão, e cada requisição deve trazer sua credencial.
+
+Primeiro, os usuários. Uma migração nova (use a próxima versão livre da sua pasta `db/migration`):
+
+```sql
+-- V7__create_table_usuarios.sql
+CREATE TABLE usuarios (
+    id    BIGSERIAL PRIMARY KEY,
+    login VARCHAR(100) NOT NULL UNIQUE,
+    senha VARCHAR(255) NOT NULL
+);
+```
+
+```java
+@Entity
+@Table(name = "usuarios")
+public class Usuario {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String login;
+    private String senha; // hash BCrypt, nunca texto puro
+    // getters
+}
+
+public interface UsuarioRepository extends JpaRepository<Usuario, Long> {
+    Optional<Usuario> findByLogin(String login);
+}
+```
+
+O Spring Security não conhece a sua entidade. Ele pergunta a um `UserDetailsService` "quem é este login?" e recebe um `UserDetails`:
+
+```java
+@Service
+public class AutenticacaoService implements UserDetailsService {
+
+    private final UsuarioRepository repository;
+
+    public AutenticacaoService(UsuarioRepository repository) {
+        this.repository = repository;
+    }
+
+    @Override
+    public UserDetails loadUserByUsername(String login) {
+        return repository.findByLogin(login)
+                .map(u -> User.withUsername(u.getLogin()).password(u.getSenha()).roles("USER").build())
+                .orElseThrow(() -> new UsernameNotFoundException(login));
+    }
+}
+```
+
+Converter para o `User` do Spring, em vez de fazer a entidade implementar `UserDetails`, mantém o modelo de domínio livre de detalhes do framework.
+
+## JWT: emitindo e validando
+
+O fluxo é: o cliente manda login e senha para `POST /login`, recebe um token assinado e o envia em toda requisição no cabeçalho `Authorization: Bearer <token>`. O servidor não guarda nada: valida a assinatura e a expiração a cada chamada.
+
+```java
+@Service
+public class TokenService {
+
+    private static final String EMISSOR = "api-clinica";
+    private final Algorithm algoritmo;
+
+    public TokenService(@Value("${api.security.token.secret}") String segredo) {
+        this.algoritmo = Algorithm.HMAC256(segredo);
+    }
+
+    public String gerar(String login) {
+        var agora = Instant.now();
+        return JWT.create()
+                .withIssuer(EMISSOR)
+                .withSubject(login)
+                .withIssuedAt(agora)
+                .withExpiresAt(agora.plus(Duration.ofMinutes(30)))
+                .sign(algoritmo);
+    }
+
+    public Optional<String> loginDoToken(String token) {
+        try {
+            return Optional.of(JWT.require(algoritmo).withIssuer(EMISSOR).build().verify(token).getSubject());
+        } catch (JWTVerificationException e) {
+            return Optional.empty(); // assinatura errada, expirado ou malformado
+        }
+    }
+}
+```
+
+```yaml
+# application.yml
+api:
+  security:
+    token:
+      secret: ${JWT_SECRET}
+```
+
+O endpoint de login usa o `AuthenticationManager`, que chama o `UserDetailsService` e compara a senha com o `PasswordEncoder`:
+
+```java
+@RestController
+@RequestMapping("/login")
+public class AutenticacaoController {
+
+    private final AuthenticationManager manager;
+    private final TokenService tokens;
+
+    public AutenticacaoController(AuthenticationManager manager, TokenService tokens) {
+        this.manager = manager;
+        this.tokens = tokens;
+    }
+
+    @PostMapping
+    public ResponseEntity<DadosToken> login(@RequestBody @Valid DadosLogin dados) {
+        var credenciais = UsernamePasswordAuthenticationToken.unauthenticated(dados.login(), dados.senha());
+        var autenticado = manager.authenticate(credenciais); // lança BadCredentialsException se errar
+        return ResponseEntity.ok(new DadosToken(tokens.gerar(autenticado.getName())));
+    }
+}
+
+public record DadosLogin(@NotBlank String login, @NotBlank String senha) {}
+public record DadosToken(String token) {}
+```
+
+E o filtro que lê o token em cada requisição:
+
+```java
+public class FiltroJwt extends OncePerRequestFilter {
+
+    private final TokenService tokens;
+    private final UserDetailsService usuarios;
+
+    public FiltroJwt(TokenService tokens, UserDetailsService usuarios) {
+        this.tokens = tokens;
+        this.usuarios = usuarios;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+            throws ServletException, IOException {
+        var cabecalho = req.getHeader(HttpHeaders.AUTHORIZATION);
+        if (cabecalho != null && cabecalho.startsWith("Bearer ")) {
+            tokens.loginDoToken(cabecalho.substring(7)).ifPresent(login -> {
+                var usuario = usuarios.loadUserByUsername(login);
+                var auth = UsernamePasswordAuthenticationToken.authenticated(usuario, null, usuario.getAuthorities());
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            });
+        }
+        chain.doFilter(req, res);
+    }
+}
+```
+
+O filtro não rejeita nada sozinho. Ele só preenche o `SecurityContext` quando o token é válido. Quem decide se a rota exige autenticação é a configuração:
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain filterChain(HttpSecurity http, TokenService tokens,
+                                    UserDetailsService usuarios) throws Exception {
+        return http
+                .csrf(csrf -> csrf.disable())
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(req -> req
+                        .requestMatchers(HttpMethod.POST, "/login").permitAll()
+                        .anyRequest().authenticated())
+                .exceptionHandling(e -> e.authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))
+                .addFilterBefore(new FiltroJwt(tokens, usuarios), UsernamePasswordAuthenticationFilter.class)
+                .build();
+    }
+
+    @Bean
+    AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+```
+
+Linha por linha: CSRF desligado porque a API não usa cookie de sessão (o ataque CSRF depende do navegador mandar o cookie sozinho); sessão `STATELESS` para o Spring nunca criar `HttpSession`; só o login é público; requisição sem token válido recebe 401 em vez do redirecionamento para um formulário; e o filtro roda antes do filtro padrão de usuário e senha.
+
+Falta tratar a senha errada no `TratadorDeErros`, devolvendo 401 com mensagem genérica (não diga se o erro foi no login ou na senha, isso ajuda quem tenta descobrir usuários válidos):
+
+```java
+@ExceptionHandler(AuthenticationException.class)
+public ProblemDetail falhaDeAutenticacao(AuthenticationException ex) {
+    var problema = ProblemDetail.forStatusAndDetail(HttpStatus.UNAUTHORIZED, "Login ou senha inválidos");
+    problema.setTitle("Não autenticado");
+    return problema;
+}
+```
+
+Teste o fluxo completo:
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/login -H 'Content-Type: application/json' \
+  -d '{"login":"ana@clinica.com","senha":"s3nh@Forte"}' | jq -r .token)
+
+curl -i localhost:8080/medicos                                  # 401
+curl -i localhost:8080/medicos -H "Authorization: Bearer $TOKEN" # 200
+```
+
+<Callout type="warning" title="Segredo no código e filtro registrado duas vezes">
+Dois erros aparecem em quase todo primeiro projeto com JWT. O primeiro é escrever o segredo do HMAC no `application.yml` versionado: quem lê o repositório emite tokens válidos para qualquer usuário. Leia de variável de ambiente e use pelo menos 32 bytes aleatórios. O segundo é anotar o filtro com `@Component`: o Spring Boot registra todo bean `Filter` no contêiner de servlets automaticamente, e ele roda uma vez fora da cadeia de segurança e outra dentro. Criar o filtro com `new` dentro da configuração, como acima, evita isso.
+</Callout>
+
+## 401 ou 403?
+
+**401 Unauthorized** quer dizer "não sei quem você é": sem token, token expirado ou assinatura inválida. O cliente deve se autenticar de novo. **403 Forbidden** quer dizer "sei quem você é, mas você não pode": um usuário comum tentando excluir médico. O cliente não resolve tentando de novo. Perfis e autorização por papel ficam para os capítulos de Spring Security.
+
+## Na entrevista
+
+**Por que devolver 201 com `Location` no POST?** Porque o cliente precisa saber onde o recurso foi criado sem montar a URL por conta própria. É o contrato definido pelo HTTP para criação e permite navegar a API sem conhecimento prévio das rotas.
+
+**O que é `ProblemDetail` e por que usar?** É a implementação do Spring para a RFC 9457, um formato padrão de erro em JSON. Clientes e gateways sabem interpretá-lo, e a API deixa de inventar um formato diferente para cada erro.
+
+**Por que desabilitar CSRF numa API com JWT é aceitável?** CSRF explora o envio automático de cookies pelo navegador. Se a credencial vai num cabeçalho `Authorization` que o JavaScript precisa colocar explicitamente, um site malicioso não consegue forjá-la. Se você guardar o token em cookie, a proteção volta a ser necessária.
+
+**Qual a desvantagem do JWT stateless?** Revogar é difícil: o token vale até expirar. Por isso a expiração é curta e, quando é preciso derrubar sessões, entra uma lista de bloqueio ou tokens de atualização (refresh tokens) guardados no servidor.
+
+## Pratique
+
+Na API da clínica, entregue:
+
+1. Todos os endpoints de médicos e pacientes devolvendo `ResponseEntity` com os códigos da tabela, incluindo `Location` no cadastro.
+2. Um `@RestControllerAdvice` com handlers para 404, 400 (com a lista de campos), 422, 401 e 500, todos em `ProblemDetail`.
+3. Dois validadores de agendamento (horário de funcionamento e antecedência mínima de 30 minutos) testáveis isoladamente.
+4. Login com JWT de 30 minutos, segredo lido de `JWT_SECRET` e um usuário inicial inserido por migração com a senha já em BCrypt.
+5. Um roteiro com `curl` mostrando 401 sem token, 200 com token e 401 com token adulterado (troque um caractere da assinatura).
+
+<Quiz question="Qual a resposta adequada para um DELETE bem-sucedido que não devolve corpo?" options={["200 OK com corpo vazio","201 Created","204 No Content","202 Accepted"]} answer={2} explanation="204 indica sucesso sem corpo. 201 é para criação e 202 para processamento assíncrono ainda não concluído." />
+
+<Quiz question="Por que o FiltroJwt não lança exceção quando o token é inválido?" options={["Porque exceções em filtros são proibidas","Para que a regra de autorização decida e o entry point responda 401","Porque o Spring ignora tokens inválidos sozinho","Para que o controller trate o erro"]} answer={1} explanation="O filtro só autentica quando pode. Se a rota exigir autenticação e o contexto estiver vazio, o Spring Security chama o authentication entry point, que responde 401. Rotas públicas continuam acessíveis." />
+
+<Quiz question="Agendar uma consulta num domingo, com JSON válido, deve retornar qual código?" options={["400 Bad Request","404 Not Found","409 Conflict","422 Unprocessable Content"]} answer={3} explanation="A requisição está bem formada e passa na validação de campos, mas viola uma regra de negócio. 422 comunica exatamente isso, separando de erros de formato (400)." />
+
+## Base no CodeForge
+
+- [Spring Boot 3: Desenvolva uma API Rest em Java](/learn/carreira-java/spring-boot-3-desenvolva-api-rest-java): a API que este capítulo evolui.
+- [REST](/learn/system-design/rest) e [HTTP/1.1](/learn/redes/http-1): semântica de métodos e códigos de status.
+- [JWT](/learn/system-design/jwt) e [Sessão vs token](/learn/system-design/sessao-vs-token): a teoria por trás da escolha stateless.
+- [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas): por que BCrypt e não SHA-256.
+- [Exceções](/learn/java/excecoes): checked, unchecked e quando criar as suas.
+
+## Referências
+
+- [Spring Framework: Error Responses (ProblemDetail)](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-rest-exceptions.html)
+- [Spring Security: Authorize HttpServletRequests](https://docs.spring.io/spring-security/reference/servlet/authorization/authorize-http-requests.html)
+- [RFC 9457: Problem Details for HTTP APIs](https://datatracker.ietf.org/doc/html/rfc9457)

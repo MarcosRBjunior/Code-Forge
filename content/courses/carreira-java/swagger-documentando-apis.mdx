@@ -1,0 +1,347 @@
+---
+title: "Swagger: Documentando suas APIs"
+kind: lesson
+---
+
+Uma API sem documentação vira uma fila de mensagens no chat: "qual o formato da data?", "esse campo é obrigatório?", "o que volta quando dá erro?". A especificação OpenAPI resolve isso com um contrato legível por pessoas e por máquinas, que gera a interface do Swagger UI, clientes em várias linguagens, mocks e testes de compatibilidade. Neste capítulo você vai além do "adicionei a dependência": documenta operações, erros, exemplos, segurança e versões da API da clínica com springdoc, e entende quando escrever o contrato antes do código.
+
+**Você vai aprender:**
+
+- A diferença entre OpenAPI, Swagger UI e springdoc, e o que cada um faz
+- Documentar operações, parâmetros, respostas de erro e schemas com anotações
+- Organizar a documentação em grupos e configurar autenticação JWT no Swagger UI
+- Escolher entre contrato primeiro (gerando código com OpenAPI Generator) e código primeiro
+
+## Nomes que se confundem
+
+**OpenAPI** é a especificação: um formato YAML ou JSON que descreve rotas, parâmetros, corpos, respostas e segurança de uma API HTTP. A versão atual é a 3.1. **Swagger** era o nome da especificação até a versão 2.0; hoje é a marca das ferramentas em volta dela, como o **Swagger UI** (a página interativa) e o Swagger Editor. **springdoc-openapi** é a biblioteca que inspeciona uma aplicação Spring em execução e gera o documento OpenAPI a partir dos controllers.
+
+Um trecho de especificação, para você saber o que está sendo gerado:
+
+```yaml
+openapi: 3.1.0
+info:
+  title: API Clínica
+  version: v1
+paths:
+  /medicos/{id}:
+    get:
+      tags: [Médicos]
+      summary: Detalha um médico
+      operationId: detalharMedico
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Médico encontrado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DadosDetalhamentoMedico" }
+        "404":
+          description: Médico não existe
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/ProblemDetail" }
+```
+
+## Configurando o springdoc
+
+Com o starter `springdoc-openapi-starter-webmvc-ui` (versão 2.x para Spring Boot 3) no `pom.xml`, ajuste o comportamento pelo `application.yml`:
+
+```yaml
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+    version: openapi_3_1
+  swagger-ui:
+    path: /docs
+    operations-sorter: method
+    tags-sorter: alpha
+    display-request-duration: true
+    persist-authorization: true
+  packages-to-scan: br.com.clinica.api
+  default-produces-media-type: application/json
+```
+
+`packages-to-scan` evita que controllers de bibliotecas apareçam na documentação. `persist-authorization` mantém o token no navegador entre recarregamentos da página, o que poupa paciência durante o desenvolvimento. Com `path: /docs`, a interface fica em `/docs` e redireciona para `/swagger-ui/index.html`, então libere os dois caminhos e `/v3/api-docs/**` no Spring Security.
+
+As informações gerais da API vão num bean:
+
+```java
+@Configuration
+public class OpenApiConfig {
+
+    @Bean
+    OpenAPI apiClinica(@Value("${app.versao:dev}") String versao) {
+        return new OpenAPI()
+                .info(new Info()
+                        .title("API Clínica")
+                        .version(versao)
+                        .description("""
+                                Cadastro de médicos e pacientes e agendamento de consultas.
+                                Erros seguem a RFC 9457 (application/problem+json).
+                                """)
+                        .contact(new Contact().name("Time Agenda").email("agenda@clinica.com"))
+                        .license(new License().name("Uso interno")))
+                .servers(List.of(
+                        new Server().url("https://api.clinica.com").description("Produção"),
+                        new Server().url("http://localhost:8080").description("Local")));
+    }
+}
+```
+
+## Documentando operações
+
+Sem anotação nenhuma, o springdoc já sabe as rotas, os tipos dos parâmetros e o schema dos records. O que ele não sabe é a intenção: para que serve a operação, quais erros ela devolve e quando. As anotações ficam no pacote `io.swagger.v3.oas.annotations`:
+
+```java
+@RestController
+@RequestMapping("/medicos")
+@Tag(name = "Médicos", description = "Cadastro e consulta do corpo clínico")
+public class MedicoController {
+
+    @Operation(summary = "Detalha um médico",
+               description = "Devolve os dados de um médico, ativo ou inativo.")
+    @ApiResponse(responseCode = "200", description = "Médico encontrado")
+    @ApiResponse(responseCode = "404", description = "Médico não existe",
+            content = @Content(mediaType = "application/problem+json",
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @GetMapping("/{id}")
+    public ResponseEntity<DadosDetalhamentoMedico> detalhar(
+            @Parameter(description = "ID do médico", example = "42") @PathVariable Long id) {
+        // ...
+    }
+
+    @Operation(summary = "Lista médicos ativos",
+               description = "Paginado. Use sort=nome,asc ou sort=especialidade,desc.")
+    @GetMapping
+    public ResponseEntity<Page<DadosListagemMedico>> listar(
+            @ParameterObject @PageableDefault(size = 10, sort = "nome") Pageable paginacao) {
+        // ...
+    }
+
+    @Operation(summary = "Cadastra um médico")
+    @ApiResponse(responseCode = "201", description = "Criado; a URI do recurso vem no cabeçalho Location")
+    @ApiResponse(responseCode = "400", description = "Campos inválidos",
+            content = @Content(mediaType = "application/problem+json",
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @PostMapping
+    public ResponseEntity<DadosDetalhamentoMedico> cadastrar(
+            @RequestBody @Valid DadosCadastroMedico dados, UriComponentsBuilder uri) {
+        // ...
+    }
+}
+```
+
+`@ParameterObject` faz o `Pageable` aparecer como três parâmetros de query (`page`, `size`, `sort`) em vez de um objeto JSON no corpo, que é o que o Spring de fato espera. Sem ele, quem lê a documentação tenta mandar um JSON e não entende por que a paginação não funciona.
+
+Ao começar a anotar respostas, documente explicitamente todas as que importam naquela operação, inclusive a de sucesso, em vez de depender do que a inferência adivinha. Para erros que valem em toda a API (401, 500), não repita a anotação em cada método: o springdoc também lê os `@ExceptionHandler` do seu `@RestControllerAdvice` que tenham `@ResponseStatus` e acrescenta essas respostas a todas as operações, usando o tipo de retorno do handler como schema.
+
+## Documentando schemas
+
+Os records de entrada e saída viram schemas. Bean Validation já vira restrição (`@NotBlank` vira campo obrigatório, `@Size` vira `minLength`/`maxLength`, `@Pattern` vira `pattern`). Com `@Schema` você acrescenta descrição e exemplos realistas:
+
+```java
+@Schema(description = "Dados para cadastrar um médico")
+public record DadosCadastroMedico(
+        @Schema(example = "Ana Souza")
+        @NotBlank String nome,
+
+        @Schema(example = "ana.souza@clinica.com")
+        @NotBlank @Email String email,
+
+        @Schema(description = "CRM sem UF, de 4 a 6 dígitos", example = "123456")
+        @NotBlank @Pattern(regexp = "\\d{4,6}") String crm,
+
+        @Schema(example = "CARDIOLOGIA")
+        @NotNull Especialidade especialidade,
+
+        @Valid @NotNull DadosEndereco endereco) {
+}
+```
+
+Enums aparecem com a lista de valores aceitos. Datas `LocalDateTime` aparecem como `string` com formato `date-time`; se a API espera um formato específico (sem fuso, por exemplo), diga isso no `description` e dê um `example` como `2026-03-16T10:00:00`. Bons exemplos valem mais que boas descrições: o botão "Try it out" do Swagger UI usa os exemplos para preencher o corpo, e uma chamada que funciona de primeira ensina mais que um parágrafo.
+
+Para esconder algo da documentação, use `@Hidden` na classe, no método ou no parâmetro. Um caso comum é `@AuthenticationPrincipal`, que o springdoc já ignora, ou endpoints internos de manutenção.
+
+## Segurança no Swagger UI
+
+Declare o esquema uma vez e diga quais operações o exigem. Você pode fazer isso com anotação na classe de configuração:
+
+```java
+@Configuration
+@SecurityScheme(
+        name = "bearer-jwt",
+        type = SecuritySchemeType.HTTP,
+        scheme = "bearer",
+        bearerFormat = "JWT",
+        description = "Obtenha o token em POST /login e cole aqui, sem o prefixo Bearer")
+public class OpenApiSecurityConfig {
+}
+```
+
+E aplicar em toda a API pelo bean, liberando só o login:
+
+```java
+@Bean
+OpenAPI apiClinica() {
+    return new OpenAPI()
+            .info(new Info().title("API Clínica").version("v1"))
+            .addSecurityItem(new SecurityRequirement().addList("bearer-jwt"));
+}
+```
+
+```java
+@PostMapping("/login")
+@SecurityRequirements // lista vazia: esta operação não exige autenticação
+@Operation(summary = "Autentica e devolve um JWT")
+public ResponseEntity<DadosToken> login(@RequestBody @Valid DadosLogin dados) { /* ... */ }
+```
+
+Repare que existem duas anotações parecidas em pacotes diferentes: `io.swagger.v3.oas.annotations.security.SecurityRequirement` (a anotação) e `io.swagger.v3.oas.models.security.SecurityRequirement` (a classe do modelo usada no bean). Importar a errada é um erro de compilação clássico.
+
+Se a sua API usa OAuth2 com um provedor de identidade (Keycloak, Auth0, Cognito), troque o tipo para `OAUTH2` com o fluxo `authorizationCode`, e o Swagger UI abre a tela de login do provedor.
+
+<Callout type="warning" title="A documentação mostra o que existe, não o que está protegido">
+Liberar `/v3/api-docs` e o Swagger UI na `SecurityFilterChain` não abre os endpoints, só a documentação deles. Mas a documentação expõe rotas administrativas, nomes de campos internos e exemplos que às vezes são dados reais copiados do banco. Em API pública, revise o que aparece, use `@Hidden` em rotas internas, nunca use dado real em `example` e considere desligar a interface em produção com `springdoc.swagger-ui.enabled=false`.
+</Callout>
+
+## Grupos: uma API, várias documentações
+
+Quando a API tem públicos diferentes (aplicativo do paciente, sistema da recepção, administração), uma página única fica confusa. `GroupedOpenApi` separa a documentação em grupos selecionáveis no topo do Swagger UI:
+
+```java
+@Bean
+GroupedOpenApi publica() {
+    return GroupedOpenApi.builder()
+            .group("1-pacientes")
+            .displayName("App do paciente")
+            .pathsToMatch("/consultas/**", "/pacientes/me/**")
+            .build();
+}
+
+@Bean
+GroupedOpenApi administracao() {
+    return GroupedOpenApi.builder()
+            .group("2-admin")
+            .displayName("Administração")
+            .pathsToMatch("/medicos/**", "/usuarios/**")
+            .addOpenApiCustomizer(api -> api.getInfo().setDescription("Uso restrito à equipe interna"))
+            .build();
+}
+```
+
+Cada grupo tem a própria especificação em `/v3/api-docs/<grupo>`. O mesmo mecanismo serve para versões: um grupo para `/v1/**` e outro para `/v2/**` durante uma migração.
+
+## Contrato primeiro ou código primeiro
+
+Até aqui você usou **código primeiro**: escreve o controller, a documentação sai dele. É rápido, a documentação nunca fica desatualizada em relação ao código, e funciona bem quando o mesmo time faz a API e o consumidor.
+
+No **contrato primeiro**, o time escreve o `openapi.yaml` antes, revisa com quem vai consumir (front-end, outro time, parceiro externo) e gera código a partir dele. Vale a pena quando várias equipes trabalham em paralelo, quando o contrato é público e mudanças custam caro, ou quando você quer que o front comece usando um mock antes do back existir.
+
+Em Java, o OpenAPI Generator gera interfaces Spring e os DTOs no build:
+
+```xml
+<plugin>
+    <groupId>org.openapitools</groupId>
+    <artifactId>openapi-generator-maven-plugin</artifactId>
+    <version>7.10.0</version>
+    <executions>
+        <execution>
+            <goals><goal>generate</goal></goals>
+            <configuration>
+                <inputSpec>${project.basedir}/src/main/resources/openapi/clinica.yaml</inputSpec>
+                <generatorName>spring</generatorName>
+                <apiPackage>br.com.clinica.api.contrato</apiPackage>
+                <modelPackage>br.com.clinica.api.contrato.modelo</modelPackage>
+                <configOptions>
+                    <interfaceOnly>true</interfaceOnly>
+                    <useSpringBoot3>true</useSpringBoot3>
+                    <useTags>true</useTags>
+                    <openApiNullable>false</openApiNullable>
+                </configOptions>
+            </configuration>
+        </execution>
+    </executions>
+</plugin>
+```
+
+Com `interfaceOnly`, o plugin gera uma interface por tag (por exemplo `MedicosApi`, a partir da tag `Medicos`) com as anotações de mapeamento, e você só implementa:
+
+```java
+@RestController
+public class MedicoController implements MedicosApi {
+
+    private final MedicoService service;
+
+    public MedicoController(MedicoService service) {
+        this.service = service;
+    }
+
+    @Override
+    public ResponseEntity<MedicoDetalhe> detalharMedico(Long id) {
+        return ResponseEntity.ok(service.detalhar(id));
+    }
+}
+```
+
+O nome do método vem do `operationId` do contrato, e os tipos vêm dos schemas. Se alguém muda o contrato e quebra a implementação, o build falha na compilação, que é exatamente o que você quer. O custo é aprender a escrever OpenAPI à mão e conviver com classes geradas (que vão para `target/`, nunca para o Git).
+
+| Critério | Código primeiro | Contrato primeiro |
+|---|---|---|
+| Velocidade inicial | Alta | Menor, exige escrever o YAML |
+| Fonte da verdade | O código | O arquivo de contrato |
+| Trabalho em paralelo com consumidores | Difícil | Natural, com mock do contrato |
+| Risco de doc divergir do código | Baixo | Nenhum, o código é gerado |
+| Bom para | Times pequenos, APIs internas | APIs públicas, vários times |
+
+Nos dois casos, guarde a especificação gerada ou escrita no repositório e compare versões no CI. Ferramentas de diff de OpenAPI apontam mudanças que quebram clientes, como um campo que virou obrigatório ou uma rota removida. Para exportar a especificação do código primeiro, basta salvar a saída da aplicação rodando:
+
+```bash
+curl -s localhost:8080/v3/api-docs.yaml -o docs/openapi.yaml
+```
+
+## Na entrevista
+
+**Qual a diferença entre Swagger e OpenAPI?** OpenAPI é a especificação do formato, mantida pela OpenAPI Initiative. Swagger é o nome antigo dela (até a 2.0) e hoje designa as ferramentas, como o Swagger UI e o Swagger Editor.
+
+**Contrato primeiro ou código primeiro?** Código primeiro quando o mesmo time controla API e consumidor e quer velocidade. Contrato primeiro quando há vários consumidores, trabalho em paralelo ou contrato público, porque o acordo vem antes da implementação e o código gerado garante que ele seja cumprido.
+
+**Como você documenta erros numa API Spring?** Com um formato padrão (ProblemDetail, RFC 9457), um `@RestControllerAdvice` central e `@ApiResponse` nas operações para os códigos específicos. O springdoc também lê os handlers do advice e adiciona as respostas automaticamente.
+
+**Como evitar quebrar clientes ao evoluir a API?** Só adicionar campos opcionais e rotas novas, nunca remover ou mudar tipo sem nova versão, e rodar um diff de OpenAPI no CI que falha em mudanças incompatíveis.
+
+## Pratique
+
+Documente a API da clínica e entregue:
+
+1. Todos os controllers com `@Tag`, `@Operation` e as respostas de erro relevantes em `application/problem+json`.
+2. Records de entrada com `@Schema(example = ...)` realistas e fictícios, de modo que o "Try it out" funcione sem editar o corpo.
+3. Esquema `bearer-jwt` aplicado globalmente, com o login marcado como público.
+4. Dois grupos: "App do paciente" e "Administração".
+5. Um `docs/openapi.yaml` exportado e versionado, e um parágrafo no README explicando se o projeto segue código primeiro ou contrato primeiro, e por quê.
+
+Desafio: escreva à mão o contrato de um endpoint novo, `GET /medicos/{id}/agenda`, gere a interface com o OpenAPI Generator e implemente-a.
+
+<Quiz question="O que @ParameterObject faz num parâmetro Pageable?" options={["Torna a paginação obrigatória","Mostra page, size e sort como parâmetros de query","Gera um schema JSON para o corpo da requisição","Esconde o parâmetro da documentação"]} answer={1} explanation="Sem a anotação, o springdoc trata Pageable como objeto e o documenta de forma enganosa. Com ela, cada propriedade vira um parâmetro de query, como o Spring realmente espera." />
+
+<Quiz question="Em contrato primeiro com OpenAPI Generator e interfaceOnly, o que acontece se o contrato mudar o tipo de um parâmetro?" options={["Nada, o código continua igual","O Swagger UI mostra um aviso","O build falha porque a implementação não bate com a interface gerada","O springdoc corrige o contrato sozinho"]} answer={2} explanation="A interface é regenerada a cada build. Se a assinatura muda, o controller que a implementa deixa de compilar, revelando a divergência na hora." />
+
+<Quiz question="Qual o papel do springdoc-openapi num projeto Spring Boot?" options={["Gerar a especificação OpenAPI inspecionando a aplicação","Validar requisições contra o contrato","Gerar clientes HTTP em TypeScript","Proteger as rotas da documentação"]} answer={0} explanation="O springdoc lê controllers, DTOs e anotações em tempo de execução e produz o documento OpenAPI, servido em /v3/api-docs e renderizado pelo Swagger UI." />
+
+## Base no CodeForge
+
+- [Spring Boot 3: Documente, teste e prepare uma API para o deploy](/learn/carreira-java/spring-boot-3-documente-teste-prepare-api): a primeira configuração do springdoc na API da clínica.
+- [Swagger: Documentando APIs REST com OpenAPI](/learn/carreira-nodejs/swagger-documentando-apis-rest-openapi): o mesmo padrão na stack Node.js.
+- [Estilos de API](/learn/system-design/estilos-de-api) e [REST](/learn/system-design/rest): onde o OpenAPI se encaixa entre REST, gRPC e GraphQL.
+- [API Gateway](/learn/system-design/api-gateway): gateways que importam a especificação OpenAPI para rotear e validar.
+
+## Referências
+
+- [springdoc-openapi](https://springdoc.org/)
+- [OpenAPI Specification 3.1.0](https://spec.openapis.org/oas/v3.1.0)
+- [Swagger: OpenAPI Guide](https://swagger.io/docs/specification/v3_0/about/)
+- [OpenAPI Generator: Maven plugin](https://openapi-generator.tech/docs/plugins/)

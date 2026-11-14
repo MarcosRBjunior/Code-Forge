@@ -1,0 +1,337 @@
+---
+title: "Integração Contínua: Rollback e teste de carga"
+kind: lesson
+---
+
+Um pipeline que só sabe ir para a frente é uma aposta. Mais cedo ou mais tarde uma versão passa em todos os testes e quebra em produção: uma consulta que fica lenta com dados reais, um pool de conexões pequeno demais, uma migração que trava a tabela. Duas práticas reduzem esse risco. O **rollback** planejado garante que voltar à versão anterior leva minutos e não quebra nada, incluindo o banco. O **teste de carga** no pipeline encontra o problema de desempenho em staging, antes de o usuário encontrar. Neste capítulo você aplica as duas à API de pedidos.
+
+**Você vai aprender:**
+
+- Comparar estratégias de rollback no EC2, no ECS e no Kubernetes
+- Escrever migrações do Flyway que sobrevivem a um rollback (expand e contract)
+- Medir latência e taxa de erro com k6 e com Gatling em Java
+- Transformar metas de desempenho em thresholds que barram o deploy
+- Decidir entre voltar a versão, corrigir para a frente ou desligar uma feature flag
+
+## Voltar ou corrigir para a frente
+
+Quando uma versão quebra produção, existem três saídas:
+
+| Saída | Quando usar | Tempo típico |
+|---|---|---|
+| **Rollback** (voltar o artefato anterior) | O problema veio com o deploy e a versão anterior era saudável | Minutos |
+| **Roll forward** (corrigir e implantar de novo) | A correção é pequena e óbvia, ou o rollback é impossível (dado já migrado) | Dezenas de minutos |
+| **Desligar a feature flag** | A mudança problemática está atrás de uma flag | Segundos |
+
+O rollback só é a opção rápida se três coisas forem verdade antes do incidente: o artefato anterior ainda existe e é imutável (imagem com o SHA no registro, JAR versionado no S3), a plataforma sabe voltar sozinha ou com um comando, e o banco continua compatível com o código anterior. Os dois primeiros são configuração. O terceiro é disciplina de desenvolvimento, e é onde a maioria dos rollbacks falha.
+
+## Rollback automático em cada plataforma
+
+### EC2 com CodeDeploy
+
+O deployment group com `--auto-rollback-configuration enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM` reimplanta a última revisão boa quando um hook falha (por exemplo, o `ValidateService` que consulta a readiness do Actuator) ou quando um alarme associado dispara durante o deploy.
+
+### ECS: circuit breaker, alarmes e blue/green
+
+O circuit breaker reverte quando as tasks novas não ficam saudáveis. Mas uma versão pode subir saudável e mesmo assim responder 500 em metade das requisições. Para isso, o ECS também reverte com base em alarmes do CloudWatch:
+
+```bash
+aws cloudwatch put-metric-alarm --alarm-name api-pedidos-5xx \
+  --namespace AWS/ApplicationELB --metric-name HTTPCode_Target_5XX_Count \
+  --dimensions Name=LoadBalancer,Value=app/loja/abc123 Name=TargetGroup,Value=targetgroup/api-pedidos/def456 \
+  --statistic Sum --period 60 --evaluation-periods 2 --threshold 20 \
+  --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching
+
+aws ecs update-service --cluster loja-production --service api-pedidos \
+  --deployment-configuration "deploymentCircuitBreaker={enable=true,rollback=true},alarms={alarmNames=[api-pedidos-5xx],enable=true,rollback=true}"
+```
+
+Com o rolling update, as versões antiga e nova convivem durante o deploy. Se você quer trocar todo o tráfego de uma vez e manter o ambiente antigo pronto para voltar, use **blue/green**: o ECS sobe a revisão nova inteira num target group separado, testa, troca o listener do ALB e mantém a versão antiga viva por um tempo de observação. Voltar é só devolver o listener, sem esperar nenhuma JVM subir. Esse modo existe hoje nativamente no service (estratégia de deploy `BLUE_GREEN`); antes exigia o CodeDeploy.
+
+### Kubernetes: rollout undo
+
+O Deployment guarda os ReplicaSets anteriores (`revisionHistoryLimit`, 10 por padrão), então voltar é reativar um deles:
+
+```bash
+kubectl rollout history deploy/api-pedidos -n loja
+kubectl rollout undo deploy/api-pedidos -n loja                  # volta para a revisão anterior
+kubectl rollout undo deploy/api-pedidos -n loja --to-revision=14 # ou para uma específica
+```
+
+O Kubernetes, porém, não reverte sozinho. Se os pods novos não ficam prontos, o Deployment só marca `ProgressDeadlineExceeded` depois de `progressDeadlineSeconds`, e quem decide voltar é o pipeline:
+
+```bash
+if ! kubectl rollout status deploy/api-pedidos -n loja --timeout=300s; then
+  kubectl rollout undo deploy/api-pedidos -n loja
+  exit 1
+fi
+```
+
+Para rollback automático baseado em métricas (taxa de erro, latência) no Kubernetes, ferramentas como Argo Rollouts e Flagger fazem canary com análise e revertem sozinhas.
+
+## O banco: migrações que sobrevivem ao rollback
+
+O código volta; o schema não. Se a versão 1.6 rodou `ALTER TABLE pedido RENAME COLUMN valor TO valor_total` e você volta para a 1.5, cada consulta da 1.5 falha com "column valor does not exist". O Flyway Community não tem migrações de *undo*, e mesmo onde existem, desfazer schema com dados novos raramente é seguro. A saída é nunca precisar desfazer: toda migração tem de ser compatível com a versão anterior do código.
+
+O padrão para isso é **expand and contract** (também chamado de *parallel change*). Renomear `valor` para `valor_total` vira três releases:
+
+**Release 1.6, expand.** Adiciona a coluna nova, copia os dados e o código escreve nas duas, lendo da nova:
+
+```sql
+-- V20__expand_valor_total.sql
+ALTER TABLE pedido ADD COLUMN valor_total NUMERIC(12,2);
+UPDATE pedido SET valor_total = valor WHERE valor_total IS NULL;
+```
+
+```java
+@Entity
+@Table(name = "pedido")
+public class Pedido {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Deprecated // remover na 1.8, junto com a coluna
+    @Column(name = "valor")
+    private BigDecimal valorLegado;
+
+    @Column(name = "valor_total")
+    private BigDecimal valorTotal;
+
+    public void definirValorTotal(BigDecimal valor) {
+        this.valorTotal = valor;
+        this.valorLegado = valor; // a 1.5, se voltar, ainda lê esta coluna
+    }
+
+    public BigDecimal getValorTotal() {
+        return valorTotal != null ? valorTotal : valorLegado;
+    }
+}
+```
+
+Se a 1.6 quebrar, voltar para a 1.5 é seguro: a coluna `valor` continua lá e atualizada.
+
+**Release 1.7, migrar leituras.** O código para de ler e escrever `valor`. Uma migração torna a coluna nova obrigatória (`ALTER TABLE pedido ALTER COLUMN valor_total SET NOT NULL`). Voltar para a 1.6 continua seguro, porque a 1.6 lê `valor_total`.
+
+**Release 1.8, contract.** Só agora, com nenhuma versão que você possa querer reativar lendo a coluna velha, ela sai:
+
+```sql
+-- V22__contract_remover_valor.sql
+ALTER TABLE pedido DROP COLUMN valor;
+```
+
+A mesma lógica vale para trocar tipo de coluna, dividir tabelas e tornar colunas obrigatórias. Em tabelas grandes, lembre também do bloqueio: `UPDATE` de milhões de linhas numa migração trava a tabela e o deploy; faça o backfill em lotes, por um job da aplicação, e deixe a migração só com a mudança de estrutura.
+
+<Callout type="warning" title="Rollback de código depois de uma migração destrutiva">
+O cenário clássico de incidente prolongado: a versão nova remove ou renomeia uma coluna, um bug aparece, o time faz rollback com um clique, e a versão antiga sobe falhando em toda consulta que toca na tabela. Agora há dois problemas e nenhuma versão funcional. Antes de aprovar qualquer pull request com `DROP`, `RENAME` ou mudança de tipo, pergunte: a versão que está em produção hoje funciona com este schema? Se a resposta for não, a migração precisa ser dividida em expand e contract.
+</Callout>
+
+## Teste de carga: o que medir
+
+Testes funcionais dizem se a API responde certo. Testes de carga dizem se ela responde certo **com muitas requisições ao mesmo tempo**, e com qual latência. Os tipos mais usados:
+
+- **Smoke**: poucos usuários por um minuto, para validar que o script e o ambiente funcionam.
+- **Carga (load)**: o tráfego esperado no pico, por alguns minutos. É o que entra no pipeline.
+- **Estresse**: aumenta até quebrar, para descobrir o limite e como a API falha.
+- **Soak**: carga moderada por horas, para achar vazamento de memória ou de conexões.
+
+As métricas que importam são **latência em percentis** (p95 e p99, nunca a média, que esconde a cauda lenta), **taxa de erro** e **vazão** (requisições por segundo). Em Java, ignore o primeiro minuto ao analisar: a JVM ainda está compilando os caminhos quentes com o JIT, e o pool de conexões do Hikari ainda está crescendo. Um teste de carga de 30 segundos numa JVM fria mede o aquecimento, não a aplicação.
+
+## k6: thresholds que reprovam o teste
+
+O k6 é uma ferramenta de carga com scripts em JavaScript e um binário único, fácil de rodar no CI. Os **thresholds** são as metas: se uma for violada, o k6 termina com código de saída diferente de zero, e o passo do pipeline falha.
+
+```javascript
+// carga/pedidos.js
+import http from "k6/http";
+import { check } from "k6";
+
+const BASE = __ENV.BASE_URL;
+const cabecalhos = { "Content-Type": "application/json", Authorization: `Bearer ${__ENV.TOKEN}` };
+
+export const options = {
+  scenarios: {
+    pico: {
+      executor: "ramping-arrival-rate",
+      startRate: 5,
+      timeUnit: "1s",
+      preAllocatedVUs: 50,
+      maxVUs: 200,
+      stages: [
+        { target: 60, duration: "1m" },  // aquecimento da JVM
+        { target: 60, duration: "4m" },  // pico esperado: 60 req/s
+        { target: 0, duration: "30s" },
+      ],
+    },
+  },
+  thresholds: {
+    http_req_failed: ["rate<0.01"],
+    "http_req_duration{name:criar}": ["p(95)<400"],
+    "http_req_duration{name:consultar}": ["p(95)<150"],
+    http_req_duration: [{ threshold: "p(99)<1500", abortOnFail: true, delayAbortEval: "1m" }],
+  },
+};
+
+export default function () {
+  const corpo = JSON.stringify({ clienteId: 42, itens: [{ sku: "CAFE-500G", quantidade: 2 }] });
+  const criado = http.post(`${BASE}/pedidos`, corpo, { headers: cabecalhos, tags: { name: "criar" } });
+  check(criado, { "criou (201)": (r) => r.status === 201 });
+
+  const id = criado.json("id");
+  const lido = http.get(`${BASE}/pedidos/${id}`, { headers: cabecalhos, tags: { name: "consultar" } });
+  check(lido, { "consultou (200)": (r) => r.status === 200 });
+}
+```
+
+Detalhes do script:
+
+- **`ramping-arrival-rate`** controla requisições por segundo, não usuários. Se a API ficar lenta, o k6 abre mais usuários virtuais para manter a taxa, que é o que acontece com tráfego real. Executores por número de usuários escondem lentidão, porque usuários esperando geram menos requisições.
+- **Tags `name`** separam as metas por endpoint: criar pedido grava no banco e pode ser mais lento que consultar.
+- **`abortOnFail` com `delayAbortEval`** interrompe o teste cedo se o p99 explodir, mas só depois do aquecimento.
+
+## Gatling: carga escrita em Java
+
+Se o time prefere ficar no ecossistema Java, o Gatling tem uma DSL Java e roda pelo Maven. As metas são *assertions*, e uma assertion violada faz o `mvn` falhar.
+
+```java
+// src/test/java/carga/PedidosSimulation.java
+package carga;
+
+import static io.gatling.javaapi.core.CoreDsl.*;
+import static io.gatling.javaapi.http.HttpDsl.*;
+
+import io.gatling.javaapi.core.*;
+import io.gatling.javaapi.http.*;
+
+public class PedidosSimulation extends Simulation {
+
+    HttpProtocolBuilder protocolo = http
+        .baseUrl(System.getProperty("baseUrl", "http://localhost:8080"))
+        .contentTypeHeader("application/json")
+        .acceptHeader("application/json")
+        .authorizationHeader("Bearer " + System.getenv("TOKEN"));
+
+    ScenarioBuilder criarEConsultar = scenario("Criar e consultar pedido")
+        .exec(http("criar").post("/pedidos")
+            .body(StringBody("""
+                {"clienteId": 42, "itens": [{"sku": "CAFE-500G", "quantidade": 2}]}
+                """))
+            .check(status().is(201), jsonPath("$.id").saveAs("id")))
+        .exec(http("consultar").get("/pedidos/#{id}")
+            .check(status().is(200)));
+
+    {
+        setUp(criarEConsultar.injectOpen(
+                rampUsersPerSec(5).to(60).during(60),
+                constantUsersPerSec(60).during(240)))
+            .protocols(protocolo)
+            .assertions(
+                global().failedRequests().percent().lt(1.0),
+                details("criar").responseTime().percentile(95.0).lt(400),
+                details("consultar").responseTime().percentile(95.0).lt(150));
+    }
+}
+```
+
+```xml
+<!-- pom.xml: dependência de teste e plugin; use as versões mais recentes do Gatling -->
+<dependency>
+  <groupId>io.gatling.highcharts</groupId>
+  <artifactId>gatling-charts-highcharts</artifactId>
+  <version>${gatling.version}</version>
+  <scope>test</scope>
+</dependency>
+
+<plugin>
+  <groupId>io.gatling</groupId>
+  <artifactId>gatling-maven-plugin</artifactId>
+  <version>${gatling-maven-plugin.version}</version>
+</plugin>
+```
+
+```bash
+./mvnw -B gatling:test -Dgatling.simulationClass=carga.PedidosSimulation -DbaseUrl=https://staging.api.minhaloja.com.br
+```
+
+O `injectOpen` com usuários por segundo é o modelo aberto, equivalente ao `ramping-arrival-rate` do k6. O Gatling gera um relatório HTML em `target/gatling/` com percentis por requisição ao longo do tempo, ótimo para anexar como artefato do job.
+
+| | k6 | Gatling |
+|---|---|---|
+| Linguagem do script | JavaScript | Java, Kotlin ou Scala |
+| Execução | Binário único | Maven ou Gradle, roda na JVM |
+| Metas | `thresholds` | `assertions` |
+| Ponto forte | Leve, rápido de adotar no CI | Fica no repositório e na linguagem do time Java |
+
+## O teste de carga no pipeline
+
+O lugar do teste de carga é **depois do deploy em staging e antes da aprovação de produção**. Assim, uma regressão de desempenho bloqueia a promoção do mesmo jeito que um teste quebrado bloqueia o build.
+
+```yaml
+# trecho de .github/workflows/deploy-ecs.yml
+  carga:
+    needs: staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grafana/setup-k6-action@v1
+      - name: Teste de carga em staging
+        env:
+          BASE_URL: ${{ vars.APP_URL }}
+          TOKEN: ${{ secrets.TOKEN_CARGA }}
+        run: k6 run --summary-export=resumo.json carga/pedidos.js
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado-carga
+          path: resumo.json
+
+  production:
+    needs: [imagem, carga]
+    # ... igual ao capítulo de ECS
+```
+
+Para o resultado significar alguma coisa, staging precisa se parecer com produção: mesmo tamanho de task ou pod, mesmo número mínimo de réplicas, banco com volume de dados realista (uma tabela de 50 linhas nunca mostra o índice que falta). E nunca aponte o teste de carga para produção a partir do pipeline: além do risco, os pedidos de teste viram dados reais.
+
+Calibre os thresholds a partir de medições, não de chutes. Rode o teste algumas vezes contra a versão atual, anote o p95 de cada endpoint e coloque a meta com uma folga de 20% a 30%. Metas apertadas demais geram falhas aleatórias, e o time aprende a ignorar o passo.
+
+## Na entrevista
+
+**Como você garante que um rollback não quebra o banco?** Fazendo toda migração compatível com a versão anterior do código, pelo padrão expand and contract: adicionar antes de usar, remover só quando nenhuma versão ativa ou candidata a rollback depende do que sai.
+
+**Qual a diferença entre rollback e roll forward?** Rollback volta para o artefato anterior; roll forward corrige e implanta uma versão nova. Rollback é mais rápido quando possível; roll forward é inevitável quando dados já foram transformados.
+
+**Por que olhar p95 e p99 em vez da média?** Porque a média esconde a cauda. Uma API com média de 80 ms pode ter 5% das requisições acima de 2 segundos, e são justamente essas que geram reclamação e timeout em cascata.
+
+**Por que descartar o começo de um teste de carga numa aplicação Java?** Porque a JVM ainda está interpretando código e o JIT ainda não otimizou os caminhos quentes; pools também estão crescendo. O começo mede o aquecimento.
+
+## Pratique
+
+No pipeline da API de pedidos (ECS ou Kubernetes), entregue:
+
+1. Rollback automático configurado: circuit breaker e alarme de 5xx no ECS, ou `rollout status` com `rollout undo` no Kubernetes.
+2. Uma renomeação de coluna feita em três pull requests (expand, migrar leituras, contract), com um teste que sobe a versão anterior da aplicação contra o schema do expand e confirma que ela funciona.
+3. Um script de k6 ou uma simulação Gatling com metas por endpoint, rodando como job entre staging e produção.
+4. Uma prova de que o threshold barra o deploy: introduza uma consulta N+1 na listagem de pedidos, mostre o job de carga falhando e produção sem ser tentada.
+
+<Quiz question="Você precisa renomear a coluna valor para valor_total. Qual sequência permite rollback seguro a cada deploy?" options={["Renomear direto na migração e corrigir o código no mesmo deploy","Adicionar valor_total e escrever nas duas; depois ler só a nova; por fim remover valor","Remover valor primeiro e criar valor_total no deploy seguinte","Usar uma migração de undo do Flyway se der problema"]} answer={1} explanation="Expand and contract mantém sempre um schema que a versão anterior entende. Renomear direto quebra a versão antiga no rollback." />
+
+<Quiz question="Por que o executor ramping-arrival-rate do k6 é mais adequado para achar regressões de latência?" options={["Ele usa menos memória no runner","Ele mantém a taxa de requisições mesmo se a API ficar lenta","Ele ignora requisições com erro","Ele dispensa thresholds"]} answer={1} explanation="Com taxa fixa de chegada, uma API lenta acumula requisições como no tráfego real. Com número fixo de usuários, lentidão reduz a carga e esconde o problema." />
+
+<Quiz question="Uma versão sobe saudável no ECS, mas passa a responder 500 em parte das requisições. O que reverte o deploy automaticamente?" options={["O health check grace period","O circuit breaker sozinho","Um alarme do CloudWatch configurado no deploymentConfiguration com rollback","O stopTimeout da task definition"]} answer={2} explanation="O circuit breaker só olha se as tasks ficam saudáveis. Erros de aplicação com tasks saudáveis precisam de alarme associado ao deploy." />
+
+## Base no CodeForge
+
+- [Integração Contínua: Automatize o deploy no Amazon ECS](/learn/carreira-java/integracao-continua-automatize-deploy-amazon-ecs): o pipeline que recebe o job de carga.
+- [Integração Contínua: Automatize o deploy no Amazon ECS (Node.js)](/learn/carreira-nodejs/integracao-continua-automatize-deploy-amazon-ecs): o mesmo deploy com outra stack, incluindo migração em task avulsa.
+- [Rollbacks](/learn/system-design/rollbacks), [Blue-green](/learn/system-design/blue-green) e [Canary](/learn/system-design/canary): as estratégias de deploy e de reversão.
+- [Migrações de schema](/learn/system-design/migracoes-de-schema) e [Feature flags](/learn/system-design/feature-flags): mudar o banco sem downtime e desligar mudanças sem deploy.
+- [Latência e throughput](/learn/system-design/latencia-throughput): percentis e vazão, a base para escrever thresholds.
+
+## Referências
+
+- [k6: Thresholds](https://grafana.com/docs/k6/latest/using-k6/thresholds/)
+- [Gatling: Assertions](https://docs.gatling.io/reference/script/core/assertions/)
+- [Amazon ECS: deployment alarms](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-alarm-failure.html)
+- [Martin Fowler: Parallel Change](https://martinfowler.com/bliki/ParallelChange.html)

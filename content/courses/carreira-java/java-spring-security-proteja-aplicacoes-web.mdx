@@ -1,0 +1,381 @@
+---
+title: "Java e Spring Security: Proteja suas aplicações web"
+kind: lesson
+---
+
+Nem todo back-end Java é uma API consumida por um front separado. Painéis administrativos, portais internos e sistemas de back-office ainda são aplicações web renderizadas no servidor, com páginas HTML, formulário de login e sessão em cookie. Proteger esse tipo de aplicação é diferente de proteger uma API com token: aqui o navegador manda o cookie sozinho, e isso abre a porta para ataques como CSRF e fixação de sessão. Neste capítulo você monta o portal da recepção da clínica com Spring MVC e Thymeleaf e o protege com Spring Security 6.
+
+**Você vai aprender:**
+
+- Como o Spring Security intercepta requisições com a cadeia de filtros
+- Configurar login por formulário, logout e páginas públicas com `SecurityFilterChain`
+- Autenticar usuários do banco com `UserDetailsService` e senhas com hash
+- Entender e manter a proteção CSRF, e configurar a sessão com segurança
+
+## Como o Spring Security funciona por dentro
+
+Toda requisição HTTP passa por uma sequência de filtros de servlet antes de chegar ao seu controller. O Spring Security se pendura nessa sequência com um único filtro, o `DelegatingFilterProxy`, que entrega a requisição ao `FilterChainProxy`. Este escolhe qual `SecurityFilterChain` se aplica à URL e executa os filtros dela, em ordem:
+
+```text
+Requisição
+  -> DelegatingFilterProxy
+     -> FilterChainProxy
+        -> SecurityFilterChain
+           SecurityContextHolderFilter   (carrega o usuário da sessão)
+           CsrfFilter                    (confere o token CSRF em POST, PUT, DELETE)
+           LogoutFilter                  (trata POST /logout)
+           UsernamePasswordAuthenticationFilter (trata POST /login)
+           ... outros ...
+           ExceptionTranslationFilter    (transforma falta de login em redirecionamento)
+           AuthorizationFilter           (decide se a requisição pode seguir)
+  -> DispatcherServlet -> seu @Controller
+```
+
+O usuário autenticado fica no `SecurityContext`, guardado numa `ThreadLocal` acessível por `SecurityContextHolder` durante a requisição. Numa aplicação web, entre uma requisição e outra, esse contexto é salvo na `HttpSession`. É o cookie `JSESSIONID` que liga o navegador à sessão e, portanto, ao usuário.
+
+Só de adicionar `spring-boot-starter-security`, você ganha tudo protegido, um formulário de login gerado, um usuário `user` com senha aleatória no log e proteção CSRF. O trabalho agora é trocar esses padrões pelos seus.
+
+## O projeto
+
+As dependências:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-thymeleaf</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.thymeleaf.extras</groupId>
+    <artifactId>thymeleaf-extras-springsecurity6</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+```
+
+## A configuração de segurança
+
+No Spring Security 6 não existe mais `WebSecurityConfigurerAdapter`. Você declara um bean `SecurityFilterChain` usando a DSL com lambdas:
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain web(HttpSecurity http,
+                            @Value("${app.remember-me.key}") String chaveRememberMe) throws Exception {
+        return http
+                .authorizeHttpRequests(req -> req
+                        .requestMatchers("/css/**", "/js/**", "/img/**", "/favicon.ico").permitAll()
+                        .requestMatchers("/login", "/esqueci-senha").permitAll()
+                        .anyRequest().authenticated())
+                .formLogin(form -> form
+                        .loginPage("/login")
+                        .defaultSuccessUrl("/agenda")
+                        .failureUrl("/login?erro")
+                        .permitAll())
+                .logout(logout -> logout
+                        .logoutSuccessUrl("/login?saiu")
+                        .deleteCookies("JSESSIONID"))
+                .rememberMe(rm -> rm
+                        .key(chaveRememberMe)
+                        .tokenValiditySeconds((int) Duration.ofDays(14).toSeconds()))
+                .build();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+    }
+}
+```
+
+O que cada bloco faz:
+
+- **`authorizeHttpRequests`** declara regras em ordem; a primeira que casar vence. Arquivos estáticos e a página de login são públicos, todo o resto exige login. Sempre termine com uma regra para `anyRequest()`.
+- **`formLogin`** aponta para a sua página de login (um `GET /login` servido por você). O próprio Spring Security trata o `POST /login`, lendo os campos `username` e `password`. Depois do sucesso, ele redireciona para a página que o usuário tentou abrir antes do login ou, na falta dela, para `/agenda`.
+- **`logout`** trata o `POST /logout`: invalida a sessão, limpa o contexto e apaga o cookie.
+- **`rememberMe`** cria um cookie de longa duração que reautentica o usuário quando a sessão expira. A chave assina esse cookie, então ela também é um segredo.
+
+O `PasswordEncoder` delegante grava o hash com um prefixo do algoritmo, como `{bcrypt}$2a$10$...`. Hoje ele usa BCrypt; se amanhã você mudar o padrão para Argon2, os hashes antigos continuam válidos porque o prefixo diz como verificá-los.
+
+## Usuários do banco
+
+A tabela e a entidade:
+
+```sql
+CREATE TABLE usuarios (
+    id      BIGSERIAL PRIMARY KEY,
+    email   VARCHAR(150) NOT NULL UNIQUE,
+    nome    VARCHAR(150) NOT NULL,
+    senha   VARCHAR(255) NOT NULL,
+    ativo   BOOLEAN      NOT NULL DEFAULT TRUE
+);
+```
+
+```java
+@Entity
+@Table(name = "usuarios")
+public class Usuario {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String email;
+    private String nome;
+    private String senha;
+    private boolean ativo;
+    // getters
+}
+
+public interface UsuarioRepository extends JpaRepository<Usuario, Long> {
+    Optional<Usuario> findByEmailIgnoreCase(String email);
+}
+```
+
+O `UserDetailsService` traduz a sua entidade para o modelo do Spring Security. Se existir exatamente um bean desse tipo e um `PasswordEncoder`, o Spring Boot monta o provedor de autenticação com eles sem mais configuração:
+
+```java
+@Service
+public class UsuarioDetailsService implements UserDetailsService {
+
+    private final UsuarioRepository repository;
+
+    public UsuarioDetailsService(UsuarioRepository repository) {
+        this.repository = repository;
+    }
+
+    @Override
+    public UserDetails loadUserByUsername(String email) {
+        var usuario = repository.findByEmailIgnoreCase(email)
+                .orElseThrow(() -> new UsernameNotFoundException("Usuário não encontrado"));
+        return User.withUsername(usuario.getEmail())
+                .password(usuario.getSenha())
+                .disabled(!usuario.isAtivo())
+                .roles("RECEPCAO")
+                .build();
+    }
+}
+```
+
+Para criar o primeiro usuário, gere o hash com o próprio encoder (num teste ou num `CommandLineRunner` de desenvolvimento) e insira por migração:
+
+```java
+var encoder = PasswordEncoderFactories.createDelegatingPasswordEncoder();
+System.out.println(encoder.encode("troque-esta-senha"));
+// {bcrypt}$2a$10$Vx...
+```
+
+Quando o login falha, o Spring Security não diz se o e-mail existe. Isso é proposital: mensagens diferentes para "usuário não existe" e "senha errada" permitem que alguém descubra quais e-mails têm conta.
+
+## A página de login com Thymeleaf
+
+```java
+@Controller
+public class LoginController {
+    @GetMapping("/login")
+    public String login() {
+        return "login";
+    }
+}
+```
+
+```html
+<!-- src/main/resources/templates/login.html -->
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="pt-BR">
+<head><title>Entrar | Clínica</title></head>
+<body>
+  <p th:if="${param.erro}">E-mail ou senha inválidos.</p>
+  <p th:if="${param.saiu}">Você saiu do sistema.</p>
+
+  <form th:action="@{/login}" method="post">
+    <label>E-mail <input type="email" name="username" autofocus required></label>
+    <label>Senha <input type="password" name="password" required></label>
+    <label><input type="checkbox" name="remember-me"> Manter conectado</label>
+    <button type="submit">Entrar</button>
+  </form>
+</body>
+</html>
+```
+
+Repare no `th:action`. Quando o Thymeleaf processa um formulário `POST` com `th:action` e o Spring Security está ativo, ele insere sozinho um campo oculto com o token CSRF. Se você escrever `action="/login"` sem o prefixo `th:`, o campo não aparece e o login responde 403.
+
+Nas outras páginas, o módulo `thymeleaf-extras-springsecurity6` mostra dados do usuário e esconde trechos conforme a autenticação:
+
+```html
+<html xmlns:th="http://www.thymeleaf.org"
+      xmlns:sec="http://www.thymeleaf.org/extras/spring-security">
+<header>
+  <span sec:authorize="isAuthenticated()">
+    Olá, <span sec:authentication="name">usuario</span>
+  </span>
+  <form th:action="@{/logout}" method="post">
+    <button type="submit">Sair</button>
+  </form>
+</header>
+```
+
+O logout é um formulário `POST`, não um link. Com CSRF ativo, o Spring Security 6 só aceita logout por `POST` com token, porque um `GET /logout` poderia ser disparado por uma imagem em qualquer site e deslogar o usuário sem ele querer.
+
+No controller, o usuário logado chega como parâmetro:
+
+```java
+@Controller
+public class AgendaController {
+
+    private final AgendaService agenda;
+
+    public AgendaController(AgendaService agenda) {
+        this.agenda = agenda;
+    }
+
+    @GetMapping("/agenda")
+    public String agenda(@AuthenticationPrincipal UserDetails usuario, Model model) {
+        model.addAttribute("consultas", agenda.doDia(LocalDate.now()));
+        model.addAttribute("usuario", usuario.getUsername());
+        return "agenda";
+    }
+}
+```
+
+## CSRF: o ataque e a defesa
+
+Cross-Site Request Forgery funciona assim: a recepcionista está logada no portal da clínica e, numa outra aba, abre um site malicioso. Esse site tem um formulário escondido que faz `POST` para `https://portal.clinica.com/consultas/123/cancelar` e se envia sozinho com JavaScript. O navegador manda junto o cookie de sessão do portal, porque cookies vão para o domínio de destino, não importa de onde a requisição saiu. Para o servidor, é uma requisição legítima da recepcionista.
+
+A defesa padrão do Spring Security é o **token sincronizador**: o servidor gera um valor aleatório ligado à sessão, coloca-o em cada formulário e exige que toda requisição que muda estado (`POST`, `PUT`, `PATCH`, `DELETE`) devolva esse valor. O site malicioso consegue enviar o cookie, mas não consegue ler o token, porque a política de mesma origem do navegador impede que ele leia o HTML do portal.
+
+Quando a página faz chamadas com `fetch`, coloque o token em meta tags e envie no cabeçalho:
+
+```html
+<meta name="_csrf" th:content="${_csrf.token}">
+<meta name="_csrf_header" th:content="${_csrf.headerName}">
+```
+
+```javascript
+const token = document.querySelector('meta[name="_csrf"]').content;
+const header = document.querySelector('meta[name="_csrf_header"]').content;
+
+await fetch(`/consultas/${id}/confirmar`, {
+  method: "POST",
+  headers: { [header]: token },
+});
+```
+
+O atributo `SameSite` do cookie é uma segunda camada: com `Lax` (o padrão dos navegadores atuais), o cookie não vai em `POST` iniciado por outro site. Ele ajuda, mas não substitui o token, porque navegadores antigos e algumas situações de subdomínio não respeitam a regra do jeito que você espera.
+
+<Callout type="warning" title="Desligar o CSRF porque o POST deu 403">
+O erro mais comum com Spring Security em aplicação web é ver um 403 num formulário e "resolver" com `csrf.disable()`. O 403 quase sempre significa que o formulário não leva o token: falta o `th:action`, o formulário foi escrito com HTML puro ou o `fetch` não manda o cabeçalho. Desligar o CSRF numa aplicação com sessão em cookie deixa todos os usuários expostos. Desligar só faz sentido em API stateless que não usa cookie para autenticar.
+</Callout>
+
+## Sessão com segurança
+
+A sessão é a credencial do usuário enquanto ele navega, então ela merece cuidado:
+
+```java
+http.sessionManagement(session -> session
+        .sessionFixation(fix -> fix.changeSessionId())
+        .maximumSessions(1)
+        .maxSessionsPreventsLogin(false)
+        .expiredUrl("/login?expirou"));
+```
+
+```yaml
+server:
+  servlet:
+    session:
+      timeout: 30m
+      cookie:
+        http-only: true
+        secure: true
+        same-site: lax
+```
+
+- **Fixação de sessão.** Um atacante consegue plantar um ID de sessão conhecido no navegador da vítima e esperar ela fazer login. Trocar o ID no momento da autenticação (`changeSessionId`, o padrão) invalida o ID plantado.
+- **Sessões simultâneas.** `maximumSessions(1)` derruba a sessão antiga quando o mesmo usuário entra em outro computador, útil em sistemas de balcão. Para funcionar, o Spring precisa ser avisado quando sessões terminam; registre um bean `HttpSessionEventPublisher`.
+- **Cookie.** `http-only` impede que JavaScript leia o cookie (um XSS não rouba a sessão), `secure` só envia por HTTPS, e `same-site` reforça a defesa contra CSRF.
+- **Expiração.** Trinta minutos de inatividade é um padrão razoável para sistemas com dados de saúde. Ajuste conforme o risco.
+
+Em produção com mais de uma instância atrás de um load balancer, a sessão precisa ser compartilhada (Spring Session com Redis ou JDBC) ou o balanceador precisa de afinidade de sessão. Sem isso, o usuário "desloga" sempre que cai em outra instância.
+
+## Testando a segurança
+
+O `spring-security-test` dá ferramentas para o MockMvc:
+
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+class SegurancaWebTest {
+
+    @Autowired MockMvc mvc;
+
+    @Test
+    void anonimoERedirecionadoParaLogin() throws Exception {
+        mvc.perform(get("/agenda"))
+                .andExpect(status().is3xxRedirection())
+                .andExpect(redirectedUrlPattern("**/login"));
+    }
+
+    @Test
+    @WithMockUser
+    void postSemTokenCsrfEhRecusado() throws Exception {
+        mvc.perform(post("/consultas/1/cancelar")).andExpect(status().isForbidden());
+    }
+
+    @Test
+    @WithMockUser
+    void postComTokenCsrfPassa() throws Exception {
+        mvc.perform(post("/consultas/1/cancelar").with(csrf())).andExpect(status().is3xxRedirection());
+    }
+}
+```
+
+O teste do meio é importante: ele falha se alguém desligar o CSRF por engano.
+
+## Na entrevista
+
+**O que é CSRF e como o Spring Security protege contra ele?** É um ataque em que outro site faz o navegador da vítima enviar uma requisição que muda estado, aproveitando o cookie de sessão. O Spring exige um token aleatório ligado à sessão em toda requisição que altera dados; o site atacante não consegue lê-lo.
+
+**Quando é seguro desabilitar o CSRF?** Quando a aplicação não autentica por cookie, como uma API stateless que recebe JWT no cabeçalho `Authorization`. Se o token ou a sessão estiver em cookie, a proteção continua necessária.
+
+**O que é fixação de sessão?** O atacante faz a vítima usar um ID de sessão que ele conhece e espera o login. O Spring Security troca o ID da sessão na autenticação, invalidando o ID conhecido.
+
+**Como funciona o `SecurityFilterChain`?** É uma lista ordenada de filtros aplicada a um conjunto de URLs. O `FilterChainProxy` escolhe a primeira cadeia que casa com a requisição e a executa; você pode ter várias, por exemplo uma para `/api/**` stateless e outra para o site com sessão.
+
+## Pratique
+
+Monte o portal da recepção e entregue:
+
+1. Página de login própria com Thymeleaf, mensagens de erro e de logout, e "manter conectado".
+2. Usuários lidos do PostgreSQL, com senha em `{bcrypt}` e um usuário inicial criado por migração.
+3. Uma tela de agenda do dia, protegida, com botão de cancelar consulta (formulário `POST` com CSRF) e um botão de confirmar presença via `fetch` mandando o cabeçalho CSRF.
+4. Sessão de 30 minutos, cookie `http-only`, `secure` e `same-site`, e uma sessão por usuário.
+5. Testes com MockMvc provando: anônimo redirecionado, `POST` sem CSRF recusado e `POST` com CSRF aceito.
+
+<Quiz question="Por que o formulário de login com action='/login' sem o prefixo th: recebe 403?" options={["Porque o Thymeleaf não renderiza o formulário","Porque falta o token CSRF que o th:action insere","Porque o Spring Security não aceita POST em /login","Porque o campo deve se chamar email"]} answer={1} explanation="O Thymeleaf só injeta o campo oculto _csrf em formulários processados com th:action. Sem o token, o CsrfFilter recusa a requisição com 403." />
+
+<Quiz question="Qual atributo de cookie impede que um script injetado por XSS leia o JSESSIONID?" options={["Secure","SameSite","HttpOnly","Path"]} answer={2} explanation="HttpOnly torna o cookie invisível para document.cookie. Secure exige HTTPS e SameSite controla o envio em requisições vindas de outros sites." />
+
+<Quiz question="Por que o logout precisa ser POST no Spring Security 6 com CSRF ativo?" options={["Para que outro site não deslogue o usuário com um simples link ou imagem","Porque GET não pode invalidar sessões","Porque o navegador não envia cookies em GET","Para registrar o logout no banco"]} answer={0} explanation="Um GET pode ser disparado por qualquer página, por exemplo com uma tag de imagem. Exigir POST com token CSRF garante que só o próprio sistema inicie o logout." />
+
+## Base no CodeForge
+
+- [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao) e [Sessão vs token](/learn/system-design/sessao-vs-token): quando usar sessão em cookie.
+- [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas): BCrypt, salt e por que hash lento.
+- [Desenvolvimento seguro](/learn/carreira-nodejs/desenvolvimento-seguro): XSS, CSRF e outros ataques do OWASP vistos em Node.js.
+- [Java e Spring Security: Crie perfis e autorize requisições](/learn/carreira-java/java-spring-security-crie-perfis-autorize-requisicoes): o próximo passo, com papéis e permissões.
+
+## Referências
+
+- [Spring Security: Architecture](https://docs.spring.io/spring-security/reference/servlet/architecture.html)
+- [Spring Security: Form Login](https://docs.spring.io/spring-security/reference/servlet/authentication/passwords/form.html)
+- [Spring Security: CSRF](https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html)
+- [OWASP: Cross-Site Request Forgery Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)

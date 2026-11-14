@@ -1,0 +1,408 @@
+---
+title: "Java exceções: Aprenda a criar, lançar e controlar exceções"
+kind: lesson
+---
+
+Toda API falha em algum momento: o médico pedido não existe, o JSON chegou incompleto, o banco caiu, o arquivo não abriu. A diferença entre um back-end profissional e um amador está no que acontece nessa hora. No amador, o cliente recebe um 500 com stack trace e o erro some do log. No profissional, cada falha tem um tipo, uma mensagem útil, um status HTTP correto e um registro que ajuda a investigar. Neste capítulo você aprende a usar o mecanismo de exceções do Java para chegar nesse segundo cenário, usando como fio condutor a API de uma clínica (médicos, pacientes e consultas).
+
+**Você vai aprender:**
+
+- A hierarquia de exceções e a diferença entre checked e unchecked
+- Capturar com `try`/`catch`/`finally` e liberar recursos com try-with-resources
+- Lançar exceções e criar uma hierarquia própria para o domínio
+- Encadear causas e traduzir exceções entre camadas
+- Transformar exceções em respostas HTTP com `@RestControllerAdvice` e `ProblemDetail`
+
+## A hierarquia
+
+Tudo que pode ser lançado em Java herda de `Throwable`. Abaixo dele há dois ramos:
+
+| Tipo | Exemplo | O que significa | Você trata? |
+|---|---|---|---|
+| `Error` | `OutOfMemoryError`, `StackOverflowError` | Problema da JVM ou do ambiente | Quase nunca |
+| `Exception` (checked) | `IOException`, `SQLException` | Falha previsível de algo externo | O compilador obriga a tratar ou declarar |
+| `RuntimeException` (unchecked) | `IllegalArgumentException`, `NullPointerException` | Erro de programação ou regra violada | Não é obrigatório |
+
+Uma exceção **checked** é qualquer `Exception` que não seja `RuntimeException`. O compilador exige que o método a capture ou a declare com `throws`. A ideia original era forçar o tratamento de falhas recuperáveis, como um arquivo que não existe. Na prática, o ecossistema moderno (Spring, JPA, a maior parte das bibliotecas novas) prefere **unchecked**: elas não poluem as assinaturas e deixam o tratamento concentrado num ponto só, longe do código de negócio.
+
+```java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class LeitorDeAgenda {
+
+    // checked: o compilador obriga a declarar ou tratar
+    public String ler(Path arquivo) throws IOException {
+        return Files.readString(arquivo);
+    }
+
+    // unchecked: compila sem throws
+    public int duracaoEmMinutos(String texto) {
+        return Integer.parseInt(texto); // pode lançar NumberFormatException
+    }
+}
+```
+
+## Capturando: try, catch e finally
+
+O bloco `try` delimita o código que pode falhar. Cada `catch` trata um tipo, e o primeiro compatível vence, então os mais específicos vêm antes. O `finally` roda sempre, com ou sem exceção.
+
+```java
+public int lerDuracao(String texto) {
+    try {
+        int minutos = Integer.parseInt(texto.trim());
+        if (minutos <= 0) {
+            throw new IllegalArgumentException("Duração deve ser positiva: " + minutos);
+        }
+        return minutos;
+    } catch (NumberFormatException e) {
+        System.out.println("Valor não numérico, usando 30 minutos: " + texto);
+        return 30;
+    } finally {
+        System.out.println("Leitura de duração concluída");
+    }
+}
+```
+
+Quando dois tipos recebem o mesmo tratamento, use **multi-catch** com `|`:
+
+```java
+try {
+    var conteudo = Files.readString(Path.of("agenda.csv"));
+    var linhas = conteudo.lines().map(Integer::parseInt).toList();
+} catch (IOException | NumberFormatException e) {
+    System.out.println("Agenda inválida: " + e.getMessage());
+}
+```
+
+Os tipos de um multi-catch não podem ser parentes entre si (`IOException | Exception` não compila), porque o mais genérico já cobriria o outro.
+
+## Liberando recursos: try-with-resources
+
+Conexões, arquivos e streams precisam ser fechados mesmo quando algo falha. Antes do Java 7 isso era feito no `finally`, com um `if (x != null) x.close()` cheio de `try` aninhado. Hoje qualquer classe que implemente `AutoCloseable` pode ser declarada no próprio `try`, e o Java chama `close()` no fim, na ordem inversa da abertura.
+
+```java
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public long contarConsultas(Path arquivo) throws IOException {
+    try (BufferedReader leitor = Files.newBufferedReader(arquivo)) {
+        return leitor.lines().filter(linha -> !linha.isBlank()).count();
+    }
+}
+```
+
+Se o corpo lança uma exceção e o `close()` também lança, a do corpo é a principal e a do `close()` vira uma exceção **suprimida**, acessível por `getSuppressed()`. Nada se perde, o que não acontecia com o `finally` manual.
+
+Você pode criar seus próprios recursos:
+
+```java
+public class Cronometro implements AutoCloseable {
+    private final String operacao;
+    private final long inicio = System.nanoTime();
+
+    public Cronometro(String operacao) { this.operacao = operacao; }
+
+    @Override
+    public void close() {
+        long ms = (System.nanoTime() - inicio) / 1_000_000;
+        System.out.printf("%s levou %d ms%n", operacao, ms);
+    }
+}
+
+// uso
+try (var c = new Cronometro("agendamento")) {
+    agendar(dados);
+}
+```
+
+## Lançando exceções
+
+`throw` interrompe o método e sobe a exceção pela pilha até alguém capturá-la. O uso mais comum em back-end é validar entradas e regras no começo do método (guard clauses):
+
+```java
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.Objects;
+
+public record Agendamento(Long idMedico, Long idPaciente, LocalDateTime data) {
+
+    public Agendamento {
+        Objects.requireNonNull(idPaciente, "idPaciente é obrigatório");
+        Objects.requireNonNull(data, "data é obrigatória");
+        if (data.isBefore(LocalDateTime.now().plus(Duration.ofMinutes(30)))) {
+            throw new IllegalArgumentException("Consulta precisa ser agendada com 30 minutos de antecedência");
+        }
+    }
+}
+```
+
+O construtor compacto do record valida antes de atribuir os campos. Se a validação falha, o objeto nunca existe em estado inválido.
+
+Use as exceções da biblioteca padrão quando elas descrevem bem o problema: `IllegalArgumentException` para argumento inválido, `IllegalStateException` quando o objeto não está no estado certo para a operação (cancelar uma consulta já cancelada), `UnsupportedOperationException` para operação não suportada. Para regras do seu domínio, crie as suas.
+
+## Criando exceções do domínio
+
+Uma exceção própria dá nome ao problema e permite tratamento específico. Para a API da clínica, uma hierarquia pequena resolve quase tudo: "não encontrado" e "regra de negócio violada". Com classes `sealed` (Java 17+) você declara exatamente quais subtipos existem:
+
+```java
+// ClinicaException.java
+public abstract sealed class ClinicaException extends RuntimeException
+        permits RecursoNaoEncontradoException, RegraDeNegocioException {
+
+    protected ClinicaException(String mensagem) {
+        super(mensagem);
+    }
+
+    protected ClinicaException(String mensagem, Throwable causa) {
+        super(mensagem, causa);
+    }
+}
+
+// RecursoNaoEncontradoException.java
+public final class RecursoNaoEncontradoException extends ClinicaException {
+    public RecursoNaoEncontradoException(String recurso, Long id) {
+        super("%s com id %d não encontrado".formatted(recurso, id));
+    }
+}
+
+// RegraDeNegocioException.java
+public final class RegraDeNegocioException extends ClinicaException {
+    public RegraDeNegocioException(String mensagem) {
+        super(mensagem);
+    }
+}
+```
+
+Decisões que valem para quase todo projeto:
+
+- **Estenda `RuntimeException`.** Regra violada não é algo que o chamador imediato consegue resolver, e o tratamento vai acontecer na borda da aplicação.
+- **Mensagem com contexto.** "Médico com id 42 não encontrado" ajuda; "Erro" não ajuda ninguém.
+- **Construtor com causa.** Sempre ofereça um construtor que recebe `Throwable`, para não perder a origem quando você embrulha outra exceção.
+
+No serviço, o código fica direto:
+
+```java
+public DadosDetalhamentoMedico detalhar(Long id) {
+    var medico = repositorio.findById(id)
+            .orElseThrow(() -> new RecursoNaoEncontradoException("Médico", id));
+    return DadosDetalhamentoMedico.de(medico);
+}
+
+public void cancelar(Long idConsulta, MotivoCancelamento motivo) {
+    var consulta = consultas.findById(idConsulta)
+            .orElseThrow(() -> new RecursoNaoEncontradoException("Consulta", idConsulta));
+    if (consulta.getData().isBefore(LocalDateTime.now().plusHours(24))) {
+        throw new RegraDeNegocioException("Cancelamento exige 24 horas de antecedência");
+    }
+    consulta.cancelar(motivo);
+}
+```
+
+Como a hierarquia é selada, um `switch` com pattern matching sobre ela é exaustivo, e o compilador avisa se alguém adicionar um subtipo sem tratar:
+
+```java
+static int status(ClinicaException e) {
+    return switch (e) {
+        case RecursoNaoEncontradoException nf -> 404;
+        case RegraDeNegocioException rn -> 422;
+    };
+}
+```
+
+## Encadeando causas e traduzindo entre camadas
+
+Às vezes você captura uma exceção técnica e lança outra com significado de negócio. O erro clássico é jogar fora a original:
+
+```java
+// Ruim: a causa real some
+try {
+    return clienteDeConvenio.consultarCobertura(carteirinha);
+} catch (IOException e) {
+    throw new RegraDeNegocioException("Falha ao consultar convênio");
+}
+```
+
+Passe a causa adiante. O stack trace vai mostrar as duas, com `Caused by:`:
+
+```java
+public final class IntegracaoException extends RuntimeException {
+    public IntegracaoException(String mensagem, Throwable causa) {
+        super(mensagem, causa);
+    }
+}
+
+try {
+    return clienteDeConvenio.consultarCobertura(carteirinha);
+} catch (IOException e) {
+    throw new IntegracaoException("Falha ao consultar cobertura da carteirinha " + carteirinha, e);
+}
+```
+
+Esse é o padrão de **tradução de exceções**: cada camada lança exceções no vocabulário dela. O repositório fala de banco, o serviço fala de regras, o controller fala de HTTP. O Spring Data já faz isso por você: erros do driver JDBC chegam como subclasses de `DataAccessException`, independentes do banco usado.
+
+Um caso especial é `InterruptedException`. Se você não pode repassá-la, restaure a flag de interrupção para que quem está acima saiba que a thread foi interrompida:
+
+```java
+try {
+    Thread.sleep(Duration.ofSeconds(1));
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+    throw new IllegalStateException("Espera interrompida", e);
+}
+```
+
+## Exceções e transações no Spring
+
+Por padrão, um método `@Transactional` faz **rollback em `RuntimeException` e `Error`**, mas faz **commit** quando sai com uma exceção checked. Esse detalhe é mais um motivo para as exceções de domínio serem unchecked. Se precisar de rollback para uma checked, declare:
+
+```java
+@Transactional(rollbackFor = IOException.class)
+public void importarAgenda(Path arquivo) throws IOException {
+    // ...
+}
+```
+
+E repare: se você capturar a exceção dentro do próprio método transacional e não relançar, o Spring nunca a vê, e a transação faz commit do que já foi gravado.
+
+## Da exceção à resposta HTTP
+
+Num controller Spring, uma exceção não tratada vira 500. Em vez de espalhar `try/catch` pelos controllers, concentre a tradução numa classe com `@RestControllerAdvice`. O Spring Framework 6 traz `ProblemDetail`, que implementa o formato padrão de erro HTTP da RFC 9457 (`type`, `title`, `status`, `detail`, `instance`, mais propriedades extras).
+
+```java
+import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.ErrorResponse;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.Map;
+
+@RestControllerAdvice
+public class TratadorDeErros {
+
+    private static final Logger log = LoggerFactory.getLogger(TratadorDeErros.class);
+
+    @ExceptionHandler(RecursoNaoEncontradoException.class)
+    ProblemDetail naoEncontrado(RecursoNaoEncontradoException e) {
+        var problema = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
+        problema.setTitle("Recurso não encontrado");
+        return problema;
+    }
+
+    @ExceptionHandler(RegraDeNegocioException.class)
+    ProblemDetail regraDeNegocio(RegraDeNegocioException e) {
+        var problema = ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, e.getMessage());
+        problema.setTitle("Regra de negócio violada");
+        return problema;
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    ProblemDetail validacao(MethodArgumentNotValidException e) {
+        var problema = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Um ou mais campos são inválidos");
+        problema.setTitle("Dados inválidos");
+        var erros = e.getBindingResult().getFieldErrors().stream()
+                .map(campo -> Map.of(
+                        "campo", campo.getField(),
+                        "mensagem", String.valueOf(campo.getDefaultMessage())))
+                .toList();
+        problema.setProperty("erros", erros);
+        return problema;
+    }
+
+    // JSON malformado não implementa ErrorResponse: sem este handler, viraria 500
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    ProblemDetail corpoInvalido(HttpMessageNotReadableException e) {
+        var problema = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Corpo da requisição ilegível ou malformado");
+        problema.setTitle("JSON inválido");
+        return problema;
+    }
+
+    @ExceptionHandler(Exception.class)
+    ProblemDetail inesperado(Exception e, HttpServletRequest request) {
+        // Exceções do próprio Spring MVC (404 de rota, método não suportado, tipo de mídia não suportado)
+        // já sabem qual é o status certo
+        if (e instanceof ErrorResponse respostaPronta) {
+            return respostaPronta.getBody();
+        }
+        log.error("Erro inesperado em {} {}", request.getMethod(), request.getRequestURI(), e);
+        var problema = ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR,
+                "Erro interno. Tente novamente mais tarde.");
+        problema.setTitle("Erro interno");
+        return problema;
+    }
+}
+```
+
+Quando o handler devolve um `ProblemDetail`, o Spring usa o `status` dele na resposta e serializa com `Content-Type: application/problem+json`. Uma chamada para um médico inexistente responde assim:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Recurso não encontrado",
+  "status": 404,
+  "detail": "Médico com id 42 não encontrado",
+  "instance": "/medicos/42"
+}
+```
+
+Três cuidados nesse tratador. Primeiro, o handler genérico **loga** o erro com stack trace (o último argumento do `log.error` é a exceção), mas devolve ao cliente uma mensagem neutra: stack trace e mensagem de SQL na resposta entregam detalhes internos para um atacante. Segundo, os handlers de domínio não logam como erro, porque 404 e 422 são respostas normais. Terceiro, o `if (e instanceof ErrorResponse ...)` evita que exceções do Spring, que já carregam o status certo (400, 404, 405, 415), virem 500.
+
+<Callout type="warning" title="Engolir exceção, ou logar e relançar">
+Os dois erros mais comuns são opostos. O primeiro é o `catch (Exception e) {}` vazio, ou com um `e.printStackTrace()` que ninguém lê: o sistema segue num estado errado e o bug aparece longe da causa. O segundo é logar e relançar em todas as camadas, o que gera o mesmo stack trace cinco vezes no log. A regra: **ou você trata (e então registra o que fez), ou você propaga**. O registro com stack trace acontece uma vez, no ponto que decide a resposta final, como o `@RestControllerAdvice`.
+</Callout>
+
+## Outras boas práticas
+
+- **Não use exceção para controle de fluxo.** Criar uma exceção captura o stack trace, o que custa caro, e esconde a lógica. Para "talvez não exista", devolva `Optional`; para "é válido?", devolva `boolean`.
+- **Capture o tipo mais específico possível.** `catch (Exception e)` no meio do código pega também `NullPointerException` e outros bugs que deveriam explodir.
+- **Falhe cedo.** Valide entradas na borda (Bean Validation no DTO) e invariantes no construtor. Quanto mais perto da causa, mais fácil o diagnóstico.
+- **Não devolva `null` para sinalizar erro.** O chamador esquece de checar e o problema vira um `NullPointerException` três métodos depois.
+
+## Na entrevista
+
+**Qual a diferença entre exceção checked e unchecked?** Checked herda de `Exception` sem passar por `RuntimeException`, e o compilador obriga a capturar ou declarar com `throws`. Unchecked herda de `RuntimeException` e não tem essa exigência. Frameworks modernos preferem unchecked para não acoplar assinaturas a detalhes de falha.
+
+**O finally sempre executa?** Executa em retorno normal, em exceção e mesmo com `return` dentro do `try`. As exceções são o fim abrupto da JVM (`System.exit`, processo morto) ou uma thread que nunca sai do `try`. Não se deve dar `return` dentro do `finally`, porque isso descarta a exceção em andamento.
+
+**Por que preferir try-with-resources?** Fecha o recurso automaticamente na ordem certa, mesmo com exceção, e preserva a exceção do `close()` como suprimida em vez de esconder a principal.
+
+**Como você padroniza erros numa API Spring?** Exceções de domínio unchecked, um `@RestControllerAdvice` que as traduz para status HTTP, e o corpo no formato `ProblemDetail` (RFC 9457), com log completo só para erros inesperados.
+
+## Pratique
+
+Na API da clínica (ou num projeto Spring Boot novo com um CRUD de médicos):
+
+1. Crie a hierarquia selada `ClinicaException`, `RecursoNaoEncontradoException` e `RegraDeNegocioException`.
+2. No serviço, lance `RecursoNaoEncontradoException` ao buscar médico ou consulta inexistente, e `RegraDeNegocioException` ao tentar cancelar consulta com menos de 24 horas de antecedência.
+3. Escreva o `TratadorDeErros` com `ProblemDetail` para 404, 422, 400 de validação (com a lista de campos) e 500 genérico.
+4. Entregue um arquivo `erros.http` (ou uma coleção do Postman) com uma requisição que provoca cada status, e confirme que nenhuma resposta expõe stack trace.
+
+<Quiz question="Um método @Transactional lança uma IOException (checked) depois de salvar uma entidade. O que acontece por padrão?" options={["A transação faz rollback","A transação faz commit","O Spring converte em RuntimeException e faz rollback","A aplicação não compila"]} answer={1} explanation="Por padrão o Spring só faz rollback em RuntimeException e Error. Para checked é preciso declarar rollbackFor." />
+
+<Quiz question="Qual é a forma correta de embrulhar uma exceção técnica numa exceção de negócio?" options={["Lançar a nova só com a mensagem da antiga","Passar a original como causa no construtor da nova","Logar a original e lançar a nova sem relação","Retornar null e logar o erro"]} answer={1} explanation="Passar a causa preserva o stack trace original, que aparece como Caused by no log. Sem ela, a origem real do problema se perde." />
+
+<Quiz question="Num @RestControllerAdvice, o que fazer com uma exceção inesperada?" options={["Devolver o stack trace para facilitar o debug do cliente","Ignorar e responder 200","Logar com stack trace e responder 500 com mensagem genérica","Relançar para o Tomcat tratar"]} answer={2} explanation="O detalhe técnico vai para o log, onde você investiga. O cliente recebe uma mensagem neutra, sem expor estrutura interna." />
+
+## Base no CodeForge
+
+- [Exceções em Java](/learn/java/excecoes) e [Optional e null](/learn/java/optional-e-null): a linguagem em formato de entrevista.
+- [Records e enums](/learn/java/records-e-enums): construtores compactos que validam na criação.
+- [Java: Consumindo API, gravando arquivos e lidando com erros](/learn/carreira-java/java-consumindo-api-gravando-arquivos-lidando-erros): onde as primeiras exceções checked aparecem.
+- [Boas práticas de programação: Melhore o código de uma API Java](/learn/carreira-java/boas-praticas-programacao-melhore-codigo-api-java): o tratador de erros dentro de uma API bem organizada.
+- [TypeScript: Desenvolvendo validações e tratando erros](/learn/carreira-nodejs/typescript-desenvolvendo-validacoes-tratando-erros): o mesmo problema em outra stack, para comparar.
+
+## Referências
+
+- [Oracle: Exceptions (The Java Tutorials)](https://docs.oracle.com/javase/tutorial/essential/exceptions/index.html)
+- [Spring Framework: Error Responses](https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-rest-exceptions.html)
+- [RFC 9457: Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457)
+- [Spring Framework: Rolling Back a Declarative Transaction](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/rolling-back.html)

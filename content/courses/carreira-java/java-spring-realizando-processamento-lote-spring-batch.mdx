@@ -1,0 +1,359 @@
+---
+title: "Java e Spring: Realizando processamento em lote com Spring Batch"
+kind: lesson
+---
+
+Nem todo trabalho de back-end chega por requisição HTTP. Todo dia, às 2 da manhã, alguém precisa importar o arquivo de preços do fornecedor com 2 milhões de linhas, conciliar os pagamentos do dia com o extrato do banco ou gerar o relatório fiscal do mês. Fazer isso com um laço `for` dentro de um `@Scheduled` funciona até a primeira vez que o processo cai na linha 1.300.000 e ninguém sabe o que já foi gravado. O Spring Batch resolve exatamente isso: processamento em lote com transações por bloco, controle de erros, histórico de execuções e a capacidade de reiniciar de onde parou.
+
+**Você vai aprender:**
+
+- O modelo do Spring Batch: Job, Step, JobInstance, JobExecution e JobRepository
+- Montar um step orientado a chunks com reader, processor e writer
+- Tratar erros com skip e retry sem perder o lote inteiro
+- Reiniciar um job que falhou a partir do ponto em que parou
+- Disparar e acompanhar jobs em uma aplicação Spring Boot 3
+
+## O modelo
+
+- **Job**: o processo inteiro, por exemplo "importar catálogo do fornecedor". É composto de um ou mais steps.
+- **Step**: uma fase do job. Pode ser orientado a **chunks** (ler, processar, gravar em blocos) ou uma **tasklet** (uma tarefa única, como apagar um arquivo temporário).
+- **JobInstance**: uma execução lógica do job, identificada pelos **JobParameters**. "Importar catálogo do arquivo de 13/11" é uma instância.
+- **JobExecution**: uma tentativa de rodar uma instância. Se a primeira falhar e você reiniciar, a mesma instância terá duas execuções.
+- **JobRepository**: onde o Spring Batch guarda tudo isso, em tabelas do banco (`BATCH_JOB_INSTANCE`, `BATCH_JOB_EXECUTION`, `BATCH_STEP_EXECUTION`, os contextos de execução e outras). É esse registro que permite reiniciar e auditar.
+
+### Processamento em chunks
+
+O coração do Spring Batch é o step orientado a chunks. Com um chunk de 500:
+
+1. O `ItemReader` lê um item por vez até juntar 500.
+2. O `ItemProcessor` transforma ou filtra cada item.
+3. O `ItemWriter` grava os 500 de uma vez.
+4. A transação é confirmada, e o estado do step (quantos itens foram lidos, em que linha do arquivo está) é salvo no JobRepository na mesma transação.
+
+Se o processo cair no chunk 2.601, os 2.600 primeiros já estão gravados e registrados. Ao reiniciar, o reader pula direto para onde parou.
+
+## Configuração no Spring Boot 3
+
+Adicione `spring-boot-starter-batch` e um driver de banco. O Spring Batch 5 mudou bastante em relação ao 4:
+
+- `JobBuilderFactory` e `StepBuilderFactory` não existem mais. Você usa `new JobBuilder(nome, jobRepository)` e `new StepBuilder(nome, jobRepository)`.
+- O gerenciador de transação é passado explicitamente para cada step de chunk.
+- Com Spring Boot, **não use** `@EnableBatchProcessing`: a anotação desliga a autoconfiguração do Boot.
+
+```yaml
+spring:
+  batch:
+    jdbc:
+      initialize-schema: always   # em produção, crie as tabelas pela sua ferramenta de migração
+    job:
+      enabled: false              # não roda os jobs automaticamente ao subir
+  datasource:
+    url: jdbc:postgresql://localhost:5432/loja
+    username: loja
+    password: ${DB_PASSWORD}
+```
+
+## O job de importação de catálogo
+
+O fornecedor envia um CSV:
+
+```text
+sku;descricao;preco;estoque
+TEN-001;Tênis corrida azul 42;399,90;15
+CAM-104;Camiseta dry fit M;89,90;120
+MEI-220;Meia esportiva kit 3;;40
+```
+
+O objetivo: validar cada linha, converter o preço, ignorar linhas inválidas (até um limite) e fazer upsert na tabela `produtos`.
+
+### Modelos
+
+```java
+public record LinhaFornecedor(String sku, String descricao, String preco, String estoque) {}
+
+public record Produto(String sku, String descricao, BigDecimal preco, int estoque) {}
+```
+
+### Reader
+
+```java
+@Bean
+@StepScope
+FlatFileItemReader<LinhaFornecedor> leitorFornecedor(
+        @Value("#{jobParameters['arquivo']}") String arquivo) {
+    return new FlatFileItemReaderBuilder<LinhaFornecedor>()
+            .name("leitorFornecedor")
+            .resource(new FileSystemResource(arquivo))
+            .linesToSkip(1)                       // cabeçalho
+            .encoding("UTF-8")
+            .delimited().delimiter(";")
+            .names("sku", "descricao", "preco", "estoque")
+            .targetType(LinhaFornecedor.class)    // records são suportados
+            .build();
+}
+```
+
+`@StepScope` faz o bean ser criado na hora em que o step roda, o que permite ler o caminho do arquivo dos parâmetros do job. O `name` é importante: é a chave com que o reader salva a posição atual no contexto de execução, usada no restart.
+
+### Processor
+
+```java
+@Component
+class ValidadorProduto implements ItemProcessor<LinhaFornecedor, Produto> {
+
+    private static final NumberFormat BR = NumberFormat.getNumberInstance(Locale.of("pt", "BR"));
+
+    @Override
+    public Produto process(LinhaFornecedor linha) throws Exception {
+        if (linha.sku() == null || linha.sku().isBlank()) {
+            throw new LinhaInvalidaException("SKU vazio");
+        }
+        if (linha.preco() == null || linha.preco().isBlank()) {
+            return null;                          // null = filtra o item, não é erro
+        }
+        var preco = new BigDecimal(BR.parse(linha.preco()).toString());
+        var estoque = Integer.parseInt(linha.estoque().trim());
+        return new Produto(linha.sku().trim(), linha.descricao().trim(), preco, estoque);
+    }
+}
+```
+
+Devolver `null` filtra o item: ele não vai para o writer e é contado como filtrado. Lançar exceção é tratado como erro, e o que acontece depende da política de tolerância a falhas.
+
+### Writer
+
+```java
+@Bean
+JdbcBatchItemWriter<Produto> gravadorProdutos(DataSource dataSource) {
+    return new JdbcBatchItemWriterBuilder<Produto>()
+            .dataSource(dataSource)
+            .sql("""
+                 insert into produtos (sku, descricao, preco, estoque, atualizado_em)
+                 values (?, ?, ?, ?, now())
+                 on conflict (sku) do update
+                    set descricao = excluded.descricao,
+                        preco = excluded.preco,
+                        estoque = excluded.estoque,
+                        atualizado_em = now()
+                 """)
+            .itemPreparedStatementSetter((p, ps) -> {
+                ps.setString(1, p.sku());
+                ps.setString(2, p.descricao());
+                ps.setBigDecimal(3, p.preco());
+                ps.setInt(4, p.estoque());
+            })
+            .build();
+}
+```
+
+O writer usa JDBC batch: um único envio ao banco com as 500 linhas do chunk, muito mais rápido do que 500 `INSERT` separados. O upsert torna a escrita **idempotente**: se um chunk for reprocessado depois de uma falha, o resultado é o mesmo.
+
+### Step e Job
+
+```java
+@Configuration
+class ImportacaoCatalogoConfig {
+
+    @Bean
+    Step importarProdutos(JobRepository jobRepository,
+                          PlatformTransactionManager transactionManager,
+                          FlatFileItemReader<LinhaFornecedor> leitorFornecedor,
+                          ValidadorProduto validador,
+                          JdbcBatchItemWriter<Produto> gravadorProdutos) {
+        return new StepBuilder("importarProdutos", jobRepository)
+                .<LinhaFornecedor, Produto>chunk(500, transactionManager)
+                .reader(leitorFornecedor)
+                .processor(validador)
+                .writer(gravadorProdutos)
+                .faultTolerant()
+                .skip(FlatFileParseException.class)
+                .skip(LinhaInvalidaException.class)
+                .skip(NumberFormatException.class)    // estoque inválido
+                .skip(java.text.ParseException.class) // preço inválido
+                .skipLimit(100)
+                .retry(TransientDataAccessException.class)
+                .retryLimit(3)
+                .listener(new RegistradorDeSkips())
+                .build();
+    }
+
+    @Bean
+    Step arquivarArquivo(JobRepository jobRepository, PlatformTransactionManager tm) {
+        return new StepBuilder("arquivarArquivo", jobRepository)
+                .tasklet((contribution, chunkContext) -> {
+                    var params = chunkContext.getStepContext().getJobParameters();
+                    var origem = Path.of((String) params.get("arquivo"));
+                    Files.move(origem, origem.resolveSibling("processados").resolve(origem.getFileName()));
+                    return RepeatStatus.FINISHED;
+                }, tm)
+                .build();
+    }
+
+    @Bean
+    Job importarCatalogo(JobRepository jobRepository, Step importarProdutos, Step arquivarArquivo) {
+        return new JobBuilder("importarCatalogo", jobRepository)
+                .start(importarProdutos)
+                .next(arquivarArquivo)
+                .build();
+    }
+}
+```
+
+O step de arquivar é uma tasklet: uma ação única, sem leitura em blocos. Ele só roda se a importação terminar com sucesso.
+
+## Tolerância a falhas
+
+- **skip**: o item com erro é pulado e o processamento continua. Ao estourar o `skipLimit`, o step falha. É o que você quer para dados ruins: 3 linhas com preço malformado não devem impedir a importação de 2 milhões.
+- **retry**: a operação é tentada de novo. Faz sentido para erros transitórios, como um deadlock ou uma conexão perdida, nunca para dados inválidos.
+
+Quando um erro acontece no writer, o Spring Batch não sabe qual dos 500 itens causou o problema. Ele faz rollback do chunk e reprocessa os itens **um a um** para isolar o culpado, pulando só ele. Por isso o processor e o writer devem ser idempotentes e sem efeitos colaterais fora da transação.
+
+Registre o que foi pulado, para alguém corrigir depois:
+
+```java
+class RegistradorDeSkips implements SkipListener<LinhaFornecedor, Produto> {
+    private static final Logger log = LoggerFactory.getLogger(RegistradorDeSkips.class);
+
+    @Override
+    public void onSkipInRead(Throwable t) {
+        log.warn("Linha ilegível pulada: {}", t.getMessage());
+    }
+
+    @Override
+    public void onSkipInProcess(LinhaFornecedor linha, Throwable t) {
+        log.warn("Linha inválida pulada sku={}: {}", linha.sku(), t.getMessage());
+    }
+}
+```
+
+## Disparando o job e reiniciando
+
+Com `spring.batch.job.enabled=false`, você decide quando rodar. Um agendamento diário:
+
+```java
+@Component
+class AgendadorImportacao {
+    private final JobLauncher launcher;
+    private final Job importarCatalogo;
+
+    AgendadorImportacao(JobLauncher launcher, Job importarCatalogo) {
+        this.launcher = launcher;
+        this.importarCatalogo = importarCatalogo;
+    }
+
+    @Scheduled(cron = "0 0 2 * * *", zone = "America/Sao_Paulo")
+    void importarDoDia() throws Exception {
+        var hoje = LocalDate.now(ZoneId.of("America/Sao_Paulo"));
+        var params = new JobParametersBuilder()
+                .addString("arquivo", "/dados/entrada/catalogo-" + hoje + ".csv")
+                .addLocalDate("dataReferencia", hoje)
+                .toJobParameters();
+        launcher.run(importarCatalogo, params);
+    }
+}
+```
+
+Os parâmetros identificam a instância. Isso define o comportamento de restart:
+
+| Situação | O que acontece ao rodar com os mesmos parâmetros |
+|---|---|
+| A última execução **falhou** | Restart: nova execução da mesma instância, continuando do último chunk confirmado |
+| A última execução **completou** | `JobInstanceAlreadyCompleteException`: o lote daquele dia já foi feito |
+| Está **rodando** | `JobExecutionAlreadyRunningException` |
+| Parâmetros **diferentes** | Nova instância, do zero |
+
+Esse é o grande ganho: o arquivo de 2 milhões de linhas que falhou na linha 1.300.000 por causa de uma queda do banco recomeça da linha 1.300.001 depois que o banco volta, e o mesmo arquivo nunca é importado duas vezes por engano.
+
+<Callout type="warning" title="Parâmetros únicos a cada execução quebram o restart">
+É comum adicionar um timestamp ou um `RunIdIncrementer` para poder rodar o job sempre que quiser. O efeito colateral: cada execução vira uma nova instância, e uma execução que falhou nunca é reiniciada, apenas uma nova começa do zero, possivelmente duplicando dados se o writer não for idempotente. Use como parâmetros identificadores aquilo que define o lote de verdade (o arquivo, a data de referência), e não um valor que muda a cada chamada.
+</Callout>
+
+Para acompanhar execuções, consulte as tabelas de metadados:
+
+```sql
+select je.job_execution_id, ji.job_name, je.status, je.exit_code,
+       se.step_name, se.read_count, se.write_count, se.filter_count,
+       se.read_skip_count + se.process_skip_count + se.write_skip_count as skips,
+       se.commit_count, se.start_time, se.end_time
+from batch_job_execution je
+join batch_job_instance ji on ji.job_instance_id = je.job_instance_id
+join batch_step_execution se on se.job_execution_id = je.job_execution_id
+order by je.job_execution_id desc
+limit 20;
+```
+
+Com o Actuator e o Micrometer, o Spring Batch também publica métricas de duração de jobs, steps e chunks.
+
+## Escalando
+
+Quando um único thread não dá conta da janela noturna, há opções em ordem crescente de complexidade:
+
+- **Ajustar o chunk**: chunks maiores reduzem o número de commits, até o ponto em que a transação fica grande demais. Meça com 100, 500 e 2.000.
+- **Step multi-thread**: `.taskExecutor(executor)` no StepBuilder processa chunks em paralelo. O `FlatFileItemReader` não é thread-safe e o restart perde precisão, então use com readers próprios para isso.
+- **Particionamento**: divida os dados (por faixa de id, por arquivo) e rode um step por partição, cada um com o próprio reader e estado. É a forma mais robusta, e as partições podem rodar em threads ou em outras máquinas.
+
+## Testando
+
+```java
+@SpringBatchTest
+@SpringBootTest
+class ImportacaoCatalogoTest {
+    @Autowired JobLauncherTestUtils jobLauncherTestUtils;
+    @Autowired JdbcTemplate jdbc;
+
+    @Test
+    void importaLinhasValidasEPulaInvalidas() throws Exception {
+        var params = new JobParametersBuilder()
+                .addString("arquivo", "src/test/resources/catalogo-teste.csv")
+                .toJobParameters();
+
+        var execucao = jobLauncherTestUtils.launchStep("importarProdutos", params);
+
+        assertThat(execucao.getStatus()).isEqualTo(BatchStatus.COMPLETED);
+        var step = execucao.getStepExecutions().iterator().next();
+        assertThat(step.getWriteCount()).isEqualTo(2);
+        assertThat(step.getFilterCount()).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from produtos", Integer.class)).isEqualTo(2);
+    }
+}
+```
+
+Combine com Testcontainers para rodar contra um Postgres real: o `on conflict` do upsert não existe em todos os bancos.
+
+## Na entrevista
+
+**Qual a diferença entre JobInstance e JobExecution?** A instância é a execução lógica identificada pelos parâmetros, como a importação do dia 13. A execução é cada tentativa de rodar essa instância. Uma instância que falhou e foi reiniciada tem duas execuções.
+
+**O que é um chunk e por que ele importa?** É o bloco de itens processados e gravados numa mesma transação. Ele equilibra desempenho (menos commits) e recuperação (em caso de falha, só o chunk atual é refeito), e é a unidade de checkpoint para o restart.
+
+**Como o Spring Batch sabe de onde reiniciar?** Componentes como o `FlatFileItemReader` salvam a posição no `ExecutionContext`, que é persistido no JobRepository a cada commit de chunk. No restart, o contexto é carregado e o reader continua da posição salva.
+
+**Skip ou retry?** Skip para dados inválidos que não vão melhorar com nova tentativa. Retry para falhas transitórias de infraestrutura. Os dois têm limite.
+
+## Pratique
+
+Implemente o job de importação de catálogo da loja:
+
+1. O job `importarCatalogo` com reader de CSV, processor de validação, writer com upsert e a tasklet de arquivamento.
+2. Uma política de skip com limite de 100 e um listener que grava as linhas puladas numa tabela `importacao_erros` com o motivo.
+3. Um teste que gera um CSV de 10 mil linhas, injeta uma falha no writer depois de 5 mil itens, roda o job (que falha), remove a falha, roda de novo com os mesmos parâmetros e prova que o resultado final tem exatamente 10 mil produtos e que a segunda execução leu só a parte restante.
+4. Um endpoint `POST /admin/importacoes` que dispara o job com um arquivo informado e um `GET` que lista as últimas execuções lendo as tabelas de metadados.
+
+<Quiz question="Uma JobInstance completou com sucesso. O que acontece se você rodar o job de novo com os mesmos parâmetros?" options={["Ele roda de novo do zero","Ele é reiniciado do último chunk","O Spring Batch lança JobInstanceAlreadyCompleteException","Ele roda só o último step"]} answer={2} explanation="Os parâmetros identificam a instância. Uma instância completa não roda de novo; para processar outro lote, os parâmetros identificadores precisam ser diferentes." />
+
+<Quiz question="O que acontece quando um ItemProcessor devolve null?" options={["O job falha com NullPointerException","O item é filtrado e não chega ao writer","O item é gravado com campos nulos","O item é contado como skip"]} answer={1} explanation="Devolver null é a forma prevista de filtrar itens. Eles são contados em filterCount e não vão para o writer. Skip é para itens que lançaram exceção." />
+
+<Quiz question="Por que o writer do job deve ser idempotente?" options={["Para permitir chunks maiores","Porque chunks podem ser reprocessados após falhas e no isolamento de erros","Porque o JobRepository exige","Para evitar o uso de transações"]} answer={1} explanation="Em falhas no writer, o Spring Batch faz rollback e reprocessa os itens um a um para achar o culpado, e no restart um trecho pode ser refeito. Um upsert garante o mesmo resultado." />
+
+## Base no CodeForge
+
+- [Batch vs stream](/learn/system-design/batch-vs-stream) e [ETL](/learn/system-design/etl): onde o processamento em lote se encaixa na arquitetura de dados.
+- [Idempotência](/learn/system-design/idempotencia): o princípio que torna o restart seguro.
+- [Transações e ACID](/learn/sql/transacoes-e-acid): o que significa confirmar um chunk.
+- [Mensageria com Java: RabbitMQ e Kafka](/learn/carreira-java/mensageria-java-rabbitmq-kafka): a alternativa de processamento contínuo, por eventos.
+
+## Referências
+
+- [Spring Batch: Reference Documentation](https://docs.spring.io/spring-batch/reference/)
+- [Spring Batch: Chunk-oriented processing](https://docs.spring.io/spring-batch/reference/step/chunk-oriented-processing.html)
+- [Spring Boot: Batch Applications](https://docs.spring.io/spring-boot/how-to/batch.html)

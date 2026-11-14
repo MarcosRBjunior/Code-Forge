@@ -1,0 +1,348 @@
+---
+title: "Java e Spring Security: Proteja suas APIs REST"
+kind: lesson
+---
+
+Uma API REST consumida por um front em React, por um aplicativo móvel e por outros serviços não pode depender de sessão em cookie: cada cliente tem um domínio diferente, as instâncias da API sobem e descem, e guardar estado no servidor complica tudo. A solução padrão é autenticação stateless com token assinado. No capítulo de Spring Boot 3 você escreveu o filtro de JWT à mão; aqui você usa o suporte oficial do Spring Security, o OAuth2 Resource Server, que já valida assinatura, expiração e emissor, converte claims em permissões e responde 401 e 403 no formato certo. Também configura CORS para o front conseguir chamar a API.
+
+**Você vai aprender:**
+
+- Configurar uma `SecurityFilterChain` stateless com `oauth2ResourceServer`
+- Emitir JWT assinado com RSA usando `JwtEncoder` e validá-lo com `JwtDecoder`
+- Converter claims do token em roles e usá-las nas regras de autorização
+- Configurar CORS corretamente e testar endpoints protegidos com MockMvc
+
+## Por que trocar o filtro manual
+
+O filtro feito à mão funciona, mas você passa a ser responsável por tudo: ler o cabeçalho, validar algoritmo, assinatura, expiração, emissor, montar o `Authentication`, responder 401 com o cabeçalho `WWW-Authenticate` certo e não esquecer nenhum caso. O resource server do Spring Security faz isso tudo, testado por milhares de projetos, e tem outra vantagem: se um dia a emissão de tokens passar para um provedor de identidade (Keycloak, Auth0, Amazon Cognito, Microsoft Entra ID), você muda uma linha de configuração em vez de reescrever o filtro.
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+```
+
+Esse starter traz o Spring Security e a biblioteca Nimbus JOSE + JWT, usada tanto para validar quanto para emitir tokens.
+
+## Chaves RSA
+
+Com HMAC (HS256), quem valida o token também consegue emiti-lo, porque é o mesmo segredo. Com RSA (RS256), só quem tem a chave privada emite; qualquer serviço com a chave pública valida. Quando a clínica tiver um serviço de agendamento, outro de faturamento e outro de notificações, todos validam com a pública, e só o serviço de autenticação guarda a privada.
+
+Gere o par de chaves:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out app.key
+openssl rsa -in app.key -pubout -out app.pub
+```
+
+```yaml
+# application.yml
+jwt:
+  public-key: classpath:app.pub
+  private-key: ${JWT_PRIVATE_KEY_LOCATION:classpath:app.key}
+  emissor: https://api.clinica.com
+```
+
+Em desenvolvimento, as chaves podem ficar em `src/main/resources` (fora do Git, no `.gitignore`). Em produção, a privada vem de um cofre de segredos ou de um arquivo montado no contêiner, e a propriedade aponta para ela com `file:`.
+
+## Encoder, decoder e a cadeia de filtros
+
+O Spring Security converte automaticamente uma propriedade como `classpath:app.pub` num `RSAPublicKey` quando você a injeta com `@Value`:
+
+```java
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Value("${jwt.public-key}") RSAPublicKey chavePublica;
+    @Value("${jwt.private-key}") RSAPrivateKey chavePrivada;
+
+    @Bean
+    JwtDecoder jwtDecoder(@Value("${jwt.emissor}") String emissor) {
+        var decoder = NimbusJwtDecoder.withPublicKey(chavePublica).build();
+        decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(emissor));
+        return decoder;
+    }
+
+    @Bean
+    JwtEncoder jwtEncoder() {
+        var jwk = new RSAKey.Builder(chavePublica).privateKey(chavePrivada).build();
+        return new NimbusJwtEncoder(new ImmutableJWKSet<>(new JWKSet(jwk)));
+    }
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        return http
+                .csrf(csrf -> csrf.disable())
+                .cors(Customizer.withDefaults())
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(req -> req
+                        .requestMatchers(HttpMethod.POST, "/auth/login").permitAll()
+                        .requestMatchers("/actuator/health", "/v3/api-docs/**", "/swagger-ui/**").permitAll()
+                        .requestMatchers(HttpMethod.DELETE, "/medicos/**").hasRole("ADMIN")
+                        .requestMatchers("/prontuarios/**").hasRole("MEDICO")
+                        .anyRequest().authenticated())
+                .oauth2ResourceServer(rs -> rs.jwt(jwt -> jwt.jwtAuthenticationConverter(conversorDeRoles())))
+                .build();
+    }
+
+    @Bean
+    PasswordEncoder passwordEncoder() {
+        return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+    }
+
+    @Bean
+    AuthenticationManager authenticationManager(UserDetailsService usuarios, PasswordEncoder encoder) {
+        var provedor = new DaoAuthenticationProvider(usuarios);
+        provedor.setPasswordEncoder(encoder);
+        return new ProviderManager(provedor);
+    }
+
+    private JwtAuthenticationConverter conversorDeRoles() {
+        var authorities = new JwtGrantedAuthoritiesConverter();
+        authorities.setAuthoritiesClaimName("roles");
+        authorities.setAuthorityPrefix("ROLE_");
+        var conversor = new JwtAuthenticationConverter();
+        conversor.setJwtGrantedAuthoritiesConverter(authorities);
+        return conversor;
+    }
+}
+```
+
+O que acontece em cada requisição: o `BearerTokenAuthenticationFilter` lê o `Authorization: Bearer`, o `JwtDecoder` confere assinatura, `exp`, `nbf` e `iss`, o conversor transforma a claim `roles` em authorities `ROLE_*` e o resultado vira um `JwtAuthenticationToken` no contexto. Sem token, ou com token inválido, a resposta é 401 com `WWW-Authenticate: Bearer error="invalid_token"`. Com token válido e role insuficiente, 403.
+
+O conversor existe porque o padrão do resource server é ler a claim `scope` (ou `scp`) e prefixar com `SCOPE_`, que é o formato de tokens OAuth2 emitidos para aplicações. Como aqui o token representa um usuário com perfis, mapear `roles` para `ROLE_` permite continuar usando `hasRole` e a `RoleHierarchy` do capítulo anterior.
+
+Uma observação sobre o `DaoAuthenticationProvider`: no Spring Security 6.5 (o do Spring Boot 3.5) o construtor recomendado recebe o `UserDetailsService`, e o encoder entra por `setPasswordEncoder`; o construtor que recebe o `PasswordEncoder` e o `setUserDetailsService` ficaram depreciados. Em versões anteriores à 6.5, use o construtor vazio com `setUserDetailsService` e `setPasswordEncoder`.
+
+## O endpoint de login
+
+O login confere usuário e senha e emite o token com as claims padronizadas (`iss`, `sub`, `iat`, `exp`) e as roles:
+
+```java
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+
+    private final AuthenticationManager manager;
+    private final JwtEncoder encoder;
+    private final String emissor;
+
+    public AuthController(AuthenticationManager manager, JwtEncoder encoder,
+                          @Value("${jwt.emissor}") String emissor) {
+        this.manager = manager;
+        this.encoder = encoder;
+        this.emissor = emissor;
+    }
+
+    @PostMapping("/login")
+    public DadosToken login(@RequestBody @Valid DadosLogin dados) {
+        var auth = manager.authenticate(
+                UsernamePasswordAuthenticationToken.unauthenticated(dados.email(), dados.senha()));
+
+        var roles = auth.getAuthorities().stream()
+                .map(GrantedAuthority::getAuthority)
+                .filter(a -> a.startsWith("ROLE_"))
+                .map(a -> a.substring(5))
+                .toList();
+
+        var agora = Instant.now();
+        var validade = Duration.ofMinutes(15);
+        var claims = JwtClaimsSet.builder()
+                .issuer(emissor)
+                .subject(auth.getName())
+                .issuedAt(agora)
+                .expiresAt(agora.plus(validade))
+                .claim("roles", roles)
+                .build();
+
+        var token = encoder.encode(JwtEncoderParameters.from(claims)).getTokenValue();
+        return new DadosToken(token, "Bearer", validade.toSeconds());
+    }
+}
+
+public record DadosLogin(@NotBlank @Email String email, @NotBlank String senha) {}
+public record DadosToken(String accessToken, String tokenType, long expiresIn) {}
+```
+
+Sem cabeçalho explícito, o `NimbusJwtEncoder` assina com RS256, usando a chave RSA do `JWKSet`. Nos controllers, o token decodificado chega pronto:
+
+```java
+@GetMapping("/minhas-consultas")
+public List<DadosConsulta> minhas(@AuthenticationPrincipal Jwt jwt) {
+    return consultas.doPaciente(jwt.getSubject());
+}
+```
+
+E `@PreAuthorize` continua funcionando igual, com `authentication.name` sendo o `sub` do token.
+
+## Tempo de vida, refresh e revogação
+
+O token é autossuficiente: a API não consulta o banco para validá-lo. Esse é o ganho (escala horizontal sem estado compartilhado) e o custo (não dá para "deslogar" um token emitido). O equilíbrio usual:
+
+- **Access token curto**, de 5 a 15 minutos. Se vazar, a janela de abuso é pequena.
+- **Refresh token longo e opaco**, um valor aleatório guardado no banco (com hash), associado ao usuário e ao dispositivo. O cliente troca o refresh por um novo access token em `POST /auth/refresh`.
+- **Rotação**: cada uso do refresh token gera um novo e invalida o anterior. Se um refresh já usado aparecer de novo, alguém o copiou; revogue toda a família daquele dispositivo.
+- **Revogação imediata** (usuário demitido, senha trocada): apague os refresh tokens dele. O access token ainda vive alguns minutos, o que costuma ser aceitável. Se não for, mantenha uma lista de bloqueio de `jti` em cache até a expiração.
+
+Onde o front guarda o token? Em memória (variável JavaScript) é o mais seguro contra XSS, mas some ao recarregar a página. O refresh token pode ir num cookie `HttpOnly`, `Secure`, `SameSite=Strict`, restrito ao caminho `/auth/refresh`. Note que, se você usar cookie para o refresh, aquela rota volta a precisar de proteção CSRF.
+
+<Callout type="warning" title="CORS não é autenticação">
+CORS é uma regra que o navegador aplica para decidir se um JavaScript de outra origem pode ler a resposta. Ele não impede `curl`, Postman, outro servidor nem um script malicioso fora do navegador de chamar a sua API. Liberar `*` não deixa a API "aberta" (o token continua exigido), e restringir origens não a deixa "fechada". A proteção real é a autenticação e a autorização. E atenção ao erro clássico: `allowedOrigins("*")` junto com `allowCredentials(true)` é proibido pela especificação, e o Spring recusa essa combinação. Liste as origens.
+</Callout>
+
+## CORS
+
+O front da clínica roda em `https://app.clinica.com` e a API em `https://api.clinica.com`. São origens diferentes, então o navegador, antes de um `POST` com JSON ou de qualquer requisição com `Authorization`, manda uma requisição de pré-verificação (`OPTIONS`, o "preflight") perguntando se pode. A API responde com cabeçalhos `Access-Control-Allow-*`.
+
+Com `.cors(Customizer.withDefaults())` na cadeia, o Spring Security procura um bean `CorsConfigurationSource` e trata o preflight antes da autenticação, que é o comportamento certo (o preflight não leva o token):
+
+```java
+@Bean
+CorsConfigurationSource corsConfigurationSource(
+        @Value("${app.cors.origens}") List<String> origens) {
+    var config = new CorsConfiguration();
+    config.setAllowedOrigins(origens);
+    config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+    config.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+    config.setExposedHeaders(List.of("Location"));
+    config.setMaxAge(Duration.ofHours(1));
+
+    var source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/**", config);
+    return source;
+}
+```
+
+```yaml
+app:
+  cors:
+    origens: https://app.clinica.com,http://localhost:5173
+```
+
+`setExposedHeaders` com `Location` permite que o front leia a URI do recurso criado; sem isso, o cabeçalho chega mas o JavaScript não o enxerga. `setMaxAge` deixa o navegador guardar a resposta do preflight por uma hora, economizando uma ida e volta em cada chamada.
+
+Se você configurar CORS só no Spring MVC (com `WebMvcConfigurer.addCorsMappings`) e não na cadeia de segurança, o preflight bate no Spring Security primeiro, sem token, e recebe 401. O sintoma no navegador é um erro de CORS que confunde: o problema real é que a segurança barrou o `OPTIONS`.
+
+## Uma API, duas cadeias
+
+Se o mesmo projeto tem a API stateless e um painel web com sessão (como o portal do capítulo anterior), declare duas cadeias com `securityMatcher` e `@Order`:
+
+```java
+@Bean
+@Order(1)
+SecurityFilterChain api(HttpSecurity http) throws Exception {
+    return http.securityMatcher("/api/**")
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(req -> req.anyRequest().authenticated())
+            .oauth2ResourceServer(rs -> rs.jwt(Customizer.withDefaults()))
+            .build();
+}
+
+@Bean
+@Order(2)
+SecurityFilterChain web(HttpSecurity http) throws Exception {
+    return http
+            .authorizeHttpRequests(req -> req.anyRequest().authenticated())
+            .formLogin(Customizer.withDefaults())
+            .build();
+}
+```
+
+Cada cadeia tem suas regras de CSRF, sessão e autenticação, sem uma contaminar a outra.
+
+## Usando um provedor de identidade
+
+Quando a emissão de tokens sai da sua aplicação, o resource server só precisa saber quem é o emissor:
+
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://auth.clinica.com/realms/clinica
+```
+
+Na inicialização, o Spring busca a configuração OpenID do emissor, descobre o endereço das chaves públicas (JWKS) e passa a validar tokens com elas, incluindo a troca periódica de chaves. Você remove o `JwtDecoder`, o `JwtEncoder` e o endpoint de login, e mantém só o conversor de roles ajustado ao nome da claim que o provedor usa.
+
+## Testando
+
+O `spring-security-test` cria um JWT de mentira direto no contexto, sem assinar nada:
+
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+class ApiSegurancaTest {
+
+    @Autowired MockMvc mvc;
+
+    @Test
+    void semTokenDevolve401() throws Exception {
+        mvc.perform(get("/medicos"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(header().exists("WWW-Authenticate"));
+    }
+
+    @Test
+    void recepcaoNaoExcluiMedico() throws Exception {
+        mvc.perform(delete("/medicos/1")
+                        .with(jwt().authorities(new SimpleGrantedAuthority("ROLE_RECEPCAO"))))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void preflightDoFrontEhAceito() throws Exception {
+        mvc.perform(options("/medicos")
+                        .header("Origin", "https://app.clinica.com")
+                        .header("Access-Control-Request-Method", "POST"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Access-Control-Allow-Origin", "https://app.clinica.com"));
+    }
+}
+```
+
+Vale também um teste de ponta a ponta que chama `/auth/login` de verdade e usa o token devolvido, para provar que encoder, decoder e conversor concordam entre si.
+
+## Na entrevista
+
+**Por que RS256 em vez de HS256 numa arquitetura com vários serviços?** Com HS256, todo serviço que valida tem o segredo e poderia emitir tokens. Com RS256, só o emissor tem a chave privada; os outros validam com a pública, que pode ser distribuída sem risco.
+
+**O que é o preflight do CORS?** Uma requisição `OPTIONS` que o navegador envia antes de requisições "não simples" de outra origem, perguntando se o servidor aceita aquele método e aqueles cabeçalhos. Ela não leva credenciais, então a segurança precisa deixá-la passar.
+
+**Como você revoga um JWT?** Não revoga diretamente: ele é válido até expirar. Usa-se access token curto, refresh token guardado no servidor (que pode ser apagado) e, se preciso, lista de bloqueio de `jti` até a expiração.
+
+**401 ou 403 numa API com resource server?** 401 quando o token falta ou é inválido, com `WWW-Authenticate: Bearer`. 403 quando o token é válido, mas as authorities não bastam para a operação.
+
+## Pratique
+
+Migre a API da clínica do filtro manual para o resource server e entregue:
+
+1. Par de chaves RSA fora do Git, `JwtEncoder`, `JwtDecoder` com validação de emissor e `POST /auth/login` emitindo token de 15 minutos com a claim `roles`.
+2. Regras por URL e `@PreAuthorize` funcionando com as roles do token, incluindo a hierarquia do capítulo anterior.
+3. Refresh token opaco com rotação em `POST /auth/refresh` e revogação no logout.
+4. CORS liberando apenas o front local e o de produção, lidos de propriedade.
+5. Testes cobrindo 401 sem token, 403 por role, preflight aceito e um fluxo completo de login seguido de chamada autenticada.
+
+<Quiz question="Por padrão, em quais authorities o resource server converte a claim scope do JWT?" options={["ROLE_ seguido do valor","SCOPE_ seguido do valor","O valor sem prefixo","Nenhuma, scope é ignorada"]} answer={1} explanation="O JwtGrantedAuthoritiesConverter padrão lê scope ou scp e prefixa com SCOPE_. Para usar roles, configure outro nome de claim e o prefixo ROLE_." />
+
+<Quiz question="O front recebe erro de CORS só nas chamadas autenticadas. A causa mais provável é:" options={["O token expirou","O CORS foi configurado só no Spring MVC e o preflight foi barrado pela segurança","O navegador não suporta JWT","A API precisa de HTTPS"]} answer={1} explanation="Requisições com Authorization disparam preflight. Se o Spring Security não conhece a configuração de CORS, ele trata o OPTIONS sem token como não autenticado e responde 401." />
+
+<Quiz question="Qual a principal vantagem de assinar tokens com RSA em vez de HMAC?" options={["Tokens menores","Validação mais rápida","Quem valida não consegue emitir tokens","Dispensa a claim exp"]} answer={2} explanation="Na assinatura assimétrica, a chave pública só verifica. Serviços que validam não têm como forjar tokens, ao contrário do segredo compartilhado do HMAC." />
+
+## Base no CodeForge
+
+- [Spring Boot 3: Aplique boas práticas e proteja uma API Rest](/learn/carreira-java/spring-boot-3-aplique-boas-praticas-proteja): o filtro JWT manual que este capítulo substitui.
+- [Java e Spring Security: Crie perfis e autorize requisições](/learn/carreira-java/java-spring-security-crie-perfis-autorize-requisicoes): roles, `@PreAuthorize` e hierarquia.
+- [JWT](/learn/system-design/jwt), [OAuth 2.0](/learn/system-design/oauth2) e [Sessão vs token](/learn/system-design/sessao-vs-token): os conceitos por trás.
+- [Node.js: Criptografia e tokens JWT](/learn/carreira-nodejs/nodejs-criptografia-tokens-jwt): HMAC, RSA e as armadilhas do JWT vistas por dentro.
+- [TLS](/learn/redes/tls): por que tokens só trafegam em HTTPS.
+
+## Referências
+
+- [Spring Security: OAuth 2.0 Resource Server JWT](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html)
+- [Spring Security: CORS](https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html)
+- [RFC 7519: JSON Web Token](https://datatracker.ietf.org/doc/html/rfc7519)

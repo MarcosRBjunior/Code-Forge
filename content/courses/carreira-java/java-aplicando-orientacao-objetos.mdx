@@ -1,0 +1,388 @@
+---
+title: "Java: Aplicando a Orientação a Objetos"
+kind: lesson
+---
+
+No capítulo anterior, a recepção da clínica era um amontoado de métodos estáticos trocando `String`, `int` e `double`. Funciona com dez linhas de regra; com cem, ninguém sabe onde fica a regra do convênio nem quem pode alterar o valor de uma consulta. Orientação a objetos resolve isso juntando dados e o comportamento que cuida deles no mesmo lugar, com fronteiras claras. É o modelo de todo código Spring: entidades, serviços e controladores são classes, e as decisões de design que você aprende aqui aparecem em cada pull request.
+
+**Você vai aprender:**
+
+- Criar classes com atributos privados, construtores que validam e métodos que protegem as regras
+- Usar enums e records para modelar valores do domínio
+- Aplicar herança com classes abstratas e saber quando preferir composição
+- Usar interfaces e polimorfismo para trocar regras sem `if` espalhado
+- Combinar `sealed` e `switch` com pattern matching (Java 21)
+
+## Classe e objeto
+
+Uma classe é o molde; um objeto é uma instância criada com `new`, com seu próprio estado na memória. Vamos modelar o paciente:
+
+```java
+package br.com.clinica.dominio;
+
+public class Paciente {
+    private final String nome;
+    private final String cpf;
+    private int idade;
+    private boolean temConvenio;
+
+    public Paciente(String nome, String cpf, int idade, boolean temConvenio) {
+        if (nome == null || nome.isBlank()) {
+            throw new IllegalArgumentException("Nome é obrigatório");
+        }
+        if (cpf == null || !cpf.matches("\\d{11}")) {
+            throw new IllegalArgumentException("CPF deve ter 11 dígitos");
+        }
+        if (idade < 0 || idade > 130) {
+            throw new IllegalArgumentException("Idade inválida: " + idade);
+        }
+        this.nome = nome.trim();
+        this.cpf = cpf;
+        this.idade = idade;
+        this.temConvenio = temConvenio;
+    }
+
+    public String getNome() { return nome; }
+    public String getCpf() { return cpf; }
+    public int getIdade() { return idade; }
+    public boolean temConvenio() { return temConvenio; }
+
+    public boolean ehIdoso() {
+        return idade >= 60;
+    }
+
+    public void aderirAoConvenio() {
+        this.temConvenio = true;
+    }
+}
+```
+
+Pontos que valem para toda classe que você escrever:
+
+- **Atributos `private`.** Ninguém de fora altera o estado diretamente. Isso é encapsulamento: a classe controla as próprias regras.
+- **Construtor que valida.** Um `Paciente` com CPF vazio simplesmente não pode existir. Validar na criação elimina dezenas de checagens espalhadas depois.
+- **`final` no que não muda.** Nome e CPF não mudam depois de criados; o compilador garante.
+- **Métodos com intenção, não setters genéricos.** `aderirAoConvenio()` diz o que acontece no negócio. Um `setTemConvenio(boolean)` permitiria qualquer coisa, inclusive sair do convênio sem regra nenhuma.
+- **`this`** se refere ao próprio objeto e desfaz a ambiguidade entre parâmetro e atributo de mesmo nome.
+
+Usando:
+
+```java
+var ana = new Paciente("Ana Souza", "12345678901", 67, false);
+System.out.println(ana.ehIdoso()); // true
+ana.aderirAoConvenio();
+```
+
+## Enum: um conjunto fechado de valores
+
+Especialidade não é uma `String` qualquer: são poucas e conhecidas. Com `enum`, o compilador impede "cardiolgia" escrito errado, e cada constante pode carregar dados e comportamento:
+
+```java
+package br.com.clinica.dominio;
+
+import java.math.BigDecimal;
+
+public enum Especialidade {
+    CLINICO_GERAL("180.00"),
+    CARDIOLOGIA("320.00"),
+    DERMATOLOGIA("250.00"),
+    NEUROLOGIA("320.00");
+
+    private final BigDecimal valorBase;
+
+    Especialidade(String valorBase) {
+        this.valorBase = new BigDecimal(valorBase);
+    }
+
+    public BigDecimal getValorBase() {
+        return valorBase;
+    }
+}
+```
+
+`Especialidade.valueOf("CARDIOLOGIA")` converte texto em constante (lança exceção se não existir) e `Especialidade.values()` lista todas.
+
+## Record: dados imutáveis sem cerimônia
+
+Muitos objetos são só valores: um CRM, um endereço, um período de horário. Para eles, `record` (Java 16+) gera construtor, getters (sem o prefixo `get`), `equals`, `hashCode` e `toString`:
+
+```java
+package br.com.clinica.dominio;
+
+public record Crm(String numero, String uf) {
+    public Crm {
+        if (!numero.matches("\\d{4,6}")) throw new IllegalArgumentException("CRM inválido");
+        if (!uf.matches("[A-Z]{2}")) throw new IllegalArgumentException("UF inválida");
+    }
+
+    @Override
+    public String toString() {
+        return "CRM/" + uf + " " + numero;
+    }
+}
+```
+
+O bloco `public Crm { ... }` é o construtor compacto: valida antes de os campos serem atribuídos. Dois `Crm` com o mesmo número e UF são `equals`, que é exatamente o que se espera de um valor.
+
+## Herança e classes abstratas
+
+A clínica tem médicos e nutricionistas. Os dois são profissionais com nome e registro, atendem e têm uma forma de calcular o valor base. Uma classe abstrata captura o que é comum e obriga as filhas a definir o que varia:
+
+```java
+package br.com.clinica.dominio;
+
+import java.math.BigDecimal;
+
+public abstract class Profissional {
+    private final String nome;
+
+    protected Profissional(String nome) {
+        this.nome = nome;
+    }
+
+    public String getNome() { return nome; }
+
+    public abstract BigDecimal valorBase();
+
+    public abstract String registro();
+
+    @Override
+    public String toString() {
+        return nome + " (" + registro() + ")";
+    }
+}
+```
+
+```java
+public class Medico extends Profissional {
+    private final Crm crm;
+    private final Especialidade especialidade;
+
+    public Medico(String nome, Crm crm, Especialidade especialidade) {
+        super(nome);
+        this.crm = crm;
+        this.especialidade = especialidade;
+    }
+
+    public Especialidade getEspecialidade() { return especialidade; }
+
+    @Override
+    public BigDecimal valorBase() { return especialidade.getValorBase(); }
+
+    @Override
+    public String registro() { return crm.toString(); }
+}
+
+public class Nutricionista extends Profissional {
+    private final String crn;
+
+    public Nutricionista(String nome, String crn) {
+        super(nome);
+        this.crn = crn;
+    }
+
+    @Override
+    public BigDecimal valorBase() { return new BigDecimal("150.00"); }
+
+    @Override
+    public String registro() { return "CRN " + crn; }
+}
+```
+
+`extends` cria a relação "é um": todo `Medico` é um `Profissional`. `super(nome)` chama o construtor da mãe. `@Override` pede ao compilador para conferir que você está mesmo sobrescrevendo um método (sem ela, um erro de digitação cria um método novo em silêncio). `toString()` na mãe chama `registro()`, e cada filha responde do seu jeito.
+
+<Callout type="warning" title="Herança para reaproveitar código costuma dar errado">
+Herdar só para reaproveitar métodos (`Consulta extends ArrayList`, `Paciente extends Pessoa extends Endereco`) cria acoplamento forte: qualquer mudança na mãe quebra as filhas, e a filha herda métodos que não fazem sentido para ela. Use herança apenas quando a relação "é um" é verdadeira e estável. Para reaproveitar comportamento, prefira composição: a classe **tem** um objeto que faz o trabalho, como a `Consulta` abaixo tem uma `RegraDePreco`.
+</Callout>
+
+## Interfaces e polimorfismo
+
+Volte à regra de preço: particular paga o valor base, idoso tem 20% de desconto, convênio paga R$ 50. No capítulo anterior isso era um `if` encadeado. Quando aparecer "retorno em até 30 dias é grátis" e "pacote de 5 sessões tem 10% de desconto", o `if` vira um monstro. Com uma interface, cada regra é uma classe:
+
+```java
+package br.com.clinica.preco;
+
+import java.math.BigDecimal;
+import br.com.clinica.dominio.Paciente;
+import br.com.clinica.dominio.Profissional;
+
+public interface RegraDePreco {
+    BigDecimal calcular(Paciente paciente, Profissional profissional);
+}
+```
+
+```java
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+
+public class PrecoParticular implements RegraDePreco {
+    @Override
+    public BigDecimal calcular(Paciente paciente, Profissional profissional) {
+        BigDecimal base = profissional.valorBase();
+        if (paciente.ehIdoso()) {
+            return base.multiply(new BigDecimal("0.80")).setScale(2, RoundingMode.HALF_EVEN);
+        }
+        return base;
+    }
+}
+
+public class PrecoConvenio implements RegraDePreco {
+    private final BigDecimal coparticipacao;
+
+    public PrecoConvenio(BigDecimal coparticipacao) {
+        this.coparticipacao = coparticipacao;
+    }
+
+    @Override
+    public BigDecimal calcular(Paciente paciente, Profissional profissional) {
+        return coparticipacao;
+    }
+}
+
+public class Retorno implements RegraDePreco {
+    @Override
+    public BigDecimal calcular(Paciente paciente, Profissional profissional) {
+        return BigDecimal.ZERO;
+    }
+}
+```
+
+Agora a consulta compõe as peças:
+
+```java
+package br.com.clinica.dominio;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import br.com.clinica.preco.RegraDePreco;
+
+public class Consulta {
+    private final Paciente paciente;
+    private final Profissional profissional;
+    private final LocalDateTime dataHora;
+    private final RegraDePreco regra;
+    private boolean cancelada;
+
+    public Consulta(Paciente paciente, Profissional profissional, LocalDateTime dataHora, RegraDePreco regra) {
+        if (dataHora.getHour() < 8 || dataHora.getHour() > 17) {
+            throw new IllegalArgumentException("Fora do expediente");
+        }
+        this.paciente = paciente;
+        this.profissional = profissional;
+        this.dataHora = dataHora;
+        this.regra = regra;
+    }
+
+    public BigDecimal valor() {
+        return cancelada ? BigDecimal.ZERO : regra.calcular(paciente, profissional);
+    }
+
+    public void cancelar() {
+        if (dataHora.isBefore(LocalDateTime.now())) {
+            throw new IllegalStateException("Não dá para cancelar consulta passada");
+        }
+        this.cancelada = true;
+    }
+
+    public Paciente getPaciente() { return paciente; }
+    public Profissional getProfissional() { return profissional; }
+    public LocalDateTime getDataHora() { return dataHora; }
+    public boolean isCancelada() { return cancelada; }
+}
+```
+
+O ponto central: `Consulta` não sabe qual regra está usando. Ela chama `regra.calcular(...)` e a JVM decide, em tempo de execução, qual implementação roda. Isso é polimorfismo. Para criar uma regra nova, você escreve uma classe nova e não mexe em `Consulta` (o princípio aberto/fechado na prática).
+
+```java
+var ana = new Paciente("Ana Souza", "12345678901", 67, false);
+var drCarlos = new Medico("Carlos Lima", new Crm("123456", "SP"), Especialidade.CARDIOLOGIA);
+var quando = LocalDateTime.of(2026, 12, 3, 10, 0);
+
+var particular = new Consulta(ana, drCarlos, quando, new PrecoParticular());
+var convenio = new Consulta(ana, drCarlos, quando, new PrecoConvenio(new BigDecimal("50.00")));
+
+System.out.println(particular.valor()); // 256.00
+System.out.println(convenio.valor());   // 50.00
+System.out.println(drCarlos);           // Carlos Lima (CRM/SP 123456)
+```
+
+Repare também no tipo da variável: um método que recebe `Profissional` aceita `Medico` e `Nutricionista`. Programe para a abstração (a interface ou a classe mãe), não para a implementação concreta. É a mesma ideia que o Spring usa ao injetar dependências.
+
+## Classe abstrata ou interface?
+
+| | Classe abstrata | Interface |
+|---|---|---|
+| Estado (atributos) | Sim | Não (só constantes) |
+| Construtor | Sim | Não |
+| Quantas uma classe pode usar | Uma (`extends`) | Várias (`implements`) |
+| Uso típico | Base comum de uma família | Contrato de comportamento |
+
+Na dúvida, comece com interface. Interfaces podem ter métodos `default` com implementação, o que cobre muitos casos em que antes se usava classe abstrata.
+
+## sealed e pattern matching
+
+Às vezes você quer o contrário da extensibilidade: um conjunto fechado de tipos que o compilador conhece. O status de pagamento de uma consulta é um bom exemplo. Com `sealed` e records, o `switch` com pattern matching (Java 21) fica exaustivo, sem `default`:
+
+```java
+// Cada tipo público em seu próprio arquivo (ou todos aninhados dentro de Pagamento)
+public sealed interface Pagamento permits Pendente, Pago, Estornado {}
+public record Pendente() implements Pagamento {}
+public record Pago(BigDecimal valor, String formaPagamento) implements Pagamento {}
+public record Estornado(BigDecimal valor, String motivo) implements Pagamento {}
+
+static String descrever(Pagamento p) {
+    return switch (p) {
+        case Pendente pendente -> "Aguardando pagamento";
+        case Pago(var valor, var forma) -> "Pago R$ " + valor + " via " + forma;
+        case Estornado(var valor, var motivo) -> "Estornado R$ " + valor + ": " + motivo;
+    };
+}
+```
+
+Se alguém adicionar `Parcelado` à lista do `permits`, todo `switch` que não trata o novo caso deixa de compilar. Esse é um uso legítimo de "conjunto fechado" que interfaces abertas não oferecem.
+
+## Membros static
+
+`static` pertence à classe, não ao objeto. Use para constantes e métodos utilitários que não dependem de estado, como uma fábrica:
+
+```java
+public static Paciente particular(String nome, String cpf, int idade) {
+    return new Paciente(nome, cpf, idade, false);
+}
+```
+
+Evite atributos `static` mutáveis (um contador global, uma lista compartilhada): eles viram estado global, difícil de testar e perigoso com várias threads, que é o caso de qualquer servidor web.
+
+## Na entrevista
+
+- **Quais os pilares da orientação a objetos?** Encapsulamento (esconder estado e expor comportamento), herança (reaproveitar e especializar), polimorfismo (mesma chamada, comportamentos diferentes) e abstração (modelar só o essencial).
+- **Classe abstrata ou interface?** Interface para contratos e quando uma classe precisa de vários; classe abstrata quando há estado ou construtor comum a uma família. Na dúvida, interface.
+- **Por que composição sobre herança?** Herança acopla a filha à implementação da mãe e é fixa em compilação. Composição permite trocar o comportamento em tempo de execução e mantém as classes independentes.
+- **Quando usar record?** Para valores imutáveis em que igualdade é por conteúdo: DTOs, identificadores, objetos de valor. Não para entidades JPA, que precisam de construtor vazio e estado mutável.
+
+## Pratique
+
+Estenda o modelo da clínica:
+
+1. Crie a regra `PacoteDeSessoes` que dá 10% de desconto sobre o valor base e só pode ser usada com `Nutricionista` (lance `IllegalArgumentException` caso contrário).
+2. Crie a classe `Agenda` que **tem** uma lista de consultas de um profissional e o método `agendar(Consulta)`, que recusa horário já ocupado com `IllegalStateException`.
+3. Adicione `Pagamento` à `Consulta` com os tipos selados e um método `pagar(String forma)` que só funciona se o pagamento estiver `Pendente`.
+
+Entregue as classes e um `main` que demonstre cada regra funcionando e cada erro sendo lançado.
+
+<Quiz question="Em record Crm(String numero, String uf), como se lê o número?" options={["crm.getNumero()","crm.numero()","crm.numero","Crm.numero(crm)"]} answer={1} explanation="Records geram métodos de acesso com o mesmo nome do componente, sem o prefixo get." />
+<Quiz question="Qual a vantagem principal de RegraDePreco ser uma interface usada por Consulta?" options={["Deixar o código mais rápido","Permitir criar regras novas sem alterar Consulta","Evitar o uso de construtores","Dispensar o uso de BigDecimal"]} answer={1} explanation="Consulta depende só do contrato. Novas regras são classes novas, e a JVM escolhe a implementação em tempo de execução." />
+<Quiz question="O que acontece com um switch sobre uma interface sealed quando um novo tipo é adicionado ao permits?" options={["Cai no default sem aviso","Lança exceção em tempo de execução","Deixa de compilar se o novo tipo não for tratado","Ignora o novo tipo"]} answer={2} explanation="Com sealed, o compilador sabe todos os subtipos e exige que o switch sem default seja exaustivo." />
+
+## Base no CodeForge
+
+- [Classes e objetos](/learn/java/classes-e-objetos), [Interfaces e herança](/learn/java/interfaces-e-heranca) e [Records e enums](/learn/java/records-e-enums): a linguagem a fundo, no formato de entrevista.
+- [Encapsulamento](/learn/lld/encapsulamento), [Polimorfismo](/learn/lld/polimorfismo) e [Composição sobre herança](/learn/lld/composicao-sobre-heranca): os princípios de design por trás das escolhas.
+- [Strategy](/learn/lld/strategy): o padrão que a `RegraDePreco` aplica.
+- [OCP](/learn/lld/ocp): aberto para extensão, fechado para modificação.
+
+## Referências
+
+- [dev.java: Classes and Objects](https://dev.java/learn/classes-objects/)
+- [dev.java: Inheritance](https://dev.java/learn/inheritance/)
+- [Java 21: Record Classes](https://docs.oracle.com/en/java/javase/21/language/records.html)

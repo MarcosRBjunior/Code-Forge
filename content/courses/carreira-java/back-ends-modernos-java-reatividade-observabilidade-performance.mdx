@@ -1,0 +1,307 @@
+---
+title: "Back-ends Modernos em Java: Reatividade, Observabilidade e Performance"
+kind: lesson
+---
+
+Durante anos, a resposta padrão para "meu serviço Java não aguenta a concorrência" foi migrar para programação reativa. Com o Java 21, as virtual threads mudaram essa conta: código bloqueante simples voltou a escalar para dezenas de milhares de requisições simultâneas. Saber escolher entre os dois modelos, e provar a escolha com medições em vez de opinião, é o que separa um back-end moderno de um que só segue moda. Neste capítulo você compara os modelos, aprende a medir a JVM com JFR e GC logs e escreve microbenchmarks corretos com JMH, sempre na API de pedidos.
+
+**Você vai aprender:**
+
+- Como funcionam as virtual threads e como ativá-las no Spring Boot
+- Quando o modelo reativo ainda é a melhor escolha, e quando não é
+- Investigar gargalos com Java Flight Recorder, métricas e GC logs
+- Escolher e configurar o garbage collector para o seu caso
+- Escrever um microbenchmark confiável com JMH
+
+## O problema: uma thread por requisição
+
+O modelo clássico do Spring MVC sobre Tomcat é simples: cada requisição ocupa uma thread do pool do início ao fim. Quando o código chama o banco ou outro serviço, a thread fica bloqueada esperando a resposta. Uma thread de plataforma é uma thread do sistema operacional, com cerca de 1 MB de pilha reservada e troca de contexto cara. Por isso o pool tem tamanho limitado (200 por padrão no Tomcat).
+
+Imagine o checkout: 20 ms de CPU e 400 ms esperando o gateway de pagamento. Com 200 threads, o teto é cerca de 500 requisições por segundo, mesmo com a CPU quase ociosa. O gargalo não é processamento, é espera.
+
+Existem duas saídas: não bloquear threads (modelo reativo) ou tornar threads tão baratas que bloquear não importa (virtual threads).
+
+## Virtual threads
+
+Uma virtual thread é gerenciada pela JVM, não pelo sistema operacional. Ela roda em cima de um pequeno conjunto de threads de plataforma chamadas **carrier threads** (por padrão, uma por núcleo). Quando a virtual thread faz uma operação bloqueante de I/O, a JVM a desmonta do carrier, guarda a pilha dela no heap e usa o carrier para outra virtual thread. Quando a resposta chega, ela é remontada e continua. Para o seu código, nada mudou: é o mesmo `repo.save()` e o mesmo `restClient.post()`.
+
+Criar milhões delas é viável:
+
+```java
+import java.time.Duration;
+import java.util.concurrent.Executors;
+import java.util.stream.IntStream;
+
+public class MilThreads {
+    public static void main(String[] args) {
+        var inicio = System.nanoTime();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            IntStream.range(0, 100_000).forEach(i ->
+                executor.submit(() -> {
+                    Thread.sleep(Duration.ofSeconds(1)); // simula I/O
+                    return i;
+                }));
+        } // close() espera todas terminarem
+        System.out.printf("100 mil tarefas em %d ms%n", (System.nanoTime() - inicio) / 1_000_000);
+    }
+}
+```
+
+Isso termina em pouco mais de um segundo. Com um pool fixo de 200 threads de plataforma, levaria mais de 8 minutos.
+
+No Spring Boot 3.2 ou superior, uma propriedade faz o Tomcat, o `@Async`, os listeners de Kafka e RabbitMQ e o agendador usarem virtual threads:
+
+```yaml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+
+### Regras para usar bem
+
+- **Não faça pool de virtual threads.** Elas são descartáveis: crie uma por tarefa. Pool existe para recursos caros, e elas não são.
+- **Limite o recurso, não a thread.** Com threads ilimitadas, o limite real passa a ser o pool de conexões do banco ou a cota do parceiro. Proteja com o tamanho do pool do Hikari ou um `Semaphore`.
+- **Cuidado com `ThreadLocal` pesado.** Com milhões de threads, um cache em `ThreadLocal` vira milhões de cópias.
+- **Virtual threads não aceleram CPU.** Para cálculo pesado, o paralelismo continua limitado pelos núcleos.
+
+<Callout type="warning" title="Pinning: quando a virtual thread prende o carrier">
+No Java 21, se a virtual thread bloqueia em I/O dentro de um bloco `synchronized`, ela fica presa (pinned) ao carrier e não libera o núcleo. Com poucos carriers, alguns blocos assim travam a aplicação inteira. A correção no Java 21 é trocar `synchronized` por `ReentrantLock` nos trechos que fazem I/O e atualizar drivers antigos. O JDK 24 (JEP 491) removeu essa limitação para `synchronized`, mas se você está no 21 LTS, detecte o problema com o evento `jdk.VirtualThreadPinned` do JFR, mostrado mais abaixo.
+</Callout>
+
+```java
+// Antes: prende o carrier no Java 21
+public synchronized Token renovarToken() {
+    return authClient.post().retrieve().body(Token.class);
+}
+
+// Depois
+private final ReentrantLock lock = new ReentrantLock();
+
+public Token renovarToken() {
+    lock.lock();
+    try {
+        return authClient.post().retrieve().body(Token.class);
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+## E o modelo reativo?
+
+O modelo reativo (Project Reactor, Spring WebFlux) resolve o mesmo problema por outro caminho: nenhuma thread espera. O código descreve um pipeline de transformações, e um pequeno número de threads de event loop executa cada etapa quando o dado fica disponível. Ele traz algo que virtual threads sozinhas não trazem: **backpressure**, o consumidor dizendo ao produtor quanto consegue receber, e operadores ricos para combinar fluxos.
+
+| Critério | Virtual threads (MVC) | Reativo (WebFlux) |
+|---|---|---|
+| Estilo de código | Imperativo, sequencial | Pipeline de operadores |
+| Depuração e stack traces | Normais | Fragmentados, exigem ferramentas |
+| Bibliotecas | Qualquer uma (JDBC, JPA, clientes bloqueantes) | Precisam ser não bloqueantes (R2DBC, WebClient) |
+| Streaming e backpressure | Manual | Nativo |
+| Curva de aprendizado | Baixa | Alta |
+
+Na prática, a regra que funciona:
+
+- **Serviço CRUD, integração com APIs, JPA**: Spring MVC com virtual threads. Você ganha a escala sem pagar o custo cognitivo.
+- **Streaming de dados, SSE, WebSocket, gateways que só repassam tráfego, composição de muitas chamadas com cancelamento e backpressure**: WebFlux.
+- **Já tem uma base reativa funcionando bem**: não há motivo para reescrever.
+
+O capítulo [Java e Spring: Construindo aplicações reativas com WebFlux](/learn/carreira-java/java-spring-construindo-aplicacoes-reativas-webflux) aprofunda o modelo reativo.
+
+## Meça antes de otimizar
+
+Otimização sem medição é chute. O ciclo correto é: definir uma meta (p99 do checkout abaixo de 300 ms com 500 requisições por segundo), medir, encontrar o maior gargalo, corrigir, medir de novo.
+
+### Métricas de latência
+
+O Actuator já mede `http.server.requests`. Ative histogramas para calcular percentis no Prometheus:
+
+```yaml
+management:
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      slo:
+        http.server.requests: 100ms,300ms,1s
+```
+
+Olhe percentis, nunca só a média. Uma média de 80 ms pode esconder 1% de requisições levando 4 segundos, e esse 1% costuma ser o cliente com o carrinho maior.
+
+### Java Flight Recorder
+
+O JFR é um profiler embutido na JVM, com custo baixo o bastante (em geral abaixo de 2%) para rodar em produção. Ele registra amostras de CPU, alocações, pausas de GC, contenção de locks, I/O e eventos de virtual threads.
+
+```bash
+# Ao subir a aplicação
+java -XX:StartFlightRecording=duration=120s,filename=pedidos.jfr,settings=profile \
+     -jar pedidos-api.jar
+
+# Em um processo que já está rodando
+jcmd $(pgrep -f pedidos-api) JFR.start name=checkout settings=profile duration=120s filename=/tmp/checkout.jfr
+
+# Resumo e eventos específicos na linha de comando
+jfr summary /tmp/checkout.jfr
+jfr print --events jdk.VirtualThreadPinned /tmp/checkout.jfr
+jfr print --events jdk.GarbageCollection /tmp/checkout.jfr
+```
+
+Abra o arquivo no JDK Mission Control para ver o flame graph de CPU (onde o tempo é gasto), as maiores fontes de alocação (quem gera lixo) e os locks mais disputados. Um padrão comum de achado: 30% da CPU do checkout em serialização JSON de um objeto enorme que nem precisava ser devolvido inteiro.
+
+Você também pode criar eventos próprios para marcar operações de negócio na mesma linha do tempo:
+
+```java
+import jdk.jfr.Event;
+import jdk.jfr.Label;
+import jdk.jfr.Name;
+
+@Name("pedidos.Checkout")
+@Label("Checkout")
+class CheckoutEvent extends Event {
+    @Label("Itens") int itens;
+}
+
+// no serviço
+var evento = new CheckoutEvent();
+evento.begin();
+var pedido = processar(novo);
+evento.itens = novo.itens().size();
+evento.commit();
+```
+
+## Garbage collector
+
+A JVM gerencia memória para você, mas o coletor escolhido define o tipo de pausa que a aplicação sente.
+
+| Coletor | Foco | Quando usar |
+|---|---|---|
+| G1 (padrão) | Equilíbrio entre throughput e pausa | A maioria das APIs |
+| ZGC geracional | Pausas abaixo de 1 ms, mesmo com heaps grandes | Latência crítica, heaps de muitos GB |
+| Parallel | Throughput máximo, pausas longas aceitáveis | Jobs em lote |
+| Serial | Menor overhead | Containers com 1 CPU e heap pequeno |
+
+```bash
+# Container: dimensione o heap pela memória do container, não por -Xmx fixo
+java -XX:MaxRAMPercentage=75 \
+     -XX:+UseZGC -XX:+ZGenerational \
+     -Xlog:gc*:file=/var/log/gc.log:time,uptime,level,tags:filecount=5,filesize=20m \
+     -jar pedidos-api.jar
+```
+
+No Java 21, `-XX:+ZGenerational` liga o modo geracional do ZGC (a partir do 23 ele é o padrão). Antes de trocar de coletor, leia o GC log: se as pausas já são curtas e o problema é alocação excessiva, trocar o coletor não resolve. Reduzir alocação resolve.
+
+## Microbenchmarks com JMH
+
+Medir um trecho de código com `System.nanoTime()` num loop quase sempre mente. O JIT compila o código durante o loop, elimina cálculos cujo resultado não é usado e otimiza com base no que já viu. O JMH (Java Microbenchmark Harness), feito pelo próprio time da OpenJDK, cuida de aquecimento, forks de JVM separados e eliminação de código morto.
+
+Crie o projeto de benchmark com o arquétipo oficial:
+
+```bash
+mvn archetype:generate \
+  -DarchetypeGroupId=org.openjdk.jmh \
+  -DarchetypeArtifactId=jmh-java-benchmark-archetype \
+  -DarchetypeVersion=1.37 \
+  -DgroupId=br.com.loja -DartifactId=pedidos-bench -Dversion=1.0 -DinteractiveMode=false
+```
+
+Compare duas formas de calcular o total de um pedido:
+
+```java
+package br.com.loja;
+
+import org.openjdk.jmh.annotations.*;
+import org.openjdk.jmh.infra.Blackhole;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
+
+@State(Scope.Thread)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+@Warmup(iterations = 5, time = 1)
+@Measurement(iterations = 5, time = 1)
+@Fork(2)
+public class TotalPedidoBenchmark {
+
+    record Item(BigDecimal preco, int quantidade) {}
+
+    @Param({"10", "1000"})
+    int tamanho;
+
+    List<Item> itens;
+
+    @Setup
+    public void preparar() {
+        itens = IntStream.range(0, tamanho)
+                .mapToObj(i -> new Item(BigDecimal.valueOf(10 + i % 7), 1 + i % 3))
+                .toList();
+    }
+
+    @Benchmark
+    public BigDecimal comStream() {
+        return itens.stream()
+                .map(i -> i.preco().multiply(BigDecimal.valueOf(i.quantidade())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    @Benchmark
+    public void comLaco(Blackhole bh) {
+        var total = BigDecimal.ZERO;
+        for (var i : itens) {
+            total = total.add(i.preco().multiply(BigDecimal.valueOf(i.quantidade())));
+        }
+        bh.consume(total); // impede o JIT de descartar o cálculo
+    }
+}
+```
+
+```bash
+mvn clean verify
+java -jar target/benchmarks.jar TotalPedidoBenchmark -prof gc
+```
+
+O `-prof gc` mostra quantos bytes cada operação aloca, o que muitas vezes explica a diferença de tempo melhor do que o tempo em si. Devolver o resultado do método ou passá-lo ao `Blackhole` são as duas formas de impedir que o JIT elimine o código.
+
+Lembre do escopo: JMH mede trechos isolados. Para saber se a API aguenta 500 requisições por segundo, você precisa de teste de carga (Gatling, k6) contra a aplicação inteira, num ambiente parecido com produção.
+
+## Na entrevista
+
+**Virtual threads tornam o código mais rápido?** Não. Elas aumentam a quantidade de tarefas concorrentes que esperam I/O sem esgotar threads, melhorando throughput. A latência de cada requisição e o desempenho de código de CPU continuam iguais.
+
+**Quando você ainda escolheria WebFlux no Java 21?** Para streaming com backpressure, SSE e WebSocket com muitas conexões, gateways que só repassam tráfego e composição complexa de chamadas assíncronas com cancelamento. Para CRUD com JPA, MVC com virtual threads é mais simples e escala o suficiente.
+
+**O que é pinning?** É quando a virtual thread não consegue liberar o carrier durante um bloqueio, como em I/O dentro de `synchronized` no Java 21. O carrier fica preso, e com poucos carriers a aplicação perde a escala. Detecta-se com o evento `jdk.VirtualThreadPinned` do JFR.
+
+**Por que não medir desempenho com System.nanoTime em um loop?** Porque o JIT, o aquecimento e a eliminação de código morto distorcem o resultado. O JMH controla aquecimento, roda em forks separados e oferece o `Blackhole`.
+
+## Pratique
+
+Na API de pedidos, entregue um relatório de desempenho:
+
+1. Um endpoint de checkout que chama um serviço de pagamento simulado com 300 ms de latência (WireMock com `fixedDelayMilliseconds`).
+2. Um teste de carga com k6 ou Gatling em três configurações: MVC com threads de plataforma, MVC com `spring.threads.virtual.enabled=true` e, se quiser ir além, WebFlux. Registre throughput e p99 de cada uma.
+3. Uma gravação JFR durante o teste e a análise do maior consumidor de CPU e de alocação.
+4. Um bloco `synchronized` com I/O plantado de propósito, o evento `jdk.VirtualThreadPinned` aparecendo no JFR e a correção com `ReentrantLock`.
+5. Um benchmark JMH de alguma função quente encontrada no JFR, antes e depois da otimização.
+
+<Quiz question="Com spring.threads.virtual.enabled=true, qual passa a ser o limite mais provável de concorrência em um CRUD com JPA?" options={["O número de núcleos da CPU","O pool de conexões do banco","O tamanho da pilha de cada thread","O limite de 200 threads do Tomcat"]} answer={1} explanation="Com virtual threads, threads deixam de ser escassas. O recurso que limita passa a ser o pool de conexões do banco, que precisa ser dimensionado e protegido." />
+
+<Quiz question="Para que serve o Blackhole no JMH?" options={["Descartar resultados para economizar memória","Impedir que o JIT elimine código cujo resultado não é usado","Isolar o benchmark do garbage collector","Simular latência de rede entre iterações"]} answer={1} explanation="Se o resultado de um cálculo não é usado, o JIT pode removê-lo e o benchmark mede nada. Consumir o valor no Blackhole, ou retorná-lo, mantém o cálculo." />
+
+<Quiz question="Qual ferramenta da própria JVM você usa para encontrar onde a CPU é gasta em produção com baixo custo?" options={["JMH","Java Flight Recorder","jshell","javap"]} answer={1} explanation="O JFR registra amostras de CPU, alocação, GC e locks com overhead baixo, adequado para produção. O JMH é para microbenchmarks fora de produção." />
+
+## Base no CodeForge
+
+- [Processos e threads](/learn/concorrencia/processos-e-threads) e [Thread pools](/learn/concorrencia/thread-pools): a base para entender o que as virtual threads mudam.
+- [Async e await](/learn/concorrencia/async-await) e [Futures e promises](/learn/concorrencia/futures-e-promises): os outros modelos de concorrência que você vai comparar.
+- [Latência e throughput](/learn/system-design/latencia-throughput): as duas métricas que todo relatório de desempenho precisa separar.
+- [Padrões arquiteturais de software: Escala, resiliência e observabilidade](/learn/carreira-java/padroes-arquiteturais-software-escala-resiliencia-observabilidade): métricas e traces com Micrometer, usados aqui para medir.
+
+## Referências
+
+- [JEP 444: Virtual Threads](https://openjdk.org/jeps/444)
+- [JDK 21: Flight Recorder API](https://docs.oracle.com/en/java/javase/21/jfapi/)
+- [JDK 21: Garbage Collection Tuning Guide](https://docs.oracle.com/en/java/javase/21/gctuning/)
+- [OpenJDK JMH](https://github.com/openjdk/jmh)

@@ -1,0 +1,344 @@
+---
+title: "Java e Spring: Construindo aplicações reativas com WebFlux"
+kind: lesson
+---
+
+Algumas cargas de back-end não combinam com o modelo de uma thread esperando cada resposta: acompanhar pedidos em tempo real por SSE, um gateway que agrega cinco serviços por requisição, um feed que precisa empurrar dados para milhares de conexões abertas. O Spring WebFlux é a pilha reativa do Spring para esses casos: não bloqueante do controller ao banco, com backpressure embutido. Neste capítulo você entende `Mono` e `Flux`, monta a versão reativa da API de pedidos com R2DBC, chama outros serviços com `WebClient` e aprende a não sabotar tudo com uma chamada bloqueante escondida.
+
+**Você vai aprender:**
+
+- O modelo de Reactive Streams e os tipos `Mono` e `Flux` do Project Reactor
+- Os operadores essenciais e a diferença entre `map` e `flatMap`
+- Criar endpoints reativos, incluindo streaming com Server-Sent Events
+- Persistir dados com R2DBC e chamar serviços com `WebClient`
+- O que é backpressure e como testar código reativo
+
+## O modelo reativo
+
+No Spring MVC, o controller devolve o resultado pronto. No WebFlux, ele devolve uma **promessa de resultado** descrita como um pipeline. O servidor (Netty, por padrão) roda em poucas threads de event loop, aproximadamente uma por núcleo. Quando o pipeline precisa esperar o banco ou a rede, nenhuma thread fica parada: o event loop atende outra requisição e retoma esta quando o dado chega.
+
+A base é a especificação **Reactive Streams**, com quatro interfaces: `Publisher` (quem emite), `Subscriber` (quem recebe), `Subscription` (o vínculo entre os dois) e `Processor`. O ponto central é que o Subscriber pede quantos elementos quer com `request(n)`. Isso é **backpressure**: o consumidor controla o ritmo, e um produtor rápido não afoga um consumidor lento.
+
+O Project Reactor implementa isso com dois tipos:
+
+- `Mono<T>`: zero ou um elemento. É o equivalente reativo de um `Optional` assíncrono. Ex.: buscar um pedido por id.
+- `Flux<T>`: zero a N elementos, possivelmente infinitos. Ex.: listar pedidos, ou um stream contínuo de atualizações.
+
+## Mono e Flux na prática
+
+Crie o projeto com `spring-boot-starter-webflux` e experimente:
+
+```java
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import java.time.Duration;
+
+public class ReatorBasico {
+    public static void main(String[] args) throws InterruptedException {
+        Mono<String> nome = Mono.just("Ana");
+        Flux<Integer> numeros = Flux.range(1, 5);
+
+        // Nada acontece até alguém se inscrever
+        Flux<String> pipeline = numeros
+                .filter(n -> n % 2 == 1)
+                .map(n -> "item " + n)
+                .doOnNext(s -> System.out.println("passando: " + s));
+
+        pipeline.subscribe(
+                s -> System.out.println("recebido: " + s),
+                erro -> System.err.println("erro: " + erro),
+                () -> System.out.println("fim"));
+
+        Flux.interval(Duration.ofMillis(200))
+                .take(3)
+                .subscribe(t -> System.out.println("tick " + t));
+        Thread.sleep(1000); // só para o exemplo não terminar antes dos ticks
+    }
+}
+```
+
+A regra mais importante: **nada acontece até a inscrição**. Montar o pipeline não executa nada; o `subscribe` dispara o fluxo. Em um controller WebFlux você não chama `subscribe`: devolve o `Mono` ou `Flux` e o framework se inscreve.
+
+### map e flatMap
+
+`map` transforma cada elemento de forma síncrona. `flatMap` transforma cada elemento em **outro Publisher** e achata o resultado. Use `flatMap` sempre que a transformação for uma operação assíncrona, como uma consulta ao banco ou uma chamada HTTP:
+
+```java
+Mono<Pedido> pedido = pedidoRepository.findById(id);
+
+// map: transformação síncrona
+Mono<String> status = pedido.map(Pedido::status);
+
+// flatMap: a transformação devolve outro Mono
+Mono<Cliente> cliente = pedido.flatMap(p -> clienteRepository.findById(p.clienteId()));
+```
+
+Se você usar `map` com uma função que devolve `Mono`, o resultado vira `Mono<Mono<Cliente>>` e a consulta interna nunca roda, porque ninguém se inscreve nela.
+
+Outros operadores do dia a dia:
+
+```java
+Mono<Pedido> encontrado = repo.findById(id)
+        .switchIfEmpty(Mono.error(new PedidoNaoEncontrado(id)));    // vazio vira erro
+
+Mono<Resumo> resumo = Mono.zip(
+        clienteClient.buscar(clienteId),
+        freteClient.cotar(cep),
+        estoqueClient.disponibilidade(sku))                          // em paralelo
+    .map(t -> new Resumo(t.getT1(), t.getT2(), t.getT3()));
+
+Flux<Pedido> recentes = repo.findByClienteId(clienteId)
+        .filter(p -> p.criadoEm().isAfter(limite))
+        .take(10);
+
+Mono<Pedido> comFallback = repo.findById(id)
+        .timeout(Duration.ofSeconds(2))
+        .onErrorResume(TimeoutException.class, e -> cache.buscar(id));
+```
+
+`Mono.zip` é onde o reativo brilha: as três chamadas saem ao mesmo tempo e o resultado fica pronto quando a mais lenta responder.
+
+## Persistência com R2DBC
+
+JDBC é bloqueante por definição, então JPA e Hibernate não servem para WebFlux. O R2DBC é a API reativa de acesso a bancos relacionais, e o Spring Data R2DBC traz os repositórios. Dependências:
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-r2dbc</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.postgresql</groupId>
+  <artifactId>r2dbc-postgresql</artifactId>
+  <scope>runtime</scope>
+</dependency>
+```
+
+```yaml
+spring:
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/pedidos
+    username: pedidos
+    password: ${DB_PASSWORD}
+```
+
+O Spring Data R2DBC não é um ORM: não há lazy loading, cascata nem relacionamentos automáticos. A entidade é mapeada para uma tabela e pronto. Records funcionam bem:
+
+```java
+import org.springframework.data.annotation.Id;
+import org.springframework.data.relational.core.mapping.Table;
+import org.springframework.data.repository.reactive.ReactiveCrudRepository;
+
+@Table("pedidos")
+public record Pedido(@Id Long id, Long clienteId, String status, BigDecimal total, Instant criadoEm) {
+    Pedido comStatus(String novo) { return new Pedido(id, clienteId, novo, total, criadoEm); }
+}
+
+public interface PedidoRepository extends ReactiveCrudRepository<Pedido, Long> {
+    Flux<Pedido> findByClienteIdOrderByCriadoEmDesc(Long clienteId);
+    Flux<Pedido> findByStatus(String status);
+}
+```
+
+As migrações continuam com Flyway ou Liquibase, que usam JDBC só na inicialização. Transações funcionam com `@Transactional` em métodos que devolvem `Mono` ou `Flux`; o contexto da transação viaja pelo pipeline, não pela thread.
+
+## Endpoints reativos
+
+Com anotações, o controller fica quase igual ao do MVC; só os tipos de retorno mudam:
+
+```java
+@RestController
+@RequestMapping("/pedidos")
+class PedidoController {
+    private final PedidoRepository repo;
+    private final PedidoService service;
+
+    PedidoController(PedidoRepository repo, PedidoService service) {
+        this.repo = repo;
+        this.service = service;
+    }
+
+    @GetMapping("/{id}")
+    Mono<ResponseEntity<Pedido>> buscar(@PathVariable Long id) {
+        return repo.findById(id)
+                .map(ResponseEntity::ok)
+                .defaultIfEmpty(ResponseEntity.notFound().build());
+    }
+
+    @GetMapping
+    Flux<Pedido> doCliente(@RequestParam Long clienteId) {
+        return repo.findByClienteIdOrderByCriadoEmDesc(clienteId);
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    Mono<Pedido> criar(@RequestBody @Valid Mono<NovoPedido> corpo) {
+        return corpo.flatMap(service::criar);
+    }
+}
+```
+
+### Streaming com Server-Sent Events
+
+Um `Flux` devolvido com `text/event-stream` vira um stream SSE: o navegador mantém a conexão aberta e recebe cada elemento assim que ele é emitido. Para acompanhar mudanças de status em tempo real, use um `Sinks.Many` como barramento interno:
+
+```java
+@Component
+class EventosStatus {
+    private final Sinks.Many<Pedido> sink = Sinks.many().multicast().onBackpressureBuffer();
+
+    void publicar(Pedido pedido) { sink.tryEmitNext(pedido); }
+
+    Flux<Pedido> fluxo() { return sink.asFlux(); }
+}
+
+@GetMapping(value = "/{id}/status", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+Flux<ServerSentEvent<String>> acompanhar(@PathVariable Long id) {
+    return eventos.fluxo()
+            .filter(p -> p.id().equals(id))
+            .map(p -> ServerSentEvent.builder(p.status()).event("status").build());
+}
+```
+
+Cada conexão aberta custa pouca memória e nenhuma thread dedicada. É esse tipo de carga, milhares de conexões quase sempre ociosas, que justifica o WebFlux. Com várias réplicas, o barramento precisa ser externo (Redis pub/sub ou Kafka), porque o evento pode acontecer em outra instância.
+
+## WebClient: chamando outros serviços
+
+O `WebClient` é o cliente HTTP não bloqueante do Spring:
+
+```java
+@Configuration
+class ClientesConfig {
+    @Bean
+    WebClient estoqueClient(WebClient.Builder builder, @Value("${estoque.url}") String url) {
+        return builder.baseUrl(url).build();
+    }
+}
+
+@Component
+class EstoqueClient {
+    private final WebClient client;
+
+    EstoqueClient(WebClient estoqueClient) { this.client = estoqueClient; }
+
+    record Disponibilidade(String sku, int quantidade) {}
+
+    Mono<Disponibilidade> disponibilidade(String sku) {
+        return client.get()
+                .uri("/estoque/{sku}", sku)
+                .retrieve()
+                .onStatus(s -> s.value() == 404, r -> Mono.error(new ProdutoNaoEncontrado(sku)))
+                .bodyToMono(Disponibilidade.class)
+                .timeout(Duration.ofSeconds(2))
+                .retryWhen(Retry.backoff(2, Duration.ofMillis(200))
+                        .filter(e -> e instanceof WebClientResponseException.ServiceUnavailable));
+    }
+}
+```
+
+Use o `WebClient.Builder` injetado pelo Spring Boot: ele já vem configurado com os codecs JSON e com a instrumentação de métricas e tracing. O `Retry` aqui é o `reactor.util.retry.Retry`.
+
+## Backpressure na prática
+
+Na maior parte do tempo o backpressure funciona sozinho: o Netty só pede mais dados ao pipeline quando consegue escrever na conexão, e o R2DBC só busca mais linhas quando elas são consumidas. Onde você precisa decidir é quando um passo dispara trabalho assíncrono para cada elemento:
+
+```java
+// Reprocessar 100 mil pedidos pendentes chamando o gateway de pagamento
+repo.findByStatus("PENDENTE")
+    .flatMap(p -> pagamentos.cobrar(p), 16)          // no máximo 16 chamadas simultâneas
+    .flatMap(p -> repo.save(p.comStatus("PAGO")))
+    .then()
+    .subscribe();
+```
+
+Sem o segundo argumento, o `flatMap` dispara até 256 chamadas simultâneas por padrão, o que pode ser suficiente para derrubar o gateway ou estourar o pool de conexões do R2DBC. Para produtores que não respeitam pedidos (eventos externos, `Flux.interval`), operadores como `onBackpressureBuffer(10_000)`, `onBackpressureDrop()` e `limitRate(n)` definem o que fazer com o excesso.
+
+## A armadilha do bloqueio
+
+<Callout type="warning" title="Uma chamada bloqueante derruba o event loop">
+No WebFlux há poucas threads de event loop. Se uma delas chamar algo bloqueante (JDBC, `RestTemplate`, `Thread.sleep`, leitura de arquivo, um SDK antigo, ou `.block()`), ela fica parada e todas as conexões atendidas por ela param junto. O sintoma é latência alta com CPU baixa. Quando não houver alternativa reativa, isole a chamada com `Mono.fromCallable(() -> sdk.chamar()).subscribeOn(Schedulers.boundedElastic())` e, em testes, use o BlockHound para detectar bloqueios.
+</Callout>
+
+```java
+Mono<Nota> nota = Mono.fromCallable(() -> sdkLegadoNotaFiscal.emitir(pedidoId))
+        .subscribeOn(Schedulers.boundedElastic());
+```
+
+O mesmo vale para `ThreadLocal`: como o pipeline troca de thread, MDC de logs e contexto de segurança não acompanham sozinhos. O Spring Security reativo usa o `Context` do Reactor (`ReactiveSecurityContextHolder`), e o Micrometer propaga o trace pela biblioteca de context propagation.
+
+## Testando código reativo
+
+O `StepVerifier` (dependência `reactor-test`) se inscreve no Publisher e confere cada sinal:
+
+```java
+@Test
+void filtraPedidosPendentes() {
+    var fluxo = Flux.just(
+            new Pedido(1L, 7L, "PAGO", BigDecimal.TEN, Instant.now()),
+            new Pedido(2L, 7L, "PENDENTE", BigDecimal.ONE, Instant.now()))
+        .filter(p -> p.status().equals("PENDENTE"));
+
+    StepVerifier.create(fluxo)
+            .assertNext(p -> assertThat(p.id()).isEqualTo(2L))
+            .verifyComplete();
+}
+```
+
+Para os endpoints, use o `WebTestClient`:
+
+```java
+@WebFluxTest(PedidoController.class)
+class PedidoControllerTest {
+    @Autowired WebTestClient http;
+    @MockitoBean PedidoRepository repo;
+    @MockitoBean PedidoService service;
+
+    @Test
+    void devolve404QuandoNaoExiste() {
+        when(repo.findById(99L)).thenReturn(Mono.empty());
+        http.get().uri("/pedidos/99").exchange().expectStatus().isNotFound();
+    }
+}
+```
+
+`@MockitoBean` é a anotação do Spring Framework 6.2 (Spring Boot 3.4+); em versões anteriores, use `@MockBean`.
+
+## Na entrevista
+
+**Qual a diferença entre Mono e Flux?** `Mono` emite no máximo um elemento, `Flux` emite de zero a N. Ambos podem terminar com sucesso ou erro, e nenhum faz nada antes da inscrição.
+
+**Quando usar flatMap em vez de map?** Quando a transformação é assíncrona e devolve outro Publisher, como uma consulta ou chamada HTTP. `map` é para transformação síncrona de valor.
+
+**O que é backpressure?** É o mecanismo pelo qual o consumidor sinaliza quantos elementos consegue receber, impedindo que um produtor rápido sobrecarregue um consumidor lento. No Reactive Streams, isso é feito com `request(n)`.
+
+**Por que não usar JPA com WebFlux?** Porque JDBC é bloqueante: cada consulta prenderia uma thread do event loop. O equivalente reativo é o R2DBC, com o custo de não ter os recursos de ORM do Hibernate.
+
+## Pratique
+
+Construa a versão reativa do serviço de acompanhamento de pedidos:
+
+1. Um projeto WebFlux com R2DBC e Postgres (Testcontainers nos testes), com `GET /pedidos/{id}`, `GET /pedidos?clienteId=` e `POST /pedidos`.
+2. Um endpoint `GET /pedidos/{id}/resumo` que usa `Mono.zip` para buscar cliente, frete e estoque em paralelo via `WebClient`, com timeout e fallback.
+3. Um endpoint SSE `GET /pedidos/{id}/status` que emite cada mudança de status.
+4. Um job de reprocessamento que usa `flatMap` com concorrência limitada a 8.
+5. Testes com `StepVerifier` e `WebTestClient`, e um teste com BlockHound que falha se alguém colocar um `Thread.sleep` no pipeline.
+
+<Quiz question="O que acontece ao montar repo.findById(1L).map(Pedido::status) sem ninguém se inscrever?" options={["A consulta roda e o resultado fica em cache","A consulta roda, mas o resultado é descartado","Nada, o pipeline só executa após a inscrição","A aplicação lança uma exceção"]} answer={2} explanation="Publishers do Reactor são preguiçosos: montar o pipeline só descreve o trabalho. A execução começa quando alguém se inscreve, o que em um controller é feito pelo próprio framework." />
+
+<Quiz question="Você precisa buscar o cliente de cada pedido no banco. Qual operador usar?" options={["map","flatMap","filter","doOnNext"]} answer={1} explanation="A busca devolve um Mono, ou seja, é assíncrona. flatMap se inscreve no Publisher interno e achata o resultado; com map você teria um Mono dentro de outro e a consulta não rodaria." />
+
+<Quiz question="Qual é o sintoma típico de uma chamada bloqueante dentro de um pipeline WebFlux?" options={["CPU a 100% e memória estável","Latência alta com CPU baixa","Erros de compilação","Aumento do número de threads"]} answer={1} explanation="A thread do event loop fica parada esperando e todas as conexões atendidas por ela também esperam. A CPU fica ociosa enquanto a latência sobe." />
+
+## Base no CodeForge
+
+- [Back-ends Modernos em Java: Reatividade, Observabilidade e Performance](/learn/carreira-java/back-ends-modernos-java-reatividade-observabilidade-performance): quando escolher WebFlux e quando virtual threads resolvem.
+- [Async e await](/learn/concorrencia/async-await) e [Futures e promises](/learn/concorrencia/futures-e-promises): os modelos assíncronos que antecedem o reativo.
+- [Produtor e consumidor](/learn/concorrencia/produtor-consumidor) e [Filas bloqueantes](/learn/concorrencia/filas-bloqueantes): a forma clássica de lidar com produtor mais rápido que consumidor.
+- [Server-Sent Events](/learn/system-design/server-sent-events): o protocolo usado no streaming de status.
+
+## Referências
+
+- [Spring Framework: Spring WebFlux](https://docs.spring.io/spring-framework/reference/web/webflux.html)
+- [Spring Framework: WebClient](https://docs.spring.io/spring-framework/reference/web/webflux-webclient.html)
+- [Reactor Core: Reference Guide](https://projectreactor.io/docs/core/release/reference/)
+- [Spring Data R2DBC](https://docs.spring.io/spring-data/relational/reference/r2dbc.html)

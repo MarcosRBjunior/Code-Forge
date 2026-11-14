@@ -1,0 +1,334 @@
+---
+title: "Java e Spring Security: Crie perfis e autorize requisições"
+kind: lesson
+---
+
+Saber quem é o usuário (autenticação) é só metade do problema. A outra metade é decidir o que ele pode fazer (autorização): a recepcionista agenda consultas, o médico vê o prontuário dos próprios pacientes, o paciente vê só as próprias consultas e o administrador cadastra médicos. Quando essas regras ficam espalhadas em `if` pelos controllers, uma rota esquecida vira um vazamento de dados. Neste capítulo você modela perfis no portal da clínica e aplica autorização em dois níveis com Spring Security 6: por URL e por método.
+
+**Você vai aprender:**
+
+- A diferença entre role e authority, e como o prefixo `ROLE_` funciona
+- Modelar perfis no banco e carregá-los no `UserDetailsService`
+- Autorizar por URL com `authorizeHttpRequests` e por método com `@PreAuthorize`
+- Escrever regras de posse ("só o dono vê") e montar uma hierarquia de perfis
+- Testar autorização e tratar o 403
+
+## Role, authority e o prefixo ROLE_
+
+No Spring Security, tudo o que um usuário pode fazer é uma `GrantedAuthority`: um objeto com uma string. Não existe um tipo "role" separado. Uma **role** é só uma authority cujo nome começa com `ROLE_`, uma convenção que alguns métodos usam para encurtar a escrita:
+
+| Você escreve | O Spring confere se existe a authority |
+|---|---|
+| `hasRole("ADMIN")` | `ROLE_ADMIN` |
+| `hasAuthority("ROLE_ADMIN")` | `ROLE_ADMIN` |
+| `hasAuthority("consulta:cancelar")` | `consulta:cancelar` |
+| `User.withUsername(...).roles("ADMIN")` | cria `ROLE_ADMIN` |
+| `User.withUsername(...).authorities("consulta:cancelar")` | cria `consulta:cancelar` |
+
+A distinção prática: **roles** são grossas e falam de quem a pessoa é (recepção, médico, admin). **Permissões** são finas e falam de uma ação (`consulta:cancelar`, `medico:cadastrar`). Sistemas pequenos vivem bem só com roles. Quando as combinações crescem ("recepcionista que também pode emitir relatório financeiro"), permissões agrupadas em roles escalam melhor. Este capítulo usa roles e mostra onde as permissões entrariam.
+
+## Perfis no banco
+
+Quatro perfis para a clínica:
+
+```java
+public enum Perfil {
+    PACIENTE, RECEPCAO, MEDICO, ADMIN
+}
+```
+
+```sql
+CREATE TABLE usuarios_perfis (
+    usuario_id BIGINT      NOT NULL REFERENCES usuarios(id),
+    perfil     VARCHAR(20) NOT NULL,
+    PRIMARY KEY (usuario_id, perfil)
+);
+```
+
+```java
+@Entity
+@Table(name = "usuarios")
+public class Usuario {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String email;
+    private String senha;
+    private boolean ativo;
+
+    @ElementCollection(fetch = FetchType.EAGER)
+    @CollectionTable(name = "usuarios_perfis", joinColumns = @JoinColumn(name = "usuario_id"))
+    @Column(name = "perfil")
+    @Enumerated(EnumType.STRING)
+    private Set<Perfil> perfis = EnumSet.noneOf(Perfil.class);
+
+    // getters
+}
+```
+
+O `UserDetailsService` transforma cada perfil numa role:
+
+```java
+@Override
+public UserDetails loadUserByUsername(String email) {
+    var usuario = repository.findByEmailIgnoreCase(email)
+            .orElseThrow(() -> new UsernameNotFoundException("Usuário não encontrado"));
+    var roles = usuario.getPerfis().stream().map(Enum::name).toArray(String[]::new);
+    return User.withUsername(usuario.getEmail())
+            .password(usuario.getSenha())
+            .disabled(!usuario.isAtivo())
+            .roles(roles)
+            .build();
+}
+```
+
+`@Enumerated(EnumType.STRING)` grava o nome do perfil. Nunca use o padrão `ORDINAL` para isso: ele grava a posição no enum, e inserir um perfil novo no meio da lista troca silenciosamente a permissão de todo mundo.
+
+## Autorização por URL
+
+A primeira barreira fica na `SecurityFilterChain`. As regras são avaliadas de cima para baixo e a primeira que casar decide, então as mais específicas vêm primeiro:
+
+```java
+@Bean
+SecurityFilterChain web(HttpSecurity http) throws Exception {
+    return http
+            .authorizeHttpRequests(req -> req
+                    .requestMatchers("/css/**", "/js/**", "/login").permitAll()
+                    .requestMatchers("/admin/**").hasRole("ADMIN")
+                    .requestMatchers(HttpMethod.POST, "/medicos/**").hasRole("ADMIN")
+                    .requestMatchers("/prontuarios/**").hasRole("MEDICO")
+                    .requestMatchers("/agenda/**", "/consultas/**").hasAnyRole("RECEPCAO", "MEDICO")
+                    .requestMatchers("/minhas-consultas/**").hasRole("PACIENTE")
+                    .anyRequest().authenticated())
+            .formLogin(form -> form.loginPage("/login").permitAll())
+            .exceptionHandling(e -> e.accessDeniedPage("/acesso-negado"))
+            .build();
+}
+```
+
+Se a ordem estivesse invertida, com `anyRequest().authenticated()` no topo, qualquer usuário logado entraria em `/admin`. O Spring Security 6 até lança erro na inicialização se você puser regras depois de `anyRequest()`, mas não detecta uma regra genérica demais antes de uma específica, como `/consultas/**` antes de `/consultas/relatorios/**`.
+
+Regras por URL são boas para fronteiras grossas: áreas inteiras do sistema. Elas não sabem nada sobre os dados. "O médico só abre prontuário dos próprios pacientes" não cabe numa URL.
+
+## Autorização por método
+
+Ative a segurança de métodos e anote os serviços:
+
+```java
+@Configuration
+@EnableMethodSecurity
+public class MethodSecurityConfig {
+}
+```
+
+```java
+@Service
+public class CadastroMedicos {
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @Transactional
+    public Medico cadastrar(DadosCadastroMedico dados) {
+        return repository.save(new Medico(dados));
+    }
+
+    @PreAuthorize("hasAnyRole('ADMIN', 'RECEPCAO')")
+    public Page<DadosListagemMedico> listar(Pageable paginacao) {
+        return repository.findAllByAtivoTrue(paginacao).map(DadosListagemMedico::new);
+    }
+}
+```
+
+`@PreAuthorize` recebe uma expressão SpEL avaliada antes do método. Se for falsa, o Spring lança `AccessDeniedException`, que vira 403. A vantagem sobre a regra por URL é que a proteção acompanha o método: se amanhã outro controller, um job agendado ou uma fila chamar `cadastrar`, a regra continua valendo.
+
+### Regras de posse
+
+A expressão enxerga os parâmetros do método (com `#nome`) e o usuário atual (`authentication`):
+
+```java
+@PreAuthorize("hasRole('PACIENTE') and #email == authentication.name")
+public List<DadosConsulta> consultasDoPaciente(String email) {
+    return consultas.findByPacienteEmail(email);
+}
+```
+
+Para regras que dependem do banco, `@PostAuthorize` avalia depois do método, com acesso ao retorno em `returnObject`:
+
+```java
+@PostAuthorize("hasRole('ADMIN') or returnObject.emailMedico() == authentication.name")
+public DadosProntuario prontuario(Long consultaId) {
+    return prontuarios.porConsulta(consultaId);
+}
+```
+
+Use `@PostAuthorize` com moderação: o método já executou, então ele não pode ter efeitos colaterais. Quando a regra ficar complexa, tire-a da string e coloque-a num bean, que você testa como qualquer classe Java:
+
+```java
+@Component("acessoConsulta")
+public class AcessoConsulta {
+
+    private final ConsultaRepository consultas;
+
+    public AcessoConsulta(ConsultaRepository consultas) {
+        this.consultas = consultas;
+    }
+
+    public boolean podeVer(Long consultaId, Authentication auth) {
+        var email = auth.getName();
+        return consultas.findById(consultaId)
+                .map(c -> c.getMedico().getEmail().equals(email) || c.getPaciente().getEmail().equals(email))
+                .orElse(false);
+    }
+}
+```
+
+```java
+@PreAuthorize("hasAnyRole('RECEPCAO', 'ADMIN') or @acessoConsulta.podeVer(#id, authentication)")
+public DadosDetalhamentoConsulta detalhar(Long id) { /* ... */ }
+```
+
+O `@acessoConsulta` referencia o bean pelo nome. A recepção e o admin veem qualquer consulta; médico e paciente só as deles.
+
+<Callout type="warning" title="@PreAuthorize que não protege nada">
+A segurança de métodos funciona por proxy: o Spring envolve o bean e intercepta chamadas vindas de fora dele. Três situações desligam a proteção sem aviso. Chamar o método anotado de dentro da mesma classe (`this.cadastrar(...)`) pula o proxy. Anotar um método `private` não tem efeito. E esquecer o `@EnableMethodSecurity` faz todas as anotações serem ignoradas. Escreva um teste que espera 403 para cada regra importante: é o único jeito de saber que ela está ativa.
+</Callout>
+
+## Hierarquia de perfis
+
+Sem hierarquia, um administrador precisa ter todas as roles para entrar em todas as áreas, e toda regra nova vira `hasAnyRole('ADMIN', 'MEDICO', 'RECEPCAO')`. Uma `RoleHierarchy` diz que uma role implica outras:
+
+```java
+@Bean
+static RoleHierarchy roleHierarchy() {
+    return RoleHierarchyImpl.fromHierarchy("""
+            ROLE_ADMIN > ROLE_MEDICO
+            ROLE_ADMIN > ROLE_RECEPCAO
+            ROLE_MEDICO > ROLE_USUARIO
+            ROLE_RECEPCAO > ROLE_USUARIO
+            ROLE_PACIENTE > ROLE_USUARIO
+            """);
+}
+```
+
+Agora quem tem `ROLE_ADMIN` passa em `hasRole('MEDICO')` e em `hasRole('RECEPCAO')`, e todo mundo passa em `hasRole('USUARIO')`. Nas versões atuais do Spring Security 6, expor o bean basta para que tanto as regras de URL quanto `@PreAuthorize` o usem. O método é `static` para que o bean exista cedo, antes da configuração de segurança de métodos ser montada.
+
+Pense bem antes de dar ao admin tudo por herança. Em sistemas de saúde, administrador do sistema não deveria ler prontuário: isso é dado clínico, e o acesso precisa ser justificado e auditado. A hierarquia acima deixa o admin ler prontuários; numa clínica de verdade, você tiraria a linha `ROLE_ADMIN > ROLE_MEDICO`.
+
+## Permissões finas
+
+Quando as roles começam a se multiplicar, separe a pergunta "quem é" de "o que pode". Cada perfil vira um conjunto de permissões, e as regras passam a usar `hasAuthority`:
+
+```java
+public enum Perfil {
+    PACIENTE(Set.of("consulta:ver-proprias")),
+    RECEPCAO(Set.of("consulta:agendar", "consulta:cancelar", "paciente:cadastrar")),
+    MEDICO(Set.of("consulta:ver-proprias", "prontuario:editar")),
+    ADMIN(Set.of("medico:cadastrar", "usuario:gerenciar", "relatorio:financeiro"));
+
+    private final Set<String> permissoes;
+
+    Perfil(Set<String> permissoes) { this.permissoes = permissoes; }
+
+    public Set<String> permissoes() { return permissoes; }
+}
+```
+
+```java
+var authorities = new HashSet<GrantedAuthority>();
+for (var perfil : usuario.getPerfis()) {
+    authorities.add(new SimpleGrantedAuthority("ROLE_" + perfil.name()));
+    perfil.permissoes().forEach(p -> authorities.add(new SimpleGrantedAuthority(p)));
+}
+return User.withUsername(usuario.getEmail()).password(usuario.getSenha()).authorities(authorities).build();
+```
+
+```java
+@PreAuthorize("hasAuthority('consulta:cancelar')")
+public void cancelar(Long consultaId, MotivoCancelamento motivo) { /* ... */ }
+```
+
+Dar o relatório financeiro a uma recepcionista específica vira uma mudança de dado (uma permissão extra para aquele usuário), não de código.
+
+## Tratando o acesso negado
+
+Numa aplicação web, `accessDeniedPage("/acesso-negado")` mostra uma página amigável. Para diferenciar quem não está logado (redireciona ao login) de quem está logado sem permissão (403), o Spring Security já faz o trabalho no `ExceptionTranslationFilter`. Nas telas, esconda o que o usuário não pode usar, mas lembre que isso é conforto, não segurança:
+
+```html
+<a sec:authorize="hasRole('ADMIN')" th:href="@{/admin/medicos/novo}">Cadastrar médico</a>
+<button sec:authorize="hasAuthority('consulta:cancelar')" type="submit">Cancelar</button>
+```
+
+Esconder o botão sem proteger a rota é o mesmo que trancar a porta e deixar a janela aberta: qualquer um monta a requisição à mão.
+
+Mudou o perfil de alguém? A sessão atual dele continua com as authorities antigas até o próximo login. Para revogar na hora, invalide as sessões do usuário (com `SessionRegistry` ou Spring Session) ao alterar perfis.
+
+## Testando autorização
+
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+class AutorizacaoTest {
+
+    @Autowired MockMvc mvc;
+    @Autowired CadastroMedicos cadastro;
+
+    @Test
+    @WithMockUser(roles = "RECEPCAO")
+    void recepcaoNaoEntraNoAdmin() throws Exception {
+        mvc.perform(get("/admin/medicos")).andExpect(status().isForbidden());
+    }
+
+    @Test
+    @WithMockUser(roles = "ADMIN")
+    void adminHerdaAcessoDaRecepcao() throws Exception {
+        mvc.perform(get("/agenda")).andExpect(status().isOk());
+    }
+
+    @Test
+    @WithMockUser(roles = "MEDICO")
+    void medicoNaoCadastraMedico() {
+        assertThatThrownBy(() -> cadastro.cadastrar(dadosValidos()))
+                .isInstanceOf(AccessDeniedException.class);
+    }
+}
+```
+
+O último teste chama o serviço direto, sem HTTP. É assim que você garante que a regra de método está ativa, independente das rotas.
+
+## Na entrevista
+
+**Qual a diferença entre `hasRole` e `hasAuthority`?** `hasRole("X")` procura a authority `ROLE_X`; `hasAuthority("X")` procura exatamente `X`. Roles são authorities com prefixo, usadas para perfis; authorities sem prefixo costumam representar permissões finas.
+
+**Por que proteger por método se já protejo por URL?** Porque o mesmo serviço pode ser chamado por outros controllers, jobs ou consumidores de fila, e porque regras de posse dependem dos dados, não da URL. Defesa em profundidade: URL para fronteiras grossas, método para regras de negócio.
+
+**Quando `@PreAuthorize` não funciona?** Em chamadas internas da mesma classe (sem passar pelo proxy), em métodos privados e quando `@EnableMethodSecurity` não está habilitado.
+
+**O que é RBAC?** Controle de acesso baseado em papéis: permissões são atribuídas a papéis e papéis a usuários, em vez de permissões direto a cada usuário. Simplifica a gestão; quando as regras dependem de atributos do recurso (dono, unidade, horário), entra o ABAC.
+
+## Pratique
+
+No portal da clínica, entregue:
+
+1. Os quatro perfis gravados como `STRING`, com um usuário de cada criado por migração.
+2. Regras por URL para `/admin`, `/prontuarios`, `/agenda` e `/minhas-consultas`, e uma página de acesso negado.
+3. `@PreAuthorize` nos serviços de cadastro de médico, cancelamento de consulta (por permissão) e detalhe de consulta (com o bean `acessoConsulta`).
+4. Uma `RoleHierarchy` justificada num comentário, sem dar ao admin acesso a prontuários.
+5. Testes: um 403 por perfil indevido em cada área, um teste de herança e um teste de serviço que espera `AccessDeniedException`.
+
+<Quiz question="Qual authority é exigida por hasRole('MEDICO')?" options={["MEDICO","ROLE_MEDICO","SCOPE_MEDICO","PERFIL_MEDICO"]} answer={1} explanation="hasRole acrescenta o prefixo ROLE_ automaticamente. Para conferir a string exata, sem prefixo, use hasAuthority." />
+
+<Quiz question="Um método anotado com @PreAuthorize é chamado por outro método da mesma classe. O que acontece?" options={["A regra é avaliada normalmente","O Spring lança erro na inicialização","A regra é ignorada porque a chamada não passa pelo proxy","A regra vale só para o primeiro método"]} answer={2} explanation="A segurança de métodos funciona com proxies. Uma chamada via this vai direto ao objeto, sem interceptação, e a expressão não é avaliada." />
+
+<Quiz question="Por que gravar o perfil com EnumType.STRING em vez de ORDINAL?" options={["Para que inserir um valor novo no enum não mude as permissões gravadas","Porque ORDINAL não funciona com ElementCollection","Porque STRING ocupa menos espaço","Porque o Spring Security exige texto"]} answer={0} explanation="ORDINAL grava a posição. Reordenar ou inserir valores no enum muda o significado dos números já gravados, trocando perfis de usuários sem ninguém perceber." />
+
+## Base no CodeForge
+
+- [Java e Spring Security: Proteja suas aplicações web](/learn/carreira-java/java-spring-security-proteja-aplicacoes-web): o portal que este capítulo evolui.
+- [RBAC](/learn/system-design/rbac) e [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao): os modelos de controle de acesso.
+- [Node.js: Criando API Rest com autenticação, perfis de usuários e permissões](/learn/carreira-nodejs/nodejs-criando-api-rest-autenticacao-perfis-usuarios): perfis e permissões em outra stack.
+- [Proxy](/learn/lld/proxy): o padrão que faz `@PreAuthorize` funcionar, e por que chamadas internas o ignoram.
+- [Records e enums](/learn/java/records-e-enums): enums com campos, como o `Perfil` com permissões.
+
+## Referências
+
+- [Spring Security: Authorize HttpServletRequests](https://docs.spring.io/spring-security/reference/servlet/authorization/authorize-http-requests.html)
+- [Spring Security: Method Security](https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html)
+- [Spring Security: Authorization Architecture](https://docs.spring.io/spring-security/reference/servlet/authorization/architecture.html)

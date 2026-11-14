@@ -1,0 +1,429 @@
+---
+title: "Spring Boot 3: Desenvolva uma API Rest em Java"
+kind: lesson
+---
+
+Quase toda vaga de back-end Java pede a mesma coisa: construir APIs REST com Spring Boot. O framework resolve o trabalho repetitivo (servidor HTTP embutido, conversão de JSON, conexão com banco, injeção de dependências) e deixa você focar nas regras do negócio. Este capítulo abre a sequência de três cursos de Spring Boot 3. Aqui você constrói do zero a base da API da clínica, com médicos e pacientes, usando o que um projeto atual espera: Java 21, Spring Boot 3, DTOs como records, Spring Data JPA, migrações com Flyway e validação com Bean Validation. Os próximos capítulos vão adicionar tratamento de erros, regras de agendamento de consultas, segurança, documentação e testes sobre esta mesma base.
+
+**Você vai aprender:**
+
+- Criar um projeto Spring Boot 3 com as dependências certas e entender sua estrutura
+- Modelar o banco com migrações Flyway e mapear entidades com JPA (`jakarta.persistence`)
+- Receber e devolver dados com DTOs em record, validados com Bean Validation
+- Implementar o CRUD com controller REST, repositório e paginação
+- Fazer exclusão lógica e usar os status HTTP corretos
+
+## Criando o projeto
+
+Gere o projeto no Spring Initializr (start.spring.io) com:
+
+- **Project:** Maven. **Language:** Java. **Spring Boot:** a versão 3.x estável mais recente.
+- **Group:** `br.com.clinica`. **Artifact:** `api`. **Java:** 21.
+- **Dependências:** Spring Web, Spring Data JPA, PostgreSQL Driver, Flyway Migration, Validation, Spring Boot DevTools.
+
+O Spring Boot 3 exige Java 17 ou superior e usa Jakarta EE: os pacotes são `jakarta.persistence`, `jakarta.validation` e `jakarta.servlet`, e não mais `javax.*`. Se um tutorial usa `javax.persistence.Entity`, ele é do Spring Boot 2.
+
+Com Flyway 10 ou superior (o que vem no Spring Boot 3.3 em diante), o suporte a cada banco fica num módulo separado. Para Postgres, adicione ao `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-database-postgresql</artifactId>
+</dependency>
+```
+
+Sem ele, a aplicação falha ao subir com a mensagem `Unsupported Database: PostgreSQL`.
+
+A estrutura gerada:
+
+```text
+api/
+├── mvnw, mvnw.cmd, .mvn/          # Maven Wrapper
+├── pom.xml                        # dependências; o parent é o spring-boot-starter-parent
+└── src/
+    ├── main/
+    │   ├── java/br/com/clinica/api/ApiApplication.java
+    │   └── resources/
+    │       ├── application.properties
+    │       └── db/migration/      # crie esta pasta para o Flyway
+    └── test/java/br/com/clinica/api/ApiApplicationTests.java
+```
+
+A classe principal tem `@SpringBootApplication`, que liga três coisas: configuração automática (o Spring configura o que encontrar no classpath, como o Tomcat embutido e o `DataSource`), varredura de componentes a partir do pacote dela, e a possibilidade de declarar beans. Por isso todas as suas classes ficam em subpacotes de `br.com.clinica.api`.
+
+## Configuração e banco
+
+Suba um Postgres local (com Docker é o mais simples):
+
+```bash
+docker run -d --name clinica-db -p 5432:5432 \
+  -e POSTGRES_DB=clinica -e POSTGRES_USER=clinica -e POSTGRES_PASSWORD=clinica \
+  postgres:16-alpine
+```
+
+Troque o `application.properties` por um `application.yml`:
+
+```yaml
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/clinica}
+    username: ${DB_USER:clinica}
+    password: ${DB_PASSWORD:clinica}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+    show-sql: true
+```
+
+A sintaxe `${DB_URL:valor}` lê a variável de ambiente e usa o valor padrão se ela não existir: em desenvolvimento funciona sem configurar nada, em produção os valores reais vêm do ambiente.
+
+Duas escolhas importantes:
+
+- `ddl-auto: validate` faz o Hibernate apenas **conferir** se as entidades batem com as tabelas. Quem cria e altera tabelas é o Flyway. Nunca use `update` ou `create` em produção: o Hibernate não remove colunas, não migra dados e pode alterar o schema de forma imprevisível.
+- `open-in-view: false` desliga o padrão que mantém a sessão do banco aberta durante a renderização da resposta. Com ele ligado, consultas lazy acontecem escondidas no controller; desligado, você é obrigado a carregar o que precisa no serviço.
+
+## Migrações com Flyway
+
+O Flyway executa scripts SQL versionados, em ordem, uma única vez cada, e registra o que já rodou na tabela `flyway_schema_history`. O nome segue o padrão `V<versão>__<descrição>.sql` (dois sublinhados).
+
+```sql
+-- src/main/resources/db/migration/V1__cria_tabela_medicos.sql
+CREATE TABLE medicos (
+    id            BIGSERIAL PRIMARY KEY,
+    nome          VARCHAR(100) NOT NULL,
+    email         VARCHAR(100) NOT NULL UNIQUE,
+    telefone      VARCHAR(20)  NOT NULL,
+    crm           VARCHAR(6)   NOT NULL UNIQUE,
+    especialidade VARCHAR(30)  NOT NULL,
+    ativo         BOOLEAN      NOT NULL DEFAULT TRUE
+);
+```
+
+```sql
+-- src/main/resources/db/migration/V2__cria_tabela_pacientes.sql
+CREATE TABLE pacientes (
+    id       BIGSERIAL PRIMARY KEY,
+    nome     VARCHAR(100) NOT NULL,
+    email    VARCHAR(100) NOT NULL UNIQUE,
+    cpf      VARCHAR(11)  NOT NULL UNIQUE,
+    telefone VARCHAR(20)  NOT NULL,
+    ativo    BOOLEAN      NOT NULL DEFAULT TRUE
+);
+```
+
+Ao iniciar, o Spring Boot roda o Flyway antes do JPA. O log mostra `Successfully applied 2 migrations`.
+
+<Callout type="warning" title="Nunca edite uma migração que já rodou">
+O Flyway guarda o checksum de cada script aplicado. Se você alterar o `V1` depois que ele rodou em qualquer banco (o seu, o do colega, o de produção), a aplicação não sobe mais: `Validate failed: Migration checksum mismatch`. Mudança no schema sempre é uma migração nova (`V3__adiciona_coluna_...sql`). Em desenvolvimento, se você errou um script que só rodou na sua máquina, apague o banco local e rode de novo; nunca faça isso em ambiente compartilhado.
+</Callout>
+
+## A entidade e o enum
+
+```java
+package br.com.clinica.api.medico;
+
+public enum Especialidade {
+    CARDIOLOGIA, DERMATOLOGIA, GINECOLOGIA, ORTOPEDIA, PEDIATRIA
+}
+```
+
+```java
+package br.com.clinica.api.medico;
+
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "medicos")
+public class Medico {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String nome;
+    private String email;
+    private String telefone;
+    private String crm;
+
+    @Enumerated(EnumType.STRING)
+    private Especialidade especialidade;
+
+    private boolean ativo;
+
+    protected Medico() {
+        // exigido pelo JPA
+    }
+
+    public Medico(DadosCadastroMedico dados) {
+        this.nome = dados.nome();
+        this.email = dados.email();
+        this.telefone = dados.telefone();
+        this.crm = dados.crm();
+        this.especialidade = dados.especialidade();
+        this.ativo = true;
+    }
+
+    public void atualizar(DadosAtualizacaoMedico dados) {
+        if (dados.nome() != null) this.nome = dados.nome();
+        if (dados.telefone() != null) this.telefone = dados.telefone();
+    }
+
+    public void inativar() {
+        this.ativo = false;
+    }
+
+    public Long getId() { return id; }
+    public String getNome() { return nome; }
+    public String getEmail() { return email; }
+    public String getTelefone() { return telefone; }
+    public String getCrm() { return crm; }
+    public Especialidade getEspecialidade() { return especialidade; }
+    public boolean isAtivo() { return ativo; }
+}
+```
+
+Detalhes que importam:
+
+- `GenerationType.IDENTITY` usa o `BIGSERIAL` do Postgres para gerar o id.
+- `@Enumerated(EnumType.STRING)` grava `"CARDIOLOGIA"` no banco. O padrão (`ORDINAL`) grava a posição (0, 1, 2) e corrompe os dados no dia em que alguém inserir uma especialidade no meio do enum.
+- Não há setters públicos. A entidade muda por métodos com significado (`atualizar`, `inativar`), o que deixa claro o que pode ser alterado. O construtor sem argumentos é `protected` porque só o JPA deve usá-lo.
+- Entidade JPA não pode ser record: o Hibernate precisa de uma classe mutável, com construtor sem argumentos e não final.
+
+## DTOs com records e validação
+
+Os DTOs definem o contrato da API. Para o cadastro, todas as regras de formato ficam declaradas:
+
+```java
+package br.com.clinica.api.medico;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
+
+public record DadosCadastroMedico(
+        @NotBlank String nome,
+        @NotBlank @Email String email,
+        @NotBlank String telefone,
+        @NotBlank @Pattern(regexp = "\\d{4,6}", message = "CRM deve ter de 4 a 6 dígitos") String crm,
+        @NotNull Especialidade especialidade) {
+}
+```
+
+```java
+public record DadosAtualizacaoMedico(String nome, String telefone) {
+}
+```
+
+```java
+public record DadosListagemMedico(Long id, String nome, String email, String crm, Especialidade especialidade) {
+    public DadosListagemMedico(Medico m) {
+        this(m.getId(), m.getNome(), m.getEmail(), m.getCrm(), m.getEspecialidade());
+    }
+}
+```
+
+```java
+public record DadosDetalhamentoMedico(Long id, String nome, String email, String telefone,
+                                      String crm, Especialidade especialidade, boolean ativo) {
+    public DadosDetalhamentoMedico(Medico m) {
+        this(m.getId(), m.getNome(), m.getEmail(), m.getTelefone(), m.getCrm(),
+                m.getEspecialidade(), m.isAtivo());
+    }
+}
+```
+
+`@NotBlank` rejeita nulo, vazio e só espaços; `@NotNull` só rejeita nulo (use em tipos que não são texto). O Jackson converte o JSON para o record pelo construtor canônico e converte `"CARDIOLOGIA"` para o enum; um valor inexistente gera erro 400.
+
+A listagem tem menos campos que o detalhamento de propósito: cada endpoint devolve o que o cliente precisa, e a entidade nunca sai pela API.
+
+## O repositório
+
+```java
+package br.com.clinica.api.medico;
+
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface MedicoRepository extends JpaRepository<Medico, Long> {
+    Page<Medico> findAllByAtivoTrue(Pageable paginacao);
+}
+```
+
+Só a interface. O Spring Data gera a implementação com `save`, `findById`, `findAll`, `deleteById` e outros, e cria a consulta de `findAllByAtivoTrue` a partir do nome do método: `SELECT ... WHERE ativo = true`, com paginação e ordenação aplicadas.
+
+## O controller
+
+```java
+package br.com.clinica.api.medico;
+
+import jakarta.validation.Valid;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
+import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.util.UriComponentsBuilder;
+
+@RestController
+@RequestMapping("/medicos")
+public class MedicoController {
+
+    private final MedicoRepository repositorio;
+
+    public MedicoController(MedicoRepository repositorio) {
+        this.repositorio = repositorio;
+    }
+
+    @PostMapping
+    @Transactional
+    public ResponseEntity<DadosDetalhamentoMedico> cadastrar(@RequestBody @Valid DadosCadastroMedico dados,
+                                                             UriComponentsBuilder uriBuilder) {
+        var medico = repositorio.save(new Medico(dados));
+        var uri = uriBuilder.path("/medicos/{id}").buildAndExpand(medico.getId()).toUri();
+        return ResponseEntity.created(uri).body(new DadosDetalhamentoMedico(medico));
+    }
+
+    @GetMapping
+    public Page<DadosListagemMedico> listar(@PageableDefault(size = 10, sort = "nome") Pageable paginacao) {
+        return repositorio.findAllByAtivoTrue(paginacao).map(DadosListagemMedico::new);
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<DadosDetalhamentoMedico> detalhar(@PathVariable Long id) {
+        return repositorio.findById(id)
+                .map(m -> ResponseEntity.ok(new DadosDetalhamentoMedico(m)))
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PutMapping("/{id}")
+    @Transactional
+    public ResponseEntity<DadosDetalhamentoMedico> atualizar(@PathVariable Long id,
+                                                             @RequestBody @Valid DadosAtualizacaoMedico dados) {
+        return repositorio.findById(id)
+                .map(medico -> {
+                    medico.atualizar(dados);
+                    return ResponseEntity.ok(new DadosDetalhamentoMedico(medico));
+                })
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @DeleteMapping("/{id}")
+    @Transactional
+    public ResponseEntity<Void> excluir(@PathVariable Long id) {
+        return repositorio.findById(id)
+                .map(medico -> {
+                    medico.inativar();
+                    return ResponseEntity.noContent().<Void>build();
+                })
+                .orElse(ResponseEntity.notFound().build());
+    }
+}
+```
+
+O que acontece em cada endpoint:
+
+- **POST** valida o corpo (`@Valid`), salva e responde **201 Created** com o header `Location` apontando para o novo recurso. Se a validação falha, o Spring responde 400 antes de o método rodar.
+- **GET** lista com paginação. `Pageable` lê `?page=1&size=5&sort=nome,desc` da URL; `@PageableDefault` define o padrão. `Page.map` converte cada entidade em DTO.
+- **GET /id** responde 200 com o médico ou 404.
+- **PUT** não chama `save`: dentro de uma transação, a entidade carregada é gerenciada pelo JPA, e as alterações são gravadas automaticamente no commit (dirty checking).
+- **DELETE** faz **exclusão lógica**: marca `ativo = false` e responde **204 No Content**. Em sistemas de saúde, apagar o registro de um médico apagaria também a referência dele em consultas e prontuários passados; inativar preserva o histórico.
+
+Aqui o controller fala direto com o repositório para manter o foco no essencial. Quando as regras de negócio chegarem (agendamento de consultas, no próximo curso), elas vão para uma camada de serviço, e o `@Transactional` vai junto. O tratamento de erros também fica para lá: por enquanto o 404 é montado à mão, e o próximo curso troca isso por exceções e um `@RestControllerAdvice`.
+
+## Paginação serializada de forma estável
+
+Devolver `Page` direto funciona, mas desde o Spring Data 3.3 o log avisa que serializar `PageImpl` não tem formato garantido. Habilite o modo DTO uma vez:
+
+```java
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.web.config.EnableSpringDataWebSupport;
+import static org.springframework.data.web.config.EnableSpringDataWebSupport.PageSerializationMode.VIA_DTO;
+
+@Configuration
+@EnableSpringDataWebSupport(pageSerializationMode = VIA_DTO)
+public class WebConfig {
+}
+```
+
+A resposta fica com um formato estável: `content` com os itens e `page` com `size`, `number`, `totalElements` e `totalPages`.
+
+## Testando com curl
+
+Rode com `./mvnw spring-boot:run` e exercite a API:
+
+```bash
+curl -i -X POST http://localhost:8080/medicos \
+  -H "Content-Type: application/json" \
+  -d '{"nome":"Ana Souza","email":"ana@clinica.com","telefone":"11999990000","crm":"123456","especialidade":"CARDIOLOGIA"}'
+# HTTP/1.1 201
+# Location: http://localhost:8080/medicos/1
+
+curl "http://localhost:8080/medicos?size=5&sort=nome,asc"
+
+curl -i -X PUT http://localhost:8080/medicos/1 \
+  -H "Content-Type: application/json" -d '{"telefone":"11988887777"}'
+
+curl -i -X DELETE http://localhost:8080/medicos/1       # 204
+curl -i http://localhost:8080/medicos/1                 # 200, com "ativo": false
+
+curl -i -X POST http://localhost:8080/medicos \
+  -H "Content-Type: application/json" -d '{"nome":"","email":"invalido"}'
+# HTTP/1.1 400
+```
+
+O 400 por padrão ainda vem com um corpo genérico. Para receber o formato `ProblemDetail` (RFC 9457) nos erros do próprio Spring, ative `spring.mvc.problemdetails.enabled: true`. A lista de campos inválidos com mensagens fica para o capítulo seguinte, junto com o tratamento de erros completo.
+
+O DevTools reinicia a aplicação quando você recompila uma classe, o que acelera o ciclo de desenvolvimento. Ele é desativado automaticamente no jar empacotado.
+
+## Pacientes: o mesmo padrão
+
+Pacientes seguem a mesma estrutura num pacote `br.com.clinica.api.paciente`: entidade `Paciente` mapeada para a tabela da migração `V2`, records `DadosCadastroPaciente` (com `@Pattern(regexp = "\\d{11}")` para o CPF), `DadosAtualizacaoPaciente`, `DadosListagemPaciente` e `DadosDetalhamentoPaciente`, o repositório com `findAllByAtivoTrue` e o controller com os mesmos cinco endpoints. Repetir o padrão é proposital: é assim que você fixa a estrutura, e é o exercício do fim do capítulo.
+
+## Na entrevista
+
+**O que faz a anotação @SpringBootApplication?** Combina `@Configuration`, `@EnableAutoConfiguration` e `@ComponentScan`: permite declarar beans, ativa a configuração automática baseada no classpath e varre componentes a partir do pacote da classe.
+
+**Por que usar Flyway em vez de ddl-auto: update?** Porque migrações versionadas são explícitas, revisáveis, reproduzíveis em todos os ambientes e conseguem migrar dados. O `update` do Hibernate não remove colunas, não renomeia com segurança e não deixa histórico.
+
+**Qual a diferença entre PUT e PATCH?** PUT, na semântica estrita, substitui o recurso inteiro; PATCH aplica uma alteração parcial. Muitas APIs usam PUT com atualização parcial na prática, como neste capítulo, mas é bom saber a distinção.
+
+**Por que @Enumerated(EnumType.STRING)?** Porque `ORDINAL` grava a posição do valor no enum, e reordenar ou inserir valores corrompe os dados existentes. `STRING` grava o nome, que é estável e legível.
+
+## Pratique
+
+Complete a base da API da clínica e entregue o repositório:
+
+1. Projeto Spring Boot 3 com Java 21, Postgres local e as migrações `V1` (médicos) e `V2` (pacientes).
+2. CRUD completo de médicos como no capítulo, com exclusão lógica e listagem paginada só de ativos.
+3. CRUD completo de pacientes no mesmo padrão, com CPF validado por `@Pattern` e e-mail único.
+4. Uma migração `V3` que adiciona um endereço aos médicos (logradouro, cidade, UF), mapeado com `@Embeddable` e um record `DadosEndereco` validado.
+5. Um arquivo `clinica.http` (ou coleção do Postman) com uma requisição para cada endpoint, incluindo os casos de 400 e 404.
+
+<Quiz question="Qual configuração faz o Hibernate apenas conferir se as entidades batem com as tabelas criadas pelo Flyway?" options={["ddl-auto: update","ddl-auto: create-drop","ddl-auto: validate","ddl-auto: none com show-sql"]} answer={2} explanation="validate compara o mapeamento com o schema e falha na subida se houver divergência, sem alterar nada. Quem altera o schema é o Flyway." />
+
+<Quiz question="No PUT do controller, por que as alterações são gravadas sem chamar repositorio.save?" options={["Porque o Spring chama save automaticamente em todo controller","Porque a entidade carregada numa transação é gerenciada e o JPA grava as mudanças no commit","Porque records são persistidos automaticamente","Porque o DevTools sincroniza com o banco"]} answer={1} explanation="Dentro de uma transação, entidades carregadas ficam no contexto de persistência. No commit, o Hibernate detecta as mudanças (dirty checking) e gera o UPDATE." />
+
+<Quiz question="O que acontece se você editar um script de migração do Flyway que já foi aplicado?" options={["O Flyway reaplica o script com as mudanças","A aplicação falha ao subir por divergência de checksum","O Hibernate corrige o schema automaticamente","Nada, o Flyway ignora scripts já aplicados"]} answer={1} explanation="O Flyway guarda o checksum de cada migração aplicada e valida na subida. Qualquer alteração gera Migration checksum mismatch. Mudanças vão numa migração nova." />
+
+## Base no CodeForge
+
+- [Java: Persistência de dados e consultas com Spring Data JPA](/learn/carreira-java/java-persistencia-dados-consultas-spring-data-jpa) e [Java: Criando sua primeira API e conectando ao front](/learn/carreira-java/java-criando-primeira-api-conectando-ao-front): o que vem antes deste capítulo.
+- [Spring Boot 3: aplique boas práticas e proteja uma API Rest](/learn/carreira-java/spring-boot-3-aplique-boas-praticas-proteja): a continuação, com tratamento de erros, regras de consultas e segurança.
+- [Spring Boot 3: documente, teste e prepare uma API para o deploy](/learn/carreira-java/spring-boot-3-documente-teste-prepare-api): o terceiro curso da sequência.
+- [REST](/learn/system-design/rest) e [Migrações de schema](/learn/system-design/migracoes-de-schema): a teoria por trás dos endpoints e do Flyway.
+- [Tipos e restrições](/learn/sql/tipos-e-restricoes) e [Ordenação e paginação](/learn/sql/ordenacao-e-paginacao): o SQL que o Spring Data gera por você.
+- [Records e enums](/learn/java/records-e-enums): os recursos da linguagem usados nos DTOs.
+
+## Referências
+
+- [Spring Boot Reference Documentation](https://docs.spring.io/spring-boot/reference/)
+- [Spring Data JPA Reference](https://docs.spring.io/spring-data/jpa/reference/)
+- [Flyway Documentation](https://documentation.red-gate.com/fd)
+- [Spring Initializr](https://start.spring.io)

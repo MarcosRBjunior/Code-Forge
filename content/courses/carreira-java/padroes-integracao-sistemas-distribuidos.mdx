@@ -1,0 +1,346 @@
+---
+title: "Padrões de Integração em Sistemas Distribuídos"
+kind: lesson
+---
+
+Quando pedidos, pagamentos, estoque e nota fiscal viram sistemas separados, a parte difícil deixa de ser o código de cada um e passa a ser a costura entre eles. Como um serviço avisa o outro? O que acontece se a mensagem chegar duas vezes, fora de ordem ou nunca? Como desfazer uma compra quando o estoque falha depois que o cartão já foi cobrado, sem transação distribuída? Esses problemas são antigos e têm soluções catalogadas, com nome. Neste capítulo você aprende os padrões de integração que aparecem em todo sistema distribuído Java: os Enterprise Integration Patterns (canal, roteador, tradutor), a escolha entre síncrono e assíncrono, retries com backoff, idempotência, transactional outbox e saga.
+
+**Você vai aprender:**
+
+- Escolher entre comunicação síncrona e assíncrona por critérios concretos
+- Reconhecer e aplicar os Enterprise Integration Patterns mais usados
+- Fazer retries seguros com backoff, jitter e idempotência
+- Publicar eventos de forma confiável com o transactional outbox
+- Coordenar uma transação de negócio entre serviços com saga e compensações
+
+## Síncrono ou assíncrono
+
+A primeira decisão em cada integração é o estilo de comunicação.
+
+| Critério | Síncrono (HTTP, gRPC) | Assíncrono (mensagens, eventos) |
+|---|---|---|
+| Quem chama precisa da resposta agora? | Sim | Não |
+| Acoplamento temporal | Os dois precisam estar no ar | O consumidor pode estar fora |
+| Latência percebida | Soma das chamadas da cadeia | Resposta imediata, processamento depois |
+| Picos de carga | Propagam para o chamado | A fila absorve |
+| Vários interessados no mesmo fato | O produtor chama cada um | Publica uma vez, cada um assina |
+| Complexidade | Menor: erro volta na hora | Maior: consistência eventual, duplicatas, DLQ |
+
+Uma regra que funciona: **consultas** que o usuário espera na tela são síncronas ("qual o frete para este CEP?"). **Comandos e fatos** cuja conclusão pode vir depois são assíncronos ("pagamento aprovado", "emitir nota fiscal").
+
+Cuidado com a cadeia síncrona. Se o checkout chama pagamentos, que chama antifraude, que chama um bureau de crédito, a disponibilidade do checkout é o produto das disponibilidades: quatro serviços com 99,9% cada dão cerca de 99,6% no conjunto, e a latência é a soma. Cada elo síncrono a mais exige timeout, circuit breaker e um plano para quando falhar.
+
+## Enterprise Integration Patterns
+
+O livro de Gregor Hohpe e Bobby Woolf catalogou, em 2003, a linguagem que ainda usamos para falar de integração. Os padrões mais frequentes:
+
+| Padrão | O que faz | Onde aparece em Java |
+|---|---|---|
+| Message Channel | Canal por onde mensagens trafegam | Fila do RabbitMQ, tópico do Kafka |
+| Point-to-Point Channel | Cada mensagem vai para um consumidor | Fila com vários consumidores competindo |
+| Publish-Subscribe Channel | Cada assinante recebe uma cópia | Exchange fanout ou topic com filas por serviço |
+| Message Router | Decide o destino pelo conteúdo ou cabeçalho | Exchange topic, `switch` num listener |
+| Message Translator | Converte de um formato para outro | Mapper de DTO externo para modelo interno |
+| Content Enricher | Completa a mensagem com dados de outra fonte | Listener que busca o cliente antes de seguir |
+| Splitter e Aggregator | Quebra uma mensagem em várias e junta resultados | Pedido em itens, respostas de vários fornecedores |
+| Dead Letter Channel | Destino de mensagens que não puderam ser processadas | DLQ |
+| Idempotent Receiver | Consumidor que tolera duplicatas | Tabela de mensagens processadas |
+
+Conhecer os nomes serve para conversar: "precisamos de um tradutor na entrada do parceiro e de um roteador por tipo de evento" é uma frase que o time inteiro entende.
+
+### Tradutor na fronteira
+
+O tradutor merece atenção especial. Quando você integra com um sistema externo (um gateway de pagamento, um ERP), não deixe o modelo dele vazar para dentro do seu. Converta na entrada, num lugar só. É o que o Domain-Driven Design chama de camada anticorrupção.
+
+```java
+// O formato do parceiro, como ele manda
+record WebhookGateway(String txn_id, String order_ref, String state, long amount_cents) {}
+
+// O seu modelo
+record PagamentoProcessado(UUID mensagemId, UUID pedidoId, StatusPagamento status, BigDecimal valor) {}
+
+@Component
+class TradutorGateway {
+
+    PagamentoProcessado traduzir(WebhookGateway w) {
+        var status = switch (w.state()) {
+            case "captured", "authorized" -> StatusPagamento.APROVADO;
+            case "declined", "failed" -> StatusPagamento.RECUSADO;
+            default -> throw new IllegalArgumentException("Estado desconhecido do gateway: " + w.state());
+        };
+        return new PagamentoProcessado(
+                UUID.nameUUIDFromBytes(w.txn_id().getBytes()),   // id estável: o mesmo webhook gera o mesmo id
+                UUID.fromString(w.order_ref()),
+                status,
+                BigDecimal.valueOf(w.amount_cents(), 2));
+    }
+}
+```
+
+Se o gateway mudar o formato ou você trocar de gateway, só o tradutor muda. Repare no id derivado do `txn_id`: um webhook reenviado gera o mesmo `mensagemId`, o que permite deduplicar adiante.
+
+### Roteador
+
+Um roteador baseado em conteúdo decide o destino pelo tipo da mensagem. Com RabbitMQ, a exchange topic faz isso pela routing key. No código, um `switch` com pattern matching sobre uma interface selada deixa o roteamento exaustivo (o compilador avisa se faltar um caso):
+
+```java
+sealed interface EventoPedido permits PedidoCriado, PedidoPago, PedidoCancelado {}
+record PedidoCriado(UUID pedidoId, BigDecimal total) implements EventoPedido {}
+record PedidoPago(UUID pedidoId) implements EventoPedido {}
+record PedidoCancelado(UUID pedidoId, String motivo) implements EventoPedido {}
+
+void rotear(EventoPedido evento) {
+    switch (evento) {
+        case PedidoCriado e -> rabbit.convertAndSend("loja.eventos", "pedido.criado", e);
+        case PedidoPago e -> rabbit.convertAndSend("loja.eventos", "pedido.pago", e);
+        case PedidoCancelado e -> rabbit.convertAndSend("loja.eventos", "pedido.cancelado", e);
+    }
+}
+```
+
+Para fluxos de integração grandes, o Spring Integration implementa os EIPs como componentes configuráveis (canais, roteadores, transformadores, adaptadores para arquivos, FTP, filas). Para a maioria dos microsserviços, Spring AMQP ou Spring Kafka com código simples bastam.
+
+## Retries com backoff e jitter
+
+Falhas transitórias são normais em rede: um timeout, um 503 durante um deploy, uma conexão resetada. Tentar de novo resolve a maioria. Mas o retry ingênuo piora as coisas: se mil clientes falham ao mesmo tempo e todos tentam de novo depois de exatamente um segundo, o serviço que estava se recuperando recebe mil requisições juntas e cai de novo.
+
+As regras de um retry saudável:
+
+- **Só para erros transitórios:** timeout, conexão recusada, 429, 502, 503, 504. Nunca para 400, 404 ou 422, que vão falhar de novo.
+- **Backoff exponencial:** espera crescente (200 ms, 400 ms, 800 ms...).
+- **Jitter:** uma parte aleatória na espera, para os clientes não sincronizarem.
+- **Limite:** poucas tentativas e um orçamento total de tempo menor que o timeout de quem chamou você.
+- **Só em operações idempotentes**, ou com chave de idempotência.
+
+```yaml
+resilience4j:
+  retry:
+    instances:
+      pagamentos:
+        max-attempts: 3
+        wait-duration: 200ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        enable-randomized-wait: true
+        randomized-wait-factor: 0.5
+        retry-exceptions:
+          - org.springframework.web.client.ResourceAccessException
+          - org.springframework.web.client.HttpServerErrorException
+```
+
+Cuidado com retries em camadas. Se o cliente HTTP tenta 3 vezes, o serviço tenta 3 vezes e o gateway tenta 3 vezes, uma falha vira 27 chamadas ao serviço de baixo. Faça retry em um lugar só, de preferência o mais perto da chamada.
+
+## Idempotência
+
+Retries, reentregas de mensagens e cliques duplos fazem a mesma operação chegar mais de uma vez. Uma operação **idempotente** produz o mesmo efeito não importa quantas vezes seja executada. Algumas já são por natureza (`PUT` que define um valor, `DELETE` de um recurso). Outras precisam de ajuda, como criar um pedido ou cobrar um cartão.
+
+Para APIs HTTP, o padrão é a **chave de idempotência**: o cliente gera um identificador único por operação e o envia num cabeçalho. O servidor guarda o resultado associado à chave e, ao receber a mesma chave de novo, devolve o resultado guardado sem executar outra vez.
+
+```sql
+CREATE TABLE chaves_idempotencia (
+    chave       VARCHAR(100) PRIMARY KEY,
+    hash_corpo  CHAR(64)     NOT NULL,
+    status_http INT,
+    resposta    JSONB,
+    criada_em   TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+```
+
+```java
+@PostMapping("/pagamentos")
+ResponseEntity<String> cobrar(@RequestHeader("Idempotency-Key") String chave, @RequestBody String corpo) {
+    var hash = sha256(corpo);
+    int inserida = jdbc.sql("""
+            INSERT INTO chaves_idempotencia (chave, hash_corpo) VALUES (:c, :h)
+            ON CONFLICT (chave) DO NOTHING
+            """).param("c", chave).param("h", hash).update();
+
+    if (inserida == 0) {
+        var salva = jdbc.sql("SELECT hash_corpo, status_http, resposta FROM chaves_idempotencia WHERE chave = :c")
+                .param("c", chave).query(ChaveSalva.class).single();
+        if (!salva.hashCorpo().equals(hash)) return ResponseEntity.unprocessableEntity().body("Chave reutilizada com outro corpo");
+        if (salva.statusHttp() == null) return ResponseEntity.status(409).body("Requisição em processamento");
+        return ResponseEntity.status(salva.statusHttp()).body(salva.resposta());
+    }
+
+    var resultado = service.cobrar(corpo);
+    jdbc.sql("UPDATE chaves_idempotencia SET status_http = :s, resposta = CAST(:r AS jsonb) WHERE chave = :c")
+            .param("s", 201).param("r", resultado).param("c", chave).update();
+    return ResponseEntity.status(201).body(resultado);
+}
+```
+
+Os detalhes que tornam isso correto: o `INSERT ... ON CONFLICT` garante que só uma requisição concorrente "ganha" a chave; a comparação do hash detecta uso indevido da mesma chave para outra operação; e a resposta "em processamento" cobre a segunda requisição que chega enquanto a primeira ainda não terminou. Defina uma expiração para as chaves (24 horas é comum).
+
+Para consumidores de mensagens, o equivalente é o receptor idempotente: registrar o id da mensagem processada na mesma transação do efeito, como no capítulo de RabbitMQ.
+
+## Transactional outbox
+
+O serviço de pedidos precisa gravar o pedido **e** publicar o evento `PedidoCriado`. São dois sistemas (banco e broker) e não existe transação que cubra os dois de forma prática. Qualquer ordem falha:
+
+- Grava e depois publica: se o processo cai entre os dois, o pedido existe e ninguém fica sabendo.
+- Publica e depois grava: se a gravação falha, os outros serviços reagem a um pedido que não existe.
+
+O **outbox** resolve gravando o evento numa tabela, **na mesma transação** do pedido. Um processo separado lê a tabela e publica no broker.
+
+```sql
+CREATE TABLE outbox (
+    id           UUID PRIMARY KEY,
+    agregado_id  UUID         NOT NULL,
+    tipo         VARCHAR(100) NOT NULL,
+    payload      JSONB        NOT NULL,
+    criado_em    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    publicado_em TIMESTAMPTZ
+);
+CREATE INDEX outbox_pendentes ON outbox (criado_em) WHERE publicado_em IS NULL;
+```
+
+```java
+@Service
+class PedidoService {
+
+    @Transactional
+    public Pedido criar(NovoPedido dados) {
+        var pedido = repo.save(Pedido.novo(dados));
+        outbox.save(OutboxEvento.de("pedido.criado", pedido.getId(),
+                new PedidoCriado(pedido.getId(), pedido.getTotal())));
+        return pedido;   // os dois inserts confirmam juntos ou nenhum confirma
+    }
+}
+
+@Component
+class PublicadorOutbox {
+
+    @Scheduled(fixedDelay = 1000)
+    @Transactional
+    public void publicarPendentes() {
+        var pendentes = jdbc.sql("""
+                SELECT id, tipo, payload FROM outbox
+                WHERE publicado_em IS NULL
+                ORDER BY criado_em
+                LIMIT 100
+                FOR UPDATE SKIP LOCKED
+                """).query(EventoPendente.class).list();
+
+        for (var e : pendentes) {
+            rabbit.invoke(ops -> {
+                ops.convertAndSend("loja.eventos", e.tipo(), e.payload(), m -> {
+                    m.getMessageProperties().setMessageId(e.id().toString());
+                    return m;
+                });
+                ops.waitForConfirmsOrDie(5_000);
+                return null;
+            });
+            jdbc.sql("UPDATE outbox SET publicado_em = now() WHERE id = :id").param("id", e.id()).update();
+        }
+    }
+}
+```
+
+O `FOR UPDATE SKIP LOCKED` permite rodar o publicador em várias instâncias sem que duas peguem o mesmo evento. O `waitForConfirmsOrDie` espera a confirmação do broker (exige `publisher-confirm-type: simple`) antes de marcar como publicado. Se o processo cair depois de publicar e antes do `UPDATE`, o evento é publicado de novo: o outbox garante entrega **pelo menos uma vez**, e por isso os consumidores precisam ser idempotentes. Como o id da mensagem é o id da linha do outbox, a duplicata é fácil de detectar.
+
+Em vez de polling, há a variante com **CDC** (change data capture): o Debezium lê o log de replicação do Postgres e publica as inserções na tabela outbox, com menos latência e sem carga de consulta. Dentro de um monólito modular, o registro de publicação de eventos do Spring Modulith implementa a mesma ideia.
+
+<Callout type="warning" title="Publicar no broker dentro da transação do banco">
+Chamar `rabbit.convertAndSend` dentro de um método `@Transactional` e achar que está atômico é o erro clássico. A mensagem sai na hora, mesmo que a transação faça rollback logo depois, e os consumidores processam um pedido que não existe. Também não adianta mover a publicação para depois do commit (`@TransactionalEventListener`) e considerar resolvido: se o processo cair entre o commit e a publicação, o evento se perde. Para garantir as duas coisas, use outbox.
+</Callout>
+
+## Saga
+
+Uma compra envolve criar o pedido, reservar estoque e cobrar o pagamento, em três serviços com três bancos. Em um monólito, seria uma transação. Distribuído, transações de duas fases (2PC) são frágeis, lentas e mal suportadas por brokers e bancos na nuvem. A alternativa é a **saga**: uma sequência de transações locais, cada uma publicando um evento que dispara a próxima. Se um passo falha, executam-se **compensações** que desfazem semanticamente os passos anteriores.
+
+| Passo | Transação local | Compensação |
+|---|---|---|
+| 1 | Pedidos: criar pedido `PENDENTE` | Marcar pedido `CANCELADO` |
+| 2 | Estoque: reservar itens | Liberar reserva |
+| 3 | Pagamentos: cobrar cartão | Estornar cobrança |
+| 4 | Pedidos: marcar `CONFIRMADO` | (último passo, sem compensação) |
+
+Compensação não é rollback: o cliente pode ter recebido um e-mail, o estorno aparece na fatura. Por isso a ordem importa. Coloque antes os passos que mais falham e os mais fáceis de compensar (reservar estoque), e por último os difíceis de desfazer (cobrar, emitir nota).
+
+Há dois jeitos de coordenar:
+
+**Coreografia:** cada serviço reage aos eventos dos outros, sem coordenador. Estoque ouve `PedidoCriado` e publica `EstoqueReservado` ou `EstoqueIndisponivel`; pagamentos ouve `EstoqueReservado`, e assim por diante. Simples para poucos passos, mas o fluxo fica espalhado e difícil de enxergar.
+
+**Orquestração:** um orquestrador (geralmente no serviço dono do processo) manda comandos e reage às respostas, mantendo o estado da saga.
+
+```java
+public enum EstadoSaga { RESERVANDO_ESTOQUE, COBRANDO, CONFIRMADO, COMPENSANDO, CANCELADO }
+
+@Component
+class SagaCompra {
+
+    @Transactional
+    void iniciar(Pedido pedido) {
+        sagas.save(new Saga(pedido.getId(), EstadoSaga.RESERVANDO_ESTOQUE));
+        outbox.comando("estoque.reservar", new ReservarEstoque(pedido.getId(), pedido.itens()));
+    }
+
+    @RabbitListener(queues = "pedidos.saga-compra")
+    @Transactional
+    void aoResponder(RespostaSaga resposta) {
+        var saga = sagas.findById(resposta.pedidoId()).orElseThrow();
+        switch (resposta) {
+            case EstoqueReservado r when saga.estado() == EstadoSaga.RESERVANDO_ESTOQUE -> {
+                saga.avancar(EstadoSaga.COBRANDO);
+                outbox.comando("pagamento.solicitar", new SolicitarPagamento(r.pedidoId(), saga.total()));
+            }
+            case EstoqueIndisponivel r -> {
+                saga.avancar(EstadoSaga.CANCELADO);
+                pedidos.cancelar(r.pedidoId(), "sem estoque");
+            }
+            case PagamentoAprovado r when saga.estado() == EstadoSaga.COBRANDO -> {
+                saga.avancar(EstadoSaga.CONFIRMADO);
+                pedidos.confirmar(r.pedidoId());
+            }
+            case PagamentoRecusado r -> {
+                saga.avancar(EstadoSaga.COMPENSANDO);
+                outbox.comando("estoque.liberar", new LiberarEstoque(r.pedidoId()));
+            }
+            default -> log.info("Resposta ignorada {} no estado {}", resposta, saga.estado());
+        }
+    }
+}
+```
+
+O estado da saga fica no banco; os comandos saem pelo outbox na mesma transação; os guardas `when` descartam respostas duplicadas ou fora de hora. Com mais de três ou quatro passos, ou quando o negócio precisa enxergar o processo, a orquestração costuma valer a pena. Para processos longos e complexos, motores de workflow como Temporal ou Camunda assumem o papel do orquestrador.
+
+## Na entrevista
+
+**Quando usar comunicação assíncrona entre serviços?** Quando quem chama não precisa da resposta imediata, quando vários serviços reagem ao mesmo fato, ou quando é preciso absorver picos e tolerar indisponibilidade do consumidor. O preço é consistência eventual e o tratamento de duplicatas e falhas.
+
+**O que é o padrão outbox e que problema resolve?** Gravar o evento numa tabela na mesma transação da mudança de estado e publicá-lo depois por um processo separado. Resolve o dual write: garante que o evento sai se, e somente se, a mudança foi confirmada.
+
+**Saga com coreografia ou orquestração?** Coreografia para fluxos curtos, com poucos participantes, sem coordenador. Orquestração quando o fluxo tem muitos passos, regras de compensação complexas ou precisa ser visível e monitorável.
+
+**Por que retry precisa de jitter?** Sem aleatoriedade, clientes que falharam juntos tentam de novo juntos, criando ondas de carga que impedem a recuperação do serviço. O jitter espalha as tentativas no tempo.
+
+## Pratique
+
+Implemente a saga de compra da loja e entregue:
+
+1. Tabela `outbox` e publicador com `FOR UPDATE SKIP LOCKED` e publisher confirms, no serviço de pedidos.
+2. O orquestrador `SagaCompra` com estado persistido e as compensações de estoque.
+3. Um serviço de estoque simples que reserva e libera, com consumidor idempotente.
+4. Chave de idempotência em `POST /pagamentos`, com teste de duas requisições concorrentes com a mesma chave.
+5. Um teste de integração que força `PagamentoRecusado` e verifica pedido `CANCELADO` e estoque liberado.
+
+<Quiz question="Qual problema o transactional outbox resolve?" options={["A ordem das mensagens no broker","Gravar no banco e publicar no broker de forma consistente","A falta de índices na tabela de pedidos","A serialização de records em JSON"]} answer={1} explanation="O outbox grava o evento na mesma transação da mudança, eliminando o dual write. Um processo separado publica depois, com entrega pelo menos uma vez." />
+
+<Quiz question="Numa saga, o que é uma compensação?" options={["Um rollback automático do banco distribuído","Uma ação que desfaz semanticamente um passo já confirmado","Um retry com backoff exponencial","Um bloqueio que impede passos concorrentes"]} answer={1} explanation="Cada passo já foi confirmado no seu banco. A compensação é uma nova transação de negócio, como estornar ou liberar a reserva." />
+
+<Quiz question="Para quais erros um retry automático faz sentido?" options={["400 e 422","404 e 409","Timeout, 503 e conexão recusada","401 e 403"]} answer={2} explanation="Retry só ajuda em falhas transitórias. Erros do cliente, como validação, recurso inexistente ou falta de permissão, falharão de novo." />
+
+## Base no CodeForge
+
+- [Microsserviços na prática: Mensageria com RabbitMQ](/learn/carreira-java/microsservicos-pratica-mensageria-rabbitmq): a base de filas, DLQ e consumidores idempotentes usada aqui.
+- [Saga](/learn/system-design/saga), [Outbox](/learn/system-design/outbox) e [Idempotência](/learn/system-design/idempotencia): os padrões pela ótica de system design.
+- [Semânticas de entrega](/learn/system-design/semanticas-de-entrega), [Two-phase commit](/learn/system-design/two-phase-commit) e [CDC](/learn/system-design/cdc): por que não existe entrega exatamente uma vez e alternativas ao outbox por polling.
+- [Fundamentos da Arquitetura de Software Moderna](/learn/carreira-java/fundamentos-arquitetura-software-moderna): o monólito modular antes de distribuir.
+
+## Referências
+
+- [Enterprise Integration Patterns](https://www.enterpriseintegrationpatterns.com/)
+- [Microservices.io: Transactional Outbox](https://microservices.io/patterns/data/transactional-outbox.html)
+- [Microservices.io: Saga](https://microservices.io/patterns/data/saga.html)
+- [Spring Integration Reference](https://docs.spring.io/spring-integration/reference/)

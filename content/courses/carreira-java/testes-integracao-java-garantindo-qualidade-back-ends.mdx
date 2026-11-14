@@ -1,0 +1,359 @@
+---
+title: "Testes de Integração em Java: Garantindo qualidade em back-ends modernos"
+kind: lesson
+---
+
+Testes unitários com mocks provam que sua lógica funciona quando todo o resto se comporta como você imaginou. Só que muitos bugs de back-end moram justamente no resto: a query JPQL que o Hibernate traduz de um jeito inesperado, a migração Flyway que quebra no Postgres de verdade, o JSON que o Jackson serializa com outro formato de data, a API externa que responde 500. Testes de integração exercitam essas fronteiras com peças reais. Neste capítulo você testa o serviço de pedidos com `@SpringBootTest`, Postgres e RabbitMQ reais em containers via Testcontainers e `@ServiceConnection`, e simula o serviço de pagamentos com WireMock.
+
+**Você vai aprender:**
+
+- Onde os testes de integração entram na pirâmide e o que eles devem cobrir
+- Subir Postgres e RabbitMQ reais nos testes com Testcontainers e `@ServiceConnection`
+- Usar test slices (`@DataJpaTest`, `@WebMvcTest`) e o contexto completo (`@SpringBootTest`) na hora certa
+- Simular APIs HTTP externas com WireMock, incluindo falhas e lentidão
+- Organizar a suíte para ser rápida, isolada e rodar no `mvn verify`
+
+## O que testar com integração
+
+| Tipo | O que exercita | Velocidade | Exemplo |
+|---|---|---|---|
+| Unitário | Uma classe, dependências falsas | Milissegundos | Cálculo do total do pedido |
+| Slice | Uma camada do Spring com infraestrutura real | Segundos | Query do repositório contra Postgres |
+| Integração completa | A aplicação inteira com banco, broker e HTTP | Segundos a dezenas | `POST /pedidos` até o banco |
+| End-to-end | Vários serviços implantados | Minutos | Fluxo de compra em staging |
+
+A regra prática: lógica de negócio em testes unitários, que são baratos e numerosos; **toda fronteira com o mundo externo** (banco, mensageria, HTTP de entrada e de saída, serialização) em testes de integração, menos numerosos mas que pegam o que o mock esconde.
+
+## Por que não H2
+
+Muita gente testa com H2 em memória porque é rápido. O problema é que H2 não é Postgres: funções, tipos (`jsonb`, `uuid`, `timestamptz`), `ON CONFLICT`, índices parciais e mensagens de erro são diferentes. Você acaba testando que o código funciona no H2, e o bug aparece em produção. Com Testcontainers, o teste roda contra a mesma imagem de banco da produção, e o custo é alguns segundos de inicialização.
+
+## Testcontainers com @ServiceConnection
+
+Dependências de teste no `pom.xml` (as versões vêm do BOM do Spring Boot):
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-testcontainers</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.testcontainers</groupId>
+  <artifactId>junit-jupiter</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.testcontainers</groupId>
+  <artifactId>postgresql</artifactId>
+  <scope>test</scope>
+</dependency>
+<dependency>
+  <groupId>org.testcontainers</groupId>
+  <artifactId>rabbitmq</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+Antes do Spring Boot 3.1 você precisava de `@DynamicPropertySource` para copiar URL, usuário e senha do container para as propriedades `spring.datasource.*`. Com `@ServiceConnection`, o Boot lê os dados de conexão direto do container:
+
+```java
+// pedidos: src/test/java/br/com/loja/pedidos/ContainersConfig.java
+package br.com.loja.pedidos;
+
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.annotation.Bean;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.RabbitMQContainer;
+
+@TestConfiguration(proxyBeanMethods = false)
+public class ContainersConfig {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer<?> postgres() {
+        return new PostgreSQLContainer<>("postgres:16-alpine");
+    }
+
+    @Bean
+    @ServiceConnection
+    RabbitMQContainer rabbit() {
+        return new RabbitMQContainer("rabbitmq:4-management");
+    }
+}
+```
+
+Declarar os containers como beans numa `@TestConfiguration` tem uma vantagem sobre campos `static` com `@Container`: o Spring gerencia o ciclo de vida e, como a configuração é a mesma, o **contexto é reutilizado** entre classes de teste, e os containers sobem uma vez só por execução. Toda classe que importar essa configuração com a mesma combinação de anotações aproveita o mesmo contexto em cache.
+
+O Flyway roda as migrações no container ao subir o contexto, então seu schema de teste é exatamente o de produção.
+
+Se o seu projeto usar Testcontainers 2.x, os artefatos e pacotes dos módulos mudaram de nome (por exemplo, o container do Postgres passou a viver num pacote próprio do módulo). Use os imports que correspondem à versão gerenciada pelo seu Spring Boot.
+
+## Testando o repositório com @DataJpaTest
+
+Para testar só a camada de persistência, use o slice `@DataJpaTest`. Ele sobe JPA, Flyway e o repositório, sem web nem serviços, e cada teste roda numa transação desfeita no final.
+
+```java
+package br.com.loja.pedidos.pedido;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import br.com.loja.pedidos.ContainersConfig;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.context.annotation.Import;
+
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Import(ContainersConfig.class)
+class PedidoRepositoryIT {
+
+    @Autowired PedidoRepository repo;
+
+    @Test
+    void somaFaturamentoSoDosPedidosPagos() {
+        repo.save(PedidoFixtures.pago(new BigDecimal("100.00")));
+        repo.save(PedidoFixtures.pago(new BigDecimal("50.00")));
+        repo.save(PedidoFixtures.recusado(new BigDecimal("999.00")));
+
+        var total = repo.faturamentoDoDia(LocalDate.now());
+
+        assertThat(total).isEqualByComparingTo("150.00");
+    }
+}
+```
+
+O `@AutoConfigureTestDatabase(replace = NONE)` impede que o slice troque seu banco por um embutido. A query `faturamentoDoDia` (com funções de data do Postgres) agora é testada de verdade.
+
+## A aplicação inteira com @SpringBootTest
+
+Para o fluxo completo, suba a aplicação numa porta aleatória e faça requisições HTTP de verdade:
+
+```java
+package br.com.loja.pedidos;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.simple.JdbcClient;
+
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Import(ContainersConfig.class)
+class CriarPedidoIT {
+
+    @Autowired TestRestTemplate http;
+    @Autowired JdbcClient jdbc;
+
+    @Test
+    void criaPedidoEGravaNoBanco() {
+        var corpo = """
+                {"itens":[{"sku":"LIV-001","quantidade":2}],"cartaoToken":"tok_ok"}
+                """;
+        var resposta = http.postForEntity("/pedidos", json(corpo), String.class);
+
+        assertThat(resposta.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+        var quantidade = jdbc.sql("select count(*) from pedidos").query(Long.class).single();
+        assertThat(quantidade).isEqualTo(1);
+    }
+
+    @Test
+    void rejeitaPedidoSemItens() {
+        var resposta = http.postForEntity("/pedidos", json("""
+                {"itens":[],"cartaoToken":"tok_ok"}
+                """), String.class);
+
+        assertThat(resposta.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(resposta.getBody()).contains("itens");
+    }
+
+    private static org.springframework.http.HttpEntity<String> json(String corpo) {
+        var headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+        return new org.springframework.http.HttpEntity<>(corpo, headers);
+    }
+}
+```
+
+Diferente do `@DataJpaTest`, aqui **não há rollback automático**: a requisição roda em outra thread, com sua própria transação. Os dados ficam no banco entre os testes. Limpe o estado antes de cada teste (`@BeforeEach` com `TRUNCATE ... CASCADE`, ou `@Sql` com um script de limpeza) e nunca dependa da ordem de execução.
+
+<Callout type="warning" title="@Transactional no teste de integração HTTP">
+É tentador colocar `@Transactional` na classe de teste para ganhar rollback. Com `RANDOM_PORT` isso não funciona: o servidor atende a requisição em outra thread e outra transação, que já foi confirmada. Pior, em testes com `MockMvc` (mesma thread) o `@Transactional` funciona, mas esconde bugs: a sessão do Hibernate fica aberta e lazy loading que falharia em produção passa no teste. Prefira limpar o banco explicitamente.
+</Callout>
+
+## Testando mensageria
+
+Com o RabbitMQ real do container, você publica e verifica o efeito. Como o processamento é assíncrono, use Awaitility para esperar a condição em vez de `Thread.sleep`:
+
+```java
+@Test
+void atualizaPedidoQuandoPagamentoAprovado() {
+    var pedidoId = criarPedidoAguardandoPagamento();
+
+    rabbit.convertAndSend("loja.eventos", "pagamento.aprovado",
+            new PagamentoProcessado(UUID.randomUUID(), pedidoId, "APROVADO", UUID.randomUUID()));
+
+    await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            assertThat(repo.findById(pedidoId).orElseThrow().getStatus()).isEqualTo(StatusPedido.PAGO));
+}
+```
+
+Esse teste pega erros que mock nenhum mostraria: binding com a routing key errada, conversor JSON que não desserializa o record, fila declarada com argumentos diferentes dos que já existem.
+
+## Simulando o serviço de pagamentos com WireMock
+
+Para a versão HTTP do cliente de pagamentos, você não quer subir o serviço real (ele tem seu próprio banco e suas dependências). O WireMock sobe um servidor HTTP falso, programável, numa porta local.
+
+```xml
+<dependency>
+  <groupId>org.wiremock</groupId>
+  <artifactId>wiremock-standalone</artifactId>
+  <version>3.9.1</version>
+  <scope>test</scope>
+</dependency>
+```
+
+```java
+package br.com.loja.pedidos.pagamento;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.*;
+import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
+import static org.assertj.core.api.Assertions.*;
+
+import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
+import java.math.BigDecimal;
+import java.util.UUID;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+
+@SpringBootTest
+@org.springframework.context.annotation.Import(br.com.loja.pedidos.ContainersConfig.class)
+class PagamentosClientIT {
+
+    @RegisterExtension
+    static WireMockExtension pagamentos = WireMockExtension.newInstance()
+            .options(wireMockConfig().dynamicPort())
+            .build();
+
+    @DynamicPropertySource
+    static void props(DynamicPropertyRegistry registry) {
+        registry.add("pagamentos.url", pagamentos::baseUrl);
+        registry.add("pagamentos.read-timeout", () -> "500ms");
+    }
+
+    @Autowired PagamentosClient client;
+
+    private final PagamentosClient.CobrancaRequest req =
+            new PagamentosClient.CobrancaRequest(UUID.randomUUID(), new BigDecimal("80.00"), "tok_ok");
+
+    @Test
+    void devolveCobrancaAprovada() {
+        pagamentos.stubFor(post("/pagamentos").willReturn(okJson("""
+                {"id":"6f1c2c1e-0000-4000-8000-000000000001","pedidoId":"%s","status":"APROVADO","novoCampo":1}
+                """.formatted(req.pedidoId()))));
+
+        var resposta = client.cobrar(req);
+
+        assertThat(resposta.status()).isEqualTo("APROVADO");
+        pagamentos.verify(postRequestedFor(urlEqualTo("/pagamentos"))
+                .withRequestBody(matchingJsonPath("$.pedidoId", equalTo(req.pedidoId().toString()))));
+    }
+
+    @Test
+    void traduzRecusaEmExcecaoDeDominio() {
+        pagamentos.stubFor(post("/pagamentos").willReturn(aResponse().withStatus(422)));
+
+        assertThatThrownBy(() -> client.cobrar(req)).isInstanceOf(PagamentoRecusadoException.class);
+    }
+
+    @Test
+    void falhaRapidoQuandoServicoDemora() {
+        pagamentos.stubFor(post("/pagamentos").willReturn(okJson("{}").withFixedDelay(2_000)));
+
+        assertThatThrownBy(() -> client.cobrar(req)).isInstanceOf(PagamentoIndisponivelException.class);
+    }
+}
+```
+
+Os três testes cobrem o que importa na fronteira: o contrato (incluindo um campo novo que o cliente deve ignorar), a tradução de erro e o **timeout**, que quase ninguém testa e é a causa de muitos incidentes. O `withFixedDelay` simula o serviço lento; com o read timeout de 500 ms, o cliente precisa desistir e o fallback do circuit breaker entra.
+
+O `@DynamicPropertySource` continua útil para o que não tem `@ServiceConnection`, como a URL de um WireMock.
+
+## Organizando a suíte no Maven
+
+Separe testes unitários e de integração por sufixo. O Surefire roda `*Test` na fase `test`; o Failsafe roda `*IT` na fase `integration-test` e verifica o resultado em `verify`:
+
+```xml
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-failsafe-plugin</artifactId>
+  <executions>
+    <execution>
+      <goals>
+        <goal>integration-test</goal>
+        <goal>verify</goal>
+      </goals>
+    </execution>
+  </executions>
+</plugin>
+```
+
+```bash
+./mvnw test      # só unitários, rápido, para o ciclo de edição
+./mvnw verify    # unitários + integração, o que o CI roda
+```
+
+Para desenvolvimento local, o Spring Boot permite reaproveitar a mesma `ContainersConfig` para rodar a aplicação: crie uma classe `TestPedidosApplication` em `src/test` com `SpringApplication.from(PedidosApplication::main).with(ContainersConfig.class).run(args)` e você sobe o serviço com banco e broker em containers, sem Docker Compose.
+
+## Na entrevista
+
+**Qual a diferença entre teste unitário e de integração?** O unitário isola uma unidade e substitui dependências por dublês; o de integração verifica a colaboração com componentes reais, como banco, broker ou o contexto do Spring. O primeiro dá feedback rápido sobre lógica; o segundo pega erros de configuração, mapeamento e contrato.
+
+**Por que Testcontainers em vez de H2?** Porque testa contra o mesmo banco da produção, com os mesmos tipos, funções e comportamento de SQL. H2 aceita coisas que o Postgres rejeita e vice-versa.
+
+**O que @ServiceConnection faz?** Lê os dados de conexão de um container do Testcontainers e cria os beans de `ConnectionDetails` correspondentes, substituindo a configuração manual com `@DynamicPropertySource`.
+
+**Como testar uma integração com uma API de terceiros?** Com um servidor falso como o WireMock, cobrindo respostas de sucesso, erros, payloads inesperados e lentidão. Contra a API real, só em poucos testes de contrato ou em ambiente de homologação.
+
+## Pratique
+
+No serviço de pedidos, entregue:
+
+1. `ContainersConfig` com Postgres e RabbitMQ e um `@DataJpaTest` cobrindo duas queries personalizadas.
+2. Um `@SpringBootTest` com `RANDOM_PORT` para `POST /pedidos` (sucesso e validação) com limpeza do banco entre testes.
+3. Um teste de mensageria com Awaitility para o evento `pagamento.aprovado`.
+4. Os três testes de WireMock: sucesso, recusa e timeout.
+5. Failsafe configurado e o tempo total de `./mvnw verify` anotado no README.
+
+<Quiz question="O que @ServiceConnection elimina em relação à configuração antiga?" options={["A necessidade de Docker","O @DynamicPropertySource para dados de conexão do container","O uso do Flyway nos testes","A anotação @SpringBootTest"]} answer={1} explanation="O Spring Boot lê host, porta e credenciais do container e cria os ConnectionDetails sozinho, sem copiar propriedades à mão." />
+
+<Quiz question="Por que @Transactional na classe não desfaz os dados num teste com RANDOM_PORT?" options={["Porque o Postgres do container não suporta rollback","Porque a requisição roda em outra thread com sua própria transação","Porque o Flyway confirma as transações","Porque TestRestTemplate desliga transações"]} answer={1} explanation="O servidor embutido atende a chamada em outra thread, que abre e confirma sua própria transação. O rollback do teste não alcança esses dados." />
+
+<Quiz question="Qual teste de WireMock mais provavelmente evita um incidente de produção?" options={["Resposta 200 com todos os campos","Resposta com atraso maior que o read timeout","Resposta 200 com JSON formatado","Resposta com cabeçalho Content-Length"]} answer={1} explanation="Testar lentidão garante que o timeout e o fallback funcionam. Sem isso, um serviço remoto lento pode esgotar as threads da aplicação." />
+
+## Base no CodeForge
+
+- [Boas práticas de programação: Automatizando testes com Java](/learn/carreira-java/boas-praticas-programacao-automatizando-testes-java): JUnit 5, Mockito e testes unitários, a base deste capítulo.
+- [Microsserviços na prática: Mensageria com RabbitMQ](/learn/carreira-java/microsservicos-pratica-mensageria-rabbitmq): o fluxo assíncrono testado aqui.
+- [Node.js: Implementando testes em uma API](/learn/carreira-nodejs/nodejs-implementando-testes-api): o mesmo assunto com outra stack.
+- [Integração Contínua: Pipelines e testes automatizados com GitHub Actions](/learn/carreira-java/integracao-continua-pipelines-testes-automatizados-github-actions): onde esta suíte passa a rodar a cada pull request.
+
+## Referências
+
+- [Spring Boot: Testcontainers](https://docs.spring.io/spring-boot/reference/testing/testcontainers.html)
+- [Testcontainers for Java](https://java.testcontainers.org/)
+- [WireMock: JUnit 5+ Jupiter](https://wiremock.org/docs/junit-jupiter/)
+- [Maven Failsafe Plugin](https://maven.apache.org/surefire/maven-failsafe-plugin/)

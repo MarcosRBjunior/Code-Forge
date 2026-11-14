@@ -1,0 +1,410 @@
+---
+title: "Microsserviços na prática: Implementando com Java e Spring"
+kind: lesson
+---
+
+Decidir que um sistema vira microsserviços é a parte fácil. O trabalho começa quando o serviço de pedidos precisa perguntar ao serviço de pagamentos se a cobrança passou, e de repente uma chamada de método vira uma chamada de rede: pode demorar, pode falhar, pode responder com um formato que mudou ontem. Neste capítulo você implementa dois serviços Spring Boot independentes, `pedidos` e `pagamentos`, faz um chamar o outro por HTTP com `RestClient` (e vê a alternativa com OpenFeign) e coloca timeouts, tratamento de erro e circuit breaker no lugar certo.
+
+**Você vai aprender:**
+
+- Estruturar dois serviços independentes, cada um com seu banco e seu contrato
+- Chamar outro serviço com `RestClient` e com interfaces HTTP declarativas
+- Comparar `RestClient` e OpenFeign e saber quando usar cada um
+- Configurar timeouts, traduzir erros remotos e proteger a chamada com Resilience4j
+- Subir tudo junto com Docker Compose para desenvolver localmente
+
+## O sistema que vamos construir
+
+A loja tem dois serviços:
+
+| Serviço | Porta local | Responsabilidade | Banco |
+|---|---|---|---|
+| `pedidos` | 8080 | Criar pedidos, calcular total, acompanhar status | `pedidos_db` |
+| `pagamentos` | 8081 | Cobrar o cliente e registrar a transação | `pagamentos_db` |
+
+O fluxo deste capítulo é síncrono: o cliente faz `POST /pedidos`, o serviço de pedidos grava o pedido como `AGUARDANDO_PAGAMENTO`, chama `POST /pagamentos` e, conforme a resposta, marca o pedido como `PAGO` ou `RECUSADO`. Nos próximos capítulos esse mesmo sistema vai para a AWS e depois troca parte da comunicação por mensagens.
+
+Duas regras valem desde já. Cada serviço tem **seu próprio banco**: o serviço de pedidos nunca faz `SELECT` na tabela de pagamentos. E cada serviço tem **seu próprio repositório de build** (ou pelo menos seu próprio módulo Maven com versão independente), para poder ser publicado sem esperar o outro.
+
+## Projeto de cada serviço
+
+Gere os dois projetos no Spring Initializr com Java 21, Maven e as dependências `web`, `validation`, `data-jpa`, `postgresql`, `flyway` e `actuator`. A estrutura do serviço de pedidos fica assim:
+
+```text
+pedidos/
+  pom.xml
+  src/main/java/br/com/loja/pedidos/
+    PedidosApplication.java
+    pedido/          # entidade, repositório, serviço, controller
+    pagamento/       # cliente HTTP para o serviço de pagamentos
+  src/main/resources/
+    application.yml
+    db/migration/V1__cria_pedidos.sql
+```
+
+Organize por funcionalidade (`pedido`, `pagamento`), não por camada técnica (`controllers`, `services`). Quando o serviço crescer, cada pacote continua coeso.
+
+O serviço de pagamentos expõe um endpoint simples. O contrato é o que importa aqui:
+
+```java
+// pagamentos: br.com.loja.pagamentos.PagamentoController
+package br.com.loja.pagamentos;
+
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+import java.math.BigDecimal;
+import java.util.UUID;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/pagamentos")
+class PagamentoController {
+
+    record NovoPagamento(@NotNull UUID pedidoId, @NotNull @Positive BigDecimal valor, @NotNull String cartaoToken) {}
+    record PagamentoCriado(UUID id, UUID pedidoId, String status) {}
+
+    private final PagamentoService service;
+
+    PagamentoController(PagamentoService service) {
+        this.service = service;
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    PagamentoCriado criar(@RequestBody @Valid NovoPagamento req) {
+        var pagamento = service.cobrar(req.pedidoId(), req.valor(), req.cartaoToken());
+        return new PagamentoCriado(pagamento.getId(), pagamento.getPedidoId(), pagamento.getStatus().name());
+    }
+}
+```
+
+Note que o serviço de pagamentos não sabe nada de itens, produtos ou clientes. Ele recebe o mínimo para cobrar. Contratos pequenos mudam menos e acoplam menos.
+
+## Chamando outro serviço com RestClient
+
+O `RestClient`, presente desde o Spring Framework 6.1 (Spring Boot 3.2), é a API síncrona atual para HTTP. Ele substitui o `RestTemplate` em código novo e tem a mesma interface fluente do `WebClient`, sem exigir programação reativa.
+
+Comece pela configuração. O endereço do outro serviço vem de propriedade, nunca fixo no código:
+
+```yaml
+# pedidos: application.yml
+spring:
+  application:
+    name: pedidos
+  datasource:
+    url: jdbc:postgresql://localhost:5432/pedidos_db
+    username: pedidos
+    password: pedidos
+
+pagamentos:
+  url: http://localhost:8081
+  connect-timeout: 2s
+  read-timeout: 3s
+```
+
+```java
+// pedidos: br.com.loja.pedidos.pagamento.PagamentosConfig
+package br.com.loja.pedidos.pagamento;
+
+import java.time.Duration;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.web.client.RestClient;
+
+@Configuration
+class PagamentosConfig {
+
+    @Bean
+    RestClient pagamentosRestClient(RestClient.Builder builder,
+                                    @Value("${pagamentos.url}") String url,
+                                    @Value("${pagamentos.connect-timeout}") Duration connectTimeout,
+                                    @Value("${pagamentos.read-timeout}") Duration readTimeout) {
+        var factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(connectTimeout);
+        factory.setReadTimeout(readTimeout);
+        return builder
+                .baseUrl(url)
+                .requestFactory(factory)
+                .defaultHeader("Accept", "application/json")
+                .build();
+    }
+}
+```
+
+Injete o `RestClient.Builder` que o Spring Boot já configura, em vez de usar `RestClient.create()`. O builder do Boot vem com os conversores de JSON e com a instrumentação do Micrometer (métricas e propagação de trace), que você vai querer em produção.
+
+Agora o cliente propriamente dito, que esconde o HTTP do resto do serviço:
+
+```java
+// pedidos: br.com.loja.pedidos.pagamento.PagamentosClient
+package br.com.loja.pedidos.pagamento;
+
+import java.math.BigDecimal;
+import java.util.UUID;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+
+@Component
+public class PagamentosClient {
+
+    public record CobrancaRequest(UUID pedidoId, BigDecimal valor, String cartaoToken) {}
+    public record CobrancaResponse(UUID id, UUID pedidoId, String status) {}
+
+    private final RestClient http;
+
+    PagamentosClient(RestClient pagamentosRestClient) {
+        this.http = pagamentosRestClient;
+    }
+
+    public CobrancaResponse cobrar(CobrancaRequest req) {
+        return http.post()
+                .uri("/pagamentos")
+                .body(req)
+                .retrieve()
+                .onStatus(HttpStatusCode::is4xxClientError, (request, response) -> {
+                    throw new PagamentoRecusadoException("Pagamento recusado: HTTP " + response.getStatusCode().value());
+                })
+                .body(CobrancaResponse.class);
+    }
+}
+```
+
+Repare que `CobrancaResponse` é um record **do serviço de pedidos**, não uma classe importada do projeto de pagamentos. Cada lado tem sua cópia do contrato. Compartilhar um jar de DTOs entre serviços parece economia, mas cria um acoplamento de build: mudar um campo obriga a republicar todos os consumidores ao mesmo tempo. O Jackson ignora campos desconhecidos por padrão no Spring Boot, então o serviço de pagamentos pode acrescentar campos sem quebrar ninguém.
+
+O `onStatus` traduz erros 4xx (o pagamento foi recusado, a requisição estava errada) numa exceção de domínio. Erros 5xx e falhas de rede continuam como `RestClientException`, e é com eles que o circuit breaker vai lidar.
+
+## Interfaces HTTP declarativas
+
+Se você prefere declarar o contrato como interface, o Spring tem as HTTP interfaces, que funcionam sobre o próprio `RestClient`:
+
+```java
+package br.com.loja.pedidos.pagamento;
+
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.service.annotation.HttpExchange;
+import org.springframework.web.service.annotation.PostExchange;
+
+@HttpExchange("/pagamentos")
+public interface PagamentosApi {
+
+    @PostExchange
+    PagamentosClient.CobrancaResponse cobrar(@RequestBody PagamentosClient.CobrancaRequest req);
+}
+```
+
+```java
+@Bean
+PagamentosApi pagamentosApi(RestClient pagamentosRestClient) {
+    var adapter = org.springframework.web.client.support.RestClientAdapter.create(pagamentosRestClient);
+    var factory = org.springframework.web.service.invoker.HttpServiceProxyFactory.builderFor(adapter).build();
+    return factory.createClient(PagamentosApi.class);
+}
+```
+
+O Spring gera a implementação em tempo de execução. Timeouts e tratamento de status continuam vindo do `RestClient` que você passou para o adapter.
+
+## E o OpenFeign?
+
+O OpenFeign, do Spring Cloud, foi por anos a forma padrão de fazer exatamente isso: uma interface anotada que vira cliente HTTP.
+
+```xml
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-starter-openfeign</artifactId>
+</dependency>
+```
+
+```java
+@SpringBootApplication
+@EnableFeignClients
+public class PedidosApplication { /* main */ }
+
+@FeignClient(name = "pagamentos", url = "${pagamentos.url}")
+interface PagamentosFeign {
+
+    @PostMapping("/pagamentos")
+    PagamentosClient.CobrancaResponse cobrar(@RequestBody PagamentosClient.CobrancaRequest req);
+}
+```
+
+Ele exige o BOM do Spring Cloud no `pom.xml` (na seção `dependencyManagement`) e usa as anotações do Spring MVC (`@PostMapping`) em vez de `@PostExchange`. O próprio time do Spring Cloud considera o projeto em modo de manutenção e recomenda as HTTP interfaces para código novo. Na prática:
+
+| Critério | RestClient / HTTP interfaces | OpenFeign |
+|---|---|---|
+| Dependência extra | Nenhuma, vem no Spring Web | Spring Cloud e seu BOM |
+| Estilo | Fluente ou interface | Interface |
+| Situação | Recomendado para código novo | Manutenção, muito presente em código legado |
+| Integração com service discovery | Via `@LoadBalanced` no builder | Nativa com Spring Cloud LoadBalancer |
+
+Você vai encontrar Feign em muitos projetos existentes, então vale saber ler. Para o serviço novo, use `RestClient`.
+
+## O serviço de pedidos usando o cliente
+
+```java
+// pedidos: br.com.loja.pedidos.pedido.PedidoService
+package br.com.loja.pedidos.pedido;
+
+import br.com.loja.pedidos.pagamento.PagamentoRecusadoException;
+import br.com.loja.pedidos.pagamento.PagamentosClient;
+import br.com.loja.pedidos.pagamento.PagamentosClient.CobrancaRequest;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class PedidoService {
+
+    private final PedidoRepository repo;
+    private final PagamentosClient pagamentos;
+
+    PedidoService(PedidoRepository repo, PagamentosClient pagamentos) {
+        this.repo = repo;
+        this.pagamentos = pagamentos;
+    }
+
+    public Pedido criar(NovoPedido dados) {
+        var pedido = repo.save(Pedido.aguardandoPagamento(dados));   // transação curta, só o insert
+        try {
+            var cobranca = pagamentos.cobrar(new CobrancaRequest(pedido.getId(), pedido.getTotal(), dados.cartaoToken()));
+            pedido.marcarPago(cobranca.id());
+        } catch (PagamentoRecusadoException e) {
+            pedido.marcarRecusado();
+        }
+        return repo.save(pedido);
+    }
+}
+```
+
+O método **não** é `@Transactional` inteiro de propósito. Se fosse, a conexão com o banco ficaria presa durante toda a chamada HTTP. Com o serviço de pagamentos lento, o pool de conexões esgota e o serviço de pedidos cai junto. Chamada remota não entra em transação de banco.
+
+<Callout type="warning" title="Chamada remota sem timeout">
+O erro mais comum em microsserviços Java é deixar o cliente HTTP com os timeouts padrão. Em vários clientes o padrão é infinito: se o serviço de pagamentos travar, cada requisição de pedido fica presa numa thread para sempre, o pool do Tomcat esgota e o serviço de pedidos para de responder até para o health check. Configure sempre connect timeout e read timeout, com valores baseados na latência real (algo como o p99 do outro serviço com folga), e meça.
+</Callout>
+
+## Resiliência com Resilience4j
+
+Timeout resolve a espera infinita, mas não evita que você continue batendo num serviço que já está fora. O **circuit breaker** conta falhas recentes e, acima de um limite, para de chamar por um tempo, respondendo na hora com um fallback.
+
+```xml
+<dependency>
+  <groupId>io.github.resilience4j</groupId>
+  <artifactId>resilience4j-spring-boot3</artifactId>
+  <version>2.3.0</version>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-aop</artifactId>
+</dependency>
+```
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      pagamentos:
+        sliding-window-size: 20
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        ignore-exceptions:
+          - br.com.loja.pedidos.pagamento.PagamentoRecusadoException
+  retry:
+    instances:
+      pagamentos:
+        max-attempts: 2
+        wait-duration: 300ms
+        retry-exceptions:
+          - org.springframework.web.client.ResourceAccessException
+```
+
+```java
+@CircuitBreaker(name = "pagamentos", fallbackMethod = "pagamentoIndisponivel")
+@Retry(name = "pagamentos")
+public CobrancaResponse cobrar(CobrancaRequest req) {
+    // mesmo corpo de antes
+}
+
+private CobrancaResponse pagamentoIndisponivel(CobrancaRequest req, Throwable causa) {
+    throw new PagamentoIndisponivelException("Serviço de pagamentos indisponível", causa);
+}
+```
+
+Três detalhes de configuração fazem diferença. A recusa de pagamento (4xx) entra em `ignore-exceptions`: o serviço está saudável, só disse não. O retry só repete `ResourceAccessException` (falha de rede ou timeout), nunca 4xx. E repetir uma cobrança é perigoso: se a primeira chegou e só a resposta se perdeu, a segunda cobra de novo. Por isso o serviço de pagamentos precisa aceitar uma chave de idempotência, como o `pedidoId`, e devolver o mesmo resultado se receber a mesma cobrança duas vezes. O capítulo de mensageria volta a esse ponto.
+
+No controller, traduza `PagamentoIndisponivelException` para `503 Service Unavailable` num `@RestControllerAdvice`, para o cliente saber que pode tentar mais tarde.
+
+## Rodando tudo junto com Docker Compose
+
+```yaml
+# compose.yaml na raiz
+services:
+  pedidos-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: pedidos_db, POSTGRES_USER: pedidos, POSTGRES_PASSWORD: pedidos }
+  pagamentos-db:
+    image: postgres:16-alpine
+    environment: { POSTGRES_DB: pagamentos_db, POSTGRES_USER: pagamentos, POSTGRES_PASSWORD: pagamentos }
+  pagamentos:
+    build: ./pagamentos
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://pagamentos-db:5432/pagamentos_db
+    depends_on: [pagamentos-db]
+  pedidos:
+    build: ./pedidos
+    ports: ["8080:8080"]
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://pedidos-db:5432/pedidos_db
+      PAGAMENTOS_URL: http://pagamentos:8080
+    depends_on: [pedidos-db, pagamentos]
+```
+
+```bash
+docker compose up --build
+curl -s -X POST localhost:8080/pedidos -H 'Content-Type: application/json' \
+  -d '{"itens":[{"sku":"LIV-001","quantidade":2}],"cartaoToken":"tok_ok"}'
+```
+
+Dentro da rede do Compose, o serviço de pedidos encontra o de pagamentos pelo nome `pagamentos`, e cada container escuta na 8080 (a porta 8081 da tabela vale só quando você roda pagamentos direto na sua máquina, com `server.port: 8081`). A variável `PAGAMENTOS_URL` sobrescreve `pagamentos.url` pelo relaxed binding do Spring Boot. Teste a resiliência derrubando o serviço de pagamentos com `docker compose stop pagamentos` e observando o circuito abrir em `/actuator/circuitbreakers` (exponha o endpoint em `management.endpoints.web.exposure.include`).
+
+## Na entrevista
+
+**Por que cada microsserviço deve ter seu próprio banco?** Porque banco compartilhado vira um contrato escondido: qualquer mudança de schema afeta todos os serviços, que deixam de ser implantáveis de forma independente. Cada serviço expõe os dados por API ou eventos.
+
+**RestTemplate, RestClient, WebClient ou Feign?** `RestClient` para chamadas síncronas em código novo; `WebClient` quando a aplicação é reativa; `RestTemplate` só em legado (está em manutenção); Feign é comum em projetos existentes, mas as HTTP interfaces do Spring cobrem o mesmo caso sem Spring Cloud.
+
+**Para que serve o circuit breaker se já existe timeout?** O timeout limita quanto cada chamada espera. O circuit breaker evita fazer chamadas que quase certamente vão falhar, liberando recursos e dando tempo para o serviço remoto se recuperar.
+
+**Retry é sempre seguro?** Não. Só é seguro em operações idempotentes ou quando o servidor deduplica por uma chave. Repetir uma cobrança sem idempotência pode cobrar duas vezes.
+
+## Pratique
+
+Implemente os serviços `pedidos` e `pagamentos` e entregue:
+
+1. `POST /pedidos` que grava o pedido, chama pagamentos com `RestClient` e responde com o status final.
+2. Timeouts configuráveis por propriedade e um teste manual mostrando o erro quando o serviço de pagamentos dorme mais que o read timeout (coloque um `Thread.sleep` controlado por propriedade).
+3. Circuit breaker com fallback que leva a `503`, ignorando recusas de pagamento.
+4. Um `compose.yaml` que sobe os dois serviços e os dois bancos.
+5. Um README com o diagrama do fluxo e a justificativa de não usar `@Transactional` no método que faz a chamada remota.
+
+<Quiz question="Por que o método que chama o serviço de pagamentos não deve ser inteiro @Transactional?" options={["Porque o RestClient não funciona dentro de transações","Porque a conexão do banco fica presa durante a chamada HTTP","Porque o Spring proíbe transações em serviços","Porque o JPA não grava entidades com UUID"]} answer={1} explanation="Com a transação aberta, a conexão do pool fica ocupada enquanto a rede responde. Com o serviço remoto lento, o pool esgota e o serviço inteiro para." />
+
+<Quiz question="Qual exceção deve ser ignorada pelo circuit breaker do cliente de pagamentos?" options={["Timeout de leitura","Conexão recusada","Pagamento recusado com HTTP 422","Erro 503 do serviço remoto"]} answer={2} explanation="Uma recusa de negócio mostra que o serviço está saudável. Contar isso como falha abriria o circuito sem motivo." />
+
+<Quiz question="Qual é a forma recomendada de chamar outro serviço de forma síncrona em código Spring novo?" options={["RestTemplate com timeouts padrão","RestClient ou HTTP interfaces sobre ele","HttpURLConnection direto","WebClient com block em todo lugar"]} answer={1} explanation="RestClient é a API síncrona atual do Spring Framework 6.1+, e as HTTP interfaces dão a forma declarativa sem depender do Spring Cloud." />
+
+## Base no CodeForge
+
+- [Microsserviços na prática: Entendendo a tomada de decisões](/learn/carreira-java/microsservicos-pratica-entendendo-tomada-decisoes): quando faz sentido separar serviços.
+- [Microsserviços](/learn/system-design/microsservicos) e [Circuit breaker](/learn/system-design/circuit-breaker): a teoria por trás deste capítulo.
+- [Idempotência](/learn/system-design/idempotencia): por que retry exige deduplicação no servidor.
+- [Microsserviços na prática: IaC com CDK e deploy na AWS](/learn/carreira-java/microsservicos-pratica-iac-cdk-deploy-aws): o próximo passo, levar estes serviços para a nuvem.
+
+## Referências
+
+- [Spring Framework: REST Clients](https://docs.spring.io/spring-framework/reference/integration/rest-clients.html)
+- [Spring Cloud OpenFeign](https://docs.spring.io/spring-cloud-openfeign/reference/)
+- [Resilience4j: CircuitBreaker](https://resilience4j.readme.io/docs/circuitbreaker)

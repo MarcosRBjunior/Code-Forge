@@ -1,0 +1,331 @@
+---
+title: "Java e refatoração: Melhorando códigos com boas práticas"
+kind: lesson
+---
+
+Código que funciona não é o mesmo que código fácil de mudar. Depois de alguns meses de projeto, aparecem métodos de 200 linhas, `if` dentro de `if`, números soltos que ninguém lembra de onde vieram e a mesma regra copiada em três lugares. Cada nova funcionalidade fica mais cara e mais arriscada. Refatorar é mudar a estrutura interna do código **sem mudar o comportamento**, em passos pequenos e seguros, para que a próxima mudança seja barata. Neste capítulo você aprende a reconhecer os sinais de problema (code smells), monta a rede de segurança com testes e aplica as refatorações mais usadas no dia a dia, num exemplo real da API da clínica.
+
+**Você vai aprender:**
+
+- O que é refatorar, e o que não é
+- Reconhecer os code smells mais comuns em código Java
+- Proteger a refatoração com testes de caracterização
+- Aplicar extrair método, renomear, introduzir objeto de valor e trocar condicional por polimorfismo
+- Usar recursos do Java moderno (records, enums, sealed, switch com pattern matching) para simplificar
+
+## O que é refatorar
+
+Martin Fowler define refatoração como uma mudança na estrutura interna do software para torná-lo mais fácil de entender e mais barato de modificar, sem alterar seu comportamento observável. Três consequências práticas:
+
+- **Comportamento igual.** Se você corrige um bug ou adiciona uma regra no meio da refatoração, não está mais refatorando. Faça uma coisa de cada vez, em commits separados.
+- **Passos pequenos.** Cada passo deixa o código compilando e os testes passando. Se algo quebra, você desfaz só o último passo.
+- **Contínuo.** Refatorar não é um projeto de duas semanas no fim do ano. É o que você faz antes de adicionar uma funcionalidade (deixar o terreno pronto) e depois (limpar o que ficou). A regra do escoteiro resume: deixe o código um pouco melhor do que encontrou.
+
+## O código de partida
+
+A clínica cobra consultas de formas diferentes. Este método calcula o valor e cresceu ao longo de vários pedidos do negócio:
+
+```java
+public class CalculadoraConsulta {
+
+    public double calcular(String tipo, String especialidade, int idade,
+                           boolean retorno, String convenio, int diasDesdeUltima) {
+        double v = 0;
+        if (tipo.equals("PARTICULAR")) {
+            if (especialidade.equals("CARDIOLOGIA")) {
+                v = 350;
+            } else if (especialidade.equals("ORTOPEDIA")) {
+                v = 300;
+            } else {
+                v = 250;
+            }
+            if (idade >= 60) {
+                v = v - v * 0.1;
+            }
+            if (retorno && diasDesdeUltima <= 30) {
+                v = 0;
+            }
+        } else if (tipo.equals("CONVENIO")) {
+            if (convenio.equals("SAUDE_MAIS")) {
+                v = 80;
+            } else {
+                v = 60;
+            }
+            if (retorno && diasDesdeUltima <= 30) {
+                v = 0;
+            }
+        }
+        return v;
+    }
+}
+```
+
+Funciona. Mas cada pedido novo ("desconto para criança", "convênio novo", "retorno de 15 dias para ortopedia") vai aumentar o método e o risco de errar.
+
+## Code smells: os sinais
+
+Um code smell não é um bug: é um sintoma de que o design vai dificultar mudanças. O código acima tem vários:
+
+| Smell | Onde aparece | Refatoração típica |
+|---|---|---|
+| Método longo | `calcular` faz tudo | Extrair método |
+| Lista longa de parâmetros | seis parâmetros, metade só vale para um tipo | Introduzir objeto de parâmetro (record) |
+| Obsessão por primitivos | `String tipo`, `String especialidade`, `double` para dinheiro | Enum e objeto de valor |
+| Números mágicos | `350`, `0.1`, `30`, `60` | Constante com nome, ou dado no enum |
+| Código duplicado | regra de retorno repetida nos dois ramos | Extrair método |
+| Condicional por tipo | `if (tipo.equals(...))` decidindo comportamento | Polimorfismo |
+| Nomes ruins | `v`, `calcular` | Renomear |
+
+Outros que você vai encontrar em APIs Java: **classe grande** (um `ConsultaService` com 40 métodos), **inveja de funcionalidade** (um método que só mexe nos dados de outro objeto, sinal de que deveria estar lá), **classe de dados anêmica** com toda a lógica espalhada em serviços, e **comentário explicando código confuso** (em vez de explicar, renomeie e extraia até o código se explicar).
+
+## Antes de mexer: a rede de segurança
+
+Você só refatora com confiança se sabe que o comportamento não mudou. Se o código não tem testes, escreva primeiro **testes de caracterização**: testes que registram o que o código faz hoje, mesmo que pareça estranho.
+
+```java
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class CalculadoraConsultaCaracterizacaoTest {
+
+    private final CalculadoraConsulta calculadora = new CalculadoraConsulta();
+
+    @ParameterizedTest
+    @CsvSource({
+        // tipo, especialidade, idade, retorno, convenio, dias, esperado
+        "PARTICULAR, CARDIOLOGIA, 40, false, -,          0,  350.0",
+        "PARTICULAR, ORTOPEDIA,   65, false, -,          0,  270.0",
+        "PARTICULAR, PEDIATRIA,   10, false, -,          0,  250.0",
+        "PARTICULAR, CARDIOLOGIA, 40, true,  -,          20, 0.0",
+        "PARTICULAR, CARDIOLOGIA, 40, true,  -,          45, 350.0",
+        "CONVENIO,   CARDIOLOGIA, 40, false, SAUDE_MAIS, 0,  80.0",
+        "CONVENIO,   CARDIOLOGIA, 40, false, OUTRO,      0,  60.0",
+        "CONVENIO,   CARDIOLOGIA, 40, true,  SAUDE_MAIS, 10, 0.0"
+    })
+    void registraComportamentoAtual(String tipo, String esp, int idade, boolean retorno,
+                                    String convenio, int dias, double esperado) {
+        assertThat(calculadora.calcular(tipo, esp, idade, retorno, convenio, dias))
+                .isEqualTo(esperado);
+    }
+}
+```
+
+Cubra cada ramo do código. Uma ferramenta de cobertura (JaCoCo, ou a cobertura do IntelliJ) mostra quais linhas os testes ainda não exercitam. Com tudo verde, comece.
+
+## Passo 1: renomear e extrair
+
+As refatorações mais simples são as mais usadas. A IDE faz as duas sem risco: no IntelliJ, `Shift+F6` renomeia e `Ctrl+Alt+M` extrai método (`Cmd+Option+M` no macOS). Use os atalhos em vez de editar na mão: a IDE atualiza todas as referências.
+
+```java
+public double calcularValor(String tipo, String especialidade, int idade,
+                            boolean retorno, String convenio, int diasDesdeUltima) {
+    if (ehRetornoGratuito(retorno, diasDesdeUltima)) {
+        return 0;
+    }
+    return switch (tipo) {
+        case "PARTICULAR" -> valorParticular(especialidade, idade);
+        case "CONVENIO" -> valorConvenio(convenio);
+        default -> 0;
+    };
+}
+
+private static final int PRAZO_RETORNO_DIAS = 30;
+private static final int IDADE_IDOSO = 60;
+private static final double DESCONTO_IDOSO = 0.10;
+
+private boolean ehRetornoGratuito(boolean retorno, int diasDesdeUltima) {
+    return retorno && diasDesdeUltima <= PRAZO_RETORNO_DIAS;
+}
+
+private double valorParticular(String especialidade, int idade) {
+    double base = switch (especialidade) {
+        case "CARDIOLOGIA" -> 350;
+        case "ORTOPEDIA" -> 300;
+        default -> 250;
+    };
+    return idade >= IDADE_IDOSO ? base * (1 - DESCONTO_IDOSO) : base;
+}
+
+private double valorConvenio(String convenio) {
+    return "SAUDE_MAIS".equals(convenio) ? 80 : 60;
+}
+```
+
+Repare no que mudou: a regra de retorno aparece uma vez só (fim da duplicação), cada método faz uma coisa, e os números ganharam nome. Rode os testes. Verdes? Commit.
+
+Um detalhe: o retorno antecipado (guard clause) no topo eliminou um nível de aninhamento. É uma das refatorações mais baratas e que mais melhoram a leitura.
+
+## Passo 2: tipos no lugar de strings
+
+`String tipo` aceita `"particular"`, `"PARTICULR"` e qualquer outra coisa, e o erro só aparece em produção. Um enum faz o compilador trabalhar por você, e pode carregar os dados que hoje estão espalhados:
+
+```java
+public enum Especialidade {
+    CARDIOLOGIA(new BigDecimal("350.00")),
+    ORTOPEDIA(new BigDecimal("300.00")),
+    PEDIATRIA(new BigDecimal("250.00")),
+    DERMATOLOGIA(new BigDecimal("250.00"));
+
+    private final BigDecimal valorParticular;
+
+    Especialidade(BigDecimal valorParticular) {
+        this.valorParticular = valorParticular;
+    }
+
+    public BigDecimal valorParticular() {
+        return valorParticular;
+    }
+}
+```
+
+E dinheiro em `double` é outro smell, este com bug real: `0.1 + 0.2` dá `0.30000000000000004`. Para valores monetários, use `BigDecimal` criado a partir de `String` e arredonde explicitamente.
+
+Os seis parâmetros também viram um objeto (introduzir objeto de parâmetro). Um record é perfeito para isso:
+
+```java
+public record Atendimento(Especialidade especialidade, int idadePaciente,
+                          boolean retorno, int diasDesdeUltimaConsulta) {
+
+    private static final int PRAZO_RETORNO_DIAS = 30;
+
+    public boolean retornoGratuito() {
+        return retorno && diasDesdeUltimaConsulta <= PRAZO_RETORNO_DIAS;
+    }
+
+    public boolean pacienteIdoso() {
+        return idadePaciente >= 60;
+    }
+}
+```
+
+O método `retornoGratuito` mudou de lugar: ele só usava dados do atendimento, então foi morar junto deles. Isso é **mover método**, a cura da inveja de funcionalidade.
+
+## Passo 3: trocar condicional por polimorfismo
+
+O `switch (tipo)` decide comportamento. Cada forma de pagamento nova exige abrir a calculadora e mexer nele, o que fere o princípio aberto/fechado. Em Java moderno, uma interface selada com records resolve de forma enxuta:
+
+```java
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+
+public sealed interface FormaDePagamento permits Particular, Convenio {
+    BigDecimal valor(Atendimento atendimento);
+}
+
+public record Particular() implements FormaDePagamento {
+    private static final BigDecimal DESCONTO_IDOSO = new BigDecimal("0.90");
+
+    @Override
+    public BigDecimal valor(Atendimento a) {
+        var base = a.especialidade().valorParticular();
+        var valor = a.pacienteIdoso() ? base.multiply(DESCONTO_IDOSO) : base;
+        return valor.setScale(2, RoundingMode.HALF_EVEN);
+    }
+}
+
+public record Convenio(String nome, BigDecimal valorRepasse) implements FormaDePagamento {
+    @Override
+    public BigDecimal valor(Atendimento a) {
+        return valorRepasse;
+    }
+}
+```
+
+A calculadora encolhe para o que ela realmente decide:
+
+```java
+public class CalculadoraConsulta {
+
+    public BigDecimal calcular(Atendimento atendimento, FormaDePagamento pagamento) {
+        if (atendimento.retornoGratuito()) {
+            return BigDecimal.ZERO;
+        }
+        return pagamento.valor(atendimento);
+    }
+}
+```
+
+Como a interface é `sealed`, quando você precisar decidir algo fora dela (por exemplo, o texto do recibo), o `switch` com pattern matching é exaustivo e o compilador aponta os casos esquecidos:
+
+```java
+static String descricaoRecibo(FormaDePagamento pagamento) {
+    return switch (pagamento) {
+        case Particular p -> "Consulta particular";
+        case Convenio(String nome, BigDecimal repasse) -> "Convênio " + nome;
+    };
+}
+```
+
+O segundo caso usa um **record pattern** (Java 21): desestrutura o record direto no `case`.
+
+Agora os testes de caracterização precisam ser adaptados para a nova assinatura. Mantenha os mesmos casos e os mesmos valores esperados: é isso que garante que o comportamento não mudou.
+
+<Callout type="warning" title="Refatorar sem testes, ou tudo de uma vez">
+O jeito mais comum de transformar refatoração em incidente é reescrever o método inteiro de uma vez, sem testes, e misturar a mudança de estrutura com uma regra nova. Quando algo quebra, ninguém sabe se foi a estrutura ou a regra. Escreva os testes antes, dê passos pequenos, rode os testes a cada passo e faça commits separados: "refactor: extrai regra de retorno" e "feat: desconto para crianças" nunca no mesmo commit.
+</Callout>
+
+## Quando parar
+
+Refatoração também tem excesso. Interfaces com uma única implementação "para o futuro", fábricas de fábricas e cinco camadas de abstração para um CRUD são o smell oposto (generalidade especulativa). Pare quando:
+
+- O código expressa a regra de negócio de forma que outra pessoa entende sem você explicar.
+- A próxima mudança prevista cabe num lugar só.
+- Mais abstração tornaria o código mais difícil de ler, e não mais fácil de mudar.
+
+Os princípios KISS e YAGNI existem para equilibrar o DRY: duplicação de duas linhas às vezes é mais barata que a abstração errada.
+
+## Refatorações de todo dia
+
+Um catálogo mínimo, que cobre a maior parte do que você vai fazer:
+
+| Refatoração | Quando | Atalho IntelliJ |
+|---|---|---|
+| Renomear | Nome não diz o que a coisa é | `Shift+F6` |
+| Extrair método | Bloco com um propósito claro dentro de método longo | `Ctrl+Alt+M` |
+| Extrair variável | Expressão complexa sem nome | `Ctrl+Alt+V` |
+| Extrair constante | Número ou texto mágico | `Ctrl+Alt+C` |
+| Inline | Abstração que não ajuda mais | `Ctrl+Alt+N` |
+| Mover método | Método usa mais dados de outra classe | `F6` |
+| Introduzir objeto de parâmetro | Grupos de parâmetros que andam juntos | menu Refactor |
+| Trocar condicional por polimorfismo | `switch` ou `if` por tipo decidindo comportamento | manual |
+
+## Na entrevista
+
+**O que é refatoração?** Mudar a estrutura interna do código sem mudar seu comportamento observável, em passos pequenos e verificáveis, para facilitar mudanças futuras. Correção de bug e funcionalidade nova não são refatoração.
+
+**Cite três code smells e como tratá-los.** Método longo (extrair método), código duplicado (extrair e reutilizar), condicional por tipo (polimorfismo ou interface selada com pattern matching). Outros bons exemplos: obsessão por primitivos e lista longa de parâmetros.
+
+**Como refatorar código legado sem testes?** Primeiro escrever testes de caracterização que registram o comportamento atual, cobrindo os ramos principais. Depois refatorar em passos pequenos, rodando os testes a cada passo.
+
+**Por que não usar double para dinheiro?** Porque ponto flutuante binário não representa frações decimais com exatidão, e os erros de arredondamento se acumulam. `BigDecimal` com escala e modo de arredondamento explícitos resolve.
+
+## Pratique
+
+Pegue o `CalculadoraConsulta` original deste capítulo (ou um método longo do seu próprio projeto) e entregue:
+
+1. Testes de caracterização parametrizados cobrindo todos os ramos, rodando verdes contra o código original.
+2. A sequência de refatorações, um commit por passo: renomear e extrair, enum e `BigDecimal`, record `Atendimento`, interface selada `FormaDePagamento`.
+3. Depois de tudo verde, uma funcionalidade nova em commit separado: desconto de 15% para pacientes com menos de 12 anos no particular. Conte quantos arquivos você precisou mexer e compare com o que seria no código original.
+
+<Quiz question="Qual destas mudanças NÃO é refatoração?" options={["Extrair um bloco para um método com nome claro","Trocar uma String por um enum mantendo as regras","Corrigir o cálculo de desconto que estava errado","Mover um método para a classe cujos dados ele usa"]} answer={2} explanation="Corrigir um bug muda o comportamento observável. Refatoração mantém o comportamento e muda só a estrutura." />
+
+<Quiz question="Antes de refatorar um método legado sem testes, o primeiro passo é:" options={["Reescrever o método do zero com boas práticas","Escrever testes de caracterização do comportamento atual","Adicionar comentários explicando cada linha","Converter tudo para interfaces"]} answer={1} explanation="Testes de caracterização registram o que o código faz hoje e avisam se a refatoração mudou o comportamento sem querer." />
+
+<Quiz question="Qual a vantagem de uma sealed interface com records em vez de um switch sobre String?" options={["Executa mais rápido em qualquer caso","Dispensa testes unitários","O compilador garante que todos os tipos foram tratados","Permite herança múltipla de classes"]} answer={2} explanation="Com hierarquia selada, o switch com pattern matching é exaustivo: adicionar um tipo novo sem tratá-lo gera erro de compilação." />
+
+## Base no CodeForge
+
+- [Código limpo](/learn/lld/codigo-limpo): nomes, funções pequenas e comentários.
+- [SRP](/learn/lld/srp) e [OCP](/learn/lld/ocp): os princípios por trás de extrair responsabilidades e trocar condicional por polimorfismo.
+- [Strategy](/learn/lld/strategy): o padrão que a `FormaDePagamento` aplica.
+- [DRY](/learn/lld/dry), [KISS](/learn/lld/kiss) e [YAGNI](/learn/lld/yagni): quando abstrair e quando parar.
+- [Records e enums](/learn/java/records-e-enums): os recursos da linguagem usados aqui.
+- [Boas práticas de programação: Automatizando testes com Java](/learn/carreira-java/boas-praticas-programacao-automatizando-testes-java): a rede de segurança em detalhe.
+
+## Referências
+
+- [Refactoring.com: Catalog of Refactorings](https://refactoring.com/catalog/)
+- [Refactoring Guru: Code Smells](https://refactoring.guru/refactoring/smells)
+- [Oracle: Pattern Matching (Java 21)](https://docs.oracle.com/en/java/javase/21/language/pattern-matching.html)

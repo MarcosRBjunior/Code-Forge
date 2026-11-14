@@ -1,0 +1,272 @@
+---
+title: "Microsserviços na prática: Entendendo a tomada de decisões"
+kind: lesson
+---
+
+"Vamos migrar para microsserviços" é uma das frases mais caras que um time pode dizer. Às vezes ela resolve um problema real de escala organizacional; muitas vezes troca um monólito bagunçado por um sistema distribuído bagunçado, mais lento, mais difícil de depurar e com uma conta de nuvem maior. Este capítulo não ensina a criar um microsserviço (isso vem no próximo). Ele ensina a decidir: quando a arquitetura vale o custo, como desenhar fronteiras que fazem sentido, o que fazer com os dados e quais custos operacionais chegam junto. O exemplo continua sendo a clínica.
+
+**Você vai aprender:**
+
+- O que microsserviços resolvem de verdade e o que eles custam
+- Um roteiro de perguntas para decidir entre monólito, monólito modular e microsserviços
+- Como encontrar fronteiras com bounded contexts do Domain-Driven Design
+- Construir um monólito modular em Spring e verificar suas fronteiras com Spring Modulith
+- Por que cada serviço tem o próprio banco, e como lidar com as consequências
+
+## O que é, e o que não é
+
+Um microsserviço é uma unidade de software que pode ser **implantada de forma independente**, é dona dos próprios dados e cobre uma capacidade de negócio. O critério que importa é o primeiro: se para publicar uma mudança no serviço de agendamento você precisa publicar também o de faturamento ao mesmo tempo, eles não são independentes, não importa quantos repositórios existam.
+
+Microsserviço não é sobre tamanho de código ("serviços pequenos"), nem sobre tecnologia (Docker e Kubernetes não fazem microsserviços), nem sobre ter muitos repositórios. É uma decisão sobre **fronteiras e autonomia**.
+
+## O que se ganha
+
+| Benefício | Quando ele é real |
+|---|---|
+| Deploy independente | Vários times mudando partes diferentes, travando uns aos outros no release do monólito |
+| Escala independente | Uma parte tem carga muito diferente das outras (busca de horários recebe 50 vezes mais tráfego que o cadastro) |
+| Isolamento de falhas | Uma parte pode cair sem derrubar as essenciais, e há resiliência projetada (timeouts, circuit breakers, filas) |
+| Autonomia de times | Cada time é dono de um serviço de ponta a ponta, do código ao plantão |
+| Liberdade tecnológica | Uma parte precisa mesmo de outra stack (um modelo de IA em Python, por exemplo) |
+
+Repare que quase todos os benefícios são **organizacionais**. A Lei de Conway diz que sistemas espelham a estrutura de comunicação de quem os constrói. Microsserviços funcionam quando há times que precisam trabalhar sem se coordenar o tempo todo. Com um time de cinco pessoas, a coordenação já é barata, e o ganho quase desaparece.
+
+## O que se paga
+
+Cada chamada que era uma invocação de método vira uma chamada de rede. Isso traz uma lista de problemas que o monólito simplesmente não tem:
+
+- **Latência e falha parcial.** Chamadas de rede demoram milissegundos, não nanossegundos, e falham de jeitos novos: timeout, resposta lenta, serviço reiniciando. Cada chamada precisa de timeout, retentativa com cuidado (idempotência) e plano para quando o outro lado não responde.
+- **Consistência.** Não há mais uma transação de banco cobrindo "agendar consulta e reservar cobrança". Você passa a lidar com consistência eventual, sagas e compensações.
+- **Observabilidade.** Um erro atravessa três serviços. Sem logs centralizados, métricas por serviço e tracing distribuído com ID de correlação, achar a causa vira arqueologia.
+- **Testes.** Testar o fluxo inteiro exige subir vários serviços. Contratos entre serviços precisam de testes próprios, ou uma mudança inocente quebra o consumidor em produção.
+- **Operação.** Um pipeline de CI/CD por serviço, versões, configuração, segredos, descoberta de serviços, gateway, alertas e plantão para cada um. Isso é trabalho contínuo, não uma configuração única.
+- **Custo de infraestrutura.** Cada serviço tem instâncias mínimas, banco, logs e réplicas. Dez serviços ociosos custam bem mais que um monólito ocioso.
+
+## O roteiro de decisão
+
+Antes de partir o sistema, responda com honestidade:
+
+1. **Qual problema concreto você tem hoje?** "Deploys travados porque 4 times mexem no mesmo artefato" é um problema. "Microsserviços são mais modernos" não é.
+2. **O domínio está estável?** Se você ainda não sabe onde termina "agendamento" e começa "atendimento", vai errar as fronteiras, e mover uma fronteira entre serviços custa muito mais que mover entre pacotes.
+3. **Há times para ser donos dos serviços?** Um serviço sem dono claro vira terra de ninguém. Regra prática: nenhum time deveria ter mais serviços do que consegue operar com plantão.
+4. **A plataforma está pronta?** Pipeline automatizado, contêineres, observabilidade e infraestrutura como código antes do segundo serviço, não depois.
+5. **O problema se resolve com menos?** Escalar o monólito horizontalmente, separar leitura e escrita, colocar cache, extrair só o processamento pesado para um worker assíncrono.
+
+| Situação | Escolha provável |
+|---|---|
+| Produto novo, time pequeno, domínio ainda mudando | Monólito modular |
+| Monólito com módulos claros, um módulo com carga ou ritmo muito diferente | Extrair só esse módulo |
+| Vários times bloqueados pelo mesmo deploy, domínio maduro | Microsserviços por capacidade de negócio |
+| Problema de performance pontual | Otimizar, cachear ou criar um worker, sem nova arquitetura |
+
+Para a clínica: um time de seis pessoas, um produto em crescimento e um domínio que ainda está sendo descoberto. A decisão sensata é um **monólito modular**, com fronteiras bem definidas que permitam extrair serviços quando houver motivo.
+
+## Bounded contexts: onde cortar
+
+O erro mais comum é cortar por entidade técnica: "serviço de médicos", "serviço de pacientes", "serviço de consultas". Quase toda operação útil precisa dos três, então eles conversam o tempo todo e nenhum consegue mudar sozinho.
+
+O Domain-Driven Design propõe cortar por **bounded context**: uma parte do negócio com linguagem e regras próprias. O sinal mais claro de que você cruzou uma fronteira é a mesma palavra mudar de significado. Na clínica:
+
+| Contexto | O que "paciente" significa ali | Responsabilidades |
+|---|---|---|
+| Agendamento | Alguém com horários marcados e preferências | Horários livres, agendar, remarcar, cancelar |
+| Atendimento clínico | Alguém com histórico, alergias e prontuário | Prontuário, prescrições, exames |
+| Faturamento | Um pagador com convênio, plano e CPF fiscal | Guias de convênio, cobranças, notas |
+| Notificações | Um contato com telefone e canais preferidos | Lembretes por e-mail, SMS e WhatsApp |
+
+Cada contexto tem o **próprio modelo** de paciente, com só os campos de que precisa. Tentar criar um `Paciente` único e compartilhado com 60 campos, usado por todos, é exatamente o acoplamento que impede a independência. Os contextos se referem uns aos outros por identificador (`pacienteId`) e trocam informação por eventos ou APIs.
+
+## Monólito modular em Spring
+
+Um monólito modular é uma aplicação implantada como uma unidade, mas organizada em módulos com fronteiras explícitas. Em Spring, cada contexto vira um pacote de primeiro nível, com uma API pública pequena e o resto interno:
+
+```text
+br.com.clinica
+├── ClinicaApplication.java
+├── agendamento
+│   ├── AgendaDeConsultas.java          (API pública do módulo)
+│   ├── ConsultaAgendada.java           (evento publicado)
+│   └── internal
+│       ├── Consulta.java
+│       ├── ConsultaRepository.java
+│       └── ValidadorHorario.java
+├── atendimento
+│   ├── Prontuarios.java
+│   └── internal/...
+├── faturamento
+│   └── internal
+│       └── GeracaoDeCobranca.java
+└── notificacoes
+    └── internal
+        └── LembreteDeConsulta.java
+```
+
+Os módulos não chamam o repositório uns dos outros e não compartilham entidades. Quando o agendamento termina algo que interessa a outros, publica um evento:
+
+```java
+package br.com.clinica.agendamento;
+
+public record ConsultaAgendada(Long consultaId, Long pacienteId, Long medicoId, LocalDateTime data) {}
+```
+
+```java
+@Service
+public class AgendaDeConsultas {
+
+    private final ConsultaRepository consultas;
+    private final ApplicationEventPublisher eventos;
+
+    public AgendaDeConsultas(ConsultaRepository consultas, ApplicationEventPublisher eventos) {
+        this.consultas = consultas;
+        this.eventos = eventos;
+    }
+
+    @Transactional
+    public Long agendar(DadosAgendamento dados) {
+        var consulta = consultas.save(Consulta.nova(dados));
+        eventos.publishEvent(new ConsultaAgendada(
+                consulta.getId(), dados.pacienteId(), dados.medicoId(), dados.data()));
+        return consulta.getId();
+    }
+}
+```
+
+```java
+package br.com.clinica.notificacoes.internal;
+
+@Component
+class LembreteDeConsulta {
+
+    @ApplicationModuleListener
+    void aoAgendar(ConsultaAgendada evento) {
+        // agenda o lembrete 24 horas antes de evento.data()
+    }
+}
+```
+
+O `@ApplicationModuleListener` do Spring Modulith roda o ouvinte depois que a transação do agendamento faz commit, de forma assíncrona e numa transação própria. Com o registro de publicação de eventos habilitado, o evento fica gravado no banco até ser processado, então um lembrete não se perde se a aplicação cair no meio. O agendamento nem sabe que notificações existe.
+
+E o Spring Modulith verifica as fronteiras num teste:
+
+```java
+class ModulosTest {
+
+    @Test
+    void fronteirasDosModulosSaoRespeitadas() {
+        var modulos = ApplicationModules.of(ClinicaApplication.class);
+        modulos.verify(); // falha se um módulo acessa o pacote internal de outro ou se há ciclos
+    }
+
+    @Test
+    void geraDocumentacaoDosModulos() {
+        new Documenter(ApplicationModules.of(ClinicaApplication.class)).writeDocumentation();
+    }
+}
+```
+
+Esse teste é o que mantém o monólito modular de pé ao longo dos anos. Sem ele, uma importação "só desta vez" de uma classe interna vira dez, e os módulos voltam a ser um bloco só. Com ele, extrair `notificacoes` para um serviço separado amanhã é trocar o evento em memória por uma mensagem num broker: o código do módulo quase não muda.
+
+## Dados por serviço
+
+Em microsserviços, cada serviço é o **único dono** do seu banco (ou ao menos do seu schema). Nenhum outro serviço lê ou escreve nas tabelas dele. Isso parece burocracia, mas é o que garante a independência: se o faturamento lê a tabela `consultas` do agendamento direto, o agendamento não pode mais renomear uma coluna sem coordenar um deploy com o faturamento.
+
+As consequências, e como lidar com elas:
+
+- **Sem JOIN entre serviços.** Uma tela que mostra consultas com valor cobrado precisa de dados de dois donos. Ou um componente compõe as respostas das duas APIs (composição de API, num BFF ou gateway), ou um serviço mantém uma cópia local, só leitura, dos dados de que precisa, atualizada por eventos (o padrão por trás do CQRS).
+- **Sem transação distribuída.** "Agendar e criar a cobrança" vira uma **saga**: o agendamento grava e publica `ConsultaAgendada`; o faturamento cria a cobrança; se falhar, publica um evento que leva o agendamento a compensar (cancelar ou marcar pendência).
+- **Publicar evento de forma confiável.** Gravar no banco e publicar no broker são duas operações. Se a aplicação cair entre elas, o evento some. O padrão **outbox** grava o evento numa tabela na mesma transação e um processo separado o publica. O registro de publicação do Spring Modulith segue a mesma ideia.
+- **Duplicação aceita.** O faturamento guarda o nome do paciente que estava na guia. Isso não é erro: é o dado como ele era naquele contexto, e o dono do cadastro continua sendo outro.
+
+<Callout type="warning" title="O monólito distribuído">
+O pior resultado possível é ter todos os custos dos microsserviços e nenhum benefício. Os sinais: serviços que leem o banco uns dos outros, uma requisição que atravessa uma cadeia síncrona de cinco serviços (a disponibilidade total é o produto das disponibilidades, e cinco serviços com 99,9% dão cerca de 99,5%), deploys que precisam acontecer juntos e uma biblioteca compartilhada de entidades que todos precisam atualizar ao mesmo tempo. Se você reconhece dois desses sinais, as fronteiras estão erradas, e mais serviços vão piorar o quadro.
+</Callout>
+
+## Comunicação: síncrona ou assíncrona
+
+| | Síncrona (HTTP, gRPC) | Assíncrona (eventos, filas) |
+|---|---|---|
+| Quando usar | O chamador precisa da resposta para continuar (consultar horários livres) | O chamador só avisa que algo aconteceu (consulta agendada) |
+| Acoplamento temporal | Os dois precisam estar no ar | O consumidor pode estar fora e processar depois |
+| Falha | Propaga na hora; exige timeout e circuit breaker | Fica na fila; exige idempotência e fila de mensagens mortas |
+| Rastreabilidade | Mais simples de seguir | Exige tracing e IDs de correlação nos eventos |
+
+A regra prática: comandos e consultas que o usuário espera ver respondidos, síncronos; reações a fatos que já aconteceram, assíncronas. Um sistema cheio de chamadas síncronas encadeadas é frágil; um sistema todo assíncrono é difícil de entender. A mistura certa sai do domínio.
+
+## Migrando aos poucos
+
+Se um dia a clínica precisar extrair o faturamento (porque um time novo vai cuidar só dele e a integração com convênios tem ritmo próprio), a migração segura é gradual, no padrão **strangler fig**:
+
+1. Garanta que o módulo de faturamento já é isolado no monólito, com eventos e sem acesso a tabelas alheias.
+2. Suba o serviço novo, consumindo os mesmos eventos, em paralelo, sem tráfego real (ou comparando resultados).
+3. Mova os dados do faturamento para um banco próprio.
+4. Direcione o tráfego para o serviço novo, por rota no gateway ou por feature flag.
+5. Remova o módulo do monólito.
+
+Cada passo é reversível. A reescrita total, em contraste, para a entrega de funcionalidades por meses e quase sempre demora o dobro do previsto.
+
+## Registre a decisão
+
+Decisões de arquitetura se perdem em conversas. Um **ADR** (Architecture Decision Record) é um arquivo curto no repositório que registra contexto, decisão e consequências:
+
+```markdown
+# ADR 004: Monólito modular com Spring Modulith
+
+## Contexto
+Time único de 6 pessoas. Domínio da clínica ainda em descoberta.
+Picos de carga só na busca de horários, resolvidos com cache.
+
+## Decisão
+Uma aplicação Spring Boot com módulos agendamento, atendimento,
+faturamento e notificações. Comunicação entre módulos por eventos.
+Fronteiras verificadas por ApplicationModules.verify() no CI.
+
+## Consequências
++ Um deploy, uma transação quando necessário, operação simples.
++ Extração futura facilitada pelos eventos e pelo isolamento de dados.
+- Escala apenas da aplicação inteira.
+- Revisar se surgirem times dedicados por módulo.
+```
+
+Na entrevista e no trabalho, saber justificar **por que não** usar microsserviços vale tanto quanto saber construí-los.
+
+## Na entrevista
+
+**Quando você não usaria microsserviços?** Com time pequeno, produto novo ou domínio instável. O custo de operação e de consistência distribuída supera o ganho, que é sobretudo organizacional. Um monólito modular bem dividido entrega a maior parte dos benefícios de design e permite extrair serviços depois.
+
+**O que é um bounded context?** Uma fronteira dentro da qual um modelo de domínio e sua linguagem são consistentes. A mesma palavra (paciente, pedido) pode ter significados e dados diferentes em contextos diferentes. Bons microsserviços costumam seguir essas fronteiras.
+
+**Por que cada serviço deve ter o próprio banco?** Para que ele possa mudar seu modelo de dados e ser implantado sem coordenar com outros. Banco compartilhado cria acoplamento oculto. O custo é lidar com consistência eventual, sagas e composição de dados.
+
+**O que é um monólito distribuído?** Um sistema dividido em serviços que ainda dependem uns dos outros para funcionar e para ser implantados: banco compartilhado, cadeias de chamadas síncronas, deploys sincronizados. Tem os custos das duas arquiteturas e os benefícios de nenhuma.
+
+## Pratique
+
+Faça um estudo de arquitetura da clínica e entregue:
+
+1. Um mapa de contextos com quatro bounded contexts, a linguagem de cada um e o que "paciente" e "consulta" significam em cada.
+2. A API da clínica reorganizada em módulos de pacote com `internal`, comunicação por eventos para lembrete e cobrança, e um teste `ApplicationModules.verify()` passando.
+3. A lista de dados de cada módulo, sem nenhuma tabela lida por dois módulos.
+4. Um ADR decidindo entre monólito modular e microsserviços, com as respostas do roteiro de decisão.
+5. Um plano de extração do módulo de notificações em passos reversíveis, dizendo qual evento vira mensagem no broker.
+
+<Quiz question="Qual é o critério essencial para algo ser um microsserviço?" options={["Ter menos de mil linhas de código","Rodar num contêiner Docker","Poder ser implantado de forma independente","Ter um repositório Git próprio"]} answer={2} explanation="Tamanho, contêiner e repositório não definem a arquitetura. Se um serviço precisa ser publicado junto com outro, eles não são independentes." />
+
+<Quiz question="Dois serviços leem e gravam a mesma tabela de consultas. Qual o problema principal?" options={["Desempenho pior nas consultas","Acoplamento oculto que impede mudar o modelo sem coordenar deploys","Impossibilidade de usar índices","Violação da LGPD"]} answer={1} explanation="A tabela vira um contrato não declarado entre os dois. Qualquer mudança de coluna exige coordenação, eliminando a independência que justificava a separação." />
+
+<Quiz question="Para uma clínica com um time de seis pessoas e domínio ainda mudando, a escolha mais sensata é:" options={["Monólito modular com fronteiras verificadas","Um microsserviço por entidade","Microsserviços com Kubernetes desde o início","Funções serverless para cada endpoint"]} answer={0} explanation="O ganho dos microsserviços é sobretudo organizacional. Um monólito modular dá fronteiras claras e operação simples, e permite extrair serviços quando houver motivo concreto." />
+
+## Base no CodeForge
+
+- [Microsserviços](/learn/system-design/microsservicos) e [Monólito](/learn/system-design/monolito): as duas arquiteturas em visão geral.
+- [Saga](/learn/system-design/saga), [Outbox](/learn/system-design/outbox) e [CQRS](/learn/system-design/cqrs): os padrões para dados distribuídos citados aqui.
+- [Strangler fig](/learn/system-design/strangler-fig): a migração gradual em detalhe.
+- [Circuit breaker](/learn/system-design/circuit-breaker) e [Tracing distribuído](/learn/system-design/tracing-distribuido): parte do custo operacional que chega com a rede.
+- [Exercícios de microsserviços](/learn/system-design/exercicios-microsservicos): pratique as decisões em cenários.
+- [Microsserviços na prática: Implementando com Java e Spring](/learn/carreira-java/microsservicos-pratica-implementando-java-spring): o próximo passo, construindo os serviços.
+
+## Referências
+
+- [Martin Fowler: Microservice Trade-Offs](https://martinfowler.com/articles/microservice-trade-offs.html)
+- [Martin Fowler: Monolith First](https://martinfowler.com/bliki/MonolithFirst.html)
+- [Martin Fowler: Bounded Context](https://martinfowler.com/bliki/BoundedContext.html)
+- [Spring Modulith: Reference](https://docs.spring.io/spring-modulith/reference/)
