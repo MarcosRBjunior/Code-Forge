@@ -1,0 +1,379 @@
+---
+title: "Integração Contínua com Docker e GitHub Actions: Do build ao deploy"
+kind: lesson
+---
+
+A suíte de testes do `ingressos` roda na sua máquina, o ruff e o mypy estão no pre-commit, e mesmo assim a `main` quebra. Alguém faz merge sem rodar os testes, outra pessoa tem o Postgres 14 local e não percebe que a migração falha no 16, e o servidor de produção tem uma versão do `psycopg` que ninguém lembra de ter instalado. A frase "na minha máquina funciona" descreve exatamente o problema: cada ambiente é diferente e nenhum deles é verificado automaticamente.
+
+Este capítulo resolve as duas metades. O Docker fixa o ambiente: a mesma imagem roda no seu notebook, no CI e em produção. O GitHub Actions fixa o processo: todo pull request passa por lint, tipos, testes contra um Postgres real e cobertura mínima, e todo merge na `main` gera uma imagem versionada pelo commit, publicada no GitHub Container Registry e entregue num ambiente de staging. Os próximos capítulos de Integração Contínua partem daqui para levar essa imagem à AWS.
+
+**Você vai aprender:**
+
+- Escrever um Dockerfile multi-stage para Django com `python:3.13-slim` e usuário não root
+- Subir a aplicação com Postgres no `docker compose` para desenvolvimento
+- Montar o workflow de CI com ruff, mypy, pytest e cobertura, usando cache de dependências
+- Construir e publicar a imagem no `ghcr.io` com tags pelo SHA do commit
+- Usar segredos e environments do GitHub para um primeiro deploy automático
+
+## Uma imagem boa para Python
+
+Uma imagem de produção precisa de três qualidades: ser pequena (menos para baixar e menos superfície de ataque), não rodar como root e reaproveitar o cache de camadas para que um commit que só muda código não reinstale todas as dependências. O build multi-stage separa o que é preciso para **construir** do que é preciso para **rodar**:
+
+```dockerfile
+# Dockerfile
+# syntax=docker/dockerfile:1
+
+FROM python:3.13-slim AS builder
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+WORKDIR /app
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY pyproject.toml ./
+COPY ingressos/__init__.py ingressos/__init__.py
+RUN pip install .
+COPY . .
+RUN pip install --no-deps .
+
+FROM python:3.13-slim AS final
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    DJANGO_SETTINGS_MODULE=ingressos.settings
+RUN useradd --create-home --uid 1000 app
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv
+COPY --chown=app:app . .
+RUN DJANGO_SECRET_KEY=somente-build python manage.py collectstatic --noinput
+USER app
+EXPOSE 8000
+CMD ["gunicorn", "ingressos.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--access-logfile", "-"]
+```
+
+As decisões, uma a uma:
+
+- **Dois estágios.** O `builder` cria um ambiente virtual em `/opt/venv` e instala tudo nele. O `final` copia só esse diretório. Se alguma dependência precisasse compilar extensão em C, o compilador (`build-essential`) ficaria no `builder` e nunca chegaria à imagem final. Com `psycopg[binary]` e as wheels prontas do PyPI, quase nada compila, e o `slim` basta nos dois estágios.
+- **Ordem das cópias.** O `pyproject.toml` entra antes do código, e as dependências são instaladas nessa camada. Enquanto o `pyproject.toml` não muda, o Docker reaproveita a camada e o build depois de uma mudança de código leva segundos. O `__init__.py` copiado junto existe só para o `pip install .` encontrar o pacote; a instalação definitiva, com `--no-deps`, acontece depois do `COPY . .`.
+- **`PYTHONUNBUFFERED=1`** manda os logs direto para a saída, sem buffer, para que apareçam no `docker logs` na hora. **`PYTHONDONTWRITEBYTECODE=1`** evita arquivos `.pyc` soltos no contêiner.
+- **Usuário `app`, UID 1000.** Se alguém explorar uma falha na aplicação, cai num usuário sem privilégios. O `--chown` dá a ele a posse do código, e o `collectstatic` roda antes do `USER` porque escreve em `STATIC_ROOT`. Ele recebe uma chave descartável só para o comando, e o `settings.py` não pode exigir banco ou outros segredos ao ser importado, senão o build falha.
+- **`CMD` na forma exec** (lista JSON), para o gunicorn ser o processo 1 e receber o `SIGTERM` do Docker, encerrando as requisições em andamento antes de sair. Na forma de texto, quem recebe o sinal é um shell, e o contêiner é morto à força depois do prazo.
+
+Acrescente um `.dockerignore` para o contexto de build não levar o que não deve:
+
+```text
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.pytest_cache
+.mypy_cache
+htmlcov
+```
+
+O `.env` na lista é o mais importante: segredos locais não podem acabar numa camada da imagem, onde qualquer um que baixe a imagem consegue lê-los. Configuração entra por variável de ambiente na hora de rodar, nunca no build.
+
+Para uma API FastAPI do `ingressos`, o Dockerfile é o mesmo, trocando o `CMD` por `["uvicorn", "ingressos_api.main:app", "--host", "0.0.0.0", "--port", "8000"]` (ou gunicorn com o worker do uvicorn).
+
+## O ambiente de desenvolvimento com `docker compose`
+
+O `compose.yaml` sobe a aplicação e o Postgres com um comando e deixa todo o time com o mesmo banco:
+
+```yaml
+# compose.yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ingressos
+      POSTGRES_USER: ingressos
+      POSTGRES_PASSWORD: ingressos
+    volumes:
+      - dados-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingressos -d ingressos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgres://ingressos:ingressos@db:5432/ingressos
+      DJANGO_SECRET_KEY: so-para-desenvolvimento
+      DJANGO_DEBUG: "1"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  dados-db:
+```
+
+```bash
+docker compose up --build -d
+docker compose exec api python manage.py migrate
+docker compose logs -f api
+docker compose down          # mantém o volume; down -v apaga os dados
+```
+
+Dentro da rede do compose, o host do banco é o nome do serviço (`db`), não `localhost`. O `depends_on` com `condition: service_healthy` espera o `pg_isready` responder; sem a condição, o compose só espera o contêiner **iniciar**, e a aplicação tenta conectar num Postgres que ainda está subindo. As credenciais fixas no arquivo são aceitáveis aqui porque o banco só existe na sua máquina.
+
+## O workflow de CI
+
+O workflow de integração roda em todo pull request e em todo push na `main`. A ordem dos passos vai do mais barato ao mais caro, para falhar cedo:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ingressos
+          POSTGRES_USER: ingressos
+          POSTGRES_PASSWORD: ingressos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ingressos"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://ingressos:ingressos@localhost:5432/ingressos
+      DJANGO_SECRET_KEY: chave-de-teste
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Dependências
+        run: pip install -e ".[dev]"
+
+      - name: Lint e formatação
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Tipos
+        run: mypy ingressos
+
+      - name: Migrações em dia
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Testes com cobertura
+        run: pytest --cov --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cobertura
+          path: coverage.xml
+```
+
+Pontos que valem atenção:
+
+- **`services: postgres`** sobe um Postgres 16 ao lado do job, o mesmo que você usa no compose e em produção. Como o job roda direto no runner (não num contêiner), o banco é acessado em `localhost:5432` pela porta mapeada. As `options` de health check fazem o Actions esperar o banco ficar pronto antes do primeiro passo.
+- **`cache: pip`** do `setup-python` guarda o cache de downloads do pip, indexado pelo hash do `pyproject.toml`. Enquanto as dependências não mudam, a instalação não baixa nada da internet. Com um arquivo de lock (`requirements.txt` gerado, ou `uv.lock`), aponte o `cache-dependency-path` para ele.
+- **`makemigrations --check`** falha se alguém mudou um model e esqueceu de gerar a migração, um erro que os testes nem sempre pegam: basta nenhum teste tocar no campo novo, ou a suíte rodar com `--nomigrations`, que cria as tabelas direto dos models.
+- **Cobertura mínima.** O `fail_under = 85` do `pyproject.toml`, configurado no capítulo de testes, faz o `pytest --cov` sair com erro abaixo do piso, e o job fica vermelho.
+- **`concurrency`** cancela a execução anterior do mesmo branch quando chega um push novo, para não gastar minutos testando um commit que já foi substituído.
+- **`permissions: contents: read`** reduz o `GITHUB_TOKEN` ao mínimo. Cada job que precisar de mais (como publicar imagem) pede explicitamente.
+
+Para o CI virar barreira de verdade, configure uma regra de proteção na `main` (*Settings* do repositório, *Branches* ou *Rulesets*) exigindo que o job `testes` passe antes do merge. Sem essa regra, o check vermelho é só um aviso.
+
+<Callout type="tip" title="O mesmo comando no CI e na sua máquina">
+Se o CI roda uma sequência de comandos que ninguém consegue reproduzir localmente, cada falha vira uma investigação. Mantenha os comandos idênticos aos que você roda no terminal (`ruff check .`, `mypy ingressos`, `pytest --cov`), e, se a lista crescer, coloque-a num script ou num `Makefile` que o workflow apenas chama.
+</Callout>
+
+## Construindo e publicando a imagem no ghcr.io
+
+Com os testes verdes na `main`, o próximo job gera a imagem e a publica no GitHub Container Registry, que fica junto do repositório e usa o próprio `GITHUB_TOKEN` para autenticar:
+
+```yaml
+  imagem:
+    needs: testes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=main
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+O que cada peça faz:
+
+- **`needs: testes`** e o **`if`** garantem que só código testado da `main` vira imagem. Em pull requests, o job nem aparece.
+- **`packages: write`** dá ao `GITHUB_TOKEN` permissão de publicar no registro. É o único job com essa permissão.
+- **`metadata-action`** gera as tags e os labels OCI (repositório de origem, commit, data). `type=sha,format=long` cria a tag `sha-` seguida dos 40 caracteres do commit; a tag `main` aponta sempre para a última imagem do branch, útil para quem quer testar a versão mais recente.
+- **`cache-from` e `cache-to` com `type=gha`** guardam as camadas do build no cache do Actions. Como o runner é descartável, sem isso cada build recomeçaria do zero, reinstalando todas as dependências.
+- **`outputs.digest`** expõe o digest (`sha256:...`) da imagem publicada. Diferente da tag, o digest identifica o conteúdo e não pode ser movido.
+
+Repositórios no `ghcr.io` nascem privados quando o repositório de código é privado. O servidor que vai baixar a imagem precisa de um token com `read:packages`, ou você torna o pacote público nas configurações dele.
+
+## Tags que contam a história
+
+A tag responde à pergunta "o que está rodando em produção?". Com a tag pelo SHA, a resposta é exata: `ghcr.io/minha-org/ingressos:sha-8d1f3c0...` leva ao commit, que leva ao pull request, aos testes que passaram e a quem aprovou. Rollback é apontar para o SHA anterior, cuja imagem continua no registro.
+
+| Tag | Muda depois de publicada? | Uso |
+|---|---|---|
+| `sha-<commit>` | Não | Deploy e rollback |
+| `v1.4.0` (de uma tag git) | Não, por convenção | Releases versionadas, changelog |
+| `main` | Sim, a cada merge | Ambientes de teste que seguem a ponta do branch |
+| `latest` | Sim | Evite em pipelines |
+
+Para gerar a tag semântica quando você criar uma tag git `v1.4.0`, acrescente `type=semver,pattern={{version}}` à lista do `metadata-action` e o gatilho `push: tags: ["v*"]` ao workflow.
+
+<Callout type="warning" title="Deploy da tag latest">
+Com `latest` (ou `main`) no deploy, dois servidores que baixaram a imagem em momentos diferentes podem rodar versões diferentes sem que nada indique isso, e um rollback não tem para onde voltar, porque a tag anterior foi sobrescrita. Faça deploy sempre pela tag do SHA ou pelo digest, e trate as tags móveis só como atalhos para humanos.
+</Callout>
+
+## Segredos, variáveis e environments
+
+O workflow precisa de dois tipos de configuração, guardados em lugares diferentes no GitHub:
+
+- **Secrets** (*Settings*, *Secrets and variables*, *Actions*): valores sensíveis, como a URL de deploy ou um token de acesso. São cifrados, aparecem mascarados como `***` nos logs e não são entregues a workflows disparados por pull requests vindos de forks.
+- **Variables**: configuração não sensível, como a URL pública do ambiente ou o nome do cluster. Ficam legíveis, o que facilita depurar.
+
+Os dois existem em três níveis: organização, repositório e **environment**. Um environment (`staging`, `production`) agrupa segredos próprios e regras de proteção: revisores obrigatórios, tempo de espera e quais branches podem fazer deploy nele. Um job declara `environment: staging` e passa a enxergar os segredos desse ambiente, e o GitHub registra cada deploy na página de environments, com o commit e o link para a execução.
+
+Leia segredos sempre por variável de ambiente do passo, não interpolando direto no script:
+
+```yaml
+      - name: Exemplo seguro
+        env:
+          TOKEN: ${{ secrets.TOKEN_DO_PROVEDOR }}
+        run: ./scripts/usa-token.sh   # o script lê $TOKEN
+```
+
+A interpolação `${{ }}` dentro do `run` cola o valor no texto do script antes de ele executar, e o mesmo mecanismo com dados controlados por terceiros (como o título de um pull request) abre caminho para injeção de comandos.
+
+## Um primeiro deploy automático
+
+Com a imagem publicada, o último job a entrega em staging. Muitas plataformas de hospedagem de contêineres oferecem um *deploy hook*: uma URL secreta que, ao receber um `POST`, baixa a imagem indicada e reinicia a aplicação. É o deploy mais simples possível, e serve para fechar o ciclo antes de a carreira chegar à AWS:
+
+```yaml
+  deploy-staging:
+    needs: imagem
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.ingressos.exemplo.com
+    steps:
+      - name: Dispara o deploy
+        env:
+          DEPLOY_HOOK: ${{ secrets.DEPLOY_HOOK_URL }}
+          IMAGEM: ghcr.io/${{ github.repository }}@${{ needs.imagem.outputs.digest }}
+        run: |
+          curl --fail --silent --show-error -X POST "$DEPLOY_HOOK" \
+            --data-urlencode "imgURL=$IMAGEM"
+
+      - name: Smoke test
+        run: |
+          for tentativa in $(seq 1 30); do
+            if curl --fail --silent https://staging.ingressos.exemplo.com/saude/pronto; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "staging não ficou saudável em 5 minutos" >&2
+          exit 1
+```
+
+O nome do parâmetro do hook (`imgURL` aqui) depende da plataforma; o que importa é o padrão. O job usa o **digest** da imagem, não uma tag, para garantir que staging rode exatamente o que acabou de ser testado. O `--fail` do curl faz o passo falhar com respostas 4xx e 5xx, que de outra forma passariam em silêncio. E o smoke test fecha o ciclo: o pipeline só fica verde se a aplicação nova respondeu ao health check, porque "o comando de deploy não deu erro" não significa "a aplicação está no ar".
+
+O que este deploy ainda não resolve: migrações do banco, aprovação para produção, credenciais de nuvem sem segredo fixo e rollback. São os assuntos dos três capítulos seguintes, começando por uma instância EC2.
+
+## Na entrevista
+
+**Por que usar build multi-stage?** Para separar o ambiente de construção do de execução. Compiladores, cabeçalhos e caches ficam no estágio de build, e a imagem final leva só o ambiente virtual pronto e o código, o que reduz tamanho e superfície de ataque.
+
+**Como você acelera um pipeline de Python?** Com cache de dependências do pip (pelo `setup-python` com `cache: pip`), cache de camadas do Docker (`type=gha`), ordem de cópia no Dockerfile que preserva a camada de dependências, passos baratos antes dos caros e cancelamento de execuções obsoletas com `concurrency`.
+
+**Por que taguear a imagem pelo SHA do commit?** Porque a tag fica imutável e rastreável até o código, os testes e o pull request. Ela permite promover o mesmo artefato entre ambientes e fazer rollback para uma versão exata, o que tags móveis como `latest` não permitem.
+
+**Qual a diferença entre secret e variable no GitHub Actions?** Secrets são cifrados, mascarados nos logs e não vão para pull requests de forks; variables são texto legível para configuração não sensível. Os dois podem ser definidos por environment, o que separa as credenciais de staging das de produção.
+
+**Por que testar contra Postgres no CI em vez de SQLite?** Porque o comportamento difere em tipos, constraints, locks e SQL específico. Um teste que passa no SQLite pode falhar em produção, e o `services` do Actions sobe o Postgres real em segundos.
+
+## Pratique
+
+No repositório do `ingressos`:
+
+1. Escreva o Dockerfile multi-stage e o `.dockerignore`. Confira com `docker image ls` que a imagem final fica abaixo de 250 MB e com `docker run --rm ingressos whoami` que ela roda como `app`.
+2. Crie o `compose.yaml` com Postgres e health check, e documente no README os comandos para subir, migrar e ver logs.
+3. Monte o `ci.yml` com ruff, mypy, verificação de migrações, pytest contra Postgres e cobertura mínima. Ative a regra de proteção da `main` exigindo o job.
+4. Adicione o job de imagem publicando no `ghcr.io` com tag pelo SHA e cache `type=gha`. Compare o tempo de dois builds seguidos.
+5. Crie o environment `staging` com o segredo do hook e o job de deploy com smoke test. Quebre o health check de propósito numa branch e mostre o pipeline falhando.
+
+<Quiz question="No Dockerfile, por que o pyproject.toml é copiado e instalado antes do restante do código?" options={["Porque o pip exige essa ordem","Para que a camada de dependências seja reaproveitada pelo cache enquanto o pyproject.toml não muda","Para que o código fique fora da imagem final","Para rodar os testes durante o build"]} answer={1} explanation="O Docker reaproveita uma camada enquanto os arquivos copiados para ela não mudam. Separar as dependências do código faz um commit comum reconstruir só a última camada." />
+
+<Quiz question="No job de CI, a aplicação acessa o Postgres declarado em services pelo host localhost. Por quê?" options={["Porque o Postgres roda dentro do mesmo contêiner da aplicação","Porque services só funciona com SQLite","Porque o job roda direto no runner e a porta 5432 do serviço está mapeada para ele","Porque o GitHub reescreve a DATABASE_URL"]} answer={2} explanation="Quando o job não roda dentro de um contêiner, os serviços ficam acessíveis pelas portas mapeadas em localhost. Se o job rodasse num contêiner, o host seria o nome do serviço." />
+
+<Quiz question="O que torna o deploy pelo digest mais seguro que pela tag main?" options={["O digest identifica o conteúdo exato da imagem e não pode ser movido para outra versão","O digest é menor e baixa mais rápido","A tag main não funciona no ghcr.io","O digest dispensa autenticação no registro"]} answer={0} explanation="Tags móveis podem apontar para outra imagem depois do deploy. O digest é o hash do conteúdo, então o ambiente roda exatamente a imagem testada." />
+
+## Base no CodeForge
+
+- [Python: Testes automatizados e qualidade de código](/learn/carreira-python/python-testes-automatizados-qualidade-codigo): a suíte, o ruff, o mypy e a cobertura que o CI executa.
+- [Integração Contínua: Pipeline de entrega e implementação contínua na EC2](/learn/carreira-python/integracao-continua-pipeline-entrega-implementacao-continua-ec2): o próximo passo, levando esta imagem a uma instância na AWS.
+- [CI/CD](/learn/system-design/ci-cd): os conceitos de integração e entrega contínuas.
+- [Integração Contínua: Pipeline com Docker e GitHub Actions (Java)](/learn/carreira-java/integracao-continua-pipeline-docker-github-actions): o mesmo pipeline em outra stack.
+
+## Referências
+
+- [Docker: Multi-stage builds](https://docs.docker.com/build/building/multi-stage/)
+- [GitHub Actions: Building and testing Python](https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-python)
+- [GitHub Actions: Creating PostgreSQL service containers](https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/creating-postgresql-service-containers)
+- [Working with the Container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)

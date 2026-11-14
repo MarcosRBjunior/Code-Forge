@@ -1,0 +1,497 @@
+---
+title: "Princípios SOLID com Python: Construindo códigos eficientes e escaláveis"
+kind: lesson
+---
+
+A plataforma de ingressos começou com uma função `finalizar_pedido` de quarenta linhas. Seis meses depois ela tem trezentas: calcula preço com um `if` para cada tipo de ingresso, abre conexão com o banco, chama o gateway de pagamento, monta o HTML do e-mail e grava log. Toda mudança de regra mexe nesse arquivo, todo teste precisa de banco e de servidor SMTP, e dois desenvolvedores não conseguem trabalhar nele sem conflito de merge. O código funciona, mas ficou caro de mudar.
+
+SOLID é um conjunto de cinco princípios de design orientado a objetos que atacam exatamente esse custo de mudança. Em Python eles ficam mais leves do que em Java ou C#, porque a linguagem tem duck typing, funções de primeira classe e `Protocol`. Este capítulo aplica cada princípio ao código de `ingressos`, sempre com o antes e o depois, e termina com a pergunta que separa pleno de sênior: quando não aplicar.
+
+**Você vai aprender:**
+
+- Reconhecer no código os sintomas que cada princípio resolve
+- Refatorar com `typing.Protocol`, `abc.ABC`, composição e funções como estratégia
+- Injetar dependências pelo construtor e montar o grafo de objetos num único lugar
+- Testar regras de negócio com dublês, sem banco nem rede
+- Decidir quando uma abstração se paga e quando é excesso
+
+## O ponto de partida
+
+Este é o código que será refatorado ao longo do capítulo. Ele tem todos os problemas de uma vez:
+
+```python
+# ingressos/pedidos.py (antes)
+import smtplib
+from decimal import Decimal
+from email.message import EmailMessage
+
+import psycopg
+
+
+class ServicoDePedidos:
+    def finalizar(self, pedido_id: int) -> None:
+        with psycopg.connect("postgresql://app:senha@localhost/ingressos") as conexao:
+            linha = conexao.execute(
+                "SELECT cliente_email, tipo, preco_base, quantidade FROM pedidos WHERE id = %s",
+                (pedido_id,),
+            ).fetchone()
+            email, tipo, preco_base, quantidade = linha
+
+            if tipo == "inteira":
+                total = preco_base * quantidade
+            elif tipo == "meia":
+                total = preco_base * quantidade / 2
+            elif tipo == "vip":
+                total = preco_base * quantidade * Decimal("1.5")
+            else:
+                raise ValueError(f"tipo desconhecido: {tipo}")
+
+            conexao.execute(
+                "UPDATE pedidos SET status = 'pago', total = %s WHERE id = %s",
+                (total, pedido_id),
+            )
+
+        mensagem = EmailMessage()
+        mensagem["To"] = email
+        mensagem["Subject"] = "Pedido confirmado"
+        mensagem.set_content(f"Seu pedido {pedido_id} foi confirmado. Total: R$ {total}")
+        with smtplib.SMTP("smtp.ingressos.local") as smtp:
+            smtp.send_message(mensagem)
+```
+
+Para testar a regra "meia paga metade", você precisa de um PostgreSQL no ar e de um servidor SMTP. Para criar o tipo "cortesia", edita o método que também fala com o banco. Para trocar e-mail por WhatsApp, edita o método que calcula preço.
+
+## S: responsabilidade única
+
+O enunciado clássico diz que uma classe deve ter um único motivo para mudar. A leitura mais útil é: **uma classe deve responder a um único grupo de pessoas**. No código acima, o time de produto muda a política de preço, o time de dados muda o esquema do banco e o time de marketing muda o texto do e-mail. Três grupos, três motivos de mudança, uma classe.
+
+Separe por motivo de mudança:
+
+```python
+# ingressos/dominio.py
+from dataclasses import dataclass
+from decimal import Decimal
+
+
+@dataclass
+class Pedido:
+    id: int
+    cliente_email: str
+    tipo: str
+    preco_base: Decimal
+    quantidade: int
+    status: str = "pendente"
+    total: Decimal = Decimal("0")
+
+    def confirmar(self, total: Decimal) -> None:
+        if self.status != "pendente":
+            raise ValueError("só pedido pendente pode ser confirmado")
+        self.total = total
+        self.status = "pago"
+```
+
+```python
+# ingressos/infra/repositorio_postgres.py
+import psycopg
+
+from ingressos.dominio import Pedido
+
+
+class RepositorioDePedidosPostgres:
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+
+    def buscar(self, pedido_id: int) -> Pedido:
+        with psycopg.connect(self._dsn) as conexao:
+            linha = conexao.execute(
+                "SELECT id, cliente_email, tipo, preco_base, quantidade, status, total "
+                "FROM pedidos WHERE id = %s",
+                (pedido_id,),
+            ).fetchone()
+        if linha is None:
+            raise LookupError(f"pedido {pedido_id} não existe")
+        return Pedido(*linha)
+
+    def salvar(self, pedido: Pedido) -> None:
+        with psycopg.connect(self._dsn) as conexao:
+            conexao.execute(
+                "UPDATE pedidos SET status = %s, total = %s WHERE id = %s",
+                (pedido.status, pedido.total, pedido.id),
+            )
+```
+
+O envio de e-mail vai para uma classe `NotificadorPorEmail`, e o cálculo de preço para um módulo próprio (próxima seção). `ServicoDePedidos` passa a ter uma única responsabilidade: orquestrar o caso de uso.
+
+SRP não significa "uma classe, um método". Uma classe `Pedido` com `confirmar`, `cancelar` e `expirar` tem uma responsabilidade só: manter o ciclo de vida do pedido consistente. O critério é coesão: os métodos usam os mesmos dados e mudam pelo mesmo motivo. Vale para funções e módulos também: um `utils.py` de mil linhas viola SRP sem ter classe nenhuma.
+
+## O: aberto para extensão, fechado para modificação
+
+O sintoma é a cadeia de `if/elif` sobre um tipo, que cresce a cada requisito. Cada ramo novo obriga a editar código que já funcionava e a retestar tudo. O princípio pede que comportamento novo entre como **código novo**, não como edição do antigo.
+
+Defina o contrato de uma política de preço e implemente uma classe por variação:
+
+```python
+# ingressos/precos.py
+from decimal import Decimal
+from typing import Protocol
+
+from ingressos.dominio import Pedido
+
+
+class PoliticaDePreco(Protocol):
+    def calcular(self, pedido: Pedido) -> Decimal: ...
+
+
+class Inteira:
+    def calcular(self, pedido: Pedido) -> Decimal:
+        return pedido.preco_base * pedido.quantidade
+
+
+class Meia:
+    def calcular(self, pedido: Pedido) -> Decimal:
+        return pedido.preco_base * pedido.quantidade / 2
+
+
+class Vip:
+    def __init__(self, multiplicador: Decimal = Decimal("1.5")) -> None:
+        self._multiplicador = multiplicador
+
+    def calcular(self, pedido: Pedido) -> Decimal:
+        return pedido.preco_base * pedido.quantidade * self._multiplicador
+
+
+POLITICAS: dict[str, PoliticaDePreco] = {
+    "inteira": Inteira(),
+    "meia": Meia(),
+    "vip": Vip(),
+}
+
+
+def politica_para(tipo: str) -> PoliticaDePreco:
+    try:
+        return POLITICAS[tipo]
+    except KeyError:
+        raise ValueError(f"tipo desconhecido: {tipo}") from None
+```
+
+Criar o tipo "cortesia" agora é escrever uma classe `Cortesia` e registrar uma entrada no dicionário. Nenhum cálculo existente é tocado.
+
+Em Python, quando a variação é só um cálculo sem estado, uma função resolve. O mesmo registro pode ser um `dict[str, Callable[[Pedido], Decimal]]` com funções `inteira`, `meia` e `vip`. Classe se justifica quando há configuração (o multiplicador do `Vip`) ou mais de um método no contrato. Escolher a forma mais simples que atende não fere o princípio: o que importa é o ponto de extensão existir.
+
+<Callout type="warning" title="OCP não é prever o futuro">
+Abrir ponto de extensão para toda variação imaginável deixa o código cheio de indireção que ninguém usa. A regra prática: o primeiro `if` é só um `if`. Quando a mesma dimensão de variação aparecer pela segunda ou terceira vez (um novo tipo de ingresso, um novo canal de notificação), aí você tem evidência de que aquele eixo muda, e a abstração se paga.
+</Callout>
+
+## L: substituição de Liskov
+
+Se um código funciona com um tipo, tem de continuar funcionando com qualquer subtipo dele, sem saber da troca. A violação aparece quando a subclasse herda uma interface que não consegue cumprir:
+
+```python
+# antes
+class Setor:
+    def __init__(self, nome: str, quantidade_disponivel: int) -> None:
+        self.nome = nome
+        self.quantidade_disponivel = quantidade_disponivel
+
+    def reservar(self, quantidade: int) -> None:
+        if quantidade > self.quantidade_disponivel:
+            raise ValueError("sem estoque")
+        self.quantidade_disponivel -= quantidade
+
+
+class SetorNumerado(Setor):
+    def reservar(self, quantidade: int) -> None:
+        raise NotImplementedError("use reservar_assentos")
+
+    def reservar_assentos(self, assentos: list[str]) -> None: ...
+```
+
+Qualquer função que receba um `Setor` e chame `reservar(2)` quebra em produção quando alguém passar um `SetorNumerado`. O sintoma seguinte é o `isinstance` espalhado pelo código para desviar do subtipo problemático, que por sua vez viola o OCP.
+
+Um subtipo respeita o contrato quando:
+
+- **Não fortalece pré-condições.** Se a base aceita qualquer quantidade positiva, o subtipo não pode exigir "apenas números pares".
+- **Não enfraquece pós-condições.** Se a base garante que o estoque diminui, o subtipo não pode deixar de diminuir.
+- **Não lança exceções novas** que o chamador da base não espera. `NotImplementedError` num método herdado é o sinal mais claro.
+- **Mantém as invariantes** da base, como `quantidade_disponivel` nunca negativa.
+
+A correção costuma ser reconhecer que a relação "é um" não vale. Um setor numerado não é um setor de pista com um detalhe a mais: são duas formas de reserva com contratos diferentes.
+
+```python
+# depois
+from typing import Protocol
+
+
+class SetorComEstoque(Protocol):
+    nome: str
+
+    def tem_disponibilidade(self) -> bool: ...
+
+
+class SetorPista:
+    def __init__(self, nome: str, quantidade_disponivel: int) -> None:
+        self.nome = nome
+        self.quantidade_disponivel = quantidade_disponivel
+
+    def tem_disponibilidade(self) -> bool:
+        return self.quantidade_disponivel > 0
+
+    def reservar(self, quantidade: int) -> None:
+        if quantidade > self.quantidade_disponivel:
+            raise ValueError("sem estoque")
+        self.quantidade_disponivel -= quantidade
+
+
+class SetorNumerado:
+    def __init__(self, nome: str, assentos_livres: set[str]) -> None:
+        self.nome = nome
+        self.assentos_livres = assentos_livres
+
+    def tem_disponibilidade(self) -> bool:
+        return bool(self.assentos_livres)
+
+    def reservar_assentos(self, assentos: list[str]) -> None:
+        pedidos = set(assentos)
+        if not pedidos <= self.assentos_livres:
+            raise ValueError("assento indisponível")
+        self.assentos_livres -= pedidos
+```
+
+O que os dois têm em comum de verdade (nome e disponibilidade) fica no contrato compartilhado. O que difere fica em cada classe. A vitrine de eventos, que só pergunta `tem_disponibilidade()`, aceita qualquer um dos dois.
+
+## I: segregação de interfaces
+
+Nenhum cliente deveria depender de métodos que não usa. O sintoma é a interface que cresce até virar um catálogo:
+
+```python
+# antes
+from decimal import Decimal
+from typing import Protocol
+
+from ingressos.dominio import Pedido
+
+
+class RepositorioDePedidos(Protocol):
+    def buscar(self, pedido_id: int) -> Pedido: ...
+    def salvar(self, pedido: Pedido) -> None: ...
+    def listar_por_cliente(self, email: str) -> list[Pedido]: ...
+    def total_vendido_por_evento(self, evento_id: int) -> Decimal: ...
+    def exportar_csv(self, caminho: str) -> None: ...
+```
+
+O caso de uso de finalizar pedido só precisa de `buscar` e `salvar`, mas o dublê de teste precisa implementar cinco métodos, e uma mudança na assinatura de `exportar_csv` obriga a revisar todo mundo que depende do protocolo.
+
+Quebre pelo uso de cada cliente:
+
+```python
+# ingressos/portas.py
+from decimal import Decimal
+from typing import Protocol
+
+from ingressos.dominio import Pedido
+
+
+class LeitorDePedidos(Protocol):
+    def buscar(self, pedido_id: int) -> Pedido: ...
+
+
+class GravadorDePedidos(Protocol):
+    def salvar(self, pedido: Pedido) -> None: ...
+
+
+class RepositorioDePedidos(LeitorDePedidos, GravadorDePedidos, Protocol):
+    """Leitura e escrita, para os casos de uso transacionais."""
+
+
+class RelatorioDeVendas(Protocol):
+    def total_vendido_por_evento(self, evento_id: int) -> Decimal: ...
+
+
+class Notificador(Protocol):
+    def notificar(self, destinatario: str, assunto: str, corpo: str) -> None: ...
+```
+
+A classe concreta `RepositorioDePedidosPostgres` pode continuar implementando tudo. O que muda é que cada cliente declara só a fatia de que precisa. Com `Protocol` isso custa pouco, porque a classe concreta não precisa herdar de nada: basta ter os métodos com as assinaturas certas (tipagem estrutural).
+
+## D: inversão de dependência
+
+Módulos de alto nível (regra de negócio) não deveriam depender de módulos de baixo nível (banco, SMTP, HTTP). Ambos dependem de abstrações, e a abstração pertence ao lado do negócio. No código inicial, `ServicoDePedidos` importava `psycopg` e `smtplib` e criava as conexões por conta própria. Depois de aplicar os princípios anteriores, o serviço fica assim:
+
+```python
+# ingressos/servicos.py
+from ingressos.portas import Notificador, RepositorioDePedidos
+from ingressos.precos import politica_para
+
+
+class ServicoDePedidos:
+    def __init__(self, pedidos: RepositorioDePedidos, notificador: Notificador) -> None:
+        self._pedidos = pedidos
+        self._notificador = notificador
+
+    def finalizar(self, pedido_id: int) -> None:
+        pedido = self._pedidos.buscar(pedido_id)
+        total = politica_para(pedido.tipo).calcular(pedido)
+        pedido.confirmar(total)
+        self._pedidos.salvar(pedido)
+        self._notificador.notificar(
+            pedido.cliente_email,
+            "Pedido confirmado",
+            f"Seu pedido {pedido.id} foi confirmado. Total: R$ {pedido.total}",
+        )
+```
+
+Repare nos imports: o serviço conhece `portas` e `precos`, que são código de domínio. Não conhece PostgreSQL nem SMTP. A seta de dependência se inverteu: agora é a infraestrutura que implementa um contrato definido pelo negócio.
+
+### Injeção de dependência e a raiz de composição
+
+Inversão de dependência é o princípio. **Injeção de dependência** é a técnica: quem cria o objeto entrega as dependências prontas, em vez de o objeto criá-las. Em Python a forma padrão é o construtor, e não é preciso framework. Alguém, porém, precisa escolher as implementações concretas. Faça isso num único lugar, na borda da aplicação, chamado raiz de composição:
+
+```python
+# ingressos/composicao.py
+import os
+
+from ingressos.infra.notificador_email import NotificadorPorEmail
+from ingressos.infra.repositorio_postgres import RepositorioDePedidosPostgres
+from ingressos.servicos import ServicoDePedidos
+
+
+def criar_servico_de_pedidos() -> ServicoDePedidos:
+    return ServicoDePedidos(
+        pedidos=RepositorioDePedidosPostgres(os.environ["DATABASE_URL"]),
+        notificador=NotificadorPorEmail(os.environ["SMTP_HOST"]),
+    )
+```
+
+Numa aplicação FastAPI, a raiz de composição são as funções passadas a `Depends`: a rota declara `servico: Annotated[ServicoDePedidos, Depends(criar_servico_de_pedidos)]` e, nos testes, `app.dependency_overrides` troca a função por outra que monta o serviço com dublês. Em Django, a view chama a fábrica. O princípio é o mesmo: só a borda conhece as classes concretas.
+
+O ganho imediato aparece no teste, que deixa de precisar de infraestrutura:
+
+```python
+# tests/test_servico_de_pedidos.py
+from decimal import Decimal
+
+from ingressos.dominio import Pedido
+from ingressos.servicos import ServicoDePedidos
+
+
+class RepositorioEmMemoria:
+    def __init__(self, *pedidos: Pedido) -> None:
+        self._pedidos = {p.id: p for p in pedidos}
+
+    def buscar(self, pedido_id: int) -> Pedido:
+        return self._pedidos[pedido_id]
+
+    def salvar(self, pedido: Pedido) -> None:
+        self._pedidos[pedido.id] = pedido
+
+
+class NotificadorEspiao:
+    def __init__(self) -> None:
+        self.enviadas: list[tuple[str, str, str]] = []
+
+    def notificar(self, destinatario: str, assunto: str, corpo: str) -> None:
+        self.enviadas.append((destinatario, assunto, corpo))
+
+
+def test_meia_paga_metade_e_cliente_e_avisado():
+    pedido = Pedido(1, "ana@exemplo.com", "meia", Decimal("100"), 2)
+    repositorio = RepositorioEmMemoria(pedido)
+    notificador = NotificadorEspiao()
+
+    ServicoDePedidos(repositorio, notificador).finalizar(1)
+
+    assert repositorio.buscar(1).total == Decimal("100")
+    assert repositorio.buscar(1).status == "pago"
+    assert notificador.enviadas[0][0] == "ana@exemplo.com"
+```
+
+Os dublês não herdam de nada e não usam biblioteca de mock. Eles satisfazem os protocolos porque têm os métodos certos, e o mypy confirma isso ao verificar a chamada do construtor.
+
+## Protocol ou ABC
+
+Python oferece duas formas de declarar um contrato, e a entrevista costuma perguntar a diferença.
+
+| | `typing.Protocol` | `abc.ABC` com `@abstractmethod` |
+|---|---|---|
+| Tipagem | Estrutural: basta ter os métodos | Nominal: precisa herdar |
+| Quando o erro aparece | No verificador de tipos (mypy, pyright) | Em tempo de execução, ao instanciar classe incompleta |
+| Código compartilhado | Não é o objetivo | Sim, métodos concretos na base |
+| Classes de terceiros | Servem sem alteração | Precisam de adaptador ou `register` |
+| Checagem com `isinstance` | Só com `@runtime_checkable`, e apenas a presença dos métodos | Funciona normalmente |
+
+Use `Protocol` como padrão para portas (repositórios, notificadores, gateways): o acoplamento é mínimo e os dublês de teste ficam triviais. Use `ABC` quando houver comportamento comum a herdar, como num Template Method:
+
+```python
+from abc import ABC, abstractmethod
+
+
+class NotificadorBase(ABC):
+    def notificar(self, destinatario: str, assunto: str, corpo: str) -> None:
+        if not destinatario:
+            raise ValueError("destinatário obrigatório")
+        self._enviar(destinatario, assunto, corpo)
+
+    @abstractmethod
+    def _enviar(self, destinatario: str, assunto: str, corpo: str) -> None: ...
+```
+
+Aqui a validação vive na base e cada canal implementa só `_enviar`. Tentar instanciar uma subclasse que esqueceu `_enviar` levanta `TypeError` na hora, sem depender de verificador de tipos. Sem mypy ou pyright no CI, aliás, um `Protocol` é só documentação: a garantia dele vem da análise estática.
+
+## Quando SOLID vira excesso
+
+Os princípios reduzem o custo de mudança ao preço de mais indireção. Quando a mudança não vem, só sobra o preço. Sinais de que você passou do ponto:
+
+- **Interface com uma única implementação e nenhum dublê.** Se nada troca aquela peça, nem em teste, o `Protocol` só acrescenta um arquivo para navegar.
+- **Classes de um método só, sem estado**, com nomes como `CalculadorDeTotalDePedidoService`. Em Python isso é uma função.
+- **Camadas que só repassam.** Um `Manager` que chama um `Service` que chama um `Handler` com os mesmos argumentos.
+- **Fábricas e contêineres de injeção num CRUD.** Um projeto Django pequeno com `ModelViewSet` não precisa de repositório por cima do ORM. O ORM já é a abstração de persistência, e trocar de banco relacional é configuração.
+- **Para entender uma regra simples, você abre oito arquivos.** Legibilidade local também é qualidade.
+
+O contrapeso tem nome: YAGNI (você não vai precisar disso) e KISS. Uma heurística que funciona bem: comece com o código direto, isole apenas as bordas que atrapalham teste (rede, relógio, e-mail, gateways de pagamento) e extraia as demais abstrações quando a segunda variação concreta aparecer. Refatorar para um ponto de extensão com dois exemplos reais na mão produz uma abstração melhor do que adivinhar com um.
+
+<Callout type="tip" title="Onde SOLID mais se paga">
+O retorno é maior nas regras que mudam com frequência e custam caro quando quebram: preço, estoque, pagamento, ciclo de vida do pedido. Scripts, migrações de dados, views de CRUD e código de cola raramente justificam o investimento.
+</Callout>
+
+## Na entrevista
+
+**Explique SRP sem dizer "uma classe faz uma coisa só".** Uma classe deve ter um único motivo para mudar, ou seja, responder a um único grupo de interesse. Persistência, regra de preço e notificação mudam por razões diferentes e em momentos diferentes, então ficam separadas. O critério prático é coesão: métodos que usam os mesmos dados e mudam juntos.
+
+**Como você aplica OCP em Python sem criar uma hierarquia de classes?** Com um registro de funções ou de objetos que seguem um `Protocol`, indexado pela chave da variação. Adicionar um caso é registrar uma entrada nova, sem editar os existentes. Classe só entra quando a estratégia tem estado ou mais de uma operação.
+
+**Dê um exemplo de violação de Liskov.** Uma subclasse que sobrescreve um método herdado para lançar `NotImplementedError`, ou que exige mais do que a base exigia. O código que recebe a base quebra ao receber a subclasse, e a "correção" com `isinstance` espalha o problema. A saída é rever a herança, geralmente trocando por composição ou por um contrato menor.
+
+**Qual a diferença entre inversão de dependência e injeção de dependência?** Inversão é o princípio de design: a regra de negócio depende de uma abstração que ela mesma define, e a infraestrutura implementa. Injeção é o mecanismo de entregar a implementação de fora, normalmente pelo construtor. Dá para injetar sem inverter (injetando a classe concreta) e os dois juntos é que trazem a testabilidade.
+
+**Protocol ou ABC?** `Protocol` para contratos puros, com tipagem estrutural verificada pelo mypy, sem obrigar herança. `ABC` quando há implementação compartilhada ou quando quero falha em tempo de execução ao instanciar uma classe incompleta.
+
+**Quando você não aplicaria SOLID?** Em código pequeno, estável ou descartável, e sempre que a abstração não tiver uma segunda implementação nem facilitar teste. Abstração tem custo de leitura. Prefiro extrair quando a segunda variação aparece.
+
+## Pratique
+
+1. Pegue a maior função do seu projeto `ingressos` e liste, em comentário, os motivos distintos pelos quais ela muda. Separe cada motivo num módulo e deixe a função original como orquestradora.
+2. Implemente as políticas de preço com um registro e adicione `Cortesia` (total zero) e `LoteAntecipado` (desconto percentual configurável) sem alterar nenhuma política existente. Escreva um teste por política.
+3. Defina os protocolos `RepositorioDePedidos` e `Notificador`, injete-os em `ServicoDePedidos` e escreva testes do fluxo de finalização e de cancelamento (que devolve o estoque) usando dublês em memória.
+4. Rode `mypy --strict` no pacote e corrija os erros. Remova de propósito um método de um dublê e confirme que o mypy acusa a incompatibilidade com o protocolo.
+5. Revise o resultado procurando excesso: toda abstração que tiver uma só implementação e nenhum dublê deve ser removida ou justificada no README.
+
+<Quiz question="Uma função recebe um Setor e chama reservar(2). Com SetorNumerado, que herda de Setor, ela lança NotImplementedError. Qual princípio foi violado?" options={["Responsabilidade única","Aberto/fechado","Substituição de Liskov","Segregação de interfaces"]} answer={2} explanation="O subtipo não pode ser usado no lugar do tipo base sem quebrar o chamador. A correção é rever a herança, não espalhar isinstance." />
+
+<Quiz question="Qual a diferença central entre typing.Protocol e abc.ABC?" options={["Protocol usa tipagem estrutural e não exige herança; ABC é nominal e exige herdar","Protocol só funciona em tempo de execução; ABC só no mypy","ABC não permite métodos concretos; Protocol permite","Não há diferença prática, são sinônimos"]} answer={0} explanation="Uma classe satisfaz um Protocol por ter os métodos com as assinaturas certas, verificado estaticamente. Uma ABC exige herança e falha ao instanciar subclasse incompleta." />
+
+<Quiz question="Qual destes é sinal de excesso de abstração?" options={["Um Protocol de notificador com implementações de e-mail e SMS","Um repositório em memória usado nos testes","Uma política de preço por tipo de ingresso","Uma interface com uma única implementação, sem dublê de teste e sem previsão de troca"]} answer={3} explanation="Abstração que nada substitui, nem em teste, só acrescenta indireção. Extraia quando houver a segunda variação concreta." />
+
+## Base no CodeForge
+
+- [SRP](/learn/lld/srp), [OCP](/learn/lld/ocp), [LSP](/learn/lld/lsp), [ISP](/learn/lld/isp) e [DIP](/learn/lld/dip): cada princípio em profundidade no curso de Low Level Design.
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia) e [Composição sobre herança](/learn/lld/composicao-sobre-heranca): as duas técnicas que mais aparecem nas refatorações deste capítulo.
+- [YAGNI](/learn/lld/yagni) e [KISS](/learn/lld/kiss): o contrapeso para não abstrair cedo demais.
+- [Strategy](/learn/lld/strategy) e [Repository](/learn/lld/repository): os padrões por trás das políticas de preço e do repositório de pedidos.
+- [Python: Fundamentos e Padrões de Arquitetura de Software](/learn/carreira-python/python-fundamentos-padroes-arquitetura-software): onde as portas e adaptadores se encaixam na arquitetura.
+
+## Referências
+
+- [Python: typing.Protocol](https://docs.python.org/3/library/typing.html#typing.Protocol)
+- [Python: abc, Abstract Base Classes](https://docs.python.org/3/library/abc.html)
+- [PEP 544: Protocols, structural subtyping](https://peps.python.org/pep-0544/)
+- [mypy: Protocols and structural subtyping](https://mypy.readthedocs.io/en/stable/protocols.html)

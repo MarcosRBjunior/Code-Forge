@@ -1,0 +1,395 @@
+---
+title: "Mensageria com Python e RabbitMQ: Integração assíncrona entre serviços"
+kind: lesson
+---
+
+Quando um pedido é pago, a plataforma de ingressos precisa gerar os ingressos, mandar o e-mail com os PDFs e atualizar o painel financeiro. Se o serviço `pedidos` fizer três chamadas HTTP em sequência, o cliente espera por todas, e uma queda de `notificacoes` faz o pagamento parecer falho. Com um broker de mensagens no meio, `pedidos` publica "pedido pago" e segue a vida; cada interessado recebe a sua cópia quando puder, e mensagens esperam na fila enquanto um consumidor está fora do ar.
+
+O RabbitMQ é o broker mais comum para esse papel: implementa o protocolo AMQP 0-9-1, roteia mensagens com regras flexíveis e confirma cada entrega individualmente. Este capítulo mostra o modelo de exchanges, filas e bindings, e então o que separa um exemplo de tutorial de uma integração que não perde nem duplica trabalho: confirmações dos dois lados, durabilidade, prefetch, dead letter, retry com atraso e consumidores idempotentes, com `pika` e `aio-pika`.
+
+**Você vai aprender:**
+
+- Subir o RabbitMQ com Docker Compose e entender exchanges, filas e bindings
+- Escolher entre exchanges direct, topic e fanout para cada caso
+- Publicar com durabilidade e publisher confirms, e consumir com ack manual e prefetch
+- Tratar falhas com dead letter exchange e retry com atraso
+- Escrever consumidores idempotentes e assíncronos com `aio-pika`
+
+## Subindo o RabbitMQ
+
+```yaml
+# compose.yaml
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # painel de gerenciamento
+    environment:
+      RABBITMQ_DEFAULT_USER: ingressos
+      RABBITMQ_DEFAULT_PASS: ingressos
+    volumes:
+      - rabbitmq-dados:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      retries: 5
+
+volumes:
+  rabbitmq-dados:
+```
+
+```bash
+docker compose up -d
+python -m venv .venv
+source .venv/bin/activate
+pip install pika aio-pika
+```
+
+O painel em `http://localhost:15672` mostra filas, taxas de entrada e saída e mensagens pendentes; use-o durante todo o capítulo para enxergar o que o código faz. O volume é necessário porque o RabbitMQ guarda as filas e mensagens persistentes em disco, e o nome do nó (derivado do hostname do contêiner) precisa ser estável entre reinícios.
+
+## O modelo AMQP: exchanges, filas e bindings
+
+No AMQP o produtor **nunca publica direto numa fila**. Ele publica numa **exchange**, com uma **routing key**; a exchange consulta seus **bindings** (regras que a ligam a filas) e copia a mensagem para cada fila que casar. Consumidores leem das filas. Esse desacoplamento é o que permite acrescentar interessados sem mexer no produtor: basta uma nova fila com um novo binding.
+
+| Tipo de exchange | Regra de roteamento | Uso típico |
+|---|---|---|
+| direct | Routing key igual à chave do binding | Comandos para um destino específico (`gerar_pdf`) |
+| topic | Padrão com `*` (uma palavra) e `#` (zero ou mais) | Eventos por categoria (`pedido.*`, `#.cancelado`) |
+| fanout | Ignora a chave, copia para todas as filas ligadas | Broadcast (invalidar caches de todas as instâncias) |
+| headers | Casa por cabeçalhos da mensagem | Raro; roteamento por vários atributos |
+
+Existe ainda a **exchange padrão** (nome vazio), do tipo direct, à qual toda fila está ligada pelo próprio nome. Publicar nela com `routing_key="gerar_pdf"` entrega na fila `gerar_pdf`, e é por isso que tutoriais parecem publicar "direto na fila".
+
+Para a plataforma, uma exchange topic `ingressos.eventos` funciona bem:
+
+| Fila | Binding | Recebe |
+|---|---|---|
+| `notificacoes.pedidos` | `pedido.*` | Todos os eventos de pedido |
+| `financeiro.pagamentos` | `pedido.pago` e `pedido.estornado` | Só o que mexe em receita |
+| `catalogo.estoque` | `pedido.cancelado` e `pedido.expirado` | Devolução de estoque |
+
+Duas instâncias do serviço `notificacoes` lendo da mesma fila **competem** pelas mensagens (cada mensagem vai para uma delas), o que escala o processamento. Serviços diferentes têm **filas diferentes** e cada um recebe a sua cópia, o que dá o pub/sub.
+
+## Publicando com durabilidade e confirms
+
+A topologia (exchanges, filas, bindings) é declarada pelo código, e as declarações são idempotentes: declarar algo que já existe com os mesmos argumentos não faz nada, e com argumentos diferentes gera erro. Um módulo comum declara tudo:
+
+```python
+# ingressos/mensageria/topologia.py
+import pika
+
+EXCHANGE = "ingressos.eventos"
+EXCHANGE_DLX = "ingressos.dlx"
+
+
+def declarar_topologia(canal: pika.adapters.blocking_connection.BlockingChannel) -> None:
+    canal.exchange_declare(EXCHANGE, exchange_type="topic", durable=True)
+    canal.exchange_declare(EXCHANGE_DLX, exchange_type="topic", durable=True)
+
+    canal.queue_declare(
+        "notificacoes.pedidos",
+        durable=True,
+        arguments={
+            "x-queue-type": "quorum",
+            "x-dead-letter-exchange": EXCHANGE_DLX,
+            "x-delivery-limit": 5,
+        },
+    )
+    canal.queue_bind("notificacoes.pedidos", EXCHANGE, routing_key="pedido.*")
+
+    canal.queue_declare("notificacoes.pedidos.dlq", durable=True, arguments={"x-queue-type": "quorum"})
+    canal.queue_bind("notificacoes.pedidos.dlq", EXCHANGE_DLX, routing_key="#")
+```
+
+O produtor:
+
+```python
+# ingressos/mensageria/produtor.py
+import json
+import uuid
+from datetime import UTC, datetime
+
+import pika
+
+from ingressos.mensageria.topologia import EXCHANGE, declarar_topologia
+
+parametros = pika.URLParameters("amqp://ingressos:ingressos@localhost:5672/%2F")
+conexao = pika.BlockingConnection(parametros)
+canal = conexao.channel()
+declarar_topologia(canal)
+canal.confirm_delivery()
+
+
+def publicar_evento(tipo: str, dados: dict) -> None:
+    corpo = {
+        "id": str(uuid.uuid4()),
+        "tipo": tipo,
+        "ocorrido_em": datetime.now(UTC).isoformat(),
+        "dados": dados,
+    }
+    canal.basic_publish(
+        exchange=EXCHANGE,
+        routing_key=tipo,
+        body=json.dumps(corpo).encode(),
+        properties=pika.BasicProperties(
+            content_type="application/json",
+            delivery_mode=pika.DeliveryMode.Persistent,
+            message_id=corpo["id"],
+        ),
+        mandatory=True,
+    )
+
+
+publicar_evento("pedido.pago", {"pedido_id": 1041, "cliente_id": 88})
+conexao.close()
+```
+
+Três camadas de garantia estão nesse trecho:
+
+- **Durabilidade**: exchange e fila `durable=True` sobrevivem ao reinício do broker; `delivery_mode` persistente faz a mensagem ser gravada em disco. Faltando qualquer uma das duas, uma reinicialização perde mensagens. (Em filas quorum, as mensagens são sempre persistidas.)
+- **Publisher confirms**: com `confirm_delivery()`, cada `basic_publish` do `pika` bloqueante espera o broker confirmar que assumiu a mensagem. Se o broker recusar, o método lança `pika.exceptions.NackError`. Sem confirms, o produtor não sabe se a mensagem chegou.
+- **`mandatory=True`**: se nenhuma fila casar com a routing key (um binding esquecido), a mensagem volta e o `pika` lança `UnroutableError`, em vez de ser descartada em silêncio.
+
+Esperar a confirmação de cada mensagem reduz a vazão; para volumes altos, publica-se em lotes e confirma-se o lote, o que fica mais natural no cliente assíncrono. E o confirm não resolve a escrita dupla com o banco: para garantir que "pedido pago no banco" e "evento publicado" andem juntos, a publicação sai de uma tabela de outbox, como no capítulo de padrões de integração.
+
+## Consumindo: ack, nack e prefetch
+
+```python
+# ingressos/notificacoes/consumidor.py
+import json
+import logging
+
+import pika
+
+from ingressos.mensageria.topologia import declarar_topologia
+from ingressos.notificacoes.servico import ErroPermanente, enviar_email_do_evento
+
+logger = logging.getLogger("ingressos.notificacoes")
+
+conexao = pika.BlockingConnection(
+    pika.URLParameters("amqp://ingressos:ingressos@localhost:5672/%2F")
+)
+canal = conexao.channel()
+declarar_topologia(canal)
+canal.basic_qos(prefetch_count=10)
+
+
+def ao_receber(ch, metodo, propriedades, corpo: bytes) -> None:
+    try:
+        evento = json.loads(corpo)
+        enviar_email_do_evento(evento)
+    except (json.JSONDecodeError, ErroPermanente):
+        logger.exception("mensagem_rejeitada", extra={"campos": {"id": propriedades.message_id}})
+        ch.basic_nack(delivery_tag=metodo.delivery_tag, requeue=False)
+    except Exception:
+        logger.exception("falha_temporaria")
+        ch.basic_nack(delivery_tag=metodo.delivery_tag, requeue=True)
+    else:
+        ch.basic_ack(delivery_tag=metodo.delivery_tag)
+
+
+canal.basic_consume(queue="notificacoes.pedidos", on_message_callback=ao_receber)
+canal.start_consuming()
+```
+
+Com o ack manual (o padrão do `basic_consume`, já que `auto_ack` vale `False`), o broker só remove a mensagem quando recebe o `basic_ack`. Se o consumidor cair antes, a conexão fecha e a mensagem volta para a fila e é entregue a outro consumidor, com a flag `redelivered` marcada. Isso é entrega **pelo menos uma vez**: nada se perde, mas a mesma mensagem pode ser processada duas vezes, se o processo morrer depois de enviar o e-mail e antes do ack.
+
+O `basic_nack` com `requeue=True` devolve a mensagem para a fila; com `requeue=False`, ela é descartada ou, se a fila tiver dead letter exchange, desviada para lá. Separar os dois casos é essencial: um JSON inválido nunca vai dar certo, e devolvê-lo à fila cria um laço infinito que consome CPU e bloqueia as demais (a chamada mensagem envenenada).
+
+O **prefetch** (`basic_qos`) limita quantas mensagens sem ack cada consumidor pode ter ao mesmo tempo. Sem limite, o broker empurra a fila inteira para o primeiro consumidor que conectar, e os outros ficam ociosos. Um valor baixo (1 a 10) distribui bem tarefas lentas; um valor mais alto (50 a 300) aumenta a vazão de mensagens rápidas. Ajuste medindo.
+
+<Callout type="warning" title="Uma conexão do pika por thread">
+O `BlockingConnection` não é seguro para uso entre threads, e o callback roda na mesma thread do laço de I/O. Um processamento demorado dentro do callback impede o envio de heartbeats, e o broker derruba a conexão (devolvendo as mensagens). Para trabalho pesado, use uma conexão por thread, `connection.add_callback_threadsafe` para enviar o ack de outra thread, ou o `aio-pika` com `asyncio`.
+</Callout>
+
+## Dead letter e retry com atraso
+
+Mensagens que não podem ser processadas precisam ir para algum lugar onde alguém as veja. A **dead letter exchange** (DLX) é configurada na fila (argumento `x-dead-letter-exchange`) e recebe mensagens que foram rejeitadas sem reenfileiramento, que expiraram por TTL ou que excederam o tamanho máximo da fila. Ligada a uma fila `.dlq`, ela vira o arquivo de mensagens com problema, com alertas sobre o tamanho dela e uma ferramenta para reprocessar depois da correção.
+
+Para falhas temporárias (o provedor de e-mail fora do ar), devolver imediatamente à fila só repete a falha centenas de vezes por segundo. O padrão é o **retry com atraso** por filas de espera com TTL: a mensagem que falhou é publicada numa fila sem consumidores, com prazo de expiração; ao expirar, a DLX dessa fila a devolve à fila principal.
+
+```python
+def declarar_retry(canal) -> None:
+    canal.exchange_declare("ingressos.retry", exchange_type="direct", durable=True)
+    for segundos in (10, 60, 300):
+        nome = f"notificacoes.pedidos.espera.{segundos}s"
+        canal.queue_declare(
+            nome,
+            durable=True,
+            arguments={
+                "x-message-ttl": segundos * 1000,
+                "x-dead-letter-exchange": "",
+                "x-dead-letter-routing-key": "notificacoes.pedidos",
+            },
+        )
+        canal.queue_bind(nome, "ingressos.retry", routing_key=f"espera.{segundos}s")
+
+
+ESPERAS = (10, 60, 300)
+
+
+def agendar_retry(canal, propriedades, corpo: bytes) -> bool:
+    cabecalhos = dict(propriedades.headers or {})
+    tentativa = int(cabecalhos.get("x-tentativa", 0))
+    if tentativa >= len(ESPERAS):
+        return False
+    cabecalhos["x-tentativa"] = tentativa + 1
+    canal.basic_publish(
+        exchange="ingressos.retry",
+        routing_key=f"espera.{ESPERAS[tentativa]}s",
+        body=corpo,
+        properties=pika.BasicProperties(
+            content_type=propriedades.content_type,
+            delivery_mode=pika.DeliveryMode.Persistent,
+            message_id=propriedades.message_id,
+            headers=cabecalhos,
+        ),
+    )
+    return True
+```
+
+No consumidor, a falha temporária passa a ser: se `agendar_retry` devolver `True`, faz `basic_ack` na mensagem original (a cópia já está na espera); se devolver `False`, faz `basic_nack(requeue=False)` e a mensagem segue para a DLQ. A espera cresce a cada tentativa (10 s, 1 min, 5 min), o que dá ao serviço externo tempo de voltar. A DLX da fila de espera usa a exchange padrão (nome vazio) com a routing key igual ao nome da fila principal, que é a forma de devolver a mensagem para ela. Uma fila de espera por intervalo é necessária porque o TTL só é avaliado na cabeça da fila: misturar prazos numa fila só faria mensagens curtas esperarem atrás das longas. Existe também um plugin de exchange com atraso, mas ele não faz parte da instalação padrão.
+
+Em filas quorum, o argumento `x-delivery-limit` complementa isso: quando uma mensagem é devolvida mais vezes que o limite (por quedas repetidas do consumidor, por exemplo), o broker a manda para a DLX. Nas versões 4.x do RabbitMQ, filas quorum já vêm com um limite padrão de 20 entregas.
+
+## Filas quorum e alta disponibilidade
+
+As filas clássicas guardam os dados num único nó; se ele cair, a fila fica indisponível. As **filas quorum** replicam cada fila em vários nós de um cluster usando o algoritmo de consenso Raft: uma mensagem só é confirmada ao produtor quando a maioria das réplicas a gravou, e a fila continua disponível enquanto a maioria estiver de pé.
+
+| | Fila clássica | Fila quorum |
+|---|---|---|
+| Replicação | Não (o espelhamento antigo foi removido no 4.0) | Sim, por Raft |
+| Persistência | Opcional por mensagem | Sempre |
+| Limite de reentregas e dead letter | Sem limite de reentrega | `x-delivery-limit` |
+| Filas exclusivas e temporárias | Sim | Não |
+| Uso recomendado | Filas temporárias, dados descartáveis | Tudo que não pode ser perdido |
+
+A regra para dados de negócio é simples: filas quorum, declaradas com `x-queue-type` igual a `quorum`, num cluster de três ou cinco nós. O tipo de uma fila não muda depois de criada; migrar exige criar outra e mover os bindings. Para volumes muito altos com necessidade de reler o histórico, o RabbitMQ oferece também **streams**, um tipo de fila em formato de log, conceito que o capítulo de Kafka explora a fundo.
+
+## Consumidor idempotente e assíncrono com aio-pika
+
+Como a entrega é pelo menos uma vez, todo consumidor precisa tolerar duplicatas. O `message_id` publicado pelo produtor é a chave: o consumidor o registra numa tabela com restrição de unicidade, na mesma transação do efeito. Em FastAPI e serviços `asyncio`, o `aio-pika` oferece a mesma API de forma assíncrona e com reconexão automática:
+
+```python
+# ingressos/pedidos/consumidor_estoque.py
+import asyncio
+import json
+
+import aio_pika
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+engine = create_async_engine("postgresql+psycopg://ingressos:ingressos@localhost/catalogo")
+Sessao = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def devolver_estoque(session: AsyncSession, evento: dict) -> None:
+    for item in evento["dados"]["itens"]:
+        await session.execute(
+            text("UPDATE setores SET reservados = reservados - :qtd WHERE id = :setor"),
+            {"qtd": item["quantidade"], "setor": item["setor_id"]},
+        )
+
+
+async def processar(mensagem: aio_pika.abc.AbstractIncomingMessage) -> None:
+    async with mensagem.process(requeue=False):
+        evento = json.loads(mensagem.body)
+        async with Sessao() as session, session.begin():
+            inserido = await session.execute(
+                text(
+                    "INSERT INTO mensagens_processadas (id) VALUES (:id) "
+                    "ON CONFLICT (id) DO NOTHING"
+                ),
+                {"id": mensagem.message_id},
+            )
+            if inserido.rowcount == 0:
+                return
+            await devolver_estoque(session, evento)
+
+
+async def main() -> None:
+    conexao = await aio_pika.connect_robust("amqp://ingressos:ingressos@localhost/")
+    async with conexao:
+        canal = await conexao.channel()
+        await canal.set_qos(prefetch_count=20)
+        fila = await canal.declare_queue(
+            "catalogo.estoque",
+            durable=True,
+            arguments={"x-queue-type": "quorum", "x-dead-letter-exchange": "ingressos.dlx"},
+        )
+        exchange = await canal.declare_exchange(
+            "ingressos.eventos", aio_pika.ExchangeType.TOPIC, durable=True
+        )
+        await fila.bind(exchange, routing_key="pedido.cancelado")
+        await fila.bind(exchange, routing_key="pedido.expirado")
+        await fila.consume(processar)
+        await asyncio.Future()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+O gerenciador `mensagem.process(requeue=False)` faz o ack quando o bloco termina sem erro e o nack sem reenfileirar (portanto, para a DLX) quando uma exceção escapa. O `connect_robust` reconecta e redeclara a topologia se a conexão cair. O detalhe que garante a idempotência é a ordem: registro da mensagem e devolução do estoque estão na mesma transação, então ou os dois acontecem ou nenhum. Se a transação confirmar e o ack se perder, a reentrega encontra o id já gravado e não devolve o estoque duas vezes. Note que "devolver estoque" é uma operação não idempotente por natureza (subtrai), e é justamente por isso que precisa da tabela.
+
+Para publicar com `aio-pika`, com confirmações (ativadas por padrão no canal):
+
+```python
+async def publicar(canal: aio_pika.abc.AbstractChannel, tipo: str, corpo: bytes, msg_id: str) -> None:
+    exchange = await canal.get_exchange("ingressos.eventos")
+    await exchange.publish(
+        aio_pika.Message(
+            body=corpo,
+            content_type="application/json",
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            message_id=msg_id,
+        ),
+        routing_key=tipo,
+    )
+```
+
+<Callout type="tip" title="Ordem não é garantida na prática">
+Uma fila entrega em ordem, mas com vários consumidores, prefetch acima de 1, reentregas e retry com atraso, a ordem de processamento se embaralha. Desenhe os consumidores para tolerar isso: carregue no evento a versão do agregado e ignore eventos mais antigos que o estado atual.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre exchange direct, topic e fanout?** A direct entrega às filas cujo binding tem exatamente a routing key da mensagem; a topic casa por padrões com `*` e `#`, útil para eventos categorizados; a fanout ignora a chave e copia para todas as filas ligadas. Em todas, o produtor publica na exchange, nunca na fila.
+
+**Como você garante que nenhuma mensagem se perca?** Fila e exchange duráveis, mensagens persistentes (ou fila quorum), publisher confirms e `mandatory` no produtor, ack manual depois do processamento no consumidor, e outbox para não perder o evento entre o banco e o broker. Para tolerar falha de nó, filas quorum num cluster.
+
+**O que é prefetch e como escolher o valor?** É o número máximo de mensagens sem ack que o broker entrega a um consumidor. Valor baixo distribui melhor trabalho lento entre consumidores; valor alto aumenta a vazão de mensagens rápidas. Sem prefetch, um consumidor pode receber tudo e deixar os outros ociosos.
+
+**Como fazer retry sem travar a fila?** Para erro permanente, nack sem reenfileirar e dead letter. Para erro temporário, publicar a mensagem em filas de espera com TTL crescente, cuja dead letter devolve à fila principal, e contar tentativas num cabeçalho até mandar para a DLQ.
+
+**Por que o consumidor precisa ser idempotente?** Porque o ack pode se perder depois do processamento e a mensagem é reentregue. Registrar o `message_id` numa tabela única na mesma transação do efeito faz a segunda entrega ser ignorada.
+
+## Pratique
+
+1. Suba o RabbitMQ com o Compose deste capítulo e declare a exchange `ingressos.eventos` com as três filas da tabela de bindings; publique eventos e confira no painel em quais filas cada um chegou.
+2. Conecte o publicador de outbox do serviço `pedidos` ao RabbitMQ, com publisher confirms e `mandatory`, e verifique o comportamento ao publicar uma routing key sem binding.
+3. Escreva o consumidor de `notificacoes` com ack manual, prefetch 10, distinção entre erro permanente e temporário, e retry com filas de espera de 10 s, 1 min e 5 min.
+4. Implemente o consumidor de devolução de estoque com `aio-pika` e a tabela `mensagens_processadas`, e prove com um teste que a mesma mensagem entregue duas vezes devolve o estoque uma vez só.
+5. Crie um script que lista as mensagens da DLQ e republica as escolhidas na exchange original.
+
+<Quiz question="Uma mensagem com JSON inválido deve ser tratada com:" options={["basic_nack com requeue igual a True","basic_ack sem processar e sem registro","basic_nack com requeue igual a False, indo para a dead letter","Fechar a conexão para forçar a reentrega"]} answer={2} explanation="Erro permanente nunca vai dar certo; reenfileirar cria um laço infinito. Rejeitar sem reenfileirar manda a mensagem para a DLX, onde pode ser analisada." />
+
+<Quiz question="Num exchange topic, qual binding recebe as routing keys pedido.pago e pedido.cancelado, mas não pagamento.estornado?" options={["pedido.*","#.pago","*.*.*","pagamento.#"]} answer={0} explanation="O asterisco casa exatamente uma palavra. pedido.* casa pedido.pago e pedido.cancelado; pagamento.estornado não começa com pedido." />
+
+<Quiz question="Qual a principal vantagem de uma fila quorum sobre uma fila clássica?" options={["Permite filas exclusivas e temporárias","Replica as mensagens em vários nós com consenso, tolerando a queda de um deles","Dispensa o ack do consumidor","Garante entrega exatamente uma vez"]} answer={1} explanation="Filas quorum usam Raft para replicar cada mensagem na maioria dos nós antes de confirmar. A fila sobrevive à queda de nós enquanto houver maioria." />
+
+## Base no CodeForge
+
+- [Padrões de Integração em Sistemas Distribuídos](/learn/carreira-python/padroes-integracao-sistemas-distribuidos): outbox, idempotência e saga, que este capítulo põe em prática.
+- [Filas de mensagens](/learn/system-design/filas-de-mensagens) e [Message brokers](/learn/system-design/message-brokers): os conceitos gerais.
+- [Dead letter queues](/learn/system-design/dead-letter-queues) e [Semânticas de entrega](/learn/system-design/semanticas-de-entrega): o que fazer com falhas e as garantias possíveis.
+- [Produtor e consumidor](/learn/concorrencia/produtor-consumidor): o padrão de concorrência por trás das filas.
+- [Microsserviços na prática com RabbitMQ](/learn/carreira-java/microsservicos-pratica-mensageria-rabbitmq): o mesmo broker com Spring.
+
+## Referências
+
+- [RabbitMQ: AMQP 0-9-1 Model Explained](https://www.rabbitmq.com/tutorials/amqp-concepts)
+- [RabbitMQ: Consumer Acknowledgements and Publisher Confirms](https://www.rabbitmq.com/docs/confirms)
+- [RabbitMQ: Quorum Queues](https://www.rabbitmq.com/docs/quorum-queues)
+- [RabbitMQ: Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx)

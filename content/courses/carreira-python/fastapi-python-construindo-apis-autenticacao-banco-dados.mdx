@@ -1,0 +1,619 @@
+---
+title: "FastAPI e Python: Construindo APIs com autenticação e banco de dados"
+kind: lesson
+---
+
+O site em Django atende quem compra pelo navegador. Mas a plataforma de ingressos também precisa de uma API para o aplicativo móvel e para os parceiros que revendem ingressos: JSON entrando e saindo, autenticação por token em vez de cookie, documentação que os parceiros consigam ler sem perguntar nada a você. O FastAPI foi desenhado para isso. Você declara os tipos com type hints, e ele valida a entrada, serializa a saída, gera a documentação OpenAPI e injeta dependências, tudo a partir da mesma declaração.
+
+Neste capítulo você constrói a API de catálogo e reservas com FastAPI, Pydantic 2, SQLAlchemy 2.0 e Alembic, protege as rotas com OAuth2 e JWT e escreve testes que trocam o banco e o usuário logado sem tocar no código da aplicação.
+
+**Você vai aprender:**
+
+- Declarar rotas, parâmetros e modelos Pydantic 2 para entrada e saída
+- Usar injeção de dependências com `Annotated` e `Depends`, inclusive a sessão de banco por requisição
+- Modelar com SQLAlchemy 2.0 (`Mapped`, `mapped_column`, `select`) e versionar o esquema com Alembic
+- Autenticar com o fluxo OAuth2 password, JWT via PyJWT e senhas com hash Argon2
+- Organizar em routers, tratar erros e testar com `TestClient` e override de dependências
+
+## Projeto e primeira rota
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install "fastapi[standard]" "sqlalchemy~=2.0" "psycopg[binary]~=3.2" alembic \
+    pydantic-settings pyjwt "pwdlib[argon2]" pytest
+```
+
+O extra `standard` traz o uvicorn, o `python-multipart` (necessário para o formulário de login) e o comando `fastapi`. A estrutura:
+
+```text
+api/
+  __init__.py
+  main.py
+  config.py
+  db.py
+  modelos.py
+  esquemas.py
+  seguranca.py
+  rotas/
+    __init__.py
+    auth.py
+    eventos.py
+migrations/
+tests/
+alembic.ini
+pyproject.toml
+```
+
+```python
+# api/config.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="INGRESSOS_")
+
+    database_url: str = "postgresql+psycopg://postgres:ingressos@localhost:5432/ingressos_api"
+    jwt_segredo: str
+    jwt_minutos: int = 30
+
+
+settings = Settings()
+```
+
+`BaseSettings` lê as variáveis de ambiente com o prefixo (`INGRESSOS_JWT_SEGREDO`), converte e valida os tipos. `jwt_segredo` não tem padrão: sem a variável, a aplicação nem sobe. É a mesma regra da `SECRET_KEY` no Django.
+
+Rode com `fastapi dev api/main.py` e abra `/docs`: o Swagger UI é gerado do código e sempre reflete o que a API aceita.
+
+## Banco com SQLAlchemy 2.0
+
+O SQLAlchemy 2.0 declara modelos com anotações de tipo. `Mapped[str]` vira coluna `NOT NULL`; `Mapped[str | None]` vira coluna anulável.
+
+```python
+# api/modelos.py
+from datetime import datetime
+
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Evento(Base):
+    __tablename__ = "eventos"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nome: Mapped[str] = mapped_column(String(120))
+    data: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    local: Mapped[str] = mapped_column(String(120), index=True)
+    capacidade: Mapped[int]
+    setores: Mapped[list["Setor"]] = relationship(
+        back_populates="evento", cascade="all, delete-orphan"
+    )
+
+
+class Setor(Base):
+    __tablename__ = "setores"
+    __table_args__ = (
+        UniqueConstraint("evento_id", "nome", name="uq_setor_evento_nome"),
+        CheckConstraint("disponivel >= 0 AND disponivel <= quantidade", name="ck_setor_estoque"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    evento_id: Mapped[int] = mapped_column(ForeignKey("eventos.id", ondelete="CASCADE"))
+    nome: Mapped[str] = mapped_column(String(60))
+    preco_centavos: Mapped[int]
+    quantidade: Mapped[int]
+    disponivel: Mapped[int]
+    evento: Mapped[Evento] = relationship(back_populates="setores")
+
+
+class Usuario(Base):
+    __tablename__ = "usuarios"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True)
+    senha_hash: Mapped[str] = mapped_column(String(255))
+    ativo: Mapped[bool] = mapped_column(default=True)
+    admin: Mapped[bool] = mapped_column(default=False)
+```
+
+A sessão é criada por requisição e fechada ao final, por uma dependência com `yield`:
+
+```python
+# api/db.py
+from collections.abc import Iterator
+from typing import Annotated
+
+from fastapi import Depends
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from api.config import settings
+
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(engine, expire_on_commit=False)
+
+
+def get_session() -> Iterator[Session]:
+    with SessionLocal() as session:
+        yield session
+
+
+SessionDep = Annotated[Session, Depends(get_session)]
+```
+
+O `engine` é único por processo e mantém o pool de conexões. A `Session` é a unidade de trabalho de uma requisição: acumula alterações e só grava no `commit()`. O código depois do `yield` (aqui, a saída do `with`) roda quando a resposta termina, devolvendo a conexão ao pool mesmo se a rota levantar exceção, e uma sessão fechada sem commit descarta o que não foi gravado. `SessionDep` é um apelido: toda rota que declarar um parâmetro desse tipo recebe uma sessão.
+
+## Migrações com Alembic
+
+```bash
+alembic init migrations
+```
+
+No `migrations/env.py` gerado, aponte o Alembic para os metadados dos modelos e para a URL das settings:
+
+```python
+# migrations/env.py (trechos alterados)
+from api.config import settings
+from api.modelos import Base
+
+config.set_main_option("sqlalchemy.url", settings.database_url)
+target_metadata = Base.metadata
+```
+
+```bash
+alembic revision --autogenerate -m "cria eventos, setores e usuarios"
+alembic upgrade head
+alembic downgrade -1
+```
+
+O `--autogenerate` compara os modelos com o banco e escreve a migração, mas **sempre revise o arquivo**: ele não detecta renomeação (gera remoção e criação, perdendo dados), nem algumas mudanças de tipo e de constraints. As migrações vão para o Git e rodam no deploy antes da nova versão subir, como no Django. A diferença é que aqui a ferramenta é separada do framework, e por isso exige essa configuração explícita.
+
+## Modelos Pydantic: o contrato da API
+
+Modelos do banco e modelos da API são coisas diferentes. Os do SQLAlchemy descrevem tabelas; os do Pydantic descrevem o que entra e o que sai. Separá-los impede que `senha_hash` vaze numa resposta e que um cliente defina `admin=True` no cadastro.
+
+```python
+# api/esquemas.py
+from datetime import datetime, timezone
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+
+class SetorCriar(BaseModel):
+    nome: str = Field(min_length=1, max_length=60)
+    preco_centavos: int = Field(ge=0)
+    quantidade: int = Field(gt=0)
+
+
+class EventoCriar(BaseModel):
+    nome: str = Field(min_length=3, max_length=120)
+    data: AwareDatetime
+    local: str = Field(min_length=2, max_length=120)
+    capacidade: int = Field(gt=0)
+    setores: list[SetorCriar] = Field(min_length=1)
+
+    @field_validator("data")
+    @classmethod
+    def no_futuro(cls, valor: datetime) -> datetime:
+        if valor <= datetime.now(timezone.utc):
+            raise ValueError("a data do evento precisa estar no futuro")
+        return valor
+
+
+class SetorLer(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    nome: str
+    preco_centavos: int
+    disponivel: int
+
+
+class EventoLer(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    nome: str
+    data: datetime
+    local: str
+    setores: list[SetorLer]
+
+
+class ReservaCriar(BaseModel):
+    setor_id: int
+    quantidade: int = Field(gt=0, le=6)
+
+
+class UsuarioCriar(BaseModel):
+    email: EmailStr
+    senha: str = Field(min_length=10, max_length=128)
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+```
+
+`from_attributes=True` permite construir o modelo a partir de um objeto do SQLAlchemy, lendo atributos em vez de chaves de dicionário. `EmailStr` exige o pacote `email-validator`, que já vem com `fastapi[standard]`. Um corpo que não respeite o modelo nunca chega à sua função: o FastAPI responde 422 com a lista de campos e motivos.
+
+## Rotas, parâmetros e routers
+
+```python
+# api/rotas/eventos.py
+from typing import Annotated
+
+from fastapi import APIRouter, HTTPException, Query, status
+from sqlalchemy import select, update
+from sqlalchemy.orm import selectinload
+
+from api.db import SessionDep
+from api.esquemas import EventoCriar, EventoLer, ReservaCriar
+from api.modelos import Evento, Setor
+from api.seguranca import AdminDep, UsuarioDep
+
+router = APIRouter(prefix="/eventos", tags=["eventos"])
+
+
+class EstoqueInsuficiente(Exception):
+    pass
+
+
+@router.get("", response_model=list[EventoLer])
+def listar(
+    session: SessionDep,
+    local: str | None = None,
+    limite: Annotated[int, Query(ge=1, le=100)] = 20,
+    deslocamento: Annotated[int, Query(ge=0)] = 0,
+):
+    consulta = select(Evento).options(selectinload(Evento.setores)).order_by(Evento.data)
+    if local:
+        consulta = consulta.where(Evento.local == local)
+    return session.scalars(consulta.limit(limite).offset(deslocamento)).all()
+
+
+@router.get("/{evento_id}", response_model=EventoLer)
+def detalhar(evento_id: int, session: SessionDep):
+    evento = session.get(Evento, evento_id)
+    if evento is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Evento não encontrado")
+    return evento
+
+
+@router.post("", response_model=EventoLer, status_code=status.HTTP_201_CREATED)
+def criar(dados: EventoCriar, session: SessionDep, _: AdminDep):
+    if sum(s.quantidade for s in dados.setores) > dados.capacidade:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Setores excedem a capacidade")
+    evento = Evento(
+        nome=dados.nome, data=dados.data, local=dados.local, capacidade=dados.capacidade,
+        setores=[
+            Setor(nome=s.nome, preco_centavos=s.preco_centavos,
+                  quantidade=s.quantidade, disponivel=s.quantidade)
+            for s in dados.setores
+        ],
+    )
+    session.add(evento)
+    session.commit()
+    return evento
+
+
+@router.post("/{evento_id}/reservas", status_code=status.HTTP_201_CREATED)
+def reservar(evento_id: int, dados: ReservaCriar, session: SessionDep, usuario: UsuarioDep):
+    resultado = session.execute(
+        update(Setor)
+        .where(
+            Setor.id == dados.setor_id,
+            Setor.evento_id == evento_id,
+            Setor.disponivel >= dados.quantidade,
+        )
+        .values(disponivel=Setor.disponivel - dados.quantidade)
+    )
+    if resultado.rowcount == 0:
+        raise EstoqueInsuficiente("Setor inexistente ou sem ingressos suficientes")
+    session.commit()
+    return {"setor_id": dados.setor_id, "quantidade": dados.quantidade, "cliente": usuario.email}
+```
+
+Como o FastAPI decide de onde vem cada parâmetro:
+
+| Declaração | Origem |
+|---|---|
+| Nome presente no caminho (`evento_id`) | Path, convertido para o tipo |
+| Tipo simples fora do caminho (`local: str or None`) | Query string |
+| Modelo Pydantic (`dados: EventoCriar`) | Corpo JSON |
+| `Annotated` com `Depends` | Resultado de uma dependência |
+
+`response_model` filtra e valida a saída: mesmo que o objeto tenha mais atributos, só os campos do modelo saem. `selectinload` carrega os setores de todos os eventos numa segunda consulta com `IN`, o equivalente ao `prefetch_related` do Django; sem ele, cada evento dispararia uma consulta ao serializar `setores`. E a reserva repete a baixa atômica que você já fez no MongoDB e no ORM do Django, agora com `update()` do SQLAlchemy: condição e decremento no mesmo comando.
+
+O `main.py` junta os routers e registra os tratadores de erro:
+
+```python
+# api/main.py
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from api.rotas import auth, eventos
+
+app = FastAPI(title="Ingressos API", version="1.0.0")
+app.include_router(auth.router)
+app.include_router(eventos.router)
+
+
+@app.exception_handler(eventos.EstoqueInsuficiente)
+def estoque_insuficiente(request: Request, exc: eventos.EstoqueInsuficiente) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+```
+
+`HTTPException` serve para erros que a rota decide (404, 403). Exceções de domínio, como `EstoqueInsuficiente`, não deveriam saber de HTTP; o tratador registrado na aplicação faz a tradução. Assim a mesma função de domínio pode ser chamada por um consumidor de fila, sem `HTTPException` no meio.
+
+## Autenticação: OAuth2 password flow com JWT
+
+O fluxo *password* do OAuth2 é o que o FastAPI usa como padrão para APIs próprias: o cliente envia usuário e senha num formulário para `/auth/token` e recebe um access token, que manda no cabeçalho `Authorization: Bearer` nas chamadas seguintes. Ele é adequado quando o cliente é seu (o aplicativo da plataforma). Para parceiros terceiros, o fluxo certo é o authorization code do capítulo de OAuth2 do Django.
+
+```python
+# api/seguranca.py
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from pwdlib import PasswordHash
+from sqlalchemy import select
+
+from api.config import settings
+from api.db import SessionDep
+from api.modelos import Usuario
+
+hasher = PasswordHash.recommended()
+HASH_FALSO = hasher.hash("senha-que-ninguem-usa")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+ALGORITMO = "HS256"
+
+
+def autenticar(session, email: str, senha: str) -> Usuario | None:
+    usuario = session.scalar(select(Usuario).where(Usuario.email == email))
+    if usuario is None:
+        hasher.verify(senha, HASH_FALSO)  # gasta o mesmo tempo, sem revelar se o e-mail existe
+        return None
+    if not usuario.ativo or not hasher.verify(senha, usuario.senha_hash):
+        return None
+    return usuario
+
+
+def criar_token(usuario: Usuario) -> str:
+    agora = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(usuario.id),
+        "iat": agora,
+        "exp": agora + timedelta(minutes=settings.jwt_minutos),
+    }
+    return jwt.encode(payload, settings.jwt_segredo, algorithm=ALGORITMO)
+
+
+def get_usuario_atual(
+    token: Annotated[str, Depends(oauth2_scheme)], session: SessionDep
+) -> Usuario:
+    credenciais_invalidas = HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        "Credenciais inválidas",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.jwt_segredo, algorithms=[ALGORITMO])
+    except jwt.InvalidTokenError:
+        raise credenciais_invalidas
+    usuario = session.get(Usuario, int(payload["sub"]))
+    if usuario is None or not usuario.ativo:
+        raise credenciais_invalidas
+    return usuario
+
+
+UsuarioDep = Annotated[Usuario, Depends(get_usuario_atual)]
+
+
+def exigir_admin(usuario: UsuarioDep) -> Usuario:
+    if not usuario.admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Acesso restrito")
+    return usuario
+
+
+AdminDep = Annotated[Usuario, Depends(exigir_admin)]
+```
+
+```python
+# api/rotas/auth.py
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.exc import IntegrityError
+
+from api.db import SessionDep
+from api.esquemas import Token, UsuarioCriar
+from api.modelos import Usuario
+from api.seguranca import autenticar, criar_token, hasher
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/cadastro", status_code=status.HTTP_201_CREATED)
+def cadastrar(dados: UsuarioCriar, session: SessionDep) -> dict[str, str]:
+    session.add(Usuario(email=dados.email, senha_hash=hasher.hash(dados.senha)))
+    try:
+        session.commit()
+    except IntegrityError:
+        raise HTTPException(status.HTTP_409_CONFLICT, "E-mail já cadastrado")
+    return {"email": dados.email}
+
+
+@router.post("/token")
+def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], session: SessionDep) -> Token:
+    usuario = autenticar(session, form.username, form.password)
+    if usuario is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "E-mail ou senha incorretos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return Token(access_token=criar_token(usuario))
+```
+
+Pontos que caem em entrevista:
+
+- **Dependências encadeadas**: `AdminDep` depende de `UsuarioDep`, que depende do token e da sessão. O FastAPI resolve o grafo e, dentro de uma requisição, executa cada dependência uma vez, mesmo se ela aparecer em vários lugares.
+- **`algorithms=[ALGORITMO]` na decodificação** é obrigatório no PyJWT e fecha a porta para tokens com `alg: none` ou com algoritmo trocado.
+- **`ExpiredSignatureError`** é subclasse de `InvalidTokenError`, então token vencido também vira 401.
+- **`PasswordHash.recommended()`** usa Argon2. O hash inclui algoritmo, parâmetros e sal, por isso uma coluna basta.
+- **O hash falso** iguala o tempo de resposta entre "e-mail não existe" e "senha errada", impedindo enumerar usuários pelo tempo.
+- O formulário usa o campo `username` porque a especificação do OAuth2 manda; aqui ele carrega o e-mail.
+
+<Callout type="warning" title="JWT não é criptografado">
+O conteúdo de um JWT assinado é só Base64: qualquer pessoa lê o payload. Não ponha nele CPF, e-mail ou permissões detalhadas que você não queira expor. E como o token vale até expirar, mantenha a validade curta e, se precisar revogar acessos, combine com refresh tokens guardados no banco. Com vários serviços validando tokens, troque HS256 por um algoritmo assimétrico (RS256 ou ES256), para que só o emissor tenha a chave privada.
+</Callout>
+
+## Testes com TestClient e override de dependências
+
+`app.dependency_overrides` troca uma dependência por outra durante o teste. É o que permite usar um banco de teste e simular o usuário logado sem tocar no código das rotas.
+
+```python
+# tests/conftest.py
+import os
+
+os.environ.setdefault("INGRESSOS_JWT_SEGREDO", "segredo-de-teste-com-tamanho-suficiente")
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from api.db import get_session
+from api.main import app
+from api.modelos import Base, Usuario
+from api.seguranca import get_usuario_atual
+
+
+@pytest.fixture
+def session():
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    with sessionmaker(engine, expire_on_commit=False)() as s:
+        yield s
+
+
+@pytest.fixture
+def client(session):
+    app.dependency_overrides[get_session] = lambda: session
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def admin(session):
+    usuario = Usuario(email="admin@ingressos.dev", senha_hash="x", admin=True)
+    session.add(usuario)
+    session.commit()
+    app.dependency_overrides[get_usuario_atual] = lambda: usuario
+    return usuario
+```
+
+```python
+# tests/test_eventos.py
+EVENTO = {
+    "nome": "Festival de Verão",
+    "data": "2030-01-15T20:00:00-03:00",
+    "local": "Recife",
+    "capacidade": 100,
+    "setores": [{"nome": "Pista", "preco_centavos": 12000, "quantidade": 2}],
+}
+
+
+def test_anonimo_nao_cria_evento(client):
+    assert client.post("/eventos", json=EVENTO).status_code == 401
+
+
+def test_admin_cria_e_reserva_ate_esgotar(client, admin):
+    evento = client.post("/eventos", json=EVENTO).json()
+    setor_id = evento["setores"][0]["id"]
+    url = f"/eventos/{evento['id']}/reservas"
+
+    assert client.post(url, json={"setor_id": setor_id, "quantidade": 2}).status_code == 201
+    assert client.post(url, json={"setor_id": setor_id, "quantidade": 1}).status_code == 409
+
+
+def test_login_devolve_token(client):
+    client.post("/auth/cadastro", json={"email": "ana@ingressos.dev", "senha": "senha-forte-123"})
+    resposta = client.post(
+        "/auth/token", data={"username": "ana@ingressos.dev", "password": "senha-forte-123"}
+    )
+
+    assert resposta.status_code == 200
+    assert resposta.json()["token_type"] == "bearer"
+```
+
+O SQLite em memória com `StaticPool` deixa os testes rápidos e isolados (cada teste recria o banco). Ele não é o PostgreSQL: diferenças de tipos e de constraints aparecem. Rode a suíte também contra um PostgreSQL real no CI, por exemplo como serviço do GitHub Actions, e use as migrações do Alembic para criar o esquema nesse caso.
+
+## async def ou def
+
+O FastAPI roda sobre ASGI e aceita os dois tipos de rota, com comportamentos diferentes:
+
+| | `def` | `async def` |
+|---|---|---|
+| Onde roda | Num pool de threads | No event loop |
+| Pode chamar código bloqueante (SQLAlchemy síncrono, `requests`) | Sim | Não: trava todas as requisições do processo |
+| Precisa de bibliotecas | Comuns | Assíncronas (`AsyncSession`, `httpx.AsyncClient`) |
+| Quando compensa | Rotas que usam banco síncrono, padrão seguro | Muitas chamadas de rede simultâneas, streaming, WebSockets |
+
+Este capítulo usa `def` com SQLAlchemy síncrono de propósito: é simples, correto e atende a grande maioria das APIs. O erro clássico é declarar `async def` e chamar o banco síncrono por dentro: a rota parece funcionar, mas sob carga o event loop fica parado esperando o banco, e a latência de todas as outras requisições explode. Se migrar para assíncrono, migre a pilha inteira: `create_async_engine`, `AsyncSession` e um driver assíncrono.
+
+<Callout type="tip" title="A documentação vem de graça, mas é contrato">
+O `/docs` é gerado dos modelos Pydantic e das assinaturas. Isso significa que renomear um campo de `EventoLer` muda o contrato com o aplicativo e com os parceiros. Trate os modelos de saída como API pública: mudanças incompatíveis pedem versão nova da rota, e o arquivo OpenAPI exportado pode ser verificado no CI.
+</Callout>
+
+## Na entrevista
+
+**Como funciona a injeção de dependências do FastAPI?** Você declara parâmetros com `Annotated[Tipo, Depends(funcao)]`, e o FastAPI chama a função, resolve as dependências dela recursivamente e injeta o resultado. Dependências com `yield` têm código de limpeza que roda depois da resposta. Nos testes, `dependency_overrides` troca qualquer uma delas.
+
+**Por que separar modelos Pydantic dos modelos SQLAlchemy?** Porque eles têm propósitos diferentes: um descreve tabelas, o outro o contrato da API. Separados, campos internos como o hash da senha nunca saem, e campos sensíveis como `admin` não podem ser definidos pelo cliente.
+
+**O que acontece se uma rota `async def` usar um driver de banco síncrono?** A chamada bloqueia o event loop, e nenhuma outra requisição daquele processo é atendida enquanto o banco responde. Ou a rota é `def`, e roda numa thread, ou toda a pilha é assíncrona.
+
+**Como você valida um JWT com PyJWT?** Com `jwt.decode(token, chave, algorithms=[...])`, fixando a lista de algoritmos aceitos. A biblioteca confere assinatura e `exp`; tratando `InvalidTokenError` (que inclui o token expirado), respondo 401 com `WWW-Authenticate: Bearer`.
+
+**Por que revisar a migração gerada pelo autogenerate do Alembic?** Porque ele compara esquemas sem saber a intenção: uma renomeação vira remoção e criação de coluna, perdendo os dados, e algumas mudanças de tipo e de constraints não são detectadas.
+
+## Pratique
+
+1. Monte o projeto com `Settings`, os modelos e a primeira migração do Alembic, e rode contra o PostgreSQL local.
+2. Implemente as rotas de eventos com paginação, filtro por local e `selectinload`, e a reserva atômica com o tratador de `EstoqueInsuficiente`.
+3. Adicione os modelos `Pedido` e `Ingresso` com nova migração; a reserva passa a criar um pedido pendente com expiração de 15 minutos na mesma transação.
+4. Implemente cadastro e login com Argon2 e JWT, proteja a criação de eventos com `AdminDep` e crie `GET /me/pedidos` filtrado pelo usuário do token.
+5. Escreva os testes com `dependency_overrides`, inclua um teste com token expirado (gerado com `exp` no passado) e rode a suíte também contra o PostgreSQL.
+
+<Quiz question="Uma rota async def chama session.execute de uma Session síncrona do SQLAlchemy. Qual o efeito sob carga?" options={["Nenhum, o FastAPI converte automaticamente","A rota passa a rodar numa thread","O event loop fica bloqueado durante a consulta e atrasa todas as requisições do processo","A consulta é cancelada por timeout"]} answer={2} explanation="Código bloqueante dentro de async def roda no próprio event loop. Use def para que o FastAPI execute a rota num pool de threads, ou adote AsyncSession e um driver assíncrono." />
+
+<Quiz question="Para que serve app.dependency_overrides nos testes?" options={["Trocar uma dependência, como a sessão de banco ou o usuário atual, sem alterar as rotas","Desligar a validação do Pydantic","Acelerar o servidor uvicorn","Gerar o arquivo OpenAPI"]} answer={0} explanation="As rotas declaram do que precisam; o teste decide o que entregar. Assim você usa um banco de teste e simula um administrador logado sem token real." />
+
+<Quiz question="Por que passar algorithms=['HS256'] em jwt.decode?" options={["Para o token ficar menor","Para impedir que um token com algoritmo trocado ou alg none seja aceito","Porque é o único algoritmo que o PyJWT suporta","Para dispensar a claim exp"]} answer={1} explanation="Fixar os algoritmos aceitos evita ataques em que o atacante escolhe o algoritmo no cabeçalho do token. O PyJWT exige o parâmetro justamente por isso." />
+
+## Base no CodeForge
+
+- [Flask: Desenvolvendo APIs e aplicações web com MongoDB](/learn/carreira-python/flask-desenvolvendo-apis-aplicacoes-web-mongodb): a mesma API com outra filosofia, para comparar validação, erros e testes.
+- [Django: Autenticação com OAuth2.0](/learn/carreira-python/django-autenticacao-oauth2): os fluxos OAuth2 para clientes de terceiros, que complementam o password flow.
+- [JWT](/learn/system-design/jwt) e [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas): o que está por trás de PyJWT e Argon2.
+- [Async/await](/learn/concorrencia/async-await): o modelo de event loop que define quando usar `async def`.
+- [Pool de conexões](/learn/system-design/pool-de-conexoes): por que o engine é único por processo.
+
+## Referências
+
+- [FastAPI: Tutorial, User Guide](https://fastapi.tiangolo.com/tutorial/)
+- [FastAPI: OAuth2 with Password (and hashing), Bearer with JWT tokens](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/)
+- [SQLAlchemy 2.0: ORM Quick Start](https://docs.sqlalchemy.org/en/20/orm/quickstart.html)
+- [Alembic: Tutorial](https://alembic.sqlalchemy.org/en/latest/tutorial.html)

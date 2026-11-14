@@ -1,0 +1,516 @@
+---
+title: "Flask: Desenvolvendo APIs e aplicações web com MongoDB"
+kind: lesson
+---
+
+Até aqui a plataforma de ingressos era um conjunto de classes e scripts que rodavam no terminal. Para que um front, um aplicativo ou outro serviço consiga listar eventos e reservar ingressos, ela precisa falar HTTP. O Flask é o caminho mais curto entre uma função Python e uma rota: ele entrega roteamento, requisição, resposta e templates, e deixa o resto (banco, validação, organização) por sua conta. Essa liberdade é ótima para aprender o que um framework web faz de verdade, e perigosa quando o projeto cresce num único `app.py` de mil linhas.
+
+Neste capítulo você monta a API de eventos com a estrutura que os projetos Flask profissionais usam (application factory e blueprints) e persiste os dados no MongoDB, um banco de documentos em que o evento e seus setores cabem num único registro.
+
+**Você vai aprender:**
+
+- Estruturar um projeto Flask 3.1 com application factory, blueprints e configuração por ambiente
+- Receber, validar e devolver JSON com os status HTTP corretos e erros padronizados
+- Fazer CRUD, atualizações atômicas e índices no MongoDB com PyMongo 4
+- Decidir entre embutir e referenciar documentos ao modelar
+- Testar a API com o test client do Flask e pytest
+
+## Estrutura do projeto e application factory
+
+Instale as dependências num ambiente virtual e suba um MongoDB local:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # no Windows: .venv\Scripts\activate
+pip install "flask~=3.1" "pymongo~=4.10" "pydantic~=2.9" pytest
+docker run -d --name mongo -p 27017:27017 mongo:8
+```
+
+A estrutura separa cada assunto num módulo:
+
+```text
+ingressos/
+  __init__.py        # create_app
+  config.py
+  db.py
+  erros.py
+  esquemas.py
+  eventos/
+    __init__.py
+    rotas.py
+  templates/
+tests/
+  conftest.py
+  test_eventos.py
+pyproject.toml
+```
+
+O tutorial clássico cria `app = Flask(__name__)` no topo de um arquivo. Isso amarra a aplicação a uma única configuração, criada no momento do import, e gera imports circulares assim que as rotas saem para outros arquivos. A **application factory** resolve os dois problemas: a aplicação é construída por uma função, que pode ser chamada com configurações diferentes (produção, testes) quantas vezes for preciso.
+
+```python
+# ingressos/__init__.py
+from typing import Any
+
+from flask import Flask
+from pymongo import MongoClient
+
+from ingressos.config import Config
+
+
+def create_app(config: dict[str, Any] | None = None) -> Flask:
+    app = Flask(__name__)
+    app.config.from_object(Config)
+    app.config.from_prefixed_env()
+    if config:
+        app.config.update(config)
+
+    app.extensions["mongo"] = MongoClient(app.config["MONGO_URI"], tz_aware=True)
+
+    from ingressos import erros
+    from ingressos.eventos.rotas import bp as eventos_bp
+
+    erros.registrar(app)
+    app.register_blueprint(eventos_bp)
+    return app
+```
+
+O `MongoClient` é criado uma vez por processo: ele mantém um pool de conexões, é seguro entre threads e só conecta de fato na primeira operação. Abrir um cliente por requisição é um erro comum que esgota conexões. O parâmetro `tz_aware=True` faz o driver devolver `datetime` com fuso UTC; sem ele, as datas voltam sem fuso e qualquer comparação com `datetime.now(timezone.utc)` levanta `TypeError`.
+
+Rode em desenvolvimento com `flask --app ingressos run --debug`. O Flask encontra a função `create_app` sozinho. Em produção, quem serve a aplicação é um servidor WSGI: `gunicorn "ingressos:create_app()"`.
+
+## Configuração por ambiente
+
+Valores que mudam entre a sua máquina, o CI e a produção não ficam no código:
+
+```python
+# ingressos/config.py
+class Config:
+    MONGO_URI = "mongodb://localhost:27017"
+    MONGO_DB = "ingressos"
+    TAMANHO_PAGINA = 20
+```
+
+A classe guarda os padrões de desenvolvimento. `from_prefixed_env()` lê toda variável de ambiente que começa com `FLASK_` e sobrescreve a chave correspondente: `FLASK_MONGO_URI=mongodb://usuario:senha@banco:27017` vira `app.config["MONGO_URI"]`. O Flask tenta interpretar o valor como JSON, então `FLASK_TAMANHO_PAGINA=50` chega como inteiro. Por último, o dicionário passado à factory tem a palavra final, e é por ele que os testes apontam para outro banco.
+
+A ordem de precedência (padrão no código, depois ambiente, depois argumento explícito) é a mesma ideia do fator "Config" dos Twelve-Factor Apps: o mesmo artefato roda em qualquer ambiente, e só a configuração muda. Segredos (senha do banco, chaves) entram apenas pelo ambiente e nunca vão para o Git.
+
+## Blueprints e rotas
+
+Um **blueprint** é um conjunto de rotas, tratadores de erro e templates que só passa a existir quando é registrado numa aplicação. Cada área do sistema ganha o seu: `eventos`, `pedidos`, `usuarios`.
+
+```python
+# ingressos/db.py
+from flask import current_app
+from pymongo.database import Database
+
+
+def get_db() -> Database:
+    cliente = current_app.extensions["mongo"]
+    return cliente[current_app.config["MONGO_DB"]]
+```
+
+`current_app` é um proxy para a aplicação que está atendendo a requisição atual. É ele que permite a um módulo de rotas usar a configuração sem importar um objeto `app` global.
+
+```python
+# ingressos/eventos/rotas.py
+from datetime import datetime, timezone
+from typing import Any
+
+from bson import ObjectId
+from bson.errors import InvalidId
+from flask import Blueprint, abort, current_app, request
+from pymongo import ReturnDocument
+
+from ingressos.db import get_db
+from ingressos.esquemas import EventoEntrada, ReservaEntrada
+
+bp = Blueprint("eventos", __name__, url_prefix="/eventos")
+
+
+def para_object_id(valor: str) -> ObjectId:
+    try:
+        return ObjectId(valor)
+    except InvalidId:
+        abort(404, description="Evento não encontrado")
+
+
+def evento_para_json(doc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(doc["_id"]),
+        "nome": doc["nome"],
+        "data": doc["data"].isoformat(),
+        "local": doc["local"],
+        "setores": doc["setores"],
+    }
+
+
+@bp.get("")
+def listar():
+    pagina = request.args.get("pagina", 1, type=int)
+    tamanho = current_app.config["TAMANHO_PAGINA"]
+    filtro: dict[str, Any] = {"data": {"$gte": datetime.now(timezone.utc)}}
+    if local := request.args.get("local"):
+        filtro["local"] = local
+
+    cursor = (
+        get_db().eventos.find(filtro)
+        .sort("data", 1)
+        .skip((max(pagina, 1) - 1) * tamanho)
+        .limit(tamanho)
+    )
+    return [evento_para_json(doc) for doc in cursor]
+
+
+@bp.get("/<evento_id>")
+def detalhar(evento_id: str):
+    doc = get_db().eventos.find_one({"_id": para_object_id(evento_id)})
+    if doc is None:
+        abort(404, description="Evento não encontrado")
+    return evento_para_json(doc)
+```
+
+Pontos que valem atenção:
+
+- `@bp.get`, `@bp.post`, `@bp.put` e `@bp.delete` são atalhos para `@bp.route(..., methods=[...])`. Um método não declarado devolve 405 automaticamente.
+- Devolver um `dict` ou uma `list` já produz uma resposta JSON com `Content-Type: application/json`. Para mudar o status ou acrescentar cabeçalhos, devolva uma tupla: `(corpo, status, cabecalhos)`.
+- `request.args` são os parâmetros da query string. O argumento `type=int` converte e, se a conversão falhar, usa o padrão em vez de estourar.
+- O `_id` do MongoDB é um `ObjectId`, que não é serializável em JSON. A função `evento_para_json` é a fronteira entre o formato do banco e o contrato da API: ela converte o identificador para texto, formata a data em ISO 8601 e escolhe quais campos saem. Sem ela, qualquer campo interno que alguém acrescentar ao documento vaza para o cliente.
+- Um identificador malformado não é erro do servidor: `para_object_id` transforma o `InvalidId` em 404.
+
+## Validação de entrada e resposta de criação
+
+`request.get_json()` devolve o corpo já convertido e responde 415 se o `Content-Type` não for JSON, ou 400 se o JSON estiver malformado. Isso garante a sintaxe, não o conteúdo. Nunca grave no banco o dicionário que veio do cliente: valide campo a campo. O Pydantic faz isso com pouco código:
+
+```python
+# ingressos/esquemas.py
+from datetime import datetime, timezone
+
+from pydantic import AwareDatetime, BaseModel, Field, field_validator
+
+
+class SetorEntrada(BaseModel):
+    nome: str = Field(min_length=1, max_length=60)
+    preco_centavos: int = Field(ge=0)
+    quantidade: int = Field(gt=0)
+
+
+class EventoEntrada(BaseModel):
+    nome: str = Field(min_length=3, max_length=120)
+    data: AwareDatetime
+    local: str = Field(min_length=2, max_length=120)
+    setores: list[SetorEntrada] = Field(min_length=1)
+
+    @field_validator("data")
+    @classmethod
+    def data_no_futuro(cls, valor: datetime) -> datetime:
+        if valor <= datetime.now(timezone.utc):
+            raise ValueError("a data do evento precisa estar no futuro")
+        return valor
+
+
+class ReservaEntrada(BaseModel):
+    setor: str
+    quantidade: int = Field(gt=0, le=6)
+```
+
+O preço vai em centavos, como inteiro. O `Decimal` do Python não é aceito pelo codificador BSON (o tipo equivalente é o `Decimal128`), e `float` acumula erro de arredondamento. Inteiro em centavos é exato, ordenável e funciona em qualquer banco.
+
+```python
+# ingressos/eventos/rotas.py (continuação)
+@bp.post("")
+def criar():
+    dados = EventoEntrada.model_validate(request.get_json())
+    doc = {
+        "nome": dados.nome,
+        "data": dados.data,
+        "local": dados.local,
+        "setores": [
+            {
+                "nome": s.nome,
+                "preco_centavos": s.preco_centavos,
+                "total": s.quantidade,
+                "disponivel": s.quantidade,
+            }
+            for s in dados.setores
+        ],
+        "criado_em": datetime.now(timezone.utc),
+    }
+    resultado = get_db().eventos.insert_one(doc)
+    doc["_id"] = resultado.inserted_id
+    return evento_para_json(doc), 201, {"Location": f"/eventos/{resultado.inserted_id}"}
+```
+
+Criação bem-sucedida responde 201 com o cabeçalho `Location` apontando para o recurso novo. Se `model_validate` falhar, ele levanta `ValidationError`, que o tratador da próxima seção converte em 422.
+
+## Tratamento de erros padronizado
+
+Por padrão, o Flask responde erros com uma página HTML. Um cliente de API espera JSON, sempre no mesmo formato. Os tratadores ficam num módulo e são registrados pela factory:
+
+```python
+# ingressos/erros.py
+from flask import Flask
+from pydantic import ValidationError
+from werkzeug.exceptions import HTTPException
+
+
+class ErroDeNegocio(Exception):
+    status = 409
+
+
+class EstoqueInsuficiente(ErroDeNegocio):
+    pass
+
+
+def registrar(app: Flask) -> None:
+    @app.errorhandler(HTTPException)
+    def erro_http(erro: HTTPException):
+        return {"erro": erro.name, "detalhe": erro.description}, erro.code
+
+    @app.errorhandler(ValidationError)
+    def erro_validacao(erro: ValidationError):
+        campos = erro.errors(include_url=False, include_context=False, include_input=False)
+        return {"erro": "Dados inválidos", "campos": campos}, 422
+
+    @app.errorhandler(ErroDeNegocio)
+    def erro_negocio(erro: ErroDeNegocio):
+        return {"erro": type(erro).__name__, "detalhe": str(erro)}, erro.status
+```
+
+`abort(404, description=...)` levanta uma `HTTPException`, que cai no primeiro tratador. Regras de negócio violadas levantam exceções próprias e viram 409 (conflito com o estado atual do recurso). Exceções não previstas continuam virando 500, e é assim que deve ser: o detalhe vai para o log, não para o cliente.
+
+| Situação | Status |
+|---|---|
+| JSON malformado | 400 |
+| Corpo válido como JSON, mas com campos inválidos | 422 |
+| Recurso ou identificador inexistente | 404 |
+| Regra de negócio impede a operação (sem estoque) | 409 |
+| Criado com sucesso | 201 com `Location` |
+| Removido com sucesso, sem corpo | 204 |
+
+## CRUD e atualização atômica com PyMongo
+
+O MongoDB guarda **documentos** BSON (um JSON com mais tipos: data, `ObjectId`, binário) agrupados em **coleções**. Não há esquema imposto pelo banco: a coleção é criada no primeiro `insert_one`. As operações básicas:
+
+| Operação | Método | Retorno útil |
+|---|---|---|
+| Criar | `insert_one(doc)` | `inserted_id` |
+| Ler um | `find_one(filtro)` | documento ou `None` |
+| Ler vários | `find(filtro)` | cursor preguiçoso, com `sort`, `skip`, `limit` |
+| Atualizar | `update_one(filtro, operadores)` | `matched_count`, `modified_count` |
+| Remover | `delete_one(filtro)` | `deleted_count` |
+
+Atualizações usam operadores (`$set`, `$inc`, `$push`, `$pull`). Passar um documento sem operador em `update_one` é erro; para trocar o documento inteiro existe `replace_one`.
+
+```python
+@bp.delete("/<evento_id>")
+def remover(evento_id: str):
+    resultado = get_db().eventos.delete_one({"_id": para_object_id(evento_id)})
+    if resultado.deleted_count == 0:
+        abort(404, description="Evento não encontrado")
+    return "", 204
+```
+
+A regra mais importante do domínio é não vender acima da capacidade. A implementação ingênua lê o evento, confere se há estoque em Python e grava o novo valor. Entre a leitura e a gravação, outra requisição pode ter feito o mesmo, e as duas vendem o último ingresso. No MongoDB, uma operação sobre um único documento é atômica, então a condição e a alteração vão no mesmo comando:
+
+```python
+from ingressos.erros import EstoqueInsuficiente
+
+
+@bp.post("/<evento_id>/reservas")
+def reservar(evento_id: str):
+    dados = ReservaEntrada.model_validate(request.get_json())
+    evento = get_db().eventos.find_one_and_update(
+        {
+            "_id": para_object_id(evento_id),
+            "setores": {
+                "$elemMatch": {
+                    "nome": dados.setor,
+                    "disponivel": {"$gte": dados.quantidade},
+                }
+            },
+        },
+        {"$inc": {"setores.$.disponivel": -dados.quantidade}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if evento is None:
+        raise EstoqueInsuficiente("Setor inexistente ou sem ingressos suficientes")
+    return evento_para_json(evento), 201
+```
+
+O filtro só casa se existir um setor com aquele nome e estoque suficiente; o `$` posicional em `setores.$.disponivel` aponta para o elemento que casou. Se duas requisições disputarem o último ingresso, o banco executa uma depois da outra, e a segunda não encontra documento. O teste em Python deixou de existir, e a condição de corrida foi junto.
+
+<Callout type="warning" title="Atômico só dentro de um documento">
+A garantia vale para uma operação sobre um documento. Baixar o estoque no evento e gravar o pedido em outra coleção são duas operações: se o processo cair entre elas, o estoque fica reservado sem pedido. As saídas são modelar para que a mudança caiba num documento, usar transações multi-documento (que exigem replica set e custam mais) ou ter um processo de compensação que devolve estoque de reservas órfãs.
+</Callout>
+
+## Índices
+
+Sem índice, todo `find` percorre a coleção inteira. Índices são criados uma vez, fora do caminho da requisição. Um comando de linha, registrado dentro de `create_app`, resolve:
+
+```python
+# dentro de create_app, antes do return
+import click
+from pymongo import ASCENDING
+
+@app.cli.command("criar-indices")
+def criar_indices() -> None:
+    db = app.extensions["mongo"][app.config["MONGO_DB"]]
+    db.eventos.create_index([("local", ASCENDING), ("data", ASCENDING)])
+    db.usuarios.create_index("email", unique=True)
+    db.tokens_confirmacao.create_index("expira_em", expireAfterSeconds=0)
+    click.echo("Índices criados.")
+```
+
+Execute com `flask --app ingressos criar-indices`. `create_index` é idempotente: se o índice já existe com a mesma definição, nada acontece.
+
+- **Composto**: `(local, data)` atende a listagem filtrada por local e ordenada por data. A ordem dos campos importa: igualdade primeiro, depois ordenação, depois faixa. O índice também serve consultas só por `local` (prefixo), mas não consultas só por `data`.
+- **Único**: garante no banco que não existem dois usuários com o mesmo e-mail. A violação levanta `pymongo.errors.DuplicateKeyError`, que você converte em 409.
+- **TTL**: o MongoDB remove o documento quando a data do campo passa. Serve para dados descartáveis, como tokens de confirmação. Não serve para expirar reservas, porque a remoção não devolve o estoque: isso pede um processo que marque o pedido como expirado e faça o `$inc` de volta.
+
+Para saber se uma consulta usa índice, chame `.explain()` no cursor e procure `IXSCAN` (índice) em vez de `COLLSCAN` (varredura completa) no plano vencedor.
+
+## Modelagem: embutir ou referenciar
+
+No banco relacional, você normaliza e junta com `JOIN`. No MongoDB, a pergunta é outra: quais dados são lidos e alterados juntos?
+
+| | Embutir (subdocumento) | Referenciar (guardar o `_id`) |
+|---|---|---|
+| Leitura | Uma consulta traz tudo | Duas consultas ou `$lookup` |
+| Atomicidade | Alteração conjunta é atômica | Exige transação ou compensação |
+| Crescimento | Limitado: documento tem teto de 16 MB | Sem limite |
+| Use quando | O filho pertence ao pai, é poucos e é lido junto | O filho cresce sem limite, é consultado sozinho ou é compartilhado |
+
+Na plataforma: os **setores** ficam embutidos no evento (são poucos, sempre exibidos com ele, e a baixa de estoque fica atômica). Os **pedidos** ficam em coleção própria, com `evento_id` e `cliente_id` referenciados, porque crescem sem limite e são consultados por cliente. Dentro do pedido, guarde uma **cópia** do nome do evento, do setor e do preço pago: o histórico não pode mudar se o evento for editado depois, e a tela "meus pedidos" não precisa de segunda consulta. Duplicar dado que não muda (ou que deve ficar congelado) é prática normal em banco de documentos.
+
+A ausência de esquema no banco não significa ausência de esquema: ele passa a morar na aplicação, nos modelos Pydantic e nas funções de serialização. Se precisar de garantia no banco, o MongoDB aceita validação por JSON Schema na coleção.
+
+## Páginas HTML com Jinja
+
+O Flask também renderiza HTML no servidor com o Jinja. Templates ficam em `ingressos/templates/` e usam herança: um `base.html` define blocos, e cada página preenche os seus.
+
+```html
+{% extends "base.html" %}
+{% block conteudo %}
+  <h1>Próximos eventos</h1>
+  <ul>
+    {% for evento in eventos %}
+      <li><a href="{{ url_for('paginas.detalhe', evento_id=evento.id) }}">{{ evento.nome }}</a></li>
+    {% else %}
+      <li>Nenhum evento disponível.</li>
+    {% endfor %}
+  </ul>
+{% endblock %}
+```
+
+A rota chama `render_template("eventos/lista.html", eventos=lista)`. O Jinja escapa automaticamente o conteúdo das variáveis, o que bloqueia a maior parte dos ataques de XSS, e `url_for` monta URLs pelo nome da rota (`blueprint.funcao`) em vez de texto fixo. Os capítulos de Django aprofundam templates; os conceitos são os mesmos.
+
+## Testes com o test client
+
+A factory mostra seu valor aqui: cada teste cria uma aplicação apontando para um banco descartável.
+
+```python
+# tests/conftest.py
+from uuid import uuid4
+
+import pytest
+
+from ingressos import create_app
+
+
+@pytest.fixture
+def app():
+    nome_banco = f"ingressos_teste_{uuid4().hex}"
+    app = create_app({"TESTING": True, "MONGO_DB": nome_banco})
+    yield app
+    app.extensions["mongo"].drop_database(nome_banco)
+
+
+@pytest.fixture
+def client(app):
+    return app.test_client()
+```
+
+```python
+# tests/test_eventos.py
+EVENTO = {
+    "nome": "Festival de Verão",
+    "data": "2030-01-15T20:00:00-03:00",
+    "local": "Recife",
+    "setores": [{"nome": "Pista", "preco_centavos": 12000, "quantidade": 2}],
+}
+
+
+def test_cria_evento_e_devolve_location(client):
+    resposta = client.post("/eventos", json=EVENTO)
+
+    assert resposta.status_code == 201
+    assert resposta.headers["Location"].endswith(resposta.json["id"])
+    assert resposta.json["setores"][0]["disponivel"] == 2
+
+
+def test_evento_sem_setor_devolve_422(client):
+    resposta = client.post("/eventos", json={**EVENTO, "setores": []})
+
+    assert resposta.status_code == 422
+
+
+def test_nao_vende_acima_do_estoque(client):
+    evento_id = client.post("/eventos", json=EVENTO).json["id"]
+    reserva = {"setor": "Pista", "quantidade": 2}
+
+    assert client.post(f"/eventos/{evento_id}/reservas", json=reserva).status_code == 201
+    assert client.post(f"/eventos/{evento_id}/reservas", json=reserva).status_code == 409
+
+
+def test_id_malformado_devolve_404(client):
+    assert client.get("/eventos/abc").status_code == 404
+```
+
+O test client chama a aplicação em memória, sem abrir porta. Os testes usam um MongoDB real (o contêiner local), porque operadores como `$elemMatch` e o `$` posicional são justamente o que você quer provar que funciona; uma imitação do banco em memória pode se comportar diferente.
+
+<Callout type="tip" title="Flask é síncrono por padrão">
+Cada requisição ocupa uma thread ou um processo do servidor WSGI enquanto espera o banco. Para a maioria das APIs isso basta: escale com mais workers do gunicorn. O Flask aceita rotas `async def`, mas cada uma ainda ocupa um worker, então o ganho é pequeno. Se o serviço vive de muitas conexões lentas simultâneas, um framework ASGI como o FastAPI, que aparece mais adiante nesta carreira, é a escolha natural.
+</Callout>
+
+## Na entrevista
+
+**Para que serve a application factory?** Para criar a aplicação dentro de uma função em vez de no import do módulo. Isso permite várias instâncias com configurações diferentes (essencial para testes), evita imports circulares entre a aplicação e as rotas e deixa explícito o que é registrado.
+
+**O que é um blueprint?** Um agrupamento de rotas, tratadores de erro e templates que é definido sem depender de uma aplicação e depois registrado nela, com prefixo de URL próprio. É a unidade de modularização do Flask.
+
+**Quando embutir e quando referenciar no MongoDB?** Embuto quando o dado filho pertence ao pai, tem tamanho limitado e é lido ou alterado junto, o que dá leitura em uma consulta e escrita atômica. Referencio quando o filho cresce sem limite, é consultado de forma independente ou é compartilhado entre vários pais.
+
+**Como evitar vender o mesmo ingresso duas vezes?** Não fazendo "ler, conferir, gravar" em passos separados. Coloco a condição de estoque no filtro e o decremento com `$inc` na mesma operação, que é atômica dentro de um documento. Se nenhum documento casar, não havia estoque.
+
+**Qual a diferença entre `current_app` e `g`?** `current_app` aponta para a aplicação que atende a requisição atual, usado para ler configuração e extensões sem importar um global. `g` é um espaço de dados que vive durante um contexto de aplicação (na prática, uma requisição), usado para guardar recursos como o usuário autenticado.
+
+**Por que um cliente MongoDB por processo e não por requisição?** O `MongoClient` já gerencia um pool de conexões e é seguro entre threads. Criar um por requisição paga o custo de conexão e autenticação toda vez e pode esgotar o limite de conexões do servidor.
+
+## Pratique
+
+1. Implemente `PUT /eventos/<evento_id>` para alterar nome, data e local com `$set`, validando com um modelo Pydantic próprio e devolvendo 404 quando `matched_count` for zero.
+2. Crie o blueprint `pedidos`: `POST /pedidos` baixa o estoque de forma atômica e grava o pedido com status `pendente`, `expira_em` em 15 minutos e a cópia do nome do evento, do setor e do preço. Se a gravação do pedido falhar, devolva o estoque.
+3. Adicione `POST /pedidos/<pedido_id>/cancelamento`, que muda o status para `cancelado` somente se ele estiver `pendente` (condição no filtro) e devolve o estoque ao setor.
+4. Crie a coleção `usuarios` com índice único em `email` e converta `DuplicateKeyError` em 409 num tratador de erro.
+5. Escreva testes para cada rota nova, incluindo os caminhos de erro, e rode `.explain()` na listagem para confirmar que o índice composto é usado.
+
+<Quiz question="Qual a principal vantagem da application factory sobre criar o objeto app no topo do módulo?" options={["A aplicação responde mais rápido","Permite criar instâncias com configurações diferentes, como nos testes","Dispensa o uso de blueprints","Torna as rotas assíncronas"]} answer={1} explanation="Com a factory, cada chamada de create_app produz uma aplicação nova com a configuração recebida. Os testes criam uma instância apontando para outro banco, e os imports circulares deixam de acontecer." />
+
+<Quiz question="Duas requisições tentam reservar o último ingresso ao mesmo tempo. O que garante que só uma consiga?" options={["Conferir o estoque em Python antes de gravar","Usar um índice TTL no evento","Abrir um MongoClient por requisição","Pôr a condição de estoque no filtro e o decremento com $inc na mesma operação"]} answer={3} explanation="Uma operação de escrita sobre um único documento é atômica. Com a condição no filtro, a segunda requisição não encontra documento que case e nada é alterado." />
+
+<Quiz question="Os pedidos de um evento crescem sem limite e são consultados por cliente. Como modelar?" options={["Coleção própria de pedidos, referenciando o evento e copiando os dados que devem ficar congelados","Lista de pedidos embutida no documento do evento","Um documento único com todos os pedidos da plataforma","Um campo de texto com os pedidos separados por vírgula"]} answer={0} explanation="Embutir uma lista sem limite leva o documento ao teto de 16 MB e piora toda leitura do evento. Pedidos ficam em coleção própria, com referência ao evento e cópia do preço e dos nomes no momento da compra." />
+
+## Base no CodeForge
+
+- [Python: Persistência de dados com arquivos e bancos de dados](/learn/carreira-python/python-persistencia-dados-arquivos-bancos-dados): o capítulo anterior, com o modelo relacional que serve de comparação.
+- [Bancos de documentos](/learn/system-design/bancos-de-documentos) e [SQL vs NoSQL](/learn/system-design/sql-vs-nosql): quando o modelo de documentos compensa.
+- [REST](/learn/system-design/rest) e [HTTP/1.1](/learn/redes/http-1): métodos, status e cabeçalhos que a API usa.
+- [Condições de corrida](/learn/concorrencia/condicoes-de-corrida): o problema por trás da baixa de estoque atômica.
+- [Índices](/learn/system-design/indices): como um índice acelera a leitura e o que ele custa na escrita.
+
+## Referências
+
+- [Flask: Application Factories](https://flask.palletsprojects.com/en/stable/patterns/appfactories/)
+- [Flask: Modular Applications with Blueprints](https://flask.palletsprojects.com/en/stable/blueprints/)
+- [Flask: Testing Flask Applications](https://flask.palletsprojects.com/en/stable/testing/)
+- [PyMongo: documentação oficial](https://pymongo.readthedocs.io/en/stable/)

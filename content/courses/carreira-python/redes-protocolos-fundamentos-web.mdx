@@ -1,0 +1,378 @@
+---
+title: "Redes e Protocolos: Fundamentos da web"
+kind: lesson
+---
+
+Uma API Python fica entre a rede e o banco de dados, e boa parte dos problemas que chegam ao desenvolvedor back-end nasce do lado da rede: a requisição que demora 30 segundos e cai, o domínio novo que não resolve, o certificado expirado, o cookie que o navegador não envia, a aplicação que funciona em `localhost` e some quando sobe no contêiner. Quem entende o caminho de um pacote diagnostica esses casos em minutos; quem não entende tenta mudanças aleatórias no código.
+
+Este capítulo percorre esse caminho de baixo para cima: endereços e portas, DNS, TCP e UDP, HTTP com seus métodos, status e cabeçalhos, HTTPS e cookies. Os exemplos usam `socket` e `http.server`, da biblioteca padrão, para mostrar que um servidor web não tem mágica, e as ferramentas de linha de comando que você vai usar para investigar problemas reais. O curso de [Redes de computadores](/learn/redes) do CodeForge aprofunda cada tema; aqui fica o que o back-end usa todo dia.
+
+**Você vai aprender:**
+
+- Explicar o modelo TCP/IP e o papel de IP, porta, DNS, TCP e UDP numa requisição
+- Escrever um servidor e um cliente TCP com `socket` e um servidor HTTP com `http.server`
+- Ler e montar requisições HTTP: métodos, códigos de status e cabeçalhos importantes
+- Entender o que o TLS garante no HTTPS e como cookies mantêm estado
+- Diagnosticar problemas com `curl`, `ping`, `dig` e afins
+
+## O modelo em camadas
+
+Redes funcionam em camadas: cada uma resolve um problema e usa o serviço da camada de baixo, sem conhecer os detalhes dela. O modelo usado na internet é o TCP/IP:
+
+| Camada | Responsabilidade | Exemplos | Endereço que usa |
+|---|---|---|---|
+| Aplicação | O que os programas conversam | HTTP, DNS, SMTP, TLS | URL, nome de domínio |
+| Transporte | Entregar dados ao processo certo, com ou sem garantia | TCP, UDP | Porta |
+| Internet (rede) | Levar pacotes de uma máquina a outra, atravessando redes | IP, ICMP | Endereço IP |
+| Enlace (acesso à rede) | Mover quadros dentro da rede local | Ethernet, Wi-Fi | Endereço MAC |
+
+Quando sua aplicação envia uma resposta HTTP, o texto é quebrado em segmentos TCP (com portas de origem e destino), cada segmento vai dentro de um pacote IP (com endereços de origem e destino), e cada pacote vai dentro de um quadro Ethernet ou Wi-Fi até o próximo roteador. Esse empacotamento sucessivo se chama **encapsulamento**. O modelo OSI, de sete camadas, é a referência didática que aparece em entrevistas; na prática, quando alguém diz "balanceador de camada 4" está falando de transporte (TCP), e "camada 7", de aplicação (HTTP).
+
+## Endereços IP
+
+O endereço IP identifica uma interface de rede. O IPv4 tem 32 bits, escritos em quatro números de 0 a 255 (`203.0.113.10`), o que dá cerca de 4,3 bilhões de endereços, já esgotados. O IPv6 tem 128 bits (`2001:db8::10`) e resolve a escassez, mas convive com o IPv4.
+
+Alguns intervalos têm significado especial, e você vai encontrá-los em configuração:
+
+| Endereço | Significado |
+|---|---|
+| `127.0.0.1` (e `::1` no IPv6) | Loopback: a própria máquina, `localhost` |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | Faixas privadas, não roteadas na internet |
+| `0.0.0.0` | Num servidor: escutar em todas as interfaces da máquina |
+
+A notação `/24` (CIDR) diz quantos bits iniciais identificam a rede: `192.168.1.0/24` cobre de `192.168.1.0` a `192.168.1.255`. Redes domésticas e de nuvem usam faixas privadas, e um equipamento de **NAT** troca o endereço privado pelo público na saída para a internet. É por isso que o seu computador tem um IP local e o mundo vê outro.
+
+## Portas
+
+O IP leva o pacote até a máquina; a **porta** (número de 0 a 65535) indica para qual processo entregar. Uma conexão é identificada por cinco itens: protocolo, IP e porta de origem, IP e porta de destino. Isso permite milhares de conexões simultâneas na mesma porta 443 do servidor, cada uma vinda de um IP e porta diferentes do lado do cliente.
+
+| Porta | Serviço |
+|---|---|
+| 22 | SSH |
+| 53 | DNS |
+| 80 | HTTP |
+| 443 | HTTPS |
+| 5432 | PostgreSQL |
+| 6379 | Redis |
+| 8000 | Convenção de desenvolvimento do Django e do uvicorn |
+
+Portas abaixo de 1024 exigem privilégio de administrador em sistemas Unix, motivo pelo qual a aplicação Python costuma escutar na 8000 atrás de um proxy reverso (Nginx, um balanceador da nuvem) que atende a 443.
+
+<Callout type="warning" title="Escutar em 127.0.0.1 dentro de um contêiner">
+Um servidor que escuta em `127.0.0.1` só aceita conexões vindas da própria máquina. Dentro de um contêiner Docker, a própria máquina é o contêiner, e o mapeamento de porta do host não alcança o processo. O sintoma é a aplicação funcionar com `curl` de dentro do contêiner e recusar conexões de fora. Em contêiner, escute em `0.0.0.0`, como em `uvicorn app:app --host 0.0.0.0`.
+</Callout>
+
+## DNS
+
+Pessoas usam nomes; a rede usa IPs. O DNS é o sistema distribuído que traduz um para o outro. Quando o cliente procura `api.ingressos.com.br`, pergunta a um **resolvedor recursivo** (do provedor, da empresa ou público), que, se não tiver a resposta em cache, consulta os servidores raiz, depois os de `.br`, depois os autoritativos de `ingressos.com.br`, que dão a resposta final.
+
+| Registro | Para que serve |
+|---|---|
+| `A` / `AAAA` | Nome para endereço IPv4 / IPv6 |
+| `CNAME` | Nome que é apelido de outro nome |
+| `MX` | Servidores de e-mail do domínio |
+| `TXT` | Texto livre: verificação de domínio, SPF, DKIM |
+| `NS` | Servidores autoritativos do domínio |
+
+Cada resposta traz um **TTL**, o tempo em segundos que ela pode ficar em cache. Por isso uma mudança de DNS não aparece para todos ao mesmo tempo: quem tem a resposta antiga em cache continua com ela até o TTL vencer. Antes de migrar um serviço, baixe o TTL com antecedência.
+
+```bash
+dig api.github.com A +short          # só os endereços
+dig ingressos.com.br MX              # resposta completa, com TTL
+nslookup api.github.com              # alternativa disponível no Windows
+```
+
+Em Python, a resolução está no módulo `socket`:
+
+```python
+import socket
+
+for familia, _, _, _, endereco in socket.getaddrinfo("api.github.com", 443, type=socket.SOCK_STREAM):
+    print(familia.name, endereco[0])
+```
+
+## TCP e UDP
+
+Os dois protocolos de transporte fazem escolhas opostas:
+
+| | TCP | UDP |
+|---|---|---|
+| Conexão | Estabelecida antes dos dados (handshake de três vias) | Nenhuma: cada datagrama é independente |
+| Entrega | Garantida, com retransmissão de perdas | Sem garantia |
+| Ordem | Preservada | Não preservada |
+| Controle de fluxo e congestionamento | Sim | Não |
+| Custo | Uma ida e volta extra para conectar, mais cabeçalho | Mínimo |
+| Usado por | HTTP/1.1, HTTP/2, bancos de dados, SSH | DNS, vídeo e voz em tempo real, jogos, QUIC (HTTP/3) |
+
+O **handshake** do TCP tem três mensagens: o cliente envia `SYN`, o servidor responde `SYN-ACK`, o cliente confirma com `ACK`. Só então os dados fluem. Cada byte enviado é numerado e confirmado; o que não é confirmado a tempo é retransmitido. O preço é latência: abrir uma conexão nova custa uma ida e volta, e é por isso que clientes HTTP reaproveitam conexões (o `requests.Session` do capítulo anterior faz isso).
+
+O HTTP/3 roda sobre o QUIC, que usa UDP e reimplementa confiabilidade e criptografia no próprio protocolo, para evitar que uma perda de pacote atrase todas as requisições de uma conexão.
+
+## Sockets: TCP na mão
+
+O **socket** é a interface que o sistema operacional oferece aos programas para usar a rede. Todo servidor web, por mais sofisticado, faz no fundo o que este servidor de eco faz:
+
+```python
+# servidor_eco.py
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
+    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    servidor.bind(("127.0.0.1", 9000))
+    servidor.listen()
+    print("Escutando em 127.0.0.1:9000")
+    while True:
+        conexao, endereco = servidor.accept()      # bloqueia até alguém conectar
+        with conexao:
+            print("Conexão de", endereco)
+            dados = conexao.recv(1024)             # lê até 1024 bytes
+            conexao.sendall(b"eco: " + dados)
+```
+
+```python
+# cliente_eco.py
+import socket
+
+with socket.create_connection(("127.0.0.1", 9000), timeout=5) as cliente:
+    cliente.sendall("reservar 2 ingressos".encode("utf-8"))
+    resposta = cliente.recv(1024)
+    print(resposta.decode("utf-8"))                # eco: reservar 2 ingressos
+```
+
+As chamadas mapeiam o ciclo de vida do TCP: `bind` associa o socket a um IP e porta, `listen` o torna passivo, `accept` conclui o handshake com um cliente e devolve um socket novo só para aquela conexão, `recv` e `sendall` trocam bytes. `AF_INET` é IPv4 e `SOCK_STREAM` é TCP; para UDP seria `SOCK_DGRAM`, com `sendto` e `recvfrom` e sem `listen` nem `accept`.
+
+Três lições aparecem aqui. A rede trafega **bytes**, não texto: `encode` e `decode` com uma codificação combinada são obrigatórios. O TCP é um **fluxo**, sem fronteira de mensagem: um `recv` pode trazer metade do que foi enviado ou duas mensagens juntas, e por isso protocolos de aplicação definem onde cada mensagem termina (o HTTP usa linhas em branco e o cabeçalho `Content-Length`). E este servidor atende **um cliente por vez**: enquanto trata uma conexão, os outros esperam. Servidores reais usam várias threads, processos ou um laço de eventos assíncrono, que é o que gunicorn e uvicorn oferecem.
+
+## HTTP: a conversa
+
+HTTP é um protocolo de texto (até a versão 1.1) de pergunta e resposta. Uma requisição tem linha inicial, cabeçalhos, linha em branco e corpo opcional:
+
+```text
+POST /pedidos HTTP/1.1
+Host: api.ingressos.com.br
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOi...
+Content-Length: 44
+
+{"evento_id": 7, "setor": "Pista", "qtd": 2}
+```
+
+```text
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /pedidos/314
+
+{"id": 314, "status": "pendente", "total": "240.00"}
+```
+
+### Métodos
+
+| Método | Uso | Seguro | Idempotente |
+|---|---|---|---|
+| `GET` | Ler um recurso | Sim | Sim |
+| `POST` | Criar recurso ou disparar uma ação | Não | Não |
+| `PUT` | Substituir o recurso inteiro | Não | Sim |
+| `PATCH` | Alterar parte do recurso | Não | Não necessariamente |
+| `DELETE` | Remover | Não | Sim |
+| `HEAD` / `OPTIONS` | Só cabeçalhos / quais métodos são aceitos | Sim | Sim |
+
+**Seguro** significa que não altera estado no servidor. **Idempotente** significa que repetir a mesma requisição tem o mesmo efeito que fazê-la uma vez: apagar o pedido 314 duas vezes deixa o sistema igual a apagar uma. Essa propriedade decide se um cliente pode repetir uma requisição que falhou por timeout sem medo de duplicar o efeito.
+
+### Códigos de status
+
+| Faixa | Significado | Os que você mais vai usar |
+|---|---|---|
+| 1xx | Informativo | Raro no dia a dia |
+| 2xx | Sucesso | 200 OK, 201 Created, 204 No Content |
+| 3xx | Redirecionamento | 301 Moved Permanently, 302 Found, 304 Not Modified |
+| 4xx | Erro do cliente | 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 409 Conflict, 422 Unprocessable Content, 429 Too Many Requests |
+| 5xx | Erro do servidor | 500 Internal Server Error, 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout |
+
+Os pares que confundem: **401** é "não sei quem você é" (falta autenticação ou ela é inválida) e **403** é "sei quem você é e você não pode". **400** é requisição malformada; **422** é requisição bem formada com dados que não passam na validação (é o que o FastAPI devolve). **409** serve bem para conflito de estado, como tentar comprar ingressos de um setor esgotado. **502** e **504** quase sempre vêm do proxy na frente da aplicação: ele não conseguiu falar com ela ou ela demorou demais.
+
+### Cabeçalhos que importam
+
+| Cabeçalho | Para que serve |
+|---|---|
+| `Host` | Qual site o cliente quer; permite vários domínios no mesmo IP |
+| `Content-Type` | Formato do corpo: `application/json`, `text/html; charset=utf-8` |
+| `Accept` | Formatos que o cliente aceita na resposta |
+| `Authorization` | Credenciais, como `Bearer` seguido do token |
+| `Cache-Control` | Regras de cache: `no-store`, `max-age=60` |
+| `Location` | Endereço do recurso criado (com 201) ou do redirecionamento (com 3xx) |
+| `Set-Cookie` / `Cookie` | Servidor grava um cookie / navegador o devolve |
+| `User-Agent` | Identifica o cliente |
+| `X-Forwarded-For` | IP original do cliente quando há proxy no meio |
+
+## Um servidor HTTP com a biblioteca padrão
+
+O módulo `http.server` implementa o protocolo sobre sockets e deixa você tratar só a lógica. Não é para produção (é simples e sem os cuidados de segurança e desempenho de um servidor real), mas mostra o que Flask, Django e FastAPI fazem por você:
+
+```python
+# servidor_http.py
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+EVENTOS = [
+    {"id": 1, "nome": "Festival de Verão", "disponiveis": 497},
+    {"id": 2, "nome": "Sarau no Teatro", "disponiveis": 0},
+]
+
+
+class Manipulador(BaseHTTPRequestHandler):
+    def responder_json(self, status: int, corpo: object) -> None:
+        dados = json.dumps(corpo, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(dados)))
+        self.end_headers()
+        self.wfile.write(dados)
+
+    def do_GET(self) -> None:
+        if self.path == "/eventos":
+            self.responder_json(200, EVENTOS)
+        else:
+            self.responder_json(404, {"erro": "recurso não encontrado"})
+
+    def do_POST(self) -> None:
+        if self.path != "/eventos":
+            self.responder_json(404, {"erro": "recurso não encontrado"})
+            return
+        tamanho = int(self.headers.get("Content-Length", 0))
+        try:
+            dados = json.loads(self.rfile.read(tamanho))
+            nome = dados["nome"]
+        except (json.JSONDecodeError, KeyError):
+            self.responder_json(400, {"erro": "envie um JSON com o campo nome"})
+            return
+        evento = {"id": len(EVENTOS) + 1, "nome": nome, "disponiveis": 0}
+        EVENTOS.append(evento)
+        self.responder_json(201, evento)
+
+
+if __name__ == "__main__":
+    HTTPServer(("127.0.0.1", 8000), Manipulador).serve_forever()
+```
+
+```bash
+python servidor_http.py
+curl -i http://127.0.0.1:8000/eventos
+curl -i -X POST http://127.0.0.1:8000/eventos \
+     -H "Content-Type: application/json" -d '{"nome": "Stand-up"}'
+curl -i http://127.0.0.1:8000/nada
+```
+
+Repare no trabalho que um framework tira das suas mãos: rotear pelo caminho e pelo método, ler o corpo pelo `Content-Length`, converter JSON, devolver o status certo, montar cabeçalhos. A estrutura de pedido e resposta, porém, é a mesma em todos eles.
+
+## HTTPS e TLS
+
+HTTP puro trafega em texto claro: qualquer equipamento no caminho (o Wi-Fi do café, o provedor) lê senhas e tokens e pode alterar a resposta. O HTTPS é HTTP dentro de uma conexão **TLS**, que garante três coisas:
+
+- **Confidencialidade**: o conteúdo é cifrado, e quem está no meio vê apenas o IP e a porta de destino e, em geral, o nome do domínio.
+- **Integridade**: qualquer alteração no caminho é detectada.
+- **Autenticidade**: o servidor prova que é dono do domínio apresentando um **certificado** assinado por uma autoridade certificadora em que o sistema confia.
+
+No handshake do TLS 1.3, cliente e servidor combinam os algoritmos, trocam chaves usando criptografia assimétrica e derivam uma chave simétrica de sessão, mais rápida, usada no resto da conexão. Tudo isso leva uma ida e volta além do handshake TCP. O cliente confere se o certificado foi emitido para o nome acessado, se está no prazo e se a cadeia de assinaturas termina numa autoridade confiável.
+
+<Callout type="warning" title="Nunca desligue a verificação do certificado">
+Diante de um erro como `CERTIFICATE_VERIFY_FAILED`, a tentação é usar `verify=False` no `requests` ou `-k` no `curl`. Isso aceita qualquer certificado, inclusive o de um atacante no meio do caminho, e anula a autenticidade do TLS. Corrija a causa: certificado expirado, nome errado, cadeia intermediária faltando no servidor ou, numa rede corporativa, a autoridade interna que precisa ser instalada.
+</Callout>
+
+Na prática do back-end, o TLS costuma terminar no proxy reverso ou no balanceador de carga, que repassa para a aplicação em HTTP dentro da rede privada. Por isso a aplicação precisa ler cabeçalhos como `X-Forwarded-Proto` para saber que a requisição original era HTTPS, configuração que aparece nos capítulos de Django e de deploy.
+
+## Cookies e estado
+
+HTTP é **sem estado**: cada requisição é independente, e o servidor não lembra da anterior. Para manter o usuário logado, o servidor envia um cookie, e o navegador o devolve automaticamente nas requisições seguintes ao mesmo site:
+
+```text
+HTTP/1.1 200 OK
+Set-Cookie: sessao=9f2c1a7e; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600
+```
+
+```text
+GET /meus-pedidos HTTP/1.1
+Host: ingressos.com.br
+Cookie: sessao=9f2c1a7e
+```
+
+| Atributo | Efeito |
+|---|---|
+| `HttpOnly` | JavaScript da página não lê o cookie: protege a sessão contra roubo por XSS |
+| `Secure` | Só enviado por HTTPS |
+| `SameSite=Lax` ou `Strict` | Não enviado em requisições disparadas por outros sites; reduz CSRF |
+| `Max-Age` / `Expires` | Validade; sem eles, o cookie some ao fechar o navegador |
+| `Domain` / `Path` | Para quais endereços o cookie vale |
+
+O valor do cookie de sessão é só um identificador aleatório; os dados ficam no servidor, numa tabela ou num cache. Uma API consumida por aplicativos e outros serviços costuma preferir um token no cabeçalho `Authorization`, e essa escolha (sessão contra token) aparece nos capítulos de autenticação.
+
+## Ferramentas de diagnóstico
+
+| Pergunta | Ferramenta |
+|---|---|
+| A máquina responde? | `ping 8.8.8.8` (ICMP; alguns servidores bloqueiam) |
+| O nome resolve? Para qual IP? | `dig nome +short`, `nslookup nome` |
+| A porta está aberta? | `nc -vz host 5432`, ou `Test-NetConnection host -Port 5432` no PowerShell |
+| Por onde os pacotes passam? | `traceroute host` (`tracert` no Windows) |
+| Quem está escutando nesta máquina? | `ss -tlnp` no Linux, `netstat -ano` no Windows |
+| O que a API responde, com cabeçalhos? | `curl -i`, `curl -v` |
+
+O `curl` merece prática, porque é a forma universal de reproduzir uma requisição:
+
+```bash
+curl -i https://api.github.com/zen                  # status e cabeçalhos da resposta
+curl -v https://api.github.com/zen                  # mostra conexão, TLS e cabeçalhos enviados
+curl -I https://www.python.org                      # só os cabeçalhos (HEAD)
+curl -L http://github.com                           # segue redirecionamentos
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" https://www.python.org
+```
+
+A última linha mostra o status e o tempo total, útil para medir uma API. Com `-w` também dá para ver `time_namelookup`, `time_connect` e `time_appconnect`, que separam o tempo gasto em DNS, TCP e TLS.
+
+Um roteiro para "a API não responde": o nome resolve (`dig`)? A porta está aberta (`nc`)? O TLS fecha (`curl -v`)? O servidor responde algo (`curl -i`)? A aplicação registrou a requisição no log? Cada resposta elimina uma camada inteira de suspeitos.
+
+## Juntando tudo: o que acontece ao acessar uma URL
+
+Ao chamar `https://api.ingressos.com.br/eventos`: o cliente extrai o nome do domínio e o resolve no DNS (ou usa o cache); abre uma conexão TCP com o IP na porta 443 (três vias); faz o handshake TLS e valida o certificado; envia `GET /eventos` com o cabeçalho `Host`; o balanceador termina o TLS e repassa à aplicação Python; a aplicação consulta o banco e devolve 200 com JSON; a conexão fica aberta para ser reaproveitada nas próximas requisições. Saber contar essa história em detalhe é uma das perguntas mais clássicas de entrevista.
+
+## Na entrevista
+
+**Qual a diferença entre TCP e UDP?** TCP é orientado a conexão, garante entrega e ordem com retransmissão e controle de congestionamento, ao custo de latência. UDP envia datagramas independentes, sem garantia nem ordem, com custo mínimo. Usa-se TCP para HTTP e bancos de dados, e UDP para DNS, mídia em tempo real e como base do QUIC.
+
+**O que acontece quando você digita uma URL no navegador?** Resolução DNS do domínio, conexão TCP com o IP na porta 443, handshake TLS com validação do certificado, envio da requisição HTTP, processamento no servidor (proxy, aplicação, banco), resposta com status, cabeçalhos e corpo, e renderização. A conexão é mantida para requisições seguintes.
+
+**Diferença entre 401 e 403?** 401 significa que o cliente não está autenticado, ou a credencial é inválida, e deve se autenticar. 403 significa que o cliente está autenticado, mas não tem permissão para aquela operação.
+
+**O que significa um método ser idempotente?** Que repetir a mesma requisição produz o mesmo efeito no servidor que executá-la uma vez. `GET`, `PUT` e `DELETE` são idempotentes; `POST` não, por isso repetir um `POST` após timeout pode criar o recurso duas vezes.
+
+**O que o HTTPS protege?** Confidencialidade (o conteúdo é cifrado), integridade (alterações no caminho são detectadas) e autenticidade do servidor (o certificado prova o domínio). Ele não esconde o IP de destino nem, em geral, o nome do domínio, e não protege contra falhas da própria aplicação.
+
+**Por que uma mudança de DNS demora a valer para todos?** Porque as respostas ficam em cache nos resolvedores e nos clientes pelo tempo do TTL. Até ele expirar, quem tem o registro antigo continua usando o IP antigo. Reduzir o TTL antes da mudança encurta essa janela.
+
+## Pratique
+
+1. Rode o servidor e o cliente de eco. Depois altere o servidor para tratar cada conexão numa thread (`threading.Thread`) e confirme, com dois clientes abertos ao mesmo tempo, que um não espera o outro.
+2. Estenda o `servidor_http.py` com `GET /eventos/<id>`, devolvendo 404 para id inexistente e 400 para id não numérico. Teste todos os casos com `curl -i`.
+3. Acrescente `POST /eventos/<id>/reservas`, que recebe a quantidade e devolve 409 quando não há ingressos disponíveis e 201 com o cabeçalho `Location` quando a reserva é criada.
+4. Use `dig` para listar os registros `A`, `MX` e `NS` de um domínio conhecido e anote os TTLs. Repita a consulta e veja o TTL diminuindo no cache do resolvedor.
+5. Meça com `curl -w` o tempo de DNS, conexão TCP, TLS e total de três APIs públicas, e explique qual etapa pesa mais em cada uma.
+
+<Quiz question="Uma API em contêiner funciona com curl dentro do contêiner, mas recusa conexões vindas do host. Causa mais provável:" options={["Falta o certificado TLS","O servidor escuta em 127.0.0.1 em vez de 0.0.0.0","O DNS do host está errado","A porta é maior que 1024"]} answer={1} explanation="O loopback do contêiner é só dele. Para aceitar conexões encaminhadas pelo mapeamento de porta, o processo precisa escutar em todas as interfaces." />
+
+<Quiz question="Um cliente tenta comprar ingressos de um setor esgotado. Qual status representa melhor esse conflito de estado?" options={["401","404","500","409"]} answer={3} explanation="A requisição é válida e o usuário está autenticado, mas o estado atual do recurso impede a operação. 409 Conflict expressa isso; 500 indicaria falha do servidor." />
+
+<Quiz question="Qual atributo de cookie impede que o JavaScript da página leia o identificador de sessão?" options={["HttpOnly","Secure","SameSite","Max-Age"]} answer={0} explanation="HttpOnly torna o cookie inacessível ao JavaScript, reduzindo o estrago de um XSS. Secure restringe ao HTTPS e SameSite controla envio entre sites." />
+
+## Base no CodeForge
+
+- [Modelo TCP/IP](/learn/redes/modelo-tcp-ip) e [Encapsulamento](/learn/redes/encapsulamento): as camadas em detalhe.
+- [IP e endereçamento](/learn/redes/ip-e-enderecamento), [Sub-redes e CIDR](/learn/redes/subredes-e-cidr) e [NAT](/learn/redes/nat): endereços, faixas privadas e tradução.
+- [DNS](/learn/redes/dns): resolução recursiva, cache e tipos de registro.
+- [TCP](/learn/redes/tcp), [Handshake TCP](/learn/redes/handshake-tcp), [UDP](/learn/redes/udp) e [Sockets](/learn/redes/sockets): o transporte e a interface de programação.
+- [HTTP/1.1](/learn/redes/http-1), [TLS](/learn/redes/tls), [Diagnóstico](/learn/redes/diagnostico) e [O que acontece ao digitar uma URL](/learn/redes/o-que-acontece-ao-digitar-url): a aplicação, a segurança e a investigação de problemas.
+
+## Referências
+
+- [socket: interface de rede de baixo nível](https://docs.python.org/pt-br/3/library/socket.html)
+- [http.server: servidores HTTP](https://docs.python.org/pt-br/3/library/http.server.html)
+- [MDN: visão geral do HTTP](https://developer.mozilla.org/pt-BR/docs/Web/HTTP/Overview)
+- [RFC 9110: semântica do HTTP](https://www.rfc-editor.org/rfc/rfc9110)

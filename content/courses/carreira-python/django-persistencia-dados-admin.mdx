@@ -1,0 +1,486 @@
+---
+title: "Django: Persistência de dados e Admin"
+kind: lesson
+---
+
+No capítulo anterior, a vitrine de eventos lia uma lista em memória através de `listar_eventos` e `buscar_evento`. Funciona para mostrar o layout, mas nada sobrevive a um reinício, ninguém consegue cadastrar evento sem editar código e não há como garantir que dois clientes não comprem o mesmo último ingresso. Agora os dados vão para o PostgreSQL pelo ORM do Django, e a equipe de operação ganha um painel para cadastrar eventos, acompanhar pedidos e cancelar reservas, sem que você escreva uma tela sequer.
+
+O ORM é a parte do Django que mais aparece em entrevista, e quase sempre pelo mesmo ângulo: consultas que parecem inocentes no Python e viram centenas de queries no banco. Este capítulo ensina a modelar, a migrar e a consultar com consciência do SQL gerado.
+
+**Você vai aprender:**
+
+- Modelar entidades com campos, relacionamentos, choices e constraints no banco
+- Criar, revisar e escrever migrações, inclusive de dados
+- Consultar com QuerySets, `Q`, `F`, agregações e QuerySets personalizados
+- Eliminar o problema N+1 com `select_related` e `prefetch_related`
+- Montar um Admin útil com `list_display`, filtros, busca, inlines e ações
+
+## PostgreSQL e o modelo de usuário
+
+Suba um PostgreSQL 16 local e instale o driver psycopg 3:
+
+```bash
+docker run -d --name pg -e POSTGRES_PASSWORD=ingressos -e POSTGRES_DB=ingressos -p 5432:5432 postgres:16
+pip install "psycopg[binary]~=3.2"
+```
+
+Seguindo o padrão do capítulo anterior, a conexão vem do ambiente:
+
+```python
+# ingressos/settings.py (trecho)
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("POSTGRES_DB", "ingressos"),
+        "USER": os.environ.get("POSTGRES_USER", "postgres"),
+        "PASSWORD": os.environ["POSTGRES_PASSWORD"],
+        "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
+        "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+        "CONN_MAX_AGE": 60,
+    }
+}
+
+AUTH_USER_MODEL = "contas.Usuario"
+```
+
+`CONN_MAX_AGE` reaproveita a conexão por até 60 segundos em vez de abrir uma por requisição.
+
+A última linha precisa vir **antes da primeira migração**. Pedidos pertencem a um cliente, e o cliente é um usuário. A documentação do Django recomenda que todo projeto novo comece com um modelo de usuário próprio, mesmo vazio, porque trocar `AUTH_USER_MODEL` depois que as tabelas existem exige uma migração manual trabalhosa. Crie o app `contas` com o mínimo:
+
+```python
+# contas/models.py
+from django.contrib.auth.models import AbstractUser
+
+
+class Usuario(AbstractUser):
+    pass
+```
+
+Registre `contas` em `INSTALLED_APPS`. O capítulo seguinte, de autenticação, faz esse modelo usar o e-mail como login. Daqui em diante, nunca importe `django.contrib.auth.models.User` diretamente: referencie `settings.AUTH_USER_MODEL` nos modelos e use `get_user_model()` no resto do código.
+
+## Modelos do domínio
+
+Todos os modelos ficam em `eventos/models.py`. Cada classe que herda de `models.Model` é uma tabela; cada atributo de campo é uma coluna. O Django cria a chave primária `id` (do tipo definido em `DEFAULT_AUTO_FIELD`, `BigAutoField` em projetos novos).
+
+```python
+# eventos/models.py
+import uuid
+
+from django.conf import settings
+from django.db import models
+from django.db.models import Q
+from django.urls import reverse
+from django.utils import timezone
+
+
+class EventoQuerySet(models.QuerySet):
+    def publicados(self) -> "EventoQuerySet":
+        return self.filter(publicado=True)
+
+    def futuros(self) -> "EventoQuerySet":
+        return self.filter(data__gte=timezone.now())
+
+
+class Evento(models.Model):
+    nome = models.CharField(max_length=120)
+    slug = models.SlugField(max_length=140, unique=True)
+    data = models.DateTimeField()
+    local = models.CharField(max_length=120)
+    capacidade = models.PositiveIntegerField()
+    publicado = models.BooleanField(default=False)
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+    objects = EventoQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["data"]
+        indexes = [models.Index(fields=["local", "data"])]
+
+    def __str__(self) -> str:
+        return self.nome
+
+    def get_absolute_url(self) -> str:
+        return reverse("eventos:detalhe", kwargs={"slug": self.slug})
+
+
+class Setor(models.Model):
+    evento = models.ForeignKey(Evento, on_delete=models.CASCADE, related_name="setores")
+    nome = models.CharField(max_length=100)
+    preco = models.DecimalField(max_digits=10, decimal_places=2)
+    quantidade_disponivel = models.PositiveIntegerField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["evento", "nome"], name="setor_unico_por_evento"),
+            models.CheckConstraint(condition=Q(preco__gte=0), name="setor_preco_nao_negativo"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.evento} / {self.nome}"
+
+
+class Pedido(models.Model):
+    class Status(models.TextChoices):
+        PENDENTE = "pendente", "Pendente"
+        PAGO = "pago", "Pago"
+        CANCELADO = "cancelado", "Cancelado"
+        EXPIRADO = "expirado", "Expirado"
+
+    cliente = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="pedidos"
+    )
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDENTE)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    expira_em = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-criado_em"]
+        indexes = [models.Index(fields=["status", "expira_em"])]
+
+
+class Ingresso(models.Model):
+    codigo = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    pedido = models.ForeignKey(Pedido, on_delete=models.CASCADE, related_name="ingressos")
+    setor = models.ForeignKey(Setor, on_delete=models.PROTECT, related_name="ingressos")
+```
+
+Decisões que valem explicar:
+
+- **`related_name="setores"`** dá nome ao caminho inverso: `evento.setores.all()` em vez do padrão `evento.setor_set.all()`. O mesmo vale para `cliente.pedidos` e `pedido.ingressos`.
+- **`on_delete`** é obrigatório e é uma regra de negócio. `CASCADE` apaga os setores junto com o evento. `PROTECT` impede apagar o que ainda é referenciado: um setor que já emitiu ingressos, ou um usuário que tem pedidos, não pode sumir e levar o histórico junto. `SET_NULL` exige `null=True`.
+- **Dinheiro em `DecimalField`**, nunca `float`: `0.1 + 0.2` em ponto flutuante não dá `0.3`, e centavos perdidos em relatório financeiro viram auditoria.
+- **Constraints no banco** valem para qualquer caminho de escrita: Admin, shell, script, outro serviço. Validação só em formulário é contornável. A `CheckConstraint` usa o parâmetro `condition` (o antigo `check` foi depreciado no Django 5.1). `PositiveIntegerField` já gera, no PostgreSQL, a restrição de valor não negativo para `quantidade_disponivel`.
+- **`TextChoices`** cria um enum: no código, `Pedido.Status.PAGO`; no banco, o texto `"pago"`; na tela, o rótulo, disponível em `pedido.get_status_display()`.
+- **`expira_em`** guarda o fim da reserva de 15 minutos. É anulável porque só faz sentido para pedidos pendentes, e o índice em `(status, expira_em)` atende a rotina que procura reservas vencidas.
+- **`get_absolute_url`** conecta o modelo às URLs nomeadas; o Admin usa esse método para o botão "Ver no site".
+- **O índice composto** de `Evento` atende a listagem filtrada por local e ordenada por data. Campos com `unique=True` e chaves estrangeiras já ganham índice automaticamente.
+
+Os quatro modelos ficam no app `eventos`: são um domínio só, com regras que cruzam as entidades a todo momento (a reserva mexe em setor, pedido e ingresso de uma vez). Separar em apps quando as fronteiras ainda não estão claras gera dependência circular entre eles. Quando um pedaço ganhar regras e ciclo de vida próprios, como pagamentos, ele merece app próprio.
+
+A regra "a soma dos setores não passa da capacidade do evento" envolve várias linhas e não cabe numa `CheckConstraint`. Ela fica no domínio, conferida no momento de criar ou alterar setores.
+
+Muitos para muitos existe com `models.ManyToManyField` (por exemplo, eventos e categorias). Quando a ligação tem dados próprios, como a quantidade de cada setor num pedido, modele a tabela intermediária explicitamente ou declare-a com `through=`. Aqui, como cada `Ingresso` já liga um pedido a um setor, a quantidade por setor é só uma contagem de ingressos.
+
+## Migrações
+
+Migrações são o histórico versionado do esquema. O fluxo:
+
+```bash
+python manage.py makemigrations          # gera arquivos a partir das mudanças nos modelos
+python manage.py sqlmigrate eventos 0001 # mostra o SQL que será executado
+python manage.py migrate                 # aplica no banco
+python manage.py showmigrations          # o que está aplicado
+```
+
+Os arquivos de `migrations/` vão para o Git e são revisados no pull request como qualquer código. Leia o `sqlmigrate` de migrações em tabelas grandes: adicionar coluna `NOT NULL` com default, criar índice ou trocar tipo podem travar a tabela em produção. No PostgreSQL, índices em tabelas grandes podem ser criados sem bloquear escritas com `AddIndexConcurrently`, de `django.contrib.postgres.operations`, numa migração com `atomic = False`.
+
+Quando a mudança é nos **dados** e não no esquema, escreva uma migração de dados:
+
+```python
+# eventos/migrations/0003_prazo_reservas_antigas.py
+from datetime import timedelta
+
+from django.db import migrations
+from django.db.models import F
+
+
+def preencher_prazo(apps, schema_editor):
+    # a 0002 criou expira_em; pedidos pendentes antigos recebem o prazo de 15 minutos
+    Pedido = apps.get_model("eventos", "Pedido")
+    Pedido.objects.filter(status="pendente", expira_em__isnull=True).update(
+        expira_em=F("criado_em") + timedelta(minutes=15)
+    )
+
+
+class Migration(migrations.Migration):
+    dependencies = [("eventos", "0002_pedido_expira_em")]
+    operations = [migrations.RunPython(preencher_prazo, migrations.RunPython.noop)]
+```
+
+Use `apps.get_model` e nunca importe o modelo direto: a migração precisa da versão histórica do modelo, como ele era naquele ponto, não a atual. O segundo argumento de `RunPython` é a operação de volta; `noop` permite reverter sem desfazer dados.
+
+<Callout type="warning" title="Nunca edite uma migração já aplicada em outro ambiente">
+Se a migração já rodou no banco de um colega, no CI ou em produção, alterar o arquivo deixa os bancos divergentes sem aviso: o Django registra só o nome da migração, não o conteúdo. Para corrigir, crie uma migração nova. Apagar e recriar migrações só é aceitável enquanto elas existem apenas na sua máquina.
+</Callout>
+
+## QuerySets
+
+Um QuerySet é **preguiçoso**: montar filtros não toca o banco. A consulta acontece quando você itera, fatia com passo, chama `len`, `list`, `bool` ou métodos como `count()`, `exists()`, `first()`. E o resultado fica em cache no próprio QuerySet, o que ajuda ao iterar duas vezes e atrapalha se você esperava dados novos.
+
+```python
+from django.db.models import Count, F, Q, Sum
+
+from eventos.models import Evento, Pedido, Setor
+
+# filtros encadeados, com lookups
+Evento.objects.publicados().futuros().filter(local="Recife")
+Evento.objects.filter(nome__icontains="jazz", data__year=2030)
+
+# OU lógico e negação com Q
+Evento.objects.filter(Q(local="Recife") | Q(local="Olinda"), ~Q(capacidade=0))
+
+# atravessar relacionamento com __
+Pedido.objects.filter(ingressos__setor__evento__slug="festival-de-verao").distinct()
+
+# agregação por linha (annotate) e total (aggregate)
+eventos = Evento.objects.annotate(
+    restantes=Sum("setores__quantidade_disponivel"),
+    total_setores=Count("setores"),
+)
+Setor.objects.filter(evento__slug="festival-de-verao").aggregate(total=Sum("quantidade_disponivel"))
+
+# existência e contagem sem trazer linhas
+Pedido.objects.filter(cliente_id=7, status=Pedido.Status.PENDENTE).exists()
+```
+
+`get()` devolve um objeto ou levanta `DoesNotExist` (ou `MultipleObjectsReturned`). Nas views, `get_object_or_404` converte a ausência em 404. A troca dos dados em memória do capítulo anterior fica assim:
+
+```python
+# eventos/views.py
+from django.db.models import Min, Sum
+from django.shortcuts import get_object_or_404, render
+
+from eventos.models import Evento
+
+
+def lista(request):
+    eventos = Evento.objects.publicados().futuros().annotate(
+        preco_minimo=Min("setores__preco"),
+        vagas=Sum("setores__quantidade_disponivel"),
+    )
+    if local := request.GET.get("local"):
+        eventos = eventos.filter(local=local)
+    return render(request, "eventos/lista.html", {"eventos": eventos, "local": local})
+
+
+def detalhe(request, slug: str):
+    evento = get_object_or_404(Evento.objects.publicados(), slug=slug)
+    setores = evento.setores.order_by("preco")
+    return render(request, "eventos/detalhe.html", {"evento": evento, "setores": setores})
+```
+
+Os templates continuam os mesmos: o `annotate` calcula no banco o `preco_minimo` e as `vagas` que a lista em memória trazia prontos, então os objetos têm a mesma forma. O `EventoQuerySet` concentra regras de consulta (o que é "publicado", o que é "futuro") num lugar só, em vez de repetir filtros em cada view.
+
+### Escrita atômica com F e transações
+
+`F("campo")` referencia o valor da coluna dentro do banco. Isso permite a mesma baixa de estoque sem condição de corrida que você fez no MongoDB, agora em SQL:
+
+```python
+# eventos/servicos.py
+from django.db import transaction
+from django.db.models import F
+
+from eventos.models import Ingresso, Pedido, Setor
+
+
+class EstoqueInsuficiente(Exception):
+    pass
+
+
+@transaction.atomic
+def reservar(pedido: Pedido, setor_id: int, quantidade: int) -> None:
+    atualizados = Setor.objects.filter(
+        pk=setor_id, quantidade_disponivel__gte=quantidade
+    ).update(quantidade_disponivel=F("quantidade_disponivel") - quantidade)
+    if atualizados == 0:
+        raise EstoqueInsuficiente(f"Setor {setor_id} sem {quantidade} ingressos")
+    Ingresso.objects.bulk_create(
+        [Ingresso(pedido=pedido, setor_id=setor_id) for _ in range(quantidade)]
+    )
+
+
+@transaction.atomic
+def cancelar_pedido(pedido: Pedido) -> None:
+    atualizados = Pedido.objects.filter(pk=pedido.pk, status=Pedido.Status.PENDENTE).update(
+        status=Pedido.Status.CANCELADO
+    )
+    if atualizados == 0:
+        return  # já pago, cancelado ou expirado: nada a devolver
+    for setor_id in pedido.ingressos.values_list("setor_id", flat=True).distinct():
+        quantidade = pedido.ingressos.filter(setor_id=setor_id).count()
+        Setor.objects.filter(pk=setor_id).update(
+            quantidade_disponivel=F("quantidade_disponivel") + quantidade
+        )
+    pedido.ingressos.all().delete()
+```
+
+O `update` vira um único `UPDATE ... WHERE quantidade_disponivel >= quantidade`, e devolve quantas linhas mudou. `transaction.atomic` garante que a baixa de estoque e a emissão dos ingressos do pedido acontecem juntas ou não acontecem. O cancelamento usa a mesma ideia: o status só muda se o pedido ainda estiver pendente, então dois cancelamentos simultâneos não devolvem o estoque duas vezes. Diferente do MongoDB, aqui a atomicidade entre tabelas é natural. Quando precisar ler, decidir em Python e depois gravar, trave as linhas com `select_for_update()` dentro da transação.
+
+## N+1: select_related e prefetch_related
+
+Esta página de "pedidos recentes" parece inofensiva:
+
+```python
+pedidos = Pedido.objects.all()[:50]
+for pedido in pedidos:
+    print(pedido.cliente.email, [ingresso.setor.nome for ingresso in pedido.ingressos.all()])
+```
+
+Ela faz 1 consulta para os pedidos, mais 1 por pedido para o cliente, mais 1 por pedido para os ingressos, mais 1 por ingresso para o setor. Com 50 pedidos, passa de 150 queries. É o problema **N+1**: o acesso a um relacionamento dispara uma consulta preguiçosa a cada volta do laço.
+
+```python
+from django.db.models import Prefetch
+
+from eventos.models import Ingresso, Pedido
+
+pedidos = (
+    Pedido.objects.select_related("cliente")
+    .prefetch_related(
+        Prefetch("ingressos", queryset=Ingresso.objects.select_related("setor__evento"))
+    )[:50]
+)
+```
+
+| | `select_related` | `prefetch_related` |
+|---|---|---|
+| Relacionamento | `ForeignKey` e `OneToOne` (lado "para um") | Inverso de FK e `ManyToMany` (lado "para muitos") |
+| Como busca | `JOIN` na mesma consulta | Uma consulta extra por relação, com `IN (...)`, juntada em Python |
+| Total de queries | 1 | 1 mais uma por relação pré-carregada |
+
+Agora são 2 consultas, independente do número de pedidos. `Prefetch` permite filtrar, ordenar e aplicar `select_related` dentro do pré-carregamento. Cuidado: se depois você chamar `pedido.ingressos.filter(...)`, o cache do prefetch é ignorado e a consulta volta a acontecer. Filtros vão no `queryset` do `Prefetch`.
+
+Ponha essa consulta numa função `pedidos_recentes()` em `eventos/consultas.py`, para que views e testes usem a mesma versão otimizada. Prove no teste que o número de consultas não cresce, com a fixture `django_assert_num_queries` do pytest-django (`pedidos_com_ingressos` é uma fixture sua que cria alguns pedidos com ingressos):
+
+```python
+import pytest
+
+from eventos.consultas import pedidos_recentes
+
+
+@pytest.mark.django_db
+def test_pedidos_recentes_sem_n_mais_1(django_assert_num_queries, pedidos_com_ingressos):
+    with django_assert_num_queries(2):
+        for pedido in pedidos_recentes():
+            _ = pedido.cliente.email
+            _ = [ingresso.setor.evento.nome for ingresso in pedido.ingressos.all()]
+```
+
+Outras ferramentas: `only()` e `defer()` limitam colunas, `values()` e `values_list()` devolvem dicionários ou tuplas em vez de objetos, e `iterator()` percorre resultados grandes sem guardar tudo em memória. Em desenvolvimento, o django-debug-toolbar mostra cada consulta de uma página.
+
+## Admin personalizado
+
+O Admin lê os modelos e gera listagem, busca, formulário e histórico. Crie um superusuário com `python manage.py createsuperuser` e registre os modelos:
+
+```python
+# eventos/admin.py
+from django.contrib import admin
+from django.db.models import Sum
+
+from eventos.models import Evento, Setor
+
+
+class SetorInline(admin.TabularInline):
+    model = Setor
+    extra = 1
+    fields = ["nome", "preco", "quantidade_disponivel"]
+
+
+@admin.register(Evento)
+class EventoAdmin(admin.ModelAdmin):
+    list_display = ["nome", "data", "local", "capacidade", "restantes", "publicado"]
+    list_filter = ["publicado", "local", "data"]
+    list_editable = ["publicado"]
+    search_fields = ["nome", "local"]
+    prepopulated_fields = {"slug": ["nome"]}
+    date_hierarchy = "data"
+    inlines = [SetorInline]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(_restantes=Sum("setores__quantidade_disponivel"))
+
+    @admin.display(description="Restantes", ordering="_restantes")
+    def restantes(self, obj: Evento) -> int:
+        return obj._restantes or 0
+```
+
+```python
+# eventos/admin.py (continuação)
+from django.contrib import messages
+
+from eventos.models import Ingresso, Pedido
+from eventos.servicos import cancelar_pedido
+
+
+class IngressoInline(admin.TabularInline):
+    model = Ingresso
+    extra = 0
+    readonly_fields = ["codigo", "setor"]
+    can_delete = False
+
+
+@admin.register(Pedido)
+class PedidoAdmin(admin.ModelAdmin):
+    list_display = ["id", "cliente", "status", "criado_em", "expira_em"]
+    list_filter = ["status", "criado_em"]
+    search_fields = ["cliente__email", "cliente__username"]
+    list_select_related = ["cliente"]
+    readonly_fields = ["criado_em"]
+    inlines = [IngressoInline]
+    actions = ["cancelar"]
+
+    @admin.action(description="Cancelar pedidos selecionados e devolver estoque")
+    def cancelar(self, request, queryset):
+        cancelados = 0
+        for pedido in queryset.filter(status=Pedido.Status.PENDENTE):
+            cancelar_pedido(pedido)
+            cancelados += 1
+        self.message_user(request, f"{cancelados} pedido(s) cancelado(s).", messages.SUCCESS)
+
+
+@admin.register(Ingresso)
+class IngressoAdmin(admin.ModelAdmin):
+    list_display = ["codigo", "pedido", "setor", "emitido_em"]
+    search_fields = ["codigo"]
+    list_select_related = ["pedido", "setor__evento"]
+```
+
+- **`list_display`** aceita campos, métodos do modelo ou métodos do admin decorados com `@admin.display`. Coluna calculada vem de `annotate` em `get_queryset`, não de uma consulta por linha.
+- **`list_select_related`** evita o N+1 na própria listagem do Admin, que exibe o cliente de cada pedido.
+- **`search_fields`** atravessa relacionamentos com `__`. Cada campo vira um `icontains`; em tabelas grandes, prefira poucos campos indexados.
+- **Inlines** editam filhos na página do pai. `readonly_fields` e `can_delete=False` impedem que alguém altere o histórico de um pedido.
+- **Ações** chamam a mesma função de serviço que a aplicação usa (`cancelar_pedido`, escrita em `eventos/servicos.py` ao lado de `reservar`). Nunca reimplemente regra de negócio dentro do Admin, ou o painel vira um segundo caminho que ignora as regras.
+
+<Callout type="tip" title="O Admin é para a equipe, não para o cliente">
+O Admin é ótimo para operação interna e ruim como produto: personalizar demais o fluxo dele custa mais do que fazer uma tela. Proteja-o como área sensível: mude a URL padrão `admin/`, exija senha forte e, se possível, restrinja por rede. Permissões por grupo, que limitam o que cada pessoa da equipe enxerga, aparecem no próximo capítulo.
+</Callout>
+
+## Na entrevista
+
+**O que é o problema N+1 e como resolver no Django?** Acontece quando uma consulta traz N objetos e o acesso a um relacionamento de cada um dispara mais uma consulta. Resolvo com `select_related` para chaves estrangeiras (JOIN) e `prefetch_related` para relações "para muitos" (consulta extra com `IN`), e confirmo com um teste que fixa o número de queries.
+
+**QuerySets são avaliados quando?** Na iteração, em `len`, `list`, `bool`, fatiamento com passo e em métodos que precisam do resultado, como `count`, `exists`, `first` e `get`. Até lá, filtros só montam a consulta. O resultado avaliado fica em cache no QuerySet.
+
+**Por que usar `F()` numa baixa de estoque?** Porque a operação é feita pelo banco num único `UPDATE`, com a condição no `WHERE`. Ler o valor em Python e gravar depois abre uma janela em que duas requisições veem o mesmo estoque.
+
+**Por que definir um modelo de usuário próprio no início do projeto?** Porque `AUTH_USER_MODEL` é referenciado por chaves estrangeiras de vários apps desde a primeira migração. Trocá-lo depois exige migrar tabelas e relações à mão. Um `AbstractUser` vazio no começo não custa nada e deixa espaço para crescer.
+
+**Constraint no banco ou validação na aplicação?** As duas. A validação dá mensagem amigável ao usuário; a constraint garante a regra para qualquer caminho de escrita, inclusive scripts, Admin e condições de corrida.
+
+## Pratique
+
+1. Crie os apps `contas` e `eventos` com os modelos deste capítulo, configure o PostgreSQL pelo ambiente e gere as migrações. Leia o SQL de cada uma com `sqlmigrate`.
+2. Troque `eventos/dados.py` pelo ORM nas views, mantendo os templates, e adicione `restantes` anotado na listagem.
+3. Escreva `eventos/servicos.py` com `reservar` e `cancelar_pedido` usando `transaction.atomic` e `F`, e teste que a segunda reserva do último ingresso falha.
+4. Monte o Admin de eventos (com setores inline) e de pedidos (com ação de cancelamento), e verifique no django-debug-toolbar que a listagem de pedidos faz um número fixo de consultas.
+5. Escreva uma migração de dados que publica todos os eventos que já têm ao menos um setor, com operação reversa.
+
+<Quiz question="Uma listagem mostra 100 pedidos com o e-mail do cliente e faz 101 consultas. Qual a correção?" options={["prefetch_related('ingressos')","select_related('cliente')","Usar values() no template","Aumentar CONN_MAX_AGE"]} answer={1} explanation="cliente é uma ForeignKey, o lado 'para um' do relacionamento. select_related faz o JOIN na mesma consulta e elimina as 100 consultas extras." />
+
+<Quiz question="Numa migração de dados com RunPython, como obter o modelo Setor?" options={["Importando de eventos.models","Com get_user_model()","Com apps.get_model('eventos', 'Setor')","Criando a classe dentro da migração"]} answer={2} explanation="A migração precisa da versão histórica do modelo, como ele estava naquele ponto do histórico. Importar o modelo atual quebra quando campos forem alterados no futuro." />
+
+<Quiz question="Qual parâmetro de ForeignKey impede apagar um setor que já tem ingressos emitidos?" options={["on_delete=models.PROTECT na FK de Ingresso para Setor","on_delete=models.CASCADE","related_name='ingressos'","null=True"]} answer={0} explanation="PROTECT faz o banco e o Django recusarem a exclusão do objeto referenciado, levantando ProtectedError. CASCADE apagaria os ingressos junto." />
+
+## Base no CodeForge
+
+- [Django: Templates e boas práticas](/learn/carreira-python/django-templates-boas-praticas): o projeto, as views e os templates que este capítulo passa a alimentar com o banco.
+- [Python: Persistência de dados com arquivos e bancos de dados](/learn/carreira-python/python-persistencia-dados-arquivos-bancos-dados): o SQL por trás do ORM.
+- [Índices](/learn/sql/indices) e [EXPLAIN](/learn/sql/explain): como ler o plano das consultas que o ORM gera.
+- [Transações e ACID](/learn/sql/transacoes-e-acid) e [Locks no banco](/learn/sql/locks-no-banco): o que `transaction.atomic` e `select_for_update` garantem.
+- [Migrações de schema](/learn/system-design/migracoes-de-schema): mudar o esquema de tabelas grandes sem derrubar a aplicação.
+
+## Referências
+
+- [Django: Models](https://docs.djangoproject.com/en/5.2/topics/db/models/)
+- [Django: Making queries](https://docs.djangoproject.com/en/5.2/topics/db/queries/)
+- [Django: Database access optimization](https://docs.djangoproject.com/en/5.2/topics/db/optimization/)
+- [Django: The Django admin site](https://docs.djangoproject.com/en/5.2/ref/contrib/admin/)

@@ -1,0 +1,402 @@
+---
+title: "Python: Otimização de desempenho e integração com C"
+kind: lesson
+---
+
+O relatório de vendas da plataforma de ingressos leva quatro minutos para fechar o mês, a validação de ingressos na catraca engasga quando o portão abre e milhares de pessoas passam ao mesmo tempo, e o cálculo de preço dinâmico por setor começou a pesar no tempo de resposta. A reação instintiva é dizer que "Python é lento" e propor reescrever em outra linguagem. Quase sempre o problema é outro: um algoritmo quadrático escondido num laço, uma lista usada onde cabia um conjunto, mil consultas onde cabia uma, ou trabalho de CPU rodando onde só cabia I/O.
+
+Otimização começa por medir. Este capítulo mostra como encontrar o gargalo com `timeit`, `cProfile`, `py-spy` e `tracemalloc`, como resolver a maioria dos casos com estruturas de dados, geradores, cache e vetorização, como escolher entre threads, processos e `asyncio` sabendo o que o GIL faz, e, para o que sobra, como chamar código C com `ctypes`, `cffi`, uma extensão mínima com a C API e Cython. Também mostra quando nada disso compensa.
+
+**Você vai aprender:**
+
+- Medir antes de otimizar com `timeit`, `cProfile`, `py-spy` e `tracemalloc`
+- Trocar estruturas e algoritmos pelos adequados e usar geradores e `functools.cache`
+- Escolher entre threads, multiprocessing e `asyncio` sabendo o papel do GIL
+- Vetorizar cálculos numéricos com NumPy
+- Integrar código C com `ctypes`, `cffi`, a C API e Cython, e decidir quando compensa
+
+## Medir antes de otimizar
+
+Intuição sobre desempenho erra com frequência. A regra é: defina a meta (o relatório deve fechar em 10 segundos), meça, encontre onde o tempo vai, mude uma coisa, meça de novo.
+
+Para comparar trechos pequenos, o `timeit` repete a execução muitas vezes e descarta ruídos:
+
+```bash
+python -m timeit -s "codigos = [str(i) for i in range(100_000)]" "'99999' in codigos"
+python -m timeit -s "codigos = {str(i) for i in range(100_000)}" "'99999' in codigos"
+```
+
+A busca na lista percorre os 100 mil itens; no conjunto, é uma consulta de tabela hash. A diferença é de milhares de vezes, e é exatamente o que acontece na catraca se os códigos válidos estiverem numa lista.
+
+Para um programa inteiro, o `cProfile` registra quantas vezes cada função foi chamada e quanto tempo levou:
+
+```bash
+python -m cProfile -o relatorio.prof -m ingressos.relatorios.vendas_do_mes
+python -c "import pstats; pstats.Stats('relatorio.prof').sort_stats('cumulative').print_stats(15)"
+```
+
+Ordenar por `cumulative` mostra as funções em que o programa passa mais tempo, incluindo o que elas chamam; `tottime` mostra o tempo gasto dentro da própria função. Ferramentas como o `snakeviz` desenham o resultado. O `cProfile` adiciona custo a cada chamada, o que distorce funções pequenas e muito chamadas, e não serve para produção.
+
+Para produção, o `py-spy` é um profiler por amostragem que lê a pilha de um processo em execução de fora, sem alterar o código nem reiniciar:
+
+```bash
+pip install py-spy
+py-spy top --pid 4312                                  # visao ao vivo, como o top
+py-spy record -o perfil.svg --pid 4312 --duration 30   # flame graph de 30 segundos
+py-spy dump --pid 4312                                 # pilha atual de cada thread
+```
+
+O flame graph mostra a largura de cada função proporcional ao tempo em que ela aparecia nas amostras: o gargalo é a barra larga. O `dump` é ótimo para descobrir onde um worker do Gunicorn está travado. Em contêineres, o `py-spy` precisa da capacidade `SYS_PTRACE`.
+
+Memória tem a sua ferramenta na biblioteca padrão, o `tracemalloc`:
+
+```python
+import tracemalloc
+
+from ingressos.relatorios import vendas_do_mes
+
+tracemalloc.start()
+vendas_do_mes.gerar(ano=2026, mes=3)
+atual, pico = tracemalloc.get_traced_memory()
+print(f"atual: {atual / 1e6:.1f} MB, pico: {pico / 1e6:.1f} MB")
+
+for estatistica in tracemalloc.take_snapshot().statistics("lineno")[:10]:
+    print(estatistica)
+```
+
+Ele aponta as linhas que mais alocaram. Comparar dois snapshots (`snapshot2.compare_to(snapshot1, "lineno")`) mostra o que cresceu entre eles, o caminho para achar vazamentos, como um cache em dicionário global que nunca é limpo.
+
+<Callout type="tip" title="O gargalo costuma estar fora do Python">
+Antes de olhar o código, olhe o que ele espera. Num serviço web, a maior parte do tempo costuma ir para o banco e a rede: consultas N+1 do ORM, falta de índice, chamadas HTTP em série. `select_related`, `prefetch_related`, o `EXPLAIN` do PostgreSQL e um trace distribuído resolvem mais lentidão do que qualquer micro-otimização.
+</Callout>
+
+## Estruturas de dados e algoritmos certos
+
+A maior parte dos ganhos grandes vem de mudar a complexidade, não de acelerar a mesma operação. Saber o custo das operações das estruturas embutidas é obrigatório:
+
+| Operação | `list` | `dict` e `set` | `collections.deque` |
+|---|---|---|---|
+| Acesso por índice | O(1) | Não se aplica | O(n) |
+| `x in estrutura` | O(n) | O(1) em média | O(n) |
+| Inserir ou remover no fim | O(1) amortizado | O(1) em média | O(1) |
+| Inserir ou remover no início | O(n) | Não se aplica | O(1) |
+
+Um caso real do relatório de vendas:
+
+```python
+# Lento: para cada pedido, percorre a lista de clientes. O(pedidos x clientes)
+def nomes_dos_compradores(pedidos: list[dict], clientes: list[dict]) -> list[str]:
+    nomes = []
+    for pedido in pedidos:
+        for cliente in clientes:
+            if cliente["id"] == pedido["cliente_id"]:
+                nomes.append(cliente["nome"])
+    return nomes
+
+
+# Rapido: indexa uma vez, consulta em O(1). O(pedidos + clientes)
+def nomes_dos_compradores(pedidos: list[dict], clientes: list[dict]) -> list[str]:
+    nome_por_id = {cliente["id"]: cliente["nome"] for cliente in clientes}
+    return [nome_por_id[pedido["cliente_id"]] for pedido in pedidos]
+```
+
+Com 50 mil pedidos e 20 mil clientes, a primeira versão faz um bilhão de comparações; a segunda, setenta mil operações. Outras trocas frequentes: `collections.Counter` para contagens, `heapq.nlargest` para os N maiores sem ordenar tudo, `bisect` para busca em lista ordenada, `str.join` em vez de concatenar strings num laço. E use as funções embutidas (`sum`, `max`, `sorted`, `any`), implementadas em C e muito mais rápidas que o laço equivalente em Python.
+
+Para objetos criados aos milhões, `@dataclass(slots=True)` elimina o dicionário de atributos de cada instância, reduzindo memória e acelerando o acesso.
+
+## Geradores e processamento em fluxo
+
+Carregar tudo na memória para depois processar é o padrão que faz o relatório do mês consumir gigabytes. Geradores produzem um item de cada vez, sob demanda:
+
+```python
+import csv
+from collections.abc import Iterator
+from decimal import Decimal
+
+
+def ler_vendas(caminho: str) -> Iterator[dict]:
+    with open(caminho, newline="", encoding="utf-8") as arquivo:
+        yield from csv.DictReader(arquivo)
+
+
+def vendas_pagas(vendas: Iterator[dict]) -> Iterator[dict]:
+    return (venda for venda in vendas if venda["status"] == "pago")
+
+
+def total_por_setor(caminho: str) -> dict[str, Decimal]:
+    totais: dict[str, Decimal] = {}
+    for venda in vendas_pagas(ler_vendas(caminho)):
+        totais[venda["setor"]] = totais.get(venda["setor"], Decimal(0)) + Decimal(venda["valor"])
+    return totais
+```
+
+A memória usada é a de uma linha por vez, seja o arquivo de 10 MB ou de 10 GB. O mesmo raciocínio vale para o banco: `Pedido.objects.filter(...).iterator(chunk_size=2000)` no Django e `session.execute(stmt).yield_per(2000)` no SQLAlchemy percorrem grandes resultados sem carregar todos os objetos de uma vez. O módulo `itertools` (`islice`, `chain`, `groupby`, `batched`) completa o kit.
+
+## Cache de resultados com functools
+
+Quando uma função pura é chamada repetidamente com os mesmos argumentos, guardar o resultado evita recalcular:
+
+```python
+from functools import cache, lru_cache
+
+
+@cache
+def taxa_de_servico(categoria: str, faixa_preco: int) -> int:
+    return calcular_taxa_pela_tabela(categoria, faixa_preco)
+
+
+@lru_cache(maxsize=1024)
+def distancia_entre_cidades(origem: str, destino: str) -> float:
+    return consultar_matriz_de_distancias(origem, destino)
+
+
+print(taxa_de_servico.cache_info())
+```
+
+O `@cache` guarda tudo, sem limite; o `@lru_cache(maxsize=...)` descarta os menos usados. Os argumentos precisam ser hasheáveis. Os cuidados: só para funções sem efeito colateral e cujo resultado não muda com o tempo (nada de cachear consulta ao estoque), memória crescendo sem limite com `@cache` em argumentos variados, e o fato de que o cache vive no processo, separado em cada worker. Em métodos, o cache segura uma referência a `self` e impede a coleta do objeto; prefira `functools.cached_property` para valores calculados uma vez por instância.
+
+## O GIL, threads, processos e asyncio
+
+O CPython tem o **GIL** (Global Interpreter Lock): em cada processo, só uma thread executa bytecode Python por vez. Ele é liberado durante operações de I/O (rede, disco, `time.sleep`) e por muitas bibliotecas em C durante cálculos longos (NumPy, compressão, hashing). A consequência define a escolha da ferramenta:
+
+| Tipo de carga | Ferramenta | Por quê |
+|---|---|---|
+| I/O com muitas conexões simultâneas | `asyncio` | Um laço de eventos, milhares de tarefas, sem custo de thread |
+| I/O com bibliotecas bloqueantes | `ThreadPoolExecutor` | O GIL é liberado enquanto a thread espera |
+| CPU em Python puro | `ProcessPoolExecutor` | Cada processo tem o seu interpretador e o seu GIL |
+| CPU em NumPy ou extensões que liberam o GIL | Threads ou vetorização | O cálculo pesado já roda fora do GIL |
+
+Gerar os PDFs dos ingressos de um lote grande é CPU em Python puro; com processos, cada núcleo trabalha em paralelo:
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+from ingressos.ingressos.pdf import gerar_pdf
+
+
+def gerar_lote(ingresso_ids: list[int]) -> list[bytes]:
+    with ProcessPoolExecutor() as executor:
+        return list(executor.map(gerar_pdf, ingresso_ids, chunksize=50))
+
+
+if __name__ == "__main__":
+    pdfs = gerar_lote(list(range(1, 5001)))
+```
+
+Processos não compartilham memória: argumentos e resultados são serializados com pickle e copiados entre eles, então a função precisa ser importável no nível do módulo e o ganho só aparece se o trabalho de cada item for bem maior que o custo de transferi-lo (por isso o `chunksize`). O `if __name__ == "__main__"` é obrigatório nos sistemas que iniciam processos com `spawn`, como Windows e macOS.
+
+Já validar ingressos consultando uma API externa é I/O: com `asyncio` e `httpx.AsyncClient`, centenas de consultas ficam em voo ao mesmo tempo num só processo, usando `asyncio.gather` com um semáforo para limitar a concorrência. O erro clássico é chamar código bloqueante (o `requests`, um driver síncrono, um cálculo pesado) dentro de uma função `async`: o laço de eventos inteiro para. Para isso existe `await asyncio.to_thread(funcao, ...)`.
+
+O Python 3.13 trouxe, em caráter **experimental**, um build *free-threaded* (o executável `python3.13t`), em que o GIL pode ser desligado e threads executam bytecode Python em paralelo de verdade. Em 3.13 ele vem com perda de desempenho em código de uma thread só e exige que as extensões em C declarem compatibilidade; nem todas as bibliotecas estão prontas. É algo para acompanhar e testar, não para levar à produção do projeto agora. O Python 3.13 também tem um compilador JIT experimental, desligado por padrão, com ganhos ainda modestos.
+
+## Vetorização com NumPy
+
+Em Python, cada operação sobre um número passa pelo interpretador: verificar tipos, criar objetos, contar referências. Com milhões de valores, esse custo domina. O NumPy guarda os dados num bloco contíguo de memória com tipo fixo e aplica a operação em laços compilados em C, o que se chama vetorização.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(42)
+precos = rng.uniform(80, 900, size=1_000_000)       # preco base de cada ingresso
+ocupacao = rng.uniform(0, 1, size=1_000_000)        # ocupacao do setor na compra
+
+
+# Laco em Python: um milhao de iteracoes no interpretador
+def preco_dinamico_laco(precos, ocupacao):
+    resultado = []
+    for preco, taxa in zip(precos, ocupacao):
+        fator = 1.0 + max(0.0, taxa - 0.7) * 0.5
+        resultado.append(round(preco * fator, 2))
+    return resultado
+
+
+# Vetorizado: as mesmas contas sobre os arrays inteiros
+def preco_dinamico_vetor(precos: np.ndarray, ocupacao: np.ndarray) -> np.ndarray:
+    fator = 1.0 + np.maximum(0.0, ocupacao - 0.7) * 0.5
+    return np.round(precos * fator, 2)
+```
+
+A versão vetorizada costuma ser de dezenas a centenas de vezes mais rápida. A mudança de mentalidade é trocar `if` dentro de laço por operações sobre arrays inteiros: `np.where` para condicionais, máscaras booleanas para filtros (`precos[ocupacao > 0.9]`), funções de agregação (`sum`, `mean`, `percentile`) em vez de acumuladores. Para dados tabulares, como o relatório de vendas, o pandas e o Polars aplicam a mesma ideia a colunas. Atenção ao custo de converter: transformar uma lista Python em array a cada chamada pode anular o ganho, então mantenha os dados em arrays durante todo o cálculo.
+
+## Integração com C: ctypes, cffi, C API e Cython
+
+Quando medição e algoritmo já foram esgotados e um laço numérico que não vetoriza continua sendo o gargalo, ou quando existe uma biblioteca C pronta que você precisa usar, Python conversa com C de quatro formas principais. Como exemplo, uma função que calcula o dígito verificador do código de cada ingresso:
+
+```c
+/* verificador.c */
+#include <stddef.h>
+
+int digito_verificador(const char *codigo, size_t tamanho) {
+    int soma = 0;
+    for (size_t i = 0; i < tamanho; i++) {
+        int digito = codigo[i] - '0';
+        soma += (i % 2 == 0) ? digito * 3 : digito;
+    }
+    return (10 - soma % 10) % 10;
+}
+```
+
+```bash
+gcc -O2 -shared -fPIC -o libverificador.so verificador.c
+```
+
+**ctypes**, da biblioteca padrão, carrega a biblioteca compartilhada já compilada e chama a função. Você declara os tipos dos argumentos e do retorno; sem isso, o `ctypes` adivinha e pode corromper a memória:
+
+```python
+import ctypes
+from pathlib import Path
+
+lib = ctypes.CDLL(str(Path(__file__).with_name("libverificador.so")))
+lib.digito_verificador.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+lib.digito_verificador.restype = ctypes.c_int
+
+codigo = b"7894561230"
+print(lib.digito_verificador(codigo, len(codigo)))
+```
+
+**cffi** faz o mesmo partindo da declaração em C, o que é menos sujeito a erro em interfaces grandes. No modo ABI, carrega a biblioteca em tempo de execução; no modo API, compila um módulo de ligação, mais rápido e mais seguro:
+
+```python
+from cffi import FFI
+
+ffi = FFI()
+ffi.cdef("int digito_verificador(const char *codigo, size_t tamanho);")
+lib = ffi.dlopen("./libverificador.so")
+
+codigo = b"7894561230"
+print(lib.digito_verificador(codigo, len(codigo)))
+```
+
+**A C API do CPython** permite escrever um módulo de extensão de verdade, importável como qualquer módulo Python. É o caminho de mais controle e mais trabalho: você converte argumentos, cuida de contagem de referências e trata erros à mão. Um exemplo mínimo:
+
+```c
+/* _verificador.c */
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
+static PyObject *
+digito(PyObject *self, PyObject *args)
+{
+    const char *codigo;
+    Py_ssize_t tamanho;
+    if (!PyArg_ParseTuple(args, "s#", &codigo, &tamanho)) {
+        return NULL;
+    }
+    int soma = 0;
+    for (Py_ssize_t i = 0; i < tamanho; i++) {
+        int d = codigo[i] - '0';
+        soma += (i % 2 == 0) ? d * 3 : d;
+    }
+    return PyLong_FromLong((10 - soma % 10) % 10);
+}
+
+static PyMethodDef metodos[] = {
+    {"digito", digito, METH_VARARGS, "Calcula o digito verificador."},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef modulo = {
+    PyModuleDef_HEAD_INIT, "_verificador", NULL, -1, metodos
+};
+
+PyMODINIT_FUNC
+PyInit__verificador(void)
+{
+    return PyModule_Create(&modulo);
+}
+```
+
+```python
+# setup.py
+from setuptools import Extension, setup
+
+setup(ext_modules=[Extension("ingressos._verificador", ["src/_verificador.c"])])
+```
+
+Com o `setup.py` ao lado do `pyproject.toml` (que declara o `setuptools` como backend de build), `pip install -e .` compila a extensão, e `from ingressos._verificador import digito` funciona como qualquer import.
+
+**Cython** é o meio-termo mais usado na prática: um superconjunto de Python que aceita declarações de tipo em C e é compilado para uma extensão. Você escreve algo próximo de Python e obtém velocidade de C nos laços tipados:
+
+```python
+# verificador.pyx
+def digito(str codigo):
+    cdef int soma = 0
+    cdef int i, d
+    for i in range(len(codigo)):
+        d = ord(codigo[i]) - 48
+        soma += d * 3 if i % 2 == 0 else d
+    return (10 - soma % 10) % 10
+```
+
+```bash
+pip install cython
+cythonize -i verificador.pyx
+```
+
+O `cythonize -i` gera o C e compila a extensão no próprio diretório. O comando `cython -a verificador.pyx` produz um relatório em HTML que destaca as linhas que ainda passam pelo interpretador, indicando onde faltam declarações de tipo. Cython também é o caminho natural para envolver bibliotecas C existentes e para liberar o GIL em trechos sem objetos Python (`with nogil:`).
+
+| Opção | Precisa compilar | Esforço | Melhor para |
+|---|---|---|---|
+| `ctypes` | Só a biblioteca C | Baixo | Chamar uma biblioteca pronta, poucas funções |
+| `cffi` | Opcional (modo API) | Baixo a médio | Interfaces C grandes, código também usado no PyPy |
+| C API | Sim | Alto | Controle total, bibliotecas de base |
+| Cython | Sim | Médio | Acelerar laços numéricos e envolver C com sintaxe próxima de Python |
+
+## Quando compensa
+
+Cada chamada de Python para C tem um custo fixo de conversão de argumentos. Chamar a função C acima um milhão de vezes, uma por código, a partir de um laço Python, pode ser tão lento quanto a versão em Python puro: o ganho aparece quando a fronteira é atravessada poucas vezes, com muito trabalho do outro lado (passar o lote inteiro de códigos numa chamada só). E o código nativo cobra seu preço em manutenção: build por plataforma (wheels para Linux, macOS e Windows, para cada versão do Python), falhas de segmentação em vez de exceções, vazamentos de memória e um time que precisa saber C.
+
+A ordem de tentativas que costuma dar certo:
+
+1. Medir e confirmar que o gargalo é CPU em Python, não banco, rede ou espera.
+2. Corrigir algoritmo e estrutura de dados.
+3. Usar funções embutidas, geradores e cache.
+4. Vetorizar com NumPy, pandas ou Polars.
+5. Paralelizar com processos, se o trabalho for divisível.
+6. Usar uma biblioteca que já resolve em código nativo.
+7. Só então escrever Cython ou C, isolando o trecho crítico atrás de uma interface Python pequena e testada.
+
+<Callout type="warning" title="Otimização sem teste é regressão esperando para acontecer">
+Antes de otimizar, cubra a função com testes que fixem o resultado, incluindo casos de borda. Ao trocar laço por vetor, Python por Cython ou `float` por outro tipo, compare as saídas da versão antiga e da nova numa amostra grande. Arredondamento e estouro de inteiro em C são fontes clássicas de diferenças silenciosas.
+</Callout>
+
+## Na entrevista
+
+**Como você investiga uma função lenta em Python?** Primeiro defino a meta e meço. Uso `cProfile` em desenvolvimento ou `py-spy` em produção para achar onde o tempo vai, `tracemalloc` se o problema for memória, e confiro se o gargalo não é banco ou rede. Só então mudo uma coisa por vez e meço de novo.
+
+**O que é o GIL e qual o impacto dele?** É um lock do CPython que permite só uma thread executando bytecode por processo. Threads servem para I/O, porque o GIL é liberado durante a espera, mas não aceleram CPU em Python puro; para isso uso processos, ou bibliotecas em C que liberam o GIL. O build free-threaded do 3.13 remove essa limitação, ainda de forma experimental.
+
+**Threads, processos ou asyncio?** `asyncio` para muitas operações de I/O concorrentes com bibliotecas assíncronas; threads para I/O com bibliotecas bloqueantes; processos para CPU em Python puro, lembrando que argumentos e resultados são serializados entre eles.
+
+**Por que NumPy é mais rápido que um laço Python?** Porque guarda os números num bloco contíguo com tipo fixo e executa as operações em laços compilados, sem passar pelo interpretador nem criar um objeto por elemento. Trocar laços por operações sobre arrays inteiros é o que dá o ganho.
+
+**Quando vale escrever uma extensão em C ou Cython?** Quando a medição mostra um gargalo de CPU que não se resolve com algoritmo, vetorização, paralelismo ou uma biblioteca existente, e quando o trecho atravessa a fronteira Python e C poucas vezes com muito trabalho. O custo de build, distribuição e manutenção precisa caber no ganho.
+
+## Pratique
+
+1. Gere um CSV de um milhão de vendas e perfile o relatório mensal com `cProfile` e `py-spy record`; anote as três funções mais caras antes de mudar qualquer coisa.
+2. Reescreva o relatório com geradores e dicionários de índice, compare tempo com `timeit` e pico de memória com `tracemalloc`, e cubra com testes que garantem o mesmo resultado.
+3. Implemente o preço dinâmico com NumPy e compare com a versão em laço para 10 mil, 100 mil e um milhão de ingressos.
+4. Gere os PDFs de um lote de 5 mil ingressos com `ProcessPoolExecutor` e meça o ganho em relação à versão sequencial e a uma versão com threads.
+5. Implemente o dígito verificador em Python puro, com `ctypes` e com Cython, e meça chamando uma vez por código e uma vez por lote; explique a diferença no README.
+
+<Quiz question="Um serviço gasta a maior parte do tempo calculando em laços de Python puro. Qual opção usa vários núcleos?" options={["ThreadPoolExecutor","asyncio.gather","ProcessPoolExecutor","functools.cache"]} answer={2} explanation="No CPython com GIL, threads não executam bytecode Python em paralelo. Processos têm interpretador e GIL próprios, então dividem o trabalho de CPU entre os núcleos." />
+
+<Quiz question="Qual ferramenta permite perfilar um processo Python em produção sem reiniciá-lo nem mudar o código?" options={["py-spy","cProfile","timeit","tracemalloc"]} answer={0} explanation="O py-spy é um profiler por amostragem que lê a pilha do processo de fora. O cProfile e o tracemalloc precisam ser ativados dentro do programa." />
+
+<Quiz question="Uma função em C chamada por ctypes, uma vez por item num laço de um milhão de itens, ficou quase tão lenta quanto Python puro. Por quê?" options={["O ctypes executa a função C no interpretador","O GIL impede a execução de código C","Funções C não podem receber strings","O custo fixo de cada travessia da fronteira domina quando cada chamada faz pouco trabalho"]} answer={3} explanation="Converter argumentos e retorno a cada chamada tem um custo fixo. O ganho aparece ao passar o lote inteiro numa chamada, com muito trabalho do lado C." />
+
+## Base no CodeForge
+
+- [Concorrência vs paralelismo](/learn/concorrencia/concorrencia-vs-paralelismo) e [Async/await](/learn/concorrencia/async-await): a base para escolher entre threads, processos e `asyncio`.
+- [Thread pools](/learn/concorrencia/thread-pools) e [Processos e threads](/learn/concorrencia/processos-e-threads): como os executores funcionam por baixo.
+- [EXPLAIN](/learn/sql/explain) e [Índices](/learn/sql/indices): quando a lentidão está no banco, não no Python.
+- [Memória virtual](/learn/sistemas-operacionais/memoria-virtual): o que o sistema operacional faz com a memória que o `tracemalloc` mede.
+- [Padrões arquiteturais de software: Escala, resiliência e observabilidade](/learn/carreira-python/padroes-arquiteturais-software-escala-resiliencia-observabilidade): medir em produção com métricas e traces.
+
+## Referências
+
+- [Python: The Python Profilers](https://docs.python.org/3/library/profile.html)
+- [Python: tracemalloc](https://docs.python.org/3/library/tracemalloc.html)
+- [Python: Extending and Embedding the Python Interpreter](https://docs.python.org/3/extending/index.html)
+- [Python: ctypes](https://docs.python.org/3/library/ctypes.html)

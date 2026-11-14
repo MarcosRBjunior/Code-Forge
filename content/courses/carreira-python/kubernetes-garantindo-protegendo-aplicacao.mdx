@@ -1,0 +1,484 @@
+---
+title: "Kubernetes: Garantindo e protegendo a aplicação"
+kind: lesson
+---
+
+A plataforma `ingressos` está no cluster, empacotada em chart, com alta disponibilidade. Do ponto de vista de segurança, porém, ela está aberta de um jeito que um teste de intrusão encontraria na primeira hora. Os contêineres rodam como root e podem escrever em qualquer lugar da imagem. Cada Pod recebe um token da API do Kubernetes que ninguém usa, mas que um atacante usaria. Qualquer Pod de qualquer namespace consegue abrir conexão com o Postgres. O pipeline faz deploy com uma credencial de administrador do cluster. As senhas estão em Secrets que qualquer pessoa com leitura no namespace decodifica com `base64 -d`. E ninguém sabe quantas vulnerabilidades conhecidas existem nas imagens em produção.
+
+Um invasor que explore uma falha no `pagamentos` (uma dependência vulnerável, um endpoint com injeção) deveria encontrar um contêiner sem privilégios, sem ferramentas, sem acesso à API do cluster e sem rota de rede para nada além do que o serviço realmente precisa. Este capítulo constrói essas camadas, da identidade à rede, e termina com os limites de recursos que impedem um único namespace de derrubar o cluster.
+
+**Você vai aprender:**
+
+- Controlar quem faz o quê no cluster com RBAC, ServiceAccounts, Roles e RoleBindings
+- Endurecer contêineres com `securityContext` e impor o padrão com Pod Security Standards por namespace
+- Isolar a rede com NetworkPolicy no modelo de negar por padrão
+- Proteger Secrets com criptografia em repouso e gestores externos, e varrer imagens no CI
+- Limitar o consumo de cada namespace com ResourceQuota e LimitRange
+
+## O modelo de ameaça
+
+| Camada | Risco | Defesa neste capítulo |
+|---|---|---|
+| Identidade e API | Credencial ampla demais vaza (pipeline, Pod comprometido) | RBAC com menor privilégio, ServiceAccount por carga, token só quando necessário |
+| Contêiner | Processo comprometido escala para o nó | `securityContext` restritivo, Pod Security Standards |
+| Rede | Movimento lateral de um Pod comprometido até o banco | NetworkPolicy padrão negar com liberações explícitas |
+| Segredos | Senha lida do etcd, do Git ou por quem só devia ver o namespace | Criptografia em repouso, gestor externo, RBAC sobre Secrets |
+| Cadeia de suprimentos | Imagem com CVE crítica ou adulterada | Varredura de imagens, base mínima, assinatura |
+| Recursos | Um serviço (ou um ataque) consome o cluster inteiro | ResourceQuota e LimitRange |
+
+Nenhuma camada basta sozinha. O objetivo é que a falha de uma não entregue o sistema.
+
+## RBAC: identidades e permissões
+
+Toda requisição ao apiserver é autenticada (quem é você) e depois autorizada (pode fazer isto). O RBAC é o mecanismo de autorização, e se apoia em quatro objetos:
+
+| Objeto | Escopo | Função |
+|---|---|---|
+| `Role` | Um namespace | Lista de permissões: verbos sobre recursos |
+| `ClusterRole` | Cluster inteiro | O mesmo, para recursos sem namespace ou para reaproveitar em vários namespaces |
+| `RoleBinding` | Um namespace | Concede uma Role (ou ClusterRole) a usuários, grupos ou ServiceAccounts naquele namespace |
+| `ClusterRoleBinding` | Cluster inteiro | Concede uma ClusterRole em todos os namespaces |
+
+O RBAC só soma permissões: não existe regra de negação. Pessoas são autenticadas fora do cluster (certificados, OIDC do provedor de identidade); processos usam **ServiceAccounts**, identidades criadas dentro do namespace.
+
+O primeiro alvo é o pipeline. Ele não precisa de `cluster-admin`: precisa aplicar os objetos da plataforma no namespace de produção.
+
+```yaml
+# rbac-implantador.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: implantador
+  namespace: ingressos-prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: implantador
+  namespace: ingressos-prod
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "create", "update", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: implantador
+  namespace: ingressos-prod
+subjects:
+  - kind: ServiceAccount
+    name: implantador
+    namespace: ingressos-prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: implantador
+```
+
+A permissão sobre `secrets` está ali porque o Helm grava as revisões da release como Secrets no namespace. É exatamente o tipo de detalhe que se descobre testando, não supondo:
+
+```bash
+kubectl auth can-i create deployments -n ingressos-prod \
+  --as=system:serviceaccount:ingressos-prod:implantador          # yes
+kubectl auth can-i delete namespaces \
+  --as=system:serviceaccount:ingressos-prod:implantador          # no
+kubectl auth can-i --list -n ingressos-prod \
+  --as=system:serviceaccount:ingressos-prod:implantador
+```
+
+Em clusters gerenciados, o pipeline normalmente se autentica pela federação OIDC do GitHub Actions com o provedor de nuvem, que mapeia a identidade do workflow para um usuário ou grupo do Kubernetes. O binding é o mesmo, com `kind: User` ou `kind: Group` no lugar da ServiceAccount, e não existe token de longa duração guardado em lugar nenhum.
+
+Para pessoas, um padrão simples: desenvolvedores recebem a ClusterRole embutida `view` (leitura, sem Secrets) por RoleBinding nos namespaces da plataforma, e `edit` só em desenvolvimento. Os verbos mais perigosos de conceder: `create` em `pods` (quem cria Pods pode montar qualquer Secret do namespace e rodar qualquer imagem), `get` em `secrets`, `escalate`, `bind`, `impersonate` e qualquer coisa com `*`.
+
+### O token que cada Pod recebe
+
+Por padrão, todo Pod usa a ServiceAccount `default` do namespace e recebe um token montado em `/var/run/secrets/kubernetes.io/serviceaccount/token`. Os quatro serviços do `ingressos` nunca falam com a API do Kubernetes, então esse token só serve a quem invadir o contêiner. Crie uma ServiceAccount por serviço, sem permissões, e desligue a montagem:
+
+```yaml
+# serviceaccount-pagamentos.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pagamentos
+  namespace: ingressos-prod
+automountServiceAccountToken: false
+```
+
+No Deployment, `serviceAccountName: pagamentos` e `automountServiceAccountToken: false` no `spec` do Pod. Uma ServiceAccount por serviço também é o que permite, mais tarde, dar a um único serviço acesso a um recurso de nuvem (como o cofre de segredos) por federação de identidade, sem chave estática.
+
+## securityContext: endurecendo o contêiner
+
+O `securityContext` define com que privilégios os processos do contêiner rodam. Para os serviços Python, a configuração recomendada é esta:
+
+```yaml
+# dentro de spec.template.spec do Deployment pagamentos
+      serviceAccountName: pagamentos
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pagamentos
+          image: ghcr.io/ingressos/pagamentos:1.5.2
+          command: ["uvicorn", "pagamentos.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+```
+
+| Campo | O que impede |
+|---|---|
+| `runAsNonRoot` e `runAsUser` | Processo como root dentro do contêiner, que facilita fugir para o nó se houver falha no runtime ou no kernel |
+| `allowPrivilegeEscalation: false` | Ganho de privilégio por binários setuid, como `sudo` ou `su` |
+| `capabilities.drop: ["ALL"]` | Poderes do kernel como alterar a rede (`NET_ADMIN`) ou ignorar permissões de arquivo. Um servidor numa porta acima de 1024 não precisa de nenhum |
+| `readOnlyRootFilesystem` | Que um invasor grave um binário, altere o código Python ou plante um web shell |
+| `seccompProfile: RuntimeDefault` | Chamadas de sistema raras e perigosas, bloqueadas pelo perfil padrão do runtime |
+
+Três ajustes fazem a aplicação Python funcionar assim. O `runAsNonRoot` só é verificável se a imagem declarar um usuário **numérico** (`USER 10001` no Dockerfile, como no capítulo de Docker); com um nome, o kubelet não consegue provar que não é root e recusa o contêiner, a menos que `runAsUser` esteja definido no manifesto. Com o sistema de arquivos somente leitura, tudo que escreve precisa de um volume: `/tmp` vira um `emptyDir`, e `PYTHONDONTWRITEBYTECODE` evita tentativas de gravar `.pyc` (melhor ainda é compilar os bytecodes no build da imagem). No gunicorn, aponte `worker_tmp_dir` para `/dev/shm` ou para o `/tmp` montado, porque os workers usam arquivos temporários para o heartbeat. No Django, o `collectstatic` roda no build, não na inicialização.
+
+## Pod Security Standards por namespace
+
+Configurar `securityContext` em cada manifesto depende de ninguém esquecer. Os **Pod Security Standards** definem três perfis, e o controlador de admissão **Pod Security Admission**, embutido no Kubernetes, os aplica por namespace com labels:
+
+| Perfil | Permite | Para quem |
+|---|---|---|
+| `privileged` | Tudo | Componentes de sistema (CNI, coletores de log em DaemonSet) |
+| `baseline` | Bloqueia escaladas conhecidas: contêiner privilegiado, rede e PID do host, `hostPath` | Mínimo para qualquer aplicação |
+| `restricted` | Exige não root, `allowPrivilegeEscalation: false`, `drop ALL`, seccomp e tipos de volume restritos | Aplicações como a plataforma `ingressos` |
+
+```yaml
+# namespace-prod.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingressos-prod
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+```
+
+`enforce` rejeita Pods que violam o perfil; `warn` devolve um aviso a quem aplica; `audit` registra no log de auditoria. A adoção segura em um namespace existente é começar com `warn` e `audit`, corrigir os manifestos e só então ligar `enforce`. Um teste antes de aplicar:
+
+```bash
+kubectl label --dry-run=server --overwrite namespace ingressos-prod \
+  pod-security.kubernetes.io/enforce=restricted
+```
+
+O servidor responde com avisos listando os Pods existentes que violariam o perfil. Atenção a um detalhe operacional: a rejeição acontece na criação do **Pod**, não do Deployment. O Deployment é aceito, o ReplicaSet tenta criar os Pods e falha, e o sintoma é um Deployment com zero réplicas prontas e eventos `FailedCreate` no ReplicaSet (`kubectl describe replicaset`). O perfil `restricted` não exige `readOnlyRootFilesystem`; para regras além dos perfis, como exigir esse campo ou só aceitar imagens do registro da empresa, usa-se um controlador de políticas (Kyverno, OPA Gatekeeper) ou as `ValidatingAdmissionPolicy` nativas, escritas em CEL.
+
+<Callout type="warning" title="Contêineres efêmeros e o perfil restricted">
+Num namespace com `enforce: restricted`, o `kubectl debug` do capítulo de microsserviços também é verificado: uma imagem de depuração que roda como root é rejeitada. Use `kubectl debug` com a opção `--profile=restricted`, que aplica um `securityContext` compatível, e uma imagem que funcione sem root.
+</Callout>
+
+## NetworkPolicy: negar por padrão
+
+Por padrão, a rede de um cluster é plana: qualquer Pod alcança qualquer Pod, em qualquer namespace. Uma **NetworkPolicy** seleciona Pods por label e define de onde eles aceitam conexões (`ingress`) e para onde podem abrir (`egress`). A regra que faz tudo funcionar: um Pod selecionado por alguma política passa a negar todo tráfego daquele tipo que nenhuma política permita.
+
+<Callout type="warning" title="Exige um CNI que aplique as políticas">
+O apiserver aceita NetworkPolicy em qualquer cluster, mas quem aplica é o plugin de rede (CNI). Com um CNI sem suporte, as políticas são criadas e simplesmente ignoradas, o que dá uma falsa sensação de segurança. Calico e Cilium aplicam; o CNI padrão do kind passou a aplicar em versões recentes, e no minikube use `minikube start --cni=calico`. Sempre teste que o bloqueio acontece.
+</Callout>
+
+Comece negando tudo no namespace e liberando o DNS, sem o qual nada funciona:
+
+```yaml
+# netpol-padrao.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: negar-tudo
+  namespace: ingressos-prod
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: permitir-dns
+  namespace: ingressos-prod
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+```
+
+`podSelector` vazio seleciona todos os Pods do namespace. Agora libere cada fluxo da arquitetura, do lado de quem recebe. O `catalogo` só aceita o `pedidos` e o controlador de Ingress:
+
+```yaml
+# netpol-catalogo.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: catalogo-entrada
+  namespace: ingressos-prod
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: catalogo
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: pedidos
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+      ports:
+        - protocol: TCP
+          port: 8000
+```
+
+Repare na porta: a política fala da porta do **contêiner** (8000), não da porta 80 do Service, porque é aplicada depois da tradução de endereço. E repare na indentação do `from`: dois itens separados (`- podSelector` e `- namespaceSelector`) significam "um **ou** outro". Colocar `namespaceSelector` e `podSelector` no **mesmo** item significa "Pods com este label **e** neste namespace", como na política de DNS. Essa diferença de um hífen é a fonte mais comum de políticas erradas.
+
+Como o padrão também nega saída, cada serviço precisa de uma regra de egress. A do `pedidos`, por exemplo:
+
+```yaml
+# netpol-pedidos-saida.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pedidos-saida
+  namespace: ingressos-prod
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: catalogo
+      ports:
+        - protocol: TCP
+          port: 8000
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rabbitmq
+      ports:
+        - protocol: TCP
+          port: 5672
+    - to:
+        - ipBlock:
+            cidr: 10.20.0.0/24
+      ports:
+        - protocol: TCP
+          port: 5432
+```
+
+O banco gerenciado fica fora do cluster e é liberado por faixa de IP com `ipBlock`. O `pagamentos` precisa sair para o gateway de pagamento na internet; NetworkPolicy padrão não filtra por nome de domínio, então a saída externa costuma ser liberada por faixa de IP, por um proxy de saída ou por políticas estendidas de CNIs como Cilium, que aceitam nomes DNS. Teste cada política com um Pod temporário:
+
+```bash
+kubectl run teste -n ingressos-prod --rm -it --restart=Never \
+  --labels=app.kubernetes.io/name=notificacoes --image=busybox:1.36 -- \
+  wget -qO- -T 3 http://ingressos-catalogo/healthz     # deve falhar por tempo esgotado
+```
+
+## Secrets: em repouso e fora do cluster
+
+Um Secret tem três pontos de exposição: o etcd, onde é gravado; quem tem permissão de leitura na API; e o lugar de onde ele veio (Git, variável do pipeline, a máquina de alguém).
+
+**Criptografia em repouso.** Por padrão, Secrets são gravados no etcd apenas em base64: quem tiver um backup do etcd lê todas as senhas. O apiserver criptografa recursos antes de gravá-los quando recebe um arquivo de configuração pela flag `--encryption-provider-config`:
+
+```yaml
+# /etc/kubernetes/encryption.yaml (no control plane)
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - kms:
+          apiVersion: v2
+          name: kms-da-nuvem
+          endpoint: unix:///var/run/kmsplugin/socket.sock
+      - identity: {}
+```
+
+O provedor `kms` v2 usa criptografia de envelope: uma chave de dados cifra os Secrets e ela própria é cifrada por uma chave mestra guardada no serviço de gerenciamento de chaves (KMS) do provedor, que nunca sai de lá. Há também provedores locais (`aescbc`, `aesgcm`, `secretbox`), mais simples, mas que deixam a chave num arquivo no próprio control plane. O `identity` no fim permite ler o que foi gravado antes da criptografia; depois de ativá-la, regrave os Secrets existentes com `kubectl get secrets -A -o json | kubectl replace -f -`. Em clusters gerenciados você não acessa o apiserver: a criptografia com KMS é uma opção do serviço, que você habilita na criação ou na configuração do cluster.
+
+**Gestores externos.** A criptografia em repouso não resolve a origem nem a rotação. O padrão de mercado é manter os segredos num cofre (AWS Secrets Manager, Azure Key Vault, Google Secret Manager, HashiCorp Vault) e sincronizá-los para o cluster. O **External Secrets Operator** faz isso com um objeto declarativo, que pode ficar no Git porque não contém o segredo:
+
+```yaml
+# externalsecret-pagamentos.yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: pagamentos-secrets
+  namespace: ingressos-prod
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cofre-producao
+  target:
+    name: pagamentos-secrets
+  data:
+    - secretKey: GATEWAY_API_KEY
+      remoteRef:
+        key: ingressos/prod/pagamentos
+        property: gateway_api_key
+    - secretKey: DB_PASSWORD
+      remoteRef:
+        key: ingressos/prod/pagamentos
+        property: db_password
+```
+
+O operador lê o cofre usando a identidade de nuvem da própria ServiceAccount dele e cria o Secret `pagamentos-secrets`, que o Deployment já referencia. Rotacionar a senha passa a ser alterar o cofre. Alternativas: o **Secrets Store CSI Driver** monta os segredos como arquivos direto do cofre, sem criar Secret no cluster, e o **Sealed Secrets** cifra o Secret com uma chave do cluster para que a versão cifrada possa ir ao Git.
+
+Do lado da aplicação, segredos lidos de arquivo são um pouco mais seguros que variáveis de ambiente: variáveis aparecem em `/proc`, em dumps de erro e em ferramentas de depuração que listam o ambiente, e são herdadas por subprocessos. E nenhum segredo deve aparecer em log, nem no `settings` exibido pela página de erro do Django com `DEBUG` ligado.
+
+## Varredura e procedência de imagens
+
+A maior parte das vulnerabilidades de uma imagem Python vem da base do sistema operacional e das dependências do `pyproject.toml`, não do seu código. Varra as duas coisas no CI, antes de publicar, e falhe o build em achados graves:
+
+```bash
+trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+  ghcr.io/ingressos/pagamentos:1.5.2
+pip-audit                                  # dependências Python contra a base de vulnerabilidades do PyPI
+```
+
+`--ignore-unfixed` evita travar o pipeline por CVEs sem correção disponível, que viram uma lista de aceite de risco revisada periodicamente. Grype e o Docker Scout fazem o mesmo papel do Trivy. Varrer só no build não basta: uma CVE descoberta amanhã afeta a imagem que está em produção hoje, por isso a varredura também roda periodicamente sobre as imagens do registro.
+
+Reduzir a superfície é tão importante quanto encontrar falhas. A imagem `python:3.13-slim` com multi-stage já tira compiladores e cabeçalhos da imagem final; imagens distroless ou mínimas vão além e removem até o shell. Referenciar imagens por digest (`ghcr.io/ingressos/pagamentos@sha256:...`) garante que o cluster roda exatamente o que foi varrido, e assinar as imagens com o cosign, verificando a assinatura na admissão com um controlador de políticas, impede que uma imagem adulterada no registro chegue ao cluster.
+
+## ResourceQuota e LimitRange
+
+Requests e limits valem por contêiner. Nada impede, até aqui, que um namespace de testes peça toda a memória do cluster ou que um HPA mal configurado crie 200 réplicas. A **ResourceQuota** limita o total consumido por um namespace:
+
+```yaml
+# quota-prod.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: limites-ingressos
+  namespace: ingressos-prod
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.memory: 32Gi
+    pods: "60"
+    services.loadbalancers: "0"
+    persistentvolumeclaims: "10"
+    requests.storage: 200Gi
+```
+
+Quando uma criação ultrapassaria a cota, o apiserver a rejeita; no caso de um Deployment, o sintoma é de novo um ReplicaSet com `FailedCreate` e a mensagem `exceeded quota`. `services.loadbalancers: "0"` impede que alguém crie balanceadores de nuvem por fora do Ingress. Com uma cota de CPU ou memória ativa, todo Pod **precisa** declarar requests e limits desses recursos, senão é rejeitado. A **LimitRange** resolve isso definindo valores padrão e faixas permitidas por contêiner:
+
+```yaml
+# limitrange-prod.yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: padroes-conteiner
+  namespace: ingressos-prod
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      default:
+        memory: 256Mi
+      max:
+        memory: 2Gi
+      min:
+        memory: 64Mi
+```
+
+`defaultRequest` e `default` são aplicados a contêineres que não declaram nada; `max` e `min` rejeitam pedidos fora da faixa. A LimitRange age na admissão, então só afeta Pods criados depois dela. Juntas, as duas fazem do namespace uma fronteira de consumo: um vazamento de memória no `notificacoes` estoura o limite do próprio contêiner, e um erro de configuração do HPA bate na cota de Pods, sem afetar os outros sistemas do cluster.
+
+## Na entrevista
+
+**Como você aplica menor privilégio no Kubernetes?** Com RBAC: cada pessoa e processo tem uma identidade, e Roles com só os verbos e recursos necessários são concedidas por RoleBinding no namespace. Pipelines usam identidade federada em vez de credenciais de administrador, e Pods de aplicação usam ServiceAccounts próprias sem permissões e com a montagem do token desligada.
+
+**Que configurações de `securityContext` você usa por padrão?** `runAsNonRoot` com usuário numérico, `allowPrivilegeEscalation: false`, `capabilities.drop` com `ALL`, `readOnlyRootFilesystem` com volumes `emptyDir` onde a aplicação precisa escrever, e `seccompProfile` `RuntimeDefault`. Com Pod Security Standards em `restricted` no namespace, a maioria disso deixa de ser opcional.
+
+**Secrets do Kubernetes são seguros?** Por padrão são apenas base64 no etcd. Ficam aceitáveis com criptografia em repouso, de preferência via KMS, RBAC restrito sobre leitura de Secrets e origem num cofre externo sincronizado por um operador, para que não passem pelo Git nem por pessoas.
+
+**O que acontece ao aplicar uma NetworkPolicy que seleciona um Pod?** O Pod passa a negar todo tráfego do tipo declarado (entrada, saída ou ambos) que não seja permitido por alguma política, e as políticas se somam. O padrão recomendado é uma política que nega tudo no namespace, uma liberação de DNS e regras explícitas para cada fluxo, lembrando que quem aplica é o CNI.
+
+**Qual a diferença entre ResourceQuota e LimitRange?** A ResourceQuota limita o total agregado de um namespace (CPU, memória, número de Pods, armazenamento). A LimitRange atua por contêiner, aplicando valores padrão e faixas mínima e máxima. São complementares: a LimitRange garante que todo Pod declare recursos, o que a cota exige.
+
+**Um Deployment foi aceito, mas nenhum Pod aparece. Onde olhar?** Nos eventos do ReplicaSet com `kubectl describe replicaset`. Rejeições de admissão, como violação do Pod Security Standard ou cota excedida, acontecem na criação do Pod, então o Deployment é aceito e o erro aparece como `FailedCreate` no ReplicaSet.
+
+## Pratique
+
+1. Crie a ServiceAccount `implantador` com a Role mínima para o `helm upgrade` da plataforma, comprove com `kubectl auth can-i --list` e rode um upgrade com essa identidade, ajustando a Role até funcionar sem nada a mais.
+2. Endureça os quatro serviços com o `securityContext` deste capítulo, ServiceAccount própria e token desligado. Corrija o que quebrar (usuário numérico no Dockerfile, `/tmp`, `worker_tmp_dir`) e então ligue `enforce: restricted` no namespace.
+3. Aplique a política de negar tudo, libere o DNS e escreva as políticas de entrada e saída de cada serviço a partir do mapa de comunicação. Prove com Pods temporários que `notificacoes` não alcança o `catalogo` e que `pedidos` alcança.
+4. Instale o External Secrets Operator com um provedor de testes (ou o Vault em modo de desenvolvimento) e troque os Secrets criados à mão por ExternalSecrets. Altere a senha no cofre e observe a sincronização.
+5. Adicione Trivy e `pip-audit` ao workflow de build, faça o pipeline falhar com uma dependência vulnerável de propósito e configure ResourceQuota e LimitRange nos namespaces de dev e prod.
+
+<Quiz question="Um namespace tem a política negar-tudo para Ingress e Egress e mais nada. Os serviços passam a falhar até ao resolver nomes. Por quê?" options={["O CoreDNS foi removido","A saída para o DNS em kube-system também foi bloqueada e precisa de uma regra própria","NetworkPolicy desliga o kube-proxy","Os Services perdem o ClusterIP"]} answer={1} explanation="Negar Egress bloqueia inclusive as consultas DNS na porta 53. É preciso liberar explicitamente a saída para os Pods do CoreDNS." />
+
+<Quiz question="Com pod-security.kubernetes.io/enforce restricted no namespace, um Deployment com contêiner root é aplicado. O que acontece?" options={["O apiserver rejeita o Deployment","O contêiner roda, mas como usuário 65534","O Deployment é aceito, e a criação dos Pods falha com eventos FailedCreate no ReplicaSet","Nada, o perfil só gera avisos"]} answer={2} explanation="A Pod Security Admission avalia Pods. O Deployment é criado, mas o ReplicaSet não consegue criar Pods que violam o perfil." />
+
+<Quiz question="Qual combinação reduz o dano de um Pod comprometido que tenta usar a API do Kubernetes?" options={["ServiceAccount própria sem permissões e automountServiceAccountToken false","Rodar o Pod com hostNetwork","Dar ao Pod a ClusterRole view","Aumentar o limite de memória"]} answer={0} explanation="Sem token montado e sem permissões associadas à identidade, o invasor não tem credencial para falar com o apiserver." />
+
+## Base no CodeForge
+
+- [Kubernetes: Criando e gerenciando charts com o Helm](/learn/carreira-python/kubernetes-criando-gerenciando-charts-helm): o chart que recebe estas configurações de segurança.
+- [Python e OWASP: Explorando vulnerabilidades e protegendo aplicações](/learn/carreira-python/python-owasp-explorando-vulnerabilidades-protegendo-aplicacoes): as falhas de aplicação que estas camadas contêm.
+- [RBAC](/learn/system-design/rbac) e [Gestão de segredos](/learn/system-design/gestao-de-segredos): os conceitos por trás de Roles e cofres.
+- [Criptografia em repouso](/learn/system-design/criptografia-em-repouso): criptografia de envelope e KMS.
+- [Containers, namespaces e cgroups](/learn/sistemas-operacionais/containers-namespaces-cgroups): por que root no contêiner e capabilities importam.
+
+## Referências
+
+- [Kubernetes: Using RBAC Authorization](https://kubernetes.io/docs/reference/access-authn-authz/rbac/)
+- [Kubernetes: Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/)
+- [Kubernetes: Network Policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
+- [Kubernetes: Encrypting Confidential Data at Rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/)

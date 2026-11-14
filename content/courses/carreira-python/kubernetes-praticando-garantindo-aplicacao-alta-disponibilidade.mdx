@@ -1,0 +1,399 @@
+---
+title: "Kubernetes: Praticando e garantindo uma aplicação com alta disponibilidade"
+kind: lesson
+---
+
+Com Deployment, probes, requests e HPA, a API do `ingressos` já se recupera sozinha de um contêiner que morre. Mesmo assim, ela ainda cai em situações comuns: as três réplicas foram agendadas no mesmo nó e o nó reiniciou; a equipe de plataforma drenou dois nós para atualizar o cluster e levou junto todas as cópias; um deploy no meio da venda de um festival cortou requisições de pagamento pela metade; a versão nova subiu antes da migração do banco e respondeu 500 por dois minutos. Nenhuma dessas falhas é do Kubernetes: são decisões que faltaram nos manifestos e na aplicação.
+
+Este capítulo fecha essas lacunas uma a uma. O critério é prático: a plataforma precisa continuar vendendo durante a perda de um nó, durante a manutenção do cluster e durante um deploy.
+
+**Você vai aprender:**
+
+- Espalhar réplicas entre nós e zonas com anti-afinidade e topology spread constraints
+- Proteger a capacidade mínima em manutenções com PodDisruptionBudget
+- Encerrar Pods sem perder requisições: SIGTERM, `preStop` e o desligamento gracioso do gunicorn e do uvicorn
+- Publicar a API com Ingress `networking.k8s.io/v1` e TLS
+- Rodar migrações com Jobs, tarefas agendadas com CronJobs e montar um deploy sem indisponibilidade
+
+## De onde vem a indisponibilidade
+
+O Kubernetes separa as interrupções em dois grupos, e cada um tem uma defesa diferente:
+
+| Interrupção | Exemplos | Defesa |
+|---|---|---|
+| Involuntária | Falha de hardware, nó sem memória, queda de uma zona, kernel panic | Réplicas suficientes e espalhadas |
+| Voluntária | `kubectl drain`, atualização do cluster, autoscaler removendo um nó, deploy | PodDisruptionBudget, desligamento gracioso e rolling update bem configurado |
+
+Duas réplicas no mesmo nó não são alta disponibilidade: são duas cópias do mesmo ponto único de falha. E a conta precisa considerar a carga: se a API precisa de três Pods para aguentar o pico, e você quer sobreviver à perda de um nó, precisa de pelo menos quatro, distribuídos de modo que nenhum nó carregue mais de um.
+
+## Espalhando réplicas: anti-afinidade e topology spread
+
+O scheduler tenta distribuir Pods, mas sem garantia. Para exigir a distribuição, há dois mecanismos. O mais antigo é a **anti-afinidade entre Pods**: "não me coloque num nó que já tenha um Pod com estes labels".
+
+```yaml
+# dentro de spec.template.spec do Deployment api
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: api
+```
+
+A versão `preferred` é uma preferência com peso. A versão `requiredDuringSchedulingIgnoredDuringExecution` é uma regra dura: com ela, um Deployment de cinco réplicas num cluster de três nós deixa dois Pods em `Pending` para sempre. O sufixo `IgnoredDuringExecution` avisa que a regra vale só no agendamento: Pods já em execução não são movidos se a situação mudar.
+
+O mecanismo mais novo e mais expressivo são as **topology spread constraints**, que controlam o desequilíbrio máximo entre domínios (nós, zonas):
+
+```yaml
+# dentro de spec.template.spec do Deployment api
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: api
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: api
+```
+
+`maxSkew: 1` significa que a diferença entre o domínio com mais Pods e o com menos não pode passar de um. Com `DoNotSchedule` a regra é obrigatória; com `ScheduleAnyway` o scheduler apenas prioriza. A combinação acima exige equilíbrio entre nós e prefere equilíbrio entre zonas, o que continua funcionando se uma zona inteira cair.
+
+| Mecanismo | Expressa | Limitação |
+|---|---|---|
+| Anti-afinidade `required` | No máximo um Pod por domínio | Trava quando há mais réplicas que domínios |
+| Anti-afinidade `preferred` | Evite juntar, se der | Sem garantia |
+| Topology spread | Distribuição equilibrada, com vários Pods por domínio | Avaliada só no agendamento, como as demais |
+
+Em nuvem, os nós já trazem o label `topology.kubernetes.io/zone`. No kind, simule as zonas para testar:
+
+```bash
+kubectl label node ingressos-worker topology.kubernetes.io/zone=zona-a
+kubectl label node ingressos-worker2 topology.kubernetes.io/zone=zona-b
+kubectl rollout restart deployment/api -n ingressos
+kubectl get pods -n ingressos -l app=api -o wide
+```
+
+## PodDisruptionBudget
+
+Drenar um nó (`kubectl drain`) despeja os Pods dele para que sejam recriados em outro lugar. Sem restrição, uma atualização de cluster que drena nós em sequência rápida pode derrubar todas as réplicas da API antes de as substitutas ficarem prontas. O PodDisruptionBudget (PDB) declara quanto de interrupção voluntária a aplicação tolera:
+
+```yaml
+# api-pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: ingressos
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: api
+```
+
+Com esse PDB, o drain despeja um Pod da API, espera a réplica substituta ficar pronta em outro nó e só então despeja o próximo. Você escolhe entre `maxUnavailable` e `minAvailable` (número ou percentual); `maxUnavailable` costuma ser melhor porque continua correto quando o HPA muda o total de réplicas.
+
+```bash
+kubectl get pdb -n ingressos
+kubectl drain ingressos-worker --ignore-daemonsets --delete-emptydir-data
+kubectl uncordon ingressos-worker
+```
+
+<Callout type="warning" title="O que o PDB não faz">
+O PDB só vale para despejos voluntários feitos pela API de eviction: ele não impede a queda de um nó nem limita o rolling update do Deployment, que obedece a `maxUnavailable` da própria estratégia. E um PDB impossível bloqueia a manutenção: `minAvailable: 1` com uma única réplica, ou `maxUnavailable: 0`, faz o `kubectl drain` ficar parado indefinidamente. Para o Postgres de réplica única não existe PDB que ajude: a manutenção do nó dele é uma janela planejada.
+</Callout>
+
+## Desligamento gracioso: SIGTERM, preStop e o servidor Python
+
+Todo deploy, todo drain e toda redução do HPA encerram Pods. Se o encerramento cortar requisições em andamento, o cliente vê erro 502 no meio do pagamento. Entender a sequência é o que permite evitar isso. Quando um Pod é apagado, duas coisas acontecem **em paralelo**:
+
+1. O Pod é marcado como `Terminating` e removido dos endpoints dos Services. Essa remoção precisa se propagar para o kube-proxy de cada nó e para o controlador de Ingress, o que leva de frações de segundo a alguns segundos.
+2. O kubelet executa o hook `preStop`, se houver, e em seguida envia `SIGTERM` ao processo principal do contêiner. Se o processo não sair em `terminationGracePeriodSeconds` (30 segundos por padrão, contados desde o início, incluindo o `preStop`), recebe `SIGKILL`.
+
+O problema está na corrida entre 1 e 2: o servidor pode receber o SIGTERM e parar de aceitar conexões enquanto balanceadores ainda enviam tráfego para ele. A correção é atrasar o SIGTERM alguns segundos com um `preStop`, dando tempo para a remoção se propagar:
+
+```yaml
+# dentro de spec.template.spec do Deployment api
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: api
+          image: ghcr.io/ingressos/api:1.5.0
+          command: ["gunicorn", "ingressos.wsgi:application", "-c", "/etc/ingressos/gunicorn.conf.py"]
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "10"]
+```
+
+```python
+# gunicorn.conf.py (chave do ConfigMap api-config)
+bind = "0.0.0.0:8000"
+workers = 2
+timeout = 30
+graceful_timeout = 25
+keepalive = 5
+accesslog = "-"
+```
+
+A conta precisa fechar: 10 segundos de `preStop` mais 25 de `graceful_timeout` cabem nos 45 do `terminationGracePeriodSeconds`. Versões recentes do Kubernetes também oferecem a ação nativa `sleep` no `preStop`, que dispensa o binário `sleep` na imagem.
+
+Do lado do servidor Python:
+
+| Servidor | Ao receber SIGTERM | Ajuste |
+|---|---|---|
+| gunicorn | O master para de aceitar conexões e espera os workers terminarem as requisições em andamento | `graceful_timeout` (padrão 30 s); depois disso os workers são mortos |
+| uvicorn | Para de aceitar conexões, espera as requisições e tarefas em andamento e executa o encerramento do `lifespan` | `--timeout-graceful-shutdown 25` |
+
+Nos serviços FastAPI, o comando fica `uvicorn pedidos.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 25`, e a parte final do `lifespan` é o lugar de fechar o pool de conexões e o canal com o broker.
+
+Há uma armadilha de Dockerfile que anula tudo isso. Na forma shell (`CMD gunicorn ingressos.wsgi:application`), o processo de PID 1 é o `/bin/sh`, que não repassa o SIGTERM: o gunicorn nunca fica sabendo, espera o tempo todo e é morto com SIGKILL. Use a forma exec, `CMD ["gunicorn", "ingressos.wsgi:application"]`, e, se houver um script de entrada, termine-o com `exec "$@"`.
+
+Consumidores de fila precisam do mesmo cuidado, com outra lógica: parar de pegar mensagens novas e concluir a atual antes de sair.
+
+```python
+# notificacoes/consumidor.py
+import signal
+
+import pika
+
+encerrando = False
+
+
+def pedir_encerramento(signum, frame):
+    global encerrando
+    encerrando = True
+
+
+def processar(body: bytes) -> None:
+    ...  # envia o e-mail do ingresso
+
+
+def main() -> None:
+    signal.signal(signal.SIGTERM, pedir_encerramento)
+    conexao = pika.BlockingConnection(pika.URLParameters("amqp://rabbitmq:5672"))
+    canal = conexao.channel()
+    canal.basic_qos(prefetch_count=10)
+
+    for metodo, _propriedades, body in canal.consume("notificacoes", inactivity_timeout=1):
+        if metodo is not None:
+            processar(body)
+            canal.basic_ack(metodo.delivery_tag)
+        if encerrando:
+            break
+
+    canal.cancel()
+    conexao.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+O `inactivity_timeout=1` faz o laço acordar a cada segundo mesmo sem mensagens, para conferir a flag. As mensagens já entregues e não confirmadas voltam para a fila quando o canal é cancelado, e outro consumidor as processa.
+
+## Ingress com TLS
+
+Um Service `LoadBalancer` por aplicação significa um balanceador de nuvem (e uma conta) por aplicação, sem roteamento HTTP. O **Ingress** é um objeto que descreve regras de roteamento HTTP por host e caminho, com terminação TLS. Ele sozinho não faz nada: quem lê as regras e encaminha o tráfego é um **controlador de Ingress** instalado no cluster (Traefik, HAProxy, NGINX, Contour, ou o controlador do provedor de nuvem), exposto por um único balanceador.
+
+```bash
+helm repo add traefik https://traefik.github.io/charts
+helm install traefik traefik/traefik --namespace traefik --create-namespace
+kubectl get ingressclass
+
+openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+  -keyout tls.key -out tls.crt \
+  -subj "/CN=ingressos.local" -addext "subjectAltName=DNS:ingressos.local"
+kubectl create secret tls ingressos-tls --cert=tls.crt --key=tls.key -n ingressos
+```
+
+```yaml
+# api-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: ingressos
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - ingressos.local
+      secretName: ingressos-tls
+  rules:
+    - host: ingressos.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  name: http
+```
+
+O `ingressClassName` escolhe qual controlador atende a regra; o Secret do tipo `kubernetes.io/tls` precisa estar no mesmo namespace do Ingress; `pathType` é obrigatório (`Prefix` ou `Exact`). Para testar localmente sem mexer no DNS:
+
+```bash
+kubectl port-forward -n traefik service/traefik 8443:443
+curl -k --resolve ingressos.local:8443:127.0.0.1 https://ingressos.local:8443/healthz
+```
+
+Em produção, o certificado autoassinado dá lugar ao cert-manager, que emite e renova certificados (Let's Encrypt, por exemplo) e mantém o Secret atualizado. O manifesto de Ingress é o mesmo qualquer que seja o controlador; muda a classe e as annotations específicas. Dois pontos de contexto: o controlador `ingress-nginx`, por muito tempo o mais usado, foi descontinuado pelo projeto Kubernetes, então escolha um controlador mantido; e a sucessora da API de Ingress é a Gateway API (`gateway.networking.k8s.io`), com `Gateway` e `HTTPRoute`, que cobre casos como divisão de tráfego por peso. O Ingress continua estável e suportado.
+
+Como o TLS termina no controlador, a API recebe HTTP puro. No Django, configure `SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")` e inclua o host público em `ALLOWED_HOSTS`, para que redirecionamentos e URLs absolutas saiam com `https`.
+
+## Jobs para migrações e CronJobs
+
+Deployment serve para processos que rodam para sempre. Para tarefas que rodam até terminar, o objeto é o **Job**: ele cria Pods até que um conclua com sucesso e registra o resultado. É o lugar certo para as migrações do banco.
+
+```yaml
+# api-migrate-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: api-migrate-1-5-0
+  namespace: ingressos
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ghcr.io/ingressos/api:1.5.0
+          command: ["python", "manage.py", "migrate", "--noinput"]
+          envFrom:
+            - configMapRef:
+                name: api-config
+            - secretRef:
+                name: api-secrets
+```
+
+```bash
+kubectl apply -f api-migrate-job.yaml
+kubectl wait --for=condition=complete job/api-migrate-1-5-0 -n ingressos --timeout=600s
+kubectl logs job/api-migrate-1-5-0 -n ingressos
+```
+
+O template de um Job é imutável, por isso o nome carrega a versão: cada release cria um Job novo. `backoffLimit` limita as novas tentativas, `activeDeadlineSeconds` impede que uma migração travada rode para sempre e `ttlSecondsAfterFinished` limpa o Job um dia depois. Por que não rodar `migrate` no início do contêiner da API ou num init container? Porque com várias réplicas subindo ao mesmo tempo, várias cópias da migração concorrem, e cada reinício de Pod repete a tentativa. Um Job roda uma vez por release, antes do rollout, e o pipeline só avança se ele concluir.
+
+Para tarefas periódicas, o **CronJob** cria Jobs numa agenda. A regra de negócio "a reserva expira em 15 minutos" precisa de alguém que devolva ao estoque os ingressos de pedidos pendentes vencidos:
+
+```yaml
+# expirar-reservas-cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: expirar-reservas
+  namespace: ingressos
+spec:
+  schedule: "*/5 * * * *"
+  timeZone: America/Sao_Paulo
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 240
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: expirar-reservas
+              image: ghcr.io/ingressos/api:1.5.0
+              command: ["python", "manage.py", "expirar_reservas"]
+              envFrom:
+                - configMapRef:
+                    name: api-config
+                - secretRef:
+                    name: api-secrets
+```
+
+`concurrencyPolicy: Forbid` não inicia uma execução enquanto a anterior ainda roda. Mesmo assim, o CronJob não garante "exatamente uma vez": uma execução pode ser pulada ou, raramente, duplicada. O comando `expirar_reservas` precisa ser idempotente, por exemplo atualizando só pedidos com status `pendente` e criação anterior ao limite, numa transação. É também por isso que um agendador embutido na aplicação (uma thread ou um `while True` com `sleep`) não serve aqui: com três réplicas, a tarefa rodaria três vezes.
+
+## Deploy sem indisponibilidade
+
+Juntando as peças, o deploy da versão 1.5.0 fica assim:
+
+1. O pipeline publica a imagem e aplica o Job de migração. Se o Job falhar, nada mais acontece e a versão antiga segue no ar.
+2. O Deployment é atualizado. Com `maxSurge: 1` e `maxUnavailable: 0`, um Pod novo sobe, passa na startup e na readiness probe e só então entra nos endpoints.
+3. Um Pod antigo é encerrado: sai dos endpoints, o `preStop` segura o SIGTERM, o gunicorn termina as requisições em andamento.
+4. O ciclo se repete até o fim. Se os Pods novos não ficarem prontos, o rollout para e as réplicas antigas continuam atendendo.
+
+```yaml
+# dentro de spec do Deployment api
+  minReadySeconds: 10
+  progressDeadlineSeconds: 300
+```
+
+`minReadySeconds` exige que o Pod fique pronto por 10 segundos seguidos antes de contar como disponível, o que pega a versão que sobe e morre logo depois. `progressDeadlineSeconds` marca o rollout como falho se ele não avançar em cinco minutos, e o `kubectl rollout status` do pipeline retorna erro, o gatilho para um `kubectl rollout undo` automático.
+
+Há uma condição que nenhum manifesto resolve: durante o rollout, **as duas versões rodam ao mesmo tempo sobre o mesmo banco**. A migração roda antes, então o código antigo precisa funcionar com o schema novo. Isso proíbe mudanças destrutivas num único passo e leva ao padrão expandir e contrair:
+
+| Release | Migração | Código |
+|---|---|---|
+| 1 (expandir) | Adiciona a coluna nova, aceitando nulo | Escreve na antiga e na nova, lê da antiga |
+| 2 (migrar) | Preenche a coluna nova para os registros existentes | Lê da nova |
+| 3 (contrair) | Remove a coluna antiga | Não conhece mais a antiga |
+
+Renomear uma coluna de `Pedido` num único deploy quebra as réplicas antigas no instante em que a migração termina. O mesmo raciocínio vale para o rollback: voltar o código só é seguro se o schema novo for compatível com a versão anterior.
+
+<Callout type="tip" title="Teste o deploy sob carga">
+A única prova de que o deploy não derruba requisições é fazer um deploy com tráfego. Deixe uma ferramenta de carga batendo no Ingress, rode `kubectl rollout restart deployment/api -n ingressos` e conte os erros. Depois remova o `preStop` e repita: a diferença nos 502 mostra o que cada peça faz.
+</Callout>
+
+## Na entrevista
+
+**O que acontece quando um Pod é encerrado?** Ele é marcado como `Terminating` e, em paralelo, sai dos endpoints dos Services e o kubelet roda o `preStop` e envia SIGTERM. O processo tem até `terminationGracePeriodSeconds` para sair; depois recebe SIGKILL. Como a retirada do balanceamento não é instantânea, um `preStop` com alguns segundos de espera evita que requisições cheguem a um servidor que já está fechando.
+
+**Para que serve um PodDisruptionBudget?** Para limitar quantos Pods de uma aplicação podem ser despejados ao mesmo tempo em interrupções voluntárias, como drenar um nó numa atualização do cluster. Ele não protege contra falha de nó nem controla o rolling update, que tem os próprios limites.
+
+**Qual a diferença entre anti-afinidade e topology spread constraints?** A anti-afinidade obrigatória permite no máximo um Pod por domínio e trava quando as réplicas superam os domínios. As topology spread constraints definem um desequilíbrio máximo (`maxSkew`), permitindo vários Pods por nó ou zona desde que bem distribuídos, e combinam níveis diferentes, como zona e nó.
+
+**Onde você roda as migrações de banco num deploy no Kubernetes?** Num Job executado pelo pipeline antes do rollout, uma vez por release, com o deploy condicionado ao sucesso. Rodar na inicialização de cada réplica causa execuções concorrentes e repetidas. As migrações precisam ser compatíveis com a versão anterior do código, que continua rodando durante o rollout.
+
+**Qual a diferença entre Service e Ingress?** O Service dá um endereço estável a um conjunto de Pods e opera na camada de transporte. O Ingress descreve roteamento HTTP por host e caminho, com TLS, e depende de um controlador que recebe o tráfego externo e o encaminha aos Services.
+
+**Como garantir que um CronJob não cause efeito duplicado?** Com `concurrencyPolicy: Forbid` para evitar sobreposição e, principalmente, com uma tarefa idempotente, porque o agendamento não garante execução exatamente uma vez. A operação deve produzir o mesmo resultado se rodar duas vezes.
+
+## Pratique
+
+1. Adicione topology spread constraints à API (obrigatória por nó, preferencial por zona), rotule os nós do kind com zonas simuladas e confirme a distribuição com `kubectl get pods -o wide`.
+2. Crie o PDB com `maxUnavailable: 1`, mantenha um laço de `curl` rodando e drene um worker. Repita sem o PDB e compare os erros.
+3. Configure `preStop`, `terminationGracePeriodSeconds` e `graceful_timeout`, confira que o Dockerfile usa a forma exec e meça os erros de um `rollout restart` sob carga, com e sem o `preStop`.
+4. Instale um controlador de Ingress, gere o certificado autoassinado e publique a API em `https://ingressos.local`, com o Django reconhecendo o esquema `https` pelo cabeçalho do proxy.
+5. Implemente o comando `expirar_reservas` de forma idempotente, agende-o com um CronJob a cada cinco minutos e escreva o Job de migração de uma release que renomeia uma coluna de `Pedido` em três etapas, no padrão expandir e contrair.
+
+<Quiz question="Um Deployment de 5 réplicas usa anti-afinidade obrigatória por hostname em um cluster de 3 nós. O que acontece?" options={["As 5 réplicas se distribuem 2, 2 e 1","O scheduler ignora a regra quando faltam nós","Três réplicas sobem e duas ficam em Pending","O Deployment é rejeitado pelo apiserver"]} answer={2} explanation="A regra obrigatória permite no máximo um Pod por nó. Sem nó que a satisfaça, os Pods excedentes ficam em Pending. Topology spread com maxSkew resolveria o caso." />
+
+<Quiz question="Por que adicionar um preStop com alguns segundos de espera ao contêiner da API?" options={["Para o SIGTERM só chegar depois que os balanceadores pararam de enviar tráfego ao Pod","Para a liveness probe ter tempo de falhar","Para o Job de migração terminar","Para o HPA recalcular as réplicas"]} answer={0} explanation="A remoção dos endpoints e o envio do SIGTERM acontecem em paralelo. O preStop atrasa o SIGTERM para que a remoção se propague antes de o servidor parar de aceitar conexões." />
+
+<Quiz question="A release remove uma coluna que a versão anterior do código ainda lê, e a migração roda antes do rollout. Qual o resultado?" options={["Nenhum, o rolling update isola as versões","O Job de migração falha sempre","O Kubernetes bloqueia o deploy","As réplicas antigas ainda em execução passam a falhar até serem substituídas"]} answer={3} explanation="Durante o rollout as duas versões usam o mesmo banco. Mudanças destrutivas precisam ser divididas em releases, no padrão expandir e contrair." />
+
+## Base no CodeForge
+
+- [Kubernetes: Deployments, Volumes e escalabilidade](/learn/carreira-python/kubernetes-deployments-volumes-escalabilidade): Deployment, probes e HPA, pontos de partida deste capítulo.
+- [Disponibilidade](/learn/system-design/disponibilidade) e [Ponto único de falha](/learn/system-design/ponto-unico-de-falha): os conceitos que justificam réplicas espalhadas.
+- [Migrações de schema](/learn/system-design/migracoes-de-schema): expandir e contrair em detalhe.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy), [Blue-green](/learn/system-design/blue-green) e [Canary](/learn/system-design/canary): alternativas ao rolling update.
+- [TLS](/learn/redes/tls) e [Proxy e reverse proxy](/learn/system-design/proxy-reverse-proxy): o que o controlador de Ingress faz na borda.
+
+## Referências
+
+- [Kubernetes: Disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)
+- [Kubernetes: Pod Topology Spread Constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/)
+- [Kubernetes: Pod Lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [Kubernetes: Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/)

@@ -1,0 +1,521 @@
+---
+title: "Kubernetes: Criando e gerenciando charts com o Helm"
+kind: lesson
+---
+
+O Kustomize do capítulo anterior resolveu as diferenças entre ambientes, mas a plataforma `ingressos` continua sendo um monte de arquivos que só a sua equipe sabe aplicar na ordem certa. Não há uma versão do conjunto ("a plataforma na versão 2.3 tinha estes quatro serviços com estas imagens"), não há um comando que mostre o que está instalado no cluster e em qual revisão, e voltar atrás depende de achar o commit certo e reaplicá-lo. Quando outro time quiser subir a plataforma num cluster de testes, vai precisar de um tutorial.
+
+O Helm trata a aplicação como um pacote: um **chart** com templates parametrizados, versionado e publicável num registro, que vira uma **release** com histórico quando instalado. Este capítulo transforma os manifestos do `ingressos` num chart, usando laços para gerar os quatro serviços a partir de uma única definição, e cobre o ciclo completo: validar, instalar, atualizar, voltar, configurar por ambiente e publicar num registro OCI.
+
+**Você vai aprender:**
+
+- Montar a estrutura de um chart com `Chart.yaml`, `values.yaml`, templates e helpers
+- Escrever templates com a linguagem do Go: valores, condicionais, laços, `include`, `required` e `tpl`
+- Declarar dependências e usar hooks para rodar migrações antes do upgrade
+- Operar releases com `helm install`, `upgrade`, `rollback`, `lint` e `template`, com valores por ambiente
+- Empacotar e publicar o chart num registro OCI
+
+## Conceitos: chart, release e repositório
+
+| Conceito | O que é |
+|---|---|
+| Chart | Um diretório (ou arquivo `.tgz`) com templates, valores padrão e metadados |
+| Values | Os parâmetros do chart: o padrão em `values.yaml`, sobrescrito por arquivos `-f` e por `--set` |
+| Release | Uma instalação do chart num namespace, com nome próprio. O mesmo chart pode ter várias releases |
+| Revisão | Cada `install`, `upgrade` ou `rollback` cria uma revisão nova da release, guardada num Secret no namespace |
+| Registro | Onde charts são publicados: registros OCI (os mesmos das imagens) ou repositórios HTTP com `index.yaml` |
+
+O Helm 3 não tem componente no cluster: o binário renderiza os templates na sua máquina, envia os objetos ao apiserver com as suas credenciais e grava o estado da release como Secret do tipo `helm.sh/release.v1`. Por isso `kubectl get secrets -n ingressos` mostra um Secret por revisão.
+
+## A estrutura do chart
+
+```bash
+helm create ingressos
+```
+
+O comando gera um esqueleto completo. Para a plataforma, você mantém a estrutura e reescreve os templates:
+
+```text
+ingressos/
+  Chart.yaml
+  Chart.lock
+  values.yaml
+  values.schema.json
+  charts/
+  templates/
+    _helpers.tpl
+    configmap.yaml
+    deployments.yaml
+    services.yaml
+    hpa.yaml
+    migracao-job.yaml
+    NOTES.txt
+```
+
+```yaml
+# ingressos/Chart.yaml
+apiVersion: v2
+name: ingressos
+description: Plataforma de venda de ingressos (catalogo, pedidos, pagamentos, notificacoes)
+type: application
+version: 0.4.0
+appVersion: "2.3.0"
+dependencies:
+  - name: rabbitmq
+    version: "16.x.x"
+    repository: oci://registry-1.docker.io/bitnamicharts
+    condition: rabbitmq.habilitado
+```
+
+`version` é a versão do chart, em SemVer, e muda a cada alteração no pacote. `appVersion` é informativo e descreve a versão da aplicação empacotada. Arquivos que começam com `_` em `templates/` não geram objetos: guardam definições reutilizáveis. O `NOTES.txt` é impresso depois da instalação, útil para dizer como acessar a aplicação.
+
+## values.yaml: o contrato do chart
+
+O `values.yaml` é a interface pública do chart: tudo o que quem instala pode mudar está nele, com um padrão razoável. Para quatro serviços parecidos, a melhor modelagem é um mapa de serviços, para que os templates gerem os objetos com um laço:
+
+```yaml
+# ingressos/values.yaml
+config:
+  DB_HOST: postgres
+  RABBITMQ_HOST: "{{ .Release.Name }}-rabbitmq"
+  CATALOGO_URL: "http://{{ .Release.Name }}-catalogo"
+  LOG_FORMAT: json
+
+migracao:
+  habilitada: true
+
+servicos:
+  catalogo:
+    habilitado: true
+    imagem:
+      repositorio: ghcr.io/ingressos/catalogo
+      tag: ""
+    comando: ["gunicorn", "catalogo.wsgi:application", "--bind", "0.0.0.0:8000"]
+    porta: 8000
+    replicas: 2
+    recursos:
+      requests: { cpu: 200m, memory: 256Mi }
+      limits: { memory: 512Mi }
+    autoscaling:
+      habilitado: false
+  pedidos:
+    habilitado: true
+    imagem:
+      repositorio: ghcr.io/ingressos/pedidos
+      tag: ""
+    comando: ["uvicorn", "pedidos.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    porta: 8000
+    replicas: 2
+    recursos:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { memory: 512Mi }
+    autoscaling:
+      habilitado: true
+      minimo: 3
+      maximo: 12
+      cpu: 70
+  pagamentos:
+    habilitado: true
+    imagem:
+      repositorio: ghcr.io/ingressos/pagamentos
+      tag: ""
+    comando: ["uvicorn", "pagamentos.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    porta: 8000
+    replicas: 2
+    recursos:
+      requests: { cpu: 200m, memory: 256Mi }
+      limits: { memory: 512Mi }
+    autoscaling:
+      habilitado: false
+  notificacoes:
+    habilitado: true
+    imagem:
+      repositorio: ghcr.io/ingressos/notificacoes
+      tag: ""
+    comando: ["python", "-m", "notificacoes.consumidor"]
+    porta: null
+    replicas: 2
+    recursos:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { memory: 256Mi }
+    autoscaling:
+      habilitado: false
+
+rabbitmq:
+  habilitado: true
+```
+
+As tags vazias são proposital: o template vai exigir que cada ambiente informe a tag de cada serviço, em vez de instalar uma versão qualquer por omissão. As chaves em português são escolha do chart; a convenção do Helm é camelCase em inglês, e o importante é ser consistente.
+
+## Templates e helpers
+
+Os templates usam a linguagem de templates do Go com as funções da biblioteca Sprig. O essencial:
+
+| Sintaxe | Efeito |
+|---|---|
+| `{{ .Values.x }}` | Insere um valor |
+| `{{ .Release.Name }}`, `{{ .Chart.Version }}` | Objetos embutidos da release e do chart |
+| `{{- ... -}}` | O hífen remove espaços e quebras de linha à esquerda ou à direita |
+| `{{ x \| quote }}` | Pipeline: o valor passa por funções (`quote`, `default`, `upper`, `toYaml`, `nindent`) |
+| `{{ include "nome" . }}` | Renderiza uma definição de `_helpers.tpl` e permite encadear no pipeline |
+| `{{ required "msg" .Values.x }}` | Falha a renderização com a mensagem se o valor estiver vazio |
+
+Os helpers centralizam nomes e labels, que precisam ser idênticos em Deployment, Service e HPA:
+
+```yaml
+# ingressos/templates/_helpers.tpl
+{{- define "ingressos.labelsComuns" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+app.kubernetes.io/part-of: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{- define "ingressos.selectorLabels" -}}
+app.kubernetes.io/name: {{ .nome }}
+app.kubernetes.io/instance: {{ .raiz.Release.Name }}
+{{- end }}
+```
+
+O segundo helper recebe um dicionário com duas chaves, porque precisa do nome do serviço e do contexto raiz ao mesmo tempo. A versão do chart fica fora dos selector labels de propósito: selectors são imutáveis, e um label que muda a cada versão impediria o upgrade.
+
+O ConfigMap mostra o laço sobre um mapa e a função `tpl`, que renderiza como template uma string vinda dos valores. É ela que transforma `"{{ .Release.Name }}-rabbitmq"` em `ingressos-rabbitmq`:
+
+```yaml
+# ingressos/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    {{- include "ingressos.labelsComuns" . | nindent 4 }}
+data:
+  {{- range $chave, $valor := .Values.config }}
+  {{ $chave }}: {{ tpl $valor $ | quote }}
+  {{- end }}
+```
+
+## Laços e condicionais: quatro Deployments de um template
+
+Dentro de um `range`, o ponto (`.`) passa a ser o item da iteração. Para alcançar a raiz (`.Release`, `.Values`, `.Template`) usa-se `$`, que sempre aponta para o contexto de topo:
+
+```yaml
+# ingressos/templates/deployments.yaml
+{{- range $nome, $svc := .Values.servicos }}
+{{- if $svc.habilitado }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $.Release.Name }}-{{ $nome }}
+  labels:
+    {{- include "ingressos.labelsComuns" $ | nindent 4 }}
+    {{- include "ingressos.selectorLabels" (dict "raiz" $ "nome" $nome) | nindent 4 }}
+spec:
+  {{- if not $svc.autoscaling.habilitado }}
+  replicas: {{ $svc.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ingressos.selectorLabels" (dict "raiz" $ "nome" $nome) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ingressos.selectorLabels" (dict "raiz" $ "nome" $nome) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+    spec:
+      containers:
+        - name: {{ $nome }}
+          image: "{{ $svc.imagem.repositorio }}:{{ required (printf "informe servicos.%s.imagem.tag" $nome) $svc.imagem.tag }}"
+          {{- with $svc.comando }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $svc.porta }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.porta }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ $.Release.Name }}-config
+            - secretRef:
+                name: {{ $nome }}-secrets
+          resources:
+            {{- toYaml $svc.recursos | nindent 12 }}
+{{- end }}
+{{- end }}
+```
+
+Os pontos que mais causam erro:
+
+- **Indentação**: `toYaml` devolve YAML sem recuo, e `nindent N` acrescenta uma quebra de linha e N espaços. Errar o número gera YAML inválido ou, pior, válido com a estrutura errada.
+- **`with`** abre um bloco só se o valor não for vazio e muda o ponto para ele. Serve para campos opcionais, como o `command` acima.
+- **`replicas` condicional**: quando o HPA controla o Deployment, o template omite o campo, pelo mesmo motivo visto no capítulo de escalabilidade.
+- **A annotation `checksum/config`** guarda o hash do ConfigMap renderizado. Quando a configuração muda, o hash muda, o template do Pod muda e o upgrade dispara um rollout. É o equivalente Helm do sufixo de hash do Kustomize.
+
+O Service e o HPA seguem o mesmo laço, com condições adicionais: `notificacoes` não tem porta e não ganha Service.
+
+```yaml
+# ingressos/templates/services.yaml
+{{- range $nome, $svc := .Values.servicos }}
+{{- if and $svc.habilitado $svc.porta }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Release.Name }}-{{ $nome }}
+  labels:
+    {{- include "ingressos.labelsComuns" $ | nindent 4 }}
+spec:
+  selector:
+    {{- include "ingressos.selectorLabels" (dict "raiz" $ "nome" $nome) | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}
+{{- end }}
+```
+
+```yaml
+# ingressos/templates/hpa.yaml
+{{- range $nome, $svc := .Values.servicos }}
+{{- if and $svc.habilitado $svc.autoscaling.habilitado }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $.Release.Name }}-{{ $nome }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $.Release.Name }}-{{ $nome }}
+  minReplicas: {{ $svc.autoscaling.minimo }}
+  maxReplicas: {{ $svc.autoscaling.maximo }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.autoscaling.cpu }}
+{{- end }}
+{{- end }}
+```
+
+Os Secrets de cada serviço (`pedidos-secrets` e os demais) não são criados pelo chart: valores sensíveis em `values.yaml` acabam no Git e no Secret da release, legíveis por quem lê o namespace. O chart apenas os referencia, e quem os cria é o processo do capítulo de segurança.
+
+## Hooks: migrações antes do upgrade
+
+O Job de migração do capítulo de alta disponibilidade precisa rodar antes da troca dos Deployments. Hooks fazem isso: um objeto com a annotation `helm.sh/hook` é aplicado num momento específico do ciclo da release, e o Helm espera ele terminar.
+
+```yaml
+# ingressos/templates/migracao-job.yaml
+{{- if .Values.migracao.habilitada }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-migracao-{{ .Release.Revision }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migracao
+          image: "{{ .Values.servicos.pedidos.imagem.repositorio }}:{{ .Values.servicos.pedidos.imagem.tag }}"
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: {{ .Release.Name }}-config
+            - secretRef:
+                name: pedidos-secrets
+{{- end }}
+```
+
+Se o Job falhar, o upgrade falha antes de tocar nos Deployments, e a versão anterior continua no ar. A política `before-hook-creation` apaga o Job da execução anterior antes de criar o novo, e `hook-succeeded` limpa o Job quando dá certo, preservando o que falhou para investigação. Cuidado com um detalhe: num `pre-install`, o ConfigMap da release ainda não existe, porque hooks rodam antes dos objetos normais. Se o Job precisar dele na primeira instalação, o ConfigMap também tem de ser um hook com peso menor, ou o Job precisa receber as variáveis diretamente.
+
+Na prática, cada serviço tem seu banco e suas migrações (Alembic no `pedidos` e no `pagamentos`, `manage.py migrate` no `catalogo`), e o template de migração pode ser outro laço sobre `servicos`, com um campo `migracao.comando` por serviço.
+
+## Dependências
+
+O bloco `dependencies` do `Chart.yaml` declara subcharts. O `condition` liga ou desliga a dependência por um valor, e os valores do subchart ficam sob a chave com o nome dele:
+
+```bash
+helm dependency update ingressos    # baixa os subcharts para charts/ e grava o Chart.lock
+helm dependency list ingressos
+```
+
+```yaml
+# trecho de values-dev.yaml
+rabbitmq:
+  habilitado: true
+  auth:
+    username: ingressos
+    existingPasswordSecret: rabbitmq-secrets
+```
+
+Em desenvolvimento, o subchart sobe um RabbitMQ junto com a plataforma. Em produção, `rabbitmq.habilitado: false` e `RABBITMQ_HOST` aponta para o serviço gerenciado. Versione o `Chart.lock`, que fixa as versões exatas resolvidas a partir de faixas como `16.x.x`, e confira as chaves aceitas pelo subchart no `values.yaml` dele (`helm show values`), porque cada chart tem as suas. Antes de adotar um chart de terceiros, verifique quem o mantém e de onde vêm as imagens que ele usa: o catálogo da Bitnami, o mais conhecido, passou a restringir as imagens gratuitas em 2025.
+
+Dependências também resolvem reuso interno: um chart `servico-python` genérico, publicado pela equipe de plataforma, pode ser declarado várias vezes com `alias` diferentes, uma por serviço.
+
+## Validar, instalar, atualizar, voltar
+
+Antes de qualquer coisa chegar ao cluster, valide localmente:
+
+```bash
+helm lint ingressos -f ingressos/values-dev.yaml
+helm template ingressos ./ingressos -n ingressos-dev -f ingressos/values-dev.yaml > renderizado.yaml
+helm template ingressos ./ingressos -f ingressos/values-dev.yaml --show-only templates/deployments.yaml
+```
+
+O `lint` aponta erros de estrutura e de template; o `template` renderiza tudo sem acessar o cluster, o que permite revisar o YAML final e até validá-lo com ferramentas de política no CI. Um `values.schema.json` na raiz do chart faz o Helm rejeitar valores com tipo errado em `lint`, `template`, `install` e `upgrade`:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["servicos"],
+  "properties": {
+    "servicos": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["imagem", "replicas"],
+        "properties": {
+          "replicas": { "type": "integer", "minimum": 1 },
+          "porta": { "type": ["integer", "null"] }
+        }
+      }
+    }
+  }
+}
+```
+
+O ciclo de vida da release:
+
+```bash
+helm install ingressos ./ingressos -n ingressos-dev --create-namespace -f ingressos/values-dev.yaml
+
+helm upgrade --install ingressos ./ingressos -n ingressos-prod \
+  -f ingressos/values-prod.yaml \
+  --set servicos.pedidos.imagem.tag=2.3.1 \
+  --wait --timeout 10m
+
+helm list -n ingressos-prod
+helm status ingressos -n ingressos-prod
+helm history ingressos -n ingressos-prod
+helm get values ingressos -n ingressos-prod          # valores efetivos da revisão atual
+helm get manifest ingressos -n ingressos-prod        # o YAML que foi aplicado
+helm rollback ingressos 7 -n ingressos-prod --wait
+helm uninstall ingressos -n ingressos-dev
+```
+
+O `upgrade --install` é idempotente: instala se a release não existe e atualiza se existe, o que o torna o comando certo para pipelines. O `--wait` só considera o upgrade bem-sucedido quando os Pods ficarem prontos, e o pipeline pode reagir à falha com `helm rollback`. No Helm 3, a flag `--atomic` faz esse rollback automaticamente.
+
+<Callout type="warning" title="O rollback não volta o banco">
+O `helm rollback` reaplica os manifestos de uma revisão anterior e cria uma revisão nova com eles. Ele não desfaz migrações: se a revisão 8 alterou o schema, voltar para a 7 coloca o código antigo sobre o banco novo. É a mesma regra do capítulo anterior: migrações compatíveis com a versão anterior, no padrão expandir e contrair, são o que torna o rollback seguro.
+</Callout>
+
+## Valores por ambiente
+
+A precedência é: `values.yaml` do chart, depois cada arquivo `-f` na ordem informada, depois `--set`. Mapas são mesclados chave a chave; listas são substituídas inteiras. Isso permite manter um arquivo por ambiente só com as diferenças:
+
+```yaml
+# ingressos/values-prod.yaml
+config:
+  DB_HOST: postgres-prod.interno.ingressos.com.br
+  RABBITMQ_HOST: rabbitmq.mensageria.svc.cluster.local
+
+rabbitmq:
+  habilitado: false
+
+servicos:
+  catalogo:
+    imagem: { tag: "1.8.1" }
+    replicas: 3
+  pedidos:
+    imagem: { tag: "2.3.0" }
+    autoscaling: { habilitado: true, minimo: 4, maximo: 20, cpu: 65 }
+  pagamentos:
+    imagem: { tag: "1.5.2" }
+    replicas: 3
+  notificacoes:
+    imagem: { tag: "1.2.0" }
+```
+
+Use `--set` só para o que muda a cada deploy, como a tag do serviço que acabou de ser construído. Tudo mais fica em arquivo versionado, senão a única fonte da configuração de produção é o histórico de comandos de alguém.
+
+<Callout type="tip" title="Helm ou Kustomize na plataforma">
+Os dois não são excludentes. Uma divisão comum: o chart empacota a aplicação com seus parâmetros, e o repositório de implantação guarda um arquivo de valores por ambiente, aplicado por uma ferramenta de GitOps como Argo CD ou Flux. O Kustomize entra quando é preciso ajustar um chart de terceiros sem fazer um fork dele.
+</Callout>
+
+## Publicando num registro OCI
+
+Desde o Helm 3.8, charts podem ser publicados em qualquer registro compatível com OCI: o mesmo GHCR, ECR ou ACR que guarda as imagens. Não é preciso manter um servidor com `index.yaml`.
+
+```bash
+helm package ingressos                       # gera ingressos-0.4.0.tgz com a versão do Chart.yaml
+echo "$GITHUB_TOKEN" | helm registry login ghcr.io -u ingressos-bot --password-stdin
+helm push ingressos-0.4.0.tgz oci://ghcr.io/ingressos/charts
+
+helm show values oci://ghcr.io/ingressos/charts/ingressos --version 0.4.0
+helm upgrade --install ingressos oci://ghcr.io/ingressos/charts/ingressos \
+  --version 0.4.0 -n ingressos-prod -f values-prod.yaml --wait
+```
+
+O nome do chart e a versão viram o nome e a tag do artefato no registro. Uma versão publicada não deve ser sobrescrita: qualquer mudança no chart incrementa `version` no `Chart.yaml`. No GitHub Actions, o job de release roda `helm lint`, `helm package` e `helm push` quando o chart muda, autenticado com o `GITHUB_TOKEN` do próprio workflow.
+
+## Na entrevista
+
+**O que é um chart e o que é uma release?** Um chart é o pacote: templates, valores padrão e metadados, com versão. Uma release é uma instalação desse chart num namespace, com nome, valores efetivos e um histórico de revisões guardado no próprio cluster. O mesmo chart pode gerar várias releases.
+
+**Como o Helm faz rollback?** Cada install, upgrade ou rollback grava uma revisão com os manifestos renderizados. O `helm rollback` reaplica os manifestos de uma revisão anterior como uma revisão nova. Ele não desfaz efeitos externos, como migrações de banco.
+
+**Por que adicionar uma annotation com o checksum do ConfigMap no Deployment?** Porque alterar um ConfigMap não recria os Pods. Com o hash do conteúdo numa annotation do template, qualquer mudança de configuração muda o template e o upgrade dispara um rollout.
+
+**Para que servem `helm lint` e `helm template`?** O `lint` valida a estrutura do chart e os templates. O `template` renderiza os manifestos localmente, sem cluster, para revisão, diffs e verificação de políticas no CI. Os dois pegam erros antes do deploy.
+
+**Qual a ordem de precedência dos valores?** O `values.yaml` do chart é a base, os arquivos passados com `-f` sobrescrevem na ordem em que aparecem e o `--set` vence todos. Mapas são mesclados e listas são substituídas inteiras.
+
+**Como você roda migrações num deploy com Helm?** Com um Job marcado como hook `pre-upgrade` (e `pre-install`), que o Helm executa e aguarda antes de atualizar os Deployments. Se ele falhar, o upgrade para sem trocar a versão em execução.
+
+## Pratique
+
+1. Crie o chart `ingressos` com `helm create`, apague os templates de exemplo e escreva helpers, ConfigMap, Deployments, Services e HPA gerados por laço a partir do mapa `servicos`.
+2. Rode `helm template` e compare a saída com os manifestos do overlay de dev do Kustomize até não haver diferença relevante. Remova a tag de um serviço e confirme que o `required` interrompe a renderização com a mensagem certa.
+3. Escreva o `values.schema.json`, os arquivos `values-dev.yaml` e `values-prod.yaml` e instale a release em dois namespaces do cluster kind.
+4. Adicione o hook de migração, faça um upgrade com uma migração que falha de propósito, confirme que os Deployments não mudaram e execute `helm history` e `helm rollback`.
+5. Publique o chart no GHCR com um workflow do GitHub Actions disparado por mudanças na pasta do chart e instale a release a partir do registro OCI.
+
+<Quiz question="Dentro de um range sobre .Values.servicos, como acessar o nome da release?" options={["Com .Release.Name, que continua disponível","Com $.Release.Name, porque o ponto passou a ser o item do laço","Com Values.Release.Name","Não é possível dentro de um laço"]} answer={1} explanation="O range muda o contexto do ponto para o item da iteração. O cifrão sempre referencia o contexto raiz do template." />
+
+<Quiz question="Um valor é definido em values.yaml, em values-prod.yaml passado com -f e em --set. Qual vence?" options={["O do values.yaml","O do values-prod.yaml","O primeiro encontrado","O do --set"]} answer={3} explanation="A ordem é values.yaml do chart, depois os arquivos -f na ordem informada, e por último --set, que tem a maior precedência." />
+
+<Quiz question="Qual a função da annotation helm.sh/hook pre-upgrade em um Job de migração?" options={["Executar o Job e aguardar seu término antes de aplicar os demais objetos do upgrade","Executar o Job depois que todos os Pods ficarem prontos","Impedir que o Job seja removido","Rodar o Job somente na primeira instalação"]} answer={0} explanation="Hooks pre-upgrade são aplicados antes dos objetos normais da release, e o Helm espera sua conclusão. Se o Job falhar, o upgrade é interrompido." />
+
+## Base no CodeForge
+
+- [Kubernetes com microsserviços: Subindo e gerenciando uma aplicação](/learn/carreira-python/kubernetes-microsservicos-subindo-gerenciando-aplicacao): os manifestos e overlays que este chart substitui.
+- [Kubernetes: Praticando e garantindo uma aplicação com alta disponibilidade](/learn/carreira-python/kubernetes-praticando-garantindo-aplicacao-alta-disponibilidade): o Job de migração e o padrão expandir e contrair usados nos hooks.
+- [Integração Contínua com Docker e GitHub Actions: Do build ao deploy](/learn/carreira-python/integracao-continua-docker-github-actions-build-deploy): o pipeline que passa a publicar o chart.
+- [Rollbacks](/learn/system-design/rollbacks) e [Migrações de schema](/learn/system-design/migracoes-de-schema): os limites do `helm rollback`.
+
+## Referências
+
+- [Helm: Charts](https://helm.sh/docs/topics/charts/)
+- [Helm: Chart Template Guide](https://helm.sh/docs/chart_template_guide/getting_started/)
+- [Helm: Chart Hooks](https://helm.sh/docs/topics/charts_hooks/)
+- [Helm: Use OCI-based registries](https://helm.sh/docs/topics/registries/)

@@ -1,0 +1,328 @@
+---
+title: "Integração Contínua: Rollback e teste de carga"
+kind: lesson
+---
+
+O pipeline do `ingressos` já leva cada merge até produção no ECS, com testes, migração em task avulsa e aprovação manual. Ele ainda tem dois pontos cegos. O primeiro: se a versão nova sobe, passa no health check e começa a devolver erro 500 em 8% das compras, nada a tira do ar sozinho, e o rollback depende de alguém perceber no meio da noite. O segundo: nenhuma etapa mede desempenho. A abertura das vendas de um festival concentra em dez minutos o tráfego de uma semana, e uma consulta que leva 40 ms com dez usuários pode levar 4 segundos com quinhentos.
+
+Este capítulo fecha os dois. Primeiro, as estratégias de deploy e o rollback automático no ECS, incluindo a parte que o rollback não resolve sozinho: o banco. Depois, testes de carga escritos em Python com o Locust, com critérios de aprovação que reprovam a versão no pipeline antes de ela chegar a produção.
+
+**Você vai aprender:**
+
+- Comparar rolling, blue/green e canário e escolher pelo risco e pelo custo
+- Ligar o rollback automático do ECS com o circuit breaker de deploy e alarmes do CloudWatch
+- Escrever migrações compatíveis para trás com o padrão expandir e contrair no Django
+- Criar testes de carga com o Locust que simulam o fluxo de compra
+- Ler p95 e p99 e transformá-los em critérios de aprovação no pipeline
+
+## Voltar ou corrigir para a frente
+
+Quando uma versão quebra produção, há duas saídas. **Rollback** é voltar à versão anterior, conhecida e testada. **Roll forward** é corrigir e publicar uma versão nova. O rollback quase sempre vem primeiro, porque é rápido e não exige entender a causa às 3h da manhã: estabilize, depois investigue.
+
+Rollback só é rápido se três condições forem verdadeiras: a versão anterior ainda existe como artefato imutável (a imagem com a tag do SHA no ECR, a revisão da task definition), voltar é uma operação única e testada (e não um procedimento que ninguém executa há meses), e o banco aceita o código antigo. As duas primeiras os capítulos anteriores já garantiram. A terceira é a mais esquecida e tem seção própria adiante.
+
+## Estratégias de deploy
+
+| Estratégia | Como funciona | Rollback | Custo extra | Risco exposto |
+|---|---|---|---|---|
+| Rolling | Substitui as tasks aos poucos | Outro rolling, em minutos | Nenhum ou pouco | Todos os usuários, à medida que a troca avança |
+| Blue/green | Sobe o ambiente novo inteiro ao lado e vira o tráfego de uma vez | Virar o tráfego de volta, em segundos | Dobro da capacidade durante o deploy | Todos, mas com volta imediata |
+| Canário | Manda uma fração pequena do tráfego para a versão nova, observa e amplia | Tirar a fração do canário | Pouco | Só a fração, durante a observação |
+
+O **rolling** é o padrão do ECS, usado no capítulo anterior: barato e simples, mas durante a troca as duas versões atendem juntas e voltar exige outra troca completa. O **blue/green** mantém o ambiente antigo (azul) intacto enquanto o novo (verde) recebe o tráfego, então voltar é só mudar a regra do balanceador; o custo é a capacidade duplicada e a exigência de que o banco sirva às duas versões. O **canário** é o mais seguro para mudanças arriscadas: 5% dos usuários veem a versão nova por dez minutos, e se a taxa de erro desse grupo sobe, só ele foi afetado.
+
+No ECS, o rolling é o padrão, e o próprio ECS oferece também blue/green e, mais recentemente, implantações canário e lineares com o ALB, configuradas na estratégia de deployment do service; antes disso, esses modos dependiam do CodeDeploy. Os nomes dos campos variam entre essas opções, então consulte a documentação de *deployment strategies* da versão que você for usar. O que muda para o pipeline é pouco: a action `amazon-ecs-deploy-task-definition` continua registrando a revisão e esperando a estabilidade.
+
+## Rollback automático no ECS
+
+O ECS desfaz um deploy sozinho por dois gatilhos, configurados no service.
+
+O **circuit breaker de deploy** observa se as tasks novas conseguem ficar de pé. Se elas falham repetidamente ao iniciar ou no health check do ALB, ele marca o deployment como falho e, com `rollback=true`, volta o service para a última revisão que chegou ao estado estável:
+
+```bash
+aws ecs update-service --cluster ingressos-production --service ingressos-api \
+  --deployment-configuration "minimumHealthyPercent=100,maximumPercent=200,deploymentCircuitBreaker={enable=true,rollback=true}"
+```
+
+O circuit breaker pega a versão que não sobe: variável de ambiente faltando, segredo inacessível, `ALLOWED_HOSTS` errado, importação quebrada. Ele não pega a versão que sobe e responde ao health check, mas erra nas compras.
+
+Para esse segundo caso, os **alarmes de deployment** ligam o rollback a métricas do CloudWatch. Crie um alarme sobre a taxa de 5xx do target group e informe-o ao service:
+
+```bash
+aws cloudwatch put-metric-alarm --alarm-name ingressos-api-5xx \
+  --namespace AWS/ApplicationELB --metric-name HTTPCode_Target_5XX_Count \
+  --dimensions Name=LoadBalancer,Value="$ALB_DIM" Name=TargetGroup,Value="$TG_DIM" \
+  --statistic Sum --period 60 --evaluation-periods 2 \
+  --threshold 20 --comparison-operator GreaterThanThreshold \
+  --treat-missing-data notBreaching
+
+aws ecs update-service --cluster ingressos-production --service ingressos-api \
+  --deployment-configuration "minimumHealthyPercent=100,maximumPercent=200,deploymentCircuitBreaker={enable=true,rollback=true},alarms={alarmNames=[ingressos-api-5xx],enable=true,rollback=true}"
+```
+
+Se o alarme entrar em estado de alerta durante o deployment, o ECS o considera falho e volta à revisão anterior. Um contador absoluto de 5xx é o exemplo mais simples; em produção, prefira uma taxa (erros divididos por requisições, com *metric math*) e acrescente um alarme de latência p99 do target group, para que a versão lenta também seja revertida. Quando o rollback acontece, o `wait-for-service-stability` da action faz o job falhar, e o histórico do pipeline mostra exatamente qual commit foi rejeitado.
+
+<Callout type="warning" title="Rollback automático não substitui o alerta">
+O ECS observa a versão nova só durante o deployment. Um bug que aparece duas horas depois, quando o primeiro cliente tenta cancelar um pedido, não dispara rollback nenhum. Os mesmos alarmes precisam notificar uma pessoa fora da janela de deploy, e voltar manualmente para a revisão anterior precisa ser um comando conhecido por todo o time.
+</Callout>
+
+## O banco: migrações que sobrevivem ao rollback
+
+Código volta; schema não. Se o deploy da versão 42 removeu a coluna `origem` do pedido e o rollback recoloca a versão 41, que ainda faz `SELECT` dessa coluna, a versão anterior quebra também, e o rollback vira um segundo incidente. A regra que torna rollback possível: **toda migração precisa ser compatível com a versão anterior do código.**
+
+O padrão que resolve as mudanças incompatíveis é **expandir e contrair** (*expand and contract*), em que uma mudança é dividida em deploys que, isoladamente, são todos compatíveis. Para renomear o campo `origem` para `canal` no model `Pedido`:
+
+**Deploy 1, expandir.** Adicione o campo novo, aceitando nulo, e faça o código gravar nos dois e ler do antigo.
+
+```python
+# pedidos/migrations/0031_pedido_canal.py
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+    dependencies = [("pedidos", "0030_pedido_transacao_id")]
+
+    operations = [
+        migrations.AddField(
+            model_name="pedido",
+            name="canal",
+            field=models.CharField(max_length=20, null=True),
+        ),
+    ]
+```
+
+**Deploy 2, migrar os dados.** Copie os valores antigos e passe a ler do campo novo, mantendo a escrita dupla.
+
+```python
+# pedidos/migrations/0032_copiar_origem_para_canal.py
+from django.db import migrations
+from django.db.models import F
+
+
+def copiar(apps, schema_editor):
+    Pedido = apps.get_model("pedidos", "Pedido")
+    Pedido.objects.filter(canal__isnull=True).update(canal=F("origem"))
+
+
+class Migration(migrations.Migration):
+    dependencies = [("pedidos", "0031_pedido_canal")]
+
+    operations = [migrations.RunPython(copiar, migrations.RunPython.noop)]
+```
+
+**Deploy 3, contrair.** Com nenhuma versão no ar lendo `origem`, pare de gravá-la e remova a coluna.
+
+Em cada passo, a versão anterior funciona sobre o schema novo, então qualquer um dos três pode ser revertido. O `apps.get_model` na migração de dados usa o model histórico, como ele era naquela migração, e não o model atual, que pode já ter mudado. Em tabelas grandes, faça a cópia em lotes, fora da migração, para não segurar um lock por minutos; e no Postgres crie índices com `AddIndexConcurrently` (de `django.contrib.postgres.operations`), numa migração com `atomic = False`.
+
+Uma lista rápida do que é seguro num deploy só: criar tabela, adicionar coluna que aceita nulo ou tem padrão, adicionar índice concorrente. E do que exige expandir e contrair: remover ou renomear coluna ou tabela, mudar tipo, tornar obrigatória uma coluna que o código antigo não preenche.
+
+## Teste de carga: o que medir
+
+Teste de carga responde a uma pergunta de negócio: a versão nova aguenta o tráfego esperado dentro do tempo de resposta aceitável? Para responder, você precisa de três medidas:
+
+- **Vazão** (requisições por segundo): quanto trabalho o sistema faz.
+- **Taxa de erro**: a fração de requisições que falham. Sob carga, os primeiros sintomas costumam ser timeouts e 503.
+- **Latência em percentis**: o tempo abaixo do qual ficam 50%, 95% ou 99% das requisições.
+
+A média engana. Se 98 requisições levam 50 ms e duas levam 5 segundos, a média é 149 ms, um número que nenhum usuário viveu. O **p95** diz que 95% das requisições foram mais rápidas que ele, e o **p99** mostra a cauda, onde ficam os usuários do lote mais concorrido, as consultas sem índice e as pausas do banco. Numa página que faz dez chamadas à API, a chance de pelo menos uma cair acima do p99 é de quase 10%, por isso a cauda importa mais do que parece.
+
+Os tipos de teste mudam o formato da carga:
+
+| Tipo | Formato | Pergunta |
+|---|---|---|
+| Carga | Sobe até o tráfego esperado e mantém | Cumpre os critérios no pico normal? |
+| Estresse | Sobe além do esperado até quebrar | Onde está o limite e como o sistema falha? |
+| Pico (*spike*) | Salto brusco de tráfego | Aguenta a abertura das vendas? |
+| Resistência (*soak*) | Carga moderada por horas | Há vazamento de memória ou conexões? |
+
+O ambiente importa tanto quanto o script. Rode contra staging com o mesmo tamanho de task e de banco de produção, com dados realistas (um banco com cem pedidos responde diferente de um com dez milhões), e nunca contra produção sem combinar com quem opera.
+
+## Locust: carga escrita em Python
+
+O Locust descreve o comportamento de um usuário em Python puro: uma classe com tarefas e pesos, e o Locust executa centenas ou milhares desses usuários ao mesmo tempo, cada um com seu ciclo de espera.
+
+```python
+# carga/locustfile.py
+import random
+
+from locust import HttpUser, between, events, task
+
+LOTES = [1, 2, 3, 4, 5]
+
+
+class Comprador(HttpUser):
+    wait_time = between(1, 3)
+
+    def on_start(self) -> None:
+        n = random.randint(1, 500)
+        resposta = self.client.post(
+            "/api/token/",
+            json={"username": f"carga{n}", "password": "senha-de-carga"},
+            name="/api/token/",
+        )
+        self.client.headers["Authorization"] = f"Bearer {resposta.json()['access']}"
+
+    @task(10)
+    def listar_eventos(self) -> None:
+        self.client.get("/api/eventos/?page=1", name="/api/eventos/")
+
+    @task(5)
+    def ver_lote(self) -> None:
+        lote = random.choice(LOTES)
+        self.client.get(f"/api/lotes/{lote}/", name="/api/lotes/[id]/")
+
+    @task(1)
+    def comprar(self) -> None:
+        with self.client.post(
+            "/api/pedidos/",
+            json={"lote": random.choice(LOTES), "quantidade": 2},
+            name="/api/pedidos/",
+            catch_response=True,
+        ) as resposta:
+            if resposta.status_code in (201, 409):
+                resposta.success()  # 409 é estoque esgotado: resposta correta da regra
+            else:
+                resposta.failure(f"status {resposta.status_code}")
+```
+
+Os detalhes:
+
+- **`wait_time = between(1, 3)`**: cada usuário espera de 1 a 3 segundos entre tarefas, imitando uma pessoa navegando. Sem espera, cada usuário dispara requisições sem parar e o número de usuários perde o significado.
+- **`@task(10)`, `@task(5)` e `@task(1)`**: os pesos reproduzem a proporção real do tráfego, de dez listagens para cada compra. Tire essa proporção dos logs de produção, não da intuição.
+- **`on_start`** roda uma vez por usuário simulado, aqui para obter o JWT do SimpleJWT. Os usuários `carga1` a `carga500` são criados no staging antes do teste.
+- **`name=`** agrupa URLs com IDs diferentes numa linha só do relatório. Sem ele, cada `/api/lotes/3/` vira uma linha separada e os percentis perdem sentido.
+- **`catch_response=True`** deixa você decidir o que é falha. Um 409 de estoque esgotado é a API funcionando: contá-lo como erro faria o teste reprovar justamente quando a regra de capacidade funciona.
+
+Rode com interface web para explorar (`locust -f carga/locustfile.py --host https://staging.ingressos.exemplo.com`, e abra `http://localhost:8089`) ou sem interface, para o pipeline:
+
+```bash
+locust -f carga/locustfile.py --headless \
+  --host https://staging.ingressos.exemplo.com \
+  --users 300 --spawn-rate 20 --run-time 5m \
+  --csv resultado --html relatorio.html
+```
+
+`--users` é o número de usuários simultâneos e `--spawn-rate`, quantos entram por segundo até chegar lá. O `--csv` gera arquivos com as estatísticas por endpoint, e o `--html`, um relatório com gráficos de vazão e latência ao longo do tempo. Para gerar mais carga do que uma máquina consegue, o Locust roda em modo distribuído, com um processo `--master` e vários `--worker`.
+
+## Critérios de aprovação no pipeline
+
+Um teste de carga que só gera relatório depende de alguém lê-lo. Para ele barrar uma versão, os critérios precisam virar código de saída. O Locust permite isso com um listener do evento `quitting`, que roda ao fim do teste e pode definir o código com que o processo termina:
+
+```python
+# carga/locustfile.py (continuação)
+import logging
+
+LIMITE_P95_MS = 500
+LIMITE_P99_MS = 1500
+LIMITE_ERROS = 0.01
+
+
+@events.quitting.add_listener
+def avaliar(environment, **kwargs) -> None:
+    total = environment.stats.total
+    p95 = total.get_response_time_percentile(0.95)
+    p99 = total.get_response_time_percentile(0.99)
+    reprovado = False
+
+    if total.fail_ratio > LIMITE_ERROS:
+        logging.error("Taxa de erro %.2f%% acima de %.0f%%", total.fail_ratio * 100, LIMITE_ERROS * 100)
+        reprovado = True
+    if p95 > LIMITE_P95_MS:
+        logging.error("p95 de %s ms acima de %s ms", p95, LIMITE_P95_MS)
+        reprovado = True
+    if p99 > LIMITE_P99_MS:
+        logging.error("p99 de %s ms acima de %s ms", p99, LIMITE_P99_MS)
+        reprovado = True
+
+    environment.process_exit_code = 1 if reprovado else 0
+```
+
+Os limites vêm dos objetivos de nível de serviço do produto (por exemplo, "95% das compras em menos de 500 ms"), não do resultado da última execução. Comece com critérios globais e, quando o teste estiver estável, acrescente critérios por endpoint lendo `environment.stats.get("/api/pedidos/", "POST")`: a compra merece um limite mais rígido que a listagem.
+
+No pipeline, o teste roda entre staging e produção, como um portão:
+
+```yaml
+  carga:
+    needs: staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: pip install locust
+
+      - name: Teste de carga em staging
+        run: |
+          locust -f carga/locustfile.py --headless \
+            --host "${{ vars.URL_STAGING }}" \
+            --users 300 --spawn-rate 20 --run-time 5m \
+            --csv resultado --html relatorio.html
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: relatorio-carga
+          path: |
+            relatorio.html
+            resultado_*.csv
+
+  producao:
+    needs: [imagem, carga]
+    uses: ./.github/workflows/deploy-ecs-ambiente.yml
+    with:
+      ambiente: production
+      imagem: ${{ needs.imagem.outputs.imagem }}
+```
+
+Se o p95 passar do limite, o passo falha, `producao` não roda e o relatório fica anexado à execução para investigação. O `if: always()` garante o upload mesmo na falha, que é justamente quando você precisa dele.
+
+<Callout type="tip" title="Compare com a versão anterior, não só com o limite">
+Um p95 de 420 ms passa no critério de 500 ms, mas se a versão anterior fazia 180 ms, algo piorou bastante, e o próximo commit vai estourar o limite sem que ninguém saiba qual mudança causou a regressão. Guarde os CSVs de cada execução e registre a variação do p95 em relação à última versão aprovada. Uma piora acima de 20% merece um aviso no pull request, mesmo dentro do limite absoluto.
+</Callout>
+
+Um cuidado de método: cinco minutos de carga num staging compartilhado têm ruído. Use critérios com folga, rode o teste sempre com o mesmo perfil e trate falhas isoladas com uma nova execução antes de concluir que houve regressão. Testes de estresse e de resistência, que levam mais tempo, ficam fora do caminho do deploy, num workflow agendado à noite.
+
+## Na entrevista
+
+**Qual a diferença entre rolling, blue/green e canário?** O rolling troca as instâncias aos poucos, sem custo extra, mas expõe todos os usuários durante a troca. O blue/green sobe o ambiente novo inteiro e vira o tráfego de uma vez, com volta imediata e custo de capacidade dobrada. O canário manda uma fração pequena do tráfego para a versão nova e só amplia se as métricas se mantiverem, limitando o impacto de um erro.
+
+**O que o circuit breaker de deploy do ECS detecta, e o que não detecta?** Detecta tasks novas que não conseguem subir ou passar no health check, e reverte para a última revisão estável. Não detecta uma versão saudável no health check que erra ou fica lenta sob tráfego real; para isso, o service precisa de alarmes de deployment do CloudWatch com rollback.
+
+**Como renomear uma coluna sem impedir o rollback?** Com expandir e contrair: um deploy adiciona a coluna nova e grava nas duas, outro copia os dados e passa a ler da nova, e só depois um terceiro remove a antiga. Em cada etapa, a versão anterior do código funciona sobre o schema.
+
+**Por que usar p95 e p99 em vez da média?** Porque a média esconde a cauda: poucas requisições muito lentas mal mexem nela, e são justamente essas que os usuários percebem. Percentis mostram a experiência da maioria (p95) e dos piores casos (p99).
+
+**Como um teste de carga reprova uma versão no pipeline?** Transformando critérios (taxa de erro, p95, p99) em código de saída do processo, avaliados ao fim do teste. No Locust, isso se faz no evento `quitting`, definindo `process_exit_code`; o job falha e a promoção para produção não acontece.
+
+## Pratique
+
+1. Ligue o circuit breaker com rollback no service de staging e publique uma versão com `DJANGO_ALLOWED_HOSTS` vazio. Mostre nos eventos do service a reversão e o job falhando.
+2. Crie o alarme de taxa de 5xx (com *metric math*) e um de p99 do target group, associe os dois ao deployment e provoque o rollback com uma versão que devolve 500 em 10% das compras.
+3. Renomeie `origem` para `canal` no `Pedido` com expandir e contrair, em três pull requests, e prove que reverter qualquer um deles mantém a aplicação funcionando.
+4. Escreva o `locustfile.py` com login, listagem, consulta de lote e compra, com pesos tirados dos seus logs e o 409 tratado como sucesso.
+5. Acrescente o job `carga` entre staging e produção com critérios de taxa de erro, p95 e p99, e mostre uma execução reprovada por uma consulta sem `select_related` na listagem de eventos.
+
+<Quiz question="Uma versão nova sobe, passa no health check do ALB e devolve erro 500 em 8% das compras. O que faz o ECS reverter o deploy automaticamente?" options={["O circuit breaker de deploy sozinho","O período de carência do health check","Um maximumPercent menor","Um alarme do CloudWatch associado ao deployment com rollback habilitado"]} answer={3} explanation="O circuit breaker só detecta tasks que não sobem ou falham no health check. Erros sob tráfego real precisam de um alarme de deployment, que marca o deploy como falho e reverte." />
+
+<Quiz question="No Locust, para que serve o parâmetro name nas chamadas self.client.get e post?" options={["Define o nome do usuário simulado","Agrupa URLs com identificadores diferentes numa única linha de estatísticas","Escolhe o host de destino","Define o peso da tarefa"]} answer={1} explanation="Sem name, cada URL distinta, como /api/lotes/3/ e /api/lotes/4/, vira uma linha separada no relatório, e os percentis perdem significado." />
+
+<Quiz question="98 requisições levam 50 ms e 2 levam 5 segundos. Qual afirmação é correta?" options={["O p99 revela a lentidão que a média de cerca de 149 ms esconde","A média representa bem a experiência dos usuários","O p50 é de 5 segundos","O p95 é maior que o p99"]} answer={0} explanation="A média dilui as duas requisições lentas num número que ninguém viveu. O p99 cai na cauda e expõe os 5 segundos, enquanto o p50 e o p95 ficam em 50 ms." />
+
+## Base no CodeForge
+
+- [Integração Contínua: Automatize o deploy no Amazon ECS](/learn/carreira-python/integracao-continua-automatize-deploy-amazon-ecs): o pipeline e o service que este capítulo protege.
+- [Estratégias de deploy](/learn/system-design/estrategias-de-deploy), [Blue/green](/learn/system-design/blue-green) e [Canary](/learn/system-design/canary): as estratégias em detalhe.
+- [Rollbacks](/learn/system-design/rollbacks) e [Migrações de schema](/learn/system-design/migracoes-de-schema): a teoria do rollback e do expandir e contrair.
+- [Latência e throughput](/learn/system-design/latencia-throughput): percentis, vazão e como eles se relacionam.
+- [Integração Contínua: Rollback e teste de carga (Java)](/learn/carreira-java/integracao-continua-rollback-teste-carga): o mesmo tema com k6 e Gatling.
+
+## Referências
+
+- [Amazon ECS deployment circuit breaker](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
+- [Amazon ECS: deployment failure detection with CloudWatch alarms](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-alarm-failure.html)
+- [Locust: documentação oficial](https://docs.locust.io/en/stable/)
+- [Django: Writing migrations](https://docs.djangoproject.com/en/5.2/howto/writing-migrations/)

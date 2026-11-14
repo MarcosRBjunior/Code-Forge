@@ -1,0 +1,450 @@
+---
+title: "Django: Autenticação de formulários e alerta"
+kind: lesson
+---
+
+A plataforma de ingressos já tem eventos e setores no PostgreSQL, pedidos com baixa de estoque atômica e um Admin para a equipe. Falta o essencial para vender: o cliente criar conta, entrar, escolher setor e quantidade num formulário e receber um retorno claro ("reserva feita", "setor esgotado"). E falta proteger cada página: ninguém vê o pedido de outra pessoa, e só o financeiro vê o relatório de vendas.
+
+Tudo isso o Django já traz: formulários que validam e reexibem erros, proteção CSRF ligada por padrão, um sistema de autenticação completo, permissões por modelo e por grupo e um framework de mensagens para alertas. Este capítulo liga essas peças ao projeto dos capítulos anteriores.
+
+**Você vai aprender:**
+
+- Criar `Form` e `ModelForm` com validação por campo e entre campos
+- Entender o que o CSRF protege e como o Django o aplica
+- Implementar cadastro, login, logout e troca de senha com as views prontas do Django
+- Restringir acesso com `login_required`, permissões, grupos e filtro por dono
+- Mostrar alertas com o framework de mensagens e evoluir o modelo de usuário customizado
+
+## Formulários: o ciclo de validação
+
+Um `Form` declara campos, converte o texto que chega no POST para tipos Python, valida e guarda os erros para reexibição. O fluxo numa view é sempre o mesmo:
+
+1. GET: cria o formulário vazio e renderiza.
+2. POST: cria o formulário com `request.POST`, chama `is_valid()`.
+3. Válido: usa `form.cleaned_data`, executa a ação e **redireciona**.
+4. Inválido: renderiza de novo o mesmo formulário, que agora carrega os erros e os valores digitados.
+
+O redirecionamento depois do sucesso é o padrão **Post/Redirect/Get**: se o usuário apertar F5 na página seguinte, o navegador repete um GET inofensivo em vez de reenviar o POST e criar uma segunda reserva.
+
+O formulário de reserva recebe o evento para limitar os setores oferecidos:
+
+```python
+# eventos/forms.py
+from django import forms
+
+from eventos.models import Evento, Setor
+
+
+class ReservaForm(forms.Form):
+    setor = forms.ModelChoiceField(queryset=Setor.objects.none(), empty_label=None)
+    quantidade = forms.IntegerField(min_value=1, max_value=6, initial=1)
+
+    def __init__(self, *args, evento: Evento, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fields["setor"].queryset = evento.setores.filter(quantidade_disponivel__gt=0)
+
+    def clean(self):
+        dados = super().clean()
+        setor = dados.get("setor")
+        quantidade = dados.get("quantidade")
+        if setor and quantidade and quantidade > setor.quantidade_disponivel:
+            raise forms.ValidationError(
+                "Restam apenas %(n)s ingressos neste setor.",
+                params={"n": setor.quantidade_disponivel},
+                code="estoque",
+            )
+        return dados
+```
+
+Três níveis de validação, nessa ordem: o próprio campo (`min_value`, tipo, obrigatoriedade), o método `clean_<campo>` para regras de um campo só, e `clean()` para regras que cruzam campos. Erros levantados em `clean()` vão para `non_field_errors` e aparecem no topo do formulário.
+
+`ModelChoiceField` valida que o `id` enviado pertence ao QuerySet configurado. Se alguém editar o HTML e mandar o id de um setor de outro evento, o formulário recusa. Essa é a razão de restringir o QuerySet no `__init__`, e não só no template.
+
+A conferência de estoque no formulário serve para dar uma mensagem amigável; ela **não** substitui a baixa atômica do capítulo anterior. Entre a validação e a gravação, outra pessoa pode comprar o último ingresso, e quem decide de verdade é o `UPDATE` condicional em `reservar`.
+
+## ModelForm
+
+Quando o formulário espelha um modelo, o `ModelForm` gera os campos a partir dele, aproveita as validações do modelo (incluindo `unique` e constraints) e salva com `form.save()`. A área de produtores que cadastram eventos usa:
+
+```python
+# eventos/forms.py (continuação)
+from django.utils import timezone
+
+from eventos.models import Evento
+
+
+class EventoForm(forms.ModelForm):
+    class Meta:
+        model = Evento
+        fields = ["nome", "slug", "data", "local", "capacidade"]
+        widgets = {"data": forms.DateTimeInput(attrs={"type": "datetime-local"})}
+        labels = {"capacidade": "Capacidade total"}
+
+    def clean_data(self):
+        data = self.cleaned_data["data"]
+        if data <= timezone.now():
+            raise forms.ValidationError("A data do evento precisa estar no futuro.")
+        return data
+```
+
+Sempre liste os campos em `fields`. `fields = "__all__"` ou `exclude` expõem automaticamente qualquer campo que alguém acrescentar ao modelo depois, como `publicado`, e um usuário mal-intencionado consegue publicar o próprio evento mandando o campo no POST (*mass assignment*). Campos que a aplicação define, como o dono do evento (um `produtor = models.ForeignKey(settings.AUTH_USER_MODEL, ...)` acrescentado a `Evento` para essa área), são atribuídos na view antes de salvar:
+
+```python
+evento = form.save(commit=False)
+evento.produtor = request.user
+evento.save()
+```
+
+`commit=False` devolve a instância sem gravar. Se o formulário tiver campos muitos-para-muitos, chame `form.save_m2m()` depois do `save()`.
+
+## CSRF
+
+**Cross-Site Request Forgery** é o ataque em que um site malicioso faz o navegador da vítima, já logada na plataforma, enviar um POST para ela: o navegador anexa o cookie de sessão automaticamente, e o servidor acha que foi a vítima. O `CsrfViewMiddleware`, ligado por padrão, exige em todo POST, PUT, PATCH e DELETE um token que o site atacante não tem como ler: ele vai num cookie e também no corpo do formulário, e os dois precisam conferir.
+
+No template, basta a tag `csrf_token` dentro de cada formulário com `method="post"`:
+
+```html
+{% extends "base.html" %}
+{% block conteudo %}
+  <h1>{{ evento.nome }}</h1>
+  <form method="post" action="{% url 'pedidos:reservar' slug=evento.slug %}">
+    {% csrf_token %}
+    {{ form.non_field_errors }}
+    {{ form.as_div }}
+    <button type="submit">Reservar</button>
+  </form>
+{% endblock %}
+```
+
+Sem o token, a resposta é 403. Em HTTPS, o Django também confere o cabeçalho `Origin` (ou `Referer`) contra o host; se o site estiver atrás de um proxy ou o front estiver em outro domínio, as origens confiáveis vão em `CSRF_TRUSTED_ORIGINS`, como configurado no capítulo de templates.
+
+Formulários que mudam estado sempre usam POST. Um link `GET /pedidos/7/cancelar/` pode ser disparado por uma tag de imagem em qualquer página da internet, sem CSRF que o proteja.
+
+<Callout type="warning" title="Não use csrf_exempt para resolver um 403">
+Quando um formulário dá 403 por CSRF, a causa costuma ser a tag esquecida, um proxy que altera o `Host` ou a falta de `CSRF_TRUSTED_ORIGINS`. Desligar a proteção com `csrf_exempt` numa view acessada por navegador com cookie de sessão abre exatamente o ataque que ela evita. Isenção só faz sentido para endpoints que não usam cookie para autenticar, como um webhook verificado por assinatura.
+</Callout>
+
+## O modelo de usuário customizado
+
+No capítulo anterior, o projeto nasceu com `contas.Usuario(AbstractUser)` vazio. Agora ele ganha o que a plataforma precisa: login por e-mail, e-mail único e um telefone para avisos.
+
+```python
+# contas/models.py
+from django.contrib.auth.models import AbstractUser
+from django.db import models
+
+
+class Usuario(AbstractUser):
+    email = models.EmailField("e-mail", unique=True)
+    telefone = models.CharField(max_length=20, blank=True)
+
+    USERNAME_FIELD = "email"
+    REQUIRED_FIELDS = ["username"]
+```
+
+`USERNAME_FIELD` é o campo usado para autenticar; `REQUIRED_FIELDS` é o que o `createsuperuser` pede além dele e da senha. Gere a migração: como o e-mail passa a ser único, garanta antes que não há duplicados no banco de desenvolvimento. Registre o modelo no Admin com o `UserAdmin` padrão, que já sabe lidar com senha:
+
+```python
+# contas/admin.py
+from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin
+
+from contas.models import Usuario
+
+
+@admin.register(Usuario)
+class UsuarioAdmin(UserAdmin):
+    fieldsets = UserAdmin.fieldsets + (("Contato", {"fields": ["telefone"]}),)
+```
+
+| Opção | Quando |
+|---|---|
+| `AbstractUser` | Quer o usuário padrão com campos a mais ou login por e-mail. É o caso comum. |
+| `AbstractBaseUser` com `PermissionsMixin` | Precisa de um modelo bem diferente (sem `username`, sem `first_name`). Exige escrever o manager. |
+| Modelo de perfil com `OneToOneField` | Dados que não são de autenticação e pertencem a outro app (preferências, endereço). |
+
+Senhas nunca são guardadas, só o hash. O Django usa PBKDF2 por padrão; para Argon2, recomendado pela OWASP, instale `pip install "django[argon2]"` e ponha `"django.contrib.auth.hashers.Argon2PasswordHasher"` primeiro em `PASSWORD_HASHERS`. Senhas antigas continuam válidas e são convertidas para o novo algoritmo no próximo login.
+
+## Login, logout e cadastro
+
+O Django traz views prontas para login, logout, troca e redefinição de senha. Inclua as URLs e escreva só os templates:
+
+```python
+# ingressos/urls.py (trecho)
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("contas/", include("django.contrib.auth.urls")),
+    path("contas/", include("contas.urls")),
+    path("pedidos/", include("eventos.urls_pedidos")),
+    path("eventos/", include("eventos.urls")),
+    path("", include("eventos.urls_home")),
+]
+```
+
+```python
+# ingressos/settings.py (trecho)
+LOGIN_URL = "login"
+LOGIN_REDIRECT_URL = "eventos:lista"
+LOGOUT_REDIRECT_URL = "eventos:lista"
+```
+
+`django.contrib.auth.urls` cria as rotas `login`, `logout`, `password_change`, `password_reset` e suas confirmações, que procuram templates em `registration/` (por exemplo, `templates/registration/login.html`). A view de login aceita o parâmetro `next` e devolve o usuário à página que ele tentava acessar, validando que o destino é do próprio site.
+
+Desde o Django 5.0, o logout só aceita POST. Um link simples não funciona mais, e isso é proteção: um GET de logout pode ser disparado por qualquer página. No menu, use um formulário:
+
+```html
+{% if user.is_authenticated %}
+  <span>Olá, {{ user.first_name|default:user.email }}</span>
+  <form method="post" action="{% url 'logout' %}">
+    {% csrf_token %}
+    <button type="submit">Sair</button>
+  </form>
+{% else %}
+  <a href="{% url 'login' %}">Entrar</a>
+  <a href="{% url 'contas:cadastro' %}">Criar conta</a>
+{% endif %}
+```
+
+O cadastro não vem pronto, mas o formulário vem. `UserCreationForm` confere as duas senhas e aplica os validadores de `AUTH_PASSWORD_VALIDATORS` (tamanho mínimo, senha comum, só números, parecida com o nome):
+
+```python
+# contas/forms.py
+from django.contrib.auth.forms import UserCreationForm
+
+from contas.models import Usuario
+
+
+class CadastroForm(UserCreationForm):
+    class Meta(UserCreationForm.Meta):
+        model = Usuario
+        fields = ["email", "username", "first_name"]
+```
+
+```python
+# contas/views.py
+from django.contrib import messages
+from django.contrib.auth import login
+from django.shortcuts import redirect, render
+
+from contas.forms import CadastroForm
+
+
+def cadastro(request):
+    if request.user.is_authenticated:
+        return redirect("eventos:lista")
+    form = CadastroForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        usuario = form.save()
+        login(request, usuario)
+        messages.success(request, "Conta criada. Bem-vindo à plataforma!")
+        return redirect("eventos:lista")
+    return render(request, "contas/cadastro.html", {"form": form})
+```
+
+```python
+# contas/urls.py
+from django.urls import path
+
+from contas import views
+
+app_name = "contas"
+urlpatterns = [path("cadastro/", views.cadastro, name="cadastro")]
+```
+
+`login()` grava o id do usuário na sessão e **troca o identificador da sessão**, o que impede fixação de sessão. Se o projeto exigir confirmação de e-mail antes do primeiro acesso, crie o usuário com `is_active=False` e ative pelo link enviado; o próximo capítulo, com o django-allauth, traz esse fluxo pronto.
+
+## Protegendo views: login, permissões e dono
+
+`login_required` redireciona para `LOGIN_URL` com `next` preenchido. A view de reserva junta tudo que foi visto:
+
+```python
+# eventos/views_pedidos.py
+from datetime import timedelta
+
+from django.contrib import messages
+from django.contrib.auth.decorators import login_required, permission_required
+from django.db import transaction
+from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
+
+from eventos.forms import ReservaForm
+from eventos.models import Evento, Pedido
+from eventos.servicos import EstoqueInsuficiente, reservar
+
+
+@login_required
+def reservar_view(request, slug: str):
+    evento = get_object_or_404(Evento.objects.publicados(), slug=slug)
+    form = ReservaForm(request.POST or None, evento=evento)
+    if request.method == "POST" and form.is_valid():
+        try:
+            with transaction.atomic():
+                pedido = Pedido.objects.create(
+                    cliente=request.user,
+                    expira_em=timezone.now() + timedelta(minutes=15),
+                )
+                reservar(pedido, form.cleaned_data["setor"].pk, form.cleaned_data["quantidade"])
+        except EstoqueInsuficiente:
+            messages.error(request, "Os ingressos deste setor acabaram enquanto você escolhia.")
+        else:
+            messages.success(request, "Reserva feita! Você tem 15 minutos para pagar.")
+            return redirect("pedidos:detalhe", pk=pedido.pk)
+    return render(request, "eventos/reservar.html", {"evento": evento, "form": form})
+
+
+@login_required
+def detalhe(request, pk: int):
+    pedido = get_object_or_404(Pedido, pk=pk, cliente=request.user)
+    return render(request, "eventos/pedido_detalhe.html", {"pedido": pedido})
+
+
+@permission_required("eventos.ver_relatorio_vendas", raise_exception=True)
+def relatorio(request):
+    ...
+```
+
+```python
+# eventos/urls_pedidos.py
+from django.urls import path
+
+from eventos import views_pedidos as views
+
+app_name = "pedidos"
+urlpatterns = [
+    path("reservar/<slug:slug>/", views.reservar_view, name="reservar"),
+    path("<int:pk>/", views.detalhe, name="detalhe"),
+    path("relatorio/", views.relatorio, name="relatorio"),
+]
+```
+
+Os modelos continuam todos no app `eventos`; as views e as URLs de pedidos ganham módulos próprios (`views_pedidos.py`, `urls_pedidos.py`) com o namespace `pedidos`, para o `views.py` da vitrine não crescer sem controle.
+
+O `transaction.atomic` externo envolve a criação do pedido e a reserva: se o estoque acabou, o pedido também é desfeito, e não sobra pedido vazio.
+
+O filtro `cliente=request.user` em `detalhe` é a linha mais importante de segurança do capítulo. Sem ele, qualquer usuário logado troca o número na URL e vê o pedido de outro: é o **IDOR** (referência direta insegura a objeto), a falha de controle de acesso mais comum em aplicações web. Ao buscar por dono, o pedido alheio responde 404, que nem confirma a existência dele.
+
+**Permissões**: para cada modelo, o Django cria `add`, `change`, `delete` e `view`. Permissões próprias vão no `Meta`:
+
+```python
+# eventos/models.py (trecho de Pedido)
+class Meta:
+    ordering = ["-criado_em"]
+    indexes = [models.Index(fields=["status", "expira_em"])]
+    permissions = [("ver_relatorio_vendas", "Pode ver o relatório de vendas")]
+```
+
+Permissões são atribuídas a **grupos** ("Financeiro", "Operação"), e pessoas entram nos grupos; atribuir permissão diretamente a usuários vira uma bagunça impossível de auditar. Crie os grupos numa migração de dados ou pelo Admin. No código, `user.has_perm("eventos.ver_relatorio_vendas")`; no template, a variável `perms` (`perms.eventos.ver_relatorio_vendas`) esconde o link do menu. Esconder o link é conveniência; a proteção é o decorator na view.
+
+`permission_required` com `raise_exception=True` responde 403 para quem está logado sem a permissão, em vez de mandar para o login de novo. Em class-based views, os equivalentes são `LoginRequiredMixin` e `PermissionRequiredMixin`.
+
+<Callout type="tip" title="Protegido por padrão">
+Desde o Django 5.1, o `LoginRequiredMiddleware` (em `django.contrib.auth.middleware`) exige login em todas as views, e você marca as públicas com o decorator `login_not_required`. Numa plataforma em que a maioria das páginas é privada, inverter o padrão evita a view nova que alguém esqueceu de proteger. Aqui, com vitrine pública, vale avaliar caso a caso.
+</Callout>
+
+## Alertas com o framework de mensagens
+
+Mensagens são avisos de uma única exibição: gravadas numa requisição, mostradas na seguinte e descartadas. É o que permite dizer "Reserva feita!" na página para onde o Post/Redirect/Get levou o usuário. Os níveis são `debug`, `info`, `success`, `warning` e `error`, e o armazenamento padrão usa cookie e, se não couber, a sessão.
+
+Mostre-as uma vez, no `base.html`, para que toda página herde:
+
+```html
+{% if messages %}
+  <ul class="alertas">
+    {% for mensagem in messages %}
+      <li class="alerta alerta-{{ mensagem.tags }}" role="alert">{{ mensagem }}</li>
+    {% endfor %}
+  </ul>
+{% endif %}
+```
+
+Iterar sobre `messages` é o que marca as mensagens como lidas. Se o CSS usar outro nome para um nível (por exemplo, `danger` no lugar de `error`), mapeie em settings:
+
+```python
+# ingressos/settings.py (trecho)
+from django.contrib.messages import constants as mensagens
+
+MESSAGE_TAGS = {mensagens.ERROR: "danger"}
+```
+
+Use mensagens para o resultado de ações (salvou, cancelou, falhou por motivo de negócio). Erros de validação de campo ficam no próprio formulário, ao lado do campo, onde o usuário consegue corrigi-los.
+
+## Testando autenticação e formulários
+
+```python
+# eventos/tests/test_pedidos.py
+import pytest
+from django.urls import reverse
+
+from eventos.models import Pedido
+
+
+@pytest.mark.django_db
+def test_anonimo_vai_para_login(client, evento):
+    url = reverse("pedidos:reservar", kwargs={"slug": evento.slug})
+    resposta = client.get(url)
+
+    assert resposta.status_code == 302
+    assert resposta.url.startswith(reverse("login"))
+
+
+@pytest.mark.django_db
+def test_reserva_redireciona_com_mensagem(client, cliente, evento, setor):
+    client.force_login(cliente)
+    url = reverse("pedidos:reservar", kwargs={"slug": evento.slug})
+
+    resposta = client.post(url, {"setor": setor.pk, "quantidade": 2}, follow=True)
+
+    assert Pedido.objects.filter(cliente=cliente).count() == 1
+    assert "Reserva feita" in [str(m) for m in resposta.context["messages"]][0]
+
+
+@pytest.mark.django_db
+def test_nao_ve_pedido_de_outro(client, cliente, pedido_de_outro_cliente):
+    client.force_login(cliente)
+    url = reverse("pedidos:detalhe", kwargs={"pk": pedido_de_outro_cliente.pk})
+
+    assert client.get(url).status_code == 404
+```
+
+`evento`, `setor`, `cliente` e `pedido_de_outro_cliente` são fixtures do `conftest.py`, bons candidatos a factories do factory_boy. `force_login` pula o formulário e a verificação de senha, deixando os testes rápidos. O cliente de teste não exige token CSRF por padrão; para testar a proteção, crie-o com `Client(enforce_csrf_checks=True)`.
+
+## Na entrevista
+
+**O que o CSRF protege e como o Django implementa?** Protege contra um site de terceiros que faz o navegador logado da vítima enviar uma requisição que muda estado. O Django exige, em métodos não seguros, um token que fica num cookie e no corpo da requisição; o atacante não consegue lê-lo por causa da política de mesma origem.
+
+**Por que redirecionar depois de um POST bem-sucedido?** É o padrão Post/Redirect/Get: a página final é carregada por GET, então recarregá-la não reenvia o formulário e não duplica a operação.
+
+**Qual a diferença entre autenticação e autorização no Django?** Autenticação é saber quem é o usuário (login, sessão, `request.user`). Autorização é decidir o que ele pode fazer: permissões e grupos para tipos de ação, e filtro por dono, como `cliente=request.user`, para objetos específicos.
+
+**O que é IDOR e como evitar?** Referência direta insegura a objeto: o usuário troca um id na URL e acessa um recurso que não é dele. Evita-se buscando o objeto já filtrado pelo dono ou checando permissão de objeto, e respondendo 404.
+
+**Por que `fields` explícito no ModelForm?** Porque `__all__` ou `exclude` incluem automaticamente campos novos do modelo, permitindo que o usuário altere campos sensíveis mandando-os no POST. Lista explícita torna a exposição uma decisão consciente.
+
+## Pratique
+
+1. Evolua `contas.Usuario` para login por e-mail, registre-o no Admin com `UserAdmin` e troque o hasher padrão para Argon2.
+2. Crie o cadastro com `CadastroForm`, os templates de login e de troca de senha e o logout por POST no menu.
+3. Implemente a reserva com `ReservaForm`, Post/Redirect/Get e mensagens de sucesso e de esgotado; mostre as mensagens no `base.html`.
+4. Crie a página "Meus pedidos" filtrada pelo usuário e um cancelamento por POST que só funciona para pedidos pendentes do próprio cliente.
+5. Crie os grupos "Financeiro" e "Operação" numa migração de dados, proteja o relatório de vendas com a permissão própria e escreva testes para 302, 403 e 404.
+
+<Quiz question="Um usuário logado troca o número na URL de /pedidos/7/ para /pedidos/8/ e vê o pedido de outra pessoa. Qual a correção?" options={["Adicionar login_required","Usar csrf_token no template","Trocar o id por UUID e manter a busca só por pk","Buscar o pedido filtrando também por cliente=request.user"]} answer={3} explanation="O problema é de autorização sobre o objeto (IDOR). login_required só garante que há alguém logado. Filtrar pelo dono faz o pedido alheio responder 404." />
+
+<Quiz question="Por que o Django 5 exige POST para o logout?" options={["Porque um GET de logout pode ser disparado por qualquer página, como uma tag de imagem","Porque GET não carrega cookies","Para economizar banda","Porque a sessão só pode ser apagada no corpo da requisição"]} answer={0} explanation="Ações que mudam estado não devem ser acessíveis por GET. Com POST, a requisição passa pela proteção CSRF e não pode ser disparada por um link embutido em outro site." />
+
+<Quiz question="Onde fica uma regra que compara a quantidade pedida com o estoque do setor escolhido no formulário?" options={["Em clean_quantidade, sem acesso ao setor","No template","No método clean() do formulário, que tem acesso aos dois campos","No middleware de CSRF"]} answer={2} explanation="clean() roda depois da validação de cada campo e enxerga todos os valores limpos. Regras que cruzam campos ficam ali, e o erro vai para non_field_errors." />
+
+## Base no CodeForge
+
+- [Django: Persistência de dados e Admin](/learn/carreira-python/django-persistencia-dados-admin): os modelos, o usuário customizado inicial e o serviço `reservar` usados aqui.
+- [Django: Autenticação com OAuth2.0](/learn/carreira-python/django-autenticacao-oauth2): o próximo passo, com login pelo Google e pelo GitHub.
+- [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao) e [RBAC](/learn/system-design/rbac): os conceitos por trás de permissões e grupos.
+- [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas): por que hash lento e com sal.
+- [Sessão vs token](/learn/system-design/sessao-vs-token): o modelo de sessão em cookie que o Django usa.
+
+## Referências
+
+- [Django: Working with forms](https://docs.djangoproject.com/en/5.2/topics/forms/)
+- [Django: Using the Django authentication system](https://docs.djangoproject.com/en/5.2/topics/auth/default/)
+- [Django: Customizing authentication](https://docs.djangoproject.com/en/5.2/topics/auth/customizing/)
+- [Django: Cross Site Request Forgery protection](https://docs.djangoproject.com/en/5.2/ref/csrf/)

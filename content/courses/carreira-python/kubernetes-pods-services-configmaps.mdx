@@ -1,0 +1,358 @@
+---
+title: "Kubernetes: Pods, Services e ConfigMaps"
+kind: lesson
+---
+
+Nos capítulos de integração contínua você empacotou a API da plataforma `ingressos` numa imagem `python:3.13-slim` e a publicou num registro. Um `docker run` numa máquina resolve enquanto existe uma máquina. Quando a venda de um show grande abre, você precisa de várias cópias da API em vários servidores, de alguém que reinicie o contêiner que morreu às três da manhã, de um endereço estável para um conjunto de cópias que muda o tempo todo e de um jeito de trocar a versão sem derrubar quem está comprando. Fazer isso com scripts e SSH funciona até o primeiro incidente.
+
+O Kubernetes resolve esse problema com uma ideia simples: você declara o estado desejado em arquivos YAML e o cluster trabalha continuamente para que o estado real fique igual. Este capítulo monta o vocabulário básico (Pod, Service, ConfigMap, Secret, namespace) num cluster local e coloca a API do `ingressos` para responder dentro dele. Os capítulos seguintes constroem em cima destes manifestos.
+
+**Você vai aprender:**
+
+- Explicar a arquitetura de um cluster: control plane, nós e o ciclo de reconciliação
+- Criar um cluster local com kind e operar com os comandos essenciais do `kubectl`
+- Escrever Pods com labels e expô-los com Services ClusterIP, NodePort e LoadBalancer
+- Usar o DNS interno para um serviço encontrar o outro pelo nome
+- Injetar configuração com ConfigMaps e Secrets, como variáveis de ambiente e como arquivos, e isolar tudo num namespace
+
+## Por que um orquestrador
+
+Um contêiner isolado não sabe nada sobre os outros. Em produção, alguém precisa responder a estas perguntas o tempo todo:
+
+| Pergunta | Sem orquestrador | Com Kubernetes |
+|---|---|---|
+| Em qual máquina cabe este contêiner? | Você escolhe e anota | O scheduler escolhe pelo que cada nó tem livre |
+| O processo morreu. E agora? | Um alerta acorda alguém | O kubelet reinicia; se o nó caiu, o Pod é recriado em outro |
+| Qual o endereço da API hoje? | IP fixo ou arquivo de hosts | Um Service com nome e IP estáveis |
+| Onde ficam as configurações? | Arquivo `.env` copiado por SSH | ConfigMap e Secret versionados e injetados |
+| Como subir a versão nova? | Parar, trocar, torcer | Troca gradual controlada (capítulo seguinte) |
+
+O modelo é declarativo. Você não manda "suba três contêineres": você escreve "devem existir três" e entrega ao cluster. Um controlador compara o desejado com o observado e age sobre a diferença, em laço, para sempre. Esse laço se chama reconciliação e explica quase todo comportamento do Kubernetes: se você apagar um Pod gerenciado, ele volta, porque o estado desejado não mudou.
+
+## A arquitetura do cluster
+
+Um cluster tem dois tipos de máquina. O **control plane** decide; os **nós de trabalho** executam.
+
+| Componente | Onde roda | Papel |
+|---|---|---|
+| `kube-apiserver` | control plane | Única porta de entrada. Tudo (kubectl, kubelet, controladores) conversa com ele por HTTPS |
+| `etcd` | control plane | Banco chave-valor que guarda todo o estado do cluster |
+| `kube-scheduler` | control plane | Escolhe o nó de cada Pod novo, olhando recursos e restrições |
+| `kube-controller-manager` | control plane | Roda os laços de reconciliação (réplicas, nós, endpoints) |
+| `kubelet` | cada nó | Recebe a lista de Pods do nó e garante que os contêineres estejam rodando |
+| `kube-proxy` | cada nó | Programa as regras de rede que fazem o IP de um Service chegar aos Pods |
+| container runtime | cada nó | Baixa imagens e executa contêineres (containerd na maioria dos clusters) |
+
+O caminho de um `kubectl apply` ajuda a fixar: o kubectl envia o YAML ao apiserver, que valida e grava no etcd. O scheduler vê um Pod sem nó e atribui um. O kubelet daquele nó vê o Pod atribuído a ele, pede ao runtime que baixe a imagem e inicie o contêiner, e reporta o status de volta ao apiserver. Ninguém fala diretamente com ninguém: todos observam o apiserver.
+
+## Um cluster local com kind
+
+O kind sobe um cluster inteiro dentro de contêineres Docker, o que o torna rápido de criar e destruir. O minikube faz o mesmo papel com outra abordagem (uma VM ou um contêiner com um nó); os manifestos deste capítulo valem para os dois. Com o kind, um arquivo de configuração permite ter mais de um nó e publicar uma porta na sua máquina:
+
+```yaml
+# kind.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+  - role: worker
+  - role: worker
+```
+
+```bash
+kind create cluster --name ingressos --config kind.yaml
+kubectl cluster-info --context kind-ingressos
+kubectl get nodes
+
+# a imagem construída localmente precisa ser copiada para dentro dos nós
+docker build -t ghcr.io/ingressos/api:1.4.0 .
+kind load docker-image ghcr.io/ingressos/api:1.4.0 --name ingressos
+```
+
+No minikube, o equivalente é `minikube start --nodes 3` e `minikube image load ghcr.io/ingressos/api:1.4.0`.
+
+O `kubectl` é o cliente de linha de comando do apiserver. Uma dúzia de comandos cobre o dia a dia:
+
+```bash
+kubectl apply -f arquivo.yaml        # cria ou atualiza o que o arquivo declara
+kubectl get pods -o wide             # lista, com IP e nó
+kubectl describe pod api             # detalhes e eventos (comece por aqui quando algo falha)
+kubectl logs api -f                  # saída padrão do contêiner
+kubectl exec -it api -- sh           # shell dentro do contêiner
+kubectl port-forward pod/api 8000:8000   # túnel da sua máquina até o Pod
+kubectl delete -f arquivo.yaml       # remove o que o arquivo declara
+kubectl explain pod.spec.containers  # documentação dos campos, direto do cluster
+kubectl api-resources                # todos os tipos de objeto e suas abreviações
+```
+
+Prefira sempre `kubectl apply -f` com arquivos versionados no Git a comandos imperativos como `kubectl run` e `kubectl create`. Os imperativos servem para experimentar; o que vai para produção precisa ser reproduzível.
+
+## Pods
+
+O Pod é a menor unidade que o Kubernetes agenda. Ele agrupa um ou mais contêineres que compartilham o mesmo IP, as mesmas portas e os mesmos volumes. Na prática, quase sempre é um contêiner por Pod; o segundo contêiner aparece em casos como um proxy ou um coletor de logs que precisa viver colado à aplicação.
+
+Todo manifesto tem quatro blocos: `apiVersion` e `kind` dizem o tipo, `metadata` identifica o objeto, `spec` descreve o estado desejado. O cluster acrescenta um quinto, `status`, com o estado observado.
+
+```yaml
+# api-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api
+  labels:
+    app: api
+    sistema: ingressos
+spec:
+  containers:
+    - name: api
+      image: ghcr.io/ingressos/api:1.4.0
+      command: ["gunicorn", "ingressos.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2"]
+      ports:
+        - name: http
+          containerPort: 8000
+```
+
+```bash
+kubectl apply -f api-pod.yaml
+kubectl get pod api -o wide
+kubectl port-forward pod/api 8000:8000
+curl http://localhost:8000/healthz
+```
+
+Dois detalhes que costumam derrubar aplicações Python. Primeiro, o processo precisa escutar em `0.0.0.0`: se o gunicorn ou o uvicorn ficar em `127.0.0.1`, nada fora do contêiner alcança a porta. Segundo, use sempre uma tag de versão na imagem. Com `latest`, você não sabe o que está rodando e não consegue voltar atrás.
+
+Um Pod é descartável. Ele recebe um IP ao nascer e perde esse IP ao morrer. Se o nó cair, um Pod criado à mão como este desaparece e ninguém o recria: quem garante a quantidade de cópias é o Deployment, assunto do próximo capítulo. Guarde a consequência: nunca dependa do IP de um Pod nem de arquivos gravados dentro dele.
+
+## Labels e selectors
+
+Labels são pares chave-valor livres no `metadata`. Sozinhos não fazem nada; ganham sentido porque quase tudo no Kubernetes encontra seus alvos por **selector**, uma consulta sobre labels. Um Service não lista os Pods que atende: ele declara "todos os Pods com `app=api`". Esse acoplamento frouxo é o que permite trocar Pods sem reconfigurar nada.
+
+```bash
+kubectl get pods -l app=api
+kubectl get pods -l 'sistema=ingressos,app!=postgres'
+kubectl get pods -l 'app in (api, postgres)' --show-labels
+kubectl label pod api camada=web
+```
+
+Adote uma convenção desde o início. Neste projeto: `app` identifica o componente (`api`, `postgres`, `rabbitmq`) e `sistema: ingressos` agrupa tudo. A documentação oficial recomenda o prefixo `app.kubernetes.io/` (`name`, `instance`, `version`, `part-of`), que você vai adotar quando chegar ao Helm. Annotations parecem labels, mas não servem para seleção: guardam metadados para ferramentas, como a configuração de um controlador de Ingress.
+
+## Services: um endereço estável
+
+Um Service dá um nome e um IP virtual fixos a um conjunto de Pods escolhido por selector, e distribui as conexões entre eles. O Kubernetes mantém, para cada Service, a lista de IPs dos Pods prontos (objetos EndpointSlice); o kube-proxy de cada nó traduz o IP do Service para um desses endereços.
+
+```yaml
+# api-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    sistema: ingressos
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+```
+
+`port` é a porta do Service; `targetPort` é a porta do contêiner, aqui referenciada pelo nome `http` declarado no Pod. Usar o nome permite mudar a porta da aplicação sem tocar no Service.
+
+| Tipo | Alcance | Quando usar |
+|---|---|---|
+| `ClusterIP` (padrão) | Só de dentro do cluster | Comunicação entre serviços: API, banco, fila. É o caso mais comum |
+| `NodePort` | Porta fixa (30000 a 32767) em todos os nós | Testes locais e ambientes sem balanceador |
+| `LoadBalancer` | IP externo provisionado pelo provedor de nuvem | Expor direto à internet num cluster gerenciado |
+| `ExternalName` | Um apelido DNS (CNAME) para um nome externo | Dar nome interno a um banco gerenciado fora do cluster |
+
+Cada tipo inclui o anterior: um `LoadBalancer` também abre um NodePort e tem um ClusterIP. Para acessar a API pelo navegador no cluster kind criado acima, um NodePort na porta mapeada basta:
+
+```yaml
+# api-nodeport.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-externo
+spec:
+  type: NodePort
+  selector:
+    app: api
+  ports:
+    - port: 80
+      targetPort: http
+      nodePort: 30080
+```
+
+Com isso, `curl http://localhost:8080/healthz` chega ao Pod: sua máquina encaminha a 8080 para a 30080 do nó, e o NodePort leva ao Pod. Num cluster local, um Service `LoadBalancer` fica com o IP externo em `<pending>` porque não há nuvem para provisionar o balanceador (o `minikube tunnel` e o `cloud-provider-kind` simulam isso). Em produção, o usual é ter um único ponto de entrada HTTP, o Ingress, que você configura no capítulo de alta disponibilidade.
+
+<Callout type="warning" title="Service sem endpoints">
+O erro mais comum com Services é o selector não bater com os labels dos Pods: um `app: api` de um lado e `app: ingressos-api` do outro. O Service é criado sem erro e simplesmente não leva a lugar nenhum. Confira com `kubectl get endpointslices -l kubernetes.io/service-name=api` ou `kubectl describe service api`: se a lista de endpoints estiver vazia, compare o selector com `kubectl get pods --show-labels`.
+</Callout>
+
+## DNS interno
+
+Todo cluster roda um servidor DNS (o CoreDNS) e configura cada Pod para usá-lo. Cada Service ganha um registro no formato `servico.namespace.svc.cluster.local`. Dentro do mesmo namespace, o nome curto basta, porque o `/etc/resolv.conf` do Pod traz os sufixos de busca:
+
+```bash
+kubectl run teste --rm -it --restart=Never --image=busybox:1.36 -- sh
+# dentro do Pod temporário:
+nslookup api
+wget -qO- http://api/healthz
+cat /etc/resolv.conf
+```
+
+É por isso que a API se conecta ao banco com `DB_HOST=postgres` e ao RabbitMQ com `amqp://rabbitmq:5672`: os nomes são os dos Services, não mudam entre ambientes e não dependem de IP. Para falar com um Service de outro namespace, use `postgres.dados` ou o nome completo `postgres.dados.svc.cluster.local`.
+
+O Kubernetes também injeta variáveis como `API_SERVICE_HOST` em cada Pod, mas só para Services que já existiam quando o Pod nasceu. Prefira o DNS, que não depende de ordem de criação.
+
+## ConfigMaps e Secrets
+
+A imagem deve ser a mesma em todos os ambientes; o que muda é a configuração. O ConfigMap guarda configuração não sensível e o Secret guarda credenciais. Os dois são mapas de chave e valor que você injeta no Pod.
+
+```yaml
+# api-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+data:
+  DJANGO_SETTINGS_MODULE: ingressos.settings.producao
+  DB_HOST: postgres
+  DB_NAME: ingressos
+  RABBITMQ_HOST: rabbitmq
+  RESERVA_EXPIRA_MINUTOS: "15"
+  gunicorn.conf.py: |
+    bind = "0.0.0.0:8000"
+    workers = 2
+    timeout = 30
+    accesslog = "-"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-secrets
+type: Opaque
+stringData:
+  DB_USER: ingressos
+  DB_PASSWORD: troque-esta-senha
+  SECRET_KEY: gere-um-valor-aleatorio-longo
+```
+
+Valores de ConfigMap são sempre strings, por isso `"15"` vai entre aspas. No Secret, `stringData` aceita texto puro e o cluster o converte para o campo `data`, em base64. Há duas formas de consumir:
+
+```yaml
+# api-pod.yaml (versão com configuração)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api
+  labels:
+    app: api
+    sistema: ingressos
+spec:
+  containers:
+    - name: api
+      image: ghcr.io/ingressos/api:1.4.0
+      command: ["gunicorn", "ingressos.wsgi:application", "-c", "/etc/ingressos/gunicorn.conf.py"]
+      ports:
+        - name: http
+          containerPort: 8000
+      envFrom:
+        - configMapRef:
+            name: api-config
+        - secretRef:
+            name: api-secrets
+      env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      volumeMounts:
+        - name: config
+          mountPath: /etc/ingressos
+          readOnly: true
+  volumes:
+    - name: config
+      configMap:
+        name: api-config
+        items:
+          - key: gunicorn.conf.py
+            path: gunicorn.conf.py
+```
+
+`envFrom` transforma cada chave em variável de ambiente, e o `settings` do Django lê com `os.environ["DB_HOST"]`. O volume monta a chave `gunicorn.conf.py` como arquivo em `/etc/ingressos`. A diferença importa na atualização:
+
+| Forma | Como a aplicação lê | Ao alterar o ConfigMap ou Secret |
+|---|---|---|
+| Variável de ambiente (`env`, `envFrom`) | `os.environ` | Só vale para Pods novos: é preciso recriá-los |
+| Arquivo em volume | Leitura do arquivo | O arquivo é atualizado no Pod em até cerca de um minuto, mas a aplicação precisa reler |
+
+Chaves que não são nomes válidos de variável, como `gunicorn.conf.py`, são ignoradas pelo `envFrom` e ficam disponíveis apenas como arquivo.
+
+<Callout type="warning" title="base64 não é criptografia">
+Um Secret é apenas codificado em base64: `kubectl get secret api-secrets -o jsonpath='{.data.DB_PASSWORD}' | base64 -d` mostra a senha a qualquer pessoa com permissão de leitura. O ganho do Secret sobre o ConfigMap é permitir controle de acesso separado e tratamento mais cuidadoso pelo cluster. Nunca versione no Git um manifesto de Secret com valores reais: crie com `kubectl create secret generic api-secrets --from-env-file=.env.producao` ou use um gestor externo, tema do capítulo de segurança.
+</Callout>
+
+## Namespaces
+
+Um namespace é uma divisão lógica do cluster. Nomes de objetos são únicos dentro dele, o que permite ter um `api` em `ingressos-dev` e outro em `ingressos-prod`. Permissões, cotas de recursos e políticas de rede também são aplicadas por namespace, e por isso ele é a unidade natural de separação entre times e ambientes.
+
+```bash
+kubectl create namespace ingressos
+kubectl apply -n ingressos -f api-config.yaml -f api-pod.yaml -f api-service.yaml
+kubectl get all -n ingressos
+kubectl config set-context --current --namespace=ingressos   # passa a ser o padrão do contexto
+kubectl get pods -A                                          # todos os namespaces
+```
+
+O cluster já vem com `default` (onde cai tudo que não declara namespace), `kube-system` (componentes do próprio cluster, como CoreDNS e kube-proxy), `kube-public` e `kube-node-lease`. Não coloque aplicação em `default`: crie um namespace por sistema ou por ambiente. Lembre que namespace separa nomes e políticas, não rede: por padrão, um Pod de qualquer namespace alcança qualquer outro. Bloquear isso exige NetworkPolicy. Alguns objetos não pertencem a namespace nenhum, como Node, PersistentVolume e o próprio Namespace.
+
+Apagar um namespace apaga tudo o que está dentro dele, o que é ótimo para limpar um ambiente de teste e perigoso com o contexto errado selecionado. Confira o contexto atual com `kubectl config current-context` antes de comandos destrutivos.
+
+## Na entrevista
+
+**O que é um Pod e por que ele existe, se já temos contêineres?** É a menor unidade agendável do Kubernetes: um ou mais contêineres que compartilham rede e volumes e são colocados juntos no mesmo nó. Ele existe para modelar processos que precisam viver colados (aplicação e proxy, por exemplo) e para dar ao cluster uma unidade única de agendamento, IP e ciclo de vida.
+
+**Qual a diferença entre ClusterIP, NodePort e LoadBalancer?** ClusterIP dá um IP virtual acessível só de dentro do cluster. NodePort abre a mesma porta em todos os nós e encaminha para o Service. LoadBalancer pede ao provedor de nuvem um balanceador externo apontando para os nós. Cada um é construído sobre o anterior.
+
+**Como um Service sabe para quais Pods enviar tráfego?** Pelo selector de labels. O cluster mantém a lista de IPs dos Pods prontos que casam com o selector, e o kube-proxy programa em cada nó o encaminhamento do IP do Service para esses endereços. Pods que não estão prontos saem da lista.
+
+**Qual a diferença entre ConfigMap e Secret?** Os dois guardam pares chave-valor injetados como variáveis ou arquivos. O Secret é para dados sensíveis: fica em base64, pode ter permissão de acesso separada e criptografia em repouso no etcd, quando habilitada. Por padrão ele não é criptografado, então a proteção real vem de RBAC e de um gestor de segredos.
+
+**O que acontece, passo a passo, quando você roda `kubectl apply` num Pod?** O apiserver autentica, valida e grava o objeto no etcd. O scheduler percebe o Pod sem nó e escolhe um. O kubelet desse nó pede ao runtime a imagem e inicia os contêineres, e vai atualizando o status no apiserver.
+
+**Alterei um ConfigMap e a aplicação não mudou. Por quê?** Variáveis de ambiente são lidas na criação do contêiner, então só Pods novos enxergam o valor. Arquivos montados por volume são atualizados, mas a aplicação precisa reler. A solução usual é recriar os Pods a cada mudança de configuração.
+
+## Pratique
+
+1. Crie um cluster kind com um control plane e dois workers, carregue a imagem da API do `ingressos` e confirme com `kubectl get nodes -o wide` e `kubectl describe node` onde cada componente roda.
+2. Escreva os manifestos de Pod e Service ClusterIP para `postgres` (imagem `postgres:16`, porta 5432, senha vinda de um Secret) e para `rabbitmq` (imagem `rabbitmq:4-management`, portas 5672 e 15672).
+3. Suba a API num namespace `ingressos` com `api-config` e `api-secrets`, apontando `DB_HOST` e `RABBITMQ_HOST` para os nomes dos Services, e valide o caminho inteiro com um Pod temporário de `busybox` usando `nslookup` e `wget`.
+4. Quebre o selector do Service de propósito, observe a lista de endpoints vazia e conserte. Depois exponha a API com NodePort e acesse pelo navegador.
+5. Altere `RESERVA_EXPIRA_MINUTOS` no ConfigMap, comprove que o Pod em execução mantém o valor antigo, recrie o Pod e comprove o novo valor com `kubectl exec api -- env`.
+
+<Quiz question="Um Service foi criado sem erros, mas as requisições para ele não chegam a nenhum Pod. Qual a primeira coisa a verificar?" options={["Se o selector do Service casa com os labels dos Pods","Se o nó tem IP público","Se o etcd está cheio","Se o Pod tem mais de um contêiner"]} answer={0} explanation="O Service encontra Pods apenas pelo selector. Se nenhum Pod pronto tiver os labels pedidos, a lista de endpoints fica vazia e o tráfego não tem destino." />
+
+<Quiz question="Dentro do namespace ingressos, qual nome a API deve usar para alcançar o Service postgres do mesmo namespace?" options={["O IP do Pod do banco","localhost","postgres","O nome do nó onde o banco roda"]} answer={2} explanation="O CoreDNS registra cada Service como servico.namespace.svc.cluster.local, e os sufixos de busca do Pod permitem usar só o nome curto dentro do mesmo namespace." />
+
+<Quiz question="Você alterou um valor num ConfigMap consumido por envFrom. O que acontece com os Pods em execução?" options={["Reiniciam sozinhos com o valor novo","Recebem o valor novo sem reiniciar","Entram em erro até serem corrigidos","Continuam com o valor antigo até serem recriados"]} answer={3} explanation="Variáveis de ambiente são definidas quando o contêiner é criado. Só arquivos montados por volume são atualizados em Pods existentes." />
+
+## Base no CodeForge
+
+- [Integração Contínua com Docker e GitHub Actions: Do build ao deploy](/learn/carreira-python/integracao-continua-docker-github-actions-build-deploy): de onde vem a imagem que este capítulo coloca no cluster.
+- [Containers, namespaces e cgroups](/learn/sistemas-operacionais/containers-namespaces-cgroups): o que um contêiner é para o kernel, base para entender Pods.
+- [Service discovery](/learn/system-design/service-discovery) e [DNS](/learn/redes/dns): o problema que Services e CoreDNS resolvem.
+- [Load balancers](/learn/system-design/load-balancers): o que acontece por trás de um Service.
+- [Kubernetes para desenvolvedores Java](/learn/carreira-java/kubernetes-para-desenvolvedores-java): os mesmos objetos vistos a partir de outra stack.
+
+## Referências
+
+- [Kubernetes: componentes do cluster](https://kubernetes.io/docs/concepts/overview/components/)
+- [Kubernetes: Service](https://kubernetes.io/docs/concepts/services-networking/service/)
+- [Kubernetes: ConfigMaps](https://kubernetes.io/docs/concepts/configuration/configmap/)
+- [kind: Quick Start](https://kind.sigs.k8s.io/docs/user/quick-start/)

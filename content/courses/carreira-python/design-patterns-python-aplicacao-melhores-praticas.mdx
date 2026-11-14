@@ -1,0 +1,517 @@
+---
+title: "Design Patterns em Python: Aplicação e melhores práticas"
+kind: lesson
+---
+
+O serviço de pedidos do `ingressos` começou com uma função de quarenta linhas. Hoje ela tem um `if forma_pagamento == "pix"` seguido de três `elif`, outro bloco de `if` para meia-entrada, desconto de grupo e lote promocional, e no final envia e-mail, gera os ingressos e avisa o financeiro, tudo no mesmo lugar. Cada regra nova mexe nessa função, e cada mudança arrisca quebrar as outras. Os padrões de projeto são soluções com nome para esse tipo de pressão: um ponto do código que varia demais, cria objetos demais ou sabe de coisas demais.
+
+A dificuldade em Python é outra. O catálogo clássico foi escrito para C++ e Smalltalk dos anos 90, e boa parte da cerimônia (interfaces, hierarquias, classes de uma função só) existe para contornar limitações que Python não tem. Aqui funções são valores, classes são objetos, módulos são instâncias únicas e a tipagem é estrutural. Este capítulo mostra nove padrões no domínio de ingressos, sempre em duas versões: a forma clássica, que você precisa reconhecer em código e em entrevista, e a forma idiomática, que é a que você deve escrever. A teoria completa de cada padrão está no curso [Low-Level Design](/learn/lld).
+
+**Você vai aprender:**
+
+- Reconhecer o problema que cada padrão resolve antes de aplicá-lo
+- Implementar Strategy, Factory, Observer e Command com funções de primeira classe e dicionários
+- Diferenciar o padrão Decorator do decorator da linguagem
+- Usar Adapter, State e Template Method com `Protocol`, enums e classes abstratas
+- Explicar por que Singleton quase nunca precisa de uma classe em Python
+
+## O que muda em Python
+
+Quatro recursos da linguagem encurtam a maioria dos padrões:
+
+| Recurso | O que substitui |
+|---|---|
+| Funções de primeira classe e closures | Classes com um único método (estratégias, comandos, callbacks) |
+| Classes como objetos, guardáveis em dicionários | Hierarquias de fábricas |
+| `typing.Protocol` (tipagem estrutural) | Interfaces declaradas e herança só para satisfazer o tipo |
+| Módulos, importados uma única vez por processo | Singleton |
+
+Nenhum deles elimina o padrão: a intenção continua a mesma, e o nome continua útil para conversar com o time. O que desaparece é o andaime. A regra para todo o capítulo: comece pela versão mais simples que isola a variação, e só suba para classes quando houver estado ou mais de uma operação para manter juntos.
+
+## Strategy: trocar o algoritmo sem mexer em quem o usa
+
+**Problema:** o cálculo do total do pedido varia (preço cheio, meia-entrada, desconto de grupo), e a função que cria o pedido não deveria conhecer cada variação.
+
+A forma clássica define uma interface e uma classe por algoritmo:
+
+```python
+from decimal import Decimal
+from typing import Protocol
+
+
+class PoliticaDePreco(Protocol):
+    def calcular(self, preco: Decimal, quantidade: int) -> Decimal: ...
+
+
+class PrecoCheio:
+    def calcular(self, preco: Decimal, quantidade: int) -> Decimal:
+        return preco * quantidade
+
+
+class MeiaEntrada:
+    def calcular(self, preco: Decimal, quantidade: int) -> Decimal:
+        return preco * quantidade / 2
+```
+
+`Protocol` dispensa herança: qualquer objeto com um método `calcular` compatível é aceito pelo mypy. Mas uma classe sem estado e com um método só é uma função com passos extras. A versão idiomática usa a própria função como estratégia:
+
+```python
+# ingressos/pedidos/precos.py
+from collections.abc import Callable
+from decimal import Decimal
+
+PoliticaDePreco = Callable[[Decimal, int], Decimal]
+
+
+def preco_cheio(preco: Decimal, quantidade: int) -> Decimal:
+    return preco * quantidade
+
+
+def meia_entrada(preco: Decimal, quantidade: int) -> Decimal:
+    return preco * quantidade / 2
+
+
+def desconto_de_grupo(minimo: int, percentual: Decimal) -> PoliticaDePreco:
+    def politica(preco: Decimal, quantidade: int) -> Decimal:
+        total = preco * quantidade
+        if quantidade >= minimo:
+            total -= total * percentual / 100
+        return total
+
+    return politica
+
+
+def calcular_total(
+    preco: Decimal, quantidade: int, politica: PoliticaDePreco = preco_cheio
+) -> Decimal:
+    return politica(preco, quantidade).quantize(Decimal("0.01"))
+```
+
+```python
+calcular_total(Decimal("120.00"), 2)                                      # Decimal("240.00")
+calcular_total(Decimal("120.00"), 2, meia_entrada)                        # Decimal("120.00")
+calcular_total(Decimal("120.00"), 5, desconto_de_grupo(4, Decimal("10"))) # Decimal("540.00")
+```
+
+Quando a estratégia precisa de configuração, como o mínimo e o percentual do desconto de grupo, a closure guarda esses valores. Você já usa Strategy assim sem dar nome: o parâmetro `key` de `sorted` é uma estratégia de comparação. Fique com a versão em classes quando a estratégia tiver mais de uma operação (calcular e também descrever o desconto no recibo, por exemplo) ou estado que muda entre chamadas.
+
+## Factory: decidir qual objeto criar num lugar só
+
+**Problema:** o código que paga um pedido recebe a forma de pagamento como texto (`"pix"`, `"cartao"`) e precisa do objeto certo, sem espalhar cadeias de `if` e `elif` pelo sistema.
+
+No livro, Factory Method é uma hierarquia de criadores com um método abstrato. Em Python, classes são valores, então um dicionário de classes resolve:
+
+```python
+# ingressos/pagamentos/gateways.py
+from decimal import Decimal
+from typing import Protocol
+
+
+class GatewayPagamento(Protocol):
+    def cobrar(self, pedido_id: int, valor: Decimal) -> str: ...
+
+
+_GATEWAYS: dict[str, type[GatewayPagamento]] = {}
+
+
+def registrar(forma: str):
+    def decorador(classe: type[GatewayPagamento]) -> type[GatewayPagamento]:
+        _GATEWAYS[forma] = classe
+        return classe
+
+    return decorador
+
+
+def criar_gateway(forma: str) -> GatewayPagamento:
+    try:
+        return _GATEWAYS[forma]()
+    except KeyError:
+        raise ValueError(f"Forma de pagamento desconhecida: {forma}") from None
+
+
+@registrar("pix")
+class GatewayPix:
+    def cobrar(self, pedido_id: int, valor: Decimal) -> str:
+        return f"pix_{pedido_id}"
+
+
+@registrar("cartao")
+class GatewayCartao:
+    def cobrar(self, pedido_id: int, valor: Decimal) -> str:
+        return f"cartao_{pedido_id}"
+```
+
+Adicionar boleto é criar uma classe com `@registrar("boleto")`: nem `criar_gateway` nem quem o chama mudam, que é o princípio aberto-fechado na prática. O registro por decorator é opcional: um dicionário literal com as três classes é mais simples e mais fácil de localizar, e só deixa de servir quando as implementações vivem em módulos ou plugins separados.
+
+Outra fábrica idiomática é o construtor alternativo com `@classmethod`, como `datetime.fromisoformat` ou `dict.fromkeys`. Um `Pedido.a_partir_da_reserva(reserva)` dá nome à forma de criação e mantém a lógica dentro da classe. Já a Abstract Factory, que cria famílias de objetos relacionados, é rara em código de aplicação Python: quase sempre um módulo com funções de criação cumpre o papel.
+
+## Observer: reagir a um evento sem acoplar o emissor
+
+**Problema:** quando um pedido é pago, é preciso gerar ingressos, enviar e-mail e avisar o financeiro. Se `pagar_pedido` chama os três diretamente, ele passa a depender de três módulos e muda toda vez que surge uma quarta reação.
+
+A forma clássica tem um sujeito com `anexar`, `remover` e `notificar`, e observadores com um método `atualizar`. Com funções, vira um registro de handlers por tipo de evento:
+
+```python
+# ingressos/eventos_de_dominio.py
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
+
+
+@dataclass(frozen=True)
+class PedidoPago:
+    pedido_id: int
+    cliente_email: str
+    total: Decimal
+
+
+_assinantes: defaultdict[type, list[Callable[[Any], None]]] = defaultdict(list)
+
+
+def ao_ocorrer(tipo_de_evento: type):
+    def decorador(handler: Callable[[Any], None]) -> Callable[[Any], None]:
+        _assinantes[tipo_de_evento].append(handler)
+        return handler
+
+    return decorador
+
+
+def publicar(evento: object) -> None:
+    for handler in _assinantes[type(evento)]:
+        handler(evento)
+```
+
+```python
+# ingressos/notificacoes/handlers.py
+from ingressos.eventos_de_dominio import PedidoPago, ao_ocorrer
+
+
+@ao_ocorrer(PedidoPago)
+def enviar_confirmacao(evento: PedidoPago) -> None:
+    print(f"E-mail para {evento.cliente_email}: pedido {evento.pedido_id} confirmado")
+
+
+@ao_ocorrer(PedidoPago)
+def avisar_financeiro(evento: PedidoPago) -> None:
+    print(f"Receita registrada: {evento.total}")
+```
+
+O serviço só faz `publicar(PedidoPago(...))` e desconhece quem está ouvindo. Os signals do Django (`post_save`, ou um `Signal()` seu) são esse mesmo padrão, já pronto.
+
+Os custos aparecem depois. O fluxo deixa de ser legível de cima para baixo: para saber o que acontece quando um pedido é pago, é preciso procurar todos os assinantes. Um handler só é registrado se o módulo dele for importado (no Django, isso se faz no `ready()` do `AppConfig`). E a publicação acima é síncrona: uma exceção no envio de e-mail derruba o pagamento. Decida de propósito se a falha de um assinante deve interromper o emissor, e trate reações lentas ou não essenciais fora da requisição, com fila.
+
+## Decorator: o padrão e o recurso da linguagem
+
+O nome é o mesmo e a confusão é pergunta frequente de entrevista.
+
+O **padrão** Decorator embrulha um objeto em outro com a mesma interface, para acrescentar comportamento sem alterar a classe original nem criar subclasses para cada combinação:
+
+```python
+import logging
+from decimal import Decimal
+
+from ingressos.pagamentos.gateways import GatewayPagamento, criar_gateway
+
+logger = logging.getLogger(__name__)
+
+
+class GatewayComLog:
+    def __init__(self, interno: GatewayPagamento) -> None:
+        self._interno = interno
+
+    def cobrar(self, pedido_id: int, valor: Decimal) -> str:
+        logger.info("Cobrando pedido %s no valor de %s", pedido_id, valor)
+        transacao_id = self._interno.cobrar(pedido_id, valor)
+        logger.info("Pedido %s cobrado, transação %s", pedido_id, transacao_id)
+        return transacao_id
+
+
+gateway = GatewayComLog(criar_gateway("pix"))
+```
+
+Quem recebe `gateway` não sabe que há uma camada no meio, e as camadas se empilham: log por fora, retry por dentro, métrica no meio.
+
+O **decorator da linguagem** é a sintaxe `@`: uma função que recebe uma função (ou classe) e devolve outra no lugar. `@decorador` em cima de `def f` equivale a `f = decorador(f)`.
+
+```python
+import functools
+import time
+from collections.abc import Callable
+
+
+def medir_tempo[**P, R](funcao: Callable[P, R]) -> Callable[P, R]:
+    @functools.wraps(funcao)
+    def embrulhada(*args: P.args, **kwargs: P.kwargs) -> R:
+        inicio = time.perf_counter()
+        try:
+            return funcao(*args, **kwargs)
+        finally:
+            duracao_ms = (time.perf_counter() - inicio) * 1000
+            logger.info("%s levou %.1f ms", funcao.__name__, duracao_ms)
+
+    return embrulhada
+
+
+@medir_tempo
+def gerar_ingressos(pedido_id: int) -> list[str]:
+    return [f"ING-{pedido_id}-{n}" for n in range(1, 3)]
+```
+
+`functools.wraps` copia nome, docstring e assinatura da função original para a embrulhada. Sem ele, o traceback e as ferramentas de introspecção passam a mostrar `embrulhada` no lugar de `gerar_ingressos`. A sintaxe `[**P, R]` (Python 3.12 em diante) declara os parâmetros de tipo para o mypy preservar a assinatura.
+
+| | Padrão Decorator | Decorator da linguagem |
+|---|---|---|
+| O que embrulha | Um objeto, em tempo de execução | Uma função ou classe, na definição |
+| Quando se decide | A cada composição (`GatewayComLog(gateway)`) | Uma vez, onde o `@` foi escrito |
+| Uso típico | Camadas opcionais por instância | Comportamento transversal fixo: log, cache, permissão, registro |
+
+Os dois se encontram quando o decorator da linguagem embrulha a função para acrescentar comportamento, como `medir_tempo`. Mas nem todo `@` é o padrão: `@registrar("pix")` e `@ao_ocorrer(PedidoPago)`, das seções anteriores, só anotam o objeto num registro e o devolvem intacto. E `@property`, `@classmethod` e `@dataclass` transformam em vez de embrulhar.
+
+## Adapter: encaixar uma interface que não é sua
+
+**Problema:** o SDK do provedor de pagamentos tem a interface dele (valores em centavos, nomes em inglês, resposta em dicionário, exceções próprias). O `ingressos` espera um `GatewayPagamento` com `cobrar(pedido_id, valor)`.
+
+```python
+from decimal import Decimal
+
+
+class PagamentoRecusado(Exception):
+    pass
+
+
+class ClientePagaFacil:
+    """Representa o SDK de terceiros: você não controla este código."""
+
+    def create_charge(self, amount_cents: int, reference: str) -> dict[str, str]:
+        return {"id": f"ch_{reference}", "status": "approved"}
+
+
+class GatewayPagaFacil:
+    def __init__(self, cliente: ClientePagaFacil) -> None:
+        self._cliente = cliente
+
+    def cobrar(self, pedido_id: int, valor: Decimal) -> str:
+        resposta = self._cliente.create_charge(
+            amount_cents=int(valor * 100),
+            reference=f"pedido-{pedido_id}",
+        )
+        if resposta["status"] != "approved":
+            raise PagamentoRecusado(resposta["status"])
+        return resposta["id"]
+```
+
+O adapter não acrescenta comportamento, só traduz: unidades, nomes, formato da resposta e erros. É isso que o diferencia do Decorator, que mantém a interface e adiciona algo. O ganho é de fronteira: o resto do sistema nunca importa o SDK, então trocar de provedor (ou atualizar uma versão que mudou a API) altera um arquivo, e os testes usam um gateway falso sem saber que o SDK existe. Com `Protocol`, o adapter nem precisa herdar de nada: basta ter o método certo.
+
+## Command: uma ação transformada em valor
+
+**Problema:** você quer enfileirar uma operação, executá-la mais tarde, registrá-la para auditoria ou desfazê-la. Para isso, a ação precisa ser um objeto que carrega seus próprios parâmetros.
+
+```python
+from dataclasses import dataclass
+
+from ingressos.eventos.models import Lote
+
+
+@dataclass(frozen=True)
+class ReservarIngressos:
+    lote_id: int
+    quantidade: int
+
+    def executar(self) -> None:
+        lote = Lote.objects.select_for_update().get(pk=self.lote_id)
+        lote.quantidade_disponivel -= self.quantidade
+        lote.save(update_fields=["quantidade_disponivel"])
+
+    def desfazer(self) -> None:
+        lote = Lote.objects.select_for_update().get(pk=self.lote_id)
+        lote.quantidade_disponivel += self.quantidade
+        lote.save(update_fields=["quantidade_disponivel"])
+```
+
+Como o comando é um dado imutável, dá para guardar o histórico e desfazer na ordem inversa: se o pagamento falha depois de três reservas, percorra `reversed(executados)` chamando `desfazer`. Essa é a mesma ideia das compensações de uma saga, assunto do capítulo de microsserviços.
+
+Quando não existe desfazer nem histórico, a versão idiomática é um chamável com os argumentos já fixados:
+
+```python
+from collections import deque
+from collections.abc import Callable
+from functools import partial
+
+fila: deque[Callable[[], None]] = deque()
+fila.append(partial(print, "Enviando ingressos do pedido 42"))
+fila.append(partial(print, "Enviando ingressos do pedido 43"))
+
+while fila:
+    fila.popleft()()
+```
+
+`functools.partial` empacota função e argumentos num objeto que pode ser guardado e chamado depois. Filas de tarefas como o Celery são Command em escala: a chamada de `.delay(pedido_id)` serializa o nome da tarefa e os argumentos, e um worker em outro processo executa.
+
+## State: comportamento que depende do estado
+
+**Problema:** um `Pedido` pode estar pendente, pago, cancelado ou expirado, e as regras mudam conforme o estado: só pedido pendente pode ser pago, pedido expirado não pode ser cancelado. Espalhar `if pedido.status == ...` por todos os métodos acaba em transições inválidas esquecidas.
+
+O padrão clássico cria uma classe por estado, e o pedido delega a ela. Quando o que varia é só **quais transições são permitidas**, uma tabela resolve com menos código e fica legível como documentação:
+
+```python
+from enum import StrEnum
+
+
+class Status(StrEnum):
+    PENDENTE = "pendente"
+    PAGO = "pago"
+    CANCELADO = "cancelado"
+    EXPIRADO = "expirado"
+
+
+TRANSICOES: dict[Status, frozenset[Status]] = {
+    Status.PENDENTE: frozenset({Status.PAGO, Status.CANCELADO, Status.EXPIRADO}),
+    Status.PAGO: frozenset({Status.CANCELADO}),
+    Status.CANCELADO: frozenset(),
+    Status.EXPIRADO: frozenset(),
+}
+
+
+class TransicaoInvalida(Exception):
+    pass
+
+
+class Pedido:
+    def __init__(self) -> None:
+        self.status = Status.PENDENTE
+
+    def mudar_para(self, novo: Status) -> None:
+        if novo not in TRANSICOES[self.status]:
+            raise TransicaoInvalida(f"Pedido {self.status} não pode ir para {novo}")
+        self.status = novo
+```
+
+Toda mudança de status passa por `mudar_para`, então não existe caminho para sair de `EXPIRADO`. Suba para a versão com classes quando o **comportamento** diferir de verdade entre estados: se cancelar um pedido pago estorna o pagamento e devolve o estoque, enquanto cancelar um pendente só devolve o estoque, cada estado ganha sua implementação de `cancelar` e os condicionais somem dos métodos do pedido.
+
+## Template Method: o esqueleto fixo, os passos variáveis
+
+**Problema:** exportar o relatório de vendas em CSV e em texto segue os mesmos passos (cabeçalho, uma linha por pedido, rodapé com o total), e só a formatação muda.
+
+```python
+from abc import ABC, abstractmethod
+from decimal import Decimal
+
+
+class ExportadorDeVendas(ABC):
+    def exportar(self, vendas: list[tuple[int, Decimal]]) -> str:
+        linhas = [self.cabecalho()]
+        linhas += [self.linha(pedido_id, total) for pedido_id, total in vendas]
+        linhas.append(self.rodape(sum((total for _, total in vendas), Decimal("0"))))
+        return "\n".join(linhas)
+
+    @abstractmethod
+    def cabecalho(self) -> str: ...
+
+    @abstractmethod
+    def linha(self, pedido_id: int, total: Decimal) -> str: ...
+
+    def rodape(self, total: Decimal) -> str:
+        return f"TOTAL;{total}"
+
+
+class ExportadorCsv(ExportadorDeVendas):
+    def cabecalho(self) -> str:
+        return "pedido;total"
+
+    def linha(self, pedido_id: int, total: Decimal) -> str:
+        return f"{pedido_id};{total}"
+```
+
+`exportar` é o método template: define a ordem e chama os ganchos. Os métodos abstratos são obrigatórios (a classe `ABC` impede instanciar uma subclasse incompleta) e `rodape` é um gancho com padrão, que a subclasse substitui se quiser. Você usa esse padrão o tempo todo no Django: as class-based views e os viewsets do DRF fixam o fluxo da requisição e deixam você sobrescrever `get_queryset`, `get_serializer_class` ou `perform_create`.
+
+Quando só um passo varia, herança é pesada demais: receba o passo como função (`exportar(vendas, formatar_linha)`) e você terá voltado ao Strategy. Template Method se paga quando há vários ganchos que mudam juntos e um esqueleto que precisa ficar protegido.
+
+## Singleton: o módulo já é um
+
+**Problema:** deve existir uma única instância de algo no processo, como as configurações ou um pool de conexões.
+
+A versão clássica sobrescreve `__new__` ou usa uma metaclasse para devolver sempre o mesmo objeto. Em Python isso é desnecessário, porque um módulo é importado uma única vez por processo e fica guardado em `sys.modules`. Todo `import` posterior recebe o mesmo objeto:
+
+```python
+# ingressos/config.py
+import os
+from dataclasses import dataclass
+from functools import cache
+
+
+@dataclass(frozen=True)
+class Configuracoes:
+    url_do_banco: str
+    prazo_reserva_minutos: int
+
+
+@cache
+def obter_configuracoes() -> Configuracoes:
+    return Configuracoes(
+        url_do_banco=os.environ["DATABASE_URL"],
+        prazo_reserva_minutos=int(os.environ.get("PRAZO_RESERVA_MINUTOS", "15")),
+    )
+```
+
+`@cache` faz a função executar uma vez e devolver sempre o mesmo objeto. A criação é adiada até o primeiro uso, e nos testes `obter_configuracoes.cache_clear()` reinicia o estado. O `settings` do Django e o `logging.getLogger(nome)` funcionam com a mesma ideia.
+
+<Callout type="warning" title="Singleton é estado global com outro nome">
+O problema do Singleton não é a implementação, é o acoplamento escondido: qualquer função pode buscar a instância por conta própria, a assinatura deixa de mostrar do que ela depende, e um teste que altera o objeto contamina o seguinte. Prefira criar o objeto uma vez na inicialização da aplicação e passá-lo por parâmetro a quem precisa (no FastAPI, com `Depends`). Em servidores com vários processos, como gunicorn com quatro workers, lembre também que cada processo tem a sua instância: "único" vale por processo, não para o sistema.
+</Callout>
+
+## Quando não usar um padrão
+
+Padrão aplicado antes do problema é só indireção. Um `if` com dois ramos que não mudam há um ano não precisa de Strategy, e uma fábrica que cria sempre a mesma classe é uma chamada de construtor mais longa. Três perguntas ajudam a decidir:
+
+1. **O que está variando?** Se você não consegue apontar pelo menos duas variações reais (não imaginadas), espere a segunda aparecer.
+2. **Uma função ou um dicionário resolve?** Na maior parte dos casos em Python, sim.
+3. **Quem lê o código vai encontrar o caminho?** Registro por decorator, eventos e herança escondem o fluxo. O desacoplamento precisa valer esse custo.
+
+<Callout type="tip" title="Em entrevista, comece pelo problema">
+Quando pedirem um padrão, descreva primeiro a pressão que ele alivia ("o cálculo varia por tipo de ingresso e a função de pedido não deveria mudar a cada regra nova") e só então mostre o código. Em Python, dizer que usaria uma função como estratégia e explicar por que a classe é dispensável mostra mais domínio do que reproduzir o diagrama do livro.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre o padrão Decorator e os decorators do Python?** O padrão embrulha um objeto em outro com a mesma interface para acrescentar comportamento em tempo de execução. O decorator da linguagem é a sintaxe `@`, que aplica uma função sobre outra função ou classe na definição. O segundo pode implementar o primeiro, mas também serve para registrar ou transformar, sem embrulhar nada.
+
+**Como você implementa Strategy em Python?** Passando uma função como parâmetro, com um alias `Callable` para documentar a assinatura, e usando closure quando a estratégia precisa de configuração. Classes entram quando a estratégia tem estado ou mais de uma operação.
+
+**Por que Singleton é considerado problemático, e qual a alternativa em Python?** Porque é estado global: esconde dependências e dificulta testes. Em Python, um objeto criado no nível do módulo, ou uma função com `functools.cache`, já garante instância única por processo, e a injeção de dependência costuma ser melhor do que o acesso global.
+
+**Qual a diferença entre Strategy e State?** A estrutura é parecida: um objeto delega a outro que pode ser trocado. No Strategy, quem escolhe o algoritmo é o cliente, e as estratégias não se conhecem. No State, a troca acontece por dentro, como consequência das operações, e os estados conhecem as transições.
+
+**Adapter, Decorator e Proxy embrulham um objeto. O que distingue cada um?** Adapter muda a interface para encaixar em quem consome. Decorator mantém a interface e acrescenta comportamento. Proxy mantém a interface e controla o acesso (carga adiada, cache, permissão).
+
+## Pratique
+
+No projeto `ingressos`, refatore com os testes do capítulo anterior segurando o comportamento:
+
+1. Substitua os condicionais de preço por políticas em funções (`preco_cheio`, `meia_entrada`, `desconto_de_grupo`) e escreva um teste parametrizado cobrindo as três.
+2. Crie o registro de gateways com `criar_gateway` e um adapter para um SDK fictício que trabalha em centavos. O serviço de pagamento não pode importar o SDK.
+3. Publique `PedidoPago` ao pagar um pedido e mova o envio de e-mail e a geração de ingressos para handlers. Escreva um teste em que um handler falha e documente o comportamento escolhido.
+4. Implemente a tabela de transições do `Pedido` e garanta, com testes, que nenhum caminho sai de `expirado` ou `cancelado`.
+5. Escreva o decorator `medir_tempo` com `functools.wraps` e um `GatewayComLog`, e explique no PR, em duas frases, por que um é decorator da linguagem e o outro é o padrão.
+
+<Quiz question="Qual é a forma idiomática de implementar Strategy em Python quando cada estratégia não tem estado e tem uma única operação?" options={["Uma hierarquia com classe abstrata e uma subclasse por estratégia","Uma metaclasse que registra as estratégias","Passar a função como argumento, tipada com Callable","Um módulo por estratégia com variáveis globais"]} answer={2} explanation="Funções são valores de primeira classe. Uma classe sem estado e com um método só não acrescenta nada à função, e closures cobrem o caso em que há configuração." />
+
+<Quiz question="Para que serve functools.wraps ao escrever um decorator?" options={["Para copiar nome, docstring e assinatura da função original para a função que a embrulha","Para executar a função original em outra thread","Para guardar o resultado em cache","Para impedir que o decorator seja aplicado duas vezes"]} answer={0} explanation="Sem wraps, a função decorada passa a se apresentar com o nome e a docstring da função interna do decorator, o que atrapalha tracebacks, documentação e introspecção." />
+
+<Quiz question="Por que raramente se escreve uma classe Singleton em Python?" options={["Porque Python não permite sobrescrever __new__","Porque o interpretador proíbe estado global","Porque classes não podem ter atributos compartilhados","Porque um módulo é carregado uma vez por processo e já funciona como instância única"]} answer={3} explanation="O módulo fica em sys.modules após o primeiro import, e todos os imports seguintes recebem o mesmo objeto. Um objeto no nível do módulo ou uma função com cache cobre o caso de uso." />
+
+## Base no CodeForge
+
+- [Strategy](/learn/lld/strategy), [Observer](/learn/lld/observer) e [State](/learn/lld/state): a teoria completa, com diagramas e variações.
+- [Factory Method](/learn/lld/factory-method), [Adapter](/learn/lld/adapter), [Decorator](/learn/lld/decorator), [Command](/learn/lld/command), [Template Method](/learn/lld/template-method) e [Singleton](/learn/lld/singleton): os demais padrões deste capítulo no curso de Low-Level Design.
+- [Como escolher padrões](/learn/lld/escolher-padroes): o caminho do problema até o padrão.
+- [Princípios SOLID com Python: Construindo códigos eficientes e escaláveis](/learn/carreira-python/principios-solid-python-construindo-codigos-eficientes-escalaveis): os princípios que os padrões colocam em prática.
+- [Python: Testes automatizados e qualidade de código](/learn/carreira-python/python-testes-automatizados-qualidade-codigo): a rede de segurança para refatorar em direção a um padrão.
+
+## Referências
+
+- [functools (docs.python.org)](https://docs.python.org/3/library/functools.html)
+- [typing.Protocol (docs.python.org)](https://docs.python.org/3/library/typing.html#typing.Protocol)
+- [abc: Abstract Base Classes (docs.python.org)](https://docs.python.org/3/library/abc.html)
+- [Django: Signals](https://docs.djangoproject.com/en/5.2/topics/signals/)

@@ -1,0 +1,452 @@
+---
+title: "Django REST Framework: Trabalhando com relacionamentos, versionamento e desempenho"
+kind: lesson
+---
+
+A API de `ingressos` já valida, filtra, pagina e protege. Agora ela precisa mostrar o domínio como ele é: um evento tem setores, um pedido tem ingressos, cada ingresso pertence a um setor. O aplicativo quer a página do evento com os setores e preços numa chamada só, e a tela de confirmação quer o pedido com os ingressos e o nome do evento de cada um. O jeito ingênuo de entregar isso funciona com dez registros no banco de desenvolvimento e derruba a API em produção: a listagem de vinte pedidos dispara duzentas consultas.
+
+Este capítulo, o último da sequência de DRF, trata das relações nos serializers (como representar, como aninhar e como gravar dados aninhados), do problema N+1 que elas provocam, do versionamento que permite mudar o contrato sem quebrar o aplicativo instalado nos celulares e do cache para as rotas mais lidas. Termina com testes de API com `APITestCase` e `APIClient`, incluindo testes que travam o número de consultas.
+
+**Você vai aprender:**
+
+- Representar relações por chave primária, slug, hyperlink, texto ou serializer aninhado
+- Gravar dados aninhados com `create` explícito, transação e controle de estoque
+- Detectar e eliminar N+1 com `select_related`, `prefetch_related` e `Prefetch`
+- Versionar a API por URL ou por cabeçalho e evoluir serializers entre versões
+- Aplicar cache em rotas de leitura e testar a API, inclusive o número de consultas
+
+## Como representar uma relação
+
+O campo `evento` do `SetorSerializer` saiu até agora como um número. É o `PrimaryKeyRelatedField`, padrão do `ModelSerializer`. O DRF oferece outras representações, e a escolha é parte do contrato:
+
+| Campo | Saída para o setor 3 | Aceita escrita | Quando usar |
+|---|---|---|---|
+| `PrimaryKeyRelatedField` | `"evento": 42` | Sim, pelo id | Padrão; clientes que já conhecem os ids |
+| `SlugRelatedField(slug_field="codigo")` | `"ingresso": "8f1c..."` | Sim, pelo campo único | Identificador público diferente do id interno |
+| `HyperlinkedRelatedField` | `"evento": "https://api.../eventos/42/"` | Sim, pela URL | APIs navegáveis por links (HATEOAS) |
+| `StringRelatedField` | `"evento": "Festival de Inverno"` | Não | Rótulo para exibição, usa `__str__` |
+| Serializer aninhado | `"evento": {"id": 42, "nome": ...}` | Só com código seu | Quando o cliente precisa dos dados na mesma resposta |
+
+```python
+# pedidos/serializers.py
+from rest_framework import serializers
+
+from eventos.models import Ingresso, Setor
+
+
+class IngressoSerializer(serializers.ModelSerializer):
+    setor = serializers.SlugRelatedField(slug_field="nome", read_only=True)
+    evento = serializers.CharField(source="setor.evento.nome", read_only=True)
+
+    class Meta:
+        model = Ingresso
+        fields = ["codigo", "setor", "evento"]
+```
+
+O argumento `source` percorre relações com pontos (`setor.evento.nome`) e permite achatar a resposta sem aninhar um serializer inteiro. Cada ponto que atravessa uma chave estrangeira, porém, é um acesso ao banco se o objeto relacionado não tiver sido carregado. Guarde isso para a seção de desempenho.
+
+Para relações com hyperlink, o campo precisa do nome da rota (`view_name="evento-detail"`, gerado pelo router) e do `request` no contexto do serializer, para montar a URL absoluta. As views genéricas e os viewsets passam o contexto sozinhos; ao instanciar o serializer à mão, passe `context={"request": request}`.
+
+`SlugRelatedField` e `PrimaryKeyRelatedField` graváveis exigem `queryset`, que define o universo de valores aceitos. Use isso como regra de negócio: `queryset=Setor.objects.filter(evento__data__gt=timezone.now())` recusa, já na validação, a compra de setor de evento que já passou. Quando o conjunto depende do usuário, sobrescreva `get_queryset` no campo ou restrinja no `validate`.
+
+## Serializers aninhados para leitura
+
+Para a página do evento, aninhe os setores:
+
+```python
+# eventos/serializers.py
+from rest_framework import serializers
+
+from eventos.models import Evento, Setor
+
+
+class SetorResumoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Setor
+        fields = ["id", "nome", "preco", "quantidade_disponivel"]
+
+
+class EventoDetalheSerializer(serializers.ModelSerializer):
+    setores = SetorResumoSerializer(many=True, read_only=True)
+    menor_preco = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = Evento
+        fields = ["id", "nome", "data", "local", "capacidade", "setores", "menor_preco"]
+```
+
+`setores` é o `related_name` da chave estrangeira em `Setor`, então o serializer encontra a relação reversa sozinho. `menor_preco` não existe no model: virá de uma anotação no queryset, calculada pelo banco.
+
+É comum usar serializers diferentes para lista e detalhe, porque a lista não precisa dos setores e o detalhe precisa:
+
+```python
+class EventoViewSet(viewsets.ModelViewSet):
+    # permissões, filtros e paginação dos capítulos anteriores...
+
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            return EventoDetalheSerializer
+        return EventoSerializer
+```
+
+Evite aninhar em profundidade (evento com setores com ingressos com pedido). Cada nível multiplica o tamanho da resposta e as consultas, e acopla o cliente à estrutura interna. Se o cliente precisa navegar, ofereça rotas próprias ou links.
+
+## Gravando dados aninhados
+
+Um serializer aninhado é somente leitura por padrão: o DRF não sabe como você quer criar, atualizar ou remover os filhos, e se recusa a adivinhar. Se você tentar gravar, ele levanta um erro explicando que `create` precisa ser escrito. A criação de um pedido é o caso típico: o cliente envia os itens (setor e quantidade), e o servidor cria o pedido, reserva o estoque e gera os ingressos.
+
+```json
+{
+  "itens": [
+    {"setor": 3, "quantidade": 2},
+    {"setor": 5, "quantidade": 1}
+  ]
+}
+```
+
+```python
+# pedidos/serializers.py
+from django.db import transaction
+from django.db.models import F
+from rest_framework import serializers
+
+from eventos.models import Ingresso, Pedido, Setor
+
+
+class ItemDoPedidoSerializer(serializers.Serializer):
+    setor = serializers.PrimaryKeyRelatedField(queryset=Setor.objects.all())
+    quantidade = serializers.IntegerField(min_value=1, max_value=10)
+
+
+class PedidoSerializer(serializers.ModelSerializer):
+    itens = ItemDoPedidoSerializer(many=True, write_only=True)
+    ingressos = IngressoSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Pedido
+        fields = ["id", "status", "criado_em", "itens", "ingressos"]
+        read_only_fields = ["status", "criado_em"]
+
+    def validate_itens(self, itens):
+        if not itens:
+            raise serializers.ValidationError("Informe ao menos um item.")
+        setores = [item["setor"].id for item in itens]
+        if len(setores) != len(set(setores)):
+            raise serializers.ValidationError("Cada setor deve aparecer uma vez.")
+        return itens
+
+    @transaction.atomic
+    def create(self, validated_data):
+        itens = validated_data.pop("itens")
+        pedido = Pedido.objects.create(**validated_data)
+
+        for item in itens:
+            setor, quantidade = item["setor"], item["quantidade"]
+            reservados = Setor.objects.filter(
+                pk=setor.pk, quantidade_disponivel__gte=quantidade
+            ).update(quantidade_disponivel=F("quantidade_disponivel") - quantidade)
+            if reservados == 0:
+                raise serializers.ValidationError(
+                    {"itens": f"Não há {quantidade} lugares disponíveis em {setor.nome}."}
+                )
+            Ingresso.objects.bulk_create(
+                Ingresso(pedido=pedido, setor=setor) for _ in range(quantidade)
+            )
+        return pedido
+```
+
+Os pontos que fazem esse código correto:
+
+- **`itens` é `write_only` e `ingressos` é `read_only`.** O cliente envia o que quer comprar e recebe o que foi gerado. Entrada e saída não precisam ter a mesma forma.
+- **`cliente` não está no serializer.** Ele chega pelo `serializer.save(cliente=self.request.user)` do `perform_create` do capítulo anterior e aparece em `validated_data`.
+- **A reserva é uma atualização condicional atômica.** O `UPDATE ... SET quantidade_disponivel = quantidade_disponivel - 2 WHERE id = 3 AND quantidade_disponivel >= 2` é decidido pelo banco numa única instrução. Duas compras simultâneas do último lugar não passam as duas: uma atualiza uma linha, a outra atualiza zero. Validar a quantidade antes, no `validate`, e decrementar depois seria um "ler e depois escrever" sujeito a corrida.
+- **`transaction.atomic` desfaz tudo** se o segundo item falhar: o estoque do primeiro volta e o pedido não é criado. A `ValidationError` levantada dentro da transação vira o 400 de sempre.
+- **`bulk_create`** insere os ingressos numa só consulta, em vez de uma por ingresso. O `codigo` em UUID é gerado pelo `default` do campo em Python, então funciona com `bulk_create`.
+
+Para **atualização** aninhada, a decisão é ainda mais de negócio: um item ausente na lista nova significa remover? Um id desconhecido significa criar? Em vez de responder isso num `update` genérico, prefira operações explícitas: `POST /api/pedidos/{id}/cancelar/` (que devolve o estoque) é mais claro e seguro que um `PATCH` que reescreve a lista de itens.
+
+<Callout type="warning" title="Lógica de negócio fora do serializer">
+O `create` acima já é o limite do razoável para um serializer. Quando a criação do pedido ganhar mais regras (expiração da reserva em 15 minutos, cupom, limite por CPF, evento de domínio para o serviço de pagamentos), mova a operação para uma função de serviço, como `criar_pedido(cliente, itens)`, e deixe o serializer validar a entrada e chamá-la. Assim a mesma regra serve à API, ao admin e a um comando de gerenciamento, e é testada sem HTTP.
+</Callout>
+
+## O problema N+1
+
+Liste vinte pedidos com o `PedidoSerializer` e conte as consultas. Para cada pedido, o serializer lê `pedido.ingressos.all()` (uma consulta), e para cada ingresso lê `ingresso.setor` (uma consulta) e `ingresso.setor.evento` (outra). Uma consulta para os pedidos, mais N para os ingressos, mais duas por ingresso: com vinte pedidos de três ingressos, são 141 consultas para uma página. Esse é o N+1: o custo cresce com o tamanho da página, e o código não mostra nada de errado, porque os acessos estão escondidos em `source` e serializers aninhados.
+
+O Django resolve com duas ferramentas:
+
+- **`select_related`** segue chaves estrangeiras e um para um com **JOIN**, na mesma consulta. Use para relações "para um": `Ingresso.setor`, `Setor.evento`.
+- **`prefetch_related`** faz **uma consulta separada por relação** e junta os resultados em Python. Use para relações "para muitos": `Pedido.ingressos`, `Evento.setores`.
+
+```python
+# pedidos/views.py
+from django.db.models import Prefetch
+
+from eventos.models import Ingresso, Pedido
+
+
+class PedidoViewSet(...):
+    # serializer, permissões e paginação como antes
+
+    def get_queryset(self):
+        ingressos = Ingresso.objects.select_related("setor__evento")
+        pedidos = Pedido.objects.prefetch_related(Prefetch("ingressos", queryset=ingressos))
+        if self.request.user.is_staff:
+            return pedidos
+        return pedidos.filter(cliente=self.request.user)
+```
+
+Agora são duas consultas, independentemente do tamanho da página: os pedidos e os ingressos desses pedidos, com JOIN em setor e evento. Com paginação por número de página haveria uma terceira, a do `COUNT`. O `Prefetch` permite personalizar a consulta da relação pré-carregada: aplicar `select_related` nela, filtrar ou ordenar.
+
+Para o detalhe do evento, combine pré-carregamento com anotação:
+
+```python
+from django.db.models import Min, Prefetch
+
+from eventos.models import Evento, Setor
+
+
+class EventoViewSet(viewsets.ModelViewSet):
+    def get_queryset(self):
+        eventos = Evento.objects.annotate(menor_preco=Min("setores__preco"))
+        if self.action == "retrieve":
+            eventos = eventos.prefetch_related(
+                Prefetch("setores", queryset=Setor.objects.order_by("preco"))
+            )
+        return eventos.order_by("data", "id")
+```
+
+Uma armadilha clássica: depois de um `prefetch_related("setores")`, chamar `evento.setores.filter(...)` ou `.order_by(...)` no serializer **descarta o cache** e volta a consultar o banco, uma vez por evento. Qualquer filtro ou ordem precisa estar no `Prefetch`. Dentro do serializer, use apenas `.all()`.
+
+Para ver as consultas durante o desenvolvimento, use o django-debug-toolbar, ou em qualquer lugar:
+
+```python
+from django.db import connection, reset_queries
+from django.test.utils import CaptureQueriesContext
+
+with CaptureQueriesContext(connection) as consultas:
+    PedidoSerializer(Pedido.objects.all()[:20], many=True).data
+print(len(consultas))
+```
+
+## Versionamento
+
+Um aplicativo móvel instalado não atualiza junto com a API. Se você renomear `quantidade_disponivel` para `disponivel`, a versão do aplicativo na mão de metade dos usuários quebra. Versionar é manter mais de um contrato no ar durante a transição.
+
+Antes de criar uma versão, saiba o que **não** a exige. Mudanças compatíveis podem entrar na versão atual: adicionar um campo na resposta, adicionar um parâmetro opcional, adicionar uma rota. Mudanças que quebram exigem versão nova: remover ou renomear campo, mudar tipo ou formato, tornar obrigatório um campo que era opcional, mudar o significado de um status. A disciplina de só adicionar adia muito a necessidade de uma v2. Ela pressupõe clientes tolerantes, que ignoram campos que não conhecem.
+
+O DRF suporta várias estratégias de versionamento:
+
+| Estratégia | Como o cliente informa | Prós | Contras |
+|---|---|---|---|
+| `URLPathVersioning` | `/api/v1/eventos/` | Explícita, fácil de testar no navegador e de rotear no gateway | A URL do recurso muda entre versões |
+| `NamespaceVersioning` | `/api/v1/` com namespace no `include` | Igual à anterior, usando namespaces do Django | Mesmo contra |
+| `AcceptHeaderVersioning` | `Accept: application/json; version=2` | URL estável, mais aderente a REST | Menos visível, mais difícil de depurar e de cachear |
+| `QueryParameterVersioning` | `?version=2` | Simples | Mistura versão com filtros |
+
+Versionar pela URL é o mais comum no mercado por ser explícito. A configuração:
+
+```python
+# ingressos/settings.py
+REST_FRAMEWORK = {
+    # ... configurações anteriores
+    "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.URLPathVersioning",
+    "DEFAULT_VERSION": "v1",
+    "ALLOWED_VERSIONS": ["v1", "v2"],
+}
+```
+
+```python
+# ingressos/urls.py
+from django.urls import include, re_path
+
+urlpatterns = [
+    # admin e autenticação...
+    re_path(r"^api/(?P<version>v1|v2)/", include(router.urls)),
+]
+```
+
+O `URLPathVersioning` lê o argumento `version` da URL e o coloca em `request.version`. Versão fora de `ALLOWED_VERSIONS` devolve 404. Na view, escolha o serializer pela versão:
+
+```python
+# eventos/serializers.py
+class SetorResumoV2Serializer(serializers.ModelSerializer):
+    disponivel = serializers.IntegerField(source="quantidade_disponivel", read_only=True)
+
+    class Meta:
+        model = Setor
+        fields = ["id", "nome", "preco", "disponivel"]
+
+
+class EventoDetalheV2Serializer(EventoDetalheSerializer):
+    setores = SetorResumoV2Serializer(many=True, read_only=True)
+```
+
+```python
+class EventoViewSet(viewsets.ModelViewSet):
+    def get_serializer_class(self):
+        if self.action == "retrieve":
+            if self.request.version == "v2":
+                return EventoDetalheV2Serializer
+            return EventoDetalheSerializer
+        return EventoSerializer
+```
+
+O model não muda: a v2 apenas renomeia o campo na representação, com `source`. Essa é a forma saudável de versionar: o domínio é um só, e as versões são traduções na borda. Quando a lógica também diverge, ainda assim prefira versões de serializer e de view sobre um app Django inteiro duplicado.
+
+Versionar é também aposentar. Anuncie a data de fim da v1, sinalize nas respostas da versão antiga (o cabeçalho `Deprecation` e o `Sunset`, com a data, são convenções em uso), meça quem ainda chama a v1 pelos logs e só então desligue. Manter mais de duas versões ativas multiplica o custo de cada mudança.
+
+## Cache
+
+A página de um evento popular é lida milhares de vezes por minuto na abertura das vendas, e muda raramente (exceto a disponibilidade). Cache evita recomputar a mesma resposta. Duas abordagens, com compromissos diferentes:
+
+**Cache da resposta inteira**, com os decoradores do Django:
+
+```python
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+from django.views.decorators.vary import vary_on_headers
+
+
+class EventoViewSet(viewsets.ModelViewSet):
+    @method_decorator(cache_page(60))
+    @method_decorator(vary_on_headers("Authorization"))
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+```
+
+A chave do cache inclui a URL completa (com filtros, página e versão). O `vary_on_headers("Authorization")` separa as respostas por credencial; sem ele, uma resposta personalizada de um usuário poderia ser servida a outro. Para rotas públicas e iguais para todos, o cache pode ficar inteiro na CDN, com o cabeçalho `Cache-Control`. A invalidação aqui é só por tempo: por até 60 segundos, um evento editado aparece com os dados antigos.
+
+**Cache de dados com invalidação explícita**, quando o atraso não é aceitável:
+
+```python
+# eventos/cache.py
+from django.core.cache import cache
+
+from eventos.models import Evento
+from eventos.serializers import EventoDetalheSerializer
+
+
+def chave_evento(evento_id: int, versao: str) -> str:
+    return f"evento:{versao}:{evento_id}"
+
+
+def evento_serializado(evento: Evento, versao: str, serializer_class) -> dict:
+    chave = chave_evento(evento.pk, versao)
+    dados = cache.get(chave)
+    if dados is None:
+        dados = serializer_class(evento).data
+        cache.set(chave, dados, timeout=300)
+    return dados
+
+
+def invalidar_evento(evento_id: int) -> None:
+    cache.delete_many([chave_evento(evento_id, v) for v in ("v1", "v2")])
+```
+
+`invalidar_evento` é chamado onde o evento ou os setores mudam: no `perform_update`, num sinal `post_save` ou, melhor, na função de serviço que faz a alteração. Dados que mudam a cada compra, como a disponibilidade, ficam fora do cache ou com tempo curtíssimo; a decisão de quanto atraso é aceitável é de produto. Em produção, o cache do Django precisa ser compartilhado entre as instâncias (Redis), como já foi preciso para o throttling.
+
+<Callout type="tip" title="Meça antes de cachear">
+Cache esconde problemas. Uma rota com N+1 ficaria rápida com cache e voltaria a cair na primeira expiração em horário de pico, quando várias requisições recalculam a mesma resposta ao mesmo tempo. Corrija as consultas primeiro, meça a latência com o queryset otimizado e só então decida se o cache se paga.
+</Callout>
+
+## Testando a API
+
+O DRF traz `APITestCase`, um `TestCase` do Django cujo `self.client` é um `APIClient`: ele serializa o corpo em JSON com `format="json"`, autentica com `force_authenticate` ou `credentials` e devolve respostas com `.data` (o conteúdo antes de renderizar) e `.json()`.
+
+```python
+# pedidos/tests/test_api_pedidos.py
+from datetime import timedelta
+from decimal import Decimal
+
+from django.contrib.auth import get_user_model
+from django.urls import reverse
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APITestCase
+
+from eventos.models import Evento, Pedido, Setor
+
+
+class PedidoApiTest(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.ana = get_user_model().objects.create_user("ana", password="senha-forte-1")
+        evento = Evento.objects.create(
+            nome="Festival", data=timezone.now() + timedelta(days=30),
+            local="Arena", capacidade=100,
+        )
+        cls.pista = Setor.objects.create(evento=evento, nome="Pista", preco=Decimal("150"), quantidade_disponivel=2)
+
+    def setUp(self):
+        self.client.force_authenticate(user=self.ana)
+        self.url = reverse("pedido-list", kwargs={"version": "v1"})
+
+    def test_compra_gera_ingressos_e_baixa_estoque(self):
+        resposta = self.client.post(self.url, {"itens": [{"setor": self.pista.id, "quantidade": 2}]}, format="json")
+
+        self.assertEqual(resposta.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(len(resposta.data["ingressos"]), 2)
+        self.pista.refresh_from_db()
+        self.assertEqual(self.pista.quantidade_disponivel, 0)
+
+    def test_sem_estoque_nada_e_criado(self):
+        resposta = self.client.post(self.url, {"itens": [{"setor": self.pista.id, "quantidade": 3}]}, format="json")
+
+        self.assertEqual(resposta.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Pedido.objects.exists())
+
+    def test_listagem_tem_numero_fixo_de_consultas(self):
+        for _ in range(5):
+            self.client.post(self.url, {"itens": [{"setor": self.pista.id, "quantidade": 1}]}, format="json")
+            self.pista.quantidade_disponivel = 2
+            self.pista.save()
+
+        with self.assertNumQueries(2):
+            self.client.get(self.url)
+```
+
+O nome `pedido-list` vem do router (o `basename` informado no registro do viewset de pedidos, que usa `get_queryset`), e `version` entra em `kwargs` porque a rota é versionada. `setUpTestData` cria os dados uma vez por classe, o que deixa a suíte rápida. O teste de estoque insuficiente confere o que **não** aconteceu, que é o objetivo da transação.
+
+O `assertNumQueries` é o teste de regressão do N+1. O número exato depende da sua configuração: a autenticação forçada não consulta o banco, a paginação por cursor não faz `COUNT`, e restam a consulta dos pedidos e a do pré-carregamento. Descubra o valor rodando uma vez, fixe-o, e o teste quebra no dia em que alguém acrescentar ao serializer um campo que atravessa uma relação sem ajustar o queryset. Com pytest-django, a fixture equivalente é `django_assert_num_queries`.
+
+## Na entrevista
+
+**O que é o problema N+1 e como você resolve no Django?** É fazer uma consulta para a lista e mais uma para cada item ao acessar uma relação, o que no DRF acontece escondido em serializers aninhados e `source`. Resolvo com `select_related` para chaves estrangeiras, que faz JOIN, e `prefetch_related` para relações para muitos, que faz uma consulta extra por relação. E travo o resultado com `assertNumQueries`.
+
+**Por que o DRF não grava serializers aninhados automaticamente?** Porque a semântica é de negócio: ausência de um filho pode significar remover ou manter, e a criação pode envolver estoque, validações e efeitos colaterais. O DRF exige que você escreva `create` e `update`, normalmente dentro de uma transação.
+
+**Como evitar vender o mesmo lugar duas vezes?** Com uma atualização condicional atômica no banco, decrementando com `F()` apenas onde `quantidade_disponivel` é suficiente e verificando quantas linhas foram afetadas, dentro de `transaction.atomic`. Validar antes e gravar depois tem condição de corrida.
+
+**Quando uma mudança exige nova versão da API?** Quando quebra clientes existentes: remover ou renomear campo, mudar tipo, tornar obrigatório o que era opcional. Adicionar campos e parâmetros opcionais é compatível e entra na versão atual. Versiono pela URL e implemento as versões como serializers diferentes sobre o mesmo domínio.
+
+**`select_related` ou `prefetch_related`?** `select_related` para relações para um (chave estrangeira, um para um), com JOIN na mesma consulta. `prefetch_related` para relações para muitos e muitos para muitos, com consulta separada e junção em Python. Filtros sobre a relação pré-carregada vão num `Prefetch`, senão o cache é descartado.
+
+## Pratique
+
+1. Crie o `EventoDetalheSerializer` com setores aninhados e `menor_preco` anotado, use-o só no `retrieve` e confirme com `CaptureQueriesContext` que o detalhe faz um número fixo de consultas.
+2. Implemente a criação de pedido com itens, reserva atômica e `bulk_create` de ingressos, e escreva o teste de estoque insuficiente que confere que nenhum pedido nem ingresso foi criado.
+3. Escreva um teste de concorrência com duas threads comprando o último lugar ao mesmo tempo (use `TransactionTestCase` e PostgreSQL) e prove que só uma compra é aceita.
+4. Versione a API pela URL, crie a v2 do detalhe do evento com o campo renomeado e acrescente o cabeçalho `Deprecation` às respostas da v1.
+5. Aplique cache com invalidação explícita ao detalhe do evento, invalide na alteração de evento e de setor, e adicione `assertNumQueries` à listagem de pedidos e de eventos.
+
+<Quiz question="Depois de prefetch_related('setores'), o serializer chama evento.setores.order_by('preco'). Qual o efeito?" options={["Nenhum, a ordenação é feita em memória","O cache do prefetch é descartado e cada evento faz uma nova consulta","Erro, pois não se pode ordenar relação pré-carregada","A ordenação é aplicada ao queryset principal"]} answer={1} explanation="Filtrar ou ordenar a relação gera uma nova consulta. A ordem deve ir num Prefetch com queryset ordenado, e o serializer usa apenas .all()." />
+
+<Quiz question="Qual destas mudanças pode entrar na versão atual da API sem criar uma nova?" options={["Renomear o campo quantidade_disponivel","Tornar obrigatório um parâmetro que era opcional","Adicionar um novo campo à resposta","Trocar o tipo de preco de string para número"]} answer={2} explanation="Adicionar campos é compatível com clientes que ignoram o que não conhecem. As outras alterações quebram clientes existentes." />
+
+<Quiz question="Por que reservar estoque com filter(quantidade_disponivel__gte=n).update(quantidade_disponivel=F(...) - n)?" options={["Porque o banco decide de forma atômica, evitando que duas compras simultâneas vendam o mesmo lugar","Porque é mais legível que save()","Porque o DRF exige F() em serializers aninhados","Porque assim não é preciso transação"]} answer={0} explanation="A atualização condicional é uma única instrução no banco. Se não houver estoque, nenhuma linha é afetada. Ler, validar e depois gravar abre uma condição de corrida." />
+
+## Base no CodeForge
+
+- [Django REST Framework: Trabalhando com autenticação, permissões e limites de requisição](/learn/carreira-python/django-rest-framework-autenticacao-permissoes-limites): o `PedidoViewSet` e as permissões que este capítulo estende.
+- [Inner join](/learn/sql/inner-join) e [Otimização de consultas](/learn/system-design/otimizacao-de-consultas): o que `select_related` e `prefetch_related` viram no banco.
+- [Transações e ACID](/learn/sql/transacoes-e-acid) e [Níveis de isolamento](/learn/sql/niveis-de-isolamento): a base da reserva atômica de estoque.
+- [Caching](/learn/system-design/caching), [Invalidação de cache](/learn/system-design/invalidacao-de-cache) e [Cache stampede](/learn/system-design/cache-stampede): os compromissos do cache de respostas.
+- [Swagger: Documentando suas APIs](/learn/carreira-python/swagger-documentando-apis): como publicar o contrato de cada versão.
+
+## Referências
+
+- [Django REST Framework: Serializer relations](https://www.django-rest-framework.org/api-guide/relations/)
+- [Django REST Framework: Versioning](https://www.django-rest-framework.org/api-guide/versioning/) e [Testing](https://www.django-rest-framework.org/api-guide/testing/)
+- [Django: select_related e prefetch_related](https://docs.djangoproject.com/en/5.2/ref/models/querysets/#select-related)
+- [Django: framework de cache](https://docs.djangoproject.com/en/5.2/topics/cache/)

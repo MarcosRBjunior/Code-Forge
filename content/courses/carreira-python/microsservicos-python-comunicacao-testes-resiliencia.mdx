@@ -1,0 +1,386 @@
+---
+title: "Microsserviços em Python: Comunicação, testes e resiliência"
+kind: lesson
+---
+
+Num monolito, criar um pedido é uma chamada de função dentro de uma transação: ou tudo grava, ou nada grava. Quando o `ingressos` vira quatro serviços (`catalogo`, `pedidos`, `pagamentos` e `notificacoes`), essa mesma operação passa a atravessar a rede, e a rede falha de jeitos que uma função não falha: demora, responde pela metade, entrega a mesma requisição duas vezes ou some no meio de um deploy. O código que funcionava passa a travar workers inteiros esperando um serviço lento, e uma queda no pagamento derruba a vitrine do catálogo.
+
+Este capítulo trata do que muda quando a chamada sai do processo: quando vale dividir, como os serviços conversam, como sobreviver às falhas dos vizinhos, como testar sem subir o sistema inteiro e como enxergar uma requisição que passou por quatro serviços.
+
+**Você vai aprender:**
+
+- Decidir se e onde dividir um sistema, a partir das fronteiras do domínio
+- Fazer chamadas HTTP entre serviços com `httpx`, timeout, retry com backoff e circuit breaker
+- Garantir idempotência para que retries não cobrem o cliente duas vezes
+- Escolher entre comunicação síncrona e assíncrona, banco por serviço e saga
+- Testar contratos entre serviços e rastrear requisições com ID de correlação e health checks
+
+## Quando dividir, e onde
+
+Microsserviço resolve um problema de organização antes de resolver um problema técnico: permite que times diferentes façam deploy de partes diferentes sem coordenar cada mudança. O custo é alto e imediato: latência de rede, consistência eventual, mais infraestrutura, observabilidade distribuída, testes mais difíceis. Por isso a ordem recomendada é começar com um monolito bem modularizado e extrair serviços quando houver motivo concreto:
+
+| Motivo para extrair | Exemplo no `ingressos` |
+|---|---|
+| Escala muito diferente | O catálogo recebe cem vezes mais leituras que o resto na abertura das vendas |
+| Ritmo de mudança diferente | Pagamentos muda pouco e exige auditoria a cada deploy |
+| Isolamento de falha | O envio de e-mail lento não pode atrasar a compra |
+| Times independentes | Um time cuida só de integração com provedores de pagamento |
+
+As fronteiras vêm do domínio, não das tabelas. Um serviço por entidade (`servico-evento`, `servico-lote`, `servico-cliente`) gera um sistema em que toda operação precisa de cinco chamadas: o chamado monolito distribuído, com todos os custos dos dois mundos. Uma boa fronteira agrupa o que muda junto e precisa de consistência forte junto. O estoque do lote e o pedido que o consome, por exemplo, precisam de uma regra atômica (não vender acima da capacidade); se ficarem em serviços separados, essa regra vira uma coordenação distribuída. O capítulo de DDD aprofunda essa modelagem com contextos delimitados.
+
+A divisão desta carreira: `catalogo` é dono de eventos, lotes e da disponibilidade; `pedidos` é dono do pedido e da reserva; `pagamentos` conversa com o provedor; `notificacoes` envia e-mails. Cada um com seu deploy e seu banco.
+
+## Comunicação síncrona com `httpx`
+
+Quando o `pedidos` precisa saber o preço atual de um lote, ele chama o `catalogo` por HTTP e espera a resposta. O cliente `httpx` funciona em código síncrono e assíncrono com a mesma API. A regra mais importante é criar **um cliente por processo** e reaproveitá-lo, porque ele mantém o pool de conexões; criar um `httpx.Client()` por requisição refaz a conexão TCP e o handshake TLS a cada chamada.
+
+```python
+# pedidos/clientes/catalogo.py
+from decimal import Decimal
+
+import httpx
+from pydantic import BaseModel
+
+TIMEOUT = httpx.Timeout(2.0, connect=0.5)
+
+
+class LoteDto(BaseModel):
+    id: int
+    evento_id: int
+    preco: Decimal
+    quantidade_disponivel: int
+
+
+class CatalogoIndisponivel(Exception):
+    pass
+
+
+class ClienteCatalogo:
+    def __init__(self, url_base: str) -> None:
+        self._http = httpx.AsyncClient(base_url=url_base, timeout=TIMEOUT)
+
+    async def buscar_lote(self, lote_id: int) -> LoteDto | None:
+        try:
+            resposta = await self._http.get(f"/lotes/{lote_id}")
+        except httpx.TransportError as erro:
+            raise CatalogoIndisponivel(str(erro)) from erro
+        if resposta.status_code == 404:
+            return None
+        resposta.raise_for_status()
+        return LoteDto.model_validate(resposta.json())
+
+    async def fechar(self) -> None:
+        await self._http.aclose()
+```
+
+Três decisões estão nesse trecho. O **timeout** é explícito (2 segundos no total, meio segundo para conectar). O `httpx` já tem padrão de 5 segundos, mas o número certo vem do seu orçamento: se a API de pedidos promete responder em 3 segundos, uma dependência não pode consumir 5. O **DTO** valida a resposta com Pydantic na fronteira, então um campo que sumiu do `catalogo` vira erro claro aqui, e não um `KeyError` três funções depois. E os **erros de transporte** (conexão recusada, timeout) são traduzidos para uma exceção do domínio do `pedidos`, que a API transforma em 503.
+
+No FastAPI, crie o cliente no `lifespan` da aplicação e feche-o no desligamento, para que todas as requisições compartilhem o pool.
+
+## Retry com backoff exponencial e jitter
+
+Parte das falhas é passageira: uma task reiniciando, um pico momentâneo. Tentar de novo resolve, desde que você respeite três regras: só repita o que é seguro repetir, espere cada vez mais entre as tentativas e limite o total.
+
+```python
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
+
+import httpx
+
+STATUS_REPETIVEIS = {502, 503, 504}
+
+
+async def com_retry[T](
+    operacao: Callable[[], Awaitable[T]],
+    tentativas: int = 3,
+    base: float = 0.2,
+    teto: float = 2.0,
+) -> T:
+    for tentativa in range(1, tentativas + 1):
+        try:
+            return await operacao()
+        except httpx.HTTPStatusError as erro:
+            if erro.response.status_code not in STATUS_REPETIVEIS or tentativa == tentativas:
+                raise
+        except httpx.TransportError:
+            if tentativa == tentativas:
+                raise
+        espera = random.uniform(0, min(teto, base * 2**tentativa))
+        await asyncio.sleep(espera)
+    raise AssertionError("inalcançável")
+```
+
+O **backoff exponencial** dobra a espera a cada tentativa, dando tempo ao serviço para se recuperar. O **jitter** (a espera sorteada entre zero e o limite) evita que mil clientes que falharam juntos tentem de novo exatamente no mesmo instante e derrubem o serviço outra vez. Erros 4xx não são repetidos: um 400 ou 404 vai falhar igual na segunda vez.
+
+<Callout type="warning" title="Retry em cada camada multiplica a carga">
+Se o gateway tenta 3 vezes, o `pedidos` tenta 3 vezes e o `catalogo` tenta 3 vezes no banco, uma única falha no fundo gera 27 tentativas, justamente quando o sistema está mais frágil. Faça retry em um lugar só (de preferência perto da borda), mantenha o total de tentativas baixo e confira se a soma dos timeouts com as esperas cabe no tempo que o cliente original aceita esperar.
+</Callout>
+
+## Circuit breaker
+
+Retry ajuda contra falha passageira e piora a falha prolongada: se o `pagamentos` está fora há dez minutos, cada requisição ainda espera o timeout inteiro, segura um worker e manda mais carga para um serviço que já não aguenta. O circuit breaker corta esse ciclo. Ele conta falhas e, passado um limite, **abre**: as chamadas seguintes falham na hora, sem tocar na rede. Depois de um tempo, deixa passar uma chamada de teste (**meio aberto**); se ela funciona, **fecha** de novo.
+
+```python
+import time
+from collections.abc import Awaitable, Callable
+
+import httpx
+
+
+class CircuitoAberto(Exception):
+    pass
+
+
+class CircuitBreaker:
+    def __init__(self, limite_falhas: int = 5, tempo_aberto: float = 30.0) -> None:
+        self.limite_falhas = limite_falhas
+        self.tempo_aberto = tempo_aberto
+        self.falhas = 0
+        self.aberto_desde: float | None = None
+
+    async def chamar[T](self, operacao: Callable[[], Awaitable[T]]) -> T:
+        if self.aberto_desde is not None:
+            if time.monotonic() - self.aberto_desde < self.tempo_aberto:
+                raise CircuitoAberto("pagamentos indisponível")
+            # meio aberto: esta chamada decide se o circuito fecha
+        try:
+            resultado = await operacao()
+        except (httpx.TransportError, httpx.HTTPStatusError):
+            self.falhas += 1
+            if self.aberto_desde is not None or self.falhas >= self.limite_falhas:
+                self.aberto_desde = time.monotonic()
+            raise
+        self.falhas = 0
+        self.aberto_desde = None
+        return resultado
+```
+
+Esta versão é didática: o estado vive em memória, então cada processo (cada worker do uvicorn) tem o seu circuito, e no meio aberto várias requisições simultâneas podem passar juntas. Em produção, use uma biblioteca mantida ou deixe o papel para a malha de serviço. O ponto de projeto é o que fazer quando o circuito está aberto: devolver 503 rápido com `Retry-After`, servir um valor em cache (preço do lote há 30 segundos) ou aceitar o pedido e processar o pagamento depois. Falhar rápido já é uma melhoria enorme sobre ficar esperando.
+
+## Idempotência: repetir sem duplicar
+
+Retry tem uma consequência perigosa. O `pedidos` pede ao `pagamentos` para cobrar R$ 240, o `pagamentos` cobra, e a resposta se perde num timeout. Do ponto de vista do `pedidos`, a cobrança falhou e ele tenta de novo. Sem cuidado, o cliente paga duas vezes.
+
+A solução é a **chave de idempotência**: o chamador gera um identificador único para a operação e o reenvia em todas as tentativas. O servidor guarda o resultado associado à chave e, ao receber a mesma chave de novo, devolve o resultado guardado sem executar outra vez.
+
+```python
+# pagamentos/api.py
+from decimal import Decimal
+from typing import Annotated
+
+from fastapi import FastAPI, Header
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from pagamentos.db import Sessao  # Annotated[AsyncSession, Depends(obter_sessao)]
+from pagamentos.models import Cobranca
+from pagamentos.provedor import provedor
+
+app = FastAPI()
+
+
+class CobrancaIn(BaseModel):
+    pedido_id: int
+    valor: Decimal
+
+
+@app.post("/cobrancas", status_code=201)
+async def criar_cobranca(
+    dados: CobrancaIn,
+    sessao: Sessao,
+    idempotency_key: Annotated[str, Header()],
+) -> dict[str, str]:
+    existente = await sessao.scalar(
+        select(Cobranca).where(Cobranca.chave_idempotencia == idempotency_key)
+    )
+    if existente:
+        return {"id": existente.transacao_id, "status": existente.status}
+
+    transacao_id = await provedor.cobrar(dados.pedido_id, dados.valor, chave=idempotency_key)
+    sessao.add(Cobranca(chave_idempotencia=idempotency_key, transacao_id=transacao_id, status="aprovada"))
+    try:
+        await sessao.commit()
+    except IntegrityError:
+        await sessao.rollback()  # outra tentativa simultânea gravou primeiro
+    return {"id": transacao_id, "status": "aprovada"}
+```
+
+No FastAPI, o parâmetro `idempotency_key` com `Header()` lê o cabeçalho `Idempotency-Key` (o sublinhado vira hífen). A coluna `chave_idempotencia` tem constraint `UNIQUE`, que é o que protege contra duas tentativas chegando ao mesmo tempo: a consulta prévia sozinha não basta. O provedor externo também recebe a chave, porque a cobrança real acontece lá. Do lado do `pedidos`, a chave deve ser estável para o pedido (`f"pedido-{pedido_id}-cobranca"`), e não um `uuid4()` gerado a cada tentativa, o que anularia a proteção. `GET`, `PUT` e `DELETE` já são idempotentes por definição do HTTP; é o `POST` que precisa desse cuidado.
+
+## Comunicação assíncrona, em visão geral
+
+Nem toda conversa precisa de resposta imediata. Quando um pedido é pago, o `notificacoes` precisa saber, mas o cliente não deve esperar o e-mail sair para ver a confirmação. Nesse caso o `pagamentos` publica um evento `PagamentoAprovado` num broker (RabbitMQ ou Kafka), e quem se interessa consome no seu ritmo.
+
+| | Síncrona (HTTP) | Assíncrona (mensagens) |
+|---|---|---|
+| Acoplamento temporal | Os dois precisam estar no ar | O consumidor pode estar fora; a mensagem espera |
+| Resposta | Imediata, no mesmo fluxo | Eventual, por outro evento |
+| Falhas | Propagam para o chamador | Ficam na fila, com retry e fila de mensagens mortas |
+| Bom para | Consultas e decisões que o usuário espera | Reações, integrações, trabalho pesado |
+
+Mensageria traz seus próprios problemas: entrega pelo menos uma vez (o consumidor precisa ser idempotente, de novo), ordenação e o risco de gravar no banco e não publicar o evento, resolvido pelo padrão outbox. Os capítulos de RabbitMQ e Kafka desta carreira tratam disso com código.
+
+## API gateway, banco por serviço e saga
+
+O cliente (site, aplicativo) não deveria conhecer quatro endereços. Um **API gateway** fica na frente e concentra o que é comum a todas as rotas: roteamento (`/eventos` para o `catalogo`, `/pedidos` para o `pedidos`), terminação TLS, validação do JWT, rate limiting e o ID de correlação. Ele não deve conter regra de negócio, ou vira um monolito no lugar errado.
+
+**Banco por serviço** é a regra que torna os serviços independentes de verdade. Se o `pedidos` lê a tabela de lotes do `catalogo` direto no banco, qualquer mudança de schema no catálogo quebra os pedidos e os dois voltam a precisar de deploy coordenado. Cada serviço é dono dos seus dados, e os outros só os acessam pela API ou pelos eventos. O preço é que não existe mais `JOIN` entre domínios nem transação atravessando serviços.
+
+Sem transação distribuída, uma operação que envolve vários serviços vira uma **saga**: uma sequência de transações locais, cada uma com uma **compensação** que desfaz seu efeito.
+
+```text
+1. pedidos:    cria pedido PENDENTE                 compensação: marca CANCELADO
+2. catalogo:   reserva 2 ingressos do lote 7        compensação: devolve 2 ao estoque
+3. pagamentos: cobra R$ 240                          compensação: estorna
+4. pedidos:    marca PAGO e pede a geração dos ingressos
+```
+
+Se o passo 3 falha, as compensações rodam na ordem inversa: devolve o estoque e cancela o pedido. A saga pode ser **orquestrada** (o `pedidos` comanda cada passo e decide as compensações, fácil de seguir) ou **coreografada** (cada serviço reage aos eventos do anterior, sem coordenador central, mais desacoplada e mais difícil de rastrear). Note que a reserva de 15 minutos do `ingressos` é uma compensação natural: se o pagamento não confirma no prazo, o estoque volta. O capítulo de padrões de integração detalha a implementação.
+
+## Testes de contrato
+
+Testar o `pedidos` exige o `catalogo`. Subir os quatro serviços em cada pull request é lento e frágil; trocar o `catalogo` por um mock é rápido, mas o mock reflete o que você **acha** que o catálogo responde, e o teste continua verde depois que o time do catálogo renomeia `quantidade_disponivel`.
+
+O teste de contrato resolve o meio do caminho. O consumidor (`pedidos`) declara o que espera da resposta; o provedor (`catalogo`) roda essa expectativa contra a implementação real no pipeline dele, e uma mudança que quebra o consumidor falha no PR do provedor, antes do deploy. A ferramenta mais conhecida é o Pact, que gera o contrato a partir dos testes do consumidor e o verifica no provedor. Uma versão leve, sem infraestrutura extra, usa o próprio modelo Pydantic do consumidor como contrato:
+
+```python
+# pedidos/tests/test_cliente_catalogo.py
+import httpx
+import pytest
+
+from pedidos.clientes.catalogo import ClienteCatalogo
+
+LOTE_EXEMPLO = {"id": 7, "evento_id": 3, "preco": "120.00", "quantidade_disponivel": 40}
+
+
+def responder(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/lotes/7":
+        return httpx.Response(200, json=LOTE_EXEMPLO)
+    return httpx.Response(404)
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_buscar_lote_interpreta_a_resposta():
+    cliente = ClienteCatalogo("http://catalogo")
+    cliente._http = httpx.AsyncClient(
+        base_url="http://catalogo", transport=httpx.MockTransport(responder)
+    )
+
+    lote = await cliente.buscar_lote(7)
+
+    assert lote is not None and lote.quantidade_disponivel == 40
+    assert await cliente.buscar_lote(99) is None
+```
+
+O `httpx.MockTransport` responde sem rede, e o teste do consumidor fica rápido. Para fechar o contrato, o `catalogo` publica o `LOTE_EXEMPLO` como fixture versionada (ou o schema OpenAPI gerado pelo FastAPI) e tem um teste que valida a resposta real do seu endpoint contra ele. Se alguém mudar o formato, o teste do provedor quebra. A regra de evolução que mantém os contratos estáveis: acrescentar campo é seguro, remover ou renomear exige uma nova versão e um período de convivência.
+
+## Correlação de logs e health checks
+
+Uma compra lenta passou por gateway, `pedidos`, `catalogo` e `pagamentos`. Sem um identificador comum, achar as linhas de log dessa compra nos quatro serviços é impossível. O **ID de correlação** resolve: o gateway gera um `X-Request-ID`, cada serviço o lê, inclui em todo log e repassa nas chamadas que faz.
+
+```python
+# compartilhado/correlacao.py
+import logging
+import uuid
+from contextvars import ContextVar
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+request_id: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class CorrelacaoMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        valor = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        token = request_id.set(valor)
+        try:
+            resposta = await call_next(request)
+        finally:
+            request_id.reset(token)
+        resposta.headers["X-Request-ID"] = valor
+        return resposta
+
+
+class FiltroCorrelacao(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id.get()
+        return True
+
+
+async def propagar_request_id(request: httpx.Request) -> None:
+    request.headers["X-Request-ID"] = request_id.get()
+```
+
+`ContextVar` guarda o valor por requisição, isolado entre tarefas do asyncio que rodam ao mesmo tempo. O filtro coloca o ID em todo registro de log (use `%(request_id)s` no formato, de preferência JSON), e o hook `propagar_request_id`, registrado com `httpx.AsyncClient(event_hooks={"request": [propagar_request_id]})`, repassa o cabeçalho a cada chamada de saída. O passo seguinte é o tracing distribuído com OpenTelemetry, que mede a duração de cada salto; o capítulo de padrões arquiteturais trata de observabilidade.
+
+**Health checks** dizem à infraestrutura se a instância deve receber tráfego. Separe dois:
+
+```python
+@app.get("/saude/vivo")
+async def vivo() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/saude/pronto")
+async def pronto(sessao: Sessao) -> dict[str, str]:
+    await sessao.execute(select(1))
+    return {"status": "ok"}
+```
+
+O de **liveness** (`vivo`) só confirma que o processo responde; se falha, a plataforma reinicia o contêiner. O de **readiness** (`pronto`) confirma que a instância consegue trabalhar, por exemplo que o banco **próprio** responde; se falha, ela sai do balanceador sem ser reiniciada.
+
+<Callout type="tip" title="Não coloque dependências externas no health check">
+Se o readiness do `pedidos` consultar o `catalogo`, uma queda do catálogo tira todas as instâncias do `pedidos` do ar ao mesmo tempo, incluindo as rotas que nem usam o catálogo. A falha de um vizinho deve ser tratada na chamada (timeout, circuit breaker, resposta degradada), e o health check deve refletir só o que a própria instância controla.
+</Callout>
+
+## Na entrevista
+
+**Quando você não usaria microsserviços?** Em times pequenos, produtos ainda mudando de forma ou domínios sem fronteiras claras. O custo operacional (rede, consistência eventual, deploy e observabilidade distribuídos) só se paga quando há necessidade real de escala, isolamento ou independência entre times. Um monolito modular costuma ser o ponto de partida certo.
+
+**Por que retry precisa de idempotência?** Porque quem chama não distingue "não executou" de "executou e a resposta se perdeu". Sem uma chave de idempotência guardada pelo servidor, repetir um `POST` de cobrança pode cobrar duas vezes.
+
+**Como funciona um circuit breaker?** Ele conta falhas da dependência e, acima de um limite, abre: as chamadas falham imediatamente por um tempo, sem esperar o timeout. Depois deixa passar uma chamada de teste e fecha se ela funcionar. Isso protege o chamador de esgotar workers e dá fôlego para o serviço doente se recuperar.
+
+**Como manter consistência sem transação distribuída?** Com sagas: transações locais em sequência, cada uma com uma compensação, coordenadas por um orquestrador ou por eventos. A consistência passa a ser eventual, e a modelagem precisa prever estados intermediários como pedido pendente.
+
+**O que é um teste de contrato e por que não basta um mock?** É um teste em que o consumidor declara o formato que espera e o provedor verifica essa expectativa contra a implementação real. O mock só reflete a suposição do consumidor e continua passando quando o provedor muda.
+
+**Por que dois health checks?** Liveness decide reinício e deve checar só o processo. Readiness decide se a instância recebe tráfego e pode checar recursos próprios, como o banco. Misturar os dois faz a plataforma reiniciar instâncias que só estavam esperando uma dependência voltar.
+
+## Pratique
+
+Separe o `ingressos` em dois serviços FastAPI, `catalogo` e `pedidos`, num `docker compose` com um Postgres para cada:
+
+1. Implemente o `ClienteCatalogo` com cliente compartilhado criado no `lifespan`, timeout explícito e DTO Pydantic.
+2. Acrescente retry com backoff e jitter só para 502, 503, 504 e erros de transporte, e um teste que usa `MockTransport` devolvendo 503 duas vezes e 200 na terceira.
+3. Crie o serviço `pagamentos` com `POST /cobrancas` exigindo `Idempotency-Key` e constraint única. Prove com um teste que duas chamadas com a mesma chave geram uma cobrança só.
+4. Ponha um circuit breaker na chamada ao `pagamentos` e devolva 503 com `Retry-After` quando ele estiver aberto. Derrube o contêiner e observe as respostas rápidas.
+5. Adicione o middleware de correlação e os health checks `vivo` e `pronto` aos três serviços e mostre, nos logs, uma compra rastreada pelo mesmo `X-Request-ID`.
+
+<Quiz question="O pedidos chama POST /cobrancas, o pagamentos cobra, mas a resposta se perde num timeout. O que impede uma segunda cobrança quando o pedidos tenta de novo?" options={["Aumentar o timeout do cliente httpx","Um circuit breaker no pedidos","Uma chave de idempotência estável, reenviada em todas as tentativas e guardada com constraint única","Trocar POST por GET"]} answer={2} explanation="O servidor reconhece a chave já processada e devolve o resultado guardado sem cobrar de novo. A chave precisa ser a mesma em todas as tentativas, e a constraint única cobre tentativas simultâneas." />
+
+<Quiz question="Por que o retry usa jitter além do backoff exponencial?" options={["Para espalhar no tempo as novas tentativas de muitos clientes e evitar picos sincronizados","Para tornar o teste determinístico","Para repetir também os erros 4xx","Para dispensar o timeout"]} answer={0} explanation="Clientes que falharam juntos, com o mesmo backoff, tentariam de novo no mesmo instante. O sorteio da espera distribui a carga enquanto o serviço se recupera." />
+
+<Quiz question="O readiness do pedidos consulta o catalogo. O catalogo cai. Qual é a consequência?" options={["Nenhuma, o readiness só afeta o reinício","Só as rotas que usam o catálogo falham","O circuit breaker abre e o readiness passa","Todas as instâncias do pedidos saem do balanceador, inclusive para rotas que não dependem do catálogo"]} answer={3} explanation="Readiness falhando tira a instância do tráfego. Como todas consultam o mesmo vizinho, todas saem juntas. A falha de dependências deve ser tratada na chamada, não no health check." />
+
+## Base no CodeForge
+
+- [Microsserviços](/learn/system-design/microsservicos) e [API gateway](/learn/system-design/api-gateway): a visão de arquitetura por trás deste capítulo.
+- [Circuit breaker](/learn/system-design/circuit-breaker), [Idempotência](/learn/system-design/idempotencia) e [Saga](/learn/system-design/saga): os padrões de resiliência e consistência em detalhe.
+- [Padrões de Integração em Sistemas Distribuídos](/learn/carreira-python/padroes-integracao-sistemas-distribuidos): outbox, sagas e mensageria com código.
+- [Integração Contínua com Docker e GitHub Actions: Do build ao deploy](/learn/carreira-python/integracao-continua-docker-github-actions-build-deploy): o próximo passo, empacotar e publicar cada serviço.
+
+## Referências
+
+- [HTTPX: Timeouts](https://www.python-httpx.org/advanced/timeouts/)
+- [HTTPX: Transports (MockTransport)](https://www.python-httpx.org/advanced/transports/)
+- [FastAPI: Lifespan Events](https://fastapi.tiangolo.com/advanced/events/)
+- [contextvars (docs.python.org)](https://docs.python.org/3/library/contextvars.html)

@@ -1,0 +1,430 @@
+---
+title: "Kubernetes: Deployments, Volumes e escalabilidade"
+kind: lesson
+---
+
+O capítulo anterior terminou com a API do `ingressos` rodando num Pod criado à mão, atrás de um Service, com configuração em ConfigMap e Secret. Esse Pod tem três problemas sérios. Se o nó cair, ninguém o recria. Para trocar a versão, você precisa apagá-lo e criar outro, com a API fora do ar no intervalo. E o Postgres ao lado dele grava os dados dentro do contêiner: basta um reinício para perder todos os pedidos.
+
+Aqui você entrega o Pod a quem sabe cuidar dele. O Deployment mantém a quantidade de réplicas e troca versões gradualmente, as probes dizem ao cluster quando a aplicação está viva e pronta, requests e limits dão ao scheduler os números de que ele precisa, volumes persistentes guardam os dados do banco e o HorizontalPodAutoscaler ajusta o número de réplicas à carga do dia de abertura de vendas.
+
+**Você vai aprender:**
+
+- Usar Deployment e ReplicaSet para manter réplicas, atualizar com rolling update e voltar com rollback
+- Configurar probes de startup, readiness e liveness para uma aplicação Django ou FastAPI
+- Dimensionar requests e limits de CPU e memória e entender as consequências de cada um
+- Persistir dados com PersistentVolumeClaim e StorageClass, e rodar o Postgres num StatefulSet
+- Escalar automaticamente com HPA `autoscaling/v2` e metrics-server
+
+## ReplicaSet e Deployment
+
+O ReplicaSet tem uma única responsabilidade: garantir que exista um número fixo de Pods que casam com um selector, criando a partir de um molde (o `template`) quando falta e removendo quando sobra. Você quase nunca escreve um ReplicaSet diretamente, porque ele não sabe trocar de versão. Quem sabe é o Deployment, que cria um ReplicaSet novo para cada versão do template e move as réplicas do antigo para o novo.
+
+```yaml
+# api-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: ingressos
+  labels:
+    app: api
+    sistema: ingressos
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: api
+        sistema: ingressos
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/ingressos/api:1.4.0
+          command: ["gunicorn", "ingressos.wsgi:application", "-c", "/etc/ingressos/gunicorn.conf.py"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: api-config
+            - secretRef:
+                name: api-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ingressos
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: api-config
+```
+
+O `template` é exatamente o `spec` do Pod que você já tinha. As regras que importam: `selector.matchLabels` precisa casar com os labels do template e é imutável depois da criação; o Service `api` do capítulo anterior continua funcionando sem mudança, porque seleciona por `app: api` e agora encontra três Pods.
+
+```bash
+kubectl delete pod api -n ingressos          # remove o Pod avulso do capítulo anterior
+kubectl apply -f api-deployment.yaml
+kubectl get deployment,replicaset,pods -n ingressos -l app=api
+kubectl delete pod -n ingressos -l app=api   # apague todos: o ReplicaSet recria em segundos
+kubectl scale deployment api -n ingressos --replicas=5
+```
+
+Os Pods ganham nomes como `api-7c9d8b6f5d-x2kq8`: nome do Deployment, hash do template (que identifica o ReplicaSet) e um sufixo aleatório.
+
+## Rolling update e rollback
+
+Qualquer alteração no `template` (imagem, variável, recurso) dispara um rollout. Com a estratégia `RollingUpdate`, o Deployment cria o ReplicaSet novo e alterna: sobe Pods novos, espera ficarem prontos, derruba antigos. Dois parâmetros controlam o ritmo:
+
+| Parâmetro | Significado | Efeito com 3 réplicas |
+|---|---|---|
+| `maxSurge: 1` | Quantos Pods além do desejado podem existir durante a troca | Até 4 Pods ao mesmo tempo |
+| `maxUnavailable: 0` | Quantos Pods abaixo do desejado são tolerados | Nunca menos de 3 prontos |
+
+O padrão dos dois é 25%. Com `maxUnavailable: 0`, a capacidade nunca cai durante o deploy, ao custo de precisar de folga no cluster para o Pod extra. A outra estratégia, `Recreate`, derruba tudo antes de subir a versão nova: gera indisponibilidade e só se justifica quando duas versões não podem coexistir.
+
+```bash
+kubectl set image deployment/api api=ghcr.io/ingressos/api:1.5.0 -n ingressos
+kubectl rollout status deployment/api -n ingressos
+kubectl rollout history deployment/api -n ingressos
+kubectl rollout undo deployment/api -n ingressos                  # volta à revisão anterior
+kubectl rollout undo deployment/api -n ingressos --to-revision=2
+kubectl rollout restart deployment/api -n ingressos               # recria os Pods sem mudar o template
+```
+
+O rollback é rápido porque o ReplicaSet antigo continua existindo com zero réplicas (o `revisionHistoryLimit` define quantos são guardados): desfazer é só escalar o antigo e reduzir o novo. O `rollout restart` é a forma de fazer os Pods lerem um ConfigMap alterado. No fluxo real, em vez de `kubectl set image`, o pipeline altera a tag no manifesto versionado e aplica o arquivo, para o Git continuar sendo a fonte da verdade.
+
+Um rollout só é seguro se o cluster souber quando um Pod novo está de fato pronto. Sem probes, "pronto" significa apenas "o processo iniciou", e o Deployment pode trocar todas as réplicas por uma versão que sobe e responde 500.
+
+## Probes: startup, readiness e liveness
+
+| Probe | Pergunta | Quando falha |
+|---|---|---|
+| `startupProbe` | A aplicação terminou de iniciar? | Depois de esgotar as tentativas, o contêiner é reiniciado. Enquanto não passa, as outras duas ficam suspensas |
+| `readinessProbe` | Pode receber tráfego agora? | O Pod sai dos endpoints do Service, sem reinício |
+| `livenessProbe` | O processo travou sem volta? | O contêiner é reiniciado |
+
+Na API, exponha dois endpoints sem autenticação e sem custo. O de liveness não toca em nada externo; o de readiness confere as dependências sem as quais a API não atende ninguém:
+
+```python
+# ingressos/saude.py
+from django.db import connection
+from django.http import JsonResponse
+
+
+def healthz(request):
+    return JsonResponse({"status": "ok"})
+
+
+def readyz(request):
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+    except Exception:
+        return JsonResponse({"status": "indisponivel"}, status=503)
+    return JsonResponse({"status": "ok"})
+```
+
+```yaml
+# dentro de spec.template.spec.containers[0] do Deployment
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: api.ingressos.local
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: api.ingressos.local
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: api.ingressos.local
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+```
+
+A startup probe dá à aplicação até 60 segundos (30 tentativas a cada 2 segundos) para subir. Isso é melhor do que um `initialDelaySeconds` grande, que atrasa todos os Pods, inclusive os que sobem rápido.
+
+<Callout type="warning" title="Django, ALLOWED_HOSTS e as probes">
+O kubelet chama a probe HTTP usando o IP do Pod como cabeçalho `Host`. Como esse IP não está em `ALLOWED_HOSTS`, o Django responde 400 e o Pod nunca fica pronto, mesmo com a aplicação saudável. Por isso as probes acima enviam um `Host` fixo com `httpHeaders`, e esse valor deve constar em `ALLOWED_HOSTS`. Liberar `*` resolve do jeito errado, porque desliga a proteção contra ataques de cabeçalho Host.
+</Callout>
+
+Duas regras evitam os incidentes clássicos. A liveness nunca deve consultar banco ou fila: se o Postgres oscilar, todas as réplicas falham juntas, são reiniciadas juntas e o problema vira uma queda total. E a liveness deve ser mais tolerante que a readiness: tirar um Pod do balanceamento é barato e reversível, reiniciar não é.
+
+## Requests e limits
+
+Cada contêiner declara quanto precisa e quanto pode usar:
+
+```yaml
+# dentro de spec.template.spec.containers[0] do Deployment
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+```
+
+`250m` significa 250 milésimos de um núcleo. Os dois campos têm papéis diferentes:
+
+| Campo | Quem usa | Consequência |
+|---|---|---|
+| `requests` | Scheduler | Reserva. O Pod só entra num nó com essa quantidade livre. Sem nó que caiba, fica `Pending` |
+| `limits.cpu` | Kernel (cgroups) | Ao atingir o teto, o processo é contido (throttling) e fica lento, mas não morre |
+| `limits.memory` | Kernel (cgroups) | Ao ultrapassar, o contêiner é morto com `OOMKilled` (código de saída 137) e reiniciado |
+
+A combinação de requests e limits define a classe de qualidade de serviço do Pod: `Guaranteed` (requests iguais aos limits em tudo), `Burstable` (requests menores que limits) e `BestEffort` (nada declarado). Quando um nó fica sem memória, os `BestEffort` são despejados primeiro. Declarar requests em todo contêiner é o mínimo.
+
+Para Python, a conta de memória é direta: cada worker do gunicorn é um processo com sua cópia da aplicação. Se um worker ocupa 120 MiB depois de aquecido, dois workers precisam de um request em torno de 256 MiB e um limite com folga. Fixe o número de workers na configuração. Calcular a partir de `multiprocessing.cpu_count()` é uma armadilha: a função enxerga os núcleos do nó, não o limite do contêiner, e num nó de 32 núcleos sobe dezenas de workers que estouram a memória. No Kubernetes, prefira poucos workers por Pod e mais Pods: quem escala é o cluster.
+
+Muitos times definem limite de memória, mas não de CPU: memória não é compressível (passar do limite mata), enquanto o limite de CPU causa lentidão artificial mesmo com núcleo sobrando no nó. O request de CPU já garante a fatia mínima.
+
+## Volumes
+
+O sistema de arquivos de um contêiner some quando ele reinicia. Um volume é um diretório montado no contêiner cujo ciclo de vida é definido pelo tipo:
+
+| Tipo | Dura enquanto | Uso |
+|---|---|---|
+| `emptyDir` | O Pod existir | Arquivos temporários, cache, área compartilhada entre contêineres do mesmo Pod |
+| `configMap` e `secret` | O Pod existir | Configuração e credenciais como arquivos |
+| `persistentVolumeClaim` | A claim existir, independente do Pod | Dados que precisam sobreviver: banco, fila, uploads |
+
+Para dados duráveis, o Kubernetes separa quem oferece o armazenamento de quem o consome:
+
+- **PersistentVolume (PV)**: um pedaço de armazenamento real (um disco na nuvem, um diretório no nó). É um recurso do cluster, sem namespace.
+- **PersistentVolumeClaim (PVC)**: o pedido feito pela aplicação ("quero 5 GiB com leitura e escrita").
+- **StorageClass**: a receita que cria PVs sob demanda quando uma PVC chega (provisionamento dinâmico).
+
+```yaml
+# uploads-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: api-uploads
+  namespace: ingressos
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+```
+
+```bash
+kubectl get storageclass
+kubectl get pvc,pv -n ingressos
+```
+
+O kind e o minikube trazem uma StorageClass padrão chamada `standard`, que cria diretórios no nó. Em nuvem, a classe padrão cria discos de bloco gerenciados. Os modos de acesso dizem quem pode montar: `ReadWriteOnce` (um nó por vez, o caso de discos de bloco), `ReadOnlyMany`, `ReadWriteMany` (vários nós, exige um sistema de arquivos de rede) e `ReadWriteOncePod` (um único Pod). A `reclaimPolicy` da classe decide o destino do disco quando a PVC é apagada: `Delete` remove os dados, `Retain` preserva para recuperação manual. Em classes com `volumeBindingMode: WaitForFirstConsumer`, a PVC fica `Pending` até um Pod usá-la, o que é esperado.
+
+Repare na consequência para a API: um Deployment de três réplicas em nós diferentes não consegue compartilhar um volume `ReadWriteOnce`. Arquivos enviados por usuários devem ir para um object storage, e a API continua sem estado.
+
+## StatefulSet para o Postgres
+
+Bancos de dados não são intercambiáveis como réplicas de API: cada instância tem seus dados e sua identidade. O StatefulSet atende esse caso com três garantias que o Deployment não dá: nomes estáveis e ordenados (`postgres-0`, `postgres-1`), uma PVC própria por réplica, que é religada ao mesmo Pod depois de um reinício, e criação e remoção em ordem.
+
+```yaml
+# postgres.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ingressos
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ingressos
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        sistema: ingressos
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: ingressos
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: DB_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: DB_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ingressos", "-d", "ingressos"]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: dados
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: dados
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 5Gi
+```
+
+O Service com `clusterIP: None` é um **headless Service**: em vez de um IP virtual, o DNS devolve os IPs dos Pods, e cada um ganha um nome próprio, `postgres-0.postgres.ingressos.svc.cluster.local`. O nome curto `postgres` continua resolvendo, então a API não muda. O `volumeClaimTemplates` cria a PVC `dados-postgres-0`. A variável `PGDATA` aponta para um subdiretório porque alguns discos já vêm com um diretório `lost+found` na raiz, e o Postgres se recusa a inicializar num diretório não vazio.
+
+Teste a persistência: crie uma tabela, rode `kubectl delete pod postgres-0 -n ingressos` e confira que os dados continuam lá quando o Pod volta. Apagar o StatefulSet não apaga as PVCs, de propósito.
+
+<Callout type="tip" title="Banco em produção">
+Aumentar `replicas` deste StatefulSet para 3 cria três Postgres independentes, não um cluster replicado: replicação, failover e backup não vêm de graça. Em produção, use um banco gerenciado pelo provedor de nuvem ou um operator como o CloudNativePG, que automatiza essas tarefas. O StatefulSet de uma réplica serve bem para desenvolvimento e para entender o mecanismo.
+</Callout>
+
+## Escalando com o HPA
+
+O HorizontalPodAutoscaler altera o campo `replicas` de um Deployment com base em métricas. Ele precisa de uma fonte de métricas: o metrics-server, que coleta uso de CPU e memória dos kubelets. Clusters gerenciados costumam trazê-lo instalado; no kind é preciso instalar e, por causa dos certificados locais, aceitar o TLS do kubelet sem verificação:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl patch deployment metrics-server -n kube-system --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl top pods -n ingressos
+```
+
+No minikube, basta `minikube addons enable metrics-server`.
+
+```yaml
+# api-hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: ingressos
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+```
+
+A utilização é medida **em relação ao request**: com request de `250m`, 70% significa 175m de uso médio por Pod. Por isso o HPA não funciona sem requests declarados. A conta é `réplicas desejadas = teto(réplicas atuais × uso atual / alvo)`: com 3 réplicas a 140% de utilização média e alvo de 70%, o resultado é 6. O bloco `behavior` evita o efeito sanfona: a redução considera os últimos cinco minutos e remove no máximo um Pod por minuto.
+
+Quando o HPA controla um Deployment, remova o campo `replicas` do manifesto, senão cada `kubectl apply` devolve o número ao valor fixo. Gere carga e acompanhe:
+
+```bash
+kubectl run carga --rm -it --restart=Never --image=busybox:1.36 -n ingressos -- \
+  sh -c 'while true; do wget -qO- http://api/eventos/ > /dev/null; done'
+kubectl get hpa api -n ingressos --watch
+```
+
+CPU funciona bem como métrica para APIs síncronas. Para os consumidores de fila, o sinal certo é o tamanho da fila, que exige métricas customizadas ou externas (um adaptador do Prometheus ou o KEDA). E lembre do limite do outro lado: cada réplica nova abre conexões no Postgres. Sem um teto coerente com `max_connections` ou um pooler como o PgBouncer, escalar a API derruba o banco.
+
+## Na entrevista
+
+**Qual a relação entre Deployment, ReplicaSet e Pod?** O Deployment gerencia versões: cada mudança no template cria um ReplicaSet novo. O ReplicaSet mantém o número de Pods idênticos daquela versão. O rollout é a migração gradual de réplicas do ReplicaSet antigo para o novo, e o rollback é o caminho inverso.
+
+**Qual a diferença entre liveness e readiness?** Readiness decide se o Pod recebe tráfego: ao falhar, ele sai dos endpoints do Service e volta quando se recuperar. Liveness decide se o contêiner deve ser reiniciado. Dependências externas entram só na readiness, nunca na liveness, para uma falha do banco não virar reinício em massa.
+
+**O que acontece quando um contêiner passa do limite de memória? E do de CPU?** Ao passar do limite de memória, o kernel mata o processo: o status mostra `OOMKilled` e o contêiner reinicia. Ao atingir o limite de CPU, o processo é contido e fica mais lento, sem morrer.
+
+**Quando usar StatefulSet em vez de Deployment?** Quando cada réplica precisa de identidade estável e de armazenamento próprio: bancos, brokers, sistemas com quórum. Ele dá nomes ordenados, DNS por Pod via headless Service e uma PVC por réplica que acompanha o Pod. Aplicações sem estado ficam em Deployment.
+
+**Como o HPA decide quantas réplicas criar?** Ele compara a métrica média dos Pods com o alvo e aplica `réplicas atuais × uso atual / alvo`, arredondando para cima, dentro de `minReplicas` e `maxReplicas`. Para CPU e memória, o uso é percentual do request, obtido do metrics-server.
+
+**Qual a diferença entre PV, PVC e StorageClass?** O PV é o armazenamento concreto, a PVC é o pedido da aplicação e a StorageClass é o modelo que cria PVs sob demanda quando uma PVC aparece. A aplicação só conhece a PVC, o que a mantém independente do tipo de disco do ambiente.
+
+## Pratique
+
+1. Converta o Pod da API em Deployment com 3 réplicas, `maxSurge: 1` e `maxUnavailable: 0`. Apague Pods e um nó do kind (`docker stop` no contêiner do worker) e observe a recriação.
+2. Implemente `/healthz` e `/readyz` na API, configure as três probes e publique de propósito uma versão que responde 500 no `/readyz`: confirme que o rollout para sem derrubar as réplicas antigas e desfaça com `kubectl rollout undo`.
+3. Meça o consumo real com `kubectl top pods`, defina requests e limite de memória coerentes com o número de workers do gunicorn e provoque um `OOMKilled` com um limite baixo demais para ver o sintoma em `kubectl describe pod`.
+4. Substitua o Pod do Postgres por um StatefulSet com `volumeClaimTemplates`, rode as migrações do Django, apague o Pod e comprove que os pedidos continuam no banco.
+5. Instale o metrics-server, crie o HPA da API entre 3 e 12 réplicas a 70% de CPU, gere carga e registre quanto tempo o cluster leva para escalar e para voltar ao mínimo.
+
+<Quiz question="Durante um rolling update com maxSurge 1 e maxUnavailable 0 em um Deployment de 3 réplicas, o que o cluster garante?" options={["Nunca mais de 3 Pods no total","Todos os Pods antigos são removidos antes de criar os novos","Os Pods novos recebem tráfego assim que o processo inicia","Sempre pelo menos 3 Pods prontos e no máximo 4 no total"]} answer={3} explanation="maxUnavailable 0 impede que a capacidade caia abaixo do desejado e maxSurge 1 permite um Pod extra. Um Pod antigo só sai depois que um novo passa na readiness." />
+
+<Quiz question="O endpoint usado na liveness probe consulta o Postgres. O banco fica lento por dois minutos. Qual o efeito provável?" options={["Apenas o tráfego é pausado e depois retomado","Todas as réplicas da API são reiniciadas ao mesmo tempo, ampliando a falha","O HPA cria mais réplicas do banco","Nada, a liveness ignora timeouts"]} answer={1} explanation="Liveness com dependência externa transforma uma lentidão do banco em reinício em massa. Dependências pertencem à readiness, que só tira o Pod do balanceamento." />
+
+<Quiz question="Um HPA com alvo de 70 por cento de CPU não escala e mostra a métrica como unknown. Qual a causa mais comum?" options={["Os contêineres não declaram requests de CPU ou o metrics-server não está instalado","O Deployment tem réplicas demais","O Service é do tipo ClusterIP","A imagem usa a tag errada"]} answer={0} explanation="A utilização é calculada como percentual do request, com dados do metrics-server. Sem um dos dois, o HPA não consegue calcular a métrica." />
+
+## Base no CodeForge
+
+- [Kubernetes: Pods, Services e ConfigMaps](/learn/carreira-python/kubernetes-pods-services-configmaps): os manifestos de Pod, Service e configuração que este capítulo evolui.
+- [Rolling](/learn/system-design/rolling) e [Rollbacks](/learn/system-design/rollbacks): a estratégia de deploy que o Deployment implementa.
+- [Escalabilidade](/learn/system-design/escalabilidade): escala horizontal e por que a API precisa ser sem estado.
+- [Pool de conexões](/learn/system-design/pool-de-conexoes): o limite que aparece quando o HPA multiplica réplicas.
+- [Integração Contínua: Rollback e teste de carga](/learn/carreira-python/integracao-continua-rollback-teste-carga): como gerar a carga que valida o autoscaling.
+
+## Referências
+
+- [Kubernetes: Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+- [Kubernetes: Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
+- [Kubernetes: Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
+- [Kubernetes: Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)

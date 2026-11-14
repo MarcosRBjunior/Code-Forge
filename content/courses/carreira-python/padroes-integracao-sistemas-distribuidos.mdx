@@ -1,0 +1,436 @@
+---
+title: "Padrões de Integração em Sistemas Distribuídos"
+kind: lesson
+---
+
+Enquanto a plataforma de ingressos era um único processo com um único banco, "pedido pago gera ingressos e avisa o cliente" era uma transação e três chamadas de função. Separada em `catalogo`, `pedidos`, `pagamentos` e `notificacoes`, a mesma frase vira um problema de rede: o serviço de pagamentos pode estar fora do ar, a resposta pode se perder depois que o cartão já foi cobrado, a mensagem pode chegar duas vezes ou fora de ordem, e não existe mais um `ROLLBACK` que desfaça tudo de uma vez.
+
+Esses problemas têm soluções conhecidas e com nome. Este capítulo percorre os padrões que você vai usar para costurar serviços: quando chamar e quando publicar, como repetir uma operação sem duplicar o efeito, como gravar no banco e publicar um evento sem perder nenhum dos dois, e como coordenar uma compra inteira sem transação distribuída. Os exemplos usam FastAPI, SQLAlchemy e `httpx`; os brokers em si (RabbitMQ e Kafka) são assunto dos dois capítulos seguintes.
+
+**Você vai aprender:**
+
+- Escolher entre integração síncrona e assíncrona por critérios objetivos
+- Tornar chamadas e consumidores idempotentes com chave de idempotência
+- Publicar eventos de forma confiável com outbox transacional e CDC
+- Coordenar transações de negócio com saga orquestrada ou coreografada
+- Projetar webhooks seguros e posicionar um API gateway
+
+## Síncrono ou assíncrono
+
+A primeira decisão de toda integração é se quem chama precisa esperar.
+
+| Critério | Síncrono (HTTP, gRPC) | Assíncrono (fila, eventos) |
+|---|---|---|
+| Quem chama precisa da resposta agora | Sim | Não |
+| Acoplamento temporal | Os dois precisam estar no ar | O consumidor pode estar fora |
+| Latência para o usuário | Soma de todas as chamadas da cadeia | Resposta imediata, trabalho depois |
+| Pico de carga | Propaga para o serviço chamado | O broker absorve |
+| Vários interessados no mesmo fato | O produtor conhece e chama cada um | Publica uma vez, cada um assina |
+| Custo | Menor: o erro volta na hora | Maior: consistência eventual, duplicatas, monitoramento de filas |
+
+A regra prática: **consultas** que a tela espera são síncronas ("quantos lugares restam neste setor?"). **Fatos** cujas consequências podem acontecer em seguida são assíncronos ("pedido pago": gerar ingressos, enviar e-mail, atualizar relatório).
+
+Cuidado com cadeias síncronas longas. Se criar um pedido chama `catalogo`, que chama `pagamentos`, que chama o antifraude, a disponibilidade do conjunto é o produto das disponibilidades (quatro serviços a 99,9% dão cerca de 99,6%) e a latência é a soma. Cada elo síncrono exige timeout explícito e um plano para a falha.
+
+Mensagens também têm tipos, e nomeá-los ajuda no desenho:
+
+| Tipo | Intenção | Destinatário | Exemplo |
+|---|---|---|---|
+| Comando | Pedir que algo seja feito | Um serviço específico | `ReservarEstoque` |
+| Evento | Avisar que algo aconteceu | Quem tiver interesse | `PedidoPago` |
+| Consulta | Pedir um dado | Um serviço específico | `ObterDisponibilidade` |
+
+## Request/reply: timeout, retry e o problema da resposta perdida
+
+Toda chamada remota tem três resultados: sucesso, falha e "não sei". O terceiro é o que diferencia sistema distribuído de chamada de função: o timeout estourou, e você não sabe se o outro lado processou. A resposta padrão é repetir, com três cuidados.
+
+```python
+import random
+import time
+
+import httpx
+
+cliente = httpx.Client(
+    base_url="http://catalogo:8000",
+    timeout=httpx.Timeout(2.0, connect=0.5),
+)
+
+RECUPERAVEIS = {502, 503, 504}
+
+
+def consultar_disponibilidade(setor_id: str, tentativas: int = 3) -> dict:
+    for tentativa in range(1, tentativas + 1):
+        try:
+            resposta = cliente.get(f"/setores/{setor_id}/disponibilidade")
+            if resposta.status_code not in RECUPERAVEIS:
+                resposta.raise_for_status()
+                return resposta.json()
+        except httpx.TransportError:
+            pass
+        if tentativa < tentativas:
+            teto = 0.2 * 2 ** (tentativa - 1)
+            time.sleep(random.uniform(0, teto))
+    raise RuntimeError("catalogo indisponivel")
+```
+
+- **Timeout sempre.** O `httpx` tem um padrão de 5 segundos; defina o seu, mais curto, e separado para conexão. Uma chamada sem timeout prende um worker por tempo indeterminado.
+- **Backoff exponencial com jitter.** Esperar 0,2 s, 0,4 s, 0,8 s dá tempo de o outro lado se recuperar; o sorteio (jitter) evita que todas as instâncias repitam no mesmo instante e derrubem de novo quem acabou de voltar.
+- **Só repita o que é seguro repetir.** Erros 4xx são definitivos. `GET` é seguro por definição. `POST /pagamentos` só pode ser repetido se for idempotente, que é o próximo assunto.
+
+Em serviços com muito tráfego, some a isso um circuit breaker, tratado no capítulo de padrões arquiteturais. O request/reply também existe sobre mensageria: o solicitante publica com um `correlation_id` e o nome de uma fila de resposta, e casa a resposta pelo identificador. É útil quando o processamento demora, mas raramente compensa para consultas rápidas.
+
+## Entrega pelo menos uma vez e idempotência
+
+Um broker pode oferecer três garantias de entrega:
+
+| Garantia | Como acontece | Risco |
+|---|---|---|
+| No máximo uma vez | Confirma antes de processar | Perde mensagem se o consumidor cair |
+| Pelo menos uma vez | Confirma depois de processar | Duplica se a confirmação se perder |
+| Exatamente uma vez | Só dentro de limites bem definidos | Não cobre efeitos externos (e-mail, cobrança) |
+
+Na prática, você trabalha com **pelo menos uma vez** e torna o processamento **idempotente**: executar duas vezes produz o mesmo estado que executar uma. Entrega pelo menos uma vez somada a consumidor idempotente equivale, em efeito, a exatamente uma vez.
+
+Do lado da API, o padrão é a **chave de idempotência**. O cliente gera um identificador único para a operação e o envia no cabeçalho; se repetir a chamada, envia a mesma chave. O servidor guarda a chave com a resposta e, na repetição, devolve o que já tinha respondido, sem cobrar de novo.
+
+```python
+import hashlib
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import JSON, String
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+from ingressos.pagamentos.db import get_session
+from ingressos.pagamentos.servico import cobrar
+
+router = APIRouter()
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class ChaveDeIdempotencia(Base):
+    __tablename__ = "chaves_idempotencia"
+
+    chave: Mapped[str] = mapped_column(String(64), primary_key=True)
+    hash_requisicao: Mapped[str] = mapped_column(String(64))
+    resposta: Mapped[dict | None] = mapped_column(JSON, default=None)
+
+
+class DadosPagamento(BaseModel):
+    pedido_id: str
+    valor_centavos: int
+
+
+@router.post("/pagamentos", status_code=201)
+def criar_pagamento(
+    dados: DadosPagamento,
+    idempotency_key: Annotated[str, Header(max_length=64)],
+    session: Annotated[Session, Depends(get_session)],
+) -> dict:
+    impressao = hashlib.sha256(dados.model_dump_json().encode()).hexdigest()
+    reserva = session.execute(
+        insert(ChaveDeIdempotencia)
+        .values(chave=idempotency_key, hash_requisicao=impressao)
+        .on_conflict_do_nothing(index_elements=["chave"])
+    )
+    if reserva.rowcount == 0:
+        existente = session.get(ChaveDeIdempotencia, idempotency_key)
+        if existente.hash_requisicao != impressao:
+            raise HTTPException(422, "Chave reutilizada com outro conteudo")
+        if existente.resposta is None:
+            raise HTTPException(409, "Requisicao original em processamento")
+        return existente.resposta
+
+    resposta = cobrar(session, dados)
+    registro = session.get(ChaveDeIdempotencia, idempotency_key)
+    registro.resposta = resposta
+    session.commit()
+    return resposta
+```
+
+O `INSERT ... ON CONFLICT DO NOTHING` é o ponto central: a chave primária garante que, entre duas requisições simultâneas com a mesma chave, só uma insere. Conferir com `SELECT` antes de inserir teria uma janela de corrida. O hash do corpo detecta o cliente que reaproveita a chave para outra operação. A chave, a cobrança e a resposta são gravadas na mesma transação; se ela falhar, a chave some junto e a repetição começa do zero. Chaves antigas podem ser apagadas depois de um prazo (24 horas é comum).
+
+Do lado do consumidor de mensagens, o padrão equivalente é a tabela de mensagens processadas (inbox): cada mensagem carrega um id único, e o consumidor insere esse id e aplica o efeito na mesma transação.
+
+```python
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+
+def tratar_pedido_pago(session: Session, mensagem_id: str, pedido_id: str) -> None:
+    inserido = session.execute(
+        text(
+            "INSERT INTO mensagens_processadas (id) VALUES (:id) "
+            "ON CONFLICT (id) DO NOTHING"
+        ),
+        {"id": mensagem_id},
+    )
+    if inserido.rowcount == 0:
+        return  # duplicata: ja foi tratada
+    gerar_ingressos(session, pedido_id)
+    session.commit()
+```
+
+Sempre que possível, prefira operações naturalmente idempotentes: "definir status como pago" pode repetir à vontade; "somar 1 ao contador de vendidos" não pode.
+
+<Callout type="warning" title="Idempotência não é opcional">
+Com rede no meio, toda operação será repetida em algum momento: pelo retry do cliente, pela reentrega do broker, por um usuário que clicou duas vezes ou por um deploy que matou o processo antes da confirmação. Quem desenha um endpoint que move dinheiro ou estoque sem pensar na segunda execução está desenhando uma cobrança em dobro.
+</Callout>
+
+## Mensageria e pub/sub
+
+Dois modelos básicos de canal:
+
+- **Fila ponto a ponto**: cada mensagem é entregue a um único consumidor. Várias instâncias do mesmo serviço competem pela fila e dividem o trabalho. É o modelo para comandos e tarefas.
+- **Publicação e assinatura (pub/sub)**: cada assinante recebe a sua cópia. `pedidos` publica `PedidoPago` sem saber quem ouve; `notificacoes` e o relatório financeiro assinam, cada um com a sua fila ou o seu grupo de consumidores.
+
+O pub/sub inverte a dependência: acrescentar um interessado não exige mexer no produtor. O preço é que o fluxo deixa de estar escrito num lugar só, e o contrato do evento passa a ser uma API pública. Trate-o como tal:
+
+```json
+{
+  "id": "0a8f6c1e-6b0d-4f61-9f0e-2c1b8f0a7d11",
+  "tipo": "pedido.pago",
+  "versao": 1,
+  "ocorrido_em": "2026-03-01T20:04:11Z",
+  "correlation_id": "c7c1e1c0-52b4-4d0e-b7c8-7b1f1f6a9b02",
+  "dados": {"pedido_id": "1041", "cliente_id": "88", "total_centavos": 30000}
+}
+```
+
+O `id` serve à deduplicação, o `correlation_id` amarra tudo o que nasceu da mesma requisição, e a `versao` permite evoluir o formato. Mudanças compatíveis são adicionar campos opcionais; remover ou renomear campo exige uma versão nova publicada em paralelo. Sobre ordem: a maioria dos brokers só garante ordenação dentro de uma fila ou partição, então o consumidor deve tolerar eventos fora de ordem (por exemplo, ignorando um evento cuja versão do agregado é menor que a já aplicada).
+
+## Outbox transacional e CDC
+
+O erro mais comum em sistemas orientados a eventos é a escrita dupla:
+
+```python
+session.commit()                              # 1. grava o pedido como pago
+publicar("pedido.pago", {"pedido_id": "1041"})  # 2. publica no broker
+```
+
+Se o processo morrer entre as duas linhas, o pedido está pago e ninguém fica sabendo: os ingressos nunca são gerados. Inverter a ordem cria o problema oposto (evento de algo que não foi gravado). Banco e broker não compartilham transação.
+
+O **outbox transacional** resolve com o que o banco já garante: o evento é gravado numa tabela, na mesma transação da mudança de estado. Um processo separado lê essa tabela e publica.
+
+```python
+import json
+from datetime import UTC, datetime
+from uuid import uuid4
+
+from sqlalchemy import JSON, select
+from sqlalchemy.orm import Mapped, Session, mapped_column
+
+from ingressos.pedidos.db import Base, SessionLocal
+from ingressos.pedidos.models import Pedido
+
+
+class Outbox(Base):
+    __tablename__ = "outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    evento_id: Mapped[str] = mapped_column(unique=True)
+    tipo: Mapped[str]
+    payload: Mapped[dict] = mapped_column(JSON)
+    criado_em: Mapped[datetime]
+    publicado_em: Mapped[datetime | None] = mapped_column(default=None)
+
+
+def confirmar_pagamento(session: Session, pedido_id: int) -> None:
+    pedido = session.get(Pedido, pedido_id)
+    pedido.status = "pago"
+    session.add(
+        Outbox(
+            evento_id=str(uuid4()),
+            tipo="pedido.pago",
+            payload={"pedido_id": pedido.id, "cliente_id": pedido.cliente_id},
+            criado_em=datetime.now(UTC),
+        )
+    )
+    session.commit()  # estado e evento entram juntos ou nao entram
+```
+
+```python
+def publicar_pendentes(publicar) -> int:
+    with SessionLocal() as session:
+        pendentes = session.scalars(
+            select(Outbox)
+            .where(Outbox.publicado_em.is_(None))
+            .order_by(Outbox.id)
+            .limit(100)
+            .with_for_update(skip_locked=True)
+        ).all()
+        for registro in pendentes:
+            publicar(registro.tipo, registro.evento_id, json.dumps(registro.payload))
+            registro.publicado_em = datetime.now(UTC)
+        session.commit()
+        return len(pendentes)
+```
+
+O publicador roda em laço, com uma pausa curta quando não há pendentes. `FOR UPDATE SKIP LOCKED` permite várias instâncias sem que duas peguem o mesmo registro. Se o processo cair depois de publicar e antes do commit, os eventos são publicados de novo: o outbox garante **pelo menos uma vez**, e por isso cada evento leva `evento_id` e os consumidores são idempotentes.
+
+A alternativa ao laço de consulta é o **Change Data Capture (CDC)**: uma ferramenta como o Debezium lê o log de transações do banco (o WAL do PostgreSQL) e publica cada inserção da tabela de outbox num tópico do Kafka. Não há polling, a latência é baixa e a ordem de commit é preservada, ao custo de mais uma peça de infraestrutura. O CDC também pode publicar as mudanças de qualquer tabela, mas isso expõe o esquema interno como contrato; combinar CDC com outbox mantém o contrato sob seu controle.
+
+## Saga: transação de negócio sem transação distribuída
+
+Comprar ingressos envolve três serviços: reservar estoque no `catalogo`, cobrar em `pagamentos`, confirmar em `pedidos`. O commit em duas fases (2PC) manteria tudo atômico, mas bloqueia recursos, exige que todos os participantes o suportem e para quando o coordenador falha. A **saga** troca atomicidade por uma sequência de transações locais, cada uma com uma **compensação** que desfaz o seu efeito em termos de negócio.
+
+| Passo | Ação | Compensação |
+|---|---|---|
+| 1 | Criar pedido como pendente | Marcar pedido como cancelado |
+| 2 | Reservar estoque | Liberar estoque |
+| 3 | Cobrar pagamento | Estornar pagamento |
+| 4 | Confirmar pedido e gerar ingressos | (ponto sem volta: só avança) |
+
+Há duas formas de coordenar:
+
+| | Coreografia | Orquestração |
+|---|---|---|
+| Quem decide o próximo passo | Cada serviço, reagindo a eventos | Um orquestrador central |
+| Acoplamento | Baixo: ninguém conhece o fluxo todo | Os participantes conhecem só o orquestrador |
+| Visibilidade | Fluxo espalhado, difícil de acompanhar | Estado da saga num lugar só |
+| Quando usar | Fluxos curtos, de 2 a 3 passos | Fluxos longos, com ramificações e prazos |
+
+Na coreografia, `pedidos` publica `PedidoCriado`, `catalogo` reserva e publica `EstoqueReservado`, `pagamentos` cobra e publica `PagamentoAprovado` ou `PagamentoRecusado`, e cada serviço reage também aos eventos de falha para compensar. Na orquestração, o fluxo fica explícito:
+
+```python
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class EstadoSaga(StrEnum):
+    INICIADA = "iniciada"
+    ESTOQUE_RESERVADO = "estoque_reservado"
+    PAGA = "paga"
+    CONCLUIDA = "concluida"
+    COMPENSADA = "compensada"
+
+
+class FalhaDeNegocio(Exception):
+    pass
+
+
+@dataclass
+class SagaDeCompra:
+    pedido_id: str
+    setor_id: str
+    quantidade: int
+    valor_centavos: int
+    estado: EstadoSaga = EstadoSaga.INICIADA
+
+
+def executar(saga: SagaDeCompra, catalogo, pagamentos, pedidos, salvar) -> None:
+    try:
+        catalogo.reservar(saga.setor_id, saga.quantidade, chave=f"{saga.pedido_id}:reserva")
+        saga.estado = EstadoSaga.ESTOQUE_RESERVADO
+        salvar(saga)
+
+        pagamentos.cobrar(saga.pedido_id, saga.valor_centavos, chave=f"{saga.pedido_id}:cobranca")
+        saga.estado = EstadoSaga.PAGA
+        salvar(saga)
+
+        pedidos.confirmar(saga.pedido_id)
+        saga.estado = EstadoSaga.CONCLUIDA
+        salvar(saga)
+    except FalhaDeNegocio:
+        compensar(saga, catalogo, pagamentos, pedidos)
+        salvar(saga)
+
+
+def compensar(saga: SagaDeCompra, catalogo, pagamentos, pedidos) -> None:
+    if saga.estado is EstadoSaga.PAGA:
+        pagamentos.estornar(saga.pedido_id, chave=f"{saga.pedido_id}:estorno")
+    if saga.estado in {EstadoSaga.PAGA, EstadoSaga.ESTOQUE_RESERVADO}:
+        catalogo.liberar(saga.setor_id, saga.quantidade, chave=f"{saga.pedido_id}:liberacao")
+    pedidos.cancelar(saga.pedido_id)
+    saga.estado = EstadoSaga.COMPENSADA
+```
+
+O que torna isso correto em produção: o estado é **persistido a cada passo** (`salvar`), de modo que um processo reiniciado retoma de onde parou; cada chamada leva uma **chave de idempotência** derivada do pedido, porque retomar significa repetir o último passo; e as compensações também são idempotentes e repetidas até darem certo. Falha técnica (timeout) leva a retry; só falha de negócio (cartão recusado, setor esgotado) leva à compensação. Em sistemas maiores, cada passo vira um comando enviado por mensageria e o orquestrador reage às respostas, ou usa-se um motor de workflow durável.
+
+A saga não tem isolamento: entre o passo 2 e o 3, outros clientes enxergam o estoque reservado. É por isso que o domínio tem estados intermediários explícitos (pedido pendente, reserva com prazo de 15 minutos) e um processo que expira reservas abandonadas.
+
+## Webhooks e API gateway
+
+**Webhook** é a integração assíncrona sobre HTTP: em vez de você perguntar ao gateway de pagamento se a cobrança saiu, ele faz um `POST` no seu endpoint quando o estado muda. Receber webhooks com segurança exige quatro cuidados: verificar a assinatura, responder rápido, deduplicar e não confiar na ordem.
+
+```python
+import hashlib
+import hmac
+import json
+import os
+
+from fastapi import APIRouter, Header, HTTPException, Request
+
+router = APIRouter()
+SEGREDO = os.environ["WEBHOOK_SEGREDO"].encode()
+
+
+@router.post("/webhooks/pagamentos", status_code=202)
+async def receber_webhook(
+    request: Request,
+    x_assinatura: str = Header(),
+) -> dict:
+    corpo = await request.body()
+    esperada = hmac.new(SEGREDO, corpo, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(esperada, x_assinatura):
+        raise HTTPException(401, "Assinatura invalida")
+    evento = json.loads(corpo)
+    await enfileirar(evento["id"], evento)
+    return {"recebido": True}
+```
+
+A assinatura HMAC é calculada sobre os bytes exatos do corpo, antes de qualquer interpretação, e comparada em tempo constante. O endpoint só valida, guarda e responde `202`; o processamento acontece depois, num consumidor idempotente que usa `evento["id"]` para descartar duplicatas (provedores reenviam quando não recebem 2xx a tempo). Como a ordem não é garantida, ao receber "pagamento aprovado" vale consultar o estado atual na API do provedor em vez de confiar só no conteúdo. Muitos provedores incluem um timestamp na assinatura para impedir a reapresentação de um webhook antigo.
+
+Quando é você quem envia webhooks, valem os padrões anteriores: gravar o envio numa tabela (outbox), repetir com backoff, assinar, e ter uma forma de o cliente consultar eventos perdidos.
+
+O **API gateway** é a porta única na frente dos serviços. Ele concentra o que é transversal: terminação TLS, validação do token, limite de requisições, roteamento por caminho (`/eventos` para `catalogo`, `/pedidos` para `pedidos`), CORS e registro de acesso. Com isso, os clientes conhecem um endereço só e os serviços internos não ficam expostos. Duas ressalvas: regra de negócio não mora no gateway, e a autorização por objeto (este pedido é deste cliente?) continua sendo responsabilidade de cada serviço. Quando web e aplicativo móvel precisam de respostas muito diferentes, um Backend for Frontend por cliente faz a agregação em vez de inchar o gateway.
+
+<Callout type="tip" title="Comece pelo mais simples que resolve">
+Um monólito modular com uma tabela de outbox e um consumidor já entrega desacoplamento e confiabilidade. Saga orquestrada, CDC e gateway dedicado entram quando o problema aparece: fluxo longo com compensações, volume que o polling não atende, muitos serviços expostos.
+</Callout>
+
+## Na entrevista
+
+**Como você garante que um pagamento não seja cobrado duas vezes se o cliente repetir a requisição?** Com chave de idempotência: o cliente envia um identificador único da operação, e o servidor o grava com restrição de unicidade na mesma transação da cobrança. Na repetição, devolve a resposta guardada. A unicidade no banco é o que protege contra requisições simultâneas.
+
+**O que o outbox transacional resolve?** A escrita dupla: gravar no banco e publicar no broker não são atômicos, e uma falha entre os dois perde ou inventa eventos. O outbox grava o evento numa tabela na mesma transação do estado, e um publicador ou CDC o envia depois, com garantia de pelo menos uma vez.
+
+**Saga orquestrada ou coreografada?** Coreografia para fluxos curtos, em que cada serviço reage a eventos e ninguém coordena. Orquestração quando há muitos passos, ramificações ou prazos, porque o estado e a lógica de compensação ficam num lugar só e são mais fáceis de acompanhar e depurar.
+
+**Existe entrega exatamente uma vez?** Como garantia geral de rede, não. O que se obtém é entrega pelo menos uma vez com processamento idempotente, que produz o mesmo efeito. Alguns brokers oferecem exatamente uma vez dentro do próprio sistema, mas efeitos externos, como enviar e-mail, continuam exigindo deduplicação.
+
+**Por que não usar 2PC entre microsserviços?** Porque ele mantém bloqueios enquanto espera todos os participantes, reduz a disponibilidade ao produto das disponibilidades e depende de um coordenador que, se falhar, deixa transações pendentes. Além disso, brokers e APIs de terceiros em geral não participam.
+
+## Pratique
+
+1. Adicione chave de idempotência ao `POST /pagamentos` e escreva um teste que dispara a mesma requisição duas vezes em paralelo e confere que só uma cobrança foi criada.
+2. Implemente o outbox em `pedidos`: grave `pedido.pago` na mesma transação e escreva o publicador com `SKIP LOCKED`. Mate o processo entre publicar e confirmar e verifique que o evento é reenviado.
+3. Torne o consumidor de `notificacoes` idempotente com a tabela de mensagens processadas e prove com um teste que a mesma mensagem entregue duas vezes gera um único e-mail.
+4. Escreva a saga orquestrada de compra com persistência de estado e teste três cenários: sucesso, cartão recusado (libera estoque) e queda do processo depois da cobrança (retoma sem cobrar de novo).
+5. Crie o endpoint de webhook de pagamentos com verificação HMAC e teste assinatura inválida, corpo adulterado e evento duplicado.
+
+<Quiz question="O serviço grava o pedido no banco e, em seguida, publica o evento no broker. Qual é o risco?" options={["O evento ser publicado duas vezes sempre","O processo cair entre as duas operações e o evento nunca ser publicado","O banco rejeitar a transação por causa do broker","O consumidor receber o evento antes do commit em todos os casos"]} answer={1} explanation="Banco e broker não compartilham transação. Uma falha entre o commit e a publicação deixa o estado gravado sem evento. O outbox grava os dois na mesma transação local." />
+
+<Quiz question="Em uma saga, o que é uma compensação?" options={["Um rollback automático feito pelo banco de dados","Uma segunda tentativa da mesma operação","Uma operação de negócio que desfaz o efeito de um passo já confirmado","Um bloqueio distribuído entre os serviços"]} answer={2} explanation="Cada passo de uma saga é uma transação local já confirmada. Para desfazê-lo, executa-se uma nova operação, como estornar o pagamento ou liberar o estoque." />
+
+<Quiz question="Qual combinação produz, na prática, o efeito de exatamente uma vez?" options={["Entrega pelo menos uma vez com consumidor idempotente","Entrega no máximo uma vez com retry no produtor","Confirmar a mensagem antes de processar","Usar HTTP em vez de mensageria"]} answer={0} explanation="Com pelo menos uma vez nada se perde, e a idempotência neutraliza as duplicatas. Confirmar antes de processar é no máximo uma vez e pode perder mensagens." />
+
+## Base no CodeForge
+
+- [Microsserviços em Python: Comunicação, testes e resiliência](/learn/carreira-python/microsservicos-python-comunicacao-testes-resiliencia): os serviços que este capítulo integra.
+- [Idempotência](/learn/system-design/idempotencia), [Outbox](/learn/system-design/outbox) e [Saga](/learn/system-design/saga): cada padrão em profundidade.
+- [Semânticas de entrega](/learn/system-design/semanticas-de-entrega) e [CDC](/learn/system-design/cdc): as garantias dos brokers e a captura de mudanças.
+- [Webhooks](/learn/system-design/webhooks) e [API gateway](/learn/system-design/api-gateway): as bordas do sistema.
+- [Mensageria com Python e RabbitMQ: Integração assíncrona entre serviços](/learn/carreira-python/mensageria-python-rabbitmq-integracao-assincrona): o próximo passo, com um broker de verdade.
+
+## Referências
+
+- [Enterprise Integration Patterns](https://www.enterpriseintegrationpatterns.com/patterns/messaging/)
+- [microservices.io: Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html)
+- [microservices.io: Saga](https://microservices.io/patterns/data/saga.html)
+- [HTTPX: Timeouts](https://www.python-httpx.org/advanced/timeouts/)
