@@ -1,0 +1,406 @@
+---
+title: "Kubernetes com microsserviços: Subindo e gerenciando uma aplicação"
+kind: lesson
+---
+
+Até aqui o cluster rodava uma API e um banco. No capítulo de microsserviços, porém, a plataforma `ingressos` foi dividida em quatro serviços: `catalogo` (eventos, setores e lotes), `pedidos` (reserva e ciclo de vida do pedido), `pagamentos` (integração com o gateway) e `notificacoes` (e-mails com os ingressos), conversando por HTTP e por eventos no RabbitMQ. Colocar isso no Kubernetes multiplica tudo o que você já sabe fazer por quatro, e cria problemas novos: cada serviço com seu banco e suas variáveis, o mesmo conjunto de manifestos em desenvolvimento, homologação e produção com valores diferentes, e um incidente que começa com "o pedido não foi pago" e pode estar em qualquer um dos quatro.
+
+Este capítulo sobe a plataforma inteira, organiza os manifestos com Kustomize para que cada ambiente seja uma pequena diferença sobre uma base comum e monta a rotina de operação: ler logs de vários Pods, entrar num contêiner sem shell, ler eventos e diagnosticar os três estados de falha que você mais vai encontrar.
+
+**Você vai aprender:**
+
+- Subir os quatro serviços, o Postgres e o RabbitMQ com descoberta por DNS
+- Organizar manifestos em base e overlays com Kustomize, gerando ConfigMaps e trocando imagens por ambiente
+- Configurar a comunicação síncrona e assíncrona entre serviços com timeouts e propagação de correlação
+- Investigar com `kubectl logs`, `kubectl events` e `kubectl debug`, e montar uma observabilidade básica
+- Diagnosticar CrashLoopBackOff, ImagePullBackOff e Pending a partir dos sintomas
+
+## O mapa da plataforma no cluster
+
+| Componente | Objeto | Service | Fala com |
+|---|---|---|---|
+| `catalogo` (Django + DRF) | Deployment, 2 réplicas | `catalogo:80` | Postgres (banco `catalogo`) |
+| `pedidos` (FastAPI) | Deployment, 3 réplicas | `pedidos:80` | Postgres (banco `pedidos`), `catalogo` por HTTP, RabbitMQ |
+| `pagamentos` (FastAPI) | Deployment, 2 réplicas | `pagamentos:80` | Postgres (banco `pagamentos`), RabbitMQ, gateway externo |
+| `notificacoes` (consumidor `aio-pika`) | Deployment, 2 réplicas | nenhum | RabbitMQ, provedor de e-mail |
+| `postgres` | StatefulSet, 1 réplica | `postgres:5432` (headless) | |
+| `rabbitmq` | StatefulSet, 1 réplica | `rabbitmq:5672` e `15672` | |
+
+Duas decisões merecem explicação. Cada serviço tem seu próprio banco lógico (e usuário), ainda que no mesmo servidor Postgres em desenvolvimento: o isolamento de dados é o que permite cada serviço evoluir o schema sozinho. Em produção, os bancos costumam ficar em instâncias gerenciadas separadas. E `notificacoes` não tem Service, porque ninguém o chama: ele só consome da fila. Um Service sem quem o chame é superfície de ataque sem uso.
+
+Todos rodam no namespace `ingressos` e se encontram pelo DNS que você viu no primeiro capítulo de Kubernetes: `pedidos` chama `http://catalogo/api/eventos/`, todos publicam em `amqp://rabbitmq:5672/`. Nenhum endereço muda entre ambientes, só o namespace, e o nome curto resolve dentro dele.
+
+O RabbitMQ segue o mesmo modelo do Postgres, um StatefulSet com volume. O trecho que difere é o Secret com as credenciais e o cookie do Erlang:
+
+```yaml
+# base/rabbitmq.yaml (trecho do StatefulSet)
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:4-management
+          ports:
+            - name: amqp
+              containerPort: 5672
+            - name: gestao
+              containerPort: 15672
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secrets
+                  key: usuario
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secrets
+                  key: senha
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: dados
+              mountPath: /var/lib/rabbitmq
+```
+
+Para filas com alta disponibilidade em produção, o caminho é o RabbitMQ Cluster Operator ou o serviço gerenciado do provedor, pela mesma razão do Postgres.
+
+## Kustomize: base e overlays
+
+Quatro serviços com Deployment, Service, ConfigMap e HPA já são dezenas de arquivos. Copiá-los para cada ambiente e editar à mão garante que, em três meses, produção terá uma probe que desenvolvimento não tem e ninguém saberá por quê. O Kustomize resolve isso sem templates: você escreve YAML válido numa **base** e descreve cada ambiente como um **overlay** que aplica modificações. Ele vem embutido no kubectl (`kubectl apply -k`).
+
+```text
+k8s/
+  base/
+    kustomization.yaml
+    catalogo.yaml
+    pedidos.yaml
+    pagamentos.yaml
+    notificacoes.yaml
+    postgres.yaml
+    rabbitmq.yaml
+  overlays/
+    dev/
+      kustomization.yaml
+      .env.secrets
+    prod/
+      kustomization.yaml
+      pedidos-hpa.yaml
+      pedidos-recursos.yaml
+```
+
+```yaml
+# k8s/base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingressos
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: ingressos
+    includeSelectors: false
+resources:
+  - catalogo.yaml
+  - pedidos.yaml
+  - pagamentos.yaml
+  - notificacoes.yaml
+  - postgres.yaml
+  - rabbitmq.yaml
+configMapGenerator:
+  - name: comum-config
+    literals:
+      - RABBITMQ_HOST=rabbitmq
+      - DB_HOST=postgres
+      - LOG_FORMAT=json
+      - CATALOGO_URL=http://catalogo
+  - name: pedidos-config
+    literals:
+      - RESERVA_EXPIRA_MINUTOS=15
+      - DB_NAME=pedidos
+```
+
+O `configMapGenerator` cria ConfigMaps com um sufixo de hash no nome (`pedidos-config-7g2k9t4m8b`) e reescreve as referências nos Deployments. A consequência é valiosa: alterar um valor muda o nome, o que muda o template do Pod e dispara um rollout. O problema do capítulo anterior, ConfigMap alterado sem efeito nos Pods em execução, deixa de existir. O `labels` com `includeSelectors: false` acrescenta o label a todos os objetos sem mexer nos selectors, que são imutáveis.
+
+O overlay de desenvolvimento aponta para a base e muda o mínimo:
+
+```yaml
+# k8s/overlays/dev/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingressos-dev
+resources:
+  - ../../base
+images:
+  - name: ghcr.io/ingressos/pedidos
+    newTag: dev-3f9c2a1
+replicas:
+  - name: pedidos
+    count: 1
+  - name: catalogo
+    count: 1
+configMapGenerator:
+  - name: comum-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=DEBUG
+secretGenerator:
+  - name: pedidos-secrets
+    envs:
+      - .env.secrets
+```
+
+E o de produção usa um patch para o que não tem atalho, como recursos e o HPA:
+
+```yaml
+# k8s/overlays/prod/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: ingressos-prod
+resources:
+  - ../../base
+  - pedidos-hpa.yaml
+images:
+  - name: ghcr.io/ingressos/pedidos
+    newTag: "2.3.0"
+  - name: ghcr.io/ingressos/catalogo
+    newTag: "1.8.1"
+patches:
+  - path: pedidos-recursos.yaml
+```
+
+```yaml
+# k8s/overlays/prod/pedidos-recursos.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pedidos
+spec:
+  template:
+    spec:
+      containers:
+        - name: pedidos
+          resources:
+            requests:
+              cpu: 500m
+              memory: 384Mi
+            limits:
+              memory: 768Mi
+```
+
+Esse patch é um strategic merge: o Kustomize localiza o contêiner pelo `name` e funde só os campos indicados. Para alterações cirúrgicas há também patches JSON 6902, com operações `add`, `replace` e `remove` em caminhos exatos.
+
+```bash
+kubectl kustomize k8s/overlays/prod            # renderiza sem aplicar
+kubectl diff -k k8s/overlays/prod              # o que mudaria no cluster
+kubectl apply -k k8s/overlays/prod
+```
+
+Faça do `kubectl diff -k` um passo do pipeline: o revisor vê exatamente o que vai mudar no cluster. No pipeline, o passo de release vira `kustomize edit set image ghcr.io/ingressos/pedidos:2.3.1` dentro do overlay, seguido de commit, e o Git registra qual versão está em cada ambiente.
+
+<Callout type="warning" title="Segredos no secretGenerator">
+O `secretGenerator` lê arquivos locais, o que é cômodo em desenvolvimento e perigoso se o `.env.secrets` entrar no Git. Ponha o arquivo no `.gitignore` e, em produção, não gere Secrets a partir de arquivos no repositório: use um gestor externo que cria o Secret no cluster, assunto do capítulo de segurança.
+</Callout>
+
+## Comunicação entre os serviços
+
+A chamada de `pedidos` ao `catalogo` para reservar lugares é síncrona: o pedido não pode ser criado sem a confirmação de estoque. No cluster, essa chamada passa pelo Service, que distribui entre as réplicas do `catalogo` prontas. Três cuidados tornam-na robusta:
+
+```python
+# pedidos/clientes.py
+import os
+from contextvars import ContextVar
+
+import httpx
+
+correlation_id: ContextVar[str] = ContextVar("correlation_id", default="-")
+
+CATALOGO_URL = os.environ["CATALOGO_URL"]
+
+cliente_catalogo = httpx.AsyncClient(
+    base_url=CATALOGO_URL,
+    timeout=httpx.Timeout(2.0, connect=0.5),
+    limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+)
+
+
+class CatalogoIndisponivel(Exception):
+    pass
+
+
+async def reservar_lugares(setor_id: int, quantidade: int) -> dict:
+    try:
+        resposta = await cliente_catalogo.post(
+            f"/api/setores/{setor_id}/reservas/",
+            json={"quantidade": quantidade},
+            headers={"X-Correlation-ID": correlation_id.get()},
+        )
+    except httpx.TransportError as erro:
+        raise CatalogoIndisponivel(str(erro)) from erro
+    resposta.raise_for_status()
+    return resposta.json()
+```
+
+Primeiro, timeout explícito e curto: o padrão do `httpx` é 5 segundos, e um `catalogo` lento seguraria workers do `pedidos` até esgotá-los. Segundo, um único cliente reutilizado, com pool limitado, em vez de um cliente por requisição. Terceiro, o identificador de correlação viaja no cabeçalho, para que os logs dos dois serviços possam ser ligados. Retentativas, circuit breaker e idempotência da reserva, vistos no capítulo de microsserviços, continuam valendo; o Kubernetes não os substitui.
+
+Um detalhe de rede: como o Service balanceia por conexão, e não por requisição, conexões keep-alive longas tendem a concentrar tráfego nas réplicas que já existiam quando o cliente abriu o pool. Depois de um aumento de réplicas pelo HPA, as novas podem ficar ociosas por um tempo. Limitar a vida das conexões do pool ou usar um service mesh, que balanceia por requisição, resolve quando isso importa.
+
+A parte assíncrona não muda com o cluster: `pagamentos` publica `pagamento.aprovado` numa exchange, `pedidos` e `notificacoes` consomem com suas filas. O que muda é a operação: com réplicas que sobem e descem, cada consumidor precisa de `prefetch_count`, ack manual e encerramento gracioso, como no consumidor do capítulo anterior, e o mesmo evento pode ser entregue duas vezes, então o processamento deve ser idempotente.
+
+## Ordem de inicialização
+
+Em Docker Compose, `depends_on` ordena a subida. No Kubernetes não existe isso, de propósito: num cluster, o RabbitMQ pode reiniciar a qualquer momento, depois de todo mundo ter subido. A aplicação precisa tolerar a dependência ausente, tentando de novo com espera crescente, e a readiness probe deve falhar enquanto a conexão não existir, tirando o Pod do balanceamento sem reiniciá-lo.
+
+```python
+# pedidos/main.py
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+import aio_pika
+from fastapi import FastAPI, Response
+
+from pedidos.clientes import cliente_catalogo
+
+log = logging.getLogger("pedidos")
+
+
+async def conectar_broker(url: str) -> aio_pika.abc.AbstractRobustConnection:
+    espera = 1.0
+    while True:
+        try:
+            return await aio_pika.connect_robust(url)
+        except OSError as erro:
+            log.warning("broker indisponivel, nova tentativa em %.0fs: %s", espera, erro)
+            await asyncio.sleep(espera)
+            espera = min(espera * 2, 30)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.broker = await conectar_broker("amqp://rabbitmq:5672/")
+    yield
+    await app.state.broker.close()
+    await cliente_catalogo.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/readyz")
+async def readyz(response: Response):
+    if app.state.broker.is_closed:
+        response.status_code = 503
+        return {"broker": "desconectado"}
+    return {"broker": "ok"}
+```
+
+O `connect_robust` reconecta sozinho se a conexão cair depois, e enquanto isso o `/readyz` responde 503 e o Pod sai do balanceamento. A startup probe dá folga para a primeira conexão. Quando realmente for preciso esperar algo antes do contêiner principal, como checar se o banco aceita conexões, um **init container** roda até terminar antes dos demais, mas ele só ajuda na subida, não depois.
+
+## Logs, eventos e kubectl debug
+
+Com quatro serviços e várias réplicas, ler logs Pod a Pod não escala. O kubectl seleciona por label:
+
+```bash
+kubectl logs -n ingressos -l app=pedidos --tail=100 --prefix -f
+kubectl logs -n ingressos deploy/pagamentos --since=15m
+kubectl logs -n ingressos pedidos-6d8f7c9b4-k2xzp --previous     # contêiner anterior, antes do reinício
+kubectl events -n ingressos --for pod/pedidos-6d8f7c9b4-k2xzp
+kubectl get events -n ingressos --sort-by=.lastTimestamp
+kubectl top pods -n ingressos --sort-by=memory
+```
+
+O `--previous` é o que mais ajuda num Pod que reinicia: o log atual está vazio, o motivo está no anterior. Eventos registram o que o cluster fez com o Pod (agendamento, download de imagem, probes falhando, OOM) e expiram em cerca de uma hora.
+
+Para que os logs funcionem, a aplicação escreve na saída padrão, uma linha por evento, de preferência em JSON. O runtime grava a saída em arquivo no nó, e um coletor rodando como DaemonSet (Fluent Bit, Vector, o agente do OpenTelemetry) envia tudo para uma central como Loki ou Elasticsearch. Nada de arquivos de log dentro do contêiner.
+
+Imagens enxutas como as de produção muitas vezes não têm shell nem ferramentas, e `kubectl exec -- sh` falha. O `kubectl debug` adiciona um **contêiner efêmero** ao Pod em execução, com a imagem que você escolher, sem reiniciá-lo:
+
+```bash
+# shell com ferramentas, compartilhando a visão de processos do contêiner pedidos
+kubectl debug -it -n ingressos pedidos-6d8f7c9b4-k2xzp --image=nicolaka/netshoot --target=pedidos
+
+# dentro do contêiner efêmero
+nslookup catalogo
+curl -sv http://catalogo/healthz
+ps aux
+
+# cópia do Pod com o comando trocado, para investigar um Pod que nem chega a subir
+kubectl debug -n ingressos pedidos-6d8f7c9b4-k2xzp -it --copy-to=pedidos-debug \
+  --container=pedidos -- sh
+```
+
+O `--target` coloca o contêiner efêmero no namespace de processos do contêiner alvo, então `ps` mostra o uvicorn e você pode inspecionar `/proc`. O `--copy-to` cria um Pod novo, fora do Deployment, onde você pode trocar o comando por um shell e investigar sem a aplicação ser reiniciada a cada falha. Apague a cópia ao terminar.
+
+## Observabilidade básica
+
+Logs contam o que aconteceu num Pod; para entender o sistema você precisa dos três sinais:
+
+| Sinal | No cluster | Na aplicação Python |
+|---|---|---|
+| Logs | Coletor em DaemonSet, armazenamento central | JSON na saída padrão com `correlation_id`, serviço e nível |
+| Métricas | Prometheus coletando os Pods; metrics-server só para HPA e `kubectl top` | `prometheus-client` expondo `/metrics`: requisições, latência, erros, pedidos criados |
+| Traces | OpenTelemetry Collector repassando a Jaeger ou Tempo | SDK do OpenTelemetry com instrumentação de FastAPI, Django e httpx |
+
+As métricas que merecem painel desde o primeiro dia, por serviço: taxa de requisições, taxa de erros e latência em percentis (p95, p99). Do lado do cluster: reinícios de contêiner, Pods não prontos, uso de memória contra o limite e profundidade das filas do RabbitMQ. Um alerta de reinícios frequentes pega o CrashLoopBackOff antes do cliente.
+
+O identificador de correlação é a ponte barata entre os serviços enquanto o tracing não existe: com ele, uma busca na central de logs mostra a jornada inteira de um pedido, do `pedidos` ao `pagamentos` e ao `notificacoes`.
+
+## Diagnosticando os estados de falha
+
+O fluxo é sempre o mesmo: `kubectl get pods` mostra o estado, `kubectl describe pod` mostra eventos e último estado, `kubectl logs --previous` mostra o que a aplicação disse antes de morrer.
+
+| Estado | O que significa | Causas comuns | Onde olhar |
+|---|---|---|---|
+| `Pending` | O Pod não foi colocado em nenhum nó, ou espera um volume | Requests maiores do que qualquer nó tem livre, anti-afinidade ou spread impossíveis, PVC sem volume, cota do namespace esgotada | Eventos do `describe`: `0/3 nodes are available: 3 Insufficient memory` |
+| `ImagePullBackOff` ou `ErrImagePull` | O nó não conseguiu baixar a imagem | Tag inexistente, nome errado, registro privado sem `imagePullSecrets`, imagem só local num cluster kind sem `kind load` | Eventos: `manifest unknown`, `unauthorized`, `not found` |
+| `CrashLoopBackOff` | O contêiner sobe, morre e o kubelet espera cada vez mais para tentar de novo | Variável de ambiente ausente, banco inacessível na inicialização, erro de import, comando errado, falha de liveness, `OOMKilled` | `logs --previous` e `Last State` no `describe` (motivo e código de saída) |
+| `Running` mas `0/1 READY` | O processo roda, mas a readiness falha | Dependência fora, endpoint de readiness errado, `ALLOWED_HOSTS` recusando a probe | Eventos `Readiness probe failed` |
+| `CreateContainerConfigError` | O kubelet não conseguiu montar a configuração | ConfigMap ou Secret referenciado não existe, chave inexistente | Eventos do `describe` |
+
+O código de saída do último estado é uma pista forte. 1 é erro da aplicação (exceção não tratada, quase sempre visível no log anterior). 137 é SIGKILL: com motivo `OOMKilled`, falta memória; sem ele, pode ser a liveness reiniciando. 127 é comando não encontrado, típico de `command` errado ou de um binário que não está no `PATH` da imagem.
+
+Um exemplo real: `pagamentos` em CrashLoopBackOff logo depois do deploy em produção. O `logs --previous` mostra `KeyError: 'GATEWAY_API_KEY'`. A variável foi adicionada no overlay de dev e esquecida no de prod. A correção é o Secret no overlay certo, e a prevenção é a aplicação validar a configuração na inicialização (com `pydantic-settings`, por exemplo) e falhar com uma mensagem clara, que o `kubectl diff` entre overlays ajuda a enxergar.
+
+<Callout type="tip" title="Leia o describe de baixo para cima">
+A seção `Events` no fim do `kubectl describe pod` costuma ter a resposta em uma linha. Se ela estiver vazia, os eventos expiraram: recrie o Pod (`kubectl delete pod`, o Deployment recria) e observe de novo com `kubectl get pods -w` em outro terminal.
+</Callout>
+
+## Na entrevista
+
+**Como um microsserviço encontra outro no Kubernetes?** Pelo DNS do cluster: cada Service tem um nome resolvido pelo CoreDNS para um IP virtual estável, e o kube-proxy distribui as conexões entre os Pods prontos. O serviço chamador usa o nome, como `http://catalogo`, e não precisa conhecer réplicas nem IPs.
+
+**Kustomize ou Helm?** O Kustomize aplica patches sobre YAML válido, sem templates, e é ótimo para variações por ambiente da sua própria aplicação. O Helm empacota a aplicação como chart parametrizado, com versão, dependências e histórico de releases, e brilha para distribuir software para terceiros. Muitos times usam Helm para instalar dependências e Kustomize para a própria aplicação.
+
+**Um Pod está em CrashLoopBackOff. O que você faz?** Rodo `kubectl describe pod` para ver o motivo e o código de saída do último estado e os eventos, e `kubectl logs --previous` para ver o que a aplicação escreveu antes de morrer. Com isso separo erro da aplicação ou configuração ausente (código 1), falta de memória (137 com `OOMKilled`) e liveness agressiva (reinícios com eventos de probe falhando).
+
+**Por que não há `depends_on` no Kubernetes?** Porque dependências podem cair a qualquer momento, não só na subida. A aplicação precisa tentar reconectar com espera crescente e sinalizar pela readiness que ainda não está pronta. Init containers ajudam em pré-condições de subida, mas não substituem essa tolerância.
+
+**Como você investiga um contêiner que não tem shell?** Com `kubectl debug`, que adiciona um contêiner efêmero com ferramentas ao Pod em execução e, com `--target`, enxerga os processos do contêiner alvo. Para um Pod que nem sobe, `--copy-to` cria uma cópia com o comando trocado.
+
+## Pratique
+
+1. Escreva a base Kustomize com os quatro serviços, Postgres (um banco e um usuário por serviço, criados por um script de inicialização) e RabbitMQ, e suba tudo no namespace `ingressos-dev` com `kubectl apply -k`.
+2. Crie os overlays `dev` e `prod` com tags de imagem, réplicas, recursos e HPA diferentes. Compare a saída dos dois com `kubectl kustomize` e altere um valor do `configMapGenerator` para ver o rollout automático.
+3. Implemente no `pedidos` o cliente `httpx` com timeout e correlação, e a reconexão ao RabbitMQ com espera crescente. Apague o Pod do RabbitMQ durante um teste de compra e confirme que o serviço se recupera sem reinício.
+4. Provoque e diagnostique cada falha: uma tag inexistente (ImagePullBackOff), uma variável obrigatória ausente (CrashLoopBackOff), um request de 64 GiB (Pending) e um Secret não criado (CreateContainerConfigError). Anote o comando que revelou a causa em cada caso.
+5. Faça os quatro serviços logarem em JSON com `correlation_id`, exponha `/metrics` no `pedidos` com `prometheus-client` e siga um pedido pelos logs de todos os serviços com `kubectl logs -l app.kubernetes.io/part-of=ingressos --prefix`.
+
+<Quiz question="Um Pod do pagamentos aparece como CrashLoopBackOff e kubectl logs não mostra nada. Qual o próximo comando?" options={["kubectl delete namespace ingressos","kubectl logs com --previous para ver a saída do contêiner que morreu","kubectl scale para zero réplicas","kubectl top nodes"]} answer={1} explanation="O contêiner atual acabou de reiniciar e ainda não escreveu nada. A saída do contêiner anterior, onde está o erro, é obtida com --previous." />
+
+<Quiz question="Por que o configMapGenerator do Kustomize faz os Pods serem recriados quando um valor muda?" options={["Porque ele reinicia o kubelet","Porque o apiserver detecta mudanças em qualquer ConfigMap","Porque o nome do ConfigMap recebe um hash do conteúdo, o que altera o template do Deployment","Porque ele apaga os Pods diretamente"]} answer={2} explanation="O sufixo de hash muda junto com o conteúdo, e o Kustomize reescreve as referências. Template diferente significa rollout novo." />
+
+<Quiz question="Um Pod fica em Pending e o describe mostra 0/3 nodes are available: 3 Insufficient memory. O que resolve?" options={["Reduzir o request de memória ou adicionar capacidade ao cluster","Aumentar o limit de memória","Trocar a tag da imagem","Adicionar uma liveness probe"]} answer={0} explanation="O scheduler usa os requests para encontrar um nó com espaço. Se nenhum tem memória livre suficiente, o Pod não é agendado até o request caber em algum nó." />
+
+## Base no CodeForge
+
+- [Microsserviços em Python: Comunicação, testes e resiliência](/learn/carreira-python/microsservicos-python-comunicacao-testes-resiliencia): os serviços que este capítulo coloca no cluster.
+- [Mensageria com Python e RabbitMQ](/learn/carreira-python/mensageria-python-rabbitmq-integracao-assincrona): exchanges, filas e ack usados entre os serviços.
+- [Kubernetes: Praticando e garantindo uma aplicação com alta disponibilidade](/learn/carreira-python/kubernetes-praticando-garantindo-aplicacao-alta-disponibilidade): encerramento gracioso e PDB, aplicados aqui a cada serviço.
+- [Três pilares da observabilidade](/learn/system-design/tres-pilares) e [Tracing distribuído](/learn/system-design/tracing-distribuido): logs, métricas e traces em profundidade.
+- [Service mesh](/learn/system-design/service-mesh): quando o balanceamento por requisição e o mTLS entre serviços justificam a camada extra.
+
+## Referências
+
+- [Kubernetes: Declarative Management with Kustomize](https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/)
+- [Kubernetes: Debug Running Pods](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/)
+- [Kubernetes: Logging Architecture](https://kubernetes.io/docs/concepts/cluster-administration/logging/)
+- [Kubernetes: DNS for Services and Pods](https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/)

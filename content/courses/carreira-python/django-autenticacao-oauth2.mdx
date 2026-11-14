@@ -1,0 +1,333 @@
+---
+title: "Django: Autenticação com OAuth2.0"
+kind: lesson
+---
+
+O cadastro com e-mail e senha do capítulo anterior funciona, mas cada formulário a mais na hora da compra derruba a conversão: quem quer comprar o ingresso do show de sexta não quer inventar mais uma senha. "Entrar com Google" resolve isso para o cliente e tira de você parte do problema: a senha fica com um provedor que tem equipe dedicada a protegê-la, com verificação em duas etapas e detecção de acesso suspeito.
+
+Por trás do botão está o OAuth 2.0 com OpenID Connect, um protocolo que aparece em toda entrevista de back-end e que é fácil de implementar errado. Este capítulo explica o fluxo em detalhe, para você entender o que cada parâmetro protege, e depois o implementa no projeto com o django-allauth, que cuida dos detalhes perigosos.
+
+**Você vai aprender:**
+
+- Os papéis do OAuth 2.0 e a diferença entre OAuth (autorização) e OpenID Connect (autenticação)
+- O fluxo authorization code com PKCE, passo a passo, e o que são access token, refresh token e ID token
+- Configurar login com Google e GitHub no Django com django-allauth, com segredos fora do código
+- Vincular contas sociais a usuários existentes sem abrir brecha de sequestro de conta
+- Os cuidados de segurança: `state`, redirect URI, escopos mínimos e armazenamento de tokens
+
+## OAuth 2.0: papéis e propósito
+
+O OAuth 2.0 nasceu para resolver a **autorização delegada**: permitir que um aplicativo acesse dados seus em outro serviço sem que você entregue a sua senha a ele. Antes, um aplicativo que queria ler seus contatos pedia o e-mail e a senha da sua conta, e passava a ter acesso total e permanente. Com OAuth, ele recebe um token com escopo e validade limitados, que você pode revogar.
+
+| Papel | Quem é na plataforma de ingressos |
+|---|---|
+| Resource owner (dono do recurso) | O cliente, dono da conta Google |
+| Client (cliente OAuth) | A aplicação Django da plataforma |
+| Authorization server | O servidor de login do Google ou do GitHub, que autentica o usuário e emite tokens |
+| Resource server | A API que aceita o token (a API de perfil do Google, a API do GitHub) |
+
+O cliente OAuth pode ser **confidencial** (roda num servidor e consegue guardar um segredo, como o Django) ou **público** (aplicativo móvel, SPA no navegador, onde qualquer segredo embutido pode ser extraído).
+
+OAuth 2.0 puro só diz "este token permite ler o perfil". Ele não diz, de forma padronizada, **quem** fez login. O **OpenID Connect** (OIDC) é uma camada sobre o OAuth que acrescenta exatamente isso: o escopo `openid`, um **ID token** (um JWT assinado com a identidade do usuário) e um endpoint de descoberta. O Google implementa OIDC. O GitHub implementa só OAuth 2.0: para saber quem é o usuário, a aplicação usa o access token para chamar a API de perfil.
+
+## O fluxo authorization code com PKCE
+
+É o fluxo recomendado para praticamente todos os casos hoje. Os fluxos *implicit* (token direto na URL) e *password* (o cliente recebe a senha) são desaconselhados pelas boas práticas atuais do OAuth para aplicações de terceiros.
+
+1. O usuário clica em "Entrar com Google". O Django gera três valores aleatórios: o `state`, o `code_verifier` (e dele o `code_challenge`) e, no OIDC, o `nonce`. Guarda-os na sessão.
+2. O Django redireciona o navegador para o endpoint de autorização do Google:
+
+```text
+GET https://accounts.google.com/o/oauth2/v2/auth
+    ?response_type=code
+    &client_id=1234.apps.googleusercontent.com
+    &redirect_uri=https://ingressos.exemplo.com/accounts/google/login/callback/
+    &scope=openid%20email%20profile
+    &state=Zx81kq...
+    &nonce=a9Fh2p...
+    &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+    &code_challenge_method=S256
+```
+
+3. O Google autentica o usuário (senha, segundo fator) e pede consentimento para os escopos.
+4. O Google redireciona de volta para a `redirect_uri` com um **código de autorização** de uso único e vida curta, e o mesmo `state`:
+
+```text
+GET https://ingressos.exemplo.com/accounts/google/login/callback/?code=4/0AY0e...&state=Zx81kq...
+```
+
+5. O Django confere se o `state` é igual ao da sessão. Depois, **de servidor para servidor**, troca o código por tokens, enviando o `client_secret` e o `code_verifier` original:
+
+```text
+POST https://oauth2.googleapis.com/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&code=4/0AY0e...&redirect_uri=https://ingressos.exemplo.com/accounts/google/login/callback/
+&client_id=1234.apps.googleusercontent.com&client_secret=...&code_verifier=dBjftJeZ4CVP...
+```
+
+6. O Google confere que o hash do `code_verifier` bate com o `code_challenge` do passo 2 e devolve `access_token`, `id_token` e, se pedido, `refresh_token`.
+7. O Django valida o ID token (assinatura, `iss`, `aud` igual ao seu `client_id`, `exp`, `nonce`), lê o `sub` e o e-mail e cria ou localiza o usuário. A partir daí, é uma sessão Django comum, como no capítulo anterior.
+
+O **PKCE** (Proof Key for Code Exchange) protege contra a interceptação do código no passo 4: quem roubar o código não tem o `code_verifier`, que nunca passou pelo navegador. Nasceu para clientes públicos, que não têm segredo, e hoje é recomendado para todos os clientes. Gerar o par é simples:
+
+```python
+import base64
+import hashlib
+import secrets
+
+code_verifier = secrets.token_urlsafe(64)
+digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+```
+
+Você não vai escrever esse código no projeto: o allauth faz isso. Mas saber reproduzi-lo mostra que você entende o mecanismo.
+
+## Os tokens
+
+| Token | Para quê | Quem lê | Vida típica |
+|---|---|---|---|
+| Código de autorização | Ser trocado por tokens, uma única vez | O authorization server | Segundos a poucos minutos |
+| Access token | Chamar o resource server (API) | O resource server | Minutos a uma hora |
+| Refresh token | Obter novo access token sem o usuário | O authorization server | Dias a meses, revogável |
+| ID token (OIDC) | Dizer ao cliente quem autenticou | O cliente | Curta; é lido uma vez no login |
+
+Duas confusões comuns. Primeiro: o ID token não serve para chamar APIs, e o access token não serve como prova de identidade para o cliente (ele pode ter sido emitido para outra aplicação). Segundo: o identificador estável do usuário é o `sub` junto com o `iss`, não o e-mail. O e-mail pode mudar e, em alguns provedores, pode não estar verificado.
+
+Para login social, a plataforma só precisa da identidade. Ela não chama APIs do Google depois do login, então não precisa guardar access nem refresh token. Token guardado é token que pode vazar.
+
+## Registrando a aplicação nos provedores
+
+Em cada provedor, você cria um cliente OAuth e recebe um `client_id` (público) e um `client_secret` (secreto):
+
+- **Google**: no Google Cloud Console, crie credenciais "ID do cliente OAuth" do tipo aplicativo da Web e configure a tela de consentimento. Em "URIs de redirecionamento autorizados", cadastre `http://localhost:8000/accounts/google/login/callback/` para desenvolvimento e a URL de produção com HTTPS.
+- **GitHub**: em Settings, Developer settings, OAuth Apps, crie um app com a "Authorization callback URL" `http://localhost:8000/accounts/github/login/callback/`. Crie um app separado para produção.
+
+Use clientes separados por ambiente. Assim um segredo de desenvolvimento vazado não dá acesso ao cliente de produção, e a lista de URIs de produção nunca contém `localhost`.
+
+## django-allauth no projeto
+
+```bash
+pip install "django-allauth[socialaccount]"
+```
+
+```python
+# ingressos/settings.py (trecho)
+INSTALLED_APPS = [
+    # ... apps do Django e do projeto
+    "allauth",
+    "allauth.account",
+    "allauth.socialaccount",
+    "allauth.socialaccount.providers.google",
+    "allauth.socialaccount.providers.github",
+]
+
+MIDDLEWARE = [
+    # ... middlewares existentes
+    "allauth.account.middleware.AccountMiddleware",
+]
+
+AUTHENTICATION_BACKENDS = [
+    "django.contrib.auth.backends.ModelBackend",
+    "allauth.account.auth_backends.AuthenticationBackend",
+]
+
+LOGIN_URL = "account_login"
+LOGIN_REDIRECT_URL = "eventos:lista"
+
+ACCOUNT_LOGIN_METHODS = {"email"}
+ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
+ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+
+SOCIALACCOUNT_PROVIDERS = {
+    "google": {
+        "APP": {
+            "client_id": os.environ["GOOGLE_CLIENT_ID"],
+            "secret": os.environ["GOOGLE_CLIENT_SECRET"],
+        },
+        "SCOPE": ["openid", "email", "profile"],
+        "OAUTH_PKCE_ENABLED": True,
+    },
+    "github": {
+        "APP": {
+            "client_id": os.environ["GITHUB_CLIENT_ID"],
+            "secret": os.environ["GITHUB_CLIENT_SECRET"],
+        },
+        "SCOPE": ["read:user", "user:email"],
+    },
+}
+SOCIALACCOUNT_STORE_TOKENS = False
+```
+
+```python
+# ingressos/urls.py (trecho)
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("accounts/", include("allauth.urls")),
+    path("pedidos/", include("eventos.urls_pedidos")),
+    path("eventos/", include("eventos.urls")),
+    path("", include("eventos.urls_home")),
+]
+```
+
+Rode `python manage.py migrate` para criar as tabelas do allauth (endereços de e-mail, contas sociais).
+
+O que mudou em relação ao capítulo anterior: o allauth assume login, logout, cadastro, confirmação de e-mail e redefinição de senha. As rotas `django.contrib.auth.urls` e a view `cadastro` de `contas` saem; o modelo `contas.Usuario` com login por e-mail continua, e o allauth gera o `username` automaticamente quando ele não está nos campos de cadastro. Com `ACCOUNT_EMAIL_VERIFICATION = "mandatory"`, quem se cadastra com senha só entra depois de clicar no link de confirmação, enviado pelo backend de e-mail configurado em `EMAIL_BACKEND`.
+
+Os segredos vêm do ambiente, como a `SECRET_KEY`: `.env` local fora do Git, variáveis no CI e no orquestrador em produção. O allauth também aceita cadastrar os apps pelo Admin (modelo `SocialApp`), o que guarda o segredo no banco; com configuração em settings, o segredo fica no mesmo lugar que os demais e não aparece em backup de banco nem na tela do Admin.
+
+<Callout type="warning" title="O client_secret nunca vai para o front nem para o Git">
+O segredo identifica a sua aplicação perante o provedor. Com ele, alguém consegue trocar códigos de autorização em nome da plataforma. Se vazar (num commit, num log, numa imagem Docker), revogue e gere outro no console do provedor imediatamente; apagar o commit não basta, porque o histórico e os forks continuam com ele. Em aplicativos móveis e SPAs, não existe segredo seguro: esses clientes são públicos e dependem de PKCE.
+</Callout>
+
+## Os botões de login
+
+Sobrescreva o template `account/login.html` (pastas `templates/account/` do projeto) e adicione os provedores. Os botões fazem POST, protegidos por CSRF:
+
+```html
+{% extends "base.html" %}
+{% load socialaccount %}
+{% block conteudo %}
+  <h1>Entrar</h1>
+  <form method="post" action="{% provider_login_url 'google' %}">
+    {% csrf_token %}
+    <button type="submit">Entrar com Google</button>
+  </form>
+  <form method="post" action="{% provider_login_url 'github' %}">
+    {% csrf_token %}
+    <button type="submit">Entrar com GitHub</button>
+  </form>
+
+  <form method="post" action="{% url 'account_login' %}">
+    {% csrf_token %}
+    {{ form.as_div }}
+    <button type="submit">Entrar com e-mail</button>
+  </form>
+{% endblock %}
+```
+
+Por padrão (`SOCIALACCOUNT_LOGIN_ON_GET = False`), o allauth só inicia o fluxo com POST; um GET na mesma URL mostra uma página de confirmação. Isso impede que outro site inicie um login social no seu navegador sem você clicar, e vale manter assim.
+
+O menu do `base.html` continua com o formulário de logout por POST, agora apontando para `account_logout`.
+
+## Vínculo de contas
+
+Três situações aparecem na prática:
+
+1. **Primeiro acesso pelo Google, e-mail desconhecido**: o allauth cria o usuário com os dados do provedor (`SOCIALACCOUNT_AUTO_SIGNUP` é verdadeiro por padrão) e registra a conta social ligada a ele.
+2. **Usuário já logado quer ligar o GitHub**: ele vai à página de conexões (URL nomeada `socialaccount_connections`) ou você usa `provider_login_url 'github' process='connect'`. A conta social é ligada ao usuário atual, e ele passa a poder entrar por qualquer um dos métodos.
+3. **Primeiro acesso pelo Google com o e-mail de uma conta que já existe com senha**: aqui mora o risco.
+
+Ligar automaticamente pelo e-mail parece cômodo, mas se o provedor não garantir que o e-mail pertence a quem fez login, um atacante cria uma conta no provedor com o e-mail da vítima e entra na conta dela na plataforma. O allauth oferece `SOCIALACCOUNT_EMAIL_AUTHENTICATION` e `SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT` para esse vínculo automático; só ligue se todos os provedores habilitados entregarem e-mail **verificado**, e entenda que você está terceirizando a prova de posse do e-mail para eles. O caminho conservador é o padrão: pedir que a pessoa entre com a senha e ligue a conta social depois, na página de conexões.
+
+Para ajustar como o usuário é criado a partir do provedor, use um adapter:
+
+```python
+# contas/adapters.py
+from allauth.socialaccount.adapter import DefaultSocialAccountAdapter
+
+
+class AdaptadorSocial(DefaultSocialAccountAdapter):
+    def populate_user(self, request, sociallogin, data):
+        usuario = super().populate_user(request, sociallogin, data)
+        if not usuario.first_name and data.get("name"):
+            usuario.first_name = data["name"].split()[0][:150]
+        return usuario
+```
+
+```python
+# ingressos/settings.py (trecho)
+SOCIALACCOUNT_ADAPTER = "contas.adapters.AdaptadorSocial"
+```
+
+O adapter também é o lugar para recusar cadastros (por exemplo, um painel interno que só aceita e-mails do domínio da empresa) sobrescrevendo `is_open_for_signup`.
+
+## Cuidados de segurança
+
+| Cuidado | O que protege | Como fica no projeto |
+|---|---|---|
+| `state` aleatório conferido no retorno | CSRF no login: atacante fazendo a vítima entrar na conta dele | O allauth gera e confere |
+| Redirect URI cadastrada com valor exato | Código de autorização entregue a um domínio do atacante | URIs exatas no console, HTTPS em produção, sem curingas |
+| PKCE | Código interceptado ser trocado por outro | `OAUTH_PKCE_ENABLED` no Google |
+| `nonce` e validação do ID token | Reaproveitamento de um ID token antigo ou emitido para outro cliente | O allauth valida `aud`, `iss`, `exp` e `nonce` |
+| Escopos mínimos | Estrago em caso de vazamento e desconfiança na tela de consentimento | Só identidade e e-mail |
+| Não guardar tokens | Vazamento de credenciais de terceiros | `SOCIALACCOUNT_STORE_TOKENS = False` |
+
+O `state` merece destaque porque é a pergunta clássica. Sem ele, um atacante inicia o fluxo com a conta dele no provedor, para antes do callback e faz a vítima abrir o link de retorno com o código dele. A vítima fica logada **na conta do atacante**, e o que ela cadastrar (cartão, dados pessoais) vai para lá. O `state`, amarrado à sessão do navegador que iniciou o fluxo, faz o callback alheio ser recusado.
+
+Atenção também ao **open redirect**: o parâmetro `next`, que devolve o usuário à página de origem depois do login, precisa ser restrito ao próprio domínio. O allauth e as views do Django já validam; se você escrever redirecionamentos à mão, use `url_has_allowed_host_and_scheme`.
+
+<Callout type="tip" title="Login social não substitui autorização">
+Saber que a pessoa é dona de um e-mail no Google diz quem ela é, não o que pode fazer. Permissões, grupos e o filtro por dono do capítulo anterior continuam valendo do mesmo jeito para quem entrou por senha ou por provedor. Nunca dê permissão com base só no domínio do e-mail sem verificar que o provedor atesta esse e-mail.
+</Callout>
+
+## Testando
+
+Testes automatizados não devem chamar o Google. Teste a sua parte: configuração, templates, adapter e regras de negócio, e faça o fluxo completo manualmente com os clientes de desenvolvimento.
+
+```python
+# contas/tests/test_login_social.py
+import pytest
+from django.urls import reverse
+
+
+@pytest.mark.django_db
+def test_pagina_de_login_mostra_provedores(client):
+    resposta = client.get(reverse("account_login"))
+    html = resposta.content.decode()
+
+    assert resposta.status_code == 200
+    assert "Entrar com Google" in html
+    assert "Entrar com GitHub" in html
+
+
+@pytest.mark.django_db
+def test_login_social_por_get_nao_inicia_fluxo(client):
+    resposta = client.get("/accounts/google/login/")
+
+    assert resposta.status_code == 200
+    assert "accounts.google.com" not in resposta.get("Location", "")
+```
+
+O segundo teste fixa uma decisão de segurança: se alguém ligar `SOCIALACCOUNT_LOGIN_ON_GET`, ele quebra. Nos testes e no CI, as variáveis `GOOGLE_CLIENT_ID` e similares recebem valores falsos, já que nenhum fluxo real é executado.
+
+## Na entrevista
+
+**Qual a diferença entre OAuth 2.0 e OpenID Connect?** OAuth 2.0 é um protocolo de autorização delegada: emite tokens para acessar recursos. O OIDC é uma camada sobre ele para autenticação: acrescenta o escopo `openid`, o ID token com a identidade do usuário e a descoberta de configuração. Login social correto usa OIDC quando o provedor oferece.
+
+**Para que serve o PKCE?** Para que um código de autorização interceptado não possa ser trocado por tokens. O cliente envia o hash de um segredo aleatório no início e o segredo original na troca; quem só tem o código não tem o segredo. É obrigatório para clientes públicos e recomendado para todos.
+
+**O que o parâmetro `state` evita?** CSRF no fluxo de login: sem ele, um atacante faz a vítima concluir um login com o código dele, ligando a vítima à conta do atacante. O valor aleatório guardado na sessão faz o retorno que não foi iniciado por aquele navegador ser recusado.
+
+**Por que a redirect URI precisa ser exata?** Porque o código de autorização é entregue nela. Se o provedor aceitar curingas ou prefixos, um atacante pode fazer o código ir para uma URL controlada por ele, por exemplo via um redirecionamento aberto no seu domínio.
+
+**Como você vincula uma conta social a uma conta existente com o mesmo e-mail?** Por padrão, peço que a pessoa entre com a senha e ligue o provedor na página de conexões. Vínculo automático por e-mail só quando o provedor garante e-mail verificado, porque senão alguém com uma conta no provedor usando o e-mail da vítima assume a conta dela.
+
+## Pratique
+
+1. Registre clientes OAuth de desenvolvimento no Google e no GitHub e configure o allauth com os segredos lidos do ambiente.
+2. Substitua o login e o cadastro do capítulo anterior pelo allauth, com verificação de e-mail obrigatória e o backend de e-mail de console em desenvolvimento.
+3. Personalize `account/login.html` com os botões por POST e crie a página "Minha conta" com link para as conexões sociais.
+4. Escreva o adapter que preenche o primeiro nome e, num painel interno separado, recuse cadastro de e-mails fora do domínio da empresa.
+5. Faça o fluxo manualmente com as ferramentas do navegador abertas e identifique `state`, `code_challenge` e `redirect_uri` em cada requisição; escreva os testes deste capítulo.
+
+<Quiz question="O que impede que um código de autorização interceptado seja trocado por tokens por um atacante?" options={["O escopo openid","O state","O PKCE, porque o atacante não tem o code_verifier","O refresh token"]} answer={2} explanation="Na troca, o authorization server exige o code_verifier cujo hash foi enviado no início. O verifier nunca passou pelo navegador, então quem só interceptou o código não consegue concluir a troca." />
+
+<Quiz question="Qual identificador deve ser usado como chave estável do usuário vindo de um provedor OIDC?" options={["O e-mail","O par iss e sub do ID token","O access token","O nome exibido"]} answer={1} explanation="O sub é único e estável dentro do emissor. E-mail e nome podem mudar, e o access token é uma credencial temporária, não uma identidade." />
+
+<Quiz question="A plataforma faz só login social e não chama APIs do provedor depois. O que fazer com access e refresh tokens?" options={["Não guardar, mantendo SOCIALACCOUNT_STORE_TOKENS desligado","Guardar em texto puro para depuração","Enviar ao front em um cookie","Guardar o refresh token no localStorage"]} answer={0} explanation="Credenciais que a aplicação não usa só aumentam o estrago de um vazamento. A sessão do Django é suficiente depois que a identidade foi confirmada." />
+
+## Base no CodeForge
+
+- [Django: Autenticação de formulários e alerta](/learn/carreira-python/django-autenticacao-formularios-alerta): o modelo de usuário, as permissões e o CSRF sobre os quais o login social se apoia.
+- [OAuth 2.0](/learn/system-design/oauth2) e [SSO](/learn/system-design/sso): os protocolos vistos do ponto de vista de arquitetura.
+- [JWT](/learn/system-design/jwt): o formato do ID token e o que validar nele.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): onde guardar o `client_secret` em produção.
+- [TLS](/learn/redes/tls): por que redirect URIs de produção são sempre HTTPS.
+
+## Referências
+
+- [django-allauth: documentação oficial](https://docs.allauth.org/en/latest/)
+- [RFC 6749: The OAuth 2.0 Authorization Framework](https://datatracker.ietf.org/doc/html/rfc6749)
+- [RFC 7636: Proof Key for Code Exchange (PKCE)](https://datatracker.ietf.org/doc/html/rfc7636)
+- [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)

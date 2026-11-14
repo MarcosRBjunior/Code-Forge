@@ -1,0 +1,520 @@
+---
+title: "Python: Fundamentos e Padrões de Arquitetura de Software"
+kind: lesson
+---
+
+Até aqui a regra "não vender acima da capacidade" apareceu quatro vezes: no MongoDB com `$inc`, no ORM do Django com `F()`, no serializer do DRF e no `update()` do SQLAlchemy. Cada versão estava correta, mas cada uma vivia grudada num framework e num banco. Quando o time decidir que o aplicativo usa a API em FastAPI e o site continua em Django, ou quando a reserva também precisar ser feita por um consumidor de fila, a pergunta deixa de ser "como escrevo essa rota" e passa a ser "onde mora a regra, e quem depende de quem".
+
+Arquitetura de software é a resposta a essa pergunta: como dividir o código em partes com responsabilidades claras e dependências controladas, para que mudar uma parte não exija mexer em todas. Não existe estilo certo para tudo. Existe o estilo que paga o próprio custo no seu contexto, e a entrevista de nível pleno quer ver exatamente esse julgamento.
+
+**Você vai aprender:**
+
+- Separação de responsabilidades e a regra de dependência entre camadas
+- MVC e MTV, arquitetura em camadas, hexagonal (ports and adapters) e clean architecture, e como se relacionam
+- Injeção de dependência em Python com `Protocol`, construtores e composition root
+- Os padrões Repository, Service Layer e Unit of Work, com testes sem banco
+- Como organizar pacotes e decidir quando cada estilo compensa
+
+## Responsabilidades e dependências
+
+Todo back-end mistura três tipos de código:
+
+- **Entrega**: traduz o mundo externo para o sistema. Rotas HTTP, views, serializers, comandos de terminal, consumidores de fila.
+- **Domínio e aplicação**: as regras do negócio e os casos de uso. "Uma reserva expira em 15 minutos", "cancelar devolve o estoque", "reservar ingressos".
+- **Infraestrutura**: detalhes técnicos. Banco de dados, ORM, envio de e-mail, gateway de pagamento, relógio do sistema.
+
+**Separação de responsabilidades** é manter esses tipos em lugares diferentes, de modo que cada módulo tenha um motivo para mudar. Trocar o provedor de e-mail não deveria tocar a regra de expiração; mudar a regra de expiração não deveria tocar a rota HTTP.
+
+Separar não basta: importa a **direção das dependências**. Se o módulo de regras importa o SQLAlchemy, a regra não pode ser testada sem banco e não pode ser reaproveitada com outro ORM. O objetivo de praticamente todo estilo arquitetural é o mesmo: as regras de negócio não dependem de detalhes; os detalhes dependem das regras.
+
+## MVC e MTV
+
+O **MVC** (Model, View, Controller) nasceu em interfaces gráficas e foi adaptado para a web: o model guarda dados e regras, a view apresenta, o controller recebe a entrada e coordena. O Django chama a mesma divisão de **MTV**, como visto no capítulo de templates: o template é a view do MVC, e a view do Django é o controller.
+
+MVC é um padrão da **camada de apresentação**. Ele diz como separar entrada, saída e dados de uma tela, mas não diz onde ficam as regras de um caso de uso que envolve três modelos, um pagamento e um e-mail. Em projetos Django que crescem sem esse cuidado, a regra vai parar em dois lugares ruins: views gordas (a regra fica presa ao HTTP) ou models gordos que importam serviço de e-mail e gateway de pagamento (a regra fica presa ao ORM e a tudo mais). Os estilos a seguir resolvem esse "onde".
+
+## Arquitetura em camadas
+
+O estilo mais comum empilha camadas, e cada uma só conhece a de baixo:
+
+```text
+apresentação   (views, rotas, serializers)
+     |
+aplicação      (casos de uso: reservar, cancelar, pagar)
+     |
+domínio        (entidades e regras: Setor, Pedido, prazo de reserva)
+     |
+infraestrutura (ORM, banco, e-mail, gateway)
+```
+
+É simples de explicar e de seguir, e é o que a maioria dos projetos usa sem nome. O problema está na última seta: o domínio depende da infraestrutura. A regra de negócio importa o ORM, e o banco passa a ser o centro do desenho. Para muitos sistemas, isso é aceitável. Para um domínio com regras ricas, é o que torna o teste lento e a troca de tecnologia cara.
+
+## Hexagonal e clean architecture
+
+A **arquitetura hexagonal** (ou *ports and adapters*, de Alistair Cockburn) inverte essa última dependência. O núcleo (domínio e casos de uso) fica no centro e define **portas**: interfaces que descrevem o que ele precisa do mundo ("preciso obter e salvar setores") e o que oferece ("posso reservar ingressos"). Do lado de fora ficam os **adaptadores**: uma rota FastAPI é um adaptador de entrada que chama o caso de uso; um repositório SQLAlchemy é um adaptador de saída que implementa a porta de persistência. O núcleo não importa nenhum adaptador.
+
+A **clean architecture** (Robert C. Martin) é a mesma ideia desenhada em círculos concêntricos (entidades, casos de uso, adaptadores de interface, frameworks e drivers), com uma regra explícita: **dependências de código-fonte só apontam para dentro**. A **onion architecture** é outra variação. Na prática, as três compartilham o essencial: domínio puro no centro, interfaces definidas pelo centro, infraestrutura na borda.
+
+| | Camadas | Hexagonal | Clean |
+|---|---|---|---|
+| Centro do desenho | Banco e modelos de dados | Domínio e casos de uso | Entidades e casos de uso |
+| Domínio depende de infraestrutura | Sim | Não: depende de portas | Não: regra de dependência |
+| Como a infraestrutura se liga | Importada pela camada de cima | Adaptadores implementam portas | Implementações injetadas nas camadas internas |
+| Custo inicial | Baixo | Médio: portas, adaptadores, mapeamento | Médio a alto: mais camadas nomeadas |
+| Teste das regras | Costuma precisar de banco | Com fakes em memória | Com fakes em memória |
+
+O mecanismo que faz a inversão funcionar é a injeção de dependência.
+
+## Injeção de dependência em Python
+
+**Injetar** uma dependência é recebê-la de fora em vez de criá-la ou importá-la diretamente. Compare:
+
+```python
+# acoplado: a função escolhe o banco sozinha
+from ingressos.adaptadores.db import SessionLocal
+
+def total_vendido(evento_id: int) -> int:
+    with SessionLocal() as session:
+        ...
+
+# injetado: quem chama decide o que entregar
+def total_vendido(evento_id: int, repositorio: "RepositorioPedidos") -> int:
+    ...
+```
+
+A segunda versão funciona com qualquer objeto que tenha os métodos esperados: o repositório real em produção, um fake em memória no teste. Em Python, esse "qualquer objeto com os métodos esperados" se declara com `typing.Protocol`, que usa tipagem estrutural: a classe não precisa herdar da interface, basta ter os métodos com as assinaturas certas, e o mypy confere.
+
+| Forma | Quando usar |
+|---|---|
+| Parâmetro de função | Casos de uso como funções, dependências que mudam por chamada |
+| Construtor (`__init__`) | Classes que usam a mesma dependência em vários métodos |
+| `Depends` do FastAPI | Na borda HTTP, para montar e entregar as dependências por requisição |
+| Contêiner de DI (bibliotecas como dependency-injector) | Grafos grandes; raramente necessário em Python |
+
+As dependências reais são montadas num único lugar, a **composition root**: o ponto de entrada da aplicação (o `main.py` do FastAPI, uma função `bootstrap`, o `AppConfig.ready` do Django). Ali e só ali o código sabe que o repositório é SQLAlchemy e que o e-mail vai pelo provedor X.
+
+<Callout type="warning" title="Mock de import não é injeção de dependência">
+Em Python é possível testar código acoplado com `unittest.mock.patch("ingressos.servicos.SessionLocal")`. Funciona, mas o teste fica amarrado ao caminho de import interno: renomear um módulo quebra testes sem que nenhum comportamento tenha mudado. Se você precisa de `patch` em todo teste de regra de negócio, o desenho está pedindo uma dependência injetada.
+</Callout>
+
+## Domínio puro
+
+O domínio da reserva não sabe de HTTP nem de banco. São classes Python comuns com as regras:
+
+```python
+# ingressos/dominio/modelos.py
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import StrEnum
+from uuid import UUID, uuid4
+
+PRAZO_RESERVA = timedelta(minutes=15)
+
+
+class EstoqueInsuficiente(Exception):
+    pass
+
+
+class StatusPedido(StrEnum):
+    PENDENTE = "pendente"
+    PAGO = "pago"
+    CANCELADO = "cancelado"
+    EXPIRADO = "expirado"
+
+
+@dataclass
+class Setor:
+    id: int
+    nome: str
+    preco: Decimal
+    quantidade_disponivel: int
+
+    def reservar(self, quantidade: int) -> None:
+        if quantidade <= 0:
+            raise ValueError("quantidade precisa ser positiva")
+        if quantidade > self.quantidade_disponivel:
+            raise EstoqueInsuficiente(f"{self.nome}: restam {self.quantidade_disponivel}")
+        self.quantidade_disponivel -= quantidade
+
+    def devolver(self, quantidade: int) -> None:
+        self.quantidade_disponivel += quantidade
+
+
+@dataclass
+class Pedido:
+    cliente_id: int
+    setor_id: int
+    quantidade: int
+    expira_em: datetime
+    status: StatusPedido = StatusPedido.PENDENTE
+    id: UUID = field(default_factory=uuid4)
+
+    def expirou(self, agora: datetime) -> bool:
+        return self.status is StatusPedido.PENDENTE and agora >= self.expira_em
+```
+
+A regra de estoque agora é um método testável com uma linha, sem banco, sem framework. Note também que o horário atual entra como parâmetro (`agora`), e não por `datetime.now()` lá dentro: o relógio é uma dependência como outra qualquer, e injetá-lo torna testes de expiração determinísticos.
+
+## Repository e Unit of Work
+
+O **Repository** é a porta de persistência: uma interface com cara de coleção (adicionar, obter) que esconde como os objetos são guardados. A **Unit of Work** agrupa as alterações de uma operação de negócio e as confirma ou descarta juntas, como uma transação vista pelo domínio.
+
+```python
+# ingressos/dominio/portas.py
+from typing import Protocol, Self
+from uuid import UUID
+
+from ingressos.dominio.modelos import Pedido, Setor
+
+
+class RepositorioSetores(Protocol):
+    def obter_para_atualizar(self, setor_id: int) -> Setor | None: ...
+    def salvar(self, setor: Setor) -> None: ...
+
+
+class RepositorioPedidos(Protocol):
+    def adicionar(self, pedido: Pedido) -> None: ...
+    def obter(self, pedido_id: UUID) -> Pedido | None: ...
+
+
+class UnidadeDeTrabalho(Protocol):
+    setores: RepositorioSetores
+    pedidos: RepositorioPedidos
+
+    def __enter__(self) -> Self: ...
+    def __exit__(self, *exc: object) -> None: ...
+    def commit(self) -> None: ...
+    def rollback(self) -> None: ...
+```
+
+O adaptador SQLAlchemy implementa as portas. Ele usa modelos ORM próprios (`SetorORM`, `PedidoORM`, declarados como no capítulo de FastAPI) e traduz para as classes do domínio:
+
+```python
+# ingressos/adaptadores/sql.py
+from uuid import UUID
+
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session, sessionmaker
+
+from ingressos.adaptadores.orm import PedidoORM, SetorORM
+from ingressos.dominio.modelos import Pedido, Setor, StatusPedido
+
+
+class RepositorioSetoresSql:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def obter_para_atualizar(self, setor_id: int) -> Setor | None:
+        linha = self.session.scalar(
+            select(SetorORM).where(SetorORM.id == setor_id).with_for_update()
+        )
+        if linha is None:
+            return None
+        return Setor(linha.id, linha.nome, linha.preco, linha.quantidade_disponivel)
+
+    def salvar(self, setor: Setor) -> None:
+        self.session.execute(
+            update(SetorORM)
+            .where(SetorORM.id == setor.id)
+            .values(quantidade_disponivel=setor.quantidade_disponivel)
+        )
+
+
+class RepositorioPedidosSql:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def adicionar(self, pedido: Pedido) -> None:
+        self.session.add(PedidoORM(
+            id=pedido.id, cliente_id=pedido.cliente_id, setor_id=pedido.setor_id,
+            quantidade=pedido.quantidade, expira_em=pedido.expira_em, status=pedido.status.value,
+        ))
+
+    def obter(self, pedido_id: UUID) -> Pedido | None:
+        linha = self.session.get(PedidoORM, pedido_id)
+        if linha is None:
+            return None
+        return Pedido(linha.cliente_id, linha.setor_id, linha.quantidade, linha.expira_em,
+                      StatusPedido(linha.status), linha.id)
+
+
+class UnidadeDeTrabalhoSql:
+    def __init__(self, fabrica: sessionmaker[Session]) -> None:
+        self.fabrica = fabrica
+
+    def __enter__(self) -> "UnidadeDeTrabalhoSql":
+        self.session = self.fabrica()
+        self.setores = RepositorioSetoresSql(self.session)
+        self.pedidos = RepositorioPedidosSql(self.session)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.rollback()  # sem efeito se o commit já aconteceu
+        self.session.close()
+
+    def commit(self) -> None:
+        self.session.commit()
+
+    def rollback(self) -> None:
+        self.session.rollback()
+```
+
+`with_for_update()` gera `SELECT ... FOR UPDATE`: a linha do setor fica travada até o fim da transação, e uma segunda reserva simultânea espera a primeira terminar e então lê o estoque já atualizado. É a alternativa ao `UPDATE` condicional dos capítulos anteriores quando a regra mora no domínio em Python: ler, decidir e gravar passa a ser seguro porque ninguém mais altera a linha nesse intervalo.
+
+## Service Layer: o caso de uso
+
+A **Service Layer** é a camada de aplicação: uma função (ou classe) por caso de uso, que orquestra domínio e portas. Ela não contém regra de negócio (essa está no domínio) nem detalhe técnico (esse está nos adaptadores).
+
+```python
+# ingressos/servicos/reservas.py
+from datetime import datetime
+from uuid import UUID
+
+from ingressos.dominio.modelos import PRAZO_RESERVA, Pedido
+from ingressos.dominio.portas import UnidadeDeTrabalho
+
+
+class SetorInexistente(Exception):
+    pass
+
+
+def reservar(
+    uow: UnidadeDeTrabalho, cliente_id: int, setor_id: int, quantidade: int, agora: datetime
+) -> UUID:
+    with uow:
+        setor = uow.setores.obter_para_atualizar(setor_id)
+        if setor is None:
+            raise SetorInexistente(setor_id)
+        setor.reservar(quantidade)
+        pedido = Pedido(cliente_id, setor_id, quantidade, expira_em=agora + PRAZO_RESERVA)
+        uow.setores.salvar(setor)
+        uow.pedidos.adicionar(pedido)
+        uow.commit()
+        return pedido.id
+```
+
+O caso de uso não sabe se foi chamado por uma rota HTTP, por um comando agendado ou por um consumidor de RabbitMQ. O adaptador de entrada FastAPI fica fino, e a composition root é a dependência `get_uow`:
+
+```python
+# ingressos/entrada/api.py
+from datetime import datetime, timezone
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from ingressos.adaptadores.db import SessionLocal
+from ingressos.adaptadores.sql import UnidadeDeTrabalhoSql
+from ingressos.dominio.modelos import EstoqueInsuficiente
+from ingressos.dominio.portas import UnidadeDeTrabalho
+from ingressos.servicos.reservas import SetorInexistente, reservar
+
+router = APIRouter()
+
+
+def get_uow() -> UnidadeDeTrabalho:
+    return UnidadeDeTrabalhoSql(SessionLocal)
+
+
+UowDep = Annotated[UnidadeDeTrabalho, Depends(get_uow)]
+
+
+class ReservaCriar(BaseModel):
+    cliente_id: int
+    setor_id: int
+    quantidade: int = Field(gt=0, le=6)
+
+
+@router.post("/reservas", status_code=status.HTTP_201_CREATED)
+def criar_reserva(dados: ReservaCriar, uow: UowDep) -> dict[str, str]:
+    try:
+        pedido_id = reservar(
+            uow, dados.cliente_id, dados.setor_id, dados.quantidade, datetime.now(timezone.utc)
+        )
+    except SetorInexistente:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Setor não encontrado")
+    except EstoqueInsuficiente as erro:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(erro))
+    return {"pedido_id": str(pedido_id)}
+```
+
+Em produção, o `cliente_id` viria do usuário autenticado, como no capítulo de FastAPI; aqui ele vem no corpo para manter o exemplo focado na arquitetura.
+
+## Testando o núcleo sem banco
+
+Com as portas definidas, o teste do caso de uso usa fakes em memória, escritos em poucas linhas:
+
+```python
+# tests/fakes.py
+from uuid import UUID
+
+from ingressos.dominio.modelos import Pedido, Setor
+
+
+class RepositorioSetoresMemoria:
+    def __init__(self, setores: list[Setor]) -> None:
+        self.dados = {s.id: s for s in setores}
+
+    def obter_para_atualizar(self, setor_id: int) -> Setor | None:
+        return self.dados.get(setor_id)
+
+    def salvar(self, setor: Setor) -> None:
+        self.dados[setor.id] = setor
+
+
+class RepositorioPedidosMemoria:
+    def __init__(self) -> None:
+        self.dados: dict[UUID, Pedido] = {}
+
+    def adicionar(self, pedido: Pedido) -> None:
+        self.dados[pedido.id] = pedido
+
+    def obter(self, pedido_id: UUID) -> Pedido | None:
+        return self.dados.get(pedido_id)
+
+
+class UnidadeDeTrabalhoMemoria:
+    def __init__(self, setores: list[Setor]) -> None:
+        self.setores = RepositorioSetoresMemoria(setores)
+        self.pedidos = RepositorioPedidosMemoria()
+        self.confirmado = False
+
+    def __enter__(self) -> "UnidadeDeTrabalhoMemoria":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        pass
+
+    def commit(self) -> None:
+        self.confirmado = True
+
+    def rollback(self) -> None:
+        pass
+```
+
+```python
+# tests/test_reservas.py
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import pytest
+
+from ingressos.dominio.modelos import EstoqueInsuficiente, Setor
+from ingressos.servicos.reservas import SetorInexistente, reservar
+from tests.fakes import UnidadeDeTrabalhoMemoria
+
+AGORA = datetime(2030, 1, 10, 20, 0, tzinfo=timezone.utc)
+
+
+def uow_com_pista(quantidade: int) -> UnidadeDeTrabalhoMemoria:
+    return UnidadeDeTrabalhoMemoria([Setor(1, "Pista", Decimal("120.00"), quantidade)])
+
+
+def test_reserva_baixa_estoque_e_cria_pedido_com_prazo():
+    uow = uow_com_pista(2)
+
+    pedido_id = reservar(uow, cliente_id=7, setor_id=1, quantidade=2, agora=AGORA)
+
+    assert uow.setores.dados[1].quantidade_disponivel == 0
+    assert uow.pedidos.obter(pedido_id).expira_em == AGORA + timedelta(minutes=15)
+    assert uow.confirmado
+
+
+def test_sem_estoque_nao_confirma():
+    uow = uow_com_pista(1)
+
+    with pytest.raises(EstoqueInsuficiente):
+        reservar(uow, cliente_id=7, setor_id=1, quantidade=2, agora=AGORA)
+
+    assert not uow.confirmado
+    assert uow.pedidos.dados == {}
+
+
+def test_setor_inexistente():
+    with pytest.raises(SetorInexistente):
+        reservar(uow_com_pista(5), cliente_id=7, setor_id=99, quantidade=1, agora=AGORA)
+```
+
+Esses testes rodam em milissegundos e cobrem as regras. O adaptador SQL ganha poucos testes de integração próprios, contra um PostgreSQL real, verificando o mapeamento e o `FOR UPDATE`. É a pirâmide de testes acontecendo por consequência do desenho.
+
+## Organização de pacotes
+
+Duas formas de dividir as pastas:
+
+| | Por camada | Por funcionalidade |
+|---|---|---|
+| Estrutura | `dominio/`, `servicos/`, `adaptadores/`, `entrada/` | `reservas/`, `pagamentos/`, `catalogo/`, cada um com suas camadas dentro |
+| Vantagem | Deixa a arquitetura visível; ótimo para começar | Uma mudança de negócio fica num só pacote; facilita extrair um serviço depois |
+| Risco | Uma funcionalidade espalhada por quatro pastas | Duplicar infraestrutura comum entre pacotes |
+
+Projetos pequenos começam bem por camada; projetos maiores tendem a dividir por funcionalidade (os apps do Django já empurram nessa direção) e manter camadas dentro de cada uma. Em qualquer caso, regra de arquitetura que não é verificada vira sugestão. O import-linter transforma a regra de dependência em verificação de CI:
+
+```toml
+# pyproject.toml (trecho)
+[tool.importlinter]
+root_package = "ingressos"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Domínio não depende de frameworks nem de adaptadores"
+type = "forbidden"
+source_modules = ["ingressos.dominio"]
+forbidden_modules = ["ingressos.adaptadores", "ingressos.entrada", "sqlalchemy", "fastapi", "django"]
+```
+
+O comando `lint-imports` falha o pipeline se alguém importar o SQLAlchemy dentro de `ingressos.dominio`.
+
+## Quando cada estilo compensa
+
+<Callout type="tip" title="Arquitetura é custo pago adiantado">
+Portas, adaptadores e mapeamento entre modelos ORM e de domínio são código a mais. Eles se pagam quando as regras são ricas, mudam com frequência ou são chamadas por várias entradas. Num CRUD de cadastro, são cerimônia que atrasa o time sem proteger nada.
+</Callout>
+
+- **CRUD com poucas regras** (cadastro de locais, painel administrativo): o MTV do Django, com ModelForm, Admin e DRF, é a melhor arquitetura. Pôr um repositório sobre o ORM do Django só para "ficar limpo" duplica o que o QuerySet já faz.
+- **Regras crescendo em projeto Django**: o meio-termo pragmático é uma service layer de funções (`eventos/servicos.py`, como no capítulo de persistência), com views, serializers, Admin e comandos chamando os mesmos serviços. Sem repositórios, sem mapeamento, e já elimina regra duplicada.
+- **Domínio rico e várias entradas** (reserva chamada pela API, pelo site, por filas e por rotinas agendadas; regras de preço, expiração e pagamento): hexagonal com repository, unit of work e domínio puro. É aqui que o desenho deste capítulo paga o custo.
+- **Ao separar em microsserviços**: cada serviço (`catalogo`, `pedidos`, `pagamentos`) tem a sua arquitetura interna; um núcleo bem isolado facilita extrair o serviço, porque as fronteiras já existem no código.
+
+Comece simples e deixe a dor guiar: duplicação de regra em vários pontos de entrada, testes lentos por depender de banco e medo de mudar uma regra são os sinais de que vale subir um degrau.
+
+## Na entrevista
+
+**Qual a diferença entre arquitetura em camadas e hexagonal?** Nas camadas, cada uma depende da de baixo, e o domínio acaba dependendo da infraestrutura. Na hexagonal, o domínio define portas (interfaces) e a infraestrutura as implementa como adaptadores, então a dependência aponta para o núcleo. Isso permite testar as regras sem banco e trocar tecnologias na borda.
+
+**O que é injeção de dependência e como você faz em Python?** É receber as dependências de fora em vez de criá-las ou importá-las. Em Python, declaro a interface com `Protocol`, recebo a implementação por parâmetro ou construtor e monto tudo na composition root; no FastAPI, `Depends` faz essa montagem na borda HTTP. Contêiner de DI raramente é necessário.
+
+**Para que servem Repository e Unit of Work?** O repository esconde a persistência atrás de uma interface de coleção, para o domínio não conhecer o ORM. A unit of work agrupa as alterações de um caso de uso e as confirma ou descarta juntas, controlando a transação a partir da camada de aplicação.
+
+**Você usaria repository com o ORM do Django?** Em geral, não. O Django é desenhado em torno do ORM, e o QuerySet já é uma abstração de coleção. Prefiro uma service layer de funções que usa o ORM diretamente e concentra as regras. Repository faz sentido quando o domínio precisa ser independente do framework, por exemplo para ser reaproveitado por serviços sem Django.
+
+**MVC é uma arquitetura de sistema?** É um padrão da camada de apresentação: separa entrada, apresentação e dados. Ele não diz onde ficam os casos de uso que envolvem vários modelos e serviços externos; para isso entram service layer, camadas ou hexagonal.
+
+## Pratique
+
+1. Extraia o domínio da reserva (`Setor`, `Pedido`, `PRAZO_RESERVA`) para `ingressos/dominio/` sem nenhum import de framework, e escreva testes unitários dos métodos.
+2. Declare as portas com `Protocol`, implemente o adaptador SQLAlchemy com `with_for_update` e a unidade de trabalho, e teste o adaptador contra o PostgreSQL.
+3. Implemente o caso de uso `cancelar` (só pedidos pendentes, devolve estoque) na service layer, com testes usando os fakes em memória.
+4. Ligue os casos de uso à API FastAPI pela composition root e crie um comando de terminal que expira reservas vencidas chamando outro caso de uso, `expirar_reservas(uow, agora)`.
+5. Configure o import-linter no CI com a regra de que o domínio não importa adaptadores nem frameworks, e escreva no README a decisão de arquitetura e o motivo.
+
+<Quiz question="Na arquitetura hexagonal, quem define a interface do repositório de setores?" options={["O núcleo da aplicação, como uma porta que os adaptadores implementam","O adaptador SQLAlchemy","O framework web","O banco de dados, pelo esquema das tabelas"]} answer={0} explanation="O núcleo declara do que precisa (a porta), e a infraestrutura se adapta a ela. É isso que faz a dependência apontar para dentro." />
+
+<Quiz question="Por que o caso de uso reservar recebe o parâmetro agora em vez de chamar datetime.now() internamente?" options={["Porque datetime.now() é lento","Porque o relógio também é uma dependência, e injetá-lo torna os testes de expiração determinísticos","Porque o FastAPI exige","Para evitar fusos horários"]} answer={1} explanation="Com o horário injetado, o teste fixa um instante e confere o prazo exato de 15 minutos, sem patch nem espera." />
+
+<Quiz question="Um painel administrativo de cadastro de locais, com regras mínimas, está sendo feito em Django. Qual a abordagem mais adequada?" options={["Hexagonal completa com repositórios e unit of work","Microsserviço próprio","Repositórios sobre o ORM do Django para isolar o banco","O MTV do Django com ModelForm e Admin, sem camadas extras"]} answer={3} explanation="Com poucas regras, as camadas extras são custo sem benefício. O MTV e as ferramentas prontas do Django resolvem bem um CRUD." />
+
+## Base no CodeForge
+
+- [Django: Persistência de dados e Admin](/learn/carreira-python/django-persistencia-dados-admin) e [FastAPI e Python](/learn/carreira-python/fastapi-python-construindo-apis-autenticacao-banco-dados): as implementações da reserva que este capítulo reorganiza.
+- [Arquitetura hexagonal](/learn/system-design/hexagonal) e [MVC](/learn/lld/mvc): os estilos vistos de forma independente de linguagem.
+- [Repository](/learn/lld/repository) e [Injeção de dependência](/learn/lld/injecao-de-dependencia): os padrões em detalhe.
+- [Princípios SOLID com Python](/learn/carreira-python/principios-solid-python-construindo-codigos-eficientes-escalaveis): o DIP, princípio por trás da inversão de dependências.
+- [Domain-Driven Design em Python](/learn/carreira-python/domain-driven-design-python-modelagem-dominio-implementacao): como modelar o domínio que fica no centro.
+
+## Referências
+
+- [Python: typing.Protocol](https://docs.python.org/3/library/typing.html#typing.Protocol)
+- [FastAPI: Dependencies](https://fastapi.tiangolo.com/tutorial/dependencies/)
+- [SQLAlchemy: Session Basics](https://docs.sqlalchemy.org/en/20/orm/session_basics.html)
+- [Django: Design philosophies](https://docs.djangoproject.com/en/5.2/misc/design-philosophies/)

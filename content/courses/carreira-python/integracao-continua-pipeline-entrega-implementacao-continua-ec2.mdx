@@ -1,0 +1,324 @@
+---
+title: "Integração Contínua: Pipeline de entrega e implementação contínua na EC2"
+kind: lesson
+---
+
+O pipeline do capítulo anterior testa cada pull request, publica a imagem do `ingressos` no `ghcr.io` com a tag do commit e dispara um deploy hook de staging. Produção, porém, roda numa instância EC2, e quem atualiza essa instância ainda é uma pessoa: entra por SSH, edita a tag no `.env`, roda as migrações e reinicia os contêineres, consultando um documento que nem sempre está atualizado. Esse ritual falha de formas previsíveis: alguém esquece a migração, a chave SSH de quem saiu da empresa continua valendo, e ninguém sabe dizer qual versão estava no ar ontem às 22h.
+
+Este capítulo transforma esse ritual num job do GitHub Actions. O pipeline se autentica na AWS sem nenhuma chave guardada, manda a instância executar um script de deploy versionado, roda as migrações, confere a saúde da aplicação e volta para a versão anterior se algo der errado. Staging recebe todo merge automaticamente; produção espera a aprovação de uma pessoa.
+
+**Você vai aprender:**
+
+- Distinguir entrega contínua de implantação contínua e decidir onde cada uma se aplica
+- Autenticar o GitHub Actions na AWS com OIDC, sem chaves de acesso fixas
+- Executar o deploy numa EC2 pelo SSM Run Command, e saber quando SSH ainda é aceitável
+- Rodar a aplicação no servidor com `docker compose` gerenciado pelo systemd
+- Proteger produção com aprovação manual por environment e rodar migrações no deploy
+
+## Entrega contínua e implantação contínua
+
+As duas práticas se abreviam como CD e diferem num único ponto:
+
+- **Entrega contínua (continuous delivery):** todo commit que passa no pipeline gera um artefato **pronto** para produção, e colocá-lo no ar é uma decisão humana de um clique.
+- **Implantação contínua (continuous deployment):** todo commit que passa no pipeline **vai** para produção sem intervenção.
+
+O fluxo deste capítulo combina as duas: implantação contínua em staging (a `main` está sempre lá) e entrega contínua em produção (alguém aprova a promoção). A transição para implantação contínua em produção não é técnica, é de confiança: acontece quando a suíte de testes, o monitoramento e o rollback são bons o bastante para dispensar o olho humano. No GitHub, ela se resume a remover a regra de aprovação do environment.
+
+O princípio que vale nos dois casos: **construa uma vez, promova o mesmo artefato.** A imagem que passou em staging, identificada pelo digest, é exatamente a que vai para produção. Reconstruir a imagem para produção abre espaço para uma dependência ter mudado no meio do caminho.
+
+## OIDC: credenciais sem chaves
+
+A forma antiga de dar acesso à AWS a um pipeline é criar um usuário IAM e guardar `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY` nos secrets do repositório. Essas chaves não expiram, raramente são rotacionadas e, se vazarem num log ou num fork, dão acesso até alguém perceber.
+
+Com OpenID Connect, cada execução de workflow recebe do GitHub um token assinado que descreve quem ela é: repositório, branch e environment. A AWS confia no emissor do GitHub e troca esse token por credenciais temporárias de uma role IAM, válidas por uma hora. Não existe segredo de longa duração para vazar.
+
+A configuração na AWS tem duas partes. Primeiro, um *identity provider* do tipo OpenID Connect com a URL `https://token.actions.githubusercontent.com` e a audiência `sts.amazonaws.com`. Depois, uma role cuja política de confiança restringe **quem** pode assumi-la:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": [
+            "repo:minha-org/ingressos:environment:staging",
+            "repo:minha-org/ingressos:environment:production"
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+A condição sobre `sub` é a parte que importa. Quando o job declara um environment, o `sub` do token vira `repo:<dono>/<repo>:environment:<nome>`. Com essa política, só jobs nos environments `staging` e `production` deste repositório assumem a role; um workflow num fork, ou num branch qualquer sem environment, recebe acesso negado. Sem a condição de `sub`, qualquer repositório do GitHub poderia assumir a sua role.
+
+<Callout type="warning" title="Uma role por ambiente">
+Para isolar de verdade, crie uma role para staging (com `sub` restrito a `environment:staging`) e outra para produção, cada uma com permissão só sobre as instâncias do seu ambiente. Assim, um workflow de staging comprometido não consegue mandar comandos para produção, mesmo que alguém altere o YAML.
+</Callout>
+
+As permissões da role de deploy são poucas: `ssm:SendCommand` restrito ao documento `AWS-RunShellScript` e às instâncias com a tag do ambiente, e `ssm:GetCommandInvocation` e `ssm:ListCommandInvocations` para acompanhar o resultado. A role não precisa de acesso ao registro de imagens nem ao banco: quem baixa a imagem e roda a migração é a própria instância.
+
+## SSM em vez de SSH
+
+Há duas formas de o pipeline executar algo na instância:
+
+| | SSH a partir do Actions | SSM Run Command |
+|---|---|---|
+| Rede | Porta 22 aberta para os IPs dos runners (que mudam) | Nenhuma porta de entrada; o agente SSM sai para a AWS |
+| Credencial | Chave privada guardada em secret, sem expiração | Credencial temporária via OIDC e permissão IAM |
+| Auditoria | O que o servidor registrar | Cada comando registrado na AWS, com quem chamou e a saída |
+| Uso típico | Servidores fora da AWS, VPS simples | Instâncias EC2 com o agente SSM (já vem nas AMIs Amazon Linux e Ubuntu) |
+
+O SSH ainda é aceitável num VPS fora da AWS: use uma chave exclusiva do deploy, com um usuário sem sudo, `known_hosts` fixado no workflow e a chave privada num secret do environment. Na EC2, o SSM é melhor em todas as linhas da tabela. A instância precisa de um *instance profile* com a política gerenciada `AmazonSSMManagedInstanceCore` e saída para a internet (ou endpoints de VPC para o SSM).
+
+## O servidor: docker compose sob o systemd
+
+Na instância, a aplicação roda com o mesmo `compose.yaml` do desenvolvimento, sem o banco: em produção, o Postgres é um RDS gerenciado. O arquivo de produção fica em `/opt/ingressos`:
+
+```yaml
+# /opt/ingressos/compose.yaml
+services:
+  api:
+    image: ${IMAGEM}
+    env_file: /opt/ingressos/app.env
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/saude/pronto')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+```
+
+O `${IMAGEM}` é lido do arquivo `.env` ao lado do compose, que guarda só a imagem atual. O `app.env` tem `DATABASE_URL`, `DJANGO_SECRET_KEY` e afins, com permissão `600`, gravado pelo provisionamento a partir do Parameter Store. A imagem `slim` não traz `curl`, por isso o health check usa o próprio Python.
+
+Para a aplicação voltar sozinha quando a instância reinicia, uma unidade do systemd sobe o compose no boot:
+
+```ini
+# /etc/systemd/system/ingressos.service
+[Unit]
+Description=API de ingressos
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/ingressos
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Sem contêineres, o mesmo papel é feito por uma unidade com `ExecStart` apontando para o gunicorn do ambiente virtual, `User=` de um usuário sem privilégios e `Restart=on-failure`. A diferença é que o deploy passa a ser um `git pull` mais `pip install` no servidor, e o artefato deixa de ser imutável; com a imagem, o servidor só precisa do Docker.
+
+## O script de deploy, versionado
+
+Toda a lógica do deploy fica num script dentro do repositório, instalado em `/opt/ingressos/deploy.sh` pelo provisionamento. O pipeline só o chama com a imagem como argumento:
+
+```bash
+#!/usr/bin/env bash
+# deploy/deploy.sh
+set -euo pipefail
+cd /opt/ingressos
+
+NOVA="$1"
+ANTERIOR="$(grep '^IMAGEM=' .env | cut -d= -f2- || true)"
+
+# token de leitura do ghcr.io guardado no Parameter Store
+aws ssm get-parameter --name /ingressos/ghcr-token --with-decryption \
+  --query Parameter.Value --output text | docker login ghcr.io -u deploy --password-stdin
+
+echo "IMAGEM=$NOVA" > .env
+docker compose pull api
+
+# migrações com a imagem nova, antes de trocar os contêineres
+docker compose run --rm api python manage.py migrate --noinput
+
+docker compose up -d api
+
+for tentativa in $(seq 1 30); do
+  if curl --fail --silent http://localhost:8000/saude/pronto > /dev/null; then
+    echo "Deploy de $NOVA concluído"
+    docker image prune -f > /dev/null
+    exit 0
+  fi
+  sleep 5
+done
+
+echo "Aplicação não ficou saudável; voltando para $ANTERIOR" >&2
+if [ -n "$ANTERIOR" ]; then
+  echo "IMAGEM=$ANTERIOR" > .env
+  docker compose up -d api
+fi
+exit 1
+```
+
+O `set -euo pipefail` faz o script parar no primeiro erro, inclusive dentro de pipes e em variável não definida. Se a migração falha, o script para antes de trocar os contêineres e a versão antiga continua no ar. Se a aplicação nova sobe mas não responde ao health check em dois minutos e meio, o script recoloca a imagem anterior e sai com erro, o que deixa o job do pipeline vermelho. O `curl` aqui roda no host, que tem o pacote instalado. O `docker image prune -f` remove só imagens sem tag, então a anterior continua em cache para um rollback rápido.
+
+## O workflow de deploy
+
+O job `deploy-staging` do capítulo anterior é substituído por um workflow reutilizável, chamado uma vez por ambiente:
+
+```yaml
+# .github/workflows/deploy-ec2.yml
+name: Deploy EC2
+
+on:
+  workflow_call:
+    inputs:
+      ambiente:
+        type: string
+        required: true
+      imagem:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.ambiente }}
+      url: ${{ vars.URL_PUBLICA }}
+    concurrency:
+      group: deploy-${{ inputs.ambiente }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ROLE_DEPLOY_ARN }}
+          aws-region: us-east-1
+
+      - name: Executa o deploy na instância
+        env:
+          INSTANCIA: ${{ vars.INSTANCIA_ID }}
+          IMAGEM: ${{ inputs.imagem }}
+        run: |
+          PARAMETROS=$(jq -n --arg img "$IMAGEM" '{commands: ["/opt/ingressos/deploy.sh " + $img]}')
+          COMANDO=$(aws ssm send-command \
+            --instance-ids "$INSTANCIA" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA::7}" \
+            --parameters "$PARAMETROS" \
+            --query Command.CommandId --output text)
+
+          aws ssm wait command-executed --command-id "$COMANDO" --instance-id "$INSTANCIA" || true
+
+          aws ssm get-command-invocation --command-id "$COMANDO" --instance-id "$INSTANCIA" \
+            --query StandardOutputContent --output text
+          STATUS=$(aws ssm get-command-invocation --command-id "$COMANDO" --instance-id "$INSTANCIA" \
+            --query Status --output text)
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation --command-id "$COMANDO" --instance-id "$INSTANCIA" \
+              --query StandardErrorContent --output text >&2
+            exit 1
+          fi
+
+      - name: Smoke test externo
+        run: curl --fail --silent --retry 5 --retry-delay 5 "${{ vars.URL_PUBLICA }}/saude/pronto"
+```
+
+E no `ci.yml`, depois do job `imagem`:
+
+```yaml
+  staging:
+    needs: imagem
+    uses: ./.github/workflows/deploy-ec2.yml
+    with:
+      ambiente: staging
+      imagem: ghcr.io/${{ github.repository }}@${{ needs.imagem.outputs.digest }}
+
+  producao:
+    needs: [imagem, staging]
+    uses: ./.github/workflows/deploy-ec2.yml
+    with:
+      ambiente: production
+      imagem: ghcr.io/${{ github.repository }}@${{ needs.imagem.outputs.digest }}
+```
+
+Os detalhes que fazem diferença:
+
+- **`id-token: write`** autoriza o job a pedir o token OIDC. Sem essa permissão, o `configure-aws-credentials` falha ao assumir a role.
+- **`vars.ROLE_DEPLOY_ARN`, `vars.INSTANCIA_ID` e `vars.URL_PUBLICA`** são variables definidas em cada environment. O mesmo workflow serve aos dois ambientes, e o ARN da role não é segredo.
+- **`concurrency` com `cancel-in-progress: false`** enfileira deploys do mesmo ambiente em vez de cancelar o que está rodando. Cancelar um deploy no meio da migração é pior do que esperar.
+- **O `wait` com `|| true`** espera o comando terminar sem derrubar o passo, porque o `wait` sai com erro quando o comando falha. Quem decide o resultado é o `Status` lido em seguida, depois de imprimir a saída do script no log do Actions.
+- **O smoke test externo** passa pelo balanceador ou DNS, o caminho real do usuário, que o health check local não exercita.
+
+## Aprovação manual com environments
+
+No environment `production` (*Settings*, *Environments*), configure:
+
+- **Required reviewers:** uma ou mais pessoas ou times que precisam aprovar. O job `producao` fica pausado, com o botão de revisão na página da execução, até alguém aprovar ou rejeitar.
+- **Prevent self-review:** quem disparou a execução não pode aprovar a própria mudança.
+- **Deployment branches:** só a `main` pode fazer deploy em produção. Um workflow alterado num branch de teste não consegue nem iniciar o job.
+- **Wait timer** (opcional): um intervalo mínimo antes do deploy, útil para observar staging por alguns minutos.
+
+A aprovação vale também como registro: a página do environment mostra cada deploy, o commit, quem aprovou e quando. Para passar a implantação contínua em produção, remova os revisores; o resto do pipeline continua igual.
+
+## Migrações no deploy
+
+O script roda `migrate` com a imagem nova, antes de trocar o contêiner. Com uma instância só, há uma janela em que a versão **antiga** do código atende sobre o schema **novo**, e, se o health check falhar, o rollback volta o código mas não desfaz a migração. As duas situações exigem a mesma disciplina: **toda migração precisa ser compatível com a versão anterior do código.**
+
+| Mudança | Segura num deploy só? |
+|---|---|
+| Criar tabela nova | Sim |
+| Adicionar coluna que aceita nulo ou tem padrão | Sim |
+| Adicionar índice com `AddIndexConcurrently` (Postgres) | Sim |
+| Remover ou renomear coluna que o código antigo usa | Não: exige dois deploys |
+| Tornar obrigatória uma coluna que o código antigo não preenche | Não |
+
+Remover a coluna `origem` do `Pedido`, por exemplo, vira dois deploys: no primeiro, o código para de usá-la; no seguinte, a migração a remove. O capítulo sobre rollback trata esse padrão (expandir e contrair) em detalhe. Com várias instâncias, o mesmo `migrate` precisa rodar uma vez só, e não em cada servidor: é o que o próximo capítulo resolve com uma task avulsa no ECS.
+
+## Na entrevista
+
+**Qual a diferença entre entrega contínua e implantação contínua?** Na entrega contínua, todo commit aprovado no pipeline fica pronto para produção, mas o deploy depende de uma decisão humana. Na implantação contínua, ele vai para produção automaticamente. A segunda exige mais confiança nos testes, no monitoramento e no rollback.
+
+**Por que OIDC é melhor que chaves de acesso no pipeline?** Porque as credenciais são temporárias e emitidas por execução, sem segredo de longa duração guardado no GitHub. E a política de confiança limita quais repositórios, branches e environments podem assumir a role.
+
+**Por que preferir SSM a SSH para deploy em EC2?** O SSM não exige porta de entrada aberta nem chave privada guardada, usa permissões IAM temporárias e registra cada comando com a saída. O SSH continua útil fora da AWS, com chave exclusiva e usuário restrito.
+
+**Como você roda migrações num deploy?** Antes de trocar a versão, com a imagem nova e uma única vez por deploy. E escrevendo migrações compatíveis com a versão anterior do código, porque as duas convivem durante a troca e num eventual rollback.
+
+**Como impedir que um workflow alterado faça deploy em produção?** Com a condição de `sub` na role restrita ao environment de produção, o environment limitado à `main` e revisores obrigatórios. Mesmo editando o YAML num branch, o job não recebe credenciais nem passa da aprovação.
+
+## Pratique
+
+1. Crie o identity provider OIDC e duas roles (staging e produção) com a condição de `sub` por environment e permissão de `ssm:SendCommand` só para instâncias com a tag do ambiente.
+2. Provisione uma EC2 com Docker, o instance profile com `AmazonSSMManagedInstanceCore`, o `compose.yaml`, a unidade do systemd e o `deploy.sh` do repositório.
+3. Escreva o `deploy-ec2.yml` reutilizável e chame-o para staging e produção a partir do `ci.yml`, com as variables em cada environment.
+4. Configure o environment `production` com revisor obrigatório, proibição de autoaprovação e restrição à `main`.
+5. Publique uma versão cujo `/saude/pronto` devolve 500 e mostre no log do Actions o script voltando para a imagem anterior e o job falhando antes de produção.
+
+<Quiz question="Qual condição da política de confiança impede que o workflow de um fork assuma a role de deploy?" options={["A audiência sts.amazonaws.com","A condição sobre o sub, restrita ao repositório e aos environments","A permissão id-token write no workflow","O ARN da role guardado como variable"]} answer={1} explanation="O sub identifica repositório, branch ou environment da execução. Sem restringi-lo, qualquer repositório do GitHub poderia trocar seu token por credenciais da role." />
+
+<Quiz question="No script de deploy, a migração roda antes de trocar o contêiner. O que acontece se ela falhar?" options={["O set -e interrompe o script e a versão antiga continua atendendo","O docker compose reverte a migração sozinho","A versão nova sobe sem as migrações","O SSM repete o comando até funcionar"]} answer={0} explanation="Com set -euo pipefail, o primeiro comando com erro encerra o script. Como o up -d ainda não rodou, o contêiner antigo segue no ar e o job do pipeline falha." />
+
+<Quiz question="Por que o grupo de concurrency do deploy usa cancel-in-progress false?" options={["Para rodar dois deploys em paralelo","Porque o SSM não aceita cancelamento","Para que um deploy novo espere o atual terminar, em vez de interrompê-lo no meio de uma migração","Para dispensar a aprovação manual"]} answer={2} explanation="Cancelar um deploy no meio pode deixar migração e contêineres em estado intermediário. Enfileirar é mais seguro para jobs que alteram ambientes." />
+
+## Base no CodeForge
+
+- [Integração Contínua com Docker e GitHub Actions: Do build ao deploy](/learn/carreira-python/integracao-continua-docker-github-actions-build-deploy): a imagem e o CI que este pipeline promove.
+- [Integração Contínua: Automatize o deploy no Amazon ECS](/learn/carreira-python/integracao-continua-automatize-deploy-amazon-ecs): o próximo passo, com um orquestrador fazendo a troca de versões.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos) e [Migrações de schema](/learn/system-design/migracoes-de-schema): os conceitos por trás do OIDC e das migrações compatíveis.
+- [Integração Contínua: Pipeline de entrega na EC2 (Node.js)](/learn/carreira-nodejs/integracao-continua-pipeline-entrega-implementacao-continua-ec2): o mesmo tema com Terraform e ECR.
+
+## Referências
+
+- [GitHub: Configuring OpenID Connect in Amazon Web Services](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
+- [GitHub: Managing environments for deployment](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment)
+- [AWS Systems Manager Run Command](https://docs.aws.amazon.com/systems-manager/latest/userguide/run-command.html)
+- [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)

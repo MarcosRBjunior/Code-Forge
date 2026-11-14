@@ -1,0 +1,597 @@
+---
+title: "Python: Persistência de dados com arquivos e bancos de dados"
+kind: lesson
+---
+
+Até aqui, os eventos do `ingressos` vivem na memória e desaparecem quando o programa termina. Persistir dados parece simples (gravar num arquivo e ler de volta), mas as perguntas aparecem rápido: o que acontece se o programa cair no meio da gravação? Como dois usuários compram o último ingresso ao mesmo tempo sem vender dois? Como buscar os pedidos de um cliente entre um milhão sem ler tudo? Cada resposta leva a uma ferramenta diferente: arquivos para dados simples e troca com outros sistemas, banco relacional para dados que o sistema consulta e altera com garantias.
+
+Este capítulo percorre essa escada com o mesmo domínio: arquivos texto, CSV e JSON com `pathlib`, SQLite com `sqlite3`, PostgreSQL com `psycopg` 3, transações e, por fim, o ORM SQLAlchemy 2.0. No caminho, o código de acesso a dados vai para trás de um repositório, para que as regras de negócio não dependam de onde os dados moram.
+
+**Você vai aprender:**
+
+- Ler e gravar arquivos com `pathlib` e context managers, incluindo CSV e JSON
+- Usar SQLite e PostgreSQL com consultas parametrizadas, sem abrir brecha para SQL injection
+- Controlar transações e evitar vender o mesmo ingresso duas vezes
+- Mapear entidades com SQLAlchemy 2.0 (`Mapped`, `mapped_column`, `select()`)
+- Isolar a persistência num repositório e trocar a implementação sem tocar nas regras
+
+## Caminhos com pathlib
+
+O módulo `pathlib` representa caminhos como objetos, e cuida das diferenças entre `/` no Linux e `\` no Windows:
+
+```python
+from pathlib import Path
+
+base = Path(__file__).resolve().parent          # pasta do arquivo atual
+dados = base / "dados"                          # o operador / junta caminhos
+dados.mkdir(parents=True, exist_ok=True)
+
+arquivo = dados / "eventos.txt"
+print(arquivo.name, arquivo.suffix, arquivo.exists())
+
+for csv in dados.glob("*.csv"):                 # lista arquivos por padrão
+    print(csv.stem)
+```
+
+Prefira caminhos relativos a um ponto conhecido (a pasta do projeto, uma variável de ambiente) a caminhos relativos ao diretório atual, que muda conforme de onde o programa é chamado.
+
+## Arquivos texto e context managers
+
+```python
+from pathlib import Path
+
+arquivo = Path("dados/log_vendas.txt")
+
+with arquivo.open("a", encoding="utf-8") as saida:
+    saida.write("2027-01-20;Festival de Verão;Pista;2\n")
+
+with arquivo.open(encoding="utf-8") as entrada:
+    for linha in entrada:                         # lê linha a linha, sem carregar tudo
+        data, evento, setor, quantidade = linha.rstrip("\n").split(";")
+        print(evento, int(quantidade))
+
+texto = arquivo.read_text(encoding="utf-8")       # atalhos para arquivos pequenos
+```
+
+Os modos principais: `"r"` (ler, o padrão), `"w"` (gravar, apagando o conteúdo), `"a"` (acrescentar ao fim), `"x"` (criar, falhando se já existir) e `"b"` combinado para binário (`"rb"`). Sempre informe `encoding="utf-8"`: sem ele, o Python usa a codificação padrão do sistema, que no Windows pode não ser UTF-8, e acentos viram lixo ao trocar de máquina.
+
+O `with` é um **context manager**: garante que o arquivo seja fechado ao sair do bloco, mesmo se uma exceção acontecer no meio. Sem ele, um erro pode deixar o arquivo aberto e dados no buffer sem gravar. O mesmo padrão vale para conexões de banco, travas e transações, e você pode criar os seus:
+
+```python
+from collections.abc import Iterator
+from contextlib import contextmanager
+import time
+
+
+@contextmanager
+def cronometro(rotulo: str) -> Iterator[None]:
+    inicio = time.perf_counter()
+    try:
+        yield
+    finally:
+        print(f"{rotulo}: {time.perf_counter() - inicio:.3f}s")
+
+
+with cronometro("importação"):
+    total = sum(range(1_000_000))
+```
+
+O código antes do `yield` roda na entrada do bloco; o que está no `finally` roda na saída, com ou sem erro.
+
+<Callout type="tip" title="Gravação atômica de arquivo">
+Se o programa cair no meio de um `write_text`, o arquivo fica pela metade e os dados antigos se perdem. Para arquivos que não podem corromper, grave num arquivo temporário na mesma pasta e depois troque com `Path.replace`, que substitui o destino de uma vez. Ou o arquivo novo está completo, ou o antigo continua intacto.
+</Callout>
+
+## CSV
+
+CSV é o formato de troca com planilhas e outros sistemas. Não divida linhas com `split(",")`: um nome como `"Show de Rock, Pop e MPB"` tem vírgula dentro e vem entre aspas. O módulo `csv` trata isso:
+
+```python
+import csv
+from pathlib import Path
+
+caminho = Path("dados/eventos.csv")
+eventos = [
+    {"nome": "Festival de Verão", "data": "2027-01-20", "local": "Arena Norte", "capacidade": 500},
+    {"nome": "Show de Rock, Pop e MPB", "data": "2027-02-05", "local": "Teatro Central", "capacidade": 80},
+]
+
+with caminho.open("w", newline="", encoding="utf-8") as saida:
+    escritor = csv.DictWriter(saida, fieldnames=["nome", "data", "local", "capacidade"])
+    escritor.writeheader()
+    escritor.writerows(eventos)
+
+with caminho.open(newline="", encoding="utf-8") as entrada:
+    for linha in csv.DictReader(entrada):
+        print(linha["nome"], int(linha["capacidade"]))
+```
+
+Dois detalhes: `newline=""` é exigido pelo módulo para não duplicar quebras de linha no Windows, e tudo que vem do `DictReader` é texto, então números e datas precisam de conversão. Planilhas brasileiras costumam usar ponto e vírgula como separador (`delimiter=";"`), e o Excel lê melhor UTF-8 quando o arquivo é gravado com `encoding="utf-8-sig"`.
+
+## JSON
+
+JSON guarda estruturas aninhadas e é o formato das APIs. O módulo `json` converte entre JSON e `dict`, `list`, `str`, `int`, `float`, `bool` e `None`. Tipos como `date` e `Decimal` não têm equivalente direto, e a conversão é sua:
+
+```python
+import json
+from dataclasses import asdict, dataclass
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+
+@dataclass
+class Evento:
+    nome: str
+    data: date
+    local: str
+    capacidade: int
+    preco: Decimal
+
+
+def para_json(valor: object) -> str:
+    if isinstance(valor, date):
+        return valor.isoformat()
+    if isinstance(valor, Decimal):
+        return str(valor)
+    raise TypeError(f"tipo não serializável: {type(valor).__name__}")
+
+
+def salvar(eventos: list[Evento], caminho: Path) -> None:
+    conteudo = json.dumps([asdict(e) for e in eventos], default=para_json,
+                          ensure_ascii=False, indent=2)
+    temporario = caminho.with_suffix(".tmp")
+    temporario.write_text(conteudo, encoding="utf-8")
+    temporario.replace(caminho)
+
+
+def carregar(caminho: Path) -> list[Evento]:
+    if not caminho.exists():
+        return []
+    brutos = json.loads(caminho.read_text(encoding="utf-8"))
+    return [
+        Evento(
+            nome=b["nome"],
+            data=date.fromisoformat(b["data"]),
+            local=b["local"],
+            capacidade=b["capacidade"],
+            preco=Decimal(b["preco"]),
+        )
+        for b in brutos
+    ]
+```
+
+O preço vai para o JSON como texto (`"120.00"`) para não passar por `float` e perder precisão. A função `default` é chamada para cada valor que o `json` não sabe converter. `ensure_ascii=False` mantém os acentos legíveis no arquivo.
+
+Um aviso sobre o módulo `pickle`, que grava qualquer objeto Python: carregar um pickle executa código definido por quem o criou, então um arquivo malicioso roda o que quiser na sua máquina. Use pickle só para dados que o próprio programa gerou; para troca de dados, use JSON.
+
+Arquivo resolve configuração, exportação e importação. Ele começa a falhar quando dois processos gravam ao mesmo tempo, quando você precisa buscar um registro entre milhões sem ler o arquivo inteiro, ou quando uma operação altera vários registros que precisam mudar juntos. É aí que entra o banco de dados.
+
+## SQLite com sqlite3
+
+O SQLite é um banco relacional completo num único arquivo, e o módulo `sqlite3` vem com o Python. Ótimo para desenvolvimento, testes, aplicativos locais e ferramentas de linha de comando.
+
+```python
+# ingressos/banco.py
+import sqlite3
+from pathlib import Path
+
+ESQUEMA = """
+CREATE TABLE IF NOT EXISTS eventos (
+    id          INTEGER PRIMARY KEY,
+    nome        TEXT    NOT NULL,
+    data        TEXT    NOT NULL,
+    local       TEXT    NOT NULL,
+    UNIQUE (nome, data)
+);
+CREATE TABLE IF NOT EXISTS setores (
+    id              INTEGER PRIMARY KEY,
+    evento_id       INTEGER NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
+    nome            TEXT    NOT NULL,
+    preco_centavos  INTEGER NOT NULL CHECK (preco_centavos >= 0),
+    quantidade      INTEGER NOT NULL CHECK (quantidade > 0),
+    vendidos        INTEGER NOT NULL DEFAULT 0,
+    CHECK (vendidos BETWEEN 0 AND quantidade),
+    UNIQUE (evento_id, nome)
+);
+"""
+
+
+def conectar(caminho: Path) -> sqlite3.Connection:
+    conexao = sqlite3.connect(caminho)
+    conexao.row_factory = sqlite3.Row            # linhas acessíveis por nome de coluna
+    conexao.execute("PRAGMA foreign_keys = ON")  # o SQLite não liga por padrão
+    conexao.executescript(ESQUEMA)
+    return conexao
+```
+
+As restrições (`NOT NULL`, `UNIQUE`, `CHECK`, `REFERENCES`) colocam no próprio banco as regras que não podem ser violadas, independentemente de qual código grave. O `CHECK (vendidos BETWEEN 0 AND quantidade)` é a última barreira contra vender acima da capacidade. O preço fica em centavos inteiros porque o SQLite não tem tipo decimal exato. A data é gravada como texto ISO (`2027-01-20`), que ordena corretamente.
+
+### Consultas parametrizadas
+
+```python
+from datetime import date
+
+conexao = conectar(Path("ingressos.db"))
+
+with conexao:                                    # abre transação; commit no fim, rollback se der erro
+    cursor = conexao.execute(
+        "INSERT INTO eventos (nome, data, local) VALUES (?, ?, ?)",
+        ("Festival de Verão", date(2027, 1, 20).isoformat(), "Arena Norte"),
+    )
+    evento_id = cursor.lastrowid
+    conexao.executemany(
+        "INSERT INTO setores (evento_id, nome, preco_centavos, quantidade) VALUES (?, ?, ?, ?)",
+        [(evento_id, "Pista", 12000, 400), (evento_id, "Camarote", 35000, 100)],
+    )
+
+linhas = conexao.execute(
+    "SELECT nome, quantidade - vendidos AS disponiveis FROM setores WHERE evento_id = ?",
+    (evento_id,),
+).fetchall()
+for linha in linhas:
+    print(linha["nome"], linha["disponiveis"])
+```
+
+Os valores nunca entram no texto do SQL: vão separados, nos marcadores `?` (ou `:nome` com um dicionário), e o banco os trata como dados. Repare na vírgula em `(evento_id,)`: os parâmetros são uma tupla, mesmo com um valor só.
+
+<Callout type="warning" title="SQL montado com f-string é SQL injection">
+`conexao.execute(f"SELECT * FROM eventos WHERE nome = '{nome}'")` funciona nos testes e entrega o banco a quem digitar `' OR '1'='1` no campo de busca. Com parâmetros, o valor nunca é interpretado como SQL. Isso vale para todos os drivers e ORMs: f-string, `%` e `+` montando SQL com dados do usuário são proibidos. Nomes de tabela e coluna não podem ser parâmetros; se precisarem variar, escolha de uma lista fixa.
+</Callout>
+
+Sobre `with conexao`: no `sqlite3`, o context manager da conexão controla a **transação** (commit ou rollback), mas não fecha a conexão. Feche com `conexao.close()` ou envolva com `contextlib.closing`.
+
+## Transações
+
+Uma **transação** agrupa operações que acontecem todas ou nenhuma. As propriedades ACID resumem as garantias: **atomicidade** (tudo ou nada), **consistência** (restrições sempre respeitadas), **isolamento** (transações simultâneas não enxergam o meio uma da outra) e **durabilidade** (depois do commit, o dado sobrevive a uma queda).
+
+A venda de ingressos é o caso clássico. A versão ingênua lê, decide em Python e grava:
+
+```python
+# ERRADO sob concorrência
+disponiveis = conexao.execute(
+    "SELECT quantidade - vendidos FROM setores WHERE id = ?", (setor_id,)
+).fetchone()[0]
+if disponiveis >= quantidade:
+    conexao.execute("UPDATE setores SET vendidos = vendidos + ? WHERE id = ?",
+                    (quantidade, setor_id))
+```
+
+Duas requisições simultâneas leem "resta 1", as duas decidem vender e as duas gravam. A correção é fazer a verificação e a alteração numa única instrução, que o banco executa de forma atômica:
+
+```python
+def vender(conexao: sqlite3.Connection, setor_id: int, quantidade: int) -> None:
+    with conexao:
+        cursor = conexao.execute(
+            """
+            UPDATE setores
+               SET vendidos = vendidos + ?
+             WHERE id = ? AND vendidos + ? <= quantidade
+            """,
+            (quantidade, setor_id, quantidade),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("ingressos insuficientes")
+```
+
+Se não couber, nenhuma linha é alterada, `rowcount` é zero e a exceção é levantada dentro do `with`, que faz rollback de tudo o que a transação tiver feito. Esse padrão (atualização condicional e conferência de linhas afetadas) funciona em qualquer banco relacional.
+
+## PostgreSQL com psycopg 3
+
+Em produção, o banco é um servidor separado, acessado pela rede por várias instâncias da aplicação. O PostgreSQL é a escolha mais comum no ecossistema Python, e o `psycopg` 3 é o driver:
+
+```bash
+pip install "psycopg[binary]"
+docker run -d --name pg -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=ingressos -p 5432:5432 postgres:16
+```
+
+```sql
+CREATE TABLE eventos (
+    id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    nome   TEXT NOT NULL,
+    data   DATE NOT NULL,
+    local  TEXT NOT NULL,
+    UNIQUE (nome, data)
+);
+
+CREATE TABLE setores (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    evento_id   BIGINT NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
+    nome        TEXT NOT NULL,
+    preco       NUMERIC(10, 2) NOT NULL CHECK (preco >= 0),
+    quantidade  INTEGER NOT NULL CHECK (quantidade > 0),
+    vendidos    INTEGER NOT NULL DEFAULT 0,
+    CHECK (vendidos BETWEEN 0 AND quantidade),
+    UNIQUE (evento_id, nome)
+);
+```
+
+O PostgreSQL tem `DATE` e `NUMERIC` de verdade, e o psycopg converte automaticamente de e para `date` e `Decimal`:
+
+```python
+import os
+from datetime import date
+from decimal import Decimal
+
+import psycopg
+from psycopg.rows import dict_row
+
+DSN = os.environ.get("DATABASE_URL", "postgresql://postgres:dev@localhost:5432/ingressos")
+
+with psycopg.connect(DSN, row_factory=dict_row) as conexao:
+    with conexao.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO eventos (nome, data, local) VALUES (%s, %s, %s) RETURNING id",
+            ("Festival de Verão", date(2027, 1, 20), "Arena Norte"),
+        )
+        evento_id = cursor.fetchone()["id"]
+        cursor.executemany(
+            "INSERT INTO setores (evento_id, nome, preco, quantidade) VALUES (%s, %s, %s, %s)",
+            [(evento_id, "Pista", Decimal("120.00"), 400),
+             (evento_id, "Camarote", Decimal("350.00"), 100)],
+        )
+    # ao sair do with da conexão sem erro: commit e fechamento
+
+with psycopg.connect(DSN, row_factory=dict_row) as conexao:
+    linhas = conexao.execute(
+        "SELECT nome, preco, quantidade - vendidos AS disponiveis "
+        "FROM setores WHERE evento_id = %(evento)s ORDER BY preco",
+        {"evento": evento_id},
+    ).fetchall()
+    for linha in linhas:
+        print(linha["nome"], linha["preco"], linha["disponiveis"])
+```
+
+As diferenças em relação ao `sqlite3`:
+
+| | `sqlite3` | `psycopg` 3 |
+|---|---|---|
+| Marcador de parâmetro | `?` ou `:nome` | `%s` ou `%(nome)s` (mesmo para números) |
+| `with conexao` | Controla a transação, não fecha | Commit ou rollback e fecha a conexão |
+| Id gerado | `cursor.lastrowid` | `RETURNING id` no próprio `INSERT` |
+| Tipos | Poucos; datas e decimais à mão | `date`, `Decimal`, `datetime`, `UUID`, JSON nativos |
+| Concorrência | Um escritor por vez no arquivo | Muitas conexões simultâneas |
+
+O `%s` do psycopg parece formatação de string, mas não é: o valor vai separado para o servidor. Nunca use o operador `%` do Python para montar a consulta.
+
+Para controlar transações dentro de uma conexão aberta, use `conexao.transaction()`:
+
+```python
+def vender(conexao: psycopg.Connection, setor_id: int, quantidade: int) -> None:
+    with conexao.transaction():
+        cursor = conexao.execute(
+            "UPDATE setores SET vendidos = vendidos + %s "
+            "WHERE id = %s AND vendidos + %s <= quantidade",
+            (quantidade, setor_id, quantidade),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("ingressos insuficientes")
+```
+
+Quando a lógica precisa ler, decidir em Python e só então gravar, trave a linha com `SELECT ... FOR UPDATE` dentro da transação: outras transações que tentem alterar a mesma linha esperam o commit. Abrir uma conexão nova por operação custa caro (TCP, TLS, autenticação); aplicações web usam um **pool** de conexões, oferecido pelo pacote `psycopg_pool` ou pelo próprio ORM.
+
+## ORM com SQLAlchemy 2.0
+
+Escrever SQL à mão dá controle total, mas repete muito código de conversão entre linhas e objetos. Um **ORM** (mapeamento objeto-relacional) mapeia classes para tabelas e gera o SQL. O SQLAlchemy é o padrão fora do Django, e a versão 2.0 usa type hints para declarar o mapeamento:
+
+```bash
+pip install "sqlalchemy>=2.0" "psycopg[binary]"
+```
+
+```python
+# ingressos/orm.py
+from datetime import date
+from decimal import Decimal
+
+from sqlalchemy import CheckConstraint, ForeignKey, Numeric, String, UniqueConstraint
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class EventoModel(Base):
+    __tablename__ = "eventos"
+    __table_args__ = (UniqueConstraint("nome", "data"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    nome: Mapped[str] = mapped_column(String(200))
+    data: Mapped[date]
+    local: Mapped[str] = mapped_column(String(200))
+    setores: Mapped[list["SetorModel"]] = relationship(
+        back_populates="evento", cascade="all, delete-orphan"
+    )
+
+
+class SetorModel(Base):
+    __tablename__ = "setores"
+    __table_args__ = (
+        UniqueConstraint("evento_id", "nome"),
+        CheckConstraint("vendidos BETWEEN 0 AND quantidade"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    evento_id: Mapped[int] = mapped_column(ForeignKey("eventos.id", ondelete="CASCADE"))
+    nome: Mapped[str] = mapped_column(String(100))
+    preco: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    quantidade: Mapped[int]
+    vendidos: Mapped[int] = mapped_column(default=0)
+    evento: Mapped[EventoModel] = relationship(back_populates="setores")
+```
+
+`Mapped[int]` declara o tipo Python, e o SQLAlchemy deduz o tipo da coluna; `mapped_column` acrescenta detalhes. Um `Mapped[str | None]` tornaria a coluna anulável; sem `| None`, ela é `NOT NULL`. O `relationship` liga os objetos: `evento.setores` é uma lista de setores e `setor.evento` volta ao evento.
+
+```python
+from datetime import date
+from decimal import Decimal
+
+from sqlalchemy import create_engine, select, update
+from sqlalchemy.orm import Session
+
+from ingressos.orm import Base, EventoModel, SetorModel
+
+engine = create_engine("postgresql+psycopg://postgres:dev@localhost:5432/ingressos")
+Base.metadata.create_all(engine)          # só para estudo; em projeto real, migrações
+
+with Session(engine) as sessao, sessao.begin():
+    show = EventoModel(nome="Sarau", data=date(2027, 3, 14), local="Teatro Central")
+    show.setores.append(SetorModel(nome="Plateia", preco=Decimal("60.00"), quantidade=80))
+    sessao.add(show)
+# sessao.begin() faz commit ao sair sem erro, rollback se houver exceção
+
+with Session(engine) as sessao:
+    consulta = (
+        select(EventoModel)
+        .where(EventoModel.data >= date.today())
+        .order_by(EventoModel.data)
+    )
+    for evento in sessao.scalars(consulta):
+        print(evento.nome, [s.nome for s in evento.setores])
+
+    um_evento = sessao.get(EventoModel, 1)    # busca pela chave primária
+```
+
+A **sessão** é a unidade de trabalho: acompanha os objetos carregados e alterados e, no commit, envia ao banco os `INSERT` e `UPDATE` necessários, na ordem certa e numa transação. A mesma regra de venda atômica se escreve com `update()`:
+
+```python
+def vender(sessao: Session, setor_id: int, quantidade: int) -> None:
+    resultado = sessao.execute(
+        update(SetorModel)
+        .where(SetorModel.id == setor_id,
+               SetorModel.vendidos + quantidade <= SetorModel.quantidade)
+        .values(vendidos=SetorModel.vendidos + quantidade)
+    )
+    if resultado.rowcount == 0:
+        raise ValueError("ingressos insuficientes")
+```
+
+Cuidados com ORM: acessar `evento.setores` dentro de um laço sobre eventos dispara uma consulta por evento (o problema **N+1**), resolvido com `selectinload` nas opções da consulta; e `create_all` não altera tabelas existentes, por isso projetos reais usam **Alembic** para versionar o esquema com migrações, assunto do capítulo de FastAPI.
+
+| Abordagem | Vantagens | Desvantagens |
+|---|---|---|
+| SQL com driver (`sqlite3`, `psycopg`) | Controle total, desempenho previsível, nada escondido | Conversão manual entre linhas e objetos, mais código |
+| ORM (SQLAlchemy, ORM do Django) | Menos repetição, relacionamentos, unidade de trabalho, portabilidade | Abstração que pode gerar consultas ruins sem você perceber |
+
+## O padrão repositório
+
+Se as regras de negócio chamam `psycopg` ou `Session` diretamente, trocar de banco ou testar sem banco vira uma reescrita. O **repositório** é uma classe que oferece uma interface de coleção (adicionar, buscar, listar) e esconde como os dados são guardados:
+
+```python
+# ingressos/repositorio.py
+import json
+from dataclasses import asdict, dataclass
+from datetime import date
+from pathlib import Path
+from typing import Protocol
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from ingressos.orm import EventoModel
+
+
+@dataclass
+class Evento:
+    nome: str
+    data: date
+    local: str
+    id: int | None = None
+
+
+class RepositorioEventos(Protocol):
+    def adicionar(self, evento: Evento) -> Evento: ...
+    def buscar(self, evento_id: int) -> Evento | None: ...
+    def listar_futuros(self, hoje: date) -> list[Evento]: ...
+
+
+class RepositorioEventosMemoria:
+    def __init__(self) -> None:
+        self._eventos: dict[int, Evento] = {}
+
+    def adicionar(self, evento: Evento) -> Evento:
+        evento.id = len(self._eventos) + 1
+        self._eventos[evento.id] = evento
+        return evento
+
+    def buscar(self, evento_id: int) -> Evento | None:
+        return self._eventos.get(evento_id)
+
+    def listar_futuros(self, hoje: date) -> list[Evento]:
+        return sorted((e for e in self._eventos.values() if e.data >= hoje), key=lambda e: e.data)
+
+
+class RepositorioEventosSqlAlchemy:
+    def __init__(self, sessao: Session) -> None:
+        self.sessao = sessao
+
+    def adicionar(self, evento: Evento) -> Evento:
+        modelo = EventoModel(nome=evento.nome, data=evento.data, local=evento.local)
+        self.sessao.add(modelo)
+        self.sessao.flush()                 # envia o INSERT para obter o id
+        evento.id = modelo.id
+        return evento
+
+    def buscar(self, evento_id: int) -> Evento | None:
+        modelo = self.sessao.get(EventoModel, evento_id)
+        return self._para_dominio(modelo) if modelo else None
+
+    def listar_futuros(self, hoje: date) -> list[Evento]:
+        consulta = select(EventoModel).where(EventoModel.data >= hoje).order_by(EventoModel.data)
+        return [self._para_dominio(m) for m in self.sessao.scalars(consulta)]
+
+    @staticmethod
+    def _para_dominio(modelo: EventoModel) -> Evento:
+        return Evento(nome=modelo.nome, data=modelo.data, local=modelo.local, id=modelo.id)
+
+
+def cadastrar_evento(repositorio: RepositorioEventos, nome: str, data: date, local: str) -> Evento:
+    if data < date.today():
+        raise ValueError("a data do evento não pode estar no passado")
+    return repositorio.adicionar(Evento(nome=nome.strip(), data=data, local=local.strip()))
+```
+
+`cadastrar_evento` depende só do `Protocol`. Nos testes, recebe o repositório em memória e roda em milissegundos; em produção, recebe o do SQLAlchemy. O repositório não faz commit: quem controla a transação é a camada que coordena a operação (o caso de uso ou a requisição web), porque uma operação de negócio pode envolver vários repositórios que precisam ser gravados juntos. Isso não significa embrulhar o ORM em camadas sem propósito: o ganho existe quando há regra de negócio a proteger e testar.
+
+## Na entrevista
+
+**O que é SQL injection e como você evita?** É quando um dado do usuário é concatenado no texto do SQL e passa a ser interpretado como comando. Evito usando sempre consultas parametrizadas, em que os valores vão separados da instrução; o driver ou o ORM cuida disso, e nunca monto SQL com f-string ou concatenação.
+
+**O que garante uma transação?** As propriedades ACID: atomicidade (todas as operações ou nenhuma), consistência (restrições respeitadas), isolamento (transações concorrentes não veem estados intermediários umas das outras, conforme o nível de isolamento) e durabilidade (o que foi confirmado sobrevive a falhas).
+
+**Como você impede que dois clientes comprem o último ingresso?** Faço a verificação e a alteração numa única instrução atômica, como um `UPDATE` com a condição de estoque no `WHERE`, e confiro quantas linhas foram afetadas. Alternativas são travar a linha com `SELECT ... FOR UPDATE` dentro da transação, e uma restrição `CHECK` no banco como última barreira.
+
+**Para que serve o `with` ao abrir arquivos e conexões?** Ele usa o protocolo de context manager para garantir a liberação do recurso ao sair do bloco, mesmo com exceção: fecha o arquivo, faz commit ou rollback da transação, devolve a conexão. Evita vazamento de recursos e dados pela metade.
+
+**Quando usar ORM e quando escrever SQL?** ORM para o CRUD do dia a dia, relacionamentos e unidade de trabalho, com produtividade e menos repetição. SQL direto para relatórios, consultas complexas ou críticas de desempenho, em que preciso controlar exatamente o que roda. É comum usar os dois no mesmo projeto.
+
+**O que é o problema N+1?** É carregar uma lista com uma consulta e depois disparar uma consulta adicional para cada item ao acessar um relacionamento, totalizando N+1 idas ao banco. Resolve-se carregando o relacionamento junto, com `selectinload` ou `joinedload` no SQLAlchemy e `prefetch_related` ou `select_related` no Django.
+
+## Pratique
+
+1. Faça o programa de terminal salvar e carregar os eventos em JSON com gravação atômica, convertendo `date` e `Decimal`. Feche, abra de novo e confira que os eventos continuam lá.
+2. Acrescente as opções de exportar os eventos para CSV e importar de um CSV com separador ponto e vírgula, rejeitando linhas inválidas com uma mensagem que diga o número da linha.
+3. Migre a persistência para SQLite com as tabelas `eventos` e `setores`, as restrições `CHECK` e a venda atômica. Escreva um script que tente vender mais ingressos que a capacidade e confirme que o banco recusa.
+4. Suba um PostgreSQL 16 em Docker, crie as mesmas tabelas e reimplemente o acesso com `psycopg` 3, lendo a conexão da variável `DATABASE_URL`.
+5. Implemente `RepositorioEventos` em memória e com SQLAlchemy 2.0, faça `cadastrar_evento` depender só do protocolo e escreva verificações que rodem contra as duas implementações e produzam o mesmo resultado.
+
+<Quiz question="No psycopg 3, qual a forma correta de filtrar eventos pelo nome recebido do usuário?" options={["Montar o SQL com uma f-string contendo o nome","Concatenar o nome ao SQL com o operador +","Aplicar o operador porcentagem do Python ao texto do SQL","Usar o marcador %s e passar o nome numa tupla como segundo argumento de execute"]} answer={3} explanation="Só a última envia o valor separado da instrução. As outras montam o SQL com o texto do usuário e permitem SQL injection, inclusive a que usa o operador porcentagem do Python." />
+
+<Quiz question="No módulo sqlite3, o que o bloco with conexao faz ao terminar sem erro?" options={["Fecha a conexão","Faz commit da transação, mas não fecha a conexão","Apaga o arquivo do banco","Nada, o commit é sempre manual"]} answer={1} explanation="O context manager da conexão do sqlite3 controla a transação: commit no sucesso, rollback na exceção. Fechar exige close ou contextlib.closing. No psycopg 3, o with da conexão também fecha." />
+
+<Quiz question="Duas requisições simultâneas leem que resta 1 ingresso e ambas gravam a venda. Qual solução elimina o problema?" options={["UPDATE com a condição de estoque no WHERE e conferência de rowcount","Ler o estoque duas vezes antes de gravar","Aumentar o timeout da conexão","Guardar o estoque num arquivo JSON"]} answer={0} explanation="A verificação e a alteração numa só instrução são atômicas no banco. Se não couber, nenhuma linha muda e a aplicação sabe que deve recusar." />
+
+## Base no CodeForge
+
+- [Transações e ACID](/learn/sql/transacoes-e-acid) e [Níveis de isolamento](/learn/sql/niveis-de-isolamento): o que o banco garante quando há concorrência.
+- [Tipos e restrições](/learn/sql/tipos-e-restricoes) e [Modelagem ER](/learn/sql/modelagem-er): como desenhar as tabelas por trás do ORM.
+- [Locks no banco](/learn/sql/locks-no-banco): `FOR UPDATE` e as travas que evitam venda duplicada.
+- [Repository](/learn/lld/repository): o padrão repositório visto de forma independente de linguagem.
+- [FastAPI e Python: Construindo APIs com autenticação e banco de dados](/learn/carreira-python/fastapi-python-construindo-apis-autenticacao-banco-dados): SQLAlchemy e Alembic numa API completa.
+
+## Referências
+
+- [pathlib: caminhos do sistema de arquivos orientados a objetos](https://docs.python.org/pt-br/3/library/pathlib.html)
+- [sqlite3: interface DB-API 2.0 para SQLite](https://docs.python.org/pt-br/3/library/sqlite3.html)
+- [psycopg 3: uso básico](https://www.psycopg.org/psycopg3/docs/basic/usage.html)
+- [SQLAlchemy 2.0: tutorial unificado](https://docs.sqlalchemy.org/en/20/tutorial/index.html)

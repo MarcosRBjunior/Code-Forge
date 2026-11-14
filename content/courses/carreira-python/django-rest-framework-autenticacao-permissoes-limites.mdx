@@ -1,0 +1,449 @@
+---
+title: "Django REST Framework: Trabalhando com autenticação, permissões e limites de requisição"
+kind: lesson
+---
+
+Até aqui a API de `ingressos` responde a qualquer um. Qualquer pessoa cria um evento, altera o preço de um setor ou lista os pedidos de todos os clientes. Antes de abrir a compra de ingressos pela API, três perguntas precisam de resposta em cada requisição: **quem é você** (autenticação), **o que você pode fazer** (permissão) e **quantas vezes pode fazer** (limite de requisições). O DRF trata as três como etapas separadas e configuráveis, que rodam antes do código da view.
+
+Este capítulo parte dos usuários e do login que você montou nos capítulos de autenticação de Django e leva isso para a API: sessão para o próprio site, token para integrações simples e JWT com SimpleJWT para o aplicativo e o front separado. Depois vêm as classes de permissão, inclusive por objeto, os limites de requisição e o CORS para o navegador conseguir chamar a API de outro domínio.
+
+**Você vai aprender:**
+
+- Como o DRF processa autenticação, permissão e throttling em cada requisição, e quando responde 401 ou 403
+- Configurar autenticação por sessão, por token e por JWT com SimpleJWT
+- Escrever classes de permissão globais e por objeto, e filtrar o queryset pelo usuário
+- Limitar requisições por usuário, por IP e por escopo
+- Configurar CORS com django-cors-headers sem abrir mais do que o necessário
+
+## O caminho de uma requisição
+
+Antes de chamar `list`, `create` ou qualquer outra ação, o método `initial` da `APIView` executa três etapas, nesta ordem:
+
+1. **Autenticação.** Cada classe em `authentication_classes` tenta identificar o usuário a partir da requisição. A primeira que conseguir define `request.user` e `request.auth` (o token ou credencial usada). Se nenhuma conseguir, `request.user` vira `AnonymousUser`. Credencial presente e inválida (token expirado, por exemplo) já interrompe com erro.
+2. **Permissões.** Cada classe em `permission_classes` responde a `has_permission(request, view)`. Basta uma negar.
+3. **Throttling.** Cada classe em `throttle_classes` decide se a requisição cabe no limite.
+
+Autenticação não bloqueia nada sozinha: ela só identifica. Quem bloqueia o anônimo é a permissão. Essa separação é a resposta para uma pergunta comum: com autenticação JWT configurada e `AllowAny` como permissão, a rota continua pública, e o usuário apenas aparece identificado quando manda o token.
+
+Sobre 401 e 403: o DRF responde **401** quando a requisição não está autenticada e a primeira classe de autenticação sabe dizer como se autenticar (ela fornece o cabeçalho `WWW-Authenticate`, como fazem token e JWT). Responde **403** quando o usuário está autenticado e não tem permissão, e também quando não está autenticado mas a primeira classe é `SessionAuthentication`, que não tem esse cabeçalho. Por isso a ordem das classes de autenticação muda o status devolvido.
+
+## Configuração global e por view
+
+Os padrões ficam no `REST_FRAMEWORK` e podem ser sobrescritos em cada view:
+
+```python
+# ingressos/settings.py
+REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "EXCEPTION_HANDLER": "ingressos.erros.handler_de_erros",
+    "DEFAULT_FILTER_BACKENDS": ["django_filters.rest_framework.DjangoFilterBackend"],
+    "DEFAULT_PAGINATION_CLASS": "ingressos.paginacao.PaginacaoPadrao",
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+}
+```
+
+O padrão global é **fechado**: toda rota exige usuário autenticado, e você abre explicitamente as que são públicas. O contrário (padrão aberto e fechar rota a rota) é como nascem os endpoints esquecidos sem proteção. O DRF, sem configuração, usa `AllowAny`: mude isso no primeiro dia.
+
+## Autenticação por sessão
+
+`SessionAuthentication` reaproveita o login do Django: o cookie `sessionid` que o navegador já tem depois de entrar no site. É a escolha certa quando o front é servido pelo próprio Django, no mesmo domínio, e para usar a interface navegável.
+
+Ela tem uma consequência importante: para usuários autenticados por sessão, o DRF **exige o token CSRF** em métodos que alteram estado (`POST`, `PUT`, `PATCH`, `DELETE`). Isso é proteção, não incômodo: como o navegador envia o cookie automaticamente, um site malicioso poderia disparar uma compra em nome do usuário. O JavaScript do front lê o cookie `csrftoken` e envia o valor no cabeçalho `X-CSRFToken`. Requisições anônimas não passam pela verificação, porque não há sessão a explorar.
+
+## Autenticação por token
+
+O DRF traz um modelo simples de token: uma chave aleatória por usuário, guardada no banco e enviada no cabeçalho `Authorization: Token <chave>`.
+
+```python
+# ingressos/settings.py
+INSTALLED_APPS = [
+    # ...
+    "rest_framework",
+    "rest_framework.authtoken",
+]
+```
+
+```python
+# ingressos/urls.py
+from rest_framework.authtoken.views import obtain_auth_token
+
+urlpatterns = [
+    # ...
+    path("api/auth/token/", obtain_auth_token),
+]
+```
+
+```bash
+python manage.py migrate
+curl -s -X POST http://localhost:8000/api/auth/token/ -d "username=ana&password=..."
+# {"token": "9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"}
+curl -s http://localhost:8000/api/pedidos/ -H "Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"
+```
+
+Para que funcione nas requisições, inclua `rest_framework.authentication.TokenAuthentication` em `DEFAULT_AUTHENTICATION_CLASSES`. É fácil de entender e de revogar (apague a linha), mas tem limitações: um token por usuário, sem expiração e guardado em texto puro no banco. Serve bem para integrações de servidor a servidor de baixo risco, como um parceiro que só consulta eventos. Para usuários finais, a escolha comum é JWT.
+
+## JWT com SimpleJWT
+
+Um JWT é um token assinado que carrega as informações (claims) dentro dele: quem é o usuário e até quando o token vale. A API valida a assinatura e a expiração sem consultar o banco. O SimpleJWT implementa o par clássico: um **access token** curto, enviado em toda requisição, e um **refresh token** longo, usado só para obter um novo access.
+
+```bash
+pip install djangorestframework-simplejwt
+```
+
+```python
+# ingressos/settings.py
+from datetime import timedelta
+
+INSTALLED_APPS = [
+    # ...
+    "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
+]
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
+```
+
+```python
+# ingressos/urls.py
+from rest_framework_simplejwt.views import (
+    TokenBlacklistView,
+    TokenObtainPairView,
+    TokenRefreshView,
+)
+
+urlpatterns = [
+    # ...
+    path("api/auth/jwt/", TokenObtainPairView.as_view(), name="jwt-obter"),
+    path("api/auth/jwt/renovar/", TokenRefreshView.as_view(), name="jwt-renovar"),
+    path("api/auth/jwt/sair/", TokenBlacklistView.as_view(), name="jwt-sair"),
+]
+```
+
+```bash
+curl -s -X POST http://localhost:8000/api/auth/jwt/ \
+  -H "Content-Type: application/json" -d '{"username": "ana", "password": "..."}'
+# {"refresh": "eyJhbGciOi...", "access": "eyJhbGciOi..."}
+
+curl -s http://localhost:8000/api/pedidos/ -H "Authorization: Bearer eyJhbGciOi..."
+```
+
+Por padrão o SimpleJWT assina com HS256 usando a `SECRET_KEY` do Django; para isolar as chaves, defina `SIGNING_KEY` própria, e para que outros serviços validem sem poder emitir, use um algoritmo assimétrico como RS256 com `SIGNING_KEY` e `VERIFYING_KEY`.
+
+As escolhas da configuração, e o porquê de cada uma:
+
+- **Access de 15 minutos.** O JWT não pode ser revogado individualmente antes de expirar, porque a validação não consulta o banco. Vida curta limita o estrago de um token vazado.
+- **Rotação com lista de bloqueio.** A cada renovação, um refresh novo é emitido e o antigo vai para a lista de bloqueio (por isso o app `token_blacklist` e o `migrate`). Um refresh roubado e usado depois do legítimo falha.
+- **Logout** é colocar o refresh na lista de bloqueio. O access continua válido até expirar, o que, com 15 minutos, costuma ser aceitável.
+
+Para pôr informações próprias no token, como o papel do usuário que o front usa para esconder botões, crie um serializer derivado:
+
+```python
+# contas/serializers.py
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+
+class TokenComPapelSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token["organizador"] = user.groups.filter(name="organizadores").exists()
+        return token
+```
+
+E aponte para ele com `"TOKEN_OBTAIN_SERIALIZER": "contas.serializers.TokenComPapelSerializer"` em `SIMPLE_JWT`. O conteúdo do JWT é apenas codificado em Base64, não cifrado: qualquer um que tenha o token lê as claims. Não ponha nele dado pessoal nem nada que não possa ser visto pelo próprio usuário. E a API nunca deve confiar numa claim para autorizar quando a informação pode ter mudado desde a emissão; o papel no token serve para a interface, a autorização consulta o usuário.
+
+| | Sessão | Token do DRF | JWT (SimpleJWT) |
+|---|---|---|---|
+| Onde fica a credencial | Cookie `HttpOnly` | Cliente guarda a chave | Cliente guarda access e refresh |
+| Consulta ao banco por requisição | Sim (sessão) | Sim (token) | Não, só a assinatura |
+| Revogação imediata | Sim | Sim | Só no fim do access; refresh via lista de bloqueio |
+| Expiração | Configurável | Não tem | Sim, embutida |
+| CSRF | Necessário | Não | Não, se enviado no cabeçalho |
+| Melhor para | Front no mesmo domínio, interface navegável | Integrações simples | Aplicativo móvel, SPA em outro domínio, vários serviços |
+
+<Callout type="warning" title="Onde o front guarda o JWT">
+Guardar o token em `localStorage` deixa qualquer script da página lê-lo: uma única falha de XSS entrega a conta do usuário. Para SPAs, a recomendação é manter o access token em memória e o refresh num cookie `HttpOnly`, `Secure` e `SameSite`, restrito à rota de renovação. Nesse caso a rota de renovação volta a precisar de proteção contra CSRF. Aplicativos móveis usam o armazenamento seguro do sistema operacional.
+</Callout>
+
+## Permissões
+
+O DRF traz as classes mais comuns: `AllowAny`, `IsAuthenticated`, `IsAdminUser` (usuário com `is_staff`), `IsAuthenticatedOrReadOnly` (leitura livre, escrita só autenticado) e `DjangoModelPermissions` (usa as permissões `add`, `change` e `delete` do Django, as mesmas do admin). As classes podem ser combinadas com `&`, `|` e `~`.
+
+Na plataforma, os eventos são públicos para leitura e só organizadores criam ou alteram. Uma permissão própria:
+
+```python
+# ingressos/permissoes.py
+from rest_framework.permissions import SAFE_METHODS, BasePermission
+
+
+class EhOrganizadorOuSomenteLeitura(BasePermission):
+    message = "Apenas organizadores podem alterar eventos."
+
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and request.user.groups.filter(name="organizadores").exists()
+        )
+```
+
+`SAFE_METHODS` é a tupla `("GET", "HEAD", "OPTIONS")`. O atributo `message` personaliza o texto do 403.
+
+```python
+class EventoViewSet(viewsets.ModelViewSet):
+    queryset = Evento.objects.all()
+    serializer_class = EventoSerializer
+    permission_classes = [EhOrganizadorOuSomenteLeitura]
+    # filtros, busca e ordenação do capítulo anterior...
+```
+
+Quando a regra varia por ação, sobrescreva `get_permissions`:
+
+```python
+def get_permissions(self):
+    if self.action in ("list", "retrieve"):
+        return [AllowAny()]
+    return [IsAuthenticated(), EhOrganizadorOuSomenteLeitura()]
+```
+
+### Permissão por objeto
+
+Algumas regras dependem do registro: um cliente pode ver o próprio pedido, não o dos outros. Para isso existe `has_object_permission`:
+
+```python
+# ingressos/permissoes.py
+class EhDonoDoPedido(BasePermission):
+    def has_object_permission(self, request, view, obj):
+        return obj.cliente_id == request.user.id or request.user.is_staff
+```
+
+O ponto que mais gera brecha: `has_object_permission` só é chamada quando a view chama `get_object()`, ou seja, em `retrieve`, `update`, `partial_update`, `destroy` e nas ações com `detail=True` que usam `self.get_object()`. Ela **não** roda na listagem, que trabalha com o queryset inteiro. Se a listagem de pedidos usar `Pedido.objects.all()`, todo cliente vê os pedidos de todo mundo, mesmo com a permissão por objeto configurada. A defesa de verdade é filtrar o queryset:
+
+```python
+# pedidos/views.py
+from rest_framework import mixins, viewsets
+from rest_framework.permissions import IsAuthenticated
+
+from eventos.models import Pedido
+from ingressos.paginacao import PaginacaoPorCursor
+from ingressos.permissoes import EhDonoDoPedido
+from pedidos.serializers import PedidoSerializer
+
+
+class PedidoViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    serializer_class = PedidoSerializer
+    permission_classes = [IsAuthenticated, EhDonoDoPedido]
+    pagination_class = PaginacaoPorCursor
+
+    def get_queryset(self):
+        pedidos = Pedido.objects.all()
+        if self.request.user.is_staff:
+            return pedidos
+        return pedidos.filter(cliente=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(cliente=self.request.user)
+```
+
+Com o queryset filtrado, um cliente que tenta `GET /api/pedidos/912/` de outra pessoa recebe **404**, não 403. É o comportamento preferível: a API não confirma que o pedido 912 existe. A permissão por objeto continua útil como segunda camada e para regras mais finas (o organizador pode editar o evento, mas só os eventos dele).
+
+O `perform_create` mostra outra regra: o dono do pedido vem de `request.user`, nunca do corpo da requisição. No `PedidoSerializer`, `cliente` é somente leitura. Se o cliente pudesse mandar `"cliente": 7`, compraria em nome de outra pessoa.
+
+<Callout type="tip" title="Teste o acesso negado, não só o permitido">
+Para cada recurso protegido, escreva os testes do outro lado: anônimo recebe 401, cliente comum não cria evento (403), cliente A não lê nem altera o pedido do cliente B (404). Controle de acesso quebrado é a categoria número um do OWASP Top 10, e quase sempre é uma rota em que ninguém testou o caso negativo.
+</Callout>
+
+## Limites de requisição
+
+Throttling limita quantas requisições um cliente faz num intervalo. Protege contra abuso (força bruta no login, varredura de pedidos), contra um cliente com bug em laço e contra o custo de rotas caras. As classes prontas:
+
+- `AnonRateThrottle`: limita anônimos, identificados pelo IP.
+- `UserRateThrottle`: limita usuários autenticados, pelo id, e anônimos pelo IP.
+- `ScopedRateThrottle`: limita por um escopo declarado na view, para dar limites diferentes a rotas diferentes.
+
+```python
+# ingressos/settings.py
+REST_FRAMEWORK = {
+    # ... configurações anteriores
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+        "rest_framework.throttling.ScopedRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "60/minute",
+        "user": "600/minute",
+        "login": "5/minute",
+        "compra": "20/hour",
+    },
+}
+```
+
+```python
+from rest_framework_simplejwt.views import TokenObtainPairView
+
+
+class LoginView(TokenObtainPairView):
+    throttle_scope = "login"
+```
+
+```python
+class PedidoViewSet(...):
+    throttle_scope = "compra"
+```
+
+Aponte a rota `api/auth/jwt/` para `LoginView.as_view()` no lugar de `TokenObtainPairView`. A `ScopedRateThrottle` só atua em views que declaram `throttle_scope`, então pode ficar na lista global sem efeito nas demais. Quando o limite estoura, a resposta é **429 Too Many Requests** com o cabeçalho `Retry-After`, que o cliente deve respeitar antes de tentar de novo.
+
+Dois cuidados de produção. O throttling guarda os contadores no **cache do Django**. O padrão, `LocMemCache`, é por processo: com quatro workers do gunicorn e duas instâncias, cada um conta separado e o limite real fica oito vezes maior. Use um cache compartilhado, como Redis (`django.core.cache.backends.redis.RedisCache`). E a identificação por IP depende de `REMOTE_ADDR`; atrás de um balanceador, todo mundo tem o IP do balanceador. Configure `NUM_PROXIES` no `REST_FRAMEWORK` com o número de proxies confiáveis, para o DRF ler o IP correto de `X-Forwarded-For` sem aceitar um valor forjado pelo cliente.
+
+O throttling do DRF também não é atômico e não substitui proteção na borda. Para ataques volumosos, o limite fica no balanceador, no API gateway ou no WAF; o da aplicação cuida das regras que dependem do usuário e da rota.
+
+## CORS
+
+O front da plataforma roda em `https://app.ingressos.com` e a API em `https://api.ingressos.com`. São origens diferentes, e o navegador, por padrão, impede o JavaScript de uma origem de ler respostas de outra. CORS é o mecanismo pelo qual o servidor diz quais origens podem. Para requisições que não são simples (com `Authorization`, com JSON, com `PUT` ou `DELETE`), o navegador manda antes uma requisição `OPTIONS` de pré-verificação, o preflight, e só envia a real se a resposta autorizar.
+
+```bash
+pip install django-cors-headers
+```
+
+```python
+# ingressos/settings.py
+INSTALLED_APPS = [
+    # ...
+    "corsheaders",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+CORS_ALLOWED_ORIGINS = [
+    "https://app.ingressos.com",
+    "http://localhost:5173",
+]
+CORS_URLS_REGEX = r"^/api/.*$"
+CORS_EXPOSE_HEADERS = ["Retry-After"]
+```
+
+- O `CorsMiddleware` fica o mais alto possível, antes do `CommonMiddleware`, para responder ao preflight e acrescentar os cabeçalhos mesmo a respostas que outro middleware gerou.
+- `CORS_ALLOWED_ORIGINS` lista origens exatas, com esquema e porta. Leia a lista de uma variável de ambiente, para desenvolvimento e produção terem valores diferentes.
+- `CORS_URLS_REGEX` restringe o CORS às rotas da API; o admin não precisa dele.
+- `CORS_EXPOSE_HEADERS` deixa o JavaScript ler cabeçalhos além dos básicos, como o `Retry-After` do 429.
+- `CORS_ALLOW_CREDENTIALS = True` só é necessário se o front enviar cookies (sessão ou o refresh em cookie). Com credenciais, a origem nunca pode ser curinga, e a proteção CSRF passa a ser essencial; nesse caso, inclua a origem do front também em `CSRF_TRUSTED_ORIGINS`.
+
+`CORS_ALLOW_ALL_ORIGINS = True` aparece em muito tutorial. Para uma API pública sem cookies, que só aceita token no cabeçalho, ele não abre uma brecha de autenticação, mas deixa qualquer site usar a API pelo navegador dos seus usuários. Prefira a lista explícita. E lembre: CORS é uma regra que **o navegador** aplica. Ele não impede `curl`, outro servidor ou um script de chamar a API. A proteção é autenticação e permissão.
+
+## Testando
+
+O `APIClient` do DRF tem atalhos para autenticar nos testes. Com pytest-django:
+
+```python
+# tests/test_acesso_pedidos.py
+import pytest
+from django.contrib.auth import get_user_model
+from rest_framework.test import APIClient
+
+from eventos.models import Pedido
+
+
+@pytest.fixture
+def usuarios(db):
+    User = get_user_model()
+    return User.objects.create_user("ana", password="senha-forte-1"), User.objects.create_user("bruno", password="senha-forte-2")
+
+
+def test_anonimo_recebe_401():
+    resposta = APIClient().get("/api/pedidos/")
+    assert resposta.status_code == 401
+
+
+def test_cliente_nao_le_pedido_de_outro(usuarios):
+    ana, bruno = usuarios
+    pedido_do_bruno = Pedido.objects.create(cliente=bruno)
+    cliente = APIClient()
+    cliente.force_authenticate(user=ana)
+
+    resposta = cliente.get(f"/api/pedidos/{pedido_do_bruno.id}/")
+
+    assert resposta.status_code == 404
+
+
+def test_login_jwt_e_chamada_autenticada(usuarios):
+    cliente = APIClient()
+    tokens = cliente.post("/api/auth/jwt/", {"username": "ana", "password": "senha-forte-1"}, format="json").json()
+
+    cliente.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+    assert cliente.get("/api/pedidos/").status_code == 200
+```
+
+`force_authenticate` pula a autenticação e é ideal para testar permissões. O teste com login real prova que a configuração do JWT funciona de ponta a ponta. Em testes de throttling, limpe o cache entre os casos (`django.core.cache.cache.clear()` numa fixture), senão um teste herda os contadores do anterior.
+
+## Na entrevista
+
+**Qual a diferença entre autenticação e permissão no DRF?** Autenticação identifica quem fez a requisição e preenche `request.user`; ela não bloqueia. Permissão decide se aquele usuário pode executar a ação. Uma rota com JWT configurado e `AllowAny` continua pública.
+
+**Por que `has_object_permission` não basta para proteger uma listagem?** Porque ela só é chamada em `get_object()`, nas rotas de detalhe. A listagem usa o queryset inteiro. A proteção é filtrar o queryset pelo usuário em `get_queryset`, o que de quebra devolve 404 para registros alheios.
+
+**Sessão, token ou JWT?** Sessão para front no mesmo domínio, com CSRF. Token do DRF para integrações simples, por ser fácil de revogar. JWT para aplicativo, SPA em outro domínio e vários serviços, pela validação sem consulta ao banco, com access curto, refresh rotacionado e lista de bloqueio para logout.
+
+**Como revogar um JWT?** O access não se revoga individualmente: ele vale até expirar, por isso tem vida curta. O refresh vai para uma lista de bloqueio no logout e na rotação, o que impede novos access tokens.
+
+**Por que o throttling do DRF precisa de Redis em produção?** Porque os contadores ficam no cache do Django, e o cache em memória local é por processo. Com vários workers e instâncias, cada um conta separado e o limite real se multiplica.
+
+**CORS protege a API?** Não. É uma regra do navegador sobre qual origem pode ler a resposta. Não impede chamadas de fora do navegador. A proteção é autenticação e autorização; CORS só define quais fronts podem usar a API pelo navegador.
+
+## Pratique
+
+1. Configure o padrão global com `IsAuthenticated`, JWT e sessão, e abra explicitamente a listagem e o detalhe de eventos. Confira com `curl` que as demais rotas devolvem 401.
+2. Implemente `EhOrganizadorOuSomenteLeitura` e `EhDonoDoPedido`, filtre o queryset de pedidos pelo usuário e escreva os testes de acesso negado para anônimo, cliente comum e cliente tentando ler pedido alheio.
+3. Configure SimpleJWT com access de 15 minutos, rotação e lista de bloqueio, e escreva um teste que prova que um refresh já usado é recusado.
+4. Adicione os limites `login` e `compra`, configure o cache Redis e escreva um teste que faz seis tentativas de login e espera 429 na sexta.
+5. Configure o django-cors-headers lendo as origens de variável de ambiente e verifique o preflight com `curl -X OPTIONS` enviando `Origin` e `Access-Control-Request-Method`.
+
+<Quiz question="Uma view tem JWTAuthentication e permission_classes igual a AllowAny. Uma requisição sem token chega. O que acontece?" options={["401, pois a autenticação está configurada","A requisição é atendida, com request.user anônimo","403, pois o usuário é anônimo","500, pois request.user fica vazio"]} answer={1} explanation="Autenticação só identifica. Sem credencial, request.user vira AnonymousUser, e AllowAny permite a requisição." />
+
+<Quiz question="O PedidoViewSet usa Pedido.objects.all() e a permissão EhDonoDoPedido com has_object_permission. O que um cliente vê em GET /api/pedidos/?" options={["Apenas os próprios pedidos","Nada, a listagem devolve 403","Os pedidos de todos os clientes, pois a permissão por objeto não roda na listagem","Apenas pedidos pagos"]} answer={2} explanation="has_object_permission só é chamada por get_object(). A listagem precisa filtrar o queryset pelo usuário." />
+
+<Quiz question="Com quatro workers do gunicorn e o cache padrão LocMemCache, um limite de 5 por minuto no login permite, na prática:" options={["Até cerca de 20 tentativas por minuto, pois cada processo conta separado","Exatamente 5 tentativas por minuto","Nenhuma tentativa, pois o cache local bloqueia tudo","Tentativas ilimitadas, pois o throttling exige Redis para funcionar"]} answer={0} explanation="LocMemCache é por processo. Cada worker mantém o próprio contador. Um cache compartilhado como Redis torna o limite global." />
+
+## Base no CodeForge
+
+- [Django: Autenticação de formulários e alerta](/learn/carreira-python/django-autenticacao-formularios-alerta): os usuários, o login e a sessão que esta API reaproveita.
+- [JWT](/learn/system-design/jwt), [Sessão vs token](/learn/system-design/sessao-vs-token) e [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao): os conceitos por trás de cada escolha.
+- [Rate limiting](/learn/system-design/rate-limiting) e [Rate limiter](/learn/lld/rate-limiter-lld): algoritmos de limite de requisições e como implementá-los.
+- [RBAC](/learn/system-design/rbac): controle de acesso por papéis, além de grupos simples.
+- [Java e Spring Security: Proteja suas APIs REST](/learn/carreira-java/java-spring-security-proteja-apis-rest): o mesmo problema, com JWT e CORS em Spring, bom para comparar.
+
+## Referências
+
+- [Django REST Framework: Authentication](https://www.django-rest-framework.org/api-guide/authentication/)
+- [Django REST Framework: Permissions](https://www.django-rest-framework.org/api-guide/permissions/) e [Throttling](https://www.django-rest-framework.org/api-guide/throttling/)
+- [Simple JWT: documentação](https://django-rest-framework-simplejwt.readthedocs.io/en/latest/)
+- [django-cors-headers](https://github.com/adamchainz/django-cors-headers)

@@ -1,0 +1,460 @@
+---
+title: "Python: Avance na Orientação a Objetos e consuma API"
+kind: lesson
+---
+
+Com `Evento` e `Setor` como classes, o `ingressos` ganhou regras protegidas. Agora o domínio pede variações: ingresso inteira, meia-entrada e cortesia têm preços calculados de formas diferentes; o pagamento pode ser por Pix ou cartão; a confirmação pode sair por e-mail ou SMS. Encher o código de `if tipo == "meia"` funciona no primeiro dia e vira um campo minado no décimo, porque cada novo tipo exige caçar todos os `if` espalhados.
+
+Ao mesmo tempo, o sistema deixa de viver sozinho. Para cadastrar o local de um evento, faz sentido completar o endereço a partir do CEP consultando um serviço externo, e qualquer chamada pela rede pode demorar, falhar ou devolver lixo. Este capítulo trata das duas coisas: os recursos de orientação a objetos que organizam variações (herança, polimorfismo, classes abstratas, protocolos e composição) e o consumo de uma API HTTP com `requests`, com timeout e tratamento de erro de verdade.
+
+**Você vai aprender:**
+
+- Usar herança e `super()` sem cair nas armadilhas comuns
+- Substituir condicionais por polimorfismo com classes abstratas (`abc`) e `Protocol`
+- Decidir entre herança e composição, e montar objetos a partir de outros
+- Consumir uma API HTTP com `requests`, tratando timeout, status e JSON
+- Declarar dependências no `pyproject.toml` e instalar o projeto num ambiente virtual
+
+## Herança e super()
+
+Herança declara que uma classe é um caso particular de outra: a subclasse recebe atributos e métodos da classe base e pode estender ou substituir o que precisar.
+
+```python
+# ingressos/ingressos.py
+from decimal import Decimal
+
+
+class Ingresso:
+    def __init__(self, codigo: str, setor: str, preco_base: Decimal) -> None:
+        self.codigo = codigo
+        self.setor = setor
+        self.preco_base = preco_base
+
+    def preco(self) -> Decimal:
+        return self.preco_base
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(codigo={self.codigo!r}, preco={self.preco()})"
+
+
+class IngressoMeia(Ingresso):
+    def __init__(self, codigo: str, setor: str, preco_base: Decimal, documento: str) -> None:
+        super().__init__(codigo, setor, preco_base)
+        if not documento.strip():
+            raise ValueError("meia-entrada exige documento comprobatório")
+        self.documento = documento
+
+    def preco(self) -> Decimal:
+        return (self.preco_base / 2).quantize(Decimal("0.01"))
+
+
+class Cortesia(Ingresso):
+    def preco(self) -> Decimal:
+        return Decimal("0.00")
+```
+
+`super().__init__(...)` chama o inicializador da classe base, que cuida dos atributos comuns. Esquecer essa chamada é o erro mais frequente: a subclasse fica sem `codigo` e `setor`, e o problema só aparece quando alguém os acessa. `Cortesia` não define `__init__`, então herda o da base inteiro, e só sobrescreve `preco`.
+
+Duas funções embutidas consultam a hierarquia:
+
+```python
+meia = IngressoMeia("A1", "Pista", Decimal("120.00"), "RG 123")
+print(isinstance(meia, Ingresso))            # True: uma meia é um ingresso
+print(issubclass(Cortesia, Ingresso))        # True
+print(IngressoMeia.__mro__)
+# (IngressoMeia, Ingresso, object)
+```
+
+O `__mro__` (method resolution order) é a ordem em que o Python procura um método: primeiro na própria classe, depois nas bases, até `object`. Python permite herança múltipla, e é por essa ordem que o `super()` decide quem chamar. Na prática, herança múltipla aparece em **mixins**, classes pequenas que acrescentam um comportamento isolado (como serialização) sem representar uma entidade do domínio.
+
+## Polimorfismo
+
+Polimorfismo é tratar objetos diferentes pela mesma interface, deixando cada um responder do seu jeito. O código que calcula o total de um pedido não precisa saber que tipos de ingresso existem:
+
+```python
+def total_do_pedido(ingressos: list[Ingresso]) -> Decimal:
+    return sum((ingresso.preco() for ingresso in ingressos), Decimal("0"))
+
+
+itens = [
+    Ingresso("A1", "Pista", Decimal("120.00")),
+    IngressoMeia("A2", "Pista", Decimal("120.00"), "RG 123"),
+    Cortesia("A3", "Pista", Decimal("120.00")),
+]
+print(total_do_pedido(itens))      # 180.00
+```
+
+Criar um tipo novo, como um ingresso promocional com 20% de desconto, é escrever uma subclasse. `total_do_pedido` não muda. Esse é o ganho que justifica o polimorfismo: o código que usa a abstração fica fechado para alteração e aberto para novos casos, ideia que o capítulo de SOLID formaliza.
+
+Em Python, o polimorfismo nem depende de herança. Qualquer objeto com um método `preco()` funciona em `total_do_pedido`, porque a linguagem só verifica se o método existe na hora da chamada. Isso se chama **duck typing**: se anda como pato e grasna como pato, é tratado como pato.
+
+## Classes abstratas com abc
+
+Duck typing é flexível, mas não avisa cedo quando falta um método. Uma **classe abstrata** define um contrato que as subclasses são obrigadas a cumprir e não pode ser instanciada:
+
+```python
+# ingressos/pagamentos.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from decimal import Decimal
+
+
+@dataclass(frozen=True)
+class ResultadoPagamento:
+    aprovado: bool
+    identificador: str
+    mensagem: str = ""
+
+
+class MeioDePagamento(ABC):
+    @abstractmethod
+    def cobrar(self, valor: Decimal, descricao: str) -> ResultadoPagamento:
+        """Cobra o valor e informa se foi aprovado."""
+
+    def validar_valor(self, valor: Decimal) -> None:
+        if valor <= 0:
+            raise ValueError("o valor da cobrança deve ser positivo")
+
+
+class Pix(MeioDePagamento):
+    def __init__(self, chave_recebedor: str) -> None:
+        self.chave_recebedor = chave_recebedor
+
+    def cobrar(self, valor: Decimal, descricao: str) -> ResultadoPagamento:
+        self.validar_valor(valor)
+        # aqui entraria a chamada ao provedor de Pix
+        return ResultadoPagamento(True, f"pix-{descricao}", "aguardando confirmação")
+
+
+class CartaoDeCredito(MeioDePagamento):
+    def __init__(self, token_cartao: str, parcelas: int = 1) -> None:
+        if not 1 <= parcelas <= 12:
+            raise ValueError("parcelamento deve ser de 1 a 12 vezes")
+        self.token_cartao = token_cartao
+        self.parcelas = parcelas
+
+    def cobrar(self, valor: Decimal, descricao: str) -> ResultadoPagamento:
+        self.validar_valor(valor)
+        return ResultadoPagamento(True, f"cartao-{descricao}")
+```
+
+```python
+MeioDePagamento()
+# TypeError: Can't instantiate abstract class MeioDePagamento ...
+
+class Boleto(MeioDePagamento):
+    pass
+
+Boleto()
+# TypeError: ... without an implementation for abstract method 'cobrar'
+```
+
+O erro aparece na criação do objeto, não quando alguém tenta cobrar. A classe abstrata também pode ter métodos concretos, como `validar_valor`, compartilhados por todas as implementações.
+
+## Protocol: contrato sem herança
+
+Às vezes você quer o contrato, mas não quer obrigar as classes a herdar de uma base sua, seja porque vêm de outra biblioteca, seja para não acoplar módulos. `typing.Protocol` descreve a forma esperada, e o verificador de tipos (mypy, pyright, o editor) confere a compatibilidade pela estrutura:
+
+```python
+# ingressos/notificacoes.py
+from typing import Protocol
+
+
+class Notificador(Protocol):
+    def enviar(self, destinatario: str, mensagem: str) -> None: ...
+
+
+class NotificadorEmail:
+    def enviar(self, destinatario: str, mensagem: str) -> None:
+        print(f"[e-mail para {destinatario}] {mensagem}")
+
+
+class NotificadorSms:
+    def enviar(self, destinatario: str, mensagem: str) -> None:
+        print(f"[SMS para {destinatario}] {mensagem[:160]}")
+
+
+def confirmar_compra(notificador: Notificador, cliente: str, codigo: str) -> None:
+    notificador.enviar(cliente, f"Compra confirmada. Seu ingresso: {codigo}")
+```
+
+Nenhuma das duas classes menciona `Notificador`, e mesmo assim ambas são aceitas por `confirmar_compra`. Se uma delas tivesse `enviar(self, mensagem)` com um parâmetro a menos, o mypy apontaria o erro antes de rodar.
+
+| | `ABC` | `Protocol` |
+|---|---|---|
+| Como a classe adere | Herda explicitamente | Basta ter os métodos com as assinaturas certas |
+| Quando o erro aparece | Ao instanciar, em tempo de execução | Na verificação estática de tipos |
+| Compartilha código | Sim, métodos concretos na base | Não é o propósito |
+| Bom para | Hierarquias do seu domínio | Dependências de fora, testes com dublês, desacoplar módulos |
+
+<Callout type="tip" title="Protocol facilita testes">
+Num teste, você passa para `confirmar_compra` uma classe falsa que só guarda as mensagens numa lista, sem herdar de nada e sem enviar e-mail. O verificador de tipos garante que o dublê tem a mesma forma do notificador real.
+</Callout>
+
+## Composição: ter em vez de ser
+
+Herança cria o acoplamento mais forte que existe: a subclasse depende dos detalhes internos da base, e uma mudança lá em cima pode quebrar tudo embaixo. A orientação clássica é preferir composição, em que um objeto **tem** outros e delega trabalho a eles.
+
+Um `Pedido` não é um meio de pagamento nem um notificador; ele tem itens, usa um meio de pagamento e avisa por um notificador:
+
+```python
+# ingressos/pedidos.py
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from decimal import Decimal
+from enum import Enum
+
+from ingressos.ingressos import Ingresso
+from ingressos.notificacoes import Notificador
+from ingressos.pagamentos import MeioDePagamento
+
+PRAZO_RESERVA = timedelta(minutes=15)
+
+
+class StatusPedido(Enum):
+    PENDENTE = "pendente"
+    PAGO = "pago"
+    CANCELADO = "cancelado"
+    EXPIRADO = "expirado"
+
+
+@dataclass
+class Pedido:
+    cliente: str
+    itens: list[Ingresso] = field(default_factory=list)
+    status: StatusPedido = StatusPedido.PENDENTE
+    criado_em: datetime = field(default_factory=datetime.now)
+
+    @property
+    def total(self) -> Decimal:
+        return sum((item.preco() for item in self.itens), Decimal("0"))
+
+    def expirado(self, agora: datetime) -> bool:
+        return self.status is StatusPedido.PENDENTE and agora - self.criado_em > PRAZO_RESERVA
+
+    def pagar(self, meio: MeioDePagamento, notificador: Notificador, agora: datetime) -> None:
+        if self.expirado(agora):
+            self.status = StatusPedido.EXPIRADO
+            raise ValueError("a reserva expirou")
+        if self.status is not StatusPedido.PENDENTE:
+            raise ValueError(f"pedido {self.status.value} não pode ser pago")
+        resultado = meio.cobrar(self.total, descricao=self.cliente)
+        if not resultado.aprovado:
+            raise ValueError(f"pagamento recusado: {resultado.mensagem}")
+        self.status = StatusPedido.PAGO
+        for item in self.itens:
+            notificador.enviar(self.cliente, f"Ingresso {item.codigo} emitido")
+```
+
+Trocar Pix por cartão ou e-mail por SMS não exige nenhuma subclasse de `Pedido`: basta passar outro objeto. Receber `agora` como parâmetro, em vez de chamar `datetime.now()` lá dentro, permite testar a expiração de 15 minutos sem esperar 15 minutos. O `Enum` limita o status aos quatro valores válidos, no lugar de strings soltas sujeitas a erro de digitação.
+
+| Use herança quando | Use composição quando |
+|---|---|
+| A relação é "é um" estável (meia é um ingresso) | A relação é "tem um" ou "usa um" |
+| A subclasse respeita todo o contrato da base | O comportamento precisa ser trocado em tempo de execução |
+| A hierarquia é rasa (um ou dois níveis) | Você combinaria vários comportamentos independentes |
+
+## Consumindo uma API HTTP com requests
+
+Uma API HTTP recebe requisições com método, endereço e cabeçalhos, e devolve um código de status e um corpo, quase sempre em JSON. O capítulo de redes explica o protocolo por dentro; aqui o foco é o cliente. A biblioteca `requests` não vem com o Python, então antes vem a parte de dependências.
+
+### Dependências no pyproject.toml
+
+```toml
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ingressos"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy", "types-requests"]
+```
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # no Windows: .venv\Scripts\Activate.ps1
+pip install -e ".[dev]"            # instala o projeto e as dependências
+pip freeze > requirements.lock     # opcional: fotografia das versões exatas
+```
+
+O `pyproject.toml` diz quais bibliotecas o projeto aceita (`>=2.32`); um arquivo gerado por `pip freeze` registra as versões exatas instaladas, útil para reproduzir o ambiente em produção. O `-e` instala em modo editável: alterações no código valem sem reinstalar. O pacote `types-requests` dá ao mypy as anotações de tipo da biblioteca.
+
+### Primeira chamada
+
+O exemplo usa o ViaCEP, um serviço público que devolve o endereço de um CEP brasileiro:
+
+```python
+import requests
+
+resposta = requests.get("https://viacep.com.br/ws/01001000/json/", timeout=5)
+print(resposta.status_code)                  # 200
+print(resposta.headers["Content-Type"])      # application/json; charset=utf-8
+dados = resposta.json()                      # corpo JSON convertido em dict
+print(dados["logradouro"], dados["localidade"], dados["uf"])
+```
+
+`resposta.json()` converte o JSON em objetos Python: objeto vira `dict`, array vira `list`, `null` vira `None`. Para enviar dados, `requests.post(url, json=payload, timeout=5)` serializa o dicionário e põe o cabeçalho `Content-Type: application/json`. Parâmetros de consulta vão em `params={"pagina": 2}`, que monta a query string com a codificação correta.
+
+### O que pode dar errado
+
+Uma chamada de rede tem quatro desfechos distintos, e cada um pede uma reação:
+
+| Situação | Como aparece | Reação típica |
+|---|---|---|
+| Servidor não responde a tempo | `requests.Timeout` | Tentar de novo ou desistir com mensagem clara |
+| Sem conexão, DNS falhou, conexão recusada | `requests.ConnectionError` | Idem; o serviço pode estar fora |
+| Resposta com status 4xx ou 5xx | `raise_for_status()` levanta `requests.HTTPError` | 4xx: erro do pedido, não repita; 5xx: falha do servidor, pode repetir |
+| Status 200 com corpo inesperado | `ValueError` ao ler JSON, `KeyError` ao acessar campos | Tratar como resposta inválida |
+
+<Callout type="warning" title="Sem timeout, a chamada pode esperar para sempre">
+O `requests` não tem timeout padrão. Se o servidor aceitar a conexão e nunca responder, a sua aplicação fica parada naquela linha, e num servidor web isso prende um worker por requisição até esgotar todos. Passe `timeout` em toda chamada. Ele aceita uma tupla, como `timeout=(3, 10)`: 3 segundos para conectar e 10 para cada espera por dados.
+</Callout>
+
+### Um cliente de verdade
+
+Espalhar `requests.get` pelo código repete URL, timeout e tratamento de erro em todo lugar. Concentre a integração numa classe, e devolva objetos do seu domínio, não o JSON cru:
+
+```python
+# ingressos/cep.py
+from dataclasses import dataclass
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+@dataclass(frozen=True)
+class Endereco:
+    cep: str
+    logradouro: str
+    bairro: str
+    cidade: str
+    uf: str
+
+
+class CepNaoEncontrado(Exception):
+    pass
+
+
+class ServicoCepIndisponivel(Exception):
+    pass
+
+
+class ClienteCep:
+    def __init__(self, url_base: str = "https://viacep.com.br/ws", timeout: float = 5.0) -> None:
+        self.url_base = url_base
+        self.timeout = timeout
+        self.sessao = requests.Session()
+        tentativas = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        self.sessao.mount("https://", HTTPAdapter(max_retries=tentativas))
+        self.sessao.headers["Accept"] = "application/json"
+
+    def buscar(self, cep: str) -> Endereco:
+        numeros = "".join(c for c in cep if c.isdigit())
+        if len(numeros) != 8:
+            raise ValueError("o CEP deve ter 8 dígitos")
+        try:
+            resposta = self.sessao.get(f"{self.url_base}/{numeros}/json/", timeout=self.timeout)
+            resposta.raise_for_status()
+            dados = resposta.json()
+        except (requests.Timeout, requests.ConnectionError) as erro:
+            raise ServicoCepIndisponivel("serviço de CEP fora do ar") from erro
+        except requests.HTTPError as erro:
+            raise ServicoCepIndisponivel(f"serviço de CEP respondeu {resposta.status_code}") from erro
+        except ValueError as erro:
+            raise ServicoCepIndisponivel("resposta do serviço de CEP não é JSON") from erro
+
+        if dados.get("erro"):
+            raise CepNaoEncontrado(numeros)
+        return Endereco(
+            cep=dados["cep"],
+            logradouro=dados.get("logradouro", ""),
+            bairro=dados.get("bairro", ""),
+            cidade=dados["localidade"],
+            uf=dados["uf"],
+        )
+```
+
+As decisões, uma por uma:
+
+- **`requests.Session`** reaproveita a conexão TCP e TLS entre chamadas ao mesmo servidor e guarda cabeçalhos comuns. Em várias chamadas seguidas, a diferença de latência é grande.
+- **`Retry` com `HTTPAdapter`** repete automaticamente erros de conexão e os status 502, 503 e 504, com espera crescente entre as tentativas (backoff). Só para `GET`: repetir um `POST` de pagamento poderia cobrar duas vezes.
+- **Exceções próprias** (`CepNaoEncontrado`, `ServicoCepIndisponivel`) traduzem detalhes do `requests` para o vocabulário da aplicação. Quem chama não precisa saber que a integração usa `requests`, e a troca por `httpx` no futuro não vaza para o resto do código.
+- **`raise ... from erro`** encadeia a exceção original. O traceback mostra as duas, e a causa real não se perde no log.
+- **Validação antes da chamada**: um CEP com 7 dígitos nem sai da máquina.
+- **O ViaCEP responde 200 com `"erro"` no corpo** para CEP inexistente. Status 200 não significa que a resposta tem o que você precisa, por isso o corpo também é verificado.
+
+Usando:
+
+```python
+from ingressos.cep import CepNaoEncontrado, ClienteCep, ServicoCepIndisponivel
+
+cliente = ClienteCep()
+try:
+    endereco = cliente.buscar("01001-000")
+    print(f"{endereco.logradouro}, {endereco.cidade}/{endereco.uf}")
+except CepNaoEncontrado:
+    print("CEP não encontrado. Confira o número.")
+except ServicoCepIndisponivel:
+    print("Não foi possível consultar o CEP agora. Preencha o endereço manualmente.")
+```
+
+O programa continua funcionando quando o serviço externo cai: o usuário preenche o endereço à mão. Projetar o que acontece na falha da dependência faz parte da integração, não é detalhe posterior.
+
+Nos testes automatizados, não chame o ViaCEP de verdade: o teste falha quando a rede cai ou o serviço muda, e fica lento. Teste a classe que usa `ClienteCep` passando um dublê com o método `buscar`, e teste o próprio cliente com respostas simuladas, como mostra o capítulo de testes automatizados.
+
+## Na entrevista
+
+**Para que serve o `super()`?** Para chamar a implementação da próxima classe na ordem de resolução de métodos (MRO), normalmente a da classe base. O uso mais comum é no `__init__` da subclasse, para que a base inicialize seus próprios atributos antes de a subclasse acrescentar os dela.
+
+**Qual a diferença entre uma classe abstrata e um `Protocol`?** A classe abstrata exige herança explícita, pode trazer código compartilhado e impede a instanciação de subclasses incompletas em tempo de execução. O `Protocol` define o contrato pela estrutura: qualquer classe com os métodos certos é compatível, e a checagem é feita por ferramentas de tipagem estática.
+
+**Por que preferir composição a herança?** Porque herança acopla a subclasse aos detalhes da base e fixa o comportamento na definição da classe. Com composição, o objeto delega a colaboradores que podem ser trocados em tempo de execução e substituídos por dublês nos testes. Herança continua boa para relações "é um" estáveis e rasas.
+
+**O que é duck typing?** É o estilo em que o tipo de um objeto importa menos que os métodos que ele tem. Python verifica a existência do método na hora da chamada, então qualquer objeto com a interface esperada funciona, sem precisar de herança comum.
+
+**Que cuidados você toma ao consumir uma API externa?** Timeout em toda chamada, verificação do status e do corpo, retry só em operações idempotentes e com backoff, tradução dos erros para exceções do domínio, reaproveitamento de conexão com sessão e um comportamento definido para quando a API estiver fora.
+
+**Quando é seguro repetir uma requisição que falhou?** Quando a operação é idempotente, como `GET`, `PUT` e `DELETE` bem implementados, porque repeti-la produz o mesmo efeito. Um `POST` que cria um pagamento só pode ser repetido com uma chave de idempotência que o servidor use para descartar duplicatas.
+
+## Pratique
+
+1. Crie a hierarquia `Ingresso`, `IngressoMeia` e `Cortesia`, e acrescente `IngressoPromocional` com percentual de desconto validado entre 0 e 100. Confira que `total_do_pedido` funciona sem alteração.
+2. Implemente `MeioDePagamento` como classe abstrata, com `Pix` e `CartaoDeCredito`, e escreva uma classe `PagamentoRecusado` que sempre devolve `aprovado=False`, para simular recusa.
+3. Monte o `Pedido` por composição e escreva, sem framework de testes, um script que cobre os casos: pagamento aprovado, recusado, pedido expirado (passando um `agora` 16 minutos depois) e tentativa de pagar duas vezes.
+4. Crie o `pyproject.toml`, instale o projeto com `pip install -e .` e implemente o `ClienteCep`. Integre ao cadastro de eventos no terminal: o usuário digita o CEP do local e o programa preenche o endereço.
+5. Desligue a rede (ou aponte `url_base` para um endereço inexistente) e confirme que o cadastro mostra a mensagem amigável e permite preencher o endereço à mão.
+
+<Quiz question="Uma subclasse define __init__ próprio e não chama super().__init__. Qual a consequência?" options={["O Python chama o __init__ da base automaticamente","Os atributos definidos no __init__ da base não são criados","A classe não pode ser instanciada","A subclasse deixa de ser subclasse"]} answer={1} explanation="Ao sobrescrever __init__, só o da subclasse roda. Sem a chamada explícita a super, a base nunca inicializa os próprios atributos." />
+
+<Quiz question="Qual chamada com requests é adequada para uma consulta em produção?" options={["requests.get(url)","requests.get(url, verify=False)","requests.get(url, timeout=(3, 10)) seguido de raise_for_status()","requests.post(url) para aproveitar o retry"]} answer={2} explanation="Sem timeout a chamada pode esperar indefinidamente, e sem raise_for_status uma resposta 500 passaria como sucesso. verify=False desliga a validação do certificado TLS." />
+
+<Quiz question="Uma classe NotificadorSms tem o método enviar com a mesma assinatura do Protocol Notificador, mas não herda dele. O que acontece ao passá-la para uma função anotada com Notificador?" options={["O verificador de tipos aceita, porque a compatibilidade é estrutural","O Python levanta TypeError ao chamar a função","O mypy acusa erro por falta de herança","É preciso registrar a classe com register"]} answer={0} explanation="Protocol usa tipagem estrutural: basta ter os métodos com as assinaturas esperadas. Herança e registro são desnecessários." />
+
+## Base no CodeForge
+
+- [Python: Aplicando a Orientação a Objetos](/learn/carreira-python/python-aplicando-orientacao-objetos): as classes e dataclasses que este capítulo estende.
+- [Herança](/learn/lld/heranca), [Polimorfismo](/learn/lld/polimorfismo) e [Composição sobre herança](/learn/lld/composicao-sobre-heranca): os conceitos independentes de linguagem.
+- [Interfaces](/learn/lld/interfaces): contratos e por que depender deles em vez de classes concretas.
+- [Redes e Protocolos: Fundamentos da web](/learn/carreira-python/redes-protocolos-fundamentos-web): o que acontece na rede durante um `requests.get`.
+- [Idempotência](/learn/system-design/idempotencia): quando repetir uma requisição é seguro.
+
+## Referências
+
+- [Tutorial oficial de Python: herança](https://docs.python.org/pt-br/3/tutorial/classes.html#inheritance)
+- [abc: classes base abstratas](https://docs.python.org/pt-br/3/library/abc.html)
+- [typing.Protocol](https://docs.python.org/pt-br/3/library/typing.html#typing.Protocol)
+- [Requests: guia rápido](https://requests.readthedocs.io/en/latest/user/quickstart/)

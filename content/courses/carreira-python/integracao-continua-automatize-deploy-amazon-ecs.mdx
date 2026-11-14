@@ -1,0 +1,347 @@
+---
+title: "Integração Contínua: Automatize o deploy no Amazon ECS"
+kind: lesson
+---
+
+O deploy na EC2 funciona, mas tudo o que importa nele foi escrito por você: o script que troca a imagem, o laço que espera o health check, a volta para a versão anterior. Com uma instância, isso basta. Com quatro instâncias atrás de um balanceador, o script passa a precisar tirar cada uma do tráfego, atualizar, esperar e devolver, sem nunca derrubar todas ao mesmo tempo, e qualquer erro nele é um incidente em produção.
+
+O Amazon ECS assume esse trabalho. Você descreve a aplicação numa task definition, diz ao service quantas cópias quer, e ele sobe as novas, confere a saúde pelo Application Load Balancer e só então desliga as antigas. O pipeline encolhe para três passos: publicar a imagem, registrar uma revisão da task definition e mandar o service usá-la. Este capítulo leva o `ingressos` para o ECS no Fargate, onde nem existem servidores para administrar.
+
+**Você vai aprender:**
+
+- Publicar a imagem no Amazon ECR a partir do GitHub Actions
+- Escrever uma task definition para Django com gunicorn, variáveis, segredos e logs
+- Colocar o service no Fargate atrás de um ALB com o health check certo
+- Montar o workflow com `amazon-ecr-login`, `amazon-ecs-render-task-definition` e `amazon-ecs-deploy-task-definition`
+- Entender o rolling update do ECS e rodar migrações numa task avulsa antes do deploy
+
+## Os objetos do ECS
+
+Quatro conceitos cobrem quase tudo:
+
+- **Cluster:** o agrupamento lógico onde as tasks rodam. No Fargate, é só um nome: não há instâncias para você gerenciar.
+- **Task definition:** a receita versionada de uma task, com imagem, CPU, memória, variáveis, segredos, portas e logs. Cada alteração registra uma nova **revisão**: `ingressos-api:17`, `ingressos-api:18`.
+- **Task:** uma execução da task definition, isto é, um ou mais contêineres rodando juntos com um IP próprio na VPC.
+- **Service:** mantém N tasks de uma revisão rodando, substitui as que morrem e as registra no target group do ALB.
+
+Fazer deploy, portanto, é registrar uma revisão nova com a imagem nova e atualizar o service para usá-la. O ECS cuida da troca.
+
+## O ECR como registro
+
+O `ghcr.io` do capítulo anterior funciona com o ECS, mas exige guardar um token no Secrets Manager para a task baixar a imagem. O Amazon ECR fica dentro da conta, e a permissão de baixar vem da **execution role** da task, sem nenhuma credencial extra. Crie o repositório uma vez:
+
+```bash
+aws ecr create-repository --repository-name ingressos-api \
+  --image-tag-mutability IMMUTABLE \
+  --image-scanning-configuration scanOnPush=true
+```
+
+`IMMUTABLE` impede que uma tag já publicada seja sobrescrita, o que torna a tag do SHA tão confiável quanto o digest. O `scanOnPush` procura vulnerabilidades conhecidas nos pacotes da imagem a cada envio. Acrescente uma *lifecycle policy* que apague imagens antigas (por exemplo, manter as 50 mais recentes), ou o repositório cresce para sempre; só cuide para que o número cubra as versões para as quais você ainda pode querer voltar.
+
+## A task definition
+
+Versione a task definition no repositório, um arquivo por ambiente, em `ecs/staging.json` e `ecs/production.json`. Quem precisa de mais memória ou de uma variável nova muda o arquivo no mesmo pull request do código que depende dela, e o pipeline vira o único autor das revisões.
+
+```json
+{
+  "family": "ingressos-api-production",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "runtimePlatform": { "cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX" },
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ingressos-execucao",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/ingressos-task",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "definida-pelo-pipeline",
+      "essential": true,
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "DJANGO_SETTINGS_MODULE", "value": "ingressos.settings" },
+        { "name": "DJANGO_ALLOWED_HOSTS", "value": "api.ingressos.exemplo.com" },
+        { "name": "WEB_CONCURRENCY", "value": "3" }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:ingressos/producao-AbCdEf:DATABASE_URL::"
+        },
+        {
+          "name": "DJANGO_SECRET_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/ingressos/producao/secret-key"
+        }
+      ],
+      "stopTimeout": 35,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/ingressos-api",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "api"
+        }
+      }
+    }
+  ]
+}
+```
+
+As decisões que vêm de Python e do gunicorn:
+
+- **`cpu` e `memory`.** No Fargate, CPU e memória são escolhidas em combinações fixas: 512 unidades (meia vCPU) aceitam de 1 a 4 GB. Cada worker do gunicorn é um processo com uma cópia da aplicação Django, de 80 a 150 MB. Três workers numa task de 1 GB deixam folga; seis provavelmente não.
+- **`WEB_CONCURRENCY`.** O gunicorn usa essa variável como número de workers quando `--workers` não é passado. Tire o `--workers 3` do `CMD` do Dockerfile, e a mesma imagem passa a se ajustar ao tamanho de cada ambiente pela task definition.
+- **`environment` e `secrets`.** Configuração comum vai em `environment`, legível no console. Segredos vão em `secrets`, com o ARN de um segredo do Secrets Manager (o sufixo `:DATABASE_URL::` escolhe uma chave do JSON do segredo) ou de um parâmetro `SecureString` do Parameter Store. O ECS lê o valor ao iniciar a task, usando a execution role, e o injeta como variável de ambiente. O valor não aparece no repositório nem na task definition.
+- **`stopTimeout: 35`.** No deploy, o ECS manda `SIGTERM` ao contêiner e espera esse prazo antes do `SIGKILL`. O gunicorn, ao receber o sinal, para de aceitar conexões e dá `--graceful-timeout` (30 segundos por padrão) para os workers terminarem as requisições em andamento. O prazo do ECS precisa ser maior.
+- **Duas roles.** A **execution role** é usada pelo agente do ECS para baixar a imagem do ECR, ler os segredos e gravar logs. A **task role** é a identidade da sua aplicação: se o `ingressos` gravar PDFs de ingressos no S3, é ela que recebe essa permissão. Misturar as duas dá à aplicação acesso a todos os segredos que o agente lê.
+
+## Service no Fargate atrás de um ALB
+
+O service roda as tasks em sub-redes privadas, sem IP público, e o Application Load Balancer, nas sub-redes públicas, é a única porta de entrada. O security group das tasks aceita a porta 8000 só a partir do security group do ALB.
+
+O target group do ALB usa o tipo `ip`, porque no modo `awsvpc` cada task tem seu próprio IP, e o health check aponta para o endpoint de readiness criado no capítulo de microsserviços:
+
+```bash
+aws elbv2 create-target-group --name ingressos-api-prod \
+  --protocol HTTP --port 8000 --target-type ip --vpc-id "$VPC_ID" \
+  --health-check-path /saude/pronto \
+  --health-check-interval-seconds 15 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3
+
+# o padrão de 300 s para drenar uma task é longo demais para uma API
+aws elbv2 modify-target-group-attributes --target-group-arn "$TG_ARN" \
+  --attributes Key=deregistration_delay.timeout_seconds,Value=30
+```
+
+```bash
+aws ecs create-service --cluster ingressos-production --service-name ingressos-api \
+  --task-definition ingressos-api-production \
+  --desired-count 2 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS_PRIVADAS],securityGroups=[$SG_TASKS],assignPublicIp=DISABLED}" \
+  --load-balancers "targetGroupArn=$TG_ARN,containerName=api,containerPort=8000" \
+  --health-check-grace-period-seconds 60 \
+  --deployment-configuration "minimumHealthyPercent=100,maximumPercent=200"
+```
+
+Na prática, essa infraestrutura (cluster, ALB, target group, service, roles) é criada uma vez com Terraform ou CloudFormation, e o pipeline só mexe na revisão da task definition. Duas configurações do Django precisam acompanhar o ALB: `ALLOWED_HOSTS` com o domínio público e `SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")`, porque o TLS termina no balanceador e a requisição chega às tasks em HTTP.
+
+<Callout type="warning" title="O health check do ALB e o ALLOWED_HOSTS">
+O ALB faz o health check direto no IP da task, com o cabeçalho `Host` igual a esse IP. O Django rejeita hosts fora de `ALLOWED_HOSTS` com 400, o target group marca todas as tasks como não saudáveis, e o deploy fica trocando tasks sem nunca estabilizar, sem nenhuma exceção da aplicação no log. Ou o endpoint de saúde é servido antes da validação de host (um middleware no topo da lista que responde `/saude/` diretamente), ou o health check aceita 400 como sucesso, o que esconde problemas reais. A primeira opção é a correta.
+</Callout>
+
+## Rolling update
+
+Com `minimumHealthyPercent=100` e `maximumPercent=200`, um service com 2 tasks pode chegar a 4 durante o deploy e nunca ter menos de 2 saudáveis. O ECS:
+
+1. sobe 2 tasks com a revisão nova;
+2. registra cada uma no target group e espera o ALB marcá-las como saudáveis (respeitando o período de carência);
+3. tira as 2 antigas do target group, espera o `deregistration_delay` drenar as conexões e manda `SIGTERM`;
+4. marca o deployment como concluído quando só restam tasks da revisão nova.
+
+Os dois números são o controle de custo e velocidade: `minimumHealthyPercent=50` com `maximumPercent=100` troca metade de cada vez sem tasks extras, mais barato e com capacidade reduzida durante o deploy. O `healthCheckGracePeriodSeconds` dá às tasks novas tempo de subir antes de o health check contar; um Django com gunicorn sobe em poucos segundos, então 60 é folgado. Se as tasks novas nunca ficam saudáveis, o deploy fica tentando indefinidamente, e o ECS só desiste sozinho com o circuit breaker de deploy, tema do próximo capítulo.
+
+## A role de deploy
+
+A role que o GitHub assume por OIDC, com a mesma política de confiança por environment do capítulo de EC2, precisa de três grupos de permissão:
+
+- **ECR:** `ecr:GetAuthorizationToken` (em `*`) e, no repositório, `ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`, `ecr:CompleteLayerUpload`, `ecr:PutImage` e `ecr:BatchGetImage`.
+- **ECS:** `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskDefinition`, `ecs:UpdateService`, `ecs:DescribeServices`, e `ecs:RunTask` com `ecs:DescribeTasks` para a migração.
+- **IAM:** `iam:PassRole` sobre a execution role e a task role, com a condição `iam:PassedToService` igual a `ecs-tasks.amazonaws.com`. Registrar uma task definition que referencia uma role equivale a entregar essa role à task, e a AWS exige permissão explícita para isso. A falta dela é o erro `AccessDenied` mais comum no primeiro deploy.
+
+## O workflow
+
+```yaml
+# .github/workflows/deploy-ecs.yml
+name: Deploy ECS
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  imagem:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: build
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      imagem: ${{ steps.publicar.outputs.imagem }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ROLE_DEPLOY_ARN }}
+          aws-region: us-east-1
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/ingressos-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - id: publicar
+        run: echo "imagem=${{ steps.ecr.outputs.registry }}/ingressos-api:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  staging:
+    needs: imagem
+    uses: ./.github/workflows/deploy-ecs-ambiente.yml
+    with:
+      ambiente: staging
+      imagem: ${{ needs.imagem.outputs.imagem }}
+
+  producao:
+    needs: [imagem, staging]
+    uses: ./.github/workflows/deploy-ecs-ambiente.yml
+    with:
+      ambiente: production
+      imagem: ${{ needs.imagem.outputs.imagem }}
+```
+
+O `ci.yml` do capítulo de Docker ganha o gatilho `workflow_call` para ser reaproveitado aqui, e o job de imagem para o `ghcr.io` sai dele. O job `imagem` declara o environment `build` para receber o token OIDC com um `sub` conhecido: acrescente `repo:minha-org/ingressos:environment:build` à política de confiança de uma role que só pode enviar imagens ao ECR. O workflow de cada ambiente:
+
+```yaml
+# .github/workflows/deploy-ecs-ambiente.yml
+name: Deploy ECS em um ambiente
+
+on:
+  workflow_call:
+    inputs:
+      ambiente:
+        type: string
+        required: true
+      imagem:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.ambiente }}
+    concurrency:
+      group: ecs-${{ inputs.ambiente }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ROLE_DEPLOY_ARN }}
+          aws-region: us-east-1
+
+      - id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ecs/${{ inputs.ambiente }}.json
+          container-name: api
+          image: ${{ inputs.imagem }}
+
+      - id: registrar
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+
+      - name: Migrações
+        env:
+          CLUSTER: ingressos-${{ inputs.ambiente }}
+          REVISAO: ${{ steps.registrar.outputs.task-definition-arn }}
+          REDE: ${{ vars.REDE_TASKS }}
+        run: |
+          TASK=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$REVISAO" \
+            --launch-type FARGATE --network-configuration "$REDE" \
+            --overrides '{"containerOverrides":[{"name":"api","command":["python","manage.py","migrate","--noinput"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK"
+          CODIGO=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          test "$CODIGO" = "0"
+
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ingressos-${{ inputs.ambiente }}
+          service: ingressos-api
+          wait-for-service-stability: true
+```
+
+O que cada passo faz:
+
+- **`amazon-ecr-login`** autentica o Docker no ECR com as credenciais da role e devolve o endereço do registro em `outputs.registry`.
+- **`amazon-ecs-render-task-definition`** lê o JSON do ambiente, troca a imagem do contêiner `api` e grava o resultado num arquivo temporário. O repositório continua com o texto `definida-pelo-pipeline`.
+- **O primeiro `amazon-ecs-deploy-task-definition`**, sem `service`, só registra a revisão e devolve o ARN. É essa revisão que a migração usa, para que ela rode com o código novo e com os mesmos segredos e rede da aplicação.
+- **A migração** roda numa task avulsa, uma única vez, antes da troca. `aws ecs wait tasks-stopped` espera a task terminar, e o código de saída do contêiner decide se o deploy continua. A variable `REDE_TASKS` guarda o mesmo `awsvpcConfiguration` do service.
+- **O segundo `amazon-ecs-deploy-task-definition`** atualiza o service. Ele registra de novo o mesmo conteúdo (o ECS cria outra revisão idêntica, o que é inofensivo) e, com `wait-for-service-stability`, só termina quando o rolling update concluir. Se as tasks novas não estabilizarem no prazo da action, o job falha e produção nem é tentada.
+
+<Callout type="tip" title="Mesma imagem, task definitions diferentes">
+A imagem com o SHA é construída uma vez e vai para staging e produção. O que difere entre os ambientes (tamanho da task, número de workers, ARN dos segredos, domínio) mora nos arquivos `ecs/staging.json` e `ecs/production.json`, revisados por pull request. Assim, "funcionou em staging" diz algo sobre produção.
+</Callout>
+
+## Acompanhando o deploy
+
+Quando o deploy demora ou falha, olhe nesta ordem:
+
+1. **Eventos do service**: `aws ecs describe-services --cluster ingressos-production --services ingressos-api --query "services[0].events[:10]"`. Mostram tasks iniciadas, registradas e paradas, e falhas de health check.
+2. **Motivo de parada das tasks** (`stoppedReason` em `describe-tasks`): segredo inacessível pela execution role, imagem não encontrada, falha de health check do ALB, contêiner morto por memória.
+3. **Logs da aplicação** no CloudWatch, no grupo `/ecs/ingressos-api`.
+
+A maior parte das falhas de um primeiro deploy está nos itens 1 e 2, antes de a aplicação escrever qualquer linha de log. Para voltar à versão anterior manualmente, aponte o service para a revisão que funcionava: `aws ecs update-service --cluster ingressos-production --service ingressos-api --task-definition ingressos-api-production:17`. Como cada revisão fixa a imagem do SHA, ela roda exatamente o código daquele commit.
+
+## Na entrevista
+
+**Qual a diferença entre task definition, task e service?** A task definition é a receita versionada (imagem, recursos, variáveis, segredos). A task é uma execução dessa receita. O service mantém um número de tasks de uma revisão rodando, substitui as que falham e as registra no balanceador.
+
+**Qual a diferença entre execution role e task role?** A execution role é usada pelo ECS para preparar a task: baixar a imagem, ler os segredos e enviar logs. A task role é a identidade da aplicação para chamar serviços da AWS. Separá-las aplica o menor privilégio.
+
+**Como o ECS faz um deploy sem downtime?** Pelo rolling update: sobe tasks com a revisão nova, espera o ALB considerá-las saudáveis, drena e para as antigas. Com `minimumHealthyPercent=100`, a capacidade nunca fica abaixo do desejado durante a troca.
+
+**Onde você roda as migrações de uma aplicação no ECS?** Numa task avulsa com a revisão nova, uma vez por deploy, antes de atualizar o service, e com o código de saída decidindo se o deploy continua. Rodar no boot de cada task faz várias réplicas migrarem ao mesmo tempo e atrela o tempo de subida à migração.
+
+**Por que o pipeline precisa de iam:PassRole?** Porque registrar uma task definition que referencia roles equivale a conceder essas roles às tasks. A AWS exige que quem registra tenha permissão de passar cada role, restrita ao serviço `ecs-tasks.amazonaws.com`.
+
+## Pratique
+
+1. Crie o repositório no ECR com tags imutáveis, scan no envio e uma lifecycle policy que mantém as 50 imagens mais recentes.
+2. Escreva `ecs/staging.json` e `ecs/production.json` com `WEB_CONCURRENCY`, `stopTimeout`, a senha do banco no Secrets Manager e a chave do Django no Parameter Store. Retire o `--workers` do Dockerfile.
+3. Crie o service no Fargate em sub-redes privadas, atrás do ALB, com o health check em `/saude/pronto` e o middleware que responde a saúde antes da validação de host.
+4. Monte os dois workflows, com a migração em task avulsa e produção exigindo aprovação no environment.
+5. Faça um deploy com uma migração que falha de propósito e mostre que o service continua na revisão anterior e o job para antes do rolling update.
+
+<Quiz question="Num deploy no ECS, qual role é usada para ler o segredo DATABASE_URL e injetá-lo no contêiner?" options={["A task role","A role de deploy assumida pelo GitHub","A execution role","A role do Application Load Balancer"]} answer={2} explanation="A execution role é usada pelo agente do ECS para preparar a task: baixar a imagem, buscar os segredos declarados em secrets e enviar logs. A task role é a identidade da aplicação já rodando." />
+
+<Quiz question="O que a action amazon-ecs-render-task-definition faz?" options={["Troca a imagem de um contêiner no JSON da task definition e grava o resultado num arquivo novo","Registra a task definition e atualiza o service","Constrói a imagem Docker e publica no ECR","Cria o cluster e o service se não existirem"]} answer={0} explanation="Ela só edita o JSON, sem chamar a AWS. Registrar a revisão e atualizar o service é trabalho da amazon-ecs-deploy-task-definition." />
+
+<Quiz question="Com desiredCount 4, minimumHealthyPercent 100 e maximumPercent 200, quantas tasks podem existir ao mesmo tempo durante o deploy?" options={["4","8","6","2"]} answer={1} explanation="maximumPercent 200 permite chegar ao dobro do desejado, e minimumHealthyPercent 100 impede cair abaixo de 4 saudáveis. O ECS sobe as novas antes de parar as antigas." />
+
+## Base no CodeForge
+
+- [Integração Contínua: Pipeline de entrega e implementação contínua na EC2](/learn/carreira-python/integracao-continua-pipeline-entrega-implementacao-continua-ec2): OIDC, environments e o deploy feito por script, que o ECS substitui.
+- [Integração Contínua: Rollback e teste de carga](/learn/carreira-python/integracao-continua-rollback-teste-carga): o próximo passo, com circuit breaker de deploy e critérios de desempenho.
+- [Rolling](/learn/system-design/rolling) e [Load balancers](/learn/system-design/load-balancers): a teoria do rolling update e do balanceamento.
+- [Integração Contínua: Automatize o deploy no Amazon ECS (Java)](/learn/carreira-java/integracao-continua-automatize-deploy-amazon-ecs): o mesmo fluxo para uma aplicação na JVM.
+
+## Referências
+
+- [Amazon ECS: Task definition parameters](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html)
+- [Amazon ECS: Pass sensitive data to a container](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/specifying-sensitive-data.html)
+- [aws-actions/amazon-ecs-deploy-task-definition](https://github.com/aws-actions/amazon-ecs-deploy-task-definition)
+- [aws-actions/amazon-ecs-render-task-definition](https://github.com/aws-actions/amazon-ecs-render-task-definition)

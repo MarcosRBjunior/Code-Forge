@@ -1,0 +1,471 @@
+---
+title: "Swagger: Documentando suas APIs"
+kind: lesson
+---
+
+A API de `ingressos` tem eventos, setores, pedidos, autenticação JWT, filtros, paginação por cursor e duas versões. Tudo isso está no código e na cabeça de quem o escreveu. O time do aplicativo pergunta no chat qual o formato da data, o parceiro que vende ingressos em lote não sabe que o erro de estoque volta como 400 com o campo `itens`, e o front descobre a mudança do campo `disponivel` em produção. Documentação escrita à mão num wiki resolve por duas semanas, até a primeira mudança que ninguém lembra de registrar.
+
+A especificação OpenAPI resolve o problema na raiz: um documento legível por pessoas e por máquinas que descreve cada rota, parâmetro, corpo, resposta e esquema de segurança. A partir dele saem a página interativa do Swagger UI, clientes gerados em outras linguagens, servidores de mock e testes que verificam se a API cumpre o que promete. Este capítulo mostra a estrutura do documento, a geração com drf-spectacular na API Django e com o FastAPI, e como transformar o contrato em verificação automática no CI.
+
+**Você vai aprender:**
+
+- A estrutura de um documento OpenAPI 3.1: info, servers, paths, components e security
+- Gerar e enriquecer o schema da API DRF com drf-spectacular e servir o Swagger UI
+- Documentar exemplos, respostas de erro e autenticação JWT
+- Como o FastAPI gera o contrato a partir das anotações de tipo e dos modelos Pydantic
+- Escolher entre contrato primeiro e código primeiro, e validar o contrato no CI
+
+## OpenAPI, Swagger e Swagger UI
+
+Os nomes se confundem, e entrevistadores gostam de perguntar. **OpenAPI** é a especificação: um formato em YAML ou JSON para descrever APIs HTTP, mantido pela OpenAPI Initiative. A versão atual é a 3.1. **Swagger** era o nome da especificação até a versão 2.0, quando ela foi doada e renomeada; hoje é a marca de um conjunto de ferramentas em volta dela: **Swagger UI** (a página interativa que lê o documento e permite chamar a API), Swagger Editor e Swagger Codegen. **drf-spectacular** e o gerador embutido do **FastAPI** são as ferramentas que, em Python, inspecionam o código e produzem o documento.
+
+A 3.1 trouxe uma mudança que importa para quem gera schemas a partir de Pydantic: o objeto Schema passou a ser totalmente compatível com JSON Schema 2020-12. Na prática, `nullable: true` deu lugar a `type: [string, "null"]`, `example` deu lugar ao array `examples`, e foram acrescentados os `webhooks` no nível raiz, para descrever chamadas que a sua API faz para o cliente.
+
+## A estrutura do documento
+
+Um trecho do contrato da plataforma, escrito à mão para você reconhecer as partes quando as ferramentas o gerarem:
+
+```yaml
+openapi: 3.1.0
+info:
+  title: API de Ingressos
+  version: 1.0.0
+  description: Venda de ingressos para eventos.
+servers:
+  - url: https://api.ingressos.com/api/v1
+  - url: http://localhost:8000/api/v1
+security:
+  - bearerAuth: []
+paths:
+  /eventos/{id}/:
+    get:
+      operationId: eventos_retrieve
+      summary: Detalha um evento com seus setores
+      tags: [eventos]
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Evento encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventoDetalhe"
+        "404":
+          $ref: "#/components/responses/NaoEncontrado"
+components:
+  schemas:
+    Setor:
+      type: object
+      required: [id, nome, preco, quantidade_disponivel]
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        nome:
+          type: string
+          maxLength: 100
+        preco:
+          type: string
+          format: decimal
+          pattern: '^-?\d{0,8}(?:\.\d{0,2})?$'
+        quantidade_disponivel:
+          type: integer
+    EventoDetalhe:
+      type: object
+      properties:
+        id:
+          type: integer
+        nome:
+          type: string
+        data:
+          type: string
+          format: date-time
+        setores:
+          type: array
+          items:
+            $ref: "#/components/schemas/Setor"
+        menor_preco:
+          type: [string, "null"]
+          format: decimal
+    Erro:
+      type: object
+      required: [codigo, mensagem]
+      properties:
+        codigo:
+          type: string
+        mensagem:
+          type: string
+        campos:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+  responses:
+    NaoEncontrado:
+      description: Recurso não encontrado
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Erro"
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+```
+
+As partes, de cima para baixo:
+
+- **`info`** identifica a API e a versão do documento. **`servers`** lista as URLs base; o Swagger UI deixa escolher entre elas.
+- **`paths`** é o coração: cada caminho tem operações por verbo, e cada operação tem `operationId` (identificador único, usado como nome de método pelos geradores de cliente), parâmetros (`path`, `query`, `header`, `cookie`), `requestBody` e `responses` por status code.
+- **`components`** guarda o que é reutilizado e referenciado com `$ref`: `schemas` (as formas dos dados), `responses`, `parameters`, `examples` e `securitySchemes`. Um schema definido uma vez e referenciado em vinte lugares é o que mantém o documento consistente.
+- **`security`** na raiz define o requisito padrão para todas as operações; `security: []` numa operação a torna pública.
+
+Repare no `preco`: é `string` com `format: decimal`, porque o DRF serializa `DecimalField` como texto. O contrato documenta o que a API faz, não o que você gostaria que ela fizesse.
+
+## drf-spectacular no Django REST Framework
+
+O DRF tem um gerador de schema próprio, mas ele está em modo de manutenção, e a documentação do DRF recomenda o drf-spectacular, que gera OpenAPI 3 e entende serializers, viewsets, filtros, paginação, versionamento e autenticação.
+
+```bash
+pip install drf-spectacular
+```
+
+```python
+# ingressos/settings.py
+INSTALLED_APPS = [
+    # ...
+    "rest_framework",
+    "drf_spectacular",
+]
+
+REST_FRAMEWORK = {
+    # ... configurações dos capítulos de DRF
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "API de Ingressos",
+    "DESCRIPTION": "Venda de ingressos para eventos: catálogo, pedidos e autenticação.",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "OAS_VERSION": "3.1.0",
+    "COMPONENT_SPLIT_REQUEST": True,
+}
+```
+
+- `SERVE_INCLUDE_SCHEMA: False` tira do documento a própria rota que serve o schema.
+- `OAS_VERSION` escolhe a versão da especificação gerada (o padrão das versões atuais da biblioteca ainda é 3.0.3; confira a documentação da versão instalada).
+- `COMPONENT_SPLIT_REQUEST: True` gera schemas separados para entrada e saída (`Pedido` e `PedidoRequest`). Sem isso, campos somente leitura e somente escrita convivem no mesmo schema, e geradores de cliente produzem tipos errados. Com o `PedidoSerializer` do capítulo anterior, que recebe `itens` e devolve `ingressos`, essa separação é essencial.
+
+```python
+# ingressos/urls.py
+from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
+
+urlpatterns = [
+    # ...
+    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+    path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+    path("api/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
+]
+```
+
+Abra `http://localhost:8000/api/docs/`. O Swagger UI mostra as rotas agrupadas por tag, com schemas, parâmetros de filtro e paginação e o botão "Try it out" para executar requisições de verdade. O ReDoc é uma alternativa somente leitura, mais agradável para quem só consulta.
+
+Lembre que essas rotas herdam o `DEFAULT_PERMISSION_CLASSES` fechado do capítulo de autenticação. Decida se a documentação é pública (API para parceiros) ou interna (passe `permission_classes` restritas às views do schema, ou não exponha as rotas em produção e publique o arquivo gerado em outro lugar).
+
+O schema também sai pela linha de comando, sem servidor no ar, e é essa forma que vai para o CI:
+
+```bash
+python manage.py spectacular --file openapi.yaml --validate --fail-on-warn
+```
+
+`--validate` confere o documento contra a especificação, e `--fail-on-warn` transforma em erro os avisos do gerador, como uma view cujo serializer ele não conseguiu descobrir. Leve os avisos a sério: cada um é um trecho do contrato que está errado ou ausente.
+
+## Enriquecendo o schema
+
+A inferência automática acerta o caso comum: `ModelViewSet` com `serializer_class`, campos tipados, `FilterSet` declarada. Ela não sabe o que só você sabe: o resumo de cada operação, os erros de negócio, os exemplos e o formato das ações personalizadas. Para isso existe `extend_schema`:
+
+```python
+# pedidos/views.py
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema, extend_schema_view
+
+from ingressos.serializers_erro import ErroSerializer
+from pedidos.serializers import PedidoSerializer
+
+
+@extend_schema_view(
+    list=extend_schema(summary="Lista os pedidos do usuário autenticado", tags=["pedidos"]),
+    retrieve=extend_schema(summary="Detalha um pedido", tags=["pedidos"]),
+)
+class PedidoViewSet(...):
+    # queryset, permissões e paginação dos capítulos anteriores
+
+    @extend_schema(
+        summary="Cria um pedido e reserva os ingressos",
+        description="Reserva o estoque de forma atômica. A reserva expira em 15 minutos sem pagamento.",
+        tags=["pedidos"],
+        request=PedidoSerializer,
+        responses={
+            201: PedidoSerializer,
+            400: OpenApiResponse(response=ErroSerializer, description="Dados inválidos ou estoque insuficiente"),
+            401: OpenApiResponse(response=ErroSerializer, description="Token ausente ou inválido"),
+            429: OpenApiResponse(response=ErroSerializer, description="Limite de compras excedido"),
+        },
+        examples=[
+            OpenApiExample(
+                "Dois ingressos de pista",
+                value={"itens": [{"setor": 3, "quantidade": 2}]},
+                request_only=True,
+            ),
+            OpenApiExample(
+                "Estoque insuficiente",
+                value={
+                    "codigo": "dados_invalidos",
+                    "mensagem": "Os dados enviados são inválidos.",
+                    "campos": {"itens": ["Não há 3 lugares disponíveis em Pista."]},
+                },
+                response_only=True,
+                status_codes=["400"],
+            ),
+        ],
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+```
+
+Para que os erros apareçam com o formato real, crie um serializer que descreve o corpo produzido pelo `handler_de_erros` do capítulo de validações. Ele não valida nada; existe só para o schema:
+
+```python
+# ingressos/serializers_erro.py
+from rest_framework import serializers
+
+
+class ErroSerializer(serializers.Serializer):
+    codigo = serializers.CharField()
+    mensagem = serializers.CharField()
+    campos = serializers.DictField(child=serializers.ListField(child=serializers.CharField()), required=False)
+```
+
+Outras ferramentas do drf-spectacular que resolvem os casos mais comuns:
+
+- **`OpenApiParameter`** documenta parâmetros que a biblioteca não infere, como um filtro lido à mão em `get_queryset`: `OpenApiParameter("periodo", str, enum=["hoje", "semana"], description="...")` dentro de `parameters=[...]`.
+- **`@extend_schema_field`** num `SerializerMethodField` informa o tipo de retorno, que a biblioteca não consegue deduzir de um método Python sem anotação. Com a anotação de retorno no método (`-> int`), ela muitas vezes deduz sozinha.
+- **Ações com `@action`** recebem `@extend_schema` como qualquer método; sem isso, uma ação como `cancelar` aparece com o serializer padrão do viewset, que não é o que ela recebe nem devolve.
+- **`APIView` sem `serializer_class`** gera aviso: declare `request` e `responses` explicitamente.
+
+### Autenticação e versões
+
+O drf-spectacular reconhece as classes de autenticação configuradas e cria os `securitySchemes`. Com `JWTAuthentication` do SimpleJWT, ele gera um esquema `http` do tipo `bearer` com formato JWT, e o Swagger UI ganha o botão "Authorize": cole o access token obtido em `/api/auth/jwt/` e as chamadas do "Try it out" passam a levar o cabeçalho. Rotas com `AllowAny` aparecem sem requisito de segurança. Se você mantiver a sessão como segunda classe, o esquema de cookie também aparece; para a documentação pública, costuma ser mais claro exibir só o JWT.
+
+Com o versionamento por URL do capítulo anterior, cada versão tem o seu contrato. O drf-spectacular gera o schema de uma versão por vez: a view do schema respeita a versão da requisição, e a linha de comando aceita `--api-version v2`. Gere e publique um arquivo por versão ativa.
+
+<Callout type="warning" title="Documentação gerada também mente">
+Gerar o schema do código garante que rotas e campos existem, não que a descrição esteja certa. Um `responses={201: ...}` numa view que na verdade devolve 200, um exemplo com campo que foi renomeado, um erro 409 que o código lança e ninguém declarou: tudo isso passa pela geração sem aviso. O contrato só fica confiável quando é testado contra a API rodando, assunto da última seção.
+</Callout>
+
+## A geração nativa do FastAPI
+
+No FastAPI, o contrato não é um acréscimo: as mesmas anotações de tipo que validam a requisição geram o schema. Qualquer aplicação já expõe `/openapi.json`, o Swagger UI em `/docs` e o ReDoc em `/redoc`, com OpenAPI 3.1. Um trecho do serviço de catálogo, documentado com cuidado:
+
+```python
+# catalogo/main.py
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated
+
+from fastapi import FastAPI, HTTPException, Path, Query
+from pydantic import BaseModel, ConfigDict, Field
+
+app = FastAPI(
+    title="Catálogo de Eventos",
+    version="1.0.0",
+    description="Consulta pública de eventos e setores.",
+)
+
+
+class SetorSaida(BaseModel):
+    id: int
+    nome: str
+    preco: Decimal = Field(examples=[Decimal("150.00")])
+    quantidade_disponivel: int = Field(ge=0)
+
+
+class EventoSaida(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [{
+                "id": 42, "nome": "Festival de Inverno", "data": "2026-07-18T20:00:00-03:00",
+                "local": "Arena Central", "setores": [],
+            }]
+        }
+    )
+
+    id: int
+    nome: str
+    data: datetime
+    local: str
+    setores: list[SetorSaida]
+
+
+class Erro(BaseModel):
+    codigo: str
+    mensagem: str
+
+
+@app.get(
+    "/eventos/{evento_id}",
+    response_model=EventoSaida,
+    summary="Detalha um evento com seus setores",
+    tags=["eventos"],
+    responses={404: {"model": Erro, "description": "Evento não encontrado"}},
+)
+def detalhar_evento(evento_id: Annotated[int, Path(ge=1, description="Identificador do evento")]) -> EventoSaida:
+    evento = buscar_evento(evento_id)  # função do repositório do serviço
+    if evento is None:
+        raise HTTPException(status_code=404, detail={"codigo": "nao_encontrado", "mensagem": "Evento não existe"})
+    return evento
+
+
+@app.get("/eventos", response_model=list[EventoSaida], tags=["eventos"])
+def listar_eventos(
+    local: Annotated[str | None, Query(max_length=100, description="Filtra pelo local")] = None,
+    limite: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> list[EventoSaida]:
+    return listar(local=local, limite=limite)  # função do repositório do serviço
+```
+
+O que vira contrato, sem nenhuma linha extra:
+
+- Os parâmetros de caminho e de consulta, com tipo, obrigatoriedade, limites (`ge`, `le`, `max_length`) e descrição.
+- Os modelos Pydantic, em `components/schemas`, com `str | None` virando um tipo que aceita nulo, como manda a 3.1.
+- A resposta 422 de validação, que o FastAPI acrescenta a toda rota com parâmetros ou corpo.
+
+O que precisa ser declarado: respostas de erro de negócio (`responses=`), exemplos (`Field(examples=...)` e `json_schema_extra` no `model_config`), `summary`, `tags` e descrições. O `operationId` padrão é gerado a partir do nome da função e do caminho, longo e feio nos clientes gerados; se você vai gerar clientes, passe `operation_id="detalhar_evento"` ou um `generate_unique_id_function` na criação do app.
+
+Para desligar a documentação num ambiente, passe `openapi_url=None` ao `FastAPI(...)`, o que remove o schema e as duas páginas. A segurança aparece no schema quando a dependência de autenticação usa as classes de `fastapi.security` (como `HTTPBearer` ou `OAuth2PasswordBearer`), como no capítulo de FastAPI.
+
+| | drf-spectacular | FastAPI |
+|---|---|---|
+| Fonte do contrato | Serializers, viewsets e configurações do DRF | Anotações de tipo e modelos Pydantic |
+| Instalação | Pacote à parte, configurado no `REST_FRAMEWORK` | Embutido |
+| Ajuste fino | `@extend_schema` e afins | Argumentos do decorador de rota e do `Field` |
+| Ponto fraco | Inferência em views fora do padrão e `SerializerMethodField` | Erros de negócio e exemplos não aparecem sem declarar |
+
+## Contrato primeiro ou código primeiro
+
+Até aqui o contrato saiu do código (**código primeiro**). A alternativa é escrever o documento OpenAPI antes, revisá-lo com quem vai consumir a API e só então implementar (**contrato primeiro**).
+
+| | Código primeiro | Contrato primeiro |
+|---|---|---|
+| Fonte da verdade | O código; o documento é gerado | O documento; o código o implementa |
+| Velocidade inicial | Maior | Menor, há uma etapa de desenho e revisão |
+| Trabalho em paralelo | O consumidor espera a implementação | Front e parceiros começam com um mock gerado do contrato |
+| Risco | O contrato reflete decisões acidentais da implementação | Código e documento divergirem sem verificação |
+| Melhor para | API interna, um time só, evolução rápida | API pública, vários times ou empresas, integrações caras de mudar |
+
+Em contrato primeiro, o documento fica no repositório, mudanças passam por revisão como código, e a implementação é verificada contra ele: testes que comparam o schema gerado com o contrato ou testes que exercitam a API a partir do documento. Ferramentas como o OpenAPI Generator geram, a partir do mesmo arquivo, clientes em várias linguagens e esqueletos de servidor.
+
+Na prática, muitos times combinam os dois: escrevem o trecho novo do contrato no PR de desenho, implementam, e a partir daí o schema gerado vira a referência, verificado no CI.
+
+## Validando o contrato no CI
+
+Um contrato só vale o que a verificação dele vale. Três verificações, da mais barata à mais completa, cobrem a maioria dos problemas.
+
+**1. O schema gera sem avisos e é válido.** Com `--validate --fail-on-warn`, qualquer view que o gerador não entende quebra o build.
+
+**2. O schema gerado é igual ao versionado.** O arquivo `openapi.yaml` fica no repositório. O CI gera de novo e compara: se o código mudou o contrato e o arquivo não foi atualizado, falha. Isso torna toda mudança de contrato visível na revisão do PR, no diff do YAML.
+
+**3. A mudança não quebra clientes.** Uma ferramenta de comparação semântica, como o oasdiff, compara o contrato do PR com o da branch principal e acusa mudanças incompatíveis: campo removido, parâmetro que virou obrigatório, tipo alterado, status removido. É a versão automatizada da regra de versionamento do capítulo anterior.
+
+```yaml
+# .github/workflows/contrato.yml
+name: Contrato da API
+
+on:
+  pull_request:
+
+jobs:
+  contrato:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar dependências
+        run: pip install -e ".[dev]"
+
+      - name: Gerar e validar o schema
+        env:
+          DJANGO_SETTINGS_MODULE: ingressos.settings
+        run: python manage.py spectacular --file /tmp/openapi.yaml --validate --fail-on-warn
+
+      - name: Conferir se o contrato versionado está atualizado
+        run: diff -u openapi.yaml /tmp/openapi.yaml
+
+      - name: Detectar mudanças incompatíveis
+        run: |
+          git show origin/${{ github.base_ref }}:openapi.yaml > /tmp/base.yaml
+          docker run --rm -v /tmp:/specs tufin/oasdiff breaking /specs/base.yaml /specs/openapi.yaml --fail-on ERR
+```
+
+Uma mudança incompatível intencional (a v2) é tratada criando o arquivo da nova versão, não editando o da v1.
+
+A verificação mais forte exercita a API contra o contrato. Ferramentas de teste baseadas em propriedades, como o Schemathesis, leem o documento, geram centenas de requisições válidas e inválidas para cada operação e conferem se as respostas batem com o declarado: status documentado, corpo no schema certo, nenhum 500. Elas encontram exatamente as divergências que a geração não pega: o 409 não declarado, o campo nulo que o schema diz obrigatório, a entrada que derruba o servidor. Rode-as contra a aplicação no CI, com banco de teste, ou contra o ambiente de homologação.
+
+<Callout type="tip" title="O contrato é para quem consome">
+Leia a página do Swagger UI como se você fosse o desenvolvedor do aplicativo: dá para fazer uma compra sem perguntar nada a ninguém? Cada operação tem resumo, os erros possíveis estão listados com exemplo, a autenticação está clara? Documentação completa tecnicamente e inútil para o consumidor é comum. Um teste simples é pedir a alguém de outro time para integrar usando só a documentação.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre OpenAPI e Swagger?** OpenAPI é a especificação do formato que descreve APIs HTTP, atualmente na versão 3.1. Swagger foi o nome dela até a 2.0 e hoje é a marca das ferramentas em volta, como o Swagger UI, que lê o documento e gera a página interativa.
+
+**O que muda da OpenAPI 3.0 para a 3.1?** O objeto Schema passa a ser compatível com JSON Schema 2020-12: nulo vira um tipo na lista em vez de `nullable`, exemplos viram um array, e a raiz ganha `webhooks`. Para quem gera schemas a partir de Pydantic, o resultado é mais fiel ao modelo.
+
+**Contrato primeiro ou código primeiro?** Código primeiro é mais rápido e serve bem a APIs internas de um time. Contrato primeiro serve a APIs públicas e integrações entre times, porque o contrato é revisado antes e permite trabalho em paralelo com mocks. Em qualquer dos dois, o que importa é verificar no CI que código e contrato não divergem.
+
+**Como você garante que a documentação não fica desatualizada?** Gerando o schema do código, versionando o arquivo no repositório e falhando o build quando o gerado difere do versionado. Acrescento detecção de mudanças incompatíveis contra a branch principal e testes que exercitam a API a partir do contrato.
+
+**Como documentar erros com drf-spectacular?** Com `extend_schema(responses=...)`, usando `OpenApiResponse` com um serializer que descreve o corpo real do erro e exemplos por status code. Sem isso, o schema só mostra o caminho de sucesso e o 400 genérico.
+
+## Pratique
+
+1. Instale o drf-spectacular na API de `ingressos`, sirva Swagger UI e ReDoc e rode `spectacular --validate --fail-on-warn` até não haver avisos.
+2. Documente a criação de pedido com resumo, exemplos de requisição e de erro, e as respostas 400, 401 e 429 com o `ErroSerializer`. Faça uma compra completa pelo Swagger UI usando o botão de autorização com o JWT.
+3. Gere e versione `openapi.yaml` para a v1 e a v2 e confira que o diff entre elas mostra exatamente o campo renomeado.
+4. Escreva o serviço de catálogo em FastAPI com os modelos de saída, a resposta 404 documentada e `operation_id` legíveis, e compare o `/openapi.json` dele com o da API Django para o mesmo recurso.
+5. Monte o workflow de contrato no GitHub Actions, abra um PR que remove um campo da resposta de eventos na v1 e confirme que o build falha na verificação de mudanças incompatíveis.
+
+<Quiz question="Para que serve COMPONENT_SPLIT_REQUEST igual a True no drf-spectacular?" options={["Dividir o schema em vários arquivos","Gerar schemas separados para entrada e saída, respeitando campos somente leitura e somente escrita","Separar as rotas públicas das autenticadas","Gerar um schema por versão da API"]} answer={1} explanation="Com schemas distintos, um campo como itens, que só é enviado, e ingressos, que só é recebido, aparecem cada um no lugar certo, e os clientes gerados ficam corretos." />
+
+<Quiz question="No CI, o schema gerado a partir do código difere do openapi.yaml versionado. O que isso indica?" options={["Que o gerador tem um bug","Que a API está fora do ar","Que o código mudou o contrato sem que a mudança fosse registrada e revisada no arquivo","Que o Swagger UI precisa ser atualizado"]} answer={2} explanation="A comparação torna visível toda mudança de contrato. Se diferem, alguém alterou o comportamento público sem atualizar o documento versionado." />
+
+<Quiz question="Como uma operação é marcada como pública num documento cujo security global exige bearerAuth?" options={["Com security igual a uma lista vazia na própria operação","Removendo o securitySchemes de components","Usando a tag public","Não é possível, o requisito global vale para todas"]} answer={0} explanation="Uma operação com security vazio sobrescreve o requisito global e indica que não precisa de autenticação." />
+
+## Base no CodeForge
+
+- [Django REST Framework: Trabalhando com relacionamentos, versionamento e desempenho](/learn/carreira-python/django-rest-framework-relacionamentos-versionamento-desempenho): as versões e serializers documentados aqui.
+- [FastAPI e Python: Construindo APIs com autenticação e banco de dados](/learn/carreira-python/fastapi-python-construindo-apis-autenticacao-banco-dados): a aplicação FastAPI cuja documentação nasce das anotações.
+- [Estilos de API](/learn/system-design/estilos-de-api) e [REST](/learn/system-design/rest): onde o contrato OpenAPI se encaixa entre REST, gRPC e GraphQL.
+- [CI/CD](/learn/system-design/ci-cd): a verificação do contrato como etapa do pipeline.
+- [Swagger: Documentando suas APIs na carreira Java](/learn/carreira-java/swagger-documentando-apis): o mesmo tema com springdoc, bom para comparar.
+
+## Referências
+
+- [OpenAPI Specification 3.1](https://spec.openapis.org/oas/v3.1.0)
+- [drf-spectacular: documentação](https://drf-spectacular.readthedocs.io/en/latest/)
+- [FastAPI: Metadata and Docs URLs](https://fastapi.tiangolo.com/tutorial/metadata/)
+- [Django REST Framework: Schemas](https://www.django-rest-framework.org/api-guide/schemas/)

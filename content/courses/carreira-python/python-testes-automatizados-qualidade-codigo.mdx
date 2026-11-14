@@ -1,0 +1,616 @@
+---
+title: "Python: Testes automatizados e qualidade de código"
+kind: lesson
+---
+
+A API de ingressos já vende, autentica e pagina. O problema aparece na próxima mudança: você altera a regra de expiração da reserva e não tem como saber se quebrou o cancelamento, a não ser abrindo o cliente HTTP e refazendo o fluxo inteiro à mão. Em Python isso pesa ainda mais, porque não existe compilador para avisar que um método foi renomeado ou que uma função passou a devolver `None`: o erro só aparece quando a linha executa, e sem teste quem executa a linha pela primeira vez é o cliente.
+
+Este capítulo monta a rede de proteção do projeto `ingressos` em duas camadas. A primeira é a suíte de testes com pytest, do teste unitário de uma regra pura até o teste de API passando pelo banco. A segunda é a análise estática com ruff e mypy, amarrada ao pre-commit, que pega uma classe inteira de erros antes de qualquer teste rodar.
+
+**Você vai aprender:**
+
+- Distribuir os testes pela pirâmide e decidir o que merece cada tipo
+- Escrever testes com pytest usando fixtures, `parametrize` e `pytest.raises`
+- Isolar dependências externas com `unittest.mock` e reconhecer quando um mock atrapalha
+- Testar models, serviços e endpoints do DRF com pytest-django e factory_boy
+- Medir cobertura e automatizar ruff, mypy e pre-commit
+
+## A pirâmide e o que testar em cada andar
+
+Testes diferentes custam e protegem coisas diferentes. A pirâmide é uma recomendação de proporção: muitos testes baratos na base, poucos testes caros no topo.
+
+| Tipo | O que exercita no `ingressos` | Velocidade | Quantidade |
+|---|---|---|---|
+| Unitário | Uma função ou classe sem banco nem rede: cálculo de total, expiração da reserva | Milissegundos | Muitos |
+| Integração | Serviço mais banco real: `criar_pedido` baixando o estoque numa transação | Dezenas de milissegundos | Vários |
+| API | Requisição HTTP completa: URL, autenticação, serializer, view, banco | Dezenas de milissegundos | Vários, um por contrato |
+| Ponta a ponta | Sistema implantado, com serviços vizinhos reais | Segundos ou minutos | Poucos |
+
+A regra prática: regras de negócio ficam em funções puras e ganham testes unitários exaustivos; o que depende do ORM (consultas, transações, constraints) ganha teste de integração contra o Postgres; cada endpoint ganha testes do contrato (status, formato, permissões). Não teste o framework: que `Pedido.objects.create` insere uma linha é problema de quem mantém o Django.
+
+Instale as ferramentas num grupo de dependências de desenvolvimento do `pyproject.toml`:
+
+```toml
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-django>=4.9",
+    "pytest-cov>=5",
+    "factory-boy>=3.3",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "django-stubs>=5.1",
+    "djangorestframework-stubs>=3.15",
+    "pre-commit>=4",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "ingressos.settings"
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
+```
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+pytest
+```
+
+## pytest: funções, `assert` e nada mais
+
+Um teste do pytest é uma função cujo nome começa com `test_`, num arquivo `test_*.py`. A verificação é o `assert` da linguagem: o pytest reescreve a expressão e, na falha, mostra os dois lados da comparação. Comece pelas regras puras do domínio:
+
+```python
+# ingressos/pedidos/regras.py
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+PRAZO_RESERVA = timedelta(minutes=15)
+LIMITE_POR_PEDIDO = 6
+
+
+class RegraDeNegocioError(Exception):
+    pass
+
+
+def calcular_total(preco: Decimal, quantidade: int, meia_entrada: bool = False) -> Decimal:
+    if quantidade < 1 or quantidade > LIMITE_POR_PEDIDO:
+        raise RegraDeNegocioError(f"Quantidade deve ficar entre 1 e {LIMITE_POR_PEDIDO}")
+    total = preco * quantidade
+    if meia_entrada:
+        total = total / 2
+    return total.quantize(Decimal("0.01"))
+
+
+def reserva_expirada(criado_em: datetime, agora: datetime) -> bool:
+    return agora - criado_em >= PRAZO_RESERVA
+```
+
+```python
+# tests/pedidos/test_regras.py
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+
+from ingressos.pedidos.regras import RegraDeNegocioError, calcular_total, reserva_expirada
+
+
+def test_total_multiplica_preco_pela_quantidade():
+    assert calcular_total(Decimal("120.00"), 2) == Decimal("240.00")
+
+
+def test_meia_entrada_paga_metade():
+    assert calcular_total(Decimal("95.00"), 3, meia_entrada=True) == Decimal("142.50")
+
+
+def test_quantidade_acima_do_limite_e_rejeitada():
+    with pytest.raises(RegraDeNegocioError, match="entre 1 e 6"):
+        calcular_total(Decimal("120.00"), 7)
+```
+
+Cada teste segue três passos, preparar, agir e verificar, e o nome descreve o comportamento esperado, não o método chamado. `pytest.raises` falha se a exceção não for lançada, e `match` confere a mensagem com uma expressão regular.
+
+Repare que `reserva_expirada` recebe `agora` como parâmetro em vez de chamar `datetime.now()` lá dentro. Essa decisão de projeto é o que torna o teste determinístico: você passa o horário que quiser, sem precisar congelar o relógio.
+
+### `parametrize`: uma regra, vários casos
+
+Regras com fronteira (15 minutos exatos expira ou não?) pedem vários casos. Copiar e colar o teste esconde qual é a diferença entre eles; `parametrize` deixa a tabela de casos explícita:
+
+```python
+CRIADO_EM = datetime(2026, 11, 14, 20, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("minutos", "esperado"),
+    [
+        pytest.param(0, False, id="recem-criada"),
+        pytest.param(14, False, id="um-minuto-antes"),
+        pytest.param(15, True, id="no-limite"),
+        pytest.param(90, True, id="muito-depois"),
+    ],
+)
+def test_reserva_expira_aos_quinze_minutos(minutos, esperado):
+    agora = CRIADO_EM + timedelta(minutes=minutos)
+
+    assert reserva_expirada(CRIADO_EM, agora) is esperado
+```
+
+Cada linha vira um teste independente no relatório (`test_reserva_expira_aos_quinze_minutos[no-limite]`), então uma falha aponta o caso exato.
+
+Comandos do dia a dia:
+
+```bash
+pytest tests/pedidos/test_regras.py        # um arquivo
+pytest -k "expira"                         # testes cujo nome contém o termo
+pytest -x --lf                             # só os que falharam na última vez, parando no primeiro erro
+pytest tests/pedidos/test_regras.py::test_meia_entrada_paga_metade
+```
+
+## Fixtures: preparação reutilizável
+
+Uma fixture é uma função decorada com `@pytest.fixture` que entrega um recurso pronto. O teste a recebe declarando um parâmetro com o mesmo nome, e o pytest resolve as dependências entre fixtures sozinho. Fixtures definidas em `conftest.py` ficam disponíveis para todos os testes da pasta, sem import.
+
+```python
+# tests/conftest.py
+import pytest
+from rest_framework.test import APIClient
+
+from tests.factories import UsuarioFactory
+
+
+@pytest.fixture
+def cliente(db):
+    return UsuarioFactory()
+
+
+@pytest.fixture
+def api_client():
+    return APIClient()
+
+
+@pytest.fixture
+def api_autenticada(api_client, cliente):
+    api_client.force_authenticate(user=cliente)
+    yield api_client
+    api_client.force_authenticate(user=None)
+```
+
+O que vem antes do `yield` é a preparação e o que vem depois é a limpeza, executada mesmo se o teste falhar. O escopo padrão é `function`: a fixture é recriada a cada teste, o que garante isolamento. Use `scope="session"` só para recursos caros e imutáveis, porque estado compartilhado entre testes é a origem mais comum de testes que falham só quando rodam juntos.
+
+O pytest já traz fixtures úteis: `tmp_path` (diretório temporário), `monkeypatch` (troca atributos e variáveis de ambiente e desfaz no fim), `caplog` (captura logs) e `capsys` (captura a saída padrão).
+
+## Dublês de teste com `unittest.mock`
+
+Pagar um pedido chama o gateway de pagamento por HTTP. O teste não pode depender de rede nem cobrar um cartão, então a dependência externa é trocada por um dublê. Para isso funcionar sem truques, o serviço recebe o gateway por parâmetro:
+
+```python
+# ingressos/pagamentos/gateway.py
+from decimal import Decimal
+
+
+class PagamentoRecusado(Exception):
+    pass
+
+
+class GatewayHttp:
+    def cobrar(self, pedido_id: int, valor: Decimal) -> str:
+        """Chama a API do provedor e devolve o id da transação."""
+        raise NotImplementedError
+```
+
+```python
+# ingressos/pedidos/servicos.py (trecho)
+from ingressos.pagamentos.gateway import GatewayHttp
+from ingressos.pedidos.models import Pedido
+
+
+def pagar_pedido(pedido: Pedido, gateway: GatewayHttp) -> None:
+    transacao_id = gateway.cobrar(pedido_id=pedido.pk, valor=pedido.total)
+    pedido.status = Pedido.Status.PAGO
+    pedido.transacao_id = transacao_id
+    pedido.save(update_fields=["status", "transacao_id"])
+```
+
+```python
+# tests/pedidos/test_pagamento.py
+from unittest.mock import create_autospec
+
+import pytest
+
+from ingressos.pagamentos.gateway import GatewayHttp, PagamentoRecusado
+from ingressos.pedidos.models import Pedido
+from ingressos.pedidos.servicos import pagar_pedido
+from tests.factories import PedidoFactory
+
+
+@pytest.fixture
+def gateway():
+    return create_autospec(GatewayHttp, instance=True)
+
+
+@pytest.mark.django_db
+def test_pagamento_aprovado_marca_pedido_como_pago(gateway):
+    pedido = PedidoFactory()
+    gateway.cobrar.return_value = "tx_123"
+
+    pagar_pedido(pedido, gateway)
+
+    pedido.refresh_from_db()
+    assert pedido.status == Pedido.Status.PAGO
+    assert pedido.transacao_id == "tx_123"
+    gateway.cobrar.assert_called_once_with(pedido_id=pedido.pk, valor=pedido.total)
+
+
+@pytest.mark.django_db
+def test_pagamento_recusado_mantem_pedido_pendente(gateway):
+    pedido = PedidoFactory()
+    gateway.cobrar.side_effect = PagamentoRecusado("cartão sem limite")
+
+    with pytest.raises(PagamentoRecusado):
+        pagar_pedido(pedido, gateway)
+
+    pedido.refresh_from_db()
+    assert pedido.status == Pedido.Status.PENDENTE
+```
+
+O essencial da biblioteca:
+
+- `return_value` define a resposta; `side_effect` lança uma exceção ou devolve valores em sequência.
+- `assert_called_once_with(...)` e `assert_not_called()` verificam a interação.
+- `create_autospec` (ou `Mock(spec=Classe)`) cria um mock que respeita a assinatura real. Um `Mock()` puro aceita qualquer atributo e qualquer argumento, então o teste continua verde depois que alguém renomeia `cobrar` para `autorizar`. Com autospec, a chamada errada falha.
+
+Quando a dependência não é injetada, `patch` troca um nome durante o teste. O alvo é o lugar onde o nome é **usado**, não onde foi definido:
+
+```python
+from unittest.mock import patch
+
+
+@pytest.mark.django_db
+def test_confirmacao_envia_email():
+    pedido = PedidoFactory(status=Pedido.Status.PAGO)
+
+    # servicos.py faz "from ingressos.notificacoes.email import enviar_confirmacao"
+    with patch("ingressos.pedidos.servicos.enviar_confirmacao", autospec=True) as enviar:
+        from ingressos.pedidos.servicos import confirmar_pedido
+
+        confirmar_pedido(pedido)
+
+    enviar.assert_called_once_with(pedido)
+```
+
+### Quando evitar mocks
+
+Mock é ferramenta para a borda do sistema: rede, e-mail, relógio, fila, serviço de terceiros. Usado para dentro, ele produz testes que repetem a implementação linha por linha e quebram em qualquer refatoração, mesmo com o comportamento intacto. Três sinais de excesso:
+
+- **Mockar o ORM.** `Pedido.objects.filter` trocado por mock não testa a consulta, que é justamente onde o erro mora. Use o banco de teste.
+- **Mockar a classe que está sendo testada**, ou tantas dependências que o teste só confirma que o mock devolveu o que você mandou devolver.
+- **Verificar chamadas em vez de resultado.** Se dá para conferir o estado final (o pedido ficou pago, o estoque baixou), prefira isso a `assert_called_with`.
+
+Uma alternativa que envelhece melhor é o *fake*: uma implementação simples e real da mesma interface.
+
+```python
+class GatewayFalso:
+    def __init__(self, recusar: bool = False) -> None:
+        self.recusar = recusar
+        self.cobrancas: list[tuple[int, Decimal]] = []
+
+    def cobrar(self, pedido_id: int, valor: Decimal) -> str:
+        if self.recusar:
+            raise PagamentoRecusado("recusado")
+        self.cobrancas.append((pedido_id, valor))
+        return f"tx_{pedido_id}"
+```
+
+<Callout type="warning" title="Teste que não falha não protege nada">
+Depois de escrever um teste, quebre de propósito a regra no código de produção (troque o maior ou igual por maior, comente a linha que baixa o estoque) e confirme que ele fica vermelho. Um teste que passa com o código certo e com o código errado dá falsa confiança, e isso acontece com frequência em testes cheios de mock, em asserções fracas como `assert resposta is not None` e em testes que dependem da data atual.
+</Callout>
+
+## pytest-django e factory_boy: testes com banco
+
+O pytest-django cria um banco de teste (`test_<nome>`), aplica as migrações e só libera acesso ao banco para testes marcados com `@pytest.mark.django_db` (ou que usem a fixture `db`). Cada teste roda dentro de uma transação desfeita no final, então um teste não enxerga os dados do outro. Use nos testes o mesmo Postgres de produção: SQLite não se comporta igual em `select_for_update`, tipos e constraints.
+
+Criar os dados à mão em cada teste (evento, lote, usuário, pedido) polui a preparação com campos irrelevantes. O factory_boy declara um padrão válido para cada model, e o teste só informa o que importa para o cenário:
+
+```python
+# tests/factories.py
+from datetime import UTC, datetime
+from decimal import Decimal
+
+import factory
+from django.contrib.auth import get_user_model
+from factory.django import DjangoModelFactory
+
+from ingressos.eventos.models import Evento, Lote
+from ingressos.pedidos.models import Pedido
+
+
+class UsuarioFactory(DjangoModelFactory):
+    class Meta:
+        model = get_user_model()
+
+    username = factory.Sequence(lambda n: f"cliente{n}")
+    email = factory.LazyAttribute(lambda u: f"{u.username}@exemplo.com")
+
+
+class EventoFactory(DjangoModelFactory):
+    class Meta:
+        model = Evento
+
+    nome = factory.Sequence(lambda n: f"Festival {n}")
+    data = datetime(2027, 3, 20, 21, 0, tzinfo=UTC)
+    local = "Arena Central"
+    capacidade = 5000
+
+
+class LoteFactory(DjangoModelFactory):
+    class Meta:
+        model = Lote
+
+    evento = factory.SubFactory(EventoFactory)
+    nome = "Pista - 1º lote"
+    preco = Decimal("120.00")
+    quantidade_disponivel = 100
+
+
+class PedidoFactory(DjangoModelFactory):
+    class Meta:
+        model = Pedido
+
+    cliente = factory.SubFactory(UsuarioFactory)
+    lote = factory.SubFactory(LoteFactory)
+    quantidade = 2
+    total = Decimal("240.00")
+    status = Pedido.Status.PENDENTE
+```
+
+Agora o teste de integração do serviço que cria o pedido lê como a regra:
+
+```python
+# tests/pedidos/test_criar_pedido.py
+import pytest
+
+from ingressos.pedidos.regras import RegraDeNegocioError
+from ingressos.pedidos.servicos import criar_pedido
+from tests.factories import LoteFactory
+
+
+@pytest.mark.django_db
+def test_criar_pedido_baixa_o_estoque_do_lote(cliente):
+    lote = LoteFactory(quantidade_disponivel=10)
+
+    pedido = criar_pedido(cliente, lote_id=lote.pk, quantidade=4)
+
+    lote.refresh_from_db()
+    assert lote.quantidade_disponivel == 6
+    assert pedido.total == lote.preco * 4
+
+
+@pytest.mark.django_db
+def test_nao_vende_acima_do_estoque(cliente):
+    lote = LoteFactory(quantidade_disponivel=3)
+
+    with pytest.raises(RegraDeNegocioError, match="Estoque insuficiente"):
+        criar_pedido(cliente, lote_id=lote.pk, quantidade=4)
+
+    lote.refresh_from_db()
+    assert lote.quantidade_disponivel == 3
+```
+
+`refresh_from_db()` é obrigatório: o objeto em memória não sabe que o serviço alterou a linha. O `LoteFactory(quantidade_disponivel=3)` cria também o evento, pela `SubFactory`, sem que o teste precise mencioná-lo.
+
+## Testes de API com o `APIClient`
+
+O teste de API exercita o caminho inteiro da requisição: roteamento, autenticação, permissão, serializer, view e banco. O `APIClient` do DRF faz a chamada em processo, sem subir servidor.
+
+```python
+# tests/api/test_pedidos_api.py
+import pytest
+
+from tests.factories import LoteFactory, PedidoFactory
+
+URL = "/api/pedidos/"
+
+
+@pytest.mark.django_db
+def test_cria_pedido_e_devolve_201(api_autenticada, cliente):
+    lote = LoteFactory(quantidade_disponivel=10)
+
+    resposta = api_autenticada.post(URL, {"lote": lote.pk, "quantidade": 2}, format="json")
+
+    assert resposta.status_code == 201
+    assert resposta.data["status"] == "pendente"
+    assert resposta.data["total"] == "240.00"
+
+
+@pytest.mark.django_db
+def test_exige_autenticacao(api_client):
+    resposta = api_client.post(URL, {"lote": 1, "quantidade": 1}, format="json")
+
+    assert resposta.status_code == 401
+
+
+@pytest.mark.django_db
+def test_estoque_esgotado_devolve_409(api_autenticada):
+    lote = LoteFactory(quantidade_disponivel=1)
+
+    resposta = api_autenticada.post(URL, {"lote": lote.pk, "quantidade": 2}, format="json")
+
+    assert resposta.status_code == 409
+
+
+@pytest.mark.django_db
+def test_cliente_so_enxerga_os_proprios_pedidos(api_autenticada, cliente):
+    meu = PedidoFactory(cliente=cliente)
+    PedidoFactory()  # pedido de outra pessoa
+
+    resposta = api_autenticada.get(URL)
+
+    ids = [item["id"] for item in resposta.data["results"]]
+    assert ids == [meu.pk]
+
+
+@pytest.mark.django_db
+def test_listagem_nao_tem_consulta_por_item(api_autenticada, cliente, django_assert_max_num_queries):
+    PedidoFactory.create_batch(5, cliente=cliente)
+
+    with django_assert_max_num_queries(4):
+        api_autenticada.get(URL)
+```
+
+`force_authenticate` (na fixture) pula a emissão do token: o que está em teste aqui é o endpoint, não o login, que tem seus próprios testes. O teste de quem enxerga o quê é o mais valioso da lista, porque vazamento de dados entre clientes não aparece em teste manual feito com um usuário só. E o último usa a fixture `django_assert_max_num_queries` do pytest-django para travar o número de consultas, o que impede um N+1 de voltar sem aviso. Em aplicações FastAPI a ideia é a mesma, com o `TestClient` e a troca de dependências por `app.dependency_overrides`.
+
+## Cobertura e TDD
+
+A cobertura mostra quais linhas e desvios os testes executaram. Com o pytest-cov:
+
+```toml
+[tool.coverage.run]
+source = ["ingressos"]
+branch = true
+omit = ["*/migrations/*", "ingressos/settings.py"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 85
+```
+
+```bash
+pytest --cov --cov-report=term-missing --cov-report=html
+```
+
+`branch = true` mede os desvios: um `if` sem `else` em que só o caminho verdadeiro rodou conta como parcialmente coberto. `fail_under` faz o comando falhar abaixo do piso, que é o que o pipeline de CI vai usar. Trate o número como detector de buracos, não como meta: cobertura mede linha executada, não linha verificada, e uma suíte sem asserções chega a 100%.
+
+No TDD, o teste vem antes do código, em ciclos curtos: **vermelho** (escreva um teste pequeno que falha pelo motivo certo), **verde** (o mínimo de código para passar) e **refatorar** (limpe o código com os testes segurando). Para a regra de que cancelar devolve o estoque, o primeiro passo é este teste, com `cancelar_pedido` ainda inexistente:
+
+```python
+@pytest.mark.django_db
+def test_cancelar_pedido_devolve_o_estoque(cliente):
+    lote = LoteFactory(quantidade_disponivel=10)
+    pedido = criar_pedido(cliente, lote_id=lote.pk, quantidade=4)
+
+    cancelar_pedido(pedido)
+
+    lote.refresh_from_db()
+    assert lote.quantidade_disponivel == 10
+    assert pedido.status == Pedido.Status.CANCELADO
+```
+
+Ele falha com `NameError`, você cria a função, ele passa, e o próximo teste (cancelar um pedido já cancelado não devolve o estoque duas vezes) força o próximo pedaço da implementação. O ganho não é só a cobertura: escrever o teste primeiro obriga a decidir a interface da função antes dos detalhes, e código que nasce testável raramente precisa de `patch`.
+
+## Qualidade estática: ruff, mypy e pre-commit
+
+Teste verifica comportamento em execução. Análise estática lê o código sem executar e pega outro tipo de problema: import esquecido, variável não usada, `None` onde se esperava um objeto.
+
+O **ruff** substitui flake8, isort e black com um binário só: `ruff check` é o linter e `ruff format` é o formatador.
+
+```toml
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
+
+[tool.django-stubs]
+django_settings_module = "ingressos.settings"
+```
+
+Os grupos de regras selecionados: `E` e `F` (erros de estilo e do pyflakes, como nome indefinido), `I` (ordem dos imports), `B` (armadilhas conhecidas, como argumento padrão mutável), `UP` (sintaxe moderna para a versão alvo) e `SIM` (simplificações).
+
+O **mypy** confere os type hints. O caso que mais compensa no dia a dia é o `None`:
+
+```python
+def buscar_lote(lote_id: int) -> Lote | None:
+    return Lote.objects.filter(pk=lote_id).first()
+
+
+def preco_do_lote(lote_id: int) -> Decimal:
+    lote = buscar_lote(lote_id)
+    return lote.preco  # error: Item "None" of "Lote | None" has no attribute "preco"
+```
+
+Sem o mypy, esse erro vira um `AttributeError` em produção no dia em que alguém pedir um lote que não existe. O Django cria atributos dinamicamente (managers, campos, relações reversas), por isso o `django-stubs` e seu plugin são necessários para o mypy entender os models. Num projeto que já existe, ligar `strict = true` de uma vez gera centenas de erros: comece sem ele e aperte módulo por módulo com seções `[[tool.mypy.overrides]]`.
+
+O **pre-commit** roda essas verificações antes de cada commit, para o erro nem chegar ao repositório:
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy ingressos
+        language: system
+        types: [python]
+        pass_filenames: false
+```
+
+```bash
+pre-commit install          # instala o hook de git neste clone
+pre-commit run --all-files  # roda em tudo, útil na primeira vez e no CI
+```
+
+O mypy entra como hook local (`language: system`) para usar o ambiente virtual do projeto, onde estão o Django e os stubs. O hook publicado roda num ambiente isolado, sem as suas dependências, e por isso enxerga metade dos tipos como `Any`.
+
+<Callout type="tip" title="O hook local não substitui o CI">
+Qualquer pessoa pode pular o hook com `git commit --no-verify`, e quem acabou de clonar o repositório ainda não rodou `pre-commit install`. O pre-commit existe para dar retorno rápido a quem está escrevendo. A garantia de que nada entra na `main` sem lint, tipos e testes é o pipeline, montado no capítulo de Integração Contínua.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre mock, stub e fake?** Stub devolve respostas prontas para o código em teste funcionar. Mock, além disso, registra as chamadas para você verificar a interação. Fake é uma implementação real e simplificada, como um gateway em memória. No `unittest.mock`, o mesmo objeto faz os papéis de stub e mock.
+
+**Por que se diz para fazer patch onde o nome é usado?** Porque `from modulo import funcao` cria uma referência nova no módulo que importou. Trocar o original em `modulo.funcao` não altera essa referência, e o código em teste continua chamando a função real.
+
+**O que são fixtures e que escopo usar?** Funções que preparam e limpam recursos, injetadas pelo nome do parâmetro. O escopo padrão, por função, garante isolamento. Escopos maiores (`module`, `session`) servem para recursos caros e imutáveis, porque compartilhar estado mutável cria dependência de ordem entre testes.
+
+**100% de cobertura garante qualidade?** Não. Cobertura mede linhas executadas, não comportamento verificado. Ela é útil para achar código sem nenhum teste e como piso no pipeline, mas um teste sem asserção relevante cobre a linha e não protege nada.
+
+**Como testar código que depende da data atual?** Passando o instante como parâmetro (ou um relógio injetado), para o teste escolher o horário. Quando não dá para mudar a assinatura, troca-se a função de relógio com `monkeypatch` ou com uma biblioteca que congela o tempo.
+
+**O que o mypy pega que os testes não pegam?** Erros de tipo em caminhos que nenhum teste executa: acesso a atributo de valor que pode ser `None`, argumento na ordem errada, retorno esquecido. Ele analisa todos os caminhos do código de uma vez, sem depender da cobertura.
+
+## Pratique
+
+No projeto `ingressos`, entregue uma suíte que roda verde com `pytest --cov`:
+
+1. Testes unitários de `calcular_total` e `reserva_expirada`, com `parametrize` cobrindo as fronteiras (quantidade 0, 1, 6 e 7; 14 e 15 minutos).
+2. Factories para `Evento`, `Lote`, `Pedido` e usuário, e testes de integração de `criar_pedido` e `cancelar_pedido`, este último escrito em TDD (commit do teste vermelho antes do commit da implementação).
+3. Testes de `pagar_pedido` em duas versões, uma com `create_autospec` e outra com `GatewayFalso`. Anote no PR qual das duas você manteria e por quê.
+4. Testes de API para `/api/pedidos/`: 201, 401, 409, isolamento entre clientes e limite de consultas na listagem.
+5. `pyproject.toml` com ruff, mypy e cobertura mínima de 85%, mais o `.pre-commit-config.yaml`. Zere os erros de `ruff check` e `mypy ingressos`.
+
+<Quiz question="Um teste usa Mock() sem spec para o gateway de pagamento. Alguém renomeia o método cobrar para autorizar na classe real, mas esquece de atualizar o serviço. O que acontece com o teste?" options={["Falha com AttributeError","Continua passando, porque um Mock sem spec aceita qualquer atributo","É ignorado pelo pytest","Falha na coleta dos testes"]} answer={1} explanation="Mock sem spec cria atributos sob demanda, então gateway.cobrar continua existindo no dublê. Com create_autospec ou spec, o acesso a um método que não existe na classe real falha." />
+
+<Quiz question="O módulo servicos.py faz 'from ingressos.notificacoes.email import enviar_confirmacao'. Qual alvo de patch troca a função usada pelo serviço?" options={["ingressos.pedidos.servicos.enviar_confirmacao","ingressos.notificacoes.email.enviar_confirmacao","ingressos.notificacoes.enviar_confirmacao","tests.conftest.enviar_confirmacao"]} answer={0} explanation="O import cria um nome novo dentro de servicos. O patch precisa trocar o nome no módulo onde ele é usado, não onde foi definido." />
+
+<Quiz question="Por que o mypy roda como hook local com language system no pre-commit deste projeto?" options={["Porque hooks locais são mais rápidos","Porque o mypy não tem hook publicado","Porque o pre-commit não suporta Python 3.13","Porque assim ele usa o ambiente virtual do projeto, onde estão o Django e os stubs"]} answer={3} explanation="O hook publicado roda em ambiente isolado, sem as dependências do projeto, e os tipos de bibliotecas viram Any. O hook local usa o ambiente onde tudo está instalado." />
+
+## Base no CodeForge
+
+- [Django REST Framework: Trabalhando com autenticação, permissões e limites de requisição](/learn/carreira-python/django-rest-framework-autenticacao-permissoes-limites): a API e as permissões testadas aqui.
+- [Design Patterns em Python: Aplicação e melhores práticas](/learn/carreira-python/design-patterns-python-aplicacao-melhores-praticas): o próximo capítulo, com os padrões que deixam o código mais fácil de testar.
+- [Integração Contínua com Docker e GitHub Actions: Do build ao deploy](/learn/carreira-python/integracao-continua-docker-github-actions-build-deploy): onde lint, tipos, testes e cobertura passam a barrar o pull request.
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia): por que receber o gateway por parâmetro dispensa o `patch`.
+- [Boas práticas de programação: Automatizando testes com Java](/learn/carreira-java/boas-praticas-programacao-automatizando-testes-java): o mesmo tema em outra stack.
+
+## Referências
+
+- [pytest: documentação oficial](https://docs.pytest.org/en/stable/)
+- [unittest.mock (docs.python.org)](https://docs.python.org/3/library/unittest.mock.html)
+- [pytest-django](https://pytest-django.readthedocs.io/en/latest/)
+- [Django: Testing in Django](https://docs.djangoproject.com/en/5.2/topics/testing/)

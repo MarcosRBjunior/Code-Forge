@@ -1,0 +1,470 @@
+---
+title: "Django REST Framework: Trabalhando com validações, filtros e paginação"
+kind: lesson
+---
+
+A API de eventos do capítulo anterior aceita qualquer coisa que o model aceite: um evento com data no passado, um setor que soma mais lugares do que a capacidade do evento, um preço de zero centavos. E devolve tudo de uma vez: quando o catálogo tiver vinte mil eventos, `GET /api/eventos/` vai serializar os vinte mil, e o aplicativo vai travar esperando. Também não há como pedir "eventos de São Paulo em agosto, do mais barato ao mais caro", que é exatamente o que a tela de busca precisa.
+
+Este capítulo fecha essas três lacunas. Primeiro as validações, nos três níveis que o serializer oferece, e um formato de erro estável que o front consiga tratar. Depois filtros, busca e ordenação com django-filter e os backends do DRF. Por fim, paginação, com a comparação entre número de página e cursor que costuma aparecer em entrevista.
+
+**Você vai aprender:**
+
+- Validar campo a campo, o objeto inteiro e com validadores reutilizáveis
+- Padronizar as respostas de erro com um exception handler próprio
+- Filtrar por campos e intervalos com django-filter e uma `FilterSet` declarada
+- Combinar busca textual e ordenação com uma lista de campos permitidos
+- Escolher entre paginação por número de página, por limite e deslocamento ou por cursor
+
+## Onde cada validação mora
+
+Antes de escrever código, decida o lugar. Uma regra pode estar no banco, no model ou no serializer, e cada lugar protege um caminho diferente:
+
+| Lugar | Protege | Exemplo |
+|---|---|---|
+| Restrição no banco (`CheckConstraint`, `UniqueConstraint`) | Todo caminho de escrita, inclusive scripts e SQL direto | Preço maior que zero, nome de setor único por evento |
+| Model (`clean`, validadores de campo) | Formulários do Django e do admin | Mesmo conteúdo, para o admin mostrar erro amigável |
+| Serializer | A API | Data do evento no futuro, soma dos setores dentro da capacidade |
+
+Duas observações. O `ModelSerializer` **não chama** `Model.clean()` nem `full_clean()`: regra escrita só no `clean` do model não protege a API. E restrição de banco é a última linha de defesa, a única que vale também para concorrência, já que duas requisições simultâneas podem passar pela validação do serializer ao mesmo tempo. A regra prática: invariantes simples no banco, regras de entrada da API no serializer, e nunca a mesma regra escrita duas vezes de formas diferentes.
+
+```python
+# eventos/models.py (trecho)
+from django.db import models
+from django.db.models import Q
+
+
+class Setor(models.Model):
+    # campos do capítulo anterior...
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(preco__gt=0), name="setor_preco_positivo"),
+            models.UniqueConstraint(fields=["evento", "nome"], name="setor_nome_unico_por_evento"),
+        ]
+```
+
+No Django 5.2 o argumento do `CheckConstraint` é `condition` (o antigo `check` foi depreciado). O `ModelSerializer` lê a `UniqueConstraint` e gera o validador correspondente, então o cliente recebe 400 com uma mensagem, e não um 500 de `IntegrityError`.
+
+## Validação de campo
+
+O primeiro nível vem dos argumentos do próprio campo: `max_length`, `min_value`, `allow_blank`, `required`. Para uma regra que envolve um único campo, escreva um método `validate_<campo>`: ele recebe o valor já convertido para o tipo Python e devolve o valor (possivelmente normalizado) ou levanta `ValidationError`.
+
+```python
+# eventos/serializers.py
+from django.utils import timezone
+from rest_framework import serializers
+
+from eventos.models import Evento
+
+
+class EventoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Evento
+        fields = ["id", "nome", "data", "local", "capacidade"]
+        extra_kwargs = {"capacidade": {"min_value": 1, "max_value": 100_000}}
+
+    def validate_nome(self, valor: str) -> str:
+        valor = " ".join(valor.split())
+        if len(valor) < 3:
+            raise serializers.ValidationError("O nome precisa de pelo menos 3 caracteres.")
+        return valor
+
+    def validate_data(self, valor):
+        if valor <= timezone.now():
+            raise serializers.ValidationError("A data do evento precisa estar no futuro.")
+        return valor
+```
+
+`extra_kwargs` acrescenta argumentos aos campos gerados sem precisar redeclará-los. O `validate_nome` também **normaliza** (remove espaços repetidos): o valor que ele devolve é o que vai para `validated_data`. Os métodos de campo só rodam se o campo veio na requisição; num `PATCH` que não envia `data`, `validate_data` não é chamado.
+
+## Validação de objeto
+
+Regras que comparam campos entre si vão no método `validate`, que recebe o dicionário com todos os valores já validados individualmente. A regra mais importante da plataforma é não vender acima da capacidade, e ela começa no cadastro: a soma dos setores de um evento não pode passar da capacidade dele.
+
+```python
+# eventos/serializers.py
+from django.db.models import Sum
+from rest_framework import serializers
+
+from eventos.models import Setor
+
+
+class SetorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Setor
+        fields = ["id", "evento", "nome", "preco", "quantidade_disponivel"]
+
+    def validate(self, attrs):
+        evento = attrs.get("evento") or self.instance.evento
+        quantidade = attrs.get("quantidade_disponivel", getattr(self.instance, "quantidade_disponivel", 0))
+
+        outros = Setor.objects.filter(evento=evento)
+        if self.instance is not None:
+            outros = outros.exclude(pk=self.instance.pk)
+        ja_alocado = outros.aggregate(total=Sum("quantidade_disponivel"))["total"] or 0
+
+        if ja_alocado + quantidade > evento.capacidade:
+            raise serializers.ValidationError({
+                "quantidade_disponivel": (
+                    f"O evento comporta {evento.capacidade} pessoas e já há "
+                    f"{ja_alocado} lugares em outros setores."
+                )
+            })
+        return attrs
+```
+
+Três detalhes desse código valem para qualquer `validate`:
+
+- **Atualização parcial.** Num `PATCH`, `attrs` só tem os campos enviados. Por isso o código busca o valor ausente em `self.instance`, que é a instância sendo alterada (ou `None` na criação).
+- **Excluir a própria instância** da soma ao atualizar, senão o setor conta duas vezes.
+- **Erro associado a um campo.** Levantar `ValidationError` com um dicionário põe a mensagem na chave do campo. Com uma string, ela vai para `non_field_errors`, o que é certo quando a regra não pertence a nenhum campo específico.
+
+A ordem de execução é: conversão e validadores de cada campo, depois cada `validate_<campo>`, depois os validadores da classe (`Meta.validators`), e por fim `validate`. Se algum campo falha, `validate` não roda.
+
+<Callout type="warning" title="Validação não substitui transação">
+A verificação da capacidade é um "ler e depois decidir". Duas requisições simultâneas podem ler a mesma soma, passar na validação e, juntas, estourar o limite. Para cadastro de setor, que é raro e feito pelo organizador, isso é aceitável. Para a compra de ingressos, não: a reserva precisa decrementar o estoque com uma atualização condicional no banco (`filter(quantidade_disponivel__gte=n).update(...)` com `F()`) ou com `select_for_update` dentro de `transaction.atomic`. O serializer valida a entrada; a consistência sob concorrência é do banco.
+</Callout>
+
+## Validadores reutilizáveis
+
+Quando a mesma regra aparece em vários serializers, vire uma função ou uma classe. Um validador é qualquer chamável que recebe o valor e levanta `ValidationError`:
+
+```python
+# ingressos/validadores.py
+from decimal import Decimal
+
+from rest_framework import serializers
+
+
+def preco_em_centavos_validos(valor: Decimal) -> None:
+    if valor <= 0:
+        raise serializers.ValidationError("O preço precisa ser maior que zero.")
+    if valor != valor.quantize(Decimal("0.01")):
+        raise serializers.ValidationError("Use no máximo duas casas decimais.")
+
+
+class SemPalavrasProibidas:
+    def __init__(self, proibidas: set[str]) -> None:
+        self.proibidas = {p.lower() for p in proibidas}
+
+    def __call__(self, valor: str) -> None:
+        encontradas = self.proibidas & set(valor.lower().split())
+        if encontradas:
+            raise serializers.ValidationError(f"Termos não permitidos: {', '.join(sorted(encontradas))}.")
+```
+
+```python
+class SetorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Setor
+        fields = ["id", "evento", "nome", "preco", "quantidade_disponivel"]
+        extra_kwargs = {
+            "preco": {"validators": [preco_em_centavos_validos]},
+            "nome": {"validators": [SemPalavrasProibidas({"teste", "gratis"})]},
+        }
+```
+
+Atenção: passar `validators` em `extra_kwargs` **substitui** os validadores gerados para aquele campo, inclusive o de unicidade se houver. Quando quiser somar aos gerados, declare o campo explicitamente.
+
+O DRF traz validadores prontos de classe: `UniqueValidator` para um campo e `UniqueTogetherValidator` para combinações, este último em `Meta.validators`. Com `UniqueConstraint` no model, o `ModelSerializer` já os cria. Se você precisar de uma mensagem diferente, declare-os à mão:
+
+```python
+from rest_framework.validators import UniqueTogetherValidator
+
+class Meta:
+    model = Setor
+    fields = ["id", "evento", "nome", "preco", "quantidade_disponivel"]
+    validators = [
+        UniqueTogetherValidator(
+            queryset=Setor.objects.all(),
+            fields=["evento", "nome"],
+            message="Já existe um setor com esse nome neste evento.",
+        )
+    ]
+```
+
+## Erros padronizados
+
+O formato padrão do DRF muda conforme o tipo de erro. Validação devolve um dicionário de listas por campo, mas 404 e 403 devolvem `{"detail": "..."}`. O front acaba escrevendo três tratamentos. Um formato único, com um código estável que o cliente pode usar em `if` (o texto da mensagem pode mudar e ser traduzido; o código não), resolve isso. O ponto de extensão é o exception handler:
+
+```python
+# ingressos/erros.py
+from rest_framework import exceptions
+from rest_framework.views import exception_handler
+
+
+def handler_de_erros(exc, context):
+    resposta = exception_handler(exc, context)
+    if resposta is None:
+        return None  # erro não tratado: vira 500 e aparece no monitoramento
+
+    if isinstance(exc, exceptions.ValidationError):
+        corpo = {
+            "codigo": "dados_invalidos",
+            "mensagem": "Os dados enviados são inválidos.",
+            "campos": resposta.data,
+        }
+    else:
+        detalhe = resposta.data.get("detail", "") if isinstance(resposta.data, dict) else ""
+        codigo = getattr(detalhe, "code", None) or "erro"
+        corpo = {"codigo": codigo, "mensagem": str(detalhe)}
+
+    resposta.data = corpo
+    return resposta
+```
+
+```python
+# ingressos/settings.py
+REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "EXCEPTION_HANDLER": "ingressos.erros.handler_de_erros",
+}
+```
+
+As mensagens do DRF são `ErrorDetail`, uma `str` com o atributo `code` (`not_found`, `permission_denied`, `required`, `invalid`). É isso que o handler aproveita. Uma requisição de setor inválida agora responde:
+
+```json
+{
+  "codigo": "dados_invalidos",
+  "mensagem": "Os dados enviados são inválidos.",
+  "campos": {
+    "preco": ["O preço precisa ser maior que zero."],
+    "quantidade_disponivel": ["O evento comporta 5000 pessoas e já há 4800 lugares em outros setores."]
+  }
+}
+```
+
+Para erros de negócio que não são de validação, crie exceções próprias herdando de `APIException`, com `status_code`, `default_detail` e `default_code`. Uma `ReservaExpirada` com status 409 e código `reserva_expirada`, levantada no serviço, chega ao cliente no mesmo formato sem nenhum `try` na view. Se o time preferir um padrão de mercado, o RFC 9457 (Problem Details, com `type`, `title`, `status` e `detail`) é uma alternativa ao formato próprio; o importante é escolher um e usá-lo em todos os erros.
+
+## Filtros com django-filter
+
+Filtrar é restringir o queryset com base nos parâmetros da URL. Dá para fazer à mão em `get_queryset`, lendo `self.request.query_params`, mas cada parâmetro vira um `if`, a conversão de tipos fica por sua conta e a documentação não sabe que o filtro existe. O django-filter declara os filtros e cuida disso:
+
+```bash
+pip install django-filter
+```
+
+```python
+# ingressos/settings.py
+INSTALLED_APPS = [
+    # ...
+    "rest_framework",
+    "django_filters",
+    "eventos",
+]
+```
+
+O jeito mais rápido é listar campos para comparação exata no viewset:
+
+```python
+from django_filters.rest_framework import DjangoFilterBackend
+
+class EventoViewSet(viewsets.ModelViewSet):
+    queryset = Evento.objects.order_by("data")
+    serializer_class = EventoSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ["local"]
+```
+
+Isso habilita `GET /api/eventos/?local=Arena Central`. Para intervalos, buscas parciais e filtros sobre relações, declare uma `FilterSet`:
+
+```python
+# eventos/filtros.py
+import django_filters
+
+from eventos.models import Evento
+
+
+class EventoFiltro(django_filters.FilterSet):
+    local = django_filters.CharFilter(lookup_expr="icontains")
+    data_inicio = django_filters.IsoDateTimeFilter(field_name="data", lookup_expr="gte")
+    data_fim = django_filters.IsoDateTimeFilter(field_name="data", lookup_expr="lte")
+    preco_max = django_filters.NumberFilter(field_name="setores__preco", lookup_expr="lte")
+    com_disponibilidade = django_filters.BooleanFilter(method="filtrar_disponibilidade")
+
+    class Meta:
+        model = Evento
+        fields = ["local", "data_inicio", "data_fim", "preco_max", "com_disponibilidade"]
+
+    def filtrar_disponibilidade(self, queryset, nome, valor):
+        if valor:
+            return queryset.filter(setores__quantidade_disponivel__gt=0).distinct()
+        return queryset
+```
+
+```python
+class EventoViewSet(viewsets.ModelViewSet):
+    queryset = Evento.objects.order_by("data")
+    serializer_class = EventoSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = EventoFiltro
+```
+
+`GET /api/eventos/?local=arena&data_inicio=2026-08-01T00:00:00Z&com_disponibilidade=true` agora funciona, e valor mal formado (uma data inválida) devolve 400 com o erro no campo, passando pelo seu handler. O `method=` aceita qualquer lógica que receba e devolva um queryset.
+
+O `.distinct()` não é enfeite. Filtros que atravessam uma relação de um para muitos (`setores__...`) fazem um JOIN, e um evento com três setores elegíveis apareceria três vezes. O mesmo vale para `preco_max`: se essa duplicação aparecer, aplique `distinct()` também, ou filtre com `Exists` numa subconsulta, que costuma ser mais eficiente em tabelas grandes.
+
+## Busca e ordenação
+
+Busca é um texto livre aplicado a vários campos; ordenação é escolher o critério de ordem. O DRF tem backends prontos para os dois, e eles combinam com o filtro:
+
+```python
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework import filters, viewsets
+
+from eventos.filtros import EventoFiltro
+from eventos.models import Evento
+from eventos.serializers import EventoSerializer
+
+
+class EventoViewSet(viewsets.ModelViewSet):
+    queryset = Evento.objects.all()
+    serializer_class = EventoSerializer
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = EventoFiltro
+    search_fields = ["nome", "local", "setores__nome"]
+    ordering_fields = ["data", "nome", "capacidade"]
+    ordering = ["data", "id"]
+```
+
+- `?search=rock arena` procura cada termo em qualquer dos `search_fields`, sem diferenciar maiúsculas (`icontains`). Prefixos mudam o tipo: `^nome` busca no início, `=nome` exige igualdade, `@nome` usa a busca textual do PostgreSQL, `$nome` usa expressão regular.
+- `?ordering=-data` ordena do mais recente para o mais antigo; `?ordering=nome,-capacidade` combina critérios.
+- `ordering` é a ordem padrão quando o cliente não pede nenhuma.
+
+Declare `ordering_fields` sempre. Sem ele, o padrão é permitir ordenar por qualquer campo legível do serializer, o que inclui campos sem índice: um cliente pede `?ordering=local` numa tabela de milhões de linhas e o banco faz uma ordenação completa a cada requisição. A lista de campos permitidos é uma decisão de desempenho.
+
+E inclua um desempate único na ordem padrão (o `"id"` em `["data", "id"]`). Vários eventos na mesma data, sem desempate, saem em ordem arbitrária, e a paginação pode repetir ou pular itens entre uma página e outra.
+
+<Callout type="tip" title="Busca com icontains não escala para sempre">
+`SearchFilter` com `icontains` vira `UPPER(nome) LIKE UPPER('%rock%')`, que não usa índice B-tree comum. Para alguns milhares de eventos, é rápido o suficiente. Para catálogos grandes, use a busca textual do PostgreSQL (prefixo `@` ou `SearchVector` com índice GIN) ou um índice de trigramas com a extensão `pg_trgm`. Meça com `EXPLAIN ANALYZE` antes de decidir.
+</Callout>
+
+## Paginação
+
+Paginar é devolver a coleção em pedaços. Além de proteger o servidor e o cliente, a paginação muda o contrato da resposta: o corpo deixa de ser uma lista e passa a ser um objeto com os resultados e os metadados de navegação. Configure desde a primeira versão; introduzir paginação depois quebra todo cliente existente.
+
+### Por número de página
+
+```python
+# ingressos/settings.py
+REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "EXCEPTION_HANDLER": "ingressos.erros.handler_de_erros",
+    "DEFAULT_FILTER_BACKENDS": ["django_filters.rest_framework.DjangoFilterBackend"],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+}
+```
+
+```json
+{
+  "count": 1843,
+  "next": "http://localhost:8000/api/eventos/?page=3",
+  "previous": "http://localhost:8000/api/eventos/?page=1",
+  "results": [{ "id": 41, "nome": "Festival de Inverno" }]
+}
+```
+
+Os links `next` e `previous` preservam os outros parâmetros (filtros, busca, ordenação), e o cliente não precisa montar URL. Para deixar o cliente escolher o tamanho com um teto, crie uma subclasse:
+
+```python
+# ingressos/paginacao.py
+from rest_framework.pagination import CursorPagination, PageNumberPagination
+
+
+class PaginacaoPadrao(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "tamanho"
+    max_page_size = 100
+
+
+class PaginacaoPorCursor(CursorPagination):
+    page_size = 50
+    ordering = ("-criado_em", "-id")
+```
+
+Sem `max_page_size`, `?tamanho=1000000` desfaz todo o propósito da paginação. Existe ainda a `LimitOffsetPagination` (`?limit=20&offset=40`), que é a mesma ideia com outra notação, comum em APIs que querem saltos arbitrários.
+
+### Por cursor
+
+A paginação por número de página tem dois problemas que aparecem com volume e com dados que mudam:
+
+- **Custo crescente.** `?page=500` vira `OFFSET 9980 LIMIT 20`: o banco lê e descarta quase dez mil linhas para devolver vinte. E o `count` exige um `SELECT COUNT(*)` a cada requisição, caro em tabelas grandes.
+- **Instabilidade.** Se um pedido novo entra enquanto o cliente está na página 2, todos os itens deslizam uma posição, e a página 3 repete o último item da página 2.
+
+A paginação por cursor resolve os dois. Em vez de "pule N linhas", o cliente envia um cursor opaco que codifica a posição do último item visto, e a consulta vira `WHERE (criado_em, id) < (valor_do_ultimo) ORDER BY criado_em DESC LIMIT 50`, que usa índice e custa o mesmo na primeira ou na milésima página.
+
+```python
+from rest_framework import viewsets
+
+from eventos.models import Pedido
+from ingressos.paginacao import PaginacaoPorCursor
+
+
+class PedidoViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Pedido.objects.all()
+    serializer_class = PedidoSerializer          # definido no capítulo de autenticação
+    pagination_class = PaginacaoPorCursor
+```
+
+```json
+{
+  "next": "http://localhost:8000/api/pedidos/?cursor=cD0yMDI2LTA5LTAx",
+  "previous": null,
+  "results": [{ "id": 912, "status": "pago" }]
+}
+```
+
+Não há `count` nem salto para uma página qualquer: só "próxima" e "anterior". A ordem precisa ser fixa e baseada em campos imutáveis e, idealmente, únicos (por isso o `-id` como desempate), com um índice composto que a cubra. O `CursorPagination` do DRF não permite que o cliente mude a ordenação, por padrão.
+
+| | Número de página / limit-offset | Cursor |
+|---|---|---|
+| Ir direto para a página 37 | Sim | Não |
+| Total de itens | Sim (`count`) | Não |
+| Custo em páginas profundas | Cresce com o deslocamento | Constante, com índice |
+| Inserções durante a navegação | Itens repetidos ou pulados | Estável |
+| Ordenação escolhida pelo cliente | Livre (com `OrderingFilter`) | Fixa |
+| Uso típico | Telas administrativas, catálogos pequenos e médios | Feeds, históricos, rolagem infinita, sincronização |
+
+Na plataforma, a listagem de eventos usa número de página (o catálogo é moderado e o usuário quer ver o total), e o histórico de pedidos e o painel de vendas usam cursor.
+
+## Na entrevista
+
+**Qual a diferença entre `validate_campo` e `validate` num serializer?** `validate_campo` recebe um único valor já convertido e serve para regras daquele campo, podendo normalizá-lo. `validate` recebe o dicionário de todos os valores e serve para regras que cruzam campos. Em atualização parcial, `validate` precisa buscar em `self.instance` o que não veio na requisição.
+
+**O `ModelSerializer` chama o `clean()` do model?** Não. Regras escritas apenas em `Model.clean()` não protegem a API. Coloco as invariantes simples como restrição no banco, que vale para qualquer caminho, e as regras de entrada da API no serializer.
+
+**Paginação por offset ou por cursor?** Offset permite saltar para qualquer página e mostrar o total, mas fica caro em páginas profundas e repete ou pula itens quando os dados mudam. Cursor tem custo constante e é estável, ao preço de não ter total nem salto. Uso offset em catálogos e telas administrativas e cursor em feeds e históricos grandes.
+
+**Por que limitar os campos de ordenação?** Porque ordenar por um campo sem índice numa tabela grande força uma ordenação completa a cada requisição. A lista de campos permitidos é uma decisão de desempenho e de contrato, e a ordem padrão precisa de um desempate único para a paginação ser estável.
+
+**Como você padroniza os erros de uma API DRF?** Com um `EXCEPTION_HANDLER` próprio que chama o padrão e reescreve o corpo num formato único, com um código estável para o cliente tratar e as mensagens por campo quando for validação. Erros de negócio viram subclasses de `APIException` com status e código próprios.
+
+## Pratique
+
+1. Adicione ao projeto as restrições `setor_preco_positivo` e `setor_nome_unico_por_evento`, gere a migração e confirme que um setor duplicado pela API devolve 400, não 500.
+2. Implemente a validação de capacidade no `SetorSerializer` e escreva testes para criação, atualização parcial que só muda o nome e atualização que estoura a capacidade.
+3. Crie o `handler_de_erros`, a exceção `ReservaExpirada` (409) e um teste que confere o formato do corpo para 400, 404 e 409.
+4. Implemente `EventoFiltro` com local, intervalo de datas, preço máximo e disponibilidade, mais busca e ordenação com lista de campos. Verifique com `?preco_max=` que nenhum evento aparece duplicado.
+5. Configure `PaginacaoPadrao` para eventos e `PaginacaoPorCursor` para o histórico de pedidos, crie o índice composto que a ordenação do cursor usa e compare com `EXPLAIN` a consulta da página 1 e da página 500 nas duas estratégias.
+
+<Quiz question="Num PATCH que envia apenas o nome do setor, o que o método validate recebe em attrs?" options={["Todos os campos do model, preenchidos com os valores atuais","Apenas os campos enviados na requisição, já validados","Os dados brutos da requisição, sem conversão","Nada, validate não é chamado em atualização parcial"]} answer={1} explanation="Em atualização parcial, attrs contém só o que foi enviado. Valores ausentes precisam ser buscados em self.instance." />
+
+<Quiz question="Um filtro por setores__preco retorna o mesmo evento várias vezes. Qual a causa?" options={["Falta de paginação","O SearchFilter está duplicando os resultados","O JOIN com a relação de um para muitos gera uma linha por setor que satisfaz o filtro","O django-filter não suporta relações"]} answer={2} explanation="Filtrar através de uma relação de um para muitos faz um JOIN. Use distinct() ou uma subconsulta com Exists." />
+
+<Quiz question="Qual é uma limitação da paginação por cursor em relação à paginação por número de página?" options={["Fica mais lenta em páginas profundas","Repete itens quando novos registros são inseridos","Não funciona com PostgreSQL","Não permite saltar para uma página arbitrária nem informa o total"]} answer={3} explanation="O cursor só navega para a próxima e a anterior e não calcula count. Em troca, tem custo constante e é estável com inserções." />
+
+## Base no CodeForge
+
+- [Django REST Framework: Construindo APIs RESTful](/learn/carreira-python/django-rest-framework-construindo-apis-restful): os serializers e viewsets que este capítulo estende.
+- [Ordenação e paginação](/learn/sql/ordenacao-e-paginacao): `OFFSET` e paginação por chave vistos no SQL.
+- [Índices](/learn/sql/indices) e [EXPLAIN](/learn/sql/explain): como confirmar que filtros, ordenação e cursor usam índice.
+- [Tipos e restrições](/learn/sql/tipos-e-restricoes) e [Locks no banco](/learn/sql/locks-no-banco): a validação que vale também sob concorrência.
+- [Django REST Framework: Trabalhando com autenticação, permissões e limites de requisição](/learn/carreira-python/django-rest-framework-autenticacao-permissoes-limites): o próximo passo da sequência.
+
+## Referências
+
+- [Django REST Framework: Validators](https://www.django-rest-framework.org/api-guide/validators/)
+- [Django REST Framework: Filtering](https://www.django-rest-framework.org/api-guide/filtering/)
+- [Django REST Framework: Pagination](https://www.django-rest-framework.org/api-guide/pagination/)
+- [django-filter: documentação](https://django-filter.readthedocs.io/en/stable/)

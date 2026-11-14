@@ -1,0 +1,582 @@
+---
+title: "Domain-Driven Design em Python: Da modelagem de domínio à implementação"
+kind: lesson
+---
+
+A plataforma de ingressos cresceu e as regras se espalharam: a checagem de capacidade está num serializer, a expiração da reserva num comando agendado, o cancelamento numa view, e parte da devolução de estoque num signal que ninguém lembra que existe. Cada mudança de regra exige caçar código em cinco lugares, e o time de produto fala em "lote", "reserva" e "cortesia" enquanto o código fala em `Item`, `status=3` e `flag_especial`. O sistema funciona, mas ninguém consegue apontar onde mora a regra de negócio.
+
+Domain-Driven Design (DDD) ataca esse problema em duas frentes. A estratégica decide onde ficam as fronteiras e qual vocabulário vale dentro de cada uma. A tática dá os blocos para escrever o modelo: entidades, objetos de valor, agregados, eventos, repositórios e serviços. Em Python isso se traduz em classes simples, sem herdar de framework nenhum, com o ORM empurrado para a borda. Este capítulo modela o contexto de pedidos do zero e mostra quando esse esforço compensa.
+
+**Você vai aprender:**
+
+- Extrair a linguagem ubíqua e dividir o sistema em contextos delimitados
+- Implementar objetos de valor com `dataclass(frozen=True)` e entidades com identidade
+- Desenhar agregados que protegem invariantes e publicam eventos de domínio
+- Isolar o domínio do ORM com repositórios, mapeadores e unit of work
+- Integrar contextos com mapa de contextos e camada anticorrupção
+
+## Linguagem ubíqua e contextos delimitados
+
+A linguagem ubíqua é o vocabulário combinado entre desenvolvedores e especialistas do negócio, usado nas conversas, nos documentos e no código, com o mesmo significado em todos. Se a bilheteria diz que "uma reserva expira", deve existir no código algo chamado `expirar`, e não um `UPDATE` que muda `status` para 4. O teste prático: leia o código em voz alta para alguém do negócio. Se a pessoa não reconhecer a regra, o modelo se afastou do domínio.
+
+Essa linguagem só é consistente dentro de uma fronteira. "Ingresso" significa coisas diferentes para cada área:
+
+| Contexto | O que é um ingresso ali | O que importa |
+|---|---|---|
+| Catálogo | Uma vaga à venda num setor | Preço, lote, quantidade disponível |
+| Pedidos | Um item comprado por um cliente | Quantidade, preço congelado, estado do pedido |
+| Controle de acesso | Um código que abre a catraca uma vez | Validade, já utilizado ou não |
+| Financeiro | Uma linha de receita com taxa e repasse | Valor líquido, data de liquidação |
+
+Tentar uma classe `Ingresso` única que sirva a todos produz um modelo inchado, cheio de campos opcionais. Um **contexto delimitado** (bounded context) é a fronteira dentro da qual um modelo e sua linguagem valem sem ambiguidade. Cada contexto tem o seu modelo, e eles se referenciam por identificador, não por objeto compartilhado.
+
+Nem todo contexto merece o mesmo investimento. O **domínio principal** é o que diferencia o negócio (aqui, venda e reserva sob alta concorrência); os de **suporte** são necessários, mas não diferenciam (catálogo, notificações); os **genéricos** se compram prontos (pagamento, e-mail). O modelo rico deste capítulo vale para o domínio principal. Cadastro simples continua bem servido por um CRUD com Django Admin.
+
+## Objetos de valor
+
+Um objeto de valor é definido pelos seus atributos, não tem identidade e é imutável. Dois valores de R$ 150,00 são o mesmo valor. Em Python, `dataclass(frozen=True)` entrega igualdade por conteúdo, hash e imutabilidade, e o `__post_init__` é o lugar da validação: um valor inválido nunca chega a existir.
+
+```python
+# ingressos/pedidos/dominio/valores.py
+from dataclasses import dataclass
+from decimal import Decimal
+from uuid import UUID
+
+
+@dataclass(frozen=True, slots=True)
+class Dinheiro:
+    centavos: int
+    moeda: str = "BRL"
+
+    def __post_init__(self) -> None:
+        if self.centavos < 0:
+            raise ValueError("Valor monetario nao pode ser negativo")
+
+    @classmethod
+    def de_reais(cls, valor: str) -> "Dinheiro":
+        return cls(int(Decimal(valor) * 100))
+
+    def __add__(self, outro: "Dinheiro") -> "Dinheiro":
+        if outro.moeda != self.moeda:
+            raise ValueError("Moedas diferentes")
+        return Dinheiro(self.centavos + outro.centavos, self.moeda)
+
+    def vezes(self, quantidade: int) -> "Dinheiro":
+        return Dinheiro(self.centavos * quantidade, self.moeda)
+
+
+@dataclass(frozen=True, slots=True)
+class ItemPedido:
+    setor_id: UUID
+    quantidade: int
+    preco_unitario: Dinheiro
+
+    def __post_init__(self) -> None:
+        if self.quantidade <= 0:
+            raise ValueError("Quantidade deve ser positiva")
+
+    @property
+    def subtotal(self) -> Dinheiro:
+        return self.preco_unitario.vezes(self.quantidade)
+```
+
+O ganho sobre usar `int` e `str` soltos (o cheiro conhecido como obsessão por primitivos) é concreto: é impossível somar reais com dólares, passar preço no lugar de quantidade ou guardar valor negativo, e a regra de arredondamento fica num lugar só. Dinheiro em centavos inteiros evita os erros de ponto flutuante. Outros candidatos no projeto: `Email`, `Cpf`, `CodigoIngresso`, `Periodo`.
+
+## Entidades, agregados e invariantes
+
+Uma **entidade** tem identidade que persiste enquanto os atributos mudam: o pedido 1041 continua sendo o mesmo depois de pago. Um **agregado** é um grupo de entidades e valores tratado como unidade de consistência, com uma entidade raiz que é a única porta de entrada. Quem está fora só guarda referência à raiz e só altera o agregado pelos métodos dela. As **invariantes** são as regras que precisam valer sempre que uma operação termina.
+
+```python
+# ingressos/pedidos/dominio/pedido.py
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import StrEnum
+from uuid import UUID, uuid4
+
+from ingressos.pedidos.dominio.eventos import (
+    EventoDeDominio,
+    PedidoCancelado,
+    PedidoCriado,
+    PedidoPago,
+)
+from ingressos.pedidos.dominio.valores import Dinheiro, ItemPedido
+
+PRAZO_DA_RESERVA = timedelta(minutes=15)
+LIMITE_POR_PEDIDO = 6
+
+
+class RegraDeNegocioViolada(Exception):
+    pass
+
+
+class StatusPedido(StrEnum):
+    PENDENTE = "pendente"
+    PAGO = "pago"
+    CANCELADO = "cancelado"
+    EXPIRADO = "expirado"
+
+
+@dataclass(eq=False)
+class Pedido:
+    id: UUID
+    cliente_id: UUID
+    itens: tuple[ItemPedido, ...]
+    criado_em: datetime
+    status: StatusPedido = StatusPedido.PENDENTE
+    versao: int = 0
+    eventos: list[EventoDeDominio] = field(default_factory=list)
+
+    @classmethod
+    def criar(cls, cliente_id: UUID, itens: list[ItemPedido], agora: datetime) -> "Pedido":
+        if not itens:
+            raise RegraDeNegocioViolada("Pedido precisa de ao menos um item")
+        if sum(item.quantidade for item in itens) > LIMITE_POR_PEDIDO:
+            raise RegraDeNegocioViolada("Limite de ingressos por pedido excedido")
+        pedido = cls(id=uuid4(), cliente_id=cliente_id, itens=tuple(itens), criado_em=agora)
+        pedido.eventos.append(PedidoCriado(pedido.id, cliente_id, agora))
+        return pedido
+
+    @property
+    def total(self) -> Dinheiro:
+        total = Dinheiro(0)
+        for item in self.itens:
+            total = total + item.subtotal
+        return total
+
+    @property
+    def expira_em(self) -> datetime:
+        return self.criado_em + PRAZO_DA_RESERVA
+
+    def confirmar_pagamento(self, valor_pago: Dinheiro, agora: datetime) -> None:
+        if self.status is not StatusPedido.PENDENTE:
+            raise RegraDeNegocioViolada(f"Pedido {self.status} nao pode ser pago")
+        if agora > self.expira_em:
+            raise RegraDeNegocioViolada("Reserva expirada")
+        if valor_pago != self.total:
+            raise RegraDeNegocioViolada("Valor pago difere do total do pedido")
+        self.status = StatusPedido.PAGO
+        self.eventos.append(PedidoPago(self.id, self.total.centavos, agora))
+
+    def cancelar(self, agora: datetime) -> None:
+        if self.status is StatusPedido.PAGO:
+            raise RegraDeNegocioViolada("Pedido pago exige estorno, nao cancelamento")
+        if self.status is not StatusPedido.PENDENTE:
+            return
+        self.status = StatusPedido.CANCELADO
+        self.eventos.append(PedidoCancelado(self.id, self.itens, agora))
+
+    def __eq__(self, outro: object) -> bool:
+        return isinstance(outro, Pedido) and outro.id == self.id
+
+    def __hash__(self) -> int:
+        return hash(self.id)
+```
+
+Pontos de desenho que valem para qualquer agregado:
+
+- **Comportamento em vez de setters.** Não existe `pedido.status = "pago"` espalhado pelo sistema; existe `confirmar_pagamento`, que carrega todas as pré-condições. As transições de estado ficam legíveis num arquivo só.
+- **Igualdade por identidade.** `eq=False` com `__eq__` próprio: duas instâncias com o mesmo `id` são o mesmo pedido, ainda que os atributos difiram.
+- **O relógio entra por parâmetro.** `agora` é argumento, não `datetime.now()` escondido, o que deixa os testes determinísticos.
+- **Referência a outros agregados por id.** O pedido guarda `cliente_id` e `setor_id`, nunca o objeto `Cliente` ou `Setor`.
+- **Agregados pequenos.** A regra prática é uma transação alterar um agregado. O que precisa ser consistente no mesmo instante fica dentro; o resto se resolve com eventos e consistência eventual.
+
+A última regra orienta a pergunta mais difícil: onde mora "não vender acima da capacidade"? Colocar todos os pedidos dentro de um agregado `Evento` criaria um objeto gigante e um gargalo de concorrência. A saída é outro agregado, `EstoqueDoSetor`, dono da contagem:
+
+```python
+# continua em ingressos/pedidos/dominio/pedido.py
+@dataclass(eq=False)
+class EstoqueDoSetor:
+    setor_id: UUID
+    capacidade: int
+    reservados: int = 0
+    versao: int = 0
+
+    @property
+    def quantidade_disponivel(self) -> int:
+        return self.capacidade - self.reservados
+
+    def reservar(self, quantidade: int) -> None:
+        if quantidade > self.quantidade_disponivel:
+            raise RegraDeNegocioViolada("Setor esgotado")
+        self.reservados += quantidade
+
+    def liberar(self, quantidade: int) -> None:
+        self.reservados = max(0, self.reservados - quantidade)
+```
+
+A invariante `reservados <= capacidade` é garantida pelo agregado e, sob concorrência, pelo campo `versao` (bloqueio otimista): o repositório grava com `WHERE versao = :versao_lida` e, se nenhuma linha for afetada, outra transação chegou antes e a operação é repetida.
+
+<Callout type="warning" title="Modelo anêmico não é DDD">
+Classes só com atributos e toda a lógica em funções `service` que fazem `if pedido.status == ...` formam um modelo anêmico: o estado fica exposto e qualquer código pode deixá-lo inválido. Isso é aceitável num CRUD. Num domínio com regras, a regra pertence ao objeto que tem os dados para decidi-la.
+</Callout>
+
+## Eventos de domínio
+
+Um evento de domínio registra um fato que já aconteceu e que interessa ao negócio. O nome vai no particípio (`PedidoPago`, nunca `PagarPedido`), o conteúdo é imutável e carrega só o necessário para quem reage.
+
+```python
+# ingressos/pedidos/dominio/eventos.py
+from dataclasses import dataclass
+from datetime import datetime
+from uuid import UUID
+
+from ingressos.pedidos.dominio.valores import ItemPedido
+
+
+@dataclass(frozen=True)
+class EventoDeDominio:
+    pass
+
+
+@dataclass(frozen=True)
+class PedidoCriado(EventoDeDominio):
+    pedido_id: UUID
+    cliente_id: UUID
+    ocorrido_em: datetime
+
+
+@dataclass(frozen=True)
+class PedidoPago(EventoDeDominio):
+    pedido_id: UUID
+    total_centavos: int
+    ocorrido_em: datetime
+
+
+@dataclass(frozen=True)
+class PedidoCancelado(EventoDeDominio):
+    pedido_id: UUID
+    itens: tuple[ItemPedido, ...]
+    ocorrido_em: datetime
+```
+
+O agregado apenas acumula os eventos na lista `eventos`. Quem os despacha é a camada de aplicação, depois de persistir. Assim o `Pedido` não precisa saber que pagar gera ingressos, envia e-mail e alimenta um relatório: cada reação é um manipulador separado, e acrescentar uma nova não toca no agregado.
+
+Vale distinguir dois níveis. O evento de domínio circula dentro do contexto, em memória. O **evento de integração** é a versão publicada para outros contextos por um broker, com contrato estável e versionado. O segundo costuma ser derivado do primeiro e gravado numa tabela de outbox na mesma transação, tema do capítulo de padrões de integração.
+
+## Repositórios e o domínio separado do ORM
+
+O repositório dá ao domínio a ilusão de uma coleção em memória de agregados: buscar por id, adicionar, e nada de SQL. Há um repositório por agregado, e a interface pertence ao domínio:
+
+```python
+# ingressos/pedidos/dominio/repositorios.py
+from typing import Protocol
+from uuid import UUID
+
+from ingressos.pedidos.dominio.pedido import EstoqueDoSetor, Pedido
+
+
+class RepositorioDePedidos(Protocol):
+    def adicionar(self, pedido: Pedido) -> None: ...
+    def obter(self, pedido_id: UUID) -> Pedido | None: ...
+
+
+class RepositorioDeEstoque(Protocol):
+    def obter(self, setor_id: UUID) -> EstoqueDoSetor | None: ...
+```
+
+A implementação fica na infraestrutura. O modelo do ORM é outra classe, com formato de tabela, e o repositório traduz de um para o outro:
+
+```python
+# ingressos/pedidos/infra/orm.py
+from datetime import datetime
+from uuid import UUID
+
+from sqlalchemy import ForeignKey
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class PedidoModel(Base):
+    __tablename__ = "pedidos"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    cliente_id: Mapped[UUID]
+    status: Mapped[str]
+    criado_em: Mapped[datetime]
+    versao: Mapped[int] = mapped_column(default=0)
+    itens: Mapped[list["ItemPedidoModel"]] = relationship(cascade="all, delete-orphan")
+
+
+class ItemPedidoModel(Base):
+    __tablename__ = "itens_pedido"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    pedido_id: Mapped[UUID] = mapped_column(ForeignKey("pedidos.id"))
+    setor_id: Mapped[UUID]
+    quantidade: Mapped[int]
+    preco_centavos: Mapped[int]
+```
+
+```python
+# ingressos/pedidos/infra/repositorios.py
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from ingressos.pedidos.dominio.pedido import Pedido, StatusPedido
+from ingressos.pedidos.dominio.valores import Dinheiro, ItemPedido
+from ingressos.pedidos.infra.orm import ItemPedidoModel, PedidoModel
+
+
+class RepositorioDePedidosSql:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self.vistos: set[Pedido] = set()
+
+    def adicionar(self, pedido: Pedido) -> None:
+        self.session.add(
+            PedidoModel(
+                id=pedido.id,
+                cliente_id=pedido.cliente_id,
+                status=pedido.status.value,
+                criado_em=pedido.criado_em,
+                itens=[
+                    ItemPedidoModel(
+                        setor_id=item.setor_id,
+                        quantidade=item.quantidade,
+                        preco_centavos=item.preco_unitario.centavos,
+                    )
+                    for item in pedido.itens
+                ],
+            )
+        )
+        self.vistos.add(pedido)
+
+    def obter(self, pedido_id: UUID) -> Pedido | None:
+        modelo = self.session.get(PedidoModel, pedido_id)
+        if modelo is None:
+            return None
+        pedido = Pedido(
+            id=modelo.id,
+            cliente_id=modelo.cliente_id,
+            itens=tuple(
+                ItemPedido(i.setor_id, i.quantidade, Dinheiro(i.preco_centavos))
+                for i in modelo.itens
+            ),
+            criado_em=modelo.criado_em,
+            status=StatusPedido(modelo.status),
+            versao=modelo.versao,
+        )
+        self.vistos.add(pedido)
+        return pedido
+
+    def sincronizar(self) -> None:
+        for pedido in self.vistos:
+            modelo = self.session.get(PedidoModel, pedido.id)
+            if modelo is not None:
+                modelo.status = pedido.status.value
+```
+
+O `sincronizar` copia de volta para os modelos do ORM as mudanças feitas nos agregados carregados, e é chamado pelo unit of work antes do commit. A versão completa também compara e incrementa `versao`. O custo dessa separação é o código de mapeamento; o ganho é um domínio que roda em teste sem banco e que não muda quando a tabela muda. O SQLAlchemy oferece um atalho, o mapeamento imperativo (`registry.map_imperatively`), que mapeia a própria classe de domínio para a tabela sem que ela herde de nada. Com o ORM do Django, que segue o padrão Active Record, a separação é sempre manual, e muitos times adotam um meio-termo: o model do Django é a entidade, as regras ficam em métodos dele, e views e serializers nunca alteram campos diretamente. Para consultas de tela (listagens, relatórios), não passe pelo agregado: leia direto do banco para um DTO.
+
+## Serviços de aplicação, serviços de domínio e unit of work
+
+Dois tipos de serviço costumam ser confundidos:
+
+| | Serviço de domínio | Serviço de aplicação (caso de uso) |
+|---|---|---|
+| Contém | Regra de negócio que não cabe num único agregado | Orquestração: carregar, chamar o domínio, salvar |
+| Conhece | Só objetos de domínio | Repositórios, transação, despacho de eventos |
+| Exemplo | Política de preço que combina lote, cupom e meia-entrada | `CriarPedido`, `ConfirmarPagamento` |
+| Regra de negócio | Sim | Não: se tem `if` de negócio aqui, ele deveria estar no domínio |
+
+O **unit of work** representa a transação do caso de uso: reúne os repositórios, confirma tudo junto ou desfaz tudo, e entrega os eventos coletados.
+
+```python
+# ingressos/pedidos/aplicacao/uow.py
+from collections.abc import Callable
+
+from sqlalchemy.orm import Session
+
+from ingressos.pedidos.dominio.eventos import EventoDeDominio
+from ingressos.pedidos.infra.repositorios import (
+    RepositorioDeEstoqueSql,
+    RepositorioDePedidosSql,
+)
+
+
+class UnidadeDeTrabalho:
+    def __init__(self, fabrica_de_sessao: Callable[[], Session]) -> None:
+        self.fabrica_de_sessao = fabrica_de_sessao
+
+    def __enter__(self) -> "UnidadeDeTrabalho":
+        self.session = self.fabrica_de_sessao()
+        self.pedidos = RepositorioDePedidosSql(self.session)
+        self.estoque = RepositorioDeEstoqueSql(self.session)
+        return self
+
+    def __exit__(self, tipo_exc, exc, tb) -> None:
+        if tipo_exc is not None:
+            self.session.rollback()
+        self.session.close()
+
+    def commit(self) -> None:
+        self.pedidos.sincronizar()
+        self.estoque.sincronizar()
+        self.session.commit()
+
+    def coletar_eventos(self) -> list[EventoDeDominio]:
+        eventos: list[EventoDeDominio] = []
+        for pedido in self.pedidos.vistos:
+            eventos.extend(pedido.eventos)
+            pedido.eventos.clear()
+        return eventos
+```
+
+`RepositorioDeEstoqueSql` segue o mesmo molde do repositório de pedidos. O caso de uso fica curto e sem regra de negócio:
+
+```python
+# ingressos/pedidos/aplicacao/criar_pedido.py
+from dataclasses import dataclass
+from datetime import datetime
+from uuid import UUID
+
+from ingressos.pedidos.aplicacao.barramento import despachar
+from ingressos.pedidos.aplicacao.uow import UnidadeDeTrabalho
+from ingressos.pedidos.dominio.pedido import Pedido, RegraDeNegocioViolada
+from ingressos.pedidos.dominio.valores import Dinheiro, ItemPedido
+
+
+@dataclass(frozen=True)
+class ComandoCriarPedido:
+    cliente_id: UUID
+    setor_id: UUID
+    quantidade: int
+    preco_centavos: int
+
+
+def criar_pedido(comando: ComandoCriarPedido, uow: UnidadeDeTrabalho, agora: datetime) -> UUID:
+    with uow:
+        estoque = uow.estoque.obter(comando.setor_id)
+        if estoque is None:
+            raise RegraDeNegocioViolada("Setor inexistente")
+        estoque.reservar(comando.quantidade)
+        item = ItemPedido(comando.setor_id, comando.quantidade, Dinheiro(comando.preco_centavos))
+        pedido = Pedido.criar(comando.cliente_id, [item], agora)
+        uow.pedidos.adicionar(pedido)
+        uow.commit()
+        eventos = uow.coletar_eventos()
+    for evento in eventos:
+        despachar(evento)
+    return pedido.id
+```
+
+Aqui a regra de "um agregado por transação" foi relaxada de propósito: reservar estoque e criar o pedido acontecem juntos porque vender acima da capacidade é inaceitável e os dois agregados vivem no mesmo banco. É uma decisão consciente, registrada, e não um acidente. `despachar` é a função do barramento de eventos (um dicionário que associa cada tipo de evento a uma lista de manipuladores) e entrega cada evento a quem se registrou: gerar ingressos, notificar o cliente. A rota do FastAPI ou a view do DRF só converte a requisição em `ComandoCriarPedido`, chama a função e traduz `RegraDeNegocioViolada` em 409 ou 422.
+
+O teste do domínio não precisa de banco, de framework nem de mock:
+
+```python
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+
+from ingressos.pedidos.dominio.pedido import Pedido, RegraDeNegocioViolada
+from ingressos.pedidos.dominio.valores import Dinheiro, ItemPedido
+
+
+def test_reserva_expirada_nao_pode_ser_paga():
+    criado = datetime(2026, 3, 1, 20, 0, tzinfo=UTC)
+    item = ItemPedido(uuid4(), 2, Dinheiro.de_reais("150.00"))
+    pedido = Pedido.criar(uuid4(), [item], criado)
+
+    with pytest.raises(RegraDeNegocioViolada):
+        pedido.confirmar_pagamento(pedido.total, criado + timedelta(minutes=16))
+```
+
+## Mapa de contextos e camada anticorrupção
+
+O mapa de contextos documenta como os contextos se relacionam e quem depende de quem:
+
+| Relação | Significado | Exemplo no projeto |
+|---|---|---|
+| Cliente e fornecedor | O contexto a jusante depende do a montante, que considera as necessidades dele | `pedidos` consome preços do `catalogo` |
+| Conformista | O consumidor aceita o modelo do fornecedor como está | `notificacoes` usa os eventos de `pedidos` sem traduzir |
+| Camada anticorrupção | O consumidor traduz o modelo externo para o seu | `pedidos` diante do gateway de pagamento |
+| Linguagem publicada | Contrato público e documentado | Eventos de integração versionados, OpenAPI |
+| Núcleo compartilhado | Pequeno modelo mantido em conjunto | Biblioteca interna com `Dinheiro` |
+
+A **camada anticorrupção** (ACL) impede que o vocabulário de um sistema externo vaze para o domínio. O gateway responde com `transaction_status`, `amount` em texto e códigos próprios; o domínio só quer saber se foi aprovado e quanto.
+
+```python
+# ingressos/pedidos/infra/gateway_pagamento.py
+from dataclasses import dataclass
+from decimal import Decimal
+from uuid import UUID
+
+import httpx
+
+from ingressos.pedidos.dominio.valores import Dinheiro
+
+
+@dataclass(frozen=True)
+class ResultadoDoPagamento:
+    aprovado: bool
+    valor: Dinheiro
+    referencia_externa: str
+
+
+class GatewayDePagamentoHttp:
+    def __init__(self, cliente: httpx.Client) -> None:
+        self.cliente = cliente
+
+    def consultar(self, pedido_id: UUID) -> ResultadoDoPagamento:
+        resposta = self.cliente.get(f"/v2/charges/{pedido_id}", timeout=3.0)
+        resposta.raise_for_status()
+        dados = resposta.json()
+        return ResultadoDoPagamento(
+            aprovado=dados["transaction_status"] in {"CAPTURED", "SETTLED"},
+            valor=Dinheiro(int(Decimal(dados["amount"]) * 100)),
+            referencia_externa=dados["id"],
+        )
+```
+
+Se o fornecedor mudar o formato, ou se a empresa trocar de gateway, a alteração fica nesse arquivo. O domínio declara a interface de que precisa (um `Protocol` com `consultar`) e a infraestrutura a implementa, a mesma inversão de dependência da arquitetura hexagonal.
+
+<Callout type="tip" title="Estrutura de pastas que conta a história">
+Organize por contexto e, dentro dele, por camada: `ingressos/pedidos/dominio`, `ingressos/pedidos/aplicacao`, `ingressos/pedidos/infra`. A regra de dependência aponta para dentro: `dominio` não importa nada de `aplicacao`, de `infra`, do Django, do FastAPI nem do SQLAlchemy. Um teste que procura esses imports proibidos mantém a fronteira de pé.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre entidade e objeto de valor?** A entidade tem identidade própria e ciclo de vida: continua a mesma quando os atributos mudam e é comparada pelo id. O objeto de valor é imutável e comparado pelos atributos; para "alterá-lo", cria-se outro. `Pedido` é entidade, `Dinheiro` é valor.
+
+**O que é um agregado e como você define o tamanho dele?** É um conjunto de objetos alterado como uma unidade, com uma raiz que protege as invariantes. Entra no agregado só o que precisa estar consistente na mesma transação. Agregado grande gera contenção e carga desnecessária, então referencio outros agregados por id e uso eventos para o que pode ser eventual.
+
+**Por que separar o modelo de domínio do ORM?** Para que as regras sejam testáveis sem banco e não fiquem moldadas pelo formato das tabelas. O custo é o mapeamento. Em domínio simples não compensa, e usar o model do ORM como entidade é uma escolha legítima.
+
+**Serviço de domínio ou de aplicação?** O de domínio contém regra de negócio que envolve mais de um agregado e só conhece objetos de domínio. O de aplicação orquestra um caso de uso: abre a transação, carrega agregados, chama o domínio, salva e despacha eventos, sem decidir nada de negócio.
+
+**Quando não usar DDD tático?** Em CRUDs, protótipos e contextos de suporte ou genéricos, onde não há regra complexa para proteger. A parte estratégica (linguagem e fronteiras) vale quase sempre; os blocos táticos, só onde a complexidade do domínio justifica.
+
+## Pratique
+
+1. Faça uma sessão de vocabulário para o projeto: liste dez termos do negócio (reserva, lote, cortesia, estorno), defina cada um em uma frase e renomeie no código o que estiver divergente.
+2. Implemente `Dinheiro`, `ItemPedido` e `Pedido` como acima e cubra com pytest todas as transições de estado, incluindo as proibidas, sem tocar em banco.
+3. Escreva `EstoqueDoSetor` com bloqueio otimista por `versao` e um teste que simula duas reservas concorrentes da última vaga: só uma pode passar.
+4. Crie o repositório SQLAlchemy, o unit of work e o caso de uso `confirmar_pagamento`, com um manipulador de `PedidoPago` que gera os ingressos.
+5. Isole o gateway de pagamento atrás de uma camada anticorrupção e teste o caso de uso com uma implementação falsa em memória.
+
+<Quiz question="Qual característica define um objeto de valor?" options={["Tem um id gerado pelo banco","Pode ser alterado por setters","É imutável e comparado pelos atributos","Sempre é persistido em tabela própria"]} answer={2} explanation="Objetos de valor não têm identidade: dois com os mesmos atributos são intercambiáveis. Por isso são imutáveis, e a dataclass frozen dá igualdade e hash por conteúdo." />
+
+<Quiz question="Num agregado Pedido, como código externo deve mudar o status para pago?" options={["Chamando um método da raiz, como confirmar_pagamento","Atribuindo o campo status diretamente","Executando um UPDATE pelo repositório","Alterando o model do ORM na view"]} answer={0} explanation="A raiz do agregado é a única porta de entrada e concentra as pré-condições. Alterar o estado por fora permite deixar o agregado inválido." />
+
+<Quiz question="Para que serve uma camada anticorrupção?" options={["Validar a entrada do usuário nos formulários","Criptografar a comunicação entre contextos","Impedir acesso não autorizado aos repositórios","Traduzir o modelo de um sistema externo para o modelo do seu contexto"]} answer={3} explanation="A ACL isola o domínio do vocabulário e dos formatos de outro sistema. Mudanças no fornecedor ficam contidas no adaptador que faz a tradução." />
+
+## Base no CodeForge
+
+- [Python: Fundamentos e Padrões de Arquitetura de Software](/learn/carreira-python/python-fundamentos-padroes-arquitetura-software): as camadas e a inversão de dependência que o DDD pressupõe.
+- [Repository](/learn/lld/repository) e [Arquitetura hexagonal](/learn/system-design/hexagonal): os padrões de borda usados aqui.
+- [Identificar entidades](/learn/lld/identificar-entidades) e [Máquina de estados](/learn/lld/maquina-de-estados): técnicas de modelagem que ajudam a desenhar agregados.
+- [Event-driven](/learn/system-design/event-driven) e [Outbox](/learn/system-design/outbox): para onde vão os eventos depois do commit.
+- [Padrões de Integração em Sistemas Distribuídos](/learn/carreira-python/padroes-integracao-sistemas-distribuidos): a continuação, com a comunicação entre contextos.
+
+## Referências
+
+- [Python: dataclasses](https://docs.python.org/3/library/dataclasses.html)
+- [SQLAlchemy 2.0: ORM Mapped Class Overview](https://docs.sqlalchemy.org/en/20/orm/mapping_styles.html)
+- [Martin Fowler: Bounded Context](https://martinfowler.com/bliki/BoundedContext.html)
+- [Domain-Driven Design Reference, de Eric Evans](https://www.domainlanguage.com/ddd/reference/)

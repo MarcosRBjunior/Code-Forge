@@ -1,0 +1,309 @@
+---
+title: "Mensageria com Python e Kafka: Integração assíncrona em larga escala"
+kind: lesson
+---
+
+O RabbitMQ resolve bem a entrega de tarefas e eventos entre os serviços da plataforma de ingressos. Mas surgem pedidos de outra natureza: o time de dados quer reprocessar todos os pedidos dos últimos sete dias para recalcular uma métrica, o antifraude quer ler o fluxo de compras em tempo real sem atrapalhar ninguém, e na abertura das vendas do maior festival do ano o volume chega a dezenas de milhares de eventos por segundo. Uma fila apaga a mensagem depois do ack; para esses casos você precisa de um registro que fique guardado, que vários leitores percorram cada um no seu ritmo, e que escale dividindo o trabalho entre máquinas.
+
+O Apache Kafka é esse registro: um log distribuído, particionado e replicado. Este capítulo explica o modelo (tópicos, partições, offsets, grupos de consumidores), as decisões que determinam ordenação e durabilidade (chave, réplicas, `acks`), e a parte em que os sistemas costumam errar (produtor idempotente, commit manual, rebalanceamento, esquemas), com o cliente `confluent-kafka` e o Kafka em modo KRaft, sem ZooKeeper.
+
+**Você vai aprender:**
+
+- Explicar o modelo de log do Kafka: tópicos, partições, offsets e retenção
+- Escolher a chave de partição para garantir ordenação onde ela importa
+- Configurar produtores duráveis e idempotentes com replicação e `acks`
+- Consumir em grupo com commit manual e lidar com rebalanceamento
+- Comparar Kafka e RabbitMQ e explicar o exactly-once e seus limites
+
+## O log distribuído
+
+Um **tópico** é um log de eventos com nome, como `pedidos.eventos`. Log, aqui, significa uma sequência só de acréscimo: eventos novos entram no fim, nada é alterado, e cada evento ganha um número sequencial, o **offset**. Ler não apaga: o evento fica lá até a política de retenção removê-lo, e qualquer consumidor pode voltar e reler.
+
+Para escalar, cada tópico é dividido em **partições**. Cada partição é um log independente, com seus próprios offsets, e pode ficar num **broker** (servidor) diferente. A ordem é garantida dentro de uma partição e não existe entre partições.
+
+```text
+topico pedidos.eventos (3 particoes)
+
+particao 0: [0 criado p41] [1 pago p41] [2 criado p77] [3 cancelado p77] ...
+particao 1: [0 criado p12] [1 criado p90] [2 pago p12] ...
+particao 2: [0 criado p55] [1 pago p55] ...
+```
+
+O consumidor não recebe mensagens empurradas: ele pede ("me dê o que houver depois do offset 2 da partição 1") e anota até onde leu. Esse modelo tem consequências que mudam o desenho do sistema:
+
+- **Reprocessar é natural.** Um consumidor novo pode começar do início do tópico; um com bug corrigido pode voltar o offset e refazer.
+- **Leitores não competem pelos mesmos dados.** O antifraude e o relatório financeiro leem o mesmo tópico, cada um com seu progresso, sem cópias por fila.
+- **O broker é simples e rápido.** Ele não rastreia mensagem por mensagem, só grava sequencialmente em disco e serve leituras, o que dá vazão muito alta.
+
+## Subindo o Kafka em modo KRaft
+
+Até a versão 3, o Kafka dependia do ZooKeeper para guardar metadados e eleger o controlador. O modo **KRaft** move essa responsabilidade para dentro do próprio Kafka, com um quórum de controladores que usa um protocolo derivado do Raft. A partir do Kafka 4.0, o ZooKeeper foi removido e KRaft é o único modo. Para desenvolvimento, um nó que acumula os papéis de broker e controlador basta:
+
+```yaml
+# compose.yaml
+services:
+  kafka:
+    image: apache/kafka:4.1.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+```
+
+```bash
+docker compose up -d
+pip install confluent-kafka
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic pedidos.eventos --partitions 6 --replication-factor 1
+```
+
+O `KAFKA_ADVERTISED_LISTENERS` é o endereço que o broker informa aos clientes; se ele apontar para um nome que o cliente não resolve, a conexão inicial funciona e as seguintes falham, o erro de configuração mais comum. Os fatores de replicação 1 servem só para um nó local; em produção, três brokers e fator 3.
+
+## Chave, partição e ordenação
+
+Ao produzir, você escolhe uma **chave**. O particionador padrão aplica um hash à chave e escolhe a partição: mesma chave, mesma partição, portanto mesma ordem. Sem chave, os eventos são espalhados entre as partições para equilibrar a carga, e a ordem relativa se perde.
+
+Para pedidos, a chave natural é o `pedido_id`: os eventos `criado`, `pago` e `cancelado` do mesmo pedido chegam em ordem ao consumidor, enquanto pedidos diferentes são processados em paralelo. A escolha da chave é a decisão mais importante do tópico:
+
+| Chave | Ordenação garantida | Risco |
+|---|---|---|
+| `pedido_id` | Por pedido | Nenhum relevante, distribuição boa |
+| `evento_id` (o show) | Por show, útil para estoque | Partição quente: o show mais vendido concentra a carga |
+| `cliente_id` | Por cliente | Distribuição razoável |
+| Nenhuma | Nenhuma | Ideal só para eventos independentes, como logs |
+
+Duas armadilhas. Primeira: o número de partições define o paralelismo máximo de um grupo de consumidores, e **aumentar partições muda o mapeamento** chave para partição, quebrando a ordenação das chaves existentes durante a transição. Planeje com folga desde o início (seis, doze ou mais partições, conforme o volume esperado). Segunda: chaves muito desiguais criam partições quentes, e uma partição só é lida por um consumidor do grupo.
+
+## Produtor durável e idempotente
+
+```python
+# ingressos/mensageria/kafka_produtor.py
+import json
+import logging
+import uuid
+from datetime import UTC, datetime
+
+from confluent_kafka import KafkaError, Message, Producer
+
+logger = logging.getLogger("ingressos.kafka")
+
+produtor = Producer(
+    {
+        "bootstrap.servers": "localhost:9092",
+        "client.id": "pedidos",
+        "acks": "all",
+        "enable.idempotence": True,
+        "compression.type": "zstd",
+        "linger.ms": 5,
+    }
+)
+
+
+def ao_entregar(erro: KafkaError | None, mensagem: Message) -> None:
+    if erro is not None:
+        logger.error("falha_ao_publicar", extra={"campos": {"erro": str(erro)}})
+    else:
+        logger.debug(
+            "publicado",
+            extra={"campos": {"particao": mensagem.partition(), "offset": mensagem.offset()}},
+        )
+
+
+def publicar_evento(tipo: str, pedido_id: int, dados: dict) -> None:
+    evento = {
+        "id": str(uuid.uuid4()),
+        "tipo": tipo,
+        "ocorrido_em": datetime.now(UTC).isoformat(),
+        "dados": {"pedido_id": pedido_id, **dados},
+    }
+    produtor.produce(
+        topic="pedidos.eventos",
+        key=str(pedido_id),
+        value=json.dumps(evento).encode(),
+        headers={"tipo": tipo},
+        on_delivery=ao_entregar,
+    )
+    produtor.poll(0)
+
+
+publicar_evento("pedido.pago", 1041, {"total_centavos": 30000})
+produtor.flush(10)
+```
+
+O `produce` é assíncrono: coloca a mensagem num buffer local e volta na hora. O cliente agrupa mensagens em lotes por partição (o `linger.ms` espera até 5 ms para formar lotes maiores), comprime e envia. O resultado chega no callback `on_delivery`, que só é chamado quando você chama `poll` ou `flush`. Por isso `poll(0)` depois de cada envio processa os callbacks pendentes, e `flush` antes de encerrar garante que nada ficou no buffer. Esquecer o `flush` num script é perder as últimas mensagens em silêncio.
+
+As configurações de durabilidade:
+
+- **`acks`**: `0` não espera confirmação; `1` espera só o líder da partição gravar (perde dados se o líder cair antes de replicar); `all` espera todas as réplicas sincronizadas. Para eventos de negócio, `all`.
+- **Replicação**: cada partição tem um líder e seguidores em outros brokers. As réplicas que acompanham o líder formam o **ISR** (in-sync replicas). Com fator de replicação 3 e `min.insync.replicas=2` no tópico, uma escrita com `acks=all` só é aceita se pelo menos duas réplicas a tiverem; o cluster tolera a perda de um broker sem perder dados nem parar de aceitar escritas.
+- **`enable.idempotence`**: o produtor recebe um id e numera as mensagens por partição; se um retry reenviar um lote que o broker já gravou (porque a confirmação se perdeu), o broker descarta a duplicata. Também preserva a ordem durante retries. Ativá-lo exige `acks=all`. O cliente Java o liga por padrão desde a versão 3.0, mas no `confluent-kafka` (baseado na librdkafka) ele vem desligado: deixe explícito.
+
+A idempotência do produtor elimina duplicatas causadas por retries **dentro de uma sessão do produtor**. Se a aplicação cair e publicar de novo o mesmo evento a partir do outbox, para o Kafka é uma mensagem nova. Por isso o evento continua levando um `id` próprio, e o consumidor continua idempotente.
+
+## Grupos de consumidores e commit manual
+
+Consumidores com o mesmo `group.id` formam um **grupo** e dividem as partições: cada partição é lida por exatamente um membro do grupo. Com seis partições e três instâncias, cada uma lê duas; com sete instâncias, uma fica ociosa. Grupos diferentes leem o mesmo tópico de forma independente, cada um com seus offsets: `notificacoes` e `antifraude` são dois grupos.
+
+O grupo guarda seu progresso no tópico interno `__consumer_offsets`, fazendo **commit** do próximo offset a ler. O padrão do cliente é o commit automático a cada intervalo, o que pode marcar como lida uma mensagem que ainda está sendo processada; se o processo cair, ela se perde. Para controle, desligue e faça o commit depois de processar:
+
+```python
+# ingressos/notificacoes/kafka_consumidor.py
+import json
+import logging
+
+from confluent_kafka import Consumer, KafkaError, KafkaException
+
+from ingressos.notificacoes.servico import processar_evento
+
+logger = logging.getLogger("ingressos.notificacoes")
+
+consumidor = Consumer(
+    {
+        "bootstrap.servers": "localhost:9092",
+        "group.id": "notificacoes",
+        "enable.auto.commit": False,
+        "auto.offset.reset": "earliest",
+        "partition.assignment.strategy": "cooperative-sticky",
+        "max.poll.interval.ms": 300000,
+    }
+)
+
+
+def ao_atribuir(consumer, particoes):
+    logger.info("particoes_atribuidas", extra={"campos": {"n": len(particoes)}})
+
+
+def ao_revogar(consumer, particoes):
+    logger.info("particoes_revogadas", extra={"campos": {"n": len(particoes)}})
+
+
+consumidor.subscribe(["pedidos.eventos"], on_assign=ao_atribuir, on_revoke=ao_revogar)
+
+try:
+    while True:
+        mensagem = consumidor.poll(1.0)
+        if mensagem is None:
+            continue
+        if mensagem.error():
+            if mensagem.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            raise KafkaException(mensagem.error())
+        evento = json.loads(mensagem.value())
+        processar_evento(evento)
+        consumidor.commit(message=mensagem, asynchronous=False)
+finally:
+    consumidor.close()
+```
+
+- **`auto.offset.reset`** define onde começar quando o grupo não tem offset salvo: `earliest` (o início do que ainda existe) ou `latest` (só o que chegar daqui em diante).
+- **Commit depois de processar** dá **pelo menos uma vez**: se o processo cair entre o processamento e o commit, a mensagem é lida de novo. Commit antes de processar daria no máximo uma vez.
+- **Commit síncrono por mensagem** é o mais seguro e o mais lento. Para vazão, faça commit a cada N mensagens ou a cada poucos segundos, aceitando reprocessar até N mensagens numa falha. O consumidor idempotente (tabela de ids processados, ou escrita com `INSERT ... ON CONFLICT`) torna isso inofensivo.
+- **`close()`** sai do grupo de forma limpa e dispara o rebalanceamento imediato, em vez de esperar o timeout de sessão.
+
+Mensagens que falham sempre (a envenenada) são um problema maior aqui do que no RabbitMQ: o consumidor não pode pular a mensagem sem fazer commit dela, e travar nela para a partição inteira. O padrão é publicar a mensagem problemática num tópico de dead letter (`pedidos.eventos.dlt`) com os detalhes do erro, fazer o commit e seguir. Para falhas temporárias, tópicos de retry com atraso, lidos por consumidores que esperam o prazo antes de reprocessar.
+
+## Rebalanceamento
+
+Sempre que um consumidor entra ou sai do grupo, cai, ou fica tempo demais sem chamar `poll`, o coordenador do grupo **redistribui as partições**. No protocolo antigo (*eager*), todos os membros largam todas as partições e param até a nova atribuição: com muitos consumidores e deploys frequentes, o grupo passa boa parte do tempo parado. A estratégia `cooperative-sticky`, usada no exemplo, faz rebalanceamento incremental: só as partições que mudam de dono são revogadas, e o resto continua sendo consumido. O Kafka 4 traz ainda um novo protocolo de grupo, coordenado pelo broker, ativado por `group.protocol=consumer` nos clientes que o suportam.
+
+Causas comuns de rebalanceamento em excesso e como evitá-las:
+
+| Sintoma | Causa | Correção |
+|---|---|---|
+| Rebalanceia durante processamento longo | Intervalo entre `poll` maior que `max.poll.interval.ms` | Processar mais rápido, lotes menores ou aumentar o limite |
+| Rebalanceia a cada deploy | Saída sem `close()` e reinício com nova identidade | `close()` no desligamento e `group.instance.id` fixo (membro estático) |
+| Mensagens processadas duas vezes após rebalanceamento | Commit pendente das partições revogadas | Fazer commit síncrono no callback de revogação |
+
+O membro estático (`group.instance.id` com um valor estável por instância, como o nome do pod de um StatefulSet) permite que uma instância reinicie dentro do timeout de sessão e recupere as mesmas partições, sem rebalanceamento.
+
+<Callout type="warning" title="Uma thread presa derruba o grupo">
+O cliente `confluent-kafka` envia heartbeats numa thread de fundo, mas o grupo também exige que a aplicação chame `poll` dentro de `max.poll.interval.ms`. Uma chamada HTTP sem timeout dentro do laço de consumo pode passar desse limite; o consumidor é expulso, as partições vão para outro membro e a mensagem é reprocessada em paralelo. Timeout em toda chamada externa feita pelo consumidor.
+</Callout>
+
+## Retenção, compactação e esquemas
+
+O Kafka guarda dados por política, não por consumo:
+
+- **Retenção por tempo ou tamanho** (`retention.ms`, `retention.bytes`): segmentos antigos do log são apagados quando passam do limite. Sete dias é o padrão. Um consumidor parado por mais tempo que a retenção perde dados, e o `auto.offset.reset` decide de onde ele recomeça.
+- **Compactação** (`cleanup.policy=compact`): o Kafka mantém, para cada chave, ao menos o último valor, e descarta os anteriores. O tópico vira uma tabela de estado atual: um tópico `setores.disponibilidade` com chave `setor_id` permite que um serviço novo reconstrua o estado completo lendo-o do início. Uma mensagem com valor nulo (o *tombstone*) marca a chave para remoção.
+
+```bash
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create \
+  --topic setores.disponibilidade --partitions 6 --replication-factor 3 \
+  --config cleanup.policy=compact --config min.insync.replicas=2
+```
+
+Como o tópico guarda dados por dias e é lido por vários times, o formato das mensagens é um contrato de longo prazo. JSON sem esquema funciona até alguém renomear um campo. O caminho maduro é um **registro de esquemas** (o Schema Registry da Confluent e alternativas compatíveis) com Avro, Protobuf ou JSON Schema: o produtor registra o esquema, a mensagem carrega só o id dele, e o registro recusa mudanças incompatíveis segundo a regra de compatibilidade configurada. O `confluent-kafka` traz serializadores para isso no módulo `confluent_kafka.schema_registry`. Mesmo sem registro, adote as regras: só adicionar campos opcionais, nunca renomear nem mudar tipo, e uma versão nova do evento quando a mudança for incompatível.
+
+## Exactly-once e Kafka x RabbitMQ
+
+O Kafka oferece **exactly-once** num escopo preciso: ler de tópicos, processar e escrever em tópicos, tudo no mesmo cluster. O produtor transacional (`transactional.id`, `init_transactions`, `begin_transaction`, `commit_transaction`) escreve as mensagens de saída e os offsets do consumidor numa transação atômica; consumidores com `isolation.level=read_committed` só enxergam mensagens de transações confirmadas. Se o processo cair no meio, a transação é abortada e nada aparece pela metade. É a base do Kafka Streams e de pipelines de transformação.
+
+O limite é a fronteira do Kafka: se o processamento grava no PostgreSQL ou envia e-mail, a transação do Kafka não alcança esse efeito. Para isso, volta-se ao par de sempre: pelo menos uma vez e consumidor idempotente, ou gravar o resultado e o offset na mesma transação do banco e reposicionar o consumidor com `seek` ao iniciar.
+
+Quando escolher cada broker:
+
+| Critério | RabbitMQ | Kafka |
+|---|---|---|
+| Modelo | Fila: mensagem some após o ack | Log: mensagem fica até a retenção |
+| Roteamento | Rico (exchanges, padrões, cabeçalhos) | Por tópico e chave |
+| Releitura e reprocessamento | Não (exceto streams) | Nativo, por offset |
+| Ordenação | Por fila, frágil com vários consumidores | Por partição, robusta |
+| Paralelismo | Consumidores competindo na fila | Limitado ao número de partições |
+| Retry e atraso por mensagem | DLX, TTL, `x-delivery-limit` | Tópicos de retry construídos pela aplicação |
+| Vazão | Alta | Muito alta, com lotes e compressão |
+| Bom para | Tarefas, comandos, workflows entre serviços | Fluxos de eventos, integração de dados, CDC, analytics em tempo real |
+
+Na plataforma, uma divisão razoável é: RabbitMQ para comandos e tarefas (gerar PDF, enviar e-mail), Kafka para o fluxo de eventos de pedidos consumido por antifraude, dados e projeções. Muitas empresas têm só um dos dois e usam bem; não adote Kafka pela fama se o problema é uma fila de tarefas.
+
+## Na entrevista
+
+**Como o Kafka garante ordenação?** Só dentro de uma partição. Mensagens com a mesma chave vão para a mesma partição, então a ordem é garantida por chave. Para manter a ordem por pedido, uso `pedido_id` como chave; entre pedidos diferentes não há ordem, e não precisa haver.
+
+**O que acontece quando um grupo tem mais consumidores do que partições?** Os consumidores excedentes ficam ociosos, porque cada partição é atribuída a no máximo um membro do grupo. O número de partições é o teto de paralelismo do grupo.
+
+**Qual a diferença entre `acks=1` e `acks=all`?** Com `1`, o produtor recebe a confirmação quando o líder grava, e uma queda do líder antes de replicar perde a mensagem. Com `all`, a confirmação só vem quando todas as réplicas do ISR gravaram; somado a `min.insync.replicas=2` e fator 3, tolera a perda de um broker.
+
+**Commit automático ou manual?** O automático pode confirmar offsets de mensagens ainda não processadas, levando a perda numa queda. O manual depois do processamento dá pelo menos uma vez, e com consumidor idempotente o efeito é de uma vez só.
+
+**O Kafka tem exactly-once?** Sim, para o ciclo de ler, processar e escrever dentro do Kafka, com produtor transacional e consumidores `read_committed`. Efeitos fora do Kafka, como banco ou e-mail, continuam exigindo idempotência.
+
+**Quando um tópico compactado é útil?** Quando o tópico representa estado atual por chave, como a disponibilidade de cada setor. O Kafka mantém o último valor de cada chave, e um consumidor novo reconstrói o estado completo lendo do início.
+
+## Pratique
+
+1. Suba o Kafka em KRaft com o Compose do capítulo, crie `pedidos.eventos` com seis partições e publique eventos com chave `pedido_id`, conferindo que os eventos de um mesmo pedido caem sempre na mesma partição.
+2. Adapte o publicador de outbox do serviço `pedidos` para produzir no Kafka com `acks=all` e idempotência, tratando erros no callback de entrega.
+3. Escreva o consumidor do grupo `antifraude` com commit manual a cada 100 mensagens e idempotência pela tabela de ids processados; mate o processo no meio e confira que nada se perde nem duplica efeito.
+4. Rode três instâncias do consumidor, derrube uma e observe nos logs dos callbacks como as partições são redistribuídas com `cooperative-sticky`.
+5. Crie o tópico compactado `setores.disponibilidade`, publique atualizações e escreva um serviço que reconstrói o estado em memória lendo-o desde o início.
+
+<Quiz question="Um tópico tem 6 partições e o grupo de consumidores tem 8 instâncias. O que acontece?" options={["Cada partição é dividida entre instâncias","As mensagens são duplicadas para todas as instâncias","O Kafka cria duas partições a mais automaticamente","Seis instâncias recebem uma partição cada e duas ficam ociosas"]} answer={3} explanation="Dentro de um grupo, cada partição é lida por no máximo um consumidor. O número de partições limita o paralelismo do grupo." />
+
+<Quiz question="Qual configuração do produtor evita duplicatas causadas por retries de envio?" options={["acks igual a 0","enable.idempotence igual a true","linger.ms igual a 0","compression.type igual a none"]} answer={1} explanation="O produtor idempotente numera as mensagens por partição, e o broker descarta reenvios de um lote já gravado. Exige acks igual a all." />
+
+<Quiz question="O consumidor faz commit do offset só depois de processar a mensagem. Que garantia isso dá?" options={["Pelo menos uma vez","No máximo uma vez","Exatamente uma vez em qualquer cenário","Nenhuma garantia"]} answer={0} explanation="Se o processo cair depois de processar e antes do commit, a mensagem será lida de novo. Nada se perde, mas pode haver reprocessamento, tratado com idempotência." />
+
+## Base no CodeForge
+
+- [Mensageria com Python e RabbitMQ: Integração assíncrona entre serviços](/learn/carreira-python/mensageria-python-rabbitmq-integracao-assincrona): o broker de filas, para comparar.
+- [Motores de streaming](/learn/system-design/motores-de-streaming) e [Batch vs stream](/learn/system-design/batch-vs-stream): onde o Kafka se encaixa no processamento de dados.
+- [Particionamento](/learn/system-design/particionamento) e [Replicação](/learn/system-design/replicacao): os fundamentos de partições e ISR.
+- [Raft](/learn/system-design/raft): o consenso por trás do KRaft.
+- [Mensageria em Java com RabbitMQ e Kafka](/learn/carreira-java/mensageria-java-rabbitmq-kafka): os mesmos brokers com Spring.
+
+## Referências
+
+- [Apache Kafka: Documentation](https://kafka.apache.org/documentation/)
+- [Apache Kafka: Introduction](https://kafka.apache.org/intro)
+- [confluent-kafka-python: documentação da API](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html)
+- [Apache Kafka: KRaft](https://kafka.apache.org/documentation/#kraft)

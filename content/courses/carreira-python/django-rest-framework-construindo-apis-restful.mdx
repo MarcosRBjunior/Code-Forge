@@ -1,0 +1,463 @@
+---
+title: "Django REST Framework: Construindo APIs RESTful"
+kind: lesson
+---
+
+A plataforma `ingressos` que você construiu nos capítulos de Django devolve HTML: views, templates e formulários. Agora o time de mobile quer listar eventos no aplicativo, um parceiro quer consultar setores e preços, e o front vai virar uma aplicação separada. Todos precisam da mesma coisa: os dados em JSON, por HTTP, com um contrato previsível. Dá para fazer isso com `JsonResponse` e `json.loads` na mão, mas você reescreveria validação, conversão de tipos, tratamento de erro e negociação de conteúdo em cada view.
+
+O Django REST Framework (DRF) é a biblioteca padrão para isso. Ele se apoia nos models, no ORM e na autenticação que você já tem e acrescenta as peças de uma API: serializers, views baseadas em classe especializadas, routers e uma interface navegável. Este capítulo monta a primeira versão da API de eventos e setores. Os três seguintes acrescentam validações, filtros e paginação; autenticação, permissões e limites; relacionamentos, versionamento e desempenho.
+
+**Você vai aprender:**
+
+- Modelar recursos REST com URLs, verbos e status codes coerentes
+- Converter models em JSON e JSON em models com `Serializer` e `ModelSerializer`
+- Escolher entre `APIView`, views genéricas e `ViewSet`, sabendo o que cada nível esconde
+- Gerar as rotas com routers e explorar a API pela interface navegável
+
+## REST em uma página
+
+REST é um estilo de arquitetura para APIs sobre HTTP. Na prática do dia a dia, quatro ideias sustentam o resto:
+
+- **Recursos com URL própria.** `Evento` é um recurso: `/api/eventos/` é a coleção, `/api/eventos/42/` é um item. URLs têm substantivos no plural, não verbos (`/api/eventos/`, e não `/api/listarEventos`).
+- **O verbo HTTP diz a operação.** `GET` lê, `POST` cria, `PUT` substitui, `PATCH` altera parte, `DELETE` remove.
+- **O status code diz o resultado.** O cliente decide o que fazer pelo código, sem interpretar texto.
+- **Sem estado no servidor entre requisições.** Cada requisição carrega tudo de que precisa, o que permite escalar com várias instâncias.
+
+| Operação | Verbo e URL | Sucesso | Erros comuns |
+|---|---|---|---|
+| Listar | `GET /api/eventos/` | 200 | |
+| Criar | `POST /api/eventos/` | 201 com o recurso criado | 400 (dados inválidos) |
+| Detalhar | `GET /api/eventos/42/` | 200 | 404 |
+| Substituir | `PUT /api/eventos/42/` | 200 | 400, 404 |
+| Alterar parte | `PATCH /api/eventos/42/` | 200 | 400, 404 |
+| Remover | `DELETE /api/eventos/42/` | 204 sem corpo | 404 |
+
+`GET`, `PUT` e `DELETE` são idempotentes: repetir a requisição deixa o servidor no mesmo estado. `POST` não é, e por isso uma retentativa de `POST` pode criar dois registros. Guarde essa distinção: ela volta em entrevistas e no desenho de qualquer operação de compra.
+
+## Instalação e o ponto de partida
+
+```bash
+pip install djangorestframework
+```
+
+```python
+# ingressos/settings.py
+INSTALLED_APPS = [
+    # apps do Django...
+    "rest_framework",
+    "eventos",
+]
+```
+
+Os models são os que vieram dos capítulos de Django. Um resumo, para fixar os nomes usados daqui em diante (se os seus campos diferem em algum detalhe, adapte os exemplos):
+
+```python
+# eventos/models.py
+import uuid
+
+from django.conf import settings
+from django.db import models
+
+
+class Evento(models.Model):
+    nome = models.CharField(max_length=200)
+    data = models.DateTimeField()
+    local = models.CharField(max_length=200)
+    capacidade = models.PositiveIntegerField()
+
+    def __str__(self) -> str:
+        return self.nome
+
+
+class Setor(models.Model):
+    evento = models.ForeignKey(Evento, on_delete=models.CASCADE, related_name="setores")
+    nome = models.CharField(max_length=100)
+    preco = models.DecimalField(max_digits=10, decimal_places=2)
+    quantidade_disponivel = models.PositiveIntegerField()
+
+
+class Pedido(models.Model):
+    class Status(models.TextChoices):
+        PENDENTE = "pendente"
+        PAGO = "pago"
+        CANCELADO = "cancelado"
+        EXPIRADO = "expirado"
+
+    cliente = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="pedidos")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDENTE)
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+
+class Ingresso(models.Model):
+    codigo = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    pedido = models.ForeignKey(Pedido, on_delete=models.CASCADE, related_name="ingressos")
+    setor = models.ForeignKey(Setor, on_delete=models.PROTECT, related_name="ingressos")
+```
+
+Este capítulo trabalha com `Evento` e `Setor`. `Pedido` e `Ingresso` entram quando houver autenticação, no terceiro capítulo da sequência.
+
+## Serializers: a fronteira entre JSON e Python
+
+Um serializer faz duas viagens. Na **saída**, transforma uma instância de model (ou um queryset) em tipos simples de Python, que o DRF renderiza como JSON. Na **entrada**, recebe os dados da requisição, valida e devolve valores prontos para gravar. Ele é para a API o que o `Form` é para o HTML.
+
+Escrito campo a campo, para ver o mecanismo:
+
+```python
+# eventos/serializers.py
+from rest_framework import serializers
+
+from eventos.models import Evento
+
+
+class EventoSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    nome = serializers.CharField(max_length=200)
+    data = serializers.DateTimeField()
+    local = serializers.CharField(max_length=200)
+    capacidade = serializers.IntegerField(min_value=1)
+
+    def create(self, validated_data):
+        return Evento.objects.create(**validated_data)
+
+    def update(self, instance, validated_data):
+        for campo, valor in validated_data.items():
+            setattr(instance, campo, valor)
+        instance.save()
+        return instance
+```
+
+O ciclo de uso, que você pode experimentar em `python manage.py shell`:
+
+```python
+from eventos.models import Evento
+from eventos.serializers import EventoSerializer
+
+# Saída: instância para dados
+evento = Evento.objects.first()
+EventoSerializer(evento).data
+# {'id': 1, 'nome': 'Festival de Inverno', 'data': '2026-07-18T20:00:00-03:00', ...}
+
+EventoSerializer(Evento.objects.all(), many=True).data   # lista
+
+# Entrada: dados para instância
+serializer = EventoSerializer(data={"nome": "", "capacidade": 0})
+serializer.is_valid()        # False
+serializer.errors            # {'nome': [...], 'data': [...], 'local': [...], 'capacidade': [...]}
+
+serializer = EventoSerializer(data={
+    "nome": "Show de Abertura", "data": "2026-09-01T21:00:00-03:00",
+    "local": "Arena Central", "capacidade": 5000,
+})
+serializer.is_valid(raise_exception=True)
+serializer.validated_data    # valores já convertidos: data é um datetime
+evento = serializer.save()   # chama create(); com instance=..., chamaria update()
+```
+
+Três regras para guardar: `.data` é a saída serializada; `.validated_data` só existe depois de `is_valid()`; e `save()` decide entre `create` e `update` conforme o serializer tenha sido criado com ou sem uma instância.
+
+### ModelSerializer
+
+Repetir no serializer o que o model já declara é desperdício. O `ModelSerializer` gera os campos a partir do model, com os validadores correspondentes (`max_length`, `unique`, campo obrigatório), e já implementa `create` e `update`:
+
+```python
+# eventos/serializers.py
+from rest_framework import serializers
+
+from eventos.models import Evento, Setor
+
+
+class EventoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Evento
+        fields = ["id", "nome", "data", "local", "capacidade"]
+
+
+class SetorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Setor
+        fields = ["id", "evento", "nome", "preco", "quantidade_disponivel"]
+        read_only_fields = ["quantidade_disponivel"]
+```
+
+Para ver o que foi gerado, imprima o serializer no shell: `print(repr(SetorSerializer()))` lista cada campo com seus argumentos. O campo `evento`, uma chave estrangeira, vira um `PrimaryKeyRelatedField`: entra e sai como o id do evento. Outras formas de representar relações ficam para o quarto capítulo.
+
+<Callout type="warning" title="Liste os campos, não use __all__">
+`fields = "__all__"` expõe todo campo que existir no model, inclusive os que forem adicionados depois: um `custo_interno` ou um `observacao_admin` criado por outra pessoa passa a sair na API sem ninguém decidir isso. Liste os campos explicitamente. O serializer é o contrato público, e contrato não deve mudar por acidente. Marque como `read_only_fields` o que o cliente pode ver mas não pode definir.
+</Callout>
+
+Dois detalhes de representação que surpreendem: `DecimalField` sai como **string** (`"150.00"`), para o cliente não perder precisão ao tratar dinheiro como ponto flutuante, e `DateTimeField` sai em ISO 8601 com fuso. Mantenha `USE_TZ = True` e deixe a conversão de fuso para o cliente.
+
+## Views: três níveis de abstração
+
+O DRF oferece três jeitos de escrever a mesma view. Vale conhecer os três, porque cada nível esconde o anterior e, quando algo foge do padrão, você desce um degrau.
+
+### APIView: tudo explícito
+
+`APIView` é a `View` do Django com as peças de API: `request.data` já vem interpretado (JSON, formulário ou multipart), `Response` escolhe o formato de saída, e exceções como `Http404` e `ValidationError` viram respostas JSON com o status certo.
+
+```python
+# eventos/views.py
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from eventos.models import Evento
+from eventos.serializers import EventoSerializer
+
+
+class EventoLista(APIView):
+    def get(self, request):
+        eventos = Evento.objects.order_by("data")
+        return Response(EventoSerializer(eventos, many=True).data)
+
+    def post(self, request):
+        serializer = EventoSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class EventoDetalhe(APIView):
+    def get(self, request, pk):
+        evento = get_object_or_404(Evento, pk=pk)
+        return Response(EventoSerializer(evento).data)
+
+    def patch(self, request, pk):
+        evento = get_object_or_404(Evento, pk=pk)
+        serializer = EventoSerializer(evento, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, pk):
+        get_object_or_404(Evento, pk=pk).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+```
+
+`is_valid(raise_exception=True)` levanta `ValidationError`, que o DRF converte em 400 com os erros por campo. `partial=True` é a diferença entre `PATCH` e `PUT`: campos ausentes não são exigidos. Use as constantes de `status` em vez de números soltos: o código fica legível e a busca por `HTTP_201` encontra todas as criações.
+
+### Views genéricas: o padrão declarado
+
+As duas classes acima são iguais para qualquer recurso, trocando o model e o serializer. As views genéricas capturam esse padrão:
+
+```python
+# eventos/views.py
+from rest_framework import generics
+
+from eventos.models import Evento
+from eventos.serializers import EventoSerializer
+
+
+class EventoLista(generics.ListCreateAPIView):
+    queryset = Evento.objects.order_by("data")
+    serializer_class = EventoSerializer
+
+
+class EventoDetalhe(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Evento.objects.all()
+    serializer_class = EventoSerializer
+```
+
+Cada classe genérica combina uma base (`GenericAPIView`) com mixins (`ListModelMixin`, `CreateModelMixin` e assim por diante). Existem combinações prontas para cada caso: `ListAPIView`, `CreateAPIView`, `RetrieveAPIView`, `RetrieveUpdateAPIView` e outras. Os pontos de personalização mais usados são métodos pequenos:
+
+- `get_queryset()`: quando a consulta depende da requisição (usuário, parâmetro da URL).
+- `get_serializer_class()`: quando leitura e escrita usam serializers diferentes.
+- `perform_create(serializer)`, `perform_update` e `perform_destroy`: para acrescentar algo ao gravar, sem reescrever o método inteiro.
+
+Os setores de um evento são um bom exemplo, numa URL aninhada `/api/eventos/42/setores/`:
+
+```python
+from django.shortcuts import get_object_or_404
+from rest_framework import generics
+
+from eventos.models import Evento, Setor
+from eventos.serializers import SetorSerializer
+
+
+class SetoresDoEvento(generics.ListAPIView):
+    serializer_class = SetorSerializer
+
+    def get_queryset(self):
+        evento = get_object_or_404(Evento, pk=self.kwargs["evento_pk"])
+        return Setor.objects.filter(evento=evento).order_by("preco")
+```
+
+O `get_object_or_404` faz diferença: sem ele, um evento inexistente devolveria 200 com lista vazia, e o cliente não saberia distinguir "evento sem setores" de "evento que não existe".
+
+### ViewSets: um recurso, uma classe
+
+Lista e detalhe compartilham queryset e serializer. Um `ViewSet` junta as duas views numa classe só, organizada por **ações** (`list`, `create`, `retrieve`, `update`, `partial_update`, `destroy`) em vez de métodos HTTP:
+
+```python
+# eventos/views.py
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from eventos.models import Evento, Setor
+from eventos.serializers import EventoSerializer, SetorSerializer
+
+
+class EventoViewSet(viewsets.ModelViewSet):
+    queryset = Evento.objects.order_by("data")
+    serializer_class = EventoSerializer
+
+    @action(detail=True, methods=["get"])
+    def setores(self, request, pk=None):
+        evento = self.get_object()
+        setores = evento.setores.order_by("preco")
+        return Response(SetorSerializer(setores, many=True).data)
+
+
+class SetorViewSet(viewsets.ModelViewSet):
+    queryset = Setor.objects.select_related("evento")
+    serializer_class = SetorSerializer
+```
+
+`ModelViewSet` entrega as seis ações. `ReadOnlyModelViewSet` entrega só `list` e `retrieve`, útil para recursos que a API apenas expõe. O decorador `@action` cria rotas extras: com `detail=True` a rota fica sob um item (`/api/eventos/42/setores/`), e `self.get_object()` busca o evento, devolve 404 se não existir e, quando houver permissões, aplica a verificação por objeto. Com `detail=False` a rota fica sob a coleção. Dentro do viewset, `self.action` guarda o nome da ação em curso, o que permite decidir serializer ou permissão por ação.
+
+| Nível | Use quando | Custo |
+|---|---|---|
+| `APIView` | O endpoint não é um CRUD de model: um webhook, um cálculo, uma operação sobre vários recursos | Você escreve tudo |
+| Views genéricas | CRUD parcial (só listar e criar, por exemplo) ou URLs fora do padrão | Uma classe por URL |
+| `ViewSet` com router | CRUD completo de um recurso | Mais mágica: é preciso conhecer as ações e os métodos de personalização |
+
+## Routers: as URLs geradas
+
+Um viewset não se liga a uma URL diretamente, porque ele responde por várias. O router gera o conjunto:
+
+```python
+# ingressos/urls.py
+from django.contrib import admin
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from eventos.views import EventoViewSet, SetorViewSet
+
+router = DefaultRouter()
+router.register("eventos", EventoViewSet)
+router.register("setores", SetorViewSet)
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("api/", include(router.urls)),
+]
+```
+
+Para cada registro, o router cria:
+
+| URL | Método | Ação | Nome da rota |
+|---|---|---|---|
+| `/api/eventos/` | GET | `list` | `evento-list` |
+| `/api/eventos/` | POST | `create` | `evento-list` |
+| `/api/eventos/{pk}/` | GET | `retrieve` | `evento-detail` |
+| `/api/eventos/{pk}/` | PUT | `update` | `evento-detail` |
+| `/api/eventos/{pk}/` | PATCH | `partial_update` | `evento-detail` |
+| `/api/eventos/{pk}/` | DELETE | `destroy` | `evento-detail` |
+| `/api/eventos/{pk}/setores/` | GET | `setores` | `evento-setores` |
+
+O prefixo dos nomes (`evento`) vem do model do `queryset`. Se o viewset não tiver o atributo `queryset` (porque usa `get_queryset()`), informe `basename` no `register`, ou o router levanta erro. O `DefaultRouter` também cria uma página raiz em `/api/` com os links das coleções; o `SimpleRouter` gera só as rotas. Views genéricas e `APIView` continuam indo para `urlpatterns` com `path(...)` e `.as_view()`, e podem conviver com o router.
+
+Teste pelo terminal:
+
+```bash
+curl -s http://localhost:8000/api/eventos/
+
+curl -s -X POST http://localhost:8000/api/eventos/ \
+  -H "Content-Type: application/json" \
+  -d '{"nome": "Show de Abertura", "data": "2026-09-01T21:00:00-03:00", "local": "Arena Central", "capacidade": 5000}'
+
+curl -s -X POST http://localhost:8000/api/eventos/ \
+  -H "Content-Type: application/json" -d '{"nome": ""}'
+```
+
+A última chamada devolve 400 com o corpo no formato padrão do DRF, uma lista de mensagens por campo:
+
+```json
+{
+  "nome": ["Este campo não pode estar em branco."],
+  "data": ["Este campo é obrigatório."],
+  "local": ["Este campo é obrigatório."],
+  "capacidade": ["Este campo é obrigatório."]
+}
+```
+
+## Status codes: o que o DRF faz e o que é com você
+
+As views genéricas e os viewsets já devolvem 200, 201, 204, 400 e 404 nos casos certos, além de 405 para método não permitido e 415 para tipo de conteúdo não suportado. O que sobra para você são as situações de negócio:
+
+| Código | Significado | Exemplo na plataforma |
+|---|---|---|
+| 400 Bad Request | A requisição está malformada ou os dados são inválidos | Capacidade negativa |
+| 401 Unauthorized | Falta autenticação válida | Requisição sem credencial |
+| 403 Forbidden | Autenticado, mas sem permissão | Cliente tentando editar um evento |
+| 404 Not Found | O recurso não existe | Evento 9999 |
+| 409 Conflict | Conflito com o estado atual | Cancelar um pedido já cancelado |
+| 422 Unprocessable Content | Sintaxe correta, semântica inválida | Alternativa ao 400 para erro de validação; escolha um e seja consistente |
+| 429 Too Many Requests | Limite de requisições excedido | Rajada de consultas de um mesmo cliente |
+| 500 Internal Server Error | Erro não tratado no servidor | Nunca intencional |
+
+Os erros que não fazem sentido: 200 com `{"erro": "não encontrado"}` no corpo (o cliente precisa interpretar texto), 500 para dado inválido do usuário (polui o monitoramento) e 404 para falta de permissão sem que isso seja uma decisão consciente de não revelar a existência do recurso.
+
+## A interface navegável
+
+Abra `http://localhost:8000/api/eventos/` no navegador. Em vez de JSON cru, aparece uma página com a resposta formatada, os cabeçalhos, um formulário para `POST` gerado a partir do serializer e botões para `PUT`, `DELETE` e `OPTIONS`. É a browsable API. A mesma URL devolve JSON para o `curl` porque o DRF faz **negociação de conteúdo**: escolhe o renderizador conforme o cabeçalho `Accept` da requisição. O navegador pede `text/html`, o `curl` aceita qualquer coisa e recebe o primeiro da lista, que é JSON.
+
+Ela é ótima em desenvolvimento, para explorar e depurar. Em produção, o usual é deixar só JSON:
+
+```python
+# ingressos/settings.py
+REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+    ],
+}
+```
+
+Uma forma comum é acrescentar o `BrowsableAPIRenderer` à lista apenas quando `DEBUG` for verdadeiro. O dicionário `REST_FRAMEWORK` é onde ficam todos os padrões globais do DRF, e ele cresce nos próximos capítulos com paginação, autenticação, permissões e limites.
+
+<Callout type="tip" title="OPTIONS mostra o contrato">
+Faça `curl -X OPTIONS http://localhost:8000/api/eventos/`. O DRF responde com os metadados do endpoint: métodos aceitos, formatos e, para `POST`, cada campo com tipo, obrigatoriedade e limites. É uma forma rápida de conferir o que o serializer está expondo antes de existir documentação OpenAPI.
+</Callout>
+
+## Na entrevista
+
+**O que um serializer faz?** Converte instâncias de model em tipos simples para virar JSON e, no sentido inverso, valida os dados de entrada e os transforma em valores prontos para gravar. É a fronteira do contrato da API: define o que sai, o que entra e o que é somente leitura.
+
+**Qual a diferença entre APIView, views genéricas e ViewSet?** `APIView` é o nível mais baixo, com um método por verbo HTTP e tudo explícito. As genéricas combinam mixins para os padrões de CRUD a partir de `queryset` e `serializer_class`. O `ViewSet` junta lista e detalhe numa classe organizada por ações e delega as URLs a um router. Uso viewset para CRUD completo e desço de nível quando o endpoint foge do padrão.
+
+**PUT ou PATCH?** `PUT` substitui o recurso inteiro e exige todos os campos obrigatórios; `PATCH` altera só os campos enviados. No DRF, a diferença é o `partial=True` passado ao serializer. Os dois são usados em `/recurso/{id}/`, e `PUT` é idempotente por definição.
+
+**Por que não usar `fields = "__all__"`?** Porque o contrato da API passa a mudar sozinho quando alguém adiciona um campo ao model, o que pode expor dado interno ou permitir a escrita de um campo que deveria ser controlado pelo servidor. Listar os campos torna a exposição uma decisão.
+
+**Qual status devolver ao criar e ao remover um recurso?** 201 Created na criação, com a representação do recurso no corpo (e idealmente o cabeçalho `Location`), e 204 No Content na remoção, sem corpo. Dado inválido é 400, e recurso inexistente é 404.
+
+## Pratique
+
+1. Instale o DRF no projeto `ingressos`, crie `EventoSerializer` e `SetorSerializer` com campos explícitos e escreva as views de eventos nas três formas (APIView, genéricas, viewset), uma de cada vez, conferindo que o comportamento pelo `curl` é idêntico.
+2. Registre `EventoViewSet` e `SetorViewSet` num `DefaultRouter` sob `/api/` e liste as rotas geradas com `python manage.py shell` imprimindo `router.urls`.
+3. Adicione a ação `setores` ao viewset de eventos e confirme que um evento inexistente devolve 404, não lista vazia.
+4. Transforme `SetorViewSet` em somente leitura para quem acessa `/api/setores/` e crie a rota `POST /api/eventos/{pk}/setores/` que cria um setor já vinculado ao evento da URL, sem aceitar `evento` no corpo.
+5. Configure os renderizadores para que a interface navegável só exista com `DEBUG = True` e confira com `curl -H "Accept: text/html"` nos dois modos.
+
+<Quiz question="Qual a diferença entre serializer.data e serializer.validated_data?" options={["data é a representação de saída; validated_data são os valores de entrada já validados e convertidos","São sinônimos, mudou apenas o nome entre versões","data só existe depois de save(); validated_data existe sempre","validated_data é o JSON cru da requisição; data é o model"]} answer={0} explanation="data é o resultado da serialização para a resposta. validated_data fica disponível após is_valid() e contém os valores de entrada convertidos para tipos Python." />
+
+<Quiz question="Um viewset define get_queryset() e não tem o atributo queryset. O que é necessário ao registrá-lo no router?" options={["Nada, o router descobre sozinho","Trocar DefaultRouter por SimpleRouter","Informar o basename, pois o router não consegue deduzir o prefixo dos nomes das rotas","Declarar as URLs manualmente com path()"]} answer={2} explanation="O router usa o model do atributo queryset para nomear as rotas. Sem ele, é preciso passar basename no register." />
+
+<Quiz question="Uma requisição DELETE /api/eventos/42/ remove o evento com sucesso. Qual a resposta adequada?" options={["200 com o evento removido no corpo, obrigatoriamente","201 Created","202 com a mensagem removido","204 No Content, sem corpo"]} answer={3} explanation="204 indica sucesso sem conteúdo a devolver, e é o que o DestroyModelMixin do DRF retorna." />
+
+## Base no CodeForge
+
+- [REST](/learn/system-design/rest) e [O que é uma API](/learn/system-design/o-que-e-api): os princípios por trás de recursos, verbos e status codes.
+- [HTTP/1.1](/learn/redes/http-1): métodos, cabeçalhos e negociação de conteúdo no nível do protocolo.
+- [Idempotência](/learn/system-design/idempotencia): por que repetir um `POST` é diferente de repetir um `PUT`.
+- [Django: Persistência de dados e Admin](/learn/carreira-python/django-persistencia-dados-admin): os models e o ORM que esta API expõe.
+- [Django REST Framework: Trabalhando com validações, filtros e paginação](/learn/carreira-python/django-rest-framework-validacoes-filtros-paginacao): a continuação direta deste capítulo.
+
+## Referências
+
+- [Django REST Framework: Serializers](https://www.django-rest-framework.org/api-guide/serializers/)
+- [Django REST Framework: Generic views](https://www.django-rest-framework.org/api-guide/generic-views/)
+- [Django REST Framework: ViewSets](https://www.django-rest-framework.org/api-guide/viewsets/) e [Routers](https://www.django-rest-framework.org/api-guide/routers/)
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html)

@@ -1,0 +1,388 @@
+---
+title: "Padrões arquiteturais de software: Escala, resiliência e observabilidade"
+kind: lesson
+---
+
+Na abertura das vendas de um show grande, a plataforma de ingressos recebe em dez minutos o tráfego de um mês. Nesse momento três coisas precisam ser verdade: o sistema aguenta mais instâncias sem mudar código, a falha de uma dependência (o gateway de pagamento lento, o serviço de notificações fora) não derruba a compra inteira, e o time consegue responder em minutos à pergunta "o que está lento e por quê?". Escala, resiliência e observabilidade são as três faces do mesmo problema: operar software sob carga real.
+
+Este capítulo reúne os padrões que resolvem cada face, com exemplos em Python: como deixar a aplicação pronta para escalar horizontalmente, onde cache, réplicas e filas ajudam, como conter falhas com timeout, circuit breaker, bulkhead e rate limit, e como instrumentar FastAPI e Django com logs estruturados, métricas Prometheus e traces OpenTelemetry. No fim, SLOs amarram tudo numa definição objetiva de "está bom".
+
+**Você vai aprender:**
+
+- Preparar serviços Python para escala horizontal e usar cache, réplicas e particionamento
+- Absorver picos com filas e separar leitura de escrita com CQRS
+- Conter falhas com timeouts, retries, circuit breaker, bulkhead e rate limit
+- Instrumentar uma API com logs estruturados, métricas e traces distribuídos
+- Definir SLIs e SLOs e alertar pelo que afeta o usuário
+
+## Escala horizontal começa no código
+
+Escalar verticalmente (máquina maior) tem teto e custo crescente. Escalar horizontalmente (mais instâncias atrás de um balanceador) só funciona se qualquer instância puder atender qualquer requisição, o que exige um serviço **stateless**: nada que importe fica na memória ou no disco local do processo.
+
+| Estado | Onde fica errado | Onde deve ficar |
+|---|---|---|
+| Sessão de usuário | Dicionário em memória, arquivo local | Banco, Redis ou token assinado |
+| Uploads | Pasta do contêiner | Armazenamento de objetos (S3) |
+| Cache | Variável global achando que é compartilhada | Redis, ou cache local aceito como cópia descartável |
+| Tarefas agendadas | `threading.Timer` em cada instância | Um agendador único ou fila com consumidores |
+| Locks | `threading.Lock` | Restrição no banco, `SELECT ... FOR UPDATE` ou lock distribuído |
+
+Em Python há um detalhe extra: um processo CPython executa bytecode em uma thread por vez (o GIL), então uma instância já é, por dentro, vários processos. Gunicorn com workers Uvicorn é o arranjo usual para FastAPI:
+
+```bash
+gunicorn ingressos.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000
+```
+
+Cada worker é um processo independente, com seu próprio pool de conexões. Isso tem consequência direta no banco: 10 pods com 4 workers e pool de 10 conexões somam 400 conexões, acima do padrão de 100 do PostgreSQL. Dimensione o pool por worker, use um pooler como PgBouncer quando o número de instâncias variar, e lembre que o autoscaler multiplica esse número.
+
+## Cache, réplicas de leitura e particionamento
+
+A página de um evento é lida milhares de vezes por segundo e muda poucas vezes por dia: candidata perfeita para cache. O padrão mais comum é o **cache-aside**: a aplicação consulta o cache, e em caso de ausência busca no banco e grava no cache com prazo de validade.
+
+```python
+import json
+
+import redis
+
+from ingressos.catalogo.repositorio import buscar_evento_no_banco, salvar_evento_no_banco
+
+cache = redis.Redis(host="redis", port=6379, decode_responses=True)
+TTL_SEGUNDOS = 60
+
+
+def obter_evento(evento_id: int) -> dict:
+    chave = f"evento:{evento_id}"
+    if (em_cache := cache.get(chave)) is not None:
+        return json.loads(em_cache)
+    evento = buscar_evento_no_banco(evento_id)
+    cache.set(chave, json.dumps(evento), ex=TTL_SEGUNDOS)
+    return evento
+
+
+def atualizar_evento(evento_id: int, dados: dict) -> None:
+    salvar_evento_no_banco(evento_id, dados)
+    cache.delete(f"evento:{evento_id}")
+```
+
+As decisões que importam: **o que cachear** (dados lidos muito e alterados pouco; nunca a quantidade disponível na hora de vender, que precisa vir do banco com bloqueio), **quanto tempo** (o TTL é o atraso máximo que o negócio aceita) e **como invalidar** (apagar a chave na escrita é mais simples e seguro que atualizá-la). Cuidado com o *cache stampede*: quando uma chave muito acessada expira, centenas de requisições vão ao banco ao mesmo tempo. TTL com variação aleatória ou um lock curto para quem vai recalcular resolvem. No Django, o framework de cache (`django.core.cache` com backend Redis) e o `cache_page` cobrem os mesmos casos.
+
+**Réplicas de leitura** aliviam o banco principal: escritas vão para o primário, consultas pesadas (listagens, relatórios) vão para réplicas. No Django, isso é um database router:
+
+```python
+class RoteadorPrimarioReplica:
+    def db_for_read(self, model, **hints):
+        return "replica"
+
+    def db_for_write(self, model, **hints):
+        return "default"
+
+    def allow_relation(self, obj1, obj2, **hints):
+        return True
+```
+
+A réplica é assíncrona e fica alguns milissegundos (às vezes segundos) atrás. O problema clássico é ler o que acabou de escrever: o cliente paga, é redirecionado para "meus pedidos" e o pedido aparece como pendente. Leituras que precisam refletir a própria escrita vão para o primário (`Pedido.objects.using("default")`).
+
+Quando nem um primário com réplicas comporta a escrita, entra o **particionamento**: dividir os dados por uma chave. Particionar a tabela de pedidos por mês (particionamento nativo do PostgreSQL) facilita arquivar dados antigos; distribuir clientes entre bancos diferentes (sharding) multiplica a capacidade de escrita, ao custo de perder joins e transações entre partições. A escolha da chave é a decisão que mais pesa: ela precisa espalhar a carga e manter juntas as operações que acontecem juntas.
+
+## Filas para absorver picos e CQRS
+
+Na abertura das vendas, o gargalo não são as leituras, e sim o trabalho pesado depois da compra: gerar PDFs dos ingressos, enviar e-mails, emitir nota. Fazer isso dentro da requisição prende workers e transfere o pico para todas as dependências. Com uma fila, a API grava o pedido, publica uma mensagem e responde; consumidores processam no ritmo que conseguem.
+
+| Sem fila | Com fila |
+|---|---|
+| A latência inclui todo o trabalho | A API responde em milissegundos |
+| O pico chega inteiro a cada dependência | O pico vira fila, drenada em ritmo constante |
+| Dependência fora derruba a requisição | Mensagens esperam a dependência voltar |
+| Escala da API e do trabalho amarradas | Consumidores escalam pelo tamanho da fila |
+
+A métrica a vigiar passa a ser a **idade da mensagem mais antiga** na fila: se ela cresce sem parar, os consumidores não dão conta, e o autoscaler deve usar essa métrica (ou o tamanho da fila) em vez de CPU.
+
+**CQRS** (Command Query Responsibility Segregation) leva a separação para o modelo: o lado de escrita usa o modelo de domínio com suas invariantes, e o lado de leitura usa modelos desnormalizados, montados para a tela. A página "meus ingressos" pode vir de uma tabela `ingressos_do_cliente` já pronta, atualizada por um consumidor do evento `PedidoPago`, em vez de um join de cinco tabelas a cada acesso. O custo é a consistência eventual entre os dois lados e mais código para manter as projeções. Use CQRS onde leitura e escrita têm formatos e cargas muito diferentes, não como padrão de todo o sistema.
+
+## Resiliência: timeouts, retries e circuit breaker
+
+Em produção, dependências falham de duas formas: rápido (conexão recusada, 503) e devagar. A lenta é a perigosa: cada requisição presa num gateway de pagamento que não responde segura um worker, os workers acabam, e a plataforma inteira para de responder, inclusive as rotas que nem usam pagamento. Essa é a falha em cascata, e a primeira defesa é o **timeout em toda chamada de rede**, com valor escolhido a partir da latência real (por exemplo, um pouco acima do p99 da dependência), e nunca maior que o tempo que o próprio cliente espera.
+
+Retries vêm em seguida, com backoff exponencial e jitter, poucas tentativas e somente para operações idempotentes. Retry sem limite em todas as camadas multiplica a carga sobre quem já está sofrendo: três camadas com três tentativas cada transformam uma requisição em 27.
+
+O **circuit breaker** completa o quadro: depois de muitas falhas seguidas, ele para de chamar a dependência por um tempo e falha imediatamente, dando fôlego ao outro lado e devolvendo resposta rápida ao usuário.
+
+```python
+import time
+from collections.abc import Callable
+from enum import StrEnum
+from threading import Lock
+
+
+class Estado(StrEnum):
+    FECHADO = "fechado"
+    ABERTO = "aberto"
+    MEIO_ABERTO = "meio_aberto"
+
+
+class CircuitoAberto(Exception):
+    pass
+
+
+class CircuitBreaker:
+    def __init__(self, limite_falhas: int = 5, espera_segundos: float = 30.0) -> None:
+        self.limite_falhas = limite_falhas
+        self.espera_segundos = espera_segundos
+        self.estado = Estado.FECHADO
+        self.falhas = 0
+        self.aberto_em = 0.0
+        self._lock = Lock()
+
+    def chamar[T](self, funcao: Callable[[], T]) -> T:
+        with self._lock:
+            if self.estado is Estado.ABERTO:
+                if time.monotonic() - self.aberto_em < self.espera_segundos:
+                    raise CircuitoAberto()
+                self.estado = Estado.MEIO_ABERTO
+        try:
+            resultado = funcao()
+        except Exception:
+            with self._lock:
+                self.falhas += 1
+                if self.estado is Estado.MEIO_ABERTO or self.falhas >= self.limite_falhas:
+                    self.estado = Estado.ABERTO
+                    self.aberto_em = time.monotonic()
+            raise
+        with self._lock:
+            self.falhas = 0
+            self.estado = Estado.FECHADO
+        return resultado
+```
+
+Os três estados: **fechado** (chamadas passam e falhas são contadas), **aberto** (chamadas falham na hora, sem tocar a dependência) e **meio aberto** (depois da espera, uma chamada de teste decide se o circuito fecha ou volta a abrir). A versão acima é didática; em produção, bibliotecas como `pybreaker` e `tenacity` (esta para retries) já tratam os detalhes, e a configuração deve ser por dependência.
+
+Falhar rápido só ajuda se houver um **fallback**: com o circuito do serviço de recomendações aberto, a página do evento sai sem a seção "você também pode gostar"; com o de notificações aberto, o e-mail vai para a fila e sai depois. Para pagamento não há fallback honesto, e a resposta certa é uma mensagem clara de "tente em instantes".
+
+<Callout type="warning" title="Health check não chama dependência">
+Se o endpoint de liveness consultar o banco, uma lentidão no banco faz o orquestrador reiniciar todas as instâncias ao mesmo tempo, transformando um problema parcial numa queda total. Liveness responde só se o processo está vivo. Readiness pode verificar dependências essenciais, porque apenas tira a instância do balanceamento.
+</Callout>
+
+## Bulkhead e rate limit
+
+O **bulkhead** (antepara, a divisória que impede um navio de afundar por um único furo) limita quanto de um recurso compartilhado cada dependência pode consumir. Se o gateway de pagamento travar, ele deve ocupar no máximo uma fatia dos workers, não todos. Em código assíncrono, um semáforo por dependência faz isso:
+
+```python
+import asyncio
+
+import httpx
+
+limite_pagamentos = asyncio.Semaphore(20)
+cliente_pagamentos = httpx.AsyncClient(
+    base_url="http://pagamentos:8000",
+    timeout=httpx.Timeout(3.0, connect=0.5),
+    limits=httpx.Limits(max_connections=20),
+)
+
+
+class SobrecargaPagamentos(Exception):
+    pass
+
+
+async def cobrar(pedido_id: str, valor_centavos: int) -> dict:
+    try:
+        async with asyncio.timeout(0.1):
+            await limite_pagamentos.acquire()
+    except TimeoutError:
+        raise SobrecargaPagamentos() from None
+    try:
+        resposta = await cliente_pagamentos.post(
+            "/pagamentos",
+            json={"pedido_id": pedido_id, "valor_centavos": valor_centavos},
+            headers={"Idempotency-Key": f"{pedido_id}:cobranca"},
+        )
+        resposta.raise_for_status()
+        return resposta.json()
+    finally:
+        limite_pagamentos.release()
+```
+
+No máximo 20 cobranças simultâneas; a 21ª espera 100 ms por uma vaga e, se não conseguir, falha rápido em vez de enfileirar indefinidamente. Pools de conexão separados por dependência e filas separadas por tipo de trabalho são a mesma ideia em outras camadas.
+
+O **rate limit** protege o sistema de quem chama demais, por abuso ou por bug. O algoritmo mais comum é o *token bucket*: cada cliente tem um balde de N fichas que se recarrega a uma taxa fixa, e cada requisição consome uma. Ele permite rajadas curtas e limita a média. Com várias instâncias, o contador precisa ser compartilhado (Redis, com operação atômica) ou ficar no API gateway. A resposta ao exceder é `429 Too Many Requests` com o cabeçalho `Retry-After`. No DRF, o throttling já visto no Nível 2 cobre o caso por usuário; para a fila virtual de uma venda concorrida, o limite fica na borda.
+
+O irmão do rate limit é o **load shedding**: quando o próprio serviço está saturado, recusar parte das requisições cedo (503) é melhor do que aceitar todas e responder todas tarde demais.
+
+## Observabilidade: logs estruturados
+
+Monitoramento responde perguntas que você previu ("a CPU passou de 80%?"). Observabilidade é conseguir responder perguntas novas a partir dos sinais que o sistema emite: logs, métricas e traces. O primeiro passo é parar de escrever logs como frases soltas e emiti-los como JSON, com campos pesquisáveis.
+
+```python
+import json
+import logging
+import sys
+from contextvars import ContextVar
+
+correlation_id: ContextVar[str] = ContextVar("correlation_id", default="-")
+
+
+class FormatoJson(logging.Formatter):
+    def format(self, registro: logging.LogRecord) -> str:
+        dados = {
+            "ts": self.formatTime(registro, "%Y-%m-%dT%H:%M:%S%z"),
+            "nivel": registro.levelname,
+            "logger": registro.name,
+            "msg": registro.getMessage(),
+            "correlation_id": correlation_id.get(),
+        }
+        dados.update(getattr(registro, "campos", {}))
+        if registro.exc_info:
+            dados["exc"] = self.formatException(registro.exc_info)
+        return json.dumps(dados, ensure_ascii=False)
+
+
+manipulador = logging.StreamHandler(sys.stdout)
+manipulador.setFormatter(FormatoJson())
+logging.basicConfig(level=logging.INFO, handlers=[manipulador])
+
+logger = logging.getLogger("ingressos.pedidos")
+logger.info("pedido_criado", extra={"campos": {"pedido_id": 1041, "itens": 2}})
+```
+
+O `ContextVar` guarda o identificador de correlação da requisição atual, e funciona tanto com threads quanto com `asyncio`. Um middleware o preenche no início de cada requisição:
+
+```python
+import uuid
+
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+
+@app.middleware("http")
+async def definir_correlation_id(request: Request, call_next):
+    valor = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+    token = correlation_id.set(valor)
+    try:
+        resposta = await call_next(request)
+    finally:
+        correlation_id.reset(token)
+    resposta.headers["X-Correlation-ID"] = valor
+    return resposta
+```
+
+Regras: log vai para a saída padrão (quem coleta é a plataforma), nível `INFO` para eventos de negócio, `WARNING` para o que se recuperou sozinho, `ERROR` para o que precisa de atenção. Nunca registre senhas, tokens ou dados de cartão. A biblioteca `structlog` oferece o mesmo resultado com menos código, se o time preferir.
+
+## Métricas com Prometheus e traces com OpenTelemetry
+
+Métricas são números agregados ao longo do tempo, baratos de guardar e ideais para alertas e painéis. O cliente oficial do Prometheus para Python expõe contadores, histogramas e medidores num endpoint que o servidor coleta periodicamente:
+
+```python
+import time
+
+from fastapi import Request
+from prometheus_client import Counter, Histogram, make_asgi_app
+
+REQUISICOES = Counter(
+    "http_requisicoes_total", "Requisicoes HTTP", ["metodo", "rota", "status"]
+)
+LATENCIA = Histogram(
+    "http_requisicao_segundos",
+    "Latencia das requisicoes",
+    ["metodo", "rota"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
+)
+PEDIDOS_PAGOS = Counter("pedidos_pagos_total", "Pedidos confirmados como pagos")
+
+app.mount("/metrics", make_asgi_app())
+
+
+@app.middleware("http")
+async def medir(request: Request, call_next):
+    inicio = time.perf_counter()
+    resposta = await call_next(request)
+    rota = request.scope.get("route")
+    modelo = rota.path if rota else "desconhecida"
+    LATENCIA.labels(request.method, modelo).observe(time.perf_counter() - inicio)
+    REQUISICOES.labels(request.method, modelo, resposta.status_code).inc()
+    return resposta
+```
+
+O rótulo usa o **modelo da rota** (`/pedidos/{pedido_id}`), não a URL real: cada valor distinto de rótulo cria uma série temporal, e ids em rótulos explodem a cardinalidade e derrubam o Prometheus. Com vários workers do Gunicorn, cada processo tem seus contadores; o cliente oferece um modo multiprocesso, configurado pela variável `PROMETHEUS_MULTIPROC_DIR`. Para serviços, o método **RED** organiza o que medir (taxa de requisições, erros, duração); para recursos como filas e pools, o **USE** (utilização, saturação, erros). Percentis vêm do histograma com `histogram_quantile` no PromQL, e média de latência esconde exatamente os usuários que estão sofrendo.
+
+Traces mostram o caminho de uma requisição por vários serviços: cada etapa é um *span* com início, duração e atributos, e o contexto viaja entre serviços no cabeçalho `traceparent` (padrão W3C). O OpenTelemetry é o padrão aberto para isso, com instrumentação automática para FastAPI, Django, `httpx`, SQLAlchemy e outros:
+
+```bash
+pip install opentelemetry-distro opentelemetry-exporter-otlp
+opentelemetry-bootstrap -a install
+export OTEL_SERVICE_NAME=pedidos
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+opentelemetry-instrument uvicorn ingressos.main:app --host 0.0.0.0 --port 8000
+```
+
+O `opentelemetry-bootstrap` instala os pacotes de instrumentação das bibliotecas que encontrar no ambiente, e o `opentelemetry-instrument` os ativa sem mudar código. Spans de negócio entram manualmente onde agregam informação:
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("ingressos.pedidos")
+
+
+def confirmar_pagamento(pedido_id: int) -> None:
+    with tracer.start_as_current_span("confirmar_pagamento") as span:
+        span.set_attribute("pedido.id", pedido_id)
+        gerar_ingressos(pedido_id)
+```
+
+Os dados vão para um OpenTelemetry Collector, que os encaminha para o backend escolhido (Jaeger, Tempo, um serviço gerenciado). O ganho real aparece quando os três sinais se ligam: o log carrega o `trace_id`, a métrica de latência alta leva ao trace lento, e o trace mostra que 1,8 s dos 2 s foram uma consulta sem índice no `catalogo`.
+
+<Callout type="tip" title="Amostragem de traces">
+Guardar 100% dos traces de um sistema com alto tráfego custa caro. Comece com amostragem por proporção (por exemplo, 10%, configurável por `OTEL_TRACES_SAMPLER`) e, quando o backend permitir, use amostragem por cauda no Collector, que guarda todos os traces com erro ou lentos e só uma fração dos normais.
+</Callout>
+
+## SLI, SLO e o que alertar
+
+Um **SLI** (indicador de nível de serviço) é uma medida do que o usuário sente, como a proporção de requisições de compra respondidas com sucesso em menos de 500 ms. O **SLO** é a meta para esse indicador numa janela: 99,5% em 28 dias. O SLA é o contrato comercial, com multa, e costuma ser mais frouxo que o SLO.
+
+| Jornada | SLI | SLO |
+|---|---|---|
+| Ver página do evento | Requisições 2xx em menos de 300 ms | 99,9% |
+| Comprar ingresso | Checkouts concluídos sem erro do servidor | 99,5% |
+| Receber ingresso | E-mails entregues em menos de 5 min após o pagamento | 99% |
+
+A diferença entre 100% e o SLO é o **orçamento de erro**: 0,5% de 28 dias são cerca de 3 horas e 20 minutos de falha permitidos. Enquanto há orçamento, o time entrega funcionalidades; quando ele está acabando, prioriza confiabilidade. Os alertas também mudam: em vez de alarmar por CPU alta (que pode não afetar ninguém), alerta-se pela **taxa de consumo do orçamento**. Um alerta rápido dispara quando a taxa atual esgotaria o mês em poucos dias (exige ação imediata); um lento, quando a erosão é constante (vira tarefa). Todo alerta que acorda alguém deve ser acionável e ter um runbook dizendo o que verificar.
+
+## Na entrevista
+
+**O que torna um serviço stateless e por que isso importa?** Nada que precise sobreviver entre requisições fica no processo: sessão, arquivos, cache compartilhado e locks vão para serviços externos. Assim qualquer instância atende qualquer requisição, e o balanceador e o autoscaler podem adicionar ou matar instâncias livremente.
+
+**Como funciona um circuit breaker?** Fechado, ele deixa as chamadas passarem e conta falhas; ao atingir o limite, abre e passa a falhar imediatamente, sem chamar a dependência; depois de um tempo, fica meio aberto e deixa uma chamada de teste decidir se fecha ou reabre. Protege a dependência e evita que workers fiquem presos esperando.
+
+**Qual a diferença entre bulkhead e rate limit?** O bulkhead limita quanto de um recurso interno (workers, conexões) cada dependência pode ocupar, para que uma falha não contamine o resto. O rate limit limita quanto cada cliente pode pedir ao sistema, protegendo-o de abuso e de picos de um único chamador.
+
+**Logs, métricas e traces: quando usar cada um?** Métricas para saber que algo está errado e alertar, porque são baratas e agregadas. Traces para descobrir onde, seguindo a requisição entre serviços. Logs para entender o porquê, com o detalhe do evento específico, ligados ao trace pelo `trace_id`.
+
+**O que é orçamento de erro?** É a margem de falha que o SLO permite, por exemplo 0,5% das requisições num período. Ele transforma confiabilidade em decisão objetiva: com orçamento sobrando, o time arrisca mais em entregas; com ele esgotado, foca em estabilidade.
+
+## Pratique
+
+1. Rode a API de pedidos com Gunicorn e 4 workers atrás de um balanceador local com duas instâncias, e elimine todo estado em memória que quebrar nesse arranjo.
+2. Coloque cache-aside com Redis na página do evento, invalidando na atualização, e meça com um teste de carga a diferença de latência e de consultas ao banco.
+3. Proteja a chamada ao serviço de pagamentos com timeout, retry com jitter, circuit breaker e um semáforo de bulkhead, e simule o pagamento lento para ver o resto da API continuar respondendo.
+4. Adicione logs JSON com `correlation_id`, o endpoint `/metrics` com os contadores RED e a instrumentação OpenTelemetry nos serviços `pedidos` e `pagamentos`, enviando para um Jaeger local.
+5. Escreva os SLOs das três jornadas da tabela e as consultas PromQL que calculam cada SLI.
+
+<Quiz question="Qual é o principal risco de usar o id do pedido como rótulo de uma métrica Prometheus?" options={["O contador deixar de ser monotônico","Explosão de cardinalidade, com uma série temporal por pedido","Perda de precisão nos histogramas","O endpoint de métricas exigir autenticação"]} answer={1} explanation="Cada combinação distinta de rótulos é uma série temporal. Valores ilimitados, como ids, criam milhões de séries e sobrecarregam o Prometheus. Use o modelo da rota." />
+
+<Quiz question="Um circuit breaker no estado aberto:" options={["Repete a chamada com backoff exponencial","Envia todas as chamadas para uma réplica","Falha imediatamente sem chamar a dependência até o tempo de espera passar","Aumenta o timeout das chamadas"]} answer={2} explanation="Aberto, o breaker não toca a dependência e devolve erro na hora, aliviando o serviço com problema. Depois da espera, passa a meio aberto e testa com uma chamada." />
+
+<Quiz question="O cliente paga e, na tela seguinte, o pedido aparece como pendente. Qual a causa provável numa arquitetura com réplicas de leitura?" options={["Atraso de replicação: a leitura foi para a réplica antes de receber a escrita","O cache do navegador","Falta de índice na tabela de pedidos","O circuit breaker do pagamento abriu"]} answer={0} explanation="Réplicas assíncronas ficam um pouco atrás do primário. Leituras que precisam refletir a própria escrita do usuário devem ir ao primário." />
+
+## Base no CodeForge
+
+- [Microsserviços em Python: Comunicação, testes e resiliência](/learn/carreira-python/microsservicos-python-comunicacao-testes-resiliencia): os serviços que este capítulo põe sob carga.
+- [Circuit breaker](/learn/system-design/circuit-breaker), [Bulkhead](/learn/system-design/bulkhead) e [Rate limiting](/learn/system-design/rate-limiting): cada padrão em detalhe.
+- [Estratégias de cache](/learn/system-design/estrategias-de-cache), [Replicação](/learn/system-design/replicacao) e [CQRS](/learn/system-design/cqrs): a parte de dados da escala.
+- [Três pilares da observabilidade](/learn/system-design/tres-pilares) e [Tracing distribuído](/learn/system-design/tracing-distribuido): a teoria dos sinais.
+- [Padrões arquiteturais na Carreira Java](/learn/carreira-java/padroes-arquiteturais-software-escala-resiliencia-observabilidade): os mesmos padrões com Spring e Resilience4j.
+
+## Referências
+
+- [OpenTelemetry: Python](https://opentelemetry.io/docs/languages/python/)
+- [Prometheus: Python client](https://prometheus.github.io/client_python/)
+- [Google SRE Book: Service Level Objectives](https://sre.google/sre-book/service-level-objectives/)
+- [Python: logging HOWTO](https://docs.python.org/3/howto/logging.html)
