@@ -1,0 +1,672 @@
+---
+title: "Kubernetes: Garantindo e protegendo a aplicação com o Istio"
+kind: lesson
+---
+
+A plataforma `ingressos` está no cluster, empacotada no chart do capítulo anterior, com os quatro serviços conversando pelo DNS. Funciona, mas cada garantia que importa entre eles mora no código Python: o `pedidos` tem timeout, retry com backoff e um circuit breaker caseiro para chamar o `catalogo` e o `pagamentos`, e cada serviço repete a mesma lógica com pequenas diferenças. O tráfego entre os Pods anda em texto puro, e qualquer Pod do cluster que descubra o nome `ingressos-pagamentos` consegue pedir uma cobrança. Para soltar uma versão nova do `pagamentos` para 10% das chamadas, não há ferramenta: ou todo mundo recebe a versão nova, ou ninguém.
+
+Um **service mesh** tira essas preocupações de rede de dentro de cada serviço e as coloca numa camada de proxies gerenciada por configuração. Este capítulo instala o **Istio** e o usa para duas coisas: **garantir** a aplicação (roteamento, canário, timeouts, retries, circuit breaking e testes com falhas injetadas) e **protegê-la** (mTLS automático entre os serviços, identidade por ServiceAccount, autorização por serviço, método e caminho, e validação de JWT na borda). No fim, você verá o que o mesh não substitui e quando ele não vale o custo.
+
+**Você vai aprender:**
+
+- O que é um service mesh e como o Istio se organiza em control plane (istiod) e data plane (sidecar Envoy ou modo ambient)
+- Instalar o Istio, incluir o namespace no mesh e expor a plataforma com a Gateway API
+- Rotear tráfego com VirtualService e DestinationRule, incluindo canário por peso e por cabeçalho
+- Configurar timeouts, retries, circuit breaking e injeção de falhas, e decidir o que fica na aplicação Python
+- Ligar mTLS estrito, escrever AuthorizationPolicy com negação por padrão e validar JWT na borda
+- Ler métricas, traces e o grafo do Kiali, e avaliar o custo do mesh
+
+## O problema que o mesh resolve
+
+O capítulo de microsserviços colocou no `pedidos` um cliente `httpx` com timeout, uma função de retry com backoff e jitter e uma classe `CircuitBreaker`. Isso funciona para um serviço. Para quatro serviços, em três frameworks, mantidos por times diferentes, aparecem os problemas de sempre: cada um implementa de um jeito, a versão do `catalogo` não tem jitter, a do `pagamentos` faz retry de 500, e mudar a política exige um deploy de cada serviço. Criptografar o tráfego entre eles com TLS mútuo exigiria emitir, distribuir e rotacionar certificados para cada Pod. E a telemetria de "quem chama quem, com que latência e que taxa de erro" depende de cada time instrumentar direito.
+
+O mesh resolve isso colocando um proxy no caminho de toda conexão entre serviços. O proxy é o mesmo para todos, independente da linguagem, e é configurado por objetos do Kubernetes:
+
+| Preocupação | Sem mesh | Com Istio |
+|---|---|---|
+| Roteamento e canário | Um Service balanceia por conexão entre todas as réplicas | Divisão por peso, cabeçalho ou caminho, por requisição |
+| Timeout e retry | Código em cada cliente HTTP | VirtualService, igual para todos os chamadores |
+| Circuit breaking | Classe na aplicação, estado por processo | DestinationRule com limites de conexão e ejeção de réplicas doentes |
+| Criptografia entre serviços | Certificados manuais, ou nada | mTLS automático, certificados rotacionados pelo istiod |
+| Autorização serviço a serviço | Qualquer Pod chama qualquer Service | AuthorizationPolicy por identidade, método e caminho |
+| Telemetria | Instrumentação manual em cada serviço | Métricas e spans gerados pelos proxies |
+
+O mesh não conhece o seu domínio. Ele não sabe que um `POST /cobrancas` repetido cobra o cliente duas vezes, nem que, com o `catalogo` fora, o certo é servir o preço em cache. Essa fronteira, entre o que sai da aplicação e o que fica nela, é o fio deste capítulo.
+
+## Arquitetura do Istio
+
+O Istio tem duas partes:
+
+- **Control plane**: o **istiod**, um único Deployment no namespace `istio-system`. Ele lê os objetos do Istio e do Kubernetes, traduz tudo em configuração para os proxies e a envia por gRPC (o protocolo xDS do Envoy). Também é a autoridade certificadora do mesh: emite para cada carga um certificado de curta duração com a sua identidade.
+- **Data plane**: os proxies que realmente encaminham o tráfego. Aqui o Istio oferece dois modos.
+
+| | Modo sidecar | Modo ambient |
+|---|---|---|
+| Proxy | Um contêiner Envoy (`istio-proxy`) injetado em cada Pod | Um **ztunnel** por nó (L4: mTLS, identidade, autorização por porta) e **waypoints** opcionais por namespace ou serviço (L7: HTTP) |
+| Inclusão | Label `istio-injection=enabled` no namespace e reinício dos Pods | Label `istio.io/dataplane-mode=ambient`, sem reiniciar Pods |
+| Custo | CPU e memória de um Envoy por Pod, dois saltos de proxy por chamada | Bem menor: L7 só onde há waypoint |
+| Recursos L7 | Todos, em todo Pod | Só atrás de um waypoint, configurados de preferência com a Gateway API |
+| Maturidade | O modelo original, mais documentado | GA desde o Istio 1.24 |
+
+Os exemplos deste capítulo usam o **modo sidecar**. O motivo é didático: com um proxy dentro de cada Pod, fica explícito onde cada regra é aplicada (o lado de quem chama aplica roteamento, retry e circuit breaking; o lado de quem recebe aplica mTLS e autorização), e todos os recursos de VirtualService e DestinationRule funcionam sem peças extras. Os objetos de segurança são os mesmos no ambient; o que muda é que as regras L7 passam a ser aplicadas pelo waypoint. Para uma instalação nova em que o custo por Pod pesa, o ambient é a direção que o projeto recomenda avaliar.
+
+## Instalação
+
+A instalação mais direta é pelo `istioctl`, com um arquivo de configuração versionado. O perfil `minimal` instala só o istiod; a entrada da plataforma vai ser criada pela Gateway API, sem o gateway clássico do perfil `default`:
+
+```yaml
+# istio/instalacao.yaml
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  profile: minimal
+  components:
+    cni:
+      enabled: true
+  meshConfig:
+    accessLogFile: /dev/stdout
+    extensionProviders:
+      - name: otel
+        opentelemetry:
+          service: opentelemetry-collector.observabilidade.svc.cluster.local
+          port: 4317
+```
+
+```bash
+istioctl x precheck                                   # verifica se o cluster atende aos requisitos
+istioctl install -f istio/instalacao.yaml -y
+kubectl get crd gateways.gateway.networking.k8s.io || \
+  kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/standard-install.yaml
+
+kubectl label namespace ingressos-prod istio-injection=enabled
+kubectl rollout restart deployment -n ingressos-prod
+istioctl proxy-status                                 # cada Pod deve aparecer sincronizado com o istiod
+```
+
+O componente `cni` configura o redirecionamento de tráfego no nó. Sem ele, cada Pod recebe um init container `istio-init` que precisa das capabilities `NET_ADMIN` e `NET_RAW` para escrever regras de iptables, o que viola os Pod Security Standards. A injeção acontece por um webhook de admissão na criação do Pod, por isso o `rollout restart`: Pods já existentes continuam sem sidecar até serem recriados. Depois do reinício, `kubectl get pods` mostra `2/2` contêineres prontos.
+
+Como a plataforma já é instalada com Helm, vale saber que o Istio também tem charts oficiais (`istio/base`, `istio/cni`, `istio/istiod`). Em produção, atualizações do próprio Istio costumam usar **revisões**: um istiod novo instalado lado a lado com `--revision`, e namespaces migrados trocando o label `istio-injection` por `istio.io/rev`.
+
+<Callout type="warning" title="Jobs e a ordem de subida">
+O Job de migração do hook `pre-upgrade` não termina se o sidecar continuar rodando depois do `alembic upgrade head`. Nas versões atuais, o Istio injeta o proxy como sidecar nativo do Kubernetes (um init container com `restartPolicy: Always`), que encerra junto com o contêiner principal e sobe antes dele; confira se está ativo no seu cluster. Se não estiver, marque o Pod do Job com o label `sidecar.istio.io/inject: "false"`.
+</Callout>
+
+### Identidade por serviço no chart
+
+No mesh, a identidade de uma carga é a sua **ServiceAccount**. Se os quatro serviços usam a `default` do namespace, todos têm a mesma identidade e nenhuma regra consegue diferenciá-los. Acrescente ao chart uma ServiceAccount por serviço, sem token montado (eles não falam com a API do Kubernetes), e um label de versão nos Pods, que o Istio usa na telemetria e nos subsets:
+
+```yaml
+# ingressos/templates/serviceaccounts.yaml
+{{- range $nome, $svc := .Values.servicos }}
+{{- if $svc.habilitado }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $.Release.Name }}-{{ $nome }}
+automountServiceAccountToken: false
+{{- end }}
+{{- end }}
+```
+
+No `deployments.yaml`, o template do Pod ganha `serviceAccountName: {{ $.Release.Name }}-{{ $nome }}` e o label `app.kubernetes.io/version: {{ $svc.imagem.tag | quote }}`, fora do selector. O `pedidos` passa a ser `spiffe://cluster.local/ns/ingressos-prod/sa/ingressos-pedidos`.
+
+## A borda: Gateway API
+
+Até aqui, a plataforma só era acessível de dentro do cluster ou por `kubectl port-forward`. Expor HTTP para fora com um Service `LoadBalancer` por serviço significaria um balanceador de nuvem por serviço, sem roteamento por caminho e sem TLS. O que se quer é uma entrada única, que termine o TLS e roteie por host e caminho. O Kubernetes descreve isso com dois padrões: o antigo objeto `Ingress`, que depende de um controlador instalado à parte, e a **Gateway API** (`gateway.networking.k8s.io`), sua sucessora, com `Gateway` (o ponto de entrada: portas, protocolos, certificados) e `HTTPRoute` (as regras de roteamento), separados para que o time de plataforma cuide de um e os times de aplicação do outro.
+
+O Istio implementa a Gateway API e também tem um `Gateway` próprio (`networking.istio.io`), mais antigo. A plataforma usa a Gateway API, que o projeto recomenda para instalações novas, por três razões: é o padrão do Kubernetes, os manifestos funcionam com outras implementações, e o Istio cria sozinho o Deployment e o Service do gateway a partir do objeto, sem um controlador de Ingress ou um chart separado.
+
+O listener HTTPS precisa de um certificado num Secret do tipo `kubernetes.io/tls`, no mesmo namespace do Gateway. Para testar, um certificado autoassinado basta:
+
+```bash
+openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
+  -keyout tls.key -out tls.crt -subj "/CN=api.ingressos.com.br"
+kubectl create secret tls ingressos-tls -n ingressos-prod --cert=tls.crt --key=tls.key
+```
+
+Em produção, quem emite e renova o certificado é o **cert-manager**, com um `Certificate` apontando para um emissor como o Let's Encrypt; ele mantém o mesmo Secret `ingressos-tls` atualizado, e o gateway recarrega o certificado sem reinício.
+
+```yaml
+# istio/gateway.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ingressos
+  namespace: ingressos-prod
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: http
+      hostname: api.ingressos.com.br
+      port: 80
+      protocol: HTTP
+    - name: https
+      hostname: api.ingressos.com.br
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: ingressos-tls
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ingressos-redirecionar-https
+  namespace: ingressos-prod
+spec:
+  parentRefs:
+    - name: ingressos
+      sectionName: http
+  hostnames: ["api.ingressos.com.br"]
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ingressos-api
+  namespace: ingressos-prod
+spec:
+  parentRefs:
+    - name: ingressos
+      sectionName: https
+  hostnames: ["api.ingressos.com.br"]
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/eventos
+      backendRefs:
+        - name: ingressos-catalogo
+          port: 80
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/pedidos
+      backendRefs:
+        - name: ingressos-pedidos
+          port: 80
+```
+
+O Istio cria o Deployment `ingressos-istio`, com a ServiceAccount de mesmo nome, e um Service `LoadBalancer` para ele (`kubectl get gateway -n ingressos-prod` mostra o endereço atribuído; no kind, sem balanceador de nuvem, use `kubectl port-forward service/ingressos-istio 8443:443`). A primeira rota, presa ao listener HTTP pelo `sectionName`, só redireciona para HTTPS; a segunda, presa ao listener HTTPS, roteia por caminho. Só `catalogo` e `pedidos` ficam expostos: `pagamentos` é chamado apenas pelo `pedidos`, e `notificacoes` só consome da fila.
+
+Para o tráfego **dentro** do mesh, a plataforma usa os objetos do próprio Istio, VirtualService e DestinationRule. A Gateway API também pode descrever rotas internas (um `HTTPRoute` cujo `parentRefs` aponta para um Service), e é o caminho no modo ambient, mas ainda não cobre injeção de falhas, condições de retry detalhadas e a ejeção de réplicas doentes, e a maior parte dos clusters com Istio que você vai encontrar usa VirtualService. Escolha uma API por serviço: um VirtualService e um HTTPRoute para o mesmo host geram conflitos difíceis de diagnosticar.
+
+## VirtualService e DestinationRule
+
+Os dois objetos dividem o trabalho:
+
+| Objeto | Responde a | Exemplos |
+|---|---|---|
+| `VirtualService` | Para onde vai esta requisição? | Rotas por cabeçalho, caminho ou método; pesos entre versões; timeout; retry; injeção de falhas |
+| `DestinationRule` | Como tratar o tráfego depois de escolhido o destino? | Subsets por label, balanceamento, limites de conexão, ejeção de réplicas, TLS |
+
+Ambos são aplicados pelo proxy de **quem chama**: quando o `pedidos` chama `ingressos-pagamentos`, é o sidecar do `pedidos` que escolhe o subset, conta o timeout e decide repetir. Use sempre o nome completo do Service (`ingressos-pagamentos.ingressos-prod.svc.cluster.local`): um nome curto é interpretado no namespace do objeto, e o erro aparece quando alguém move a configuração.
+
+### Canário por peso e por cabeçalho
+
+A versão 1.6.0 do `pagamentos` troca a biblioteca do gateway de pagamento. O chart ganha um segundo Deployment, `ingressos-pagamentos-canario`, com os mesmos selector labels e `app.kubernetes.io/version: "1.6.0"`, e uma réplica. O Service continua o mesmo e seleciona as réplicas das duas versões; quem decide a proporção agora é o mesh:
+
+```yaml
+# istio/pagamentos-destinationrule.yaml
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: ingressos-pagamentos
+  namespace: ingressos-prod
+spec:
+  host: ingressos-pagamentos.ingressos-prod.svc.cluster.local
+  subsets:
+    - name: estavel
+      labels:
+        app.kubernetes.io/version: "1.5.2"
+    - name: canario
+      labels:
+        app.kubernetes.io/version: "1.6.0"
+```
+
+```yaml
+# istio/pagamentos-virtualservice.yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ingressos-pagamentos
+  namespace: ingressos-prod
+spec:
+  hosts:
+    - ingressos-pagamentos.ingressos-prod.svc.cluster.local
+  http:
+    - name: canario-por-cabecalho
+      match:
+        - headers:
+            x-canario:
+              exact: pagamentos
+      route:
+        - destination:
+            host: ingressos-pagamentos.ingressos-prod.svc.cluster.local
+            subset: canario
+    - name: padrao
+      route:
+        - destination:
+            host: ingressos-pagamentos.ingressos-prod.svc.cluster.local
+            subset: estavel
+          weight: 90
+        - destination:
+            host: ingressos-pagamentos.ingressos-prod.svc.cluster.local
+            subset: canario
+          weight: 10
+```
+
+As rotas são avaliadas em ordem, e a primeira que casa vence. Uma requisição com `x-canario: pagamentos` vai sempre para a versão nova, o que permite ao time testar em produção antes de liberar qualquer peso. As demais são divididas 90/10 **por requisição**, independentemente do número de réplicas: uma réplica do canário recebe 10% mesmo com cinco réplicas estáveis, algo que um Service sozinho não faz. A promoção é trocar os pesos (50/50, depois 0/100) e, por fim, atualizar o Deployment estável para 1.6.0 e remover o canário. O capítulo seguinte automatiza essa progressão no pipeline.
+
+O cabeçalho só chega ao `pagamentos` se o `pedidos` repassá-lo na chamada que faz, porque o sidecar não sabe que a chamada de saída pertence à requisição de entrada. Esse é o mesmo problema da propagação de traces, resolvido mais adiante. Para um canário de `catalogo` ou `pedidos` acessado de fora, a divisão fica no `HTTPRoute` da borda, com dois `backendRefs` (um Service por versão) e o campo `weight` em cada um.
+
+## Resiliência: timeout, retry e circuit breaking
+
+A chamada que mais importa ao `pedidos` é a reserva de lugares no `catalogo`. O `catalogo` atende leituras (`GET /api/eventos/...`), seguras de repetir, e a reserva (`POST /api/setores/.../reservas/`), que não é idempotente: repetir uma reserva cuja resposta se perdeu pode reservar o dobro.
+
+```yaml
+# istio/catalogo-virtualservice.yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: ingressos-catalogo
+  namespace: ingressos-prod
+spec:
+  hosts:
+    - ingressos-catalogo.ingressos-prod.svc.cluster.local
+  http:
+    - name: leituras
+      match:
+        - method:
+            exact: GET
+      route:
+        - destination:
+            host: ingressos-catalogo.ingressos-prod.svc.cluster.local
+      timeout: 2s
+      retries:
+        attempts: 3
+        perTryTimeout: 600ms
+        retryOn: connect-failure,refused-stream,reset,503
+    - name: escritas
+      route:
+        - destination:
+            host: ingressos-catalogo.ingressos-prod.svc.cluster.local
+      timeout: 2s
+      retries:
+        attempts: 2
+        retryOn: connect-failure,refused-stream
+```
+
+O `timeout` é o prazo total da requisição, incluindo as novas tentativas; o `perTryTimeout`, o de cada tentativa. Nas leituras, repetir em resposta 503 ou conexão reiniciada é seguro. Nas escritas, a rota repete só falhas que acontecem **antes** de a requisição chegar à aplicação: conexão recusada ou stream recusado. Um `reset` no meio da resposta, ou um 503 devolvido pelo `catalogo`, pode significar que a reserva foi feita.
+
+<Callout type="warning" title="O Istio já repete requisições sem você pedir">
+Mesmo sem VirtualService, o proxy aplica uma política padrão de retry: duas novas tentativas para falhas de conexão e respostas 503, inclusive em `POST`. Para operações não idempotentes, declare `retries` explicitamente com condições seguras, ou `attempts: 0`. E a chave de idempotência do capítulo de microsserviços continua obrigatória no `POST /cobrancas`: ela é o que torna qualquer retentativa segura, venha da aplicação, do mesh ou do usuário clicando duas vezes.
+</Callout>
+
+O circuit breaking fica na DestinationRule, e o Istio o divide em duas peças:
+
+```yaml
+# istio/catalogo-destinationrule.yaml
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: ingressos-catalogo
+  namespace: ingressos-prod
+spec:
+  host: ingressos-catalogo.ingressos-prod.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 500ms
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 200
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+```
+
+O **`connectionPool`** limita quanto cada sidecar chamador manda para o `catalogo`. Acima de 100 conexões e 50 requisições na fila, as próximas falham na hora com 503 (e a flag `UO`, upstream overflow, no log do proxy), em vez de ficarem esperando e prendendo workers do `pedidos`. É o "falhar rápido" do circuit breaker. O **`outlierDetection`** observa cada réplica: uma que devolve cinco erros 5xx seguidos sai do balanceamento por 30 segundos, com tempo crescente a cada reincidência, e nunca mais da metade das réplicas é ejetada. É diferente do circuit breaker da aplicação, que abre para a dependência inteira: aqui uma réplica doente (presa num deadlock, sem conexão com o banco) é isolada enquanto as outras continuam atendendo.
+
+### O que sai da aplicação e o que fica
+
+| Responsabilidade | Onde fica | Por quê |
+|---|---|---|
+| Retry de falhas de transporte em chamadas internas | Mesh | Uma política só, sem multiplicar tentativas entre camadas |
+| Limite de conexões e ejeção de réplicas | Mesh | O proxy vê cada réplica; a aplicação só vê o Service |
+| Timeout da chamada | Os dois | O mesh corta a requisição; a aplicação precisa do próprio prazo para liberar o worker e responder ao seu cliente |
+| Idempotência | Aplicação | Só o serviço sabe o que é "a mesma operação" |
+| Fallback e degradação | Aplicação | Servir o preço em cache ou aceitar o pedido para cobrar depois é decisão de negócio |
+| Tratar 503 e 504 do mesh | Aplicação | O `httpx` recebe uma resposta normal, que deve virar `CatalogoIndisponivel` |
+
+Na prática, o `com_retry` sai das chamadas HTTP internas do `pedidos`, para não somar às tentativas do proxy, e o `CircuitBreaker` caseiro dá lugar ao `connectionPool` e ao `outlierDetection`. O timeout do `httpx` fica um pouco acima do timeout do VirtualService, para que a resposta 504 do proxy chegue antes, e a exceção de domínio continua sendo levantada para status 503 e 504, como para erros de transporte.
+
+## Testando com injeção de falhas
+
+Configurar timeout é fácil; saber se o sistema se comporta bem quando ele estoura é outra coisa. O Istio injeta falhas no proxy de quem chama, sem mexer no código:
+
+```yaml
+# istio/catalogo-virtualservice.yaml (rota extra, antes de "leituras")
+    - name: teste-de-falha
+      match:
+        - headers:
+            x-teste-falha:
+              exact: catalogo
+      fault:
+        delay:
+          percentage:
+            value: 100
+          fixedDelay: 3s
+        abort:
+          percentage:
+            value: 20
+          httpStatus: 503
+      route:
+        - destination:
+            host: ingressos-catalogo.ingressos-prod.svc.cluster.local
+```
+
+Requisições com o cabeçalho `x-teste-falha: catalogo` esperam 3 segundos e, em 20% dos casos, recebem 503 sem que o `catalogo` seja chamado. O que se observa é o `pedidos`: com o timeout de 2 segundos do `httpx`, ele deve desistir antes dos 3, responder 503 com `Retry-After` ao cliente e registrar o erro com o `X-Request-ID`. Se em vez disso o `pedidos` travar ou devolver 500 com stack trace, o teste achou um defeito antes do cliente. Restringir a falha a um cabeçalho permite rodar o teste em homologação, ou com muito cuidado em produção, sem afetar o tráfego real. A documentação do Istio avisa que falhas injetadas não acionam os retries e timeouts da mesma rota; a rota de teste existe justamente para exercitar o comportamento da aplicação.
+
+## Segurança: mTLS e identidade
+
+Com os sidecars no lugar, o Istio já usa **mTLS automático**: quando os dois lados têm proxy, a conexão é criptografada e cada lado apresenta um certificado emitido pelo istiod, válido por 24 horas e renovado sozinho. A aplicação continua falando HTTP simples com o `localhost`; quem cifra é o proxy.
+
+O certificado carrega a identidade no formato **SPIFFE**, derivada da ServiceAccount: `spiffe://cluster.local/ns/ingressos-prod/sa/ingressos-pedidos`. É essa identidade, verificada criptograficamente, que as regras de autorização usam, e não o IP do Pod, que muda a cada reinício.
+
+O modo padrão é `PERMISSIVE`: o proxy aceita mTLS e também texto puro, para que cargas fora do mesh continuem funcionando durante a migração. Quando todos os Pods tiverem sidecar, exija mTLS em todo o mesh:
+
+```yaml
+# istio/peerauthentication.yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+```
+
+No namespace raiz (`istio-system`), a política vale para todo o mesh; num namespace, só para ele; com `selector`, para uma carga. O `STRICT` controla o lado de quem **recebe**: um cliente sem sidecar, como um CronJob num namespace fora do mesh, passa a ter a conexão recusada. Antes de ligar, confira no Kiali ou nas métricas (`connection_security_policy`) se ainda há tráfego em texto puro. As probes do kubelet continuam funcionando, porque o injetor as reescreve para passar pelo agente do sidecar.
+
+## Autorização: negar por padrão
+
+mTLS garante que o `pagamentos` sabe **quem** está chamando. A **AuthorizationPolicy** decide se esse alguém **pode**. Ela é aplicada pelo proxy de quem recebe, e a avaliação segue uma ordem fixa: políticas `CUSTOM` (autorização externa), depois `DENY`, depois `ALLOW`. Se existe ao menos uma política `ALLOW` para a carga e nenhuma casa com a requisição, ela é negada.
+
+O ponto de partida é negar tudo no namespace. Uma política com `spec` vazio é uma `ALLOW` sem regras, que não permite nada:
+
+```yaml
+# istio/autorizacao-padrao.yaml
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: negar-tudo
+  namespace: ingressos-prod
+spec: {}
+```
+
+A partir daí, cada fluxo da arquitetura é liberado do lado de quem recebe:
+
+```yaml
+# istio/autorizacao-servicos.yaml
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: pagamentos
+  namespace: ingressos-prod
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pagamentos
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/ingressos-prod/sa/ingressos-pedidos"]
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["/cobrancas"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: catalogo
+  namespace: ingressos-prod
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: catalogo
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/ingressos-prod/sa/ingressos-pedidos"]
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            paths: ["/api/*"]
+    - from:
+        - source:
+            principals: ["cluster.local/ns/ingressos-prod/sa/ingressos-istio"]
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/api/eventos", "/api/eventos/*"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: pedidos
+  namespace: ingressos-prod
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/ingressos-prod/sa/ingressos-istio"]
+```
+
+Dentro de uma regra, `from` e `to` precisam casar juntos; regras diferentes na lista são alternativas. Os `principals` só existem com mTLS, por isso a autorização por identidade depende do `STRICT`: uma conexão em texto puro não tem principal e não casa com nenhuma regra. Além de `principals`, `source` aceita `namespaces` (por exemplo, liberar o Prometheus do namespace `observabilidade` na porta de métricas), e `to.operation` aceita `ports` e `hosts`. O `notificacoes` não tem regra nenhuma e continua coberto pelo `negar-tudo`: ninguém deveria chamá-lo.
+
+Agora um Pod comprometido no `notificacoes`, ou em qualquer outro namespace, não consegue pedir uma cobrança: a conexão chega ao proxy do `pagamentos`, que responde 403 (`RBAC: access denied`) sem tocar na aplicação. Para depurar uma negação, `istioctl x authz check` mostra as políticas que se aplicam a um Pod, e o log de acesso do proxy registra a política que negou.
+
+## JWT na borda: RequestAuthentication
+
+O cliente final não tem certificado do mesh; ele se autentica com um JWT emitido pelo provedor de identidade da plataforma. A **RequestAuthentication** diz ao gateway como validar esse token: emissor, chaves públicas e, opcionalmente, quais claims repassar como cabeçalho.
+
+```yaml
+# istio/jwt-borda.yaml
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: jwt-borda
+  namespace: ingressos-prod
+spec:
+  targetRefs:
+    - kind: Gateway
+      group: gateway.networking.k8s.io
+      name: ingressos
+  jwtRules:
+    - issuer: https://auth.ingressos.com.br
+      jwksUri: https://auth.ingressos.com.br/.well-known/jwks.json
+      outputClaimToHeaders:
+        - header: x-usuario-id
+          claim: sub
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: borda
+  namespace: ingressos-prod
+spec:
+  targetRefs:
+    - kind: Gateway
+      group: gateway.networking.k8s.io
+      name: ingressos
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/api/eventos", "/api/eventos/*"]
+    - from:
+        - source:
+            requestPrincipals: ["https://auth.ingressos.com.br/*"]
+      to:
+        - operation:
+            paths: ["/api/pedidos", "/api/pedidos/*"]
+```
+
+A peça que mais confunde: a RequestAuthentication **rejeita token inválido** (assinatura errada, expirado, emissor desconhecido), mas **aceita requisição sem token**. Sozinha, ela não protege nada. Quem exige o token é a AuthorizationPolicy, com `requestPrincipals`: o principal de um JWT válido tem o formato `emissor/sub`, e o padrão com `*` aceita qualquer usuário daquele emissor. O resultado: a vitrine de eventos é pública, e `/api/pedidos` sem token recebe 403 no gateway. A política `borda` também é necessária por outro motivo: o `negar-tudo` sem selector vale para todas as cargas do namespace, inclusive o Pod do gateway.
+
+O `pedidos` recebe o identificador do usuário no cabeçalho `x-usuario-id` e pode confiar nele porque a AuthorizationPolicy garante que só o gateway o chama. Essa confiança é a razão de as duas políticas andarem juntas: se outro serviço pudesse chamar o `pedidos` diretamente, poderia forjar o cabeçalho. Regras de negócio, como "o usuário só vê os próprios pedidos", continuam na aplicação.
+
+## Observabilidade
+
+Cada sidecar exporta métricas no formato do Prometheus para todo o tráfego que passa por ele, com os mesmos rótulos em todos os serviços:
+
+| Métrica | O que mede |
+|---|---|
+| `istio_requests_total` | Requisições, com `source_workload`, `destination_workload`, `response_code` e `response_flags` |
+| `istio_request_duration_milliseconds` | Histograma de latência, de onde saem p95 e p99 |
+| `istio_tcp_sent_bytes_total` | Tráfego TCP, útil para o RabbitMQ e o Postgres |
+
+A taxa de erros do `pedidos` para o `catalogo`, por versão, vira uma consulta, sem uma linha de instrumentação. É essa métrica que o pipeline do próximo capítulo pode consultar para decidir se o canário avança ou volta. As `response_flags` explicam erros que a aplicação nunca viu: `UO` (limite do `connectionPool`), `UH` (nenhuma réplica saudável), `UT` (timeout do proxy), `DI` e `FI` (falhas injetadas).
+
+Os proxies também geram **spans** de tracing, enviados ao provedor `otel` declarado na instalação. A amostragem é configurada com a Telemetry API:
+
+```yaml
+# istio/telemetria.yaml
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: otel
+      randomSamplingPercentage: 5
+```
+
+Há um limite importante: o proxy vê uma requisição chegando ao `pedidos` e outra saindo para o `catalogo`, mas não tem como saber que a segunda foi causada pela primeira. Quem liga as duas é a aplicação, repassando os cabeçalhos de contexto. Sem isso, o trace se parte em pedaços soltos. É a extensão natural do middleware de correlação do capítulo de microsserviços:
+
+```python
+# compartilhado/propagacao.py
+from contextvars import ContextVar
+
+import httpx
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+CABECALHOS = ("x-request-id", "traceparent", "tracestate", "baggage", "x-canario")
+
+contexto_entrada: ContextVar[dict[str, str]] = ContextVar("contexto_entrada", default={})
+
+
+class PropagacaoMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        recebidos = {nome: request.headers[nome] for nome in CABECALHOS if nome in request.headers}
+        token = contexto_entrada.set(recebidos)
+        try:
+            return await call_next(request)
+        finally:
+            contexto_entrada.reset(token)
+
+
+async def propagar_contexto(request: httpx.Request) -> None:
+    for nome, valor in contexto_entrada.get().items():
+        request.headers.setdefault(nome, valor)
+```
+
+O hook entra no cliente com `httpx.AsyncClient(event_hooks={"request": [propagar_contexto]})`. O `traceparent` e o `tracestate` são o padrão W3C Trace Context; o `x-canario` vai junto para que o canário por cabeçalho atravesse os serviços. Se a aplicação usa o SDK do OpenTelemetry com as instrumentações de FastAPI, Django e httpx, a propagação do contexto de trace é automática e ainda gera spans internos (a consulta ao banco, a publicação no RabbitMQ); o hook continua útil para os cabeçalhos próprios, como `x-canario`.
+
+O **Kiali** junta métricas e configuração num grafo do mesh: quem chama quem, com que taxa de erro, se a conexão usa mTLS e quais VirtualServices se aplicam a cada serviço. Ele também valida a configuração e aponta erros comuns, como um subset sem Pods ou uma rota para um host inexistente. Os manifestos de exemplo em `samples/addons` do pacote do Istio sobem Kiali, Prometheus e Jaeger para estudo (`istioctl dashboard kiali`); em produção, use instalações próprias desses componentes.
+
+## Custos e quando não usar
+
+O mesh não é gratuito:
+
+- **Recursos**: no modo sidecar, cada Pod ganha um Envoy, que consome dezenas de megabytes de memória e CPU proporcional ao tráfego. Esses recursos contam na ResourceQuota do namespace e precisam de requests próprios (as annotations `sidecar.istio.io/proxyCPU` e `sidecar.istio.io/proxyMemory`).
+- **Latência**: toda chamada atravessa dois proxies, o que acrescenta frações de milissegundo a alguns milissegundos por salto.
+- **Operação**: mais um sistema crítico para atualizar (com revisões, a cada poucos meses), monitorar e entender. Quando o mesh falha, tudo falha; um erro numa AuthorizationPolicy derruba fluxos inteiros.
+- **Depuração**: um 503 pode vir da aplicação, do proxy de quem chama ou do de quem recebe. Ler `response_flags` e usar `istioctl proxy-config` e `istioctl analyze` vira parte do dia a dia.
+
+O mesh se paga quando há muitos serviços, vários times e linguagens, requisito de criptografia e autorização entre serviços (conformidade, zero trust), ou necessidade de entregas progressivas por tráfego. Para dois ou três serviços mantidos por um time, bibliotecas na aplicação, NetworkPolicy e um gateway simples na borda costumam bastar. Se o problema é só mTLS e autorização L4, o modo ambient sem waypoints, ou alternativas mais leves como Linkerd e o mesh do Cilium, entregam isso com custo menor.
+
+## O que o Istio não substitui
+
+O mesh protege o tráfego entre serviços. Ele não protege o cluster, os contêineres nem os segredos, e a segurança nativa do Kubernetes continua necessária:
+
+- **RBAC da API do Kubernetes**: AuthorizationPolicy controla requisições entre serviços; quem pode criar Pods, ler Secrets ou mudar uma AuthorizationPolicy é o RBAC. O pipeline usa uma identidade com Role restrita ao namespace (e permissão sobre os objetos do Istio), nunca `cluster-admin`. Quem pode editar a política de autorização efetivamente controla a segurança do mesh.
+- **securityContext e Pod Security Standards**: contêineres sem root, com `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, `readOnlyRootFilesystem` e `seccompProfile: RuntimeDefault`, impostos por namespace com o label `pod-security.kubernetes.io/enforce`. O plugin CNI do Istio é o que permite manter o namespace sob esses perfis.
+- **NetworkPolicy como defesa em profundidade**: a AuthorizationPolicy é aplicada pelo proxy dentro do Pod; um Pod sem sidecar, uma porta excluída do redirecionamento ou uma falha de configuração passam por fora dela. Uma NetworkPolicy de negar por padrão, aplicada pelo CNI no kernel, segura o movimento lateral nesses casos. Lembre de liberar o DNS, a saída para o istiod (porta 15012) e a entrada vinda do gateway.
+- **Secrets**: o mTLS não cifra o etcd. Ative a criptografia em repouso dos Secrets (com KMS, de preferência), restrinja a leitura de Secrets pelo RBAC e mantenha os valores num cofre externo (Azure Key Vault, AWS Secrets Manager, Vault), sincronizado para o cluster pelo **External Secrets Operator**, para que senhas não passem pelo Git nem pelo `values.yaml`.
+- **Cadeia de suprimentos**: uma imagem com CVE crítica roda igual dentro do mesh. Varredura com Trivy e `pip-audit` no CI e imagens referenciadas por digest continuam valendo.
+
+Uma frase resume a divisão: o Kubernetes decide o que pode rodar e com que privilégios; o Istio decide quem pode falar com quem, e como.
+
+## Na entrevista
+
+**O que é um service mesh e que problema ele resolve?** É uma camada de proxies que intercepta o tráfego entre serviços e é configurada centralmente. Ela tira da aplicação as preocupações de rede repetidas em cada serviço, como roteamento, retry, timeout, circuit breaking, mTLS, autorização entre serviços e telemetria, e aplica tudo de forma uniforme, independente da linguagem.
+
+**Qual a diferença entre o modo sidecar e o ambient do Istio?** No sidecar, cada Pod recebe um Envoy que trata L4 e L7. No ambient, um ztunnel por nó faz mTLS, identidade e autorização L4, e waypoints opcionais fazem o processamento L7 só onde é preciso. O ambient custa menos e não exige reiniciar Pods para entrar no mesh; o sidecar oferece todos os recursos L7 em todo Pod.
+
+**Para que servem VirtualService e DestinationRule?** O VirtualService decide para onde a requisição vai e com que política: rotas por cabeçalho ou caminho, pesos entre versões, timeout, retry e injeção de falhas. A DestinationRule define o que acontece depois de escolhido o destino: subsets por label, balanceamento, limites de conexão e ejeção de réplicas. Os dois são aplicados no proxy de quem chama.
+
+**Se o mesh faz retry, a aplicação ainda precisa de idempotência?** Precisa. Quem repete não distingue "não executou" de "executou e a resposta se perdeu". O mesh deve repetir operações não idempotentes só em falhas anteriores ao envio, como conexão recusada, e a chave de idempotência no servidor é o que torna qualquer retentativa segura. Também é preciso lembrar que o Istio tem uma política padrão de retry.
+
+**Como você garante que só o `pedidos` chama o `pagamentos`?** Com mTLS estrito via PeerAuthentication, uma ServiceAccount por serviço e uma AuthorizationPolicy no `pagamentos` que libera apenas o principal da ServiceAccount do `pedidos`, no método e caminho certos, sobre uma política de negar tudo no namespace. Como defesa em profundidade, uma NetworkPolicy faz o mesmo isolamento no nível de rede.
+
+**Por que uma RequestAuthentication sozinha não protege a rota?** Porque ela só rejeita tokens inválidos; uma requisição sem token passa. É preciso uma AuthorizationPolicy exigindo `requestPrincipals` para que o token seja obrigatório.
+
+## Pratique
+
+1. Instale o Istio no cluster kind com o arquivo de configuração deste capítulo (perfil `minimal` e CNI), inclua o namespace da plataforma no mesh, reinicie os Deployments e confirme `2/2` nos Pods e o sincronismo com `istioctl proxy-status`.
+2. Acrescente ao chart as ServiceAccounts por serviço e o label `app.kubernetes.io/version`, crie o Secret TLS, o `Gateway` e os dois `HTTPRoute` da Gateway API e acesse `https://api.ingressos.com.br/api/eventos` pelo Service criado para o gateway (com `curl --resolve` e `-k` para o certificado autoassinado), confirmando que HTTP redireciona para HTTPS.
+3. Suba um canário do `pagamentos`, crie a DestinationRule com subsets e o VirtualService com rota por cabeçalho e pesos 90/10. Gere cem chamadas e conte, pelas métricas ou pelos logs, quantas foram para cada versão; depois promova para 50/50 e 0/100.
+4. Configure timeout, retries diferentes para leituras e escritas e o circuit breaking do `catalogo`. Use a rota de injeção de falhas para provar que o `pedidos` responde 503 com `Retry-After` em vez de travar, e remova o `com_retry` das chamadas internas.
+5. Aplique `negar-tudo`, as políticas por serviço, o `STRICT` e a validação de JWT na borda. Prove com `kubectl exec` num Pod do `notificacoes` que `curl http://ingressos-pagamentos/cobrancas` recebe 403, e que `/api/pedidos` sem token também recebe 403 no gateway.
+
+<Quiz question="Há uma RequestAuthentication no gateway e nenhuma AuthorizationPolicy para ele. O que acontece com uma requisição a /api/pedidos sem o cabeçalho Authorization?" options={["É rejeitada com 401 pela RequestAuthentication","É aceita, porque a RequestAuthentication só rejeita tokens inválidos","É rejeitada com 403 pelo mTLS","Fica pendente até o token ser enviado"]} answer={1} explanation="A RequestAuthentication valida tokens presentes, mas não exige que existam. Tornar o token obrigatório é papel de uma AuthorizationPolicy com requestPrincipals." />
+
+<Quiz question="Um VirtualService divide o tráfego do pagamentos em 90 para o subset estável e 10 para o canário. O estável tem 9 réplicas e o canário 1. Que fração das requisições o canário recebe?" options={["10%, porque o proxy divide por requisição segundo os pesos","Cerca de 1 em cada 10 conexões, pela contagem de réplicas do Service","50%, porque são dois subsets","Depende do HPA"]} answer={0} explanation="Com o mesh, o peso é aplicado por requisição pelo proxy de quem chama, independentemente do número de réplicas de cada versão. Um Service sozinho distribuiria pela contagem de réplicas." />
+
+<Quiz question="Qual configuração de retry é adequada para o POST de reserva no catalogo, que não é idempotente?" options={["attempts 5 com retryOn 5xx","Nenhuma configuração, porque o Istio não repete requisições por padrão","retryOn apenas connect-failure e refused-stream, falhas que ocorrem antes de a requisição chegar à aplicação","retryOn reset e 503 com perTryTimeout curto"]} answer={2} explanation="Repetir após 5xx, reset ou 503 pode duplicar uma reserva que já foi feita. Conexão e stream recusados garantem que a aplicação não recebeu a requisição. E o Istio tem, sim, uma política padrão de retry que inclui 503." />
+
+<Quiz question="Com PeerAuthentication STRICT e as AuthorizationPolicies do capítulo, por que ainda manter NetworkPolicy no namespace?" options={["Porque a AuthorizationPolicy não funciona com HTTP","Porque o Istio exige NetworkPolicy para emitir certificados","Porque NetworkPolicy substitui o RBAC","Como defesa em profundidade, já que a AuthorizationPolicy depende do proxy e não cobre Pods sem sidecar ou tráfego fora do redirecionamento"]} answer={3} explanation="A autorização do mesh é aplicada pelo proxy no Pod. A NetworkPolicy é aplicada pelo CNI no kernel e segura o movimento lateral quando o proxy não está no caminho." />
+
+## Base no CodeForge
+
+- [Kubernetes: Criando e gerenciando charts com o Helm](/learn/carreira-python/kubernetes-criando-gerenciando-charts-helm): o chart que recebe as ServiceAccounts, o label de versão e o canário.
+- [Microsserviços em Python: Comunicação, testes e resiliência](/learn/carreira-python/microsservicos-python-comunicacao-testes-resiliencia): o retry, o circuit breaker e a idempotência que este capítulo divide entre a aplicação e o mesh.
+- [Integração Contínua: Automatizando a entrega no Kubernetes](/learn/carreira-python/integracao-continua-automatizando-entrega-kubernetes): o próximo passo, levar o chart e o canário para o pipeline.
+- [Service mesh](/learn/system-design/service-mesh) e [Sidecar](/learn/system-design/sidecar): o padrão por trás do Istio.
+- [Circuit breaker](/learn/system-design/circuit-breaker), [Canary](/learn/system-design/canary) e [Tracing distribuído](/learn/system-design/tracing-distribuido): os conceitos aplicados aqui pelo proxy.
+- [TLS](/learn/system-design/tls), [JWT](/learn/system-design/jwt) e [RBAC](/learn/system-design/rbac): a base de mTLS, autenticação na borda e autorização.
+
+## Referências
+
+- [Istio: Architecture](https://istio.io/latest/docs/ops/deployment/architecture/)
+- [Istio: Sidecar or ambient?](https://istio.io/latest/docs/overview/dataplane-modes/)
+- [Istio: Traffic Management](https://istio.io/latest/docs/concepts/traffic-management/)
+- [Istio: Security](https://istio.io/latest/docs/concepts/security/)
+- [Istio: Authorization Policy](https://istio.io/latest/docs/reference/config/security/authorization-policy/)
+- [Istio: Gateway API](https://istio.io/latest/docs/tasks/traffic-management/ingress/gateway-api/)
+- [Kubernetes: Gateway API](https://kubernetes.io/docs/concepts/services-networking/gateway/)
+- [Kubernetes: Network Policies](https://kubernetes.io/docs/concepts/services-networking/network-policies/)

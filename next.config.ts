@@ -23,6 +23,16 @@ const nextConfig: NextConfig = {
         destination: "/learn/carreira-python/django-rest-framework-permissoes-documentacao-limitacoes-cors-deploy-aws",
         permanent: true,
       },
+      {
+        source: "/learn/carreira-python/kubernetes-praticando-garantindo-aplicacao-alta-disponibilidade",
+        destination: "/learn/carreira-python/kubernetes-praticando-garantindo-aplicacao-livenessprobe",
+        permanent: true,
+      },
+      {
+        source: "/learn/carreira-python/kubernetes-garantindo-protegendo-aplicacao",
+        destination: "/learn/carreira-python/kubernetes-garantindo-protegendo-aplicacao-istio",
+        permanent: true,
+      },
     ];
   },
   // Pacotes nativos/WASM ficam fora do bundle (o @node-rs/argon2 carrega um binário .node).

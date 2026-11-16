@@ -1,0 +1,690 @@
+---
+title: "Integração Contínua: Automatizando a entrega no Kubernetes"
+kind: lesson
+---
+
+A plataforma `ingressos` tem tudo de que um deploy precisa: quatro imagens no `ghcr.io`, um chart versionado no registro OCI, namespaces por ambiente, o Istio dividindo tráfego e protegendo a comunicação entre serviços. O que falta é quem junte as peças. Hoje, colocar uma versão nova em produção ainda é alguém rodando `helm upgrade` da própria máquina, com um kubeconfig de administrador, digitando a tag certa de cada serviço e torcendo para o Job de migração passar. A série de integração contínua já resolveu esse problema para a EC2 e para o ECS; falta resolvê-lo para o cluster.
+
+Este capítulo monta o pipeline completo do `ingressos` no Kubernetes. O pull request valida código, chart, manifestos e imagens; o merge na `main` publica artefatos imutáveis e os promove de staging para produção sem reconstruir nada. Você vai ver os dois modelos de entrega, o push pelo GitHub Actions e o pull com GitOps no Argo CD, e fechar com entrega progressiva: um canário que o próprio cluster aborta quando a taxa de erro sobe.
+
+**Você vai aprender:**
+
+- Validar chart e manifestos no pull request com `helm lint`, `helm template` e kubeconform, e varrer as imagens
+- Publicar imagens com a tag do commit e implantar pelo digest, promovendo o mesmo artefato entre ambientes
+- Autenticar o GitHub Actions no EKS sem chaves, com OIDC e access entries
+- Entregar por push, com `helm upgrade --install --atomic`, e por pull, com Argo CD e um repositório de configuração
+- Rodar migrações como hook, fazer canário com Argo Rollouts e análise no Prometheus, e voltar versões com segurança
+
+## O pipeline de ponta a ponta
+
+O fluxo tem duas metades com objetivos diferentes. O pull request responde "esta mudança está pronta para entrar?" e não publica nada. O merge na `main` responde "como esta versão chega a produção?" e produz exatamente um conjunto de artefatos, que atravessa todos os ambientes.
+
+| Etapa | Pull request | Push na `main` |
+|---|---|---|
+| Código | `ruff` e `pytest` em cada um dos quatro serviços | Idem |
+| Chart | `helm lint` e `helm template` por ambiente, validados com kubeconform | Idem |
+| Imagem | Build e varredura com Trivy, sem publicar | Build, varredura e push com tag `sha-<commit>`; o digest vira artefato |
+| Staging | Nada | Deploy automático com os digests |
+| Produção | Nada | Deploy dos mesmos digests, depois de aprovação |
+
+O repositório de código é o monorepo `ingressos/plataforma`, com um diretório por serviço (`catalogo/`, `pedidos/`, `pagamentos/`, `notificacoes/`), cada um com seu Dockerfile, e o chart em `ingressos/`, como no capítulo de Helm. Staging roda no namespace `ingressos-staging` e produção no `ingressos-prod`, cada um no seu cluster EKS.
+
+## Imagem: tag do commit, deploy pelo digest
+
+A tag `sha-<commit>` diz de onde a imagem veio, mas no `ghcr.io` nada impede que alguém publique outra imagem com a mesma tag. O digest (`sha256:...`) é o hash do conteúdo e não pode apontar para outra coisa. A regra: **publique com a tag, implante pelo digest.** No ECR, ligue também `imageTagMutability=IMMUTABLE`; no GHCR, o digest faz esse papel.
+
+O chart do capítulo de Helm só conhece tag. Um helper novo monta a referência com digest quando ele existe, e o chart sobe para a versão `0.5.0`:
+
+```yaml
+# ingressos/templates/_helpers.tpl (acréscimo)
+{{- define "ingressos.imagem" -}}
+{{- if .imagem.digest -}}
+{{ .imagem.repositorio }}@{{ .imagem.digest }}
+{{- else -}}
+{{ .imagem.repositorio }}:{{ required (printf "informe servicos.%s.imagem.tag" .nome) .imagem.tag }}
+{{- end -}}
+{{- end }}
+```
+
+No `deployments.yaml` e no Job de migração, a linha da imagem passa a ser `image: {{ include "ingressos.imagem" (dict "nome" $nome "imagem" $svc.imagem) | quote }}`. As tags fixas saem do `values-prod.yaml`: quem informa a versão de cada serviço passa a ser um arquivo `imagens.yaml` gerado pelo pipeline, passado como último `-f`. Para o CI conseguir renderizar o chart sem versões reais, crie `ingressos/ci/imagens-ci.yaml` com `tag: ci` em cada serviço.
+
+## O workflow de entrega
+
+```yaml
+# .github/workflows/entrega.yml
+name: entrega
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: entrega-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRO: ghcr.io/ingressos
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        servico: [catalogo, pedidos, pagamentos, notificacoes]
+    defaults:
+      run:
+        working-directory: ${{ matrix.servico }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: ${{ matrix.servico }}/requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1
+      - name: Instalar kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+      - run: helm dependency build ingressos
+      - name: Lint, renderização e validação por ambiente
+        run: |
+          for ambiente in staging prod; do
+            helm lint ingressos -f ingressos/values-$ambiente.yaml -f ingressos/ci/imagens-ci.yaml
+            helm template ingressos ./ingressos -n ingressos-$ambiente \
+                -f ingressos/values-$ambiente.yaml -f ingressos/ci/imagens-ci.yaml \
+              | kubeconform -strict -summary \
+                  -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          done
+
+  imagens:
+    needs: [testes, chart]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        servico: [catalogo, pedidos, pagamentos, notificacoes]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build para varredura
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.servico }}
+          load: true
+          tags: ${{ env.REGISTRO }}/${{ matrix.servico }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.servico }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.servico }}
+      - name: Varredura de vulnerabilidades
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: ${{ env.REGISTRO }}/${{ matrix.servico }}:sha-${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Publicar
+        id: publicar
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.servico }}
+          push: true
+          tags: ${{ env.REGISTRO }}/${{ matrix.servico }}:sha-${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.servico }}
+      - name: Guardar o digest
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p digests
+          echo "${{ steps.publicar.outputs.digest }}" > "digests/${{ matrix.servico }}"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push'
+        with:
+          name: digest-${{ matrix.servico }}
+          path: digests/${{ matrix.servico }}
+
+  manifesto:
+    if: github.event_name == 'push'
+    needs: imagens
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - name: Gerar imagens.yaml
+        run: |
+          {
+            echo "servicos:"
+            for arquivo in digests/*; do
+              servico=$(basename "$arquivo")
+              echo "  $servico:"
+              echo "    imagem:"
+              echo "      tag: \"sha-$GITHUB_SHA\""
+              echo "      digest: \"$(cat "$arquivo")\""
+            done
+          } > imagens.yaml
+          cat imagens.yaml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imagens
+          path: imagens.yaml
+          retention-days: 90
+
+  staging:
+    needs: manifesto
+    uses: ./.github/workflows/deploy-helm.yml
+    with:
+      ambiente: staging
+    permissions:
+      contents: read
+      id-token: write
+
+  producao:
+    needs: staging
+    uses: ./.github/workflows/deploy-helm.yml
+    with:
+      ambiente: production
+    permissions:
+      contents: read
+      id-token: write
+```
+
+O que cada parte resolve:
+
+- **Matriz por serviço.** Os quatro serviços testam e constroem em paralelo, com cache de camadas separado por `scope`. Num monorepo maior, um filtro de caminhos evita reconstruir o que não mudou; aqui, reconstruir tudo mantém o `imagens.yaml` completo e simples.
+- **kubeconform** valida cada objeto renderizado contra o schema da API do Kubernetes, pegando o que o `helm lint` não vê: campo com nome errado, tipo trocado, `apiVersion` removida. O segundo `-schema-location` traz os schemas de CRDs (Rollout, VirtualService, ExternalSecret) de um catálogo público. Use `-kubernetes-version` com a versão do seu cluster para pegar APIs descontinuadas antes do upgrade dele.
+- **Varredura antes de publicar.** A imagem é construída com `load: true`, varrida e só então publicada; o segundo build reaproveita o cache e gera as mesmas camadas. Uma CVE crítica com correção disponível reprova o pull request.
+- **Digests como artefato.** Jobs de matriz não expõem um output por serviço de forma confiável, então cada um grava seu digest num artefato e o job `manifesto` monta o `imagens.yaml`. É esse arquivo, e não a tag, que viaja até produção.
+- **`concurrency` no topo** cancela a validação obsoleta de um pull request quando chega um push novo, mas não cancela execuções da `main`: um deploy interrompido no meio é pior do que um deploy atrasado.
+
+<Callout type="tip" title="Fixe actions de terceiros pelo SHA">
+As actions oficiais (`actions/*`, `docker/*`, `aws-actions/*`, `azure/*`) aparecem aqui pela tag de versão maior por legibilidade. Para actions de terceiros, como a do Trivy, prefira o SHA completo do commit com a versão num comentário: uma tag pode ser movida para código malicioso, um SHA não. O Dependabot atualiza os SHAs para você.
+</Callout>
+
+## Entrar no cluster sem chaves
+
+O capítulo da EC2 trocou chaves de acesso por OIDC: o GitHub emite um token assinado para o job, e a AWS o troca por credenciais temporárias de uma role cuja política de confiança exige um `sub` específico. Para o EKS, o caminho é o mesmo, com um passo a mais: a role precisa ser reconhecida como identidade dentro do Kubernetes.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:ingressos/plataforma:environment:production"
+        }
+      }
+    }
+  ]
+}
+```
+
+Essa é a política de confiança da role `gha-deploy-production`; a de staging é igual, com `environment:staging`. A política de permissões da role só precisa de `eks:DescribeCluster` no cluster, que o `aws eks update-kubeconfig` usa para descobrir o endereço e o certificado. O que a role pode fazer **dentro** do cluster é decidido pelo Kubernetes, com uma **access entry** que liga o ARN da role a um grupo:
+
+```bash
+aws eks create-access-entry --cluster-name ingressos-prod \
+  --principal-arn arn:aws:iam::123456789012:role/gha-deploy-production \
+  --kubernetes-groups ingressos-deployers
+```
+
+```yaml
+# k8s/rbac/deploy-pipeline.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-pipeline
+  namespace: ingressos-prod
+subjects:
+  - kind: Group
+    name: ingressos-deployers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: edit
+  apiGroup: rbac.authorization.k8s.io
+```
+
+O pipeline passa a editar objetos só no `ingressos-prod`, incluindo os Secrets em que o Helm grava as revisões, e nada fora dele. Uma Role própria com só os recursos do chart é ainda mais estreita. As access entries exigem o cluster com modo de autenticação `API` ou `API_AND_CONFIG_MAP`; elas substituem o antigo ConfigMap `aws-auth`, que era editado à mão e quebrava o acesso de todo mundo com um erro de indentação. A alternativa sem RBAC próprio é associar uma política gerenciada com escopo de namespace (`aws eks associate-access-policy` com `AmazonEKSEditPolicy` e `--access-scope type=namespace,namespaces=ingressos-prod`).
+
+Nas outras nuvens a ideia é a mesma: no AKS, `azure/login` com credencial federada e Microsoft Entra ID no cluster; no GKE, `google-github-actions/auth` com Workload Identity Federation e `get-gke-credentials`.
+
+## Modelo push: o Actions aplica o chart
+
+No modelo push, o pipeline tem credencial no cluster e aplica a mudança ele mesmo. O workflow reutilizável recebe o ambiente e lê do environment do GitHub tudo o que varia: `ROLE_DEPLOY_ARN`, `EKS_CLUSTER`, `NAMESPACE`, `VALORES` (o arquivo de valores do ambiente) e `URL_APLICACAO`.
+
+```yaml
+# .github/workflows/deploy-helm.yml
+name: deploy-helm
+
+on:
+  workflow_call:
+    inputs:
+      ambiente:
+        type: string
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.ambiente }}
+      url: ${{ vars.URL_APLICACAO }}
+    concurrency:
+      group: deploy-${{ inputs.ambiente }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: imagens
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ROLE_DEPLOY_ARN }}
+          aws-region: us-east-1
+
+      - name: Configurar o kubeconfig
+        run: aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER }}" --region us-east-1
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1
+
+      - run: helm dependency build ingressos
+
+      - name: Diferenças em relação ao cluster
+        run: |
+          helm template ingressos ./ingressos -n "${{ vars.NAMESPACE }}" \
+              -f "${{ vars.VALORES }}" -f imagens.yaml \
+            | kubectl diff -n "${{ vars.NAMESPACE }}" -f - || true
+
+      - name: Aplicar a release
+        run: |
+          helm upgrade --install ingressos ./ingressos \
+            --namespace "${{ vars.NAMESPACE }}" \
+            -f "${{ vars.VALORES }}" -f imagens.yaml \
+            --atomic --wait --timeout 10m --history-max 20
+
+      - name: Teste de fumaça
+        run: curl --fail --retry 10 --retry-all-errors --retry-delay 6 "${{ vars.URL_APLICACAO }}/readyz"
+```
+
+- **`--atomic --wait`**: o Helm espera os Deployments ficarem prontos e o hook de migração terminar; se algo falhar ou passar de dez minutos, ele volta a release para a revisão anterior e o job falha. No Helm 4, a flag passou a se chamar `--rollback-on-failure`; confira as notas de migração quando atualizar.
+- **`concurrency` por ambiente, sem cancelamento.** Dois merges seguidos não podem rodar `helm upgrade` ao mesmo tempo no mesmo namespace, e um upgrade morto no meio deixa a release em `pending-upgrade`, travando o próximo com `another operation (install/upgrade/rollback) is in progress`. Com o grupo `deploy-production`, o segundo deploy espera o primeiro terminar.
+- **Environments.** `production` exige revisor e só aceita a `main`; `staging` não tem portão. Como a role de produção só confia no `sub` com `environment:production`, nem um workflow editado num branch recebe credenciais de produção.
+- **O mesmo artefato.** Os dois jobs baixam o mesmo `imagens.yaml`. Produção roda byte a byte o que staging validou; reconstruir a imagem para produção traria dependências resolvidas em outro momento e invalidaria o teste.
+- **O `kubectl diff`** deixa no log do job exatamente o que vai mudar, para quem aprova o environment.
+
+## Modelo pull: GitOps com o Argo CD
+
+No modelo pull, ninguém fora do cluster aplica nada. Um repositório de configuração descreve o estado desejado de cada ambiente, e um agente dentro do cluster, o **Argo CD**, compara o que está no Git com o que está rodando e converge. O pipeline de CI deixa de ter credencial no cluster: seu último passo é um commit.
+
+```text
+ingressos/plataforma-deploy/
+  apps/
+    ingressos-staging.yaml
+    ingressos-prod.yaml
+  ambientes/
+    staging/
+      values.yaml
+      imagens.yaml
+    prod/
+      values.yaml
+      imagens.yaml
+```
+
+Separar a configuração do código tem três motivos: o histórico do repositório de configuração é o histórico de deploys; quem pode alterar produção é controlado por proteção de branch e CODEOWNERS num repositório pequeno; e um commit de versão não dispara o CI do código. Cada ambiente ganha uma Application:
+
+```yaml
+# apps/ingressos-prod.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ingressos-prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: ingressos
+  sources:
+    - repoURL: ghcr.io/ingressos/charts
+      chart: ingressos
+      targetRevision: 0.5.0
+      helm:
+        releaseName: ingressos
+        valueFiles:
+          - $config/ambientes/prod/values.yaml
+          - $config/ambientes/prod/imagens.yaml
+    - repoURL: https://github.com/ingressos/plataforma-deploy.git
+      targetRevision: main
+      ref: config
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ingressos-prod
+  ignoreDifferences:
+    - group: networking.istio.io
+      kind: VirtualService
+      jqPathExpressions:
+        - .spec.http[].route[].weight
+    - group: networking.istio.io
+      kind: DestinationRule
+      jqPathExpressions:
+        - .spec.subsets[].labels
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - RespectIgnoreDifferences=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 30s
+        factor: 2
+```
+
+- **Duas fontes.** O chart vem do registro OCI, na versão fixada; os valores vêm do repositório de configuração, referenciado como `$config`. O registro `ghcr.io/ingressos/charts` é cadastrado no Argo CD como repositório Helm com `enableOCI`.
+- **`automated`** sincroniza sozinho a cada commit. **`prune`** apaga do cluster o que saiu do Git. **`selfHeal`** desfaz alterações feitas direto no cluster: um `kubectl edit` em produção volta ao estado do Git em segundos, o que acaba com a configuração que só existe no cluster.
+- **`ignoreDifferences`** nos pesos do VirtualService e nos labels dos subsets da DestinationRule existe por causa do canário, adiante: quem muda esses campos durante o rollout é o Argo Rollouts, e o Argo CD não deve brigar com ele.
+- **O AppProject `ingressos`** limita de quais repositórios a Application lê e em quais namespaces ela escreve, para que um erro no repositório de configuração não crie objetos em `kube-system`.
+
+O job de staging do `entrega.yml` deixa de chamar o `deploy-helm.yml` e passa a fazer um commit:
+
+```yaml
+# .github/workflows/entrega.yml (job de staging no modelo GitOps)
+  staging:
+    needs: manifesto
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gitops-staging
+      cancel-in-progress: false
+    steps:
+      - id: token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_DEPLOY_ID }}
+          private-key: ${{ secrets.APP_DEPLOY_CHAVE }}
+          repositories: plataforma-deploy
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ingressos/plataforma-deploy
+          token: ${{ steps.token.outputs.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: imagens
+          path: ${{ runner.temp }}/imagens
+
+      - name: Publicar a nova versão em staging
+        run: |
+          cp "$RUNNER_TEMP/imagens/imagens.yaml" ambientes/staging/imagens.yaml
+          git add ambientes/staging/imagens.yaml
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name "ingressos-deploy[bot]"
+          git config user.email "ingressos-deploy[bot]@users.noreply.github.com"
+          git commit -m "staging: ingressos ${GITHUB_SHA::7}"
+          git pull --rebase
+          git push
+```
+
+A credencial é um token de curta duração de um GitHub App que só pode escrever no `plataforma-deploy`, e não um token pessoal. Produção é promovida por pull request no repositório de configuração, copiando `ambientes/staging/imagens.yaml` para `ambientes/prod/imagens.yaml`: o diff mostra os digests que vão mudar, a revisão obrigatória é a aprovação e o merge é o deploy. Um job agendado ou um `workflow_dispatch` pode abrir esse pull request com `gh pr create`.
+
+Uma alternativa ao commit pelo pipeline é o **Argo CD Image Updater**: ele observa o registro, encontra imagens novas segundo uma regra (SemVer, a mais recente, um padrão de tag) e grava a nova versão no repositório de configuração por conta própria. Funciona bem para staging. Para produção, o commit explícito do pipeline deixa mais claro qual commit de código gerou qual deploy.
+
+## Push ou pull
+
+| Critério | Push (Actions aplica) | Pull (Argo CD sincroniza) |
+|---|---|---|
+| Credencial no cluster | O pipeline tem, por OIDC | O pipeline não tem; o agente roda dentro |
+| Alteração manual no cluster | Fica até o próximo deploy | Desfeita pelo self-heal |
+| O que está em produção | `helm history` e logs do Actions | `git log` do repositório de configuração |
+| Rollback | `helm rollback` ou reexecutar um deploy | `git revert` |
+| Vários clusters | Um job por cluster, com credenciais de cada | Uma Application por cluster, mesmo fluxo |
+| Peças a operar | Só o Actions | Argo CD, AppProjects, repositório de configuração |
+
+A recomendação: com um cluster e um time pequeno, o push com `helm upgrade --atomic` é simples, auditável e suficiente. Quando aparecem vários clusters, vários times ou exigência de auditoria sobre quem mudou o quê, o GitOps compensa o custo de operar o Argo CD: o Git vira a única porta de entrada, o pipeline perde o acesso ao cluster e a deriva deixa de existir. Os dois modelos compartilham tudo até o `imagens.yaml`; o que muda é só o último passo, e migrar de um para o outro é trocar um job.
+
+## Migrações no Kubernetes
+
+O Job de migração do capítulo de Helm continua sendo a peça certa, como hook `pre-install,pre-upgrade`: no push, o `helm upgrade` executa o Job, espera e só então troca os Deployments; se ele falhar, `--atomic` aborta sem tocar no que está no ar.
+
+No Argo CD, o chart não é instalado com `helm install`: o Argo CD renderiza com `helm template` e aplica os objetos. Ele traduz os hooks do Helm para os seus próprios: `pre-install` e `pre-upgrade` viram `PreSync`, e as políticas de remoção também são respeitadas. Você também pode anotar o Job diretamente com `argocd.argoproj.io/hook: PreSync` e `argocd.argoproj.io/hook-delete-policy: BeforeHookCreation`. Dois detalhes mudam:
+
+- **`.Release.Revision` vale sempre 1** no `helm template`, então o nome `ingressos-migracao-1` se repete. Com `before-hook-creation`, o Job antigo é apagado antes do novo, e tudo funciona; sem essa política, a segunda sincronização falha por nome duplicado.
+- **O PreSync roda a cada sincronização**, inclusive as provocadas pelo self-heal. `alembic upgrade head` e `manage.py migrate` sem migrações pendentes não fazem nada, mas a migração tem de ser idempotente.
+
+E a regra que vale nos dois modelos: a migração roda **antes** de a versão nova receber tráfego, enquanto a versão antiga ainda atende todos os usuários. Num canário, a versão antiga continua atendendo 95% do tráfego por meia hora sobre o schema novo. Só migrações compatíveis com a versão anterior, no padrão expandir e contrair do capítulo de rollback, tornam isso seguro.
+
+## Entrega progressiva com o Argo Rollouts
+
+O `--atomic` e o self-heal protegem contra a versão que não sobe. A versão que sobe, passa na readiness probe e erra em 8% das compras passa por eles. No ECS, os alarmes de deployment resolviam isso; no Kubernetes, o **Argo Rollouts** substitui o Deployment por um recurso `Rollout`, com estratégia de canário em passos e análise automática entre eles.
+
+No capítulo anterior, o canário do `pagamentos` 1.6.0 era um segundo Deployment, com os pesos 90/10 do VirtualService trocados à mão até a promoção. O Rollouts automatiza exatamente essa progressão: ele mantém os dois ReplicaSets (estável e canário) sob um único objeto e reescreve os pesos a cada passo. Com `servicos.pagamentos.canario.habilitado: true`, o chart renderiza o `pagamentos` como Rollout, e o Deployment `ingressos-pagamentos-canario` deixa de existir. A DestinationRule e o VirtualService continuam os mesmos, com uma diferença: os subsets ficam sem o label de versão, porque quem os preenche agora é o controlador.
+
+```yaml
+# ingressos (renderizado): DestinationRule do pagamentos
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: ingressos-pagamentos
+  namespace: ingressos-prod
+spec:
+  host: ingressos-pagamentos.ingressos-prod.svc.cluster.local
+  subsets:
+    - name: estavel
+    - name: canario
+```
+
+```yaml
+# ingressos (renderizado): Rollout do pagamentos
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: ingressos-pagamentos
+  namespace: ingressos-prod
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pagamentos
+      app.kubernetes.io/instance: ingressos
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pagamentos
+        app.kubernetes.io/instance: ingressos
+        app.kubernetes.io/version: sha-7d4e2b1c9a...
+    spec:
+      serviceAccountName: ingressos-pagamentos
+      containers:
+        - name: pagamentos
+          image: ghcr.io/ingressos/pagamentos@sha256:9c1e...
+  strategy:
+    canary:
+      trafficRouting:
+        istio:
+          virtualService:
+            name: ingressos-pagamentos
+            routes:
+              - padrao
+          destinationRule:
+            name: ingressos-pagamentos
+            stableSubsetName: estavel
+            canarySubsetName: canario
+      analysis:
+        startingStep: 1
+        templates:
+          - templateName: taxa-de-erro
+        args:
+          - name: servico
+            value: ingressos-pagamentos.ingressos-prod.svc.cluster.local
+          - name: versao
+            value: sha-7d4e2b1c9a...
+      steps:
+        - setWeight: 5
+        - pause: { duration: 5m }
+        - setWeight: 25
+        - pause: { duration: 10m }
+        - setWeight: 50
+        - pause: { duration: 10m }
+```
+
+O template do Pod é o mesmo do Deployment (o trecho omite portas, probes, `envFrom`, recursos e `securityContext`). A cada versão nova, o controlador cria um ReplicaSet para o canário, grava o label `rollouts-pod-template-hash` de cada ReplicaSet no subset correspondente da DestinationRule e ajusta os pesos da rota `padrao` a cada `setWeight`. A rota `canario-por-cabecalho` do capítulo anterior não está na lista e continua funcionando: quem manda `x-canario: pagamentos` cai sempre no subset `canario`. Se o serviço tiver HPA, o campo `replicas` sai do Rollout e o `scaleTargetRef` do HPA passa a apontar para `apiVersion: argoproj.io/v1alpha1` e `kind: Rollout`. A análise roda em segundo plano a partir do segundo passo:
+
+```yaml
+# ingressos (renderizado): AnalysisTemplate da taxa de erro
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: taxa-de-erro
+  namespace: ingressos-prod
+spec:
+  args:
+    - name: servico
+    - name: versao
+  metrics:
+    - name: taxa-de-erro
+      interval: 1m
+      failureLimit: 2
+      successCondition: result[0] < 0.01
+      provider:
+        prometheus:
+          address: http://prometheus.observabilidade.svc.cluster.local:9090
+          query: |
+            (sum(rate(istio_requests_total{reporter="destination",destination_service="{{args.servico}}",destination_version="{{args.versao}}",response_code=~"5.."}[2m])) or vector(0))
+            /
+            (sum(rate(istio_requests_total{reporter="destination",destination_service="{{args.servico}}",destination_version="{{args.versao}}"}[2m])) > 0 or vector(1))
+```
+
+As métricas `istio_requests_total` vêm dos sidecars, sem nenhuma instrumentação no código, e o rótulo `destination_version` sai do label `app.kubernetes.io/version` que o capítulo anterior pôs nos Pods; como o pipeline agora usa a tag do commit, cada versão tem o seu valor. A consulta calcula a fração de respostas 5xx recebidas pelos Pods da versão nova nos últimos dois minutos; os `or vector(...)` evitam resultado vazio ou divisão por zero quando ainda não há tráfego. A cada minuto a análise mede, e com `failureLimit: 2` a terceira medição acima de 1% reprova a análise. O Rollouts então **aborta**: o peso volta inteiro para o subset estável, os Pods do canário são removidos e o Rollout fica `Degraded`, sem ninguém acordar. O AnalysisTemplate também é gerado pelo chart, e ali a sintaxe `{{args.servico}}`, que é do Argo Rollouts, precisa ser escapada como `{{ "{{args.servico}}" }}`; sem isso, o Helm tenta interpretá-la e a renderização falha.
+
+O `pagamentos` é o candidato natural porque só é chamado pelo `pedidos`, dentro do mesh, onde o VirtualService vale. Para um serviço exposto pelo gateway, como o `pedidos`, a divisão do tráfego externo fica no `HTTPRoute` da borda, e o Rollouts a controla pelo plugin de Gateway API.
+
+<Callout type="warning" title="Sem tráfego, a análise aprova">
+Do jeito que está, um canário que não recebe nenhuma requisição tem taxa de erro zero e passa. Em horários de pouco movimento, acrescente uma segunda métrica que exija um volume mínimo de requisições no canário, e uma de latência p99 comparada à versão estável. Análise automática só é tão boa quanto as perguntas que ela faz.
+</Callout>
+
+Dois ajustes nos modelos de entrega. No **push**, o `helm upgrade --wait` não entende um Rollout e termina assim que os objetos são aplicados; acrescente ao `deploy-helm.yml` um passo `kubectl argo rollouts status ingressos-pagamentos -n ingressos-prod --timeout 40m`, que falha se o rollout for abortado. No **GitOps**, o Argo CD já reconhece a saúde do Rollout: a Application fica `Progressing` durante o canário e `Degraded` se ele abortar, e as notificações do Argo CD avisam o time.
+
+## Rollback manual
+
+O rollback automático cobre a janela do deploy. O bug que aparece duas horas depois exige uma volta manual, e ela precisa ser um comando conhecido, ensaiado em staging.
+
+```bash
+# modelo push
+helm history ingressos -n ingressos-prod
+helm rollback ingressos 41 -n ingressos-prod --wait
+
+# Argo Rollouts, durante um canário
+kubectl argo rollouts abort ingressos-pagamentos -n ingressos-prod
+kubectl argo rollouts promote ingressos-pagamentos -n ingressos-prod   # pula as pausas, se a versão estiver boa
+
+# modelo GitOps
+git revert 3f2a91c && git push    # no plataforma-deploy
+```
+
+No push, outra opção é reexecutar o job de deploy de uma execução anterior bem-sucedida, que reaplica o `imagens.yaml` daquela versão (por isso o artefato fica guardado por 90 dias). Reexecutar é mais rastreável que o `helm rollback`, porque a volta aparece no histórico do environment.
+
+No GitOps, a regra é que **a volta também passa pelo Git**. Um `helm rollback` não existe para o Argo CD (as releases não são do Helm, e `helm list` vem vazio), e um `kubectl argo rollouts undo` muda o cluster sem mudar o Git, então o self-heal desfaz a volta. Depois de um aborto automático, o Git ainda diz que a versão nova é a desejada: o Rollout fica parado na estável até que um `git revert` (ou um commit com a correção) defina outra versão. O rollback do Argo CD pela interface exige desligar a sincronização automática, e serve só como medida de emergência.
+
+## Segredos: fora do pipeline e fora do Git
+
+Com o fluxo acima, o pipeline praticamente não tem segredos. No push, a única coisa no environment é o ARN da role, que nem é sensível; as credenciais são emitidas por OIDC a cada execução. No GitOps, há a chave do GitHub App, que só escreve no repositório de configuração.
+
+Os segredos da aplicação (senhas dos bancos, chave do gateway de pagamento, a credencial para baixar imagens do `ghcr.io`) **nunca entram no repositório de configuração**, nem cifrados em base64 num Secret comum. Duas formas de mantê-los declarativos:
+
+- **External Secrets Operator**: o repositório guarda um `ExternalSecret` que só diz "o Secret `pagamentos-secrets` vem da chave `ingressos/prod/pagamentos` do AWS Secrets Manager". O operador lê o cofre com a identidade da própria ServiceAccount e cria o Secret no cluster. Rotacionar é mudar o cofre.
+- **Sealed Secrets**: o Secret é cifrado com a chave pública de um controlador do cluster (`kubeseal`) e a versão cifrada pode ir ao Git, porque só aquele cluster a decifra. Bom quando não há cofre; a rotação e a troca de cluster dão mais trabalho.
+
+Nos dois casos, o pipeline nunca vê o valor, o Argo CD nunca guarda o valor e o histórico do Git não vira um vazamento esperando acontecer. O mesmo vale para as credenciais que o próprio Argo CD usa para ler o registro de charts e o repositório de configuração: crie-as no namespace `argocd` por um ExternalSecret, não por um YAML commitado.
+
+## Fim da Carreira Python
+
+Este é o último capítulo da trilha. O `ingressos` passou de uma API Django num contêiner a quatro serviços Python testados, empacotados, protegidos e entregues por um pipeline que valida cada mudança, promove o mesmo artefato até produção e se desfaz sozinho de uma versão ruim. Cada peça do caminho, de testes e tipos a filas, cache, observabilidade e Kubernetes, existe para que esse último passo seja tranquilo. Daqui em diante, o melhor exercício é repetir o ciclo num projeto seu, do primeiro commit ao primeiro canário em produção.
+
+## Na entrevista
+
+**Qual a diferença entre o modelo push e o GitOps?** No push, o pipeline tem credencial no cluster e aplica a mudança, por exemplo com `helm upgrade`. No GitOps, o estado desejado fica num repositório de configuração e um agente dentro do cluster, como o Argo CD, sincroniza continuamente o cluster com o Git. O pipeline só faz commit, o cluster não fica exposto ao CI e alterações manuais são desfeitas pelo self-heal.
+
+**Por que implantar pelo digest e não pela tag?** Tags podem ser movidas para outra imagem; o digest é o hash do conteúdo e identifica exatamente a imagem testada. Publicar com a tag do commit mantém a rastreabilidade, e implantar pelo digest garante que todos os ambientes rodam o mesmo artefato.
+
+**Por que não reconstruir a imagem para produção?** Porque um build novo pode resolver dependências diferentes ou partir de uma imagem base atualizada, e o que chega a produção deixa de ser o que foi testado em staging. Promoção é mover a referência do mesmo artefato entre ambientes.
+
+**Como o GitHub Actions acessa um cluster EKS sem chaves?** Pela federação OIDC: o job recebe um token do GitHub, a AWS o troca por credenciais temporárias de uma role cuja confiança exige o repositório e o environment no `sub`, e uma access entry do EKS mapeia essa role para um grupo do Kubernetes, que recebe permissões por RBAC só no namespace do ambiente.
+
+**Como funciona um canário com análise automática?** Uma ferramenta como o Argo Rollouts manda uma fração crescente do tráfego para a versão nova, por pesos no service mesh ou no ingress, e consulta métricas, como a taxa de 5xx no Prometheus, a cada intervalo. Se a métrica passa do limite mais vezes do que o permitido, o rollout é abortado e todo o tráfego volta para a versão estável.
+
+**Como você faz rollback num fluxo GitOps?** Com `git revert` no repositório de configuração, que o Argo CD sincroniza. Voltar direto no cluster é desfeito pelo self-heal e deixa o Git dizendo uma coisa e o cluster outra. E, como em qualquer modelo, o rollback só é seguro se as migrações forem compatíveis com a versão anterior.
+
+## Pratique
+
+1. Acrescente o helper `ingressos.imagem` ao chart, crie o `ingressos/ci/imagens-ci.yaml` e escreva o `entrega.yml`. Provoque três falhas no pull request: um teste quebrado, um campo `containerPort` digitado errado no template (pego pelo kubeconform) e uma dependência Python com CVE crítica (pega pelo Trivy).
+2. Configure o OIDC com duas roles, as access entries nos clusters de staging e produção e o RoleBinding para o grupo `ingressos-deployers`. Confirme com `kubectl auth can-i --list -n ingressos-prod` dentro do job que o pipeline não tem acesso a outros namespaces.
+3. Implemente o `deploy-helm.yml` com os environments `staging` e `production`, aprovação obrigatória em produção e `concurrency` por ambiente. Faça dois merges seguidos e observe o segundo deploy esperar o primeiro.
+4. Instale o Argo CD num cluster kind, crie o `plataforma-deploy` e as duas Applications, troque o job de staging pelo commit e altere um Deployment com `kubectl scale` para ver o self-heal desfazer a mudança.
+5. Instale o Argo Rollouts, converta o `pagamentos` em Rollout com o canário e o AnalysisTemplate, e publique uma versão que devolve 500 em 10% das cobranças. Mostre o aborto automático, o tráfego voltando à versão estável e a Application em `Degraded`; depois corrija com `git revert`.
+6. Troque os Secrets criados à mão por ExternalSecrets (ou Sealed Secrets) no repositório de configuração e prove, com `git log -p`, que nenhum valor sensível foi commitado.
+
+<Quiz question="No modelo GitOps com Argo CD, qual é o último passo do pipeline de CI depois de publicar as imagens?" options={["Rodar helm upgrade no cluster de produção","Fazer um commit com os novos digests no repositório de configuração","Executar kubectl apply com os manifestos renderizados","Chamar a API do Argo CD com um token de administrador"]} answer={1} explanation="No modelo pull, o pipeline não tem credencial no cluster. Ele registra a versão desejada no Git, e o Argo CD, rodando dentro do cluster, sincroniza o estado." />
+
+<Quiz question="Por que o grupo de concurrency do job de deploy usa cancel-in-progress igual a false?" options={["Porque o GitHub não permite cancelar jobs com environment","Para economizar minutos do Actions","Porque interromper um helm upgrade pode deixar a release em pending-upgrade e travar o próximo deploy","Para que dois deploys rodem em paralelo no mesmo namespace"]} answer={2} explanation="Com cancel-in-progress falso, o deploy seguinte espera o atual terminar. Cancelar no meio pode deixar a release num estado de operação pendente e corromper a sequência de revisões." />
+
+<Quiz question="Durante um canário com Argo Rollouts, a análise no Prometheus mede taxa de 5xx acima do limite três vezes, com failureLimit igual a 2. O que acontece?" options={["O rollout é abortado e todo o tráfego volta para a versão estável","O Argo CD faz git revert automaticamente","O rollout pausa indefinidamente com 5% do tráfego no canário","O Helm executa rollback para a revisão anterior"]} answer={0} explanation="Ao exceder o failureLimit, a análise falha e o Rollouts aborta: os pesos do VirtualService voltam para o subset estável e o canário é removido. O Git continua com a versão nova até alguém reverter ou corrigir." />
+
+<Quiz question="Num fluxo GitOps com self-heal ligado, alguém roda helm rollback direto no cluster para voltar uma versão. Qual o resultado mais provável?" options={["O rollback funciona e o Git é atualizado sozinho","O Argo CD detecta a diferença e reaplica a versão descrita no Git","O Argo CD desliga a sincronização automática","O Helm recusa o comando por falta de permissão em qualquer cenário"]} answer={1} explanation="No GitOps, o Git é a fonte da verdade. O Argo CD nem usa releases do Helm, e qualquer alteração direta no cluster é revertida pelo self-heal. A volta correta é um git revert no repositório de configuração." />
+
+## Base no CodeForge
+
+- [Integração Contínua com Docker e GitHub Actions: Do build ao deploy](/learn/carreira-python/integracao-continua-docker-github-actions-build-deploy): o build, o cache e as tags pelo SHA.
+- [Integração Contínua: Pipeline de entrega e implementação contínua na EC2](/learn/carreira-python/integracao-continua-pipeline-entrega-implementacao-continua-ec2): OIDC sem chaves e environments com aprovação.
+- [Integração Contínua: Rollback e teste de carga](/learn/carreira-python/integracao-continua-rollback-teste-carga): estratégias de deploy e o padrão expandir e contrair.
+- [Kubernetes: Criando e gerenciando charts com o Helm](/learn/carreira-python/kubernetes-criando-gerenciando-charts-helm) e [Kubernetes: Garantindo e protegendo a aplicação com o Istio](/learn/carreira-python/kubernetes-garantindo-protegendo-aplicacao-istio): o chart e a malha que este pipeline entrega.
+- [CI/CD](/learn/system-design/ci-cd), [Canary](/learn/system-design/canary), [Rollbacks](/learn/system-design/rollbacks) e [Gestão de segredos](/learn/system-design/gestao-de-segredos): a teoria por trás de cada etapa.
+- [Integração Contínua: Automatizando a entrega no Kubernetes (Java)](/learn/carreira-java/integracao-continua-automatizando-entrega-kubernetes): o mesmo tema com Jib e Kustomize.
+
+## Referências
+
+- [GitHub Actions: Configuring OpenID Connect in Amazon Web Services](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
+- [Amazon EKS: Grant IAM users access to Kubernetes with EKS access entries](https://docs.aws.amazon.com/eks/latest/userguide/access-entries.html)
+- [Argo CD: documentação oficial](https://argo-cd.readthedocs.io/en/stable/)
+- [Argo Rollouts: Istio traffic management](https://argo-rollouts.readthedocs.io/en/stable/features/traffic-management/istio/) e [Analysis](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/)
+- [kubeconform](https://github.com/yannh/kubeconform)
+- [Helm: Chart Hooks](https://helm.sh/docs/topics/charts_hooks/)

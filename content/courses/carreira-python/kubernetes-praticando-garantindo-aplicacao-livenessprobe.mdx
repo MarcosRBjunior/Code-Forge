@@ -1,0 +1,435 @@
+---
+title: "Kubernetes: Praticando e garantindo uma aplicação com LivenessProbe"
+kind: lesson
+---
+
+O Kubernetes recria um contêiner que morre sem precisar de nenhuma configuração: o processo saiu, o kubelet sobe outro. O caso difícil é o processo que **não morre**. O `pedidos` continua com PID, porta aberta e status `Running`, mas o event loop do uvicorn está preso numa chamada síncrona e nenhuma requisição é respondida. O consumidor do `notificacoes` está vivo, só que parado há vinte minutos esperando um lock que nunca será liberado. Para o cluster, está tudo bem. Para quem comprou o ingresso, nada funciona.
+
+No capítulo de Deployments você configurou as três probes no formato básico. Aqui a `livenessProbe` é a protagonista: o que ela consegue detectar e o que não consegue, como escolher o mecanismo e os números, como escrever o endpoint certo em Python e, principalmente, como provar na prática que a autocura funciona, travando a aplicação de propósito e acompanhando cada passo do kubelet.
+
+**Você vai aprender:**
+
+- Que tipo de falha a liveness resolve, e quais ela só esconde
+- Os quatro mecanismos de probe (`httpGet`, `tcpSocket`, `exec`, `grpc`) aplicados aos serviços do `ingressos`
+- Os parâmetros de tempo e a conta de quanto demora até o reinício
+- Como combinar startup, readiness e liveness, inclusive em aplicações de boot lento
+- Liveness sem HTTP: heartbeat em arquivo para consumidores de fila
+- Simular travamentos e ler a autocura em `kubectl get pods -w`, `describe`, `RESTARTS` e `logs --previous`
+- CrashLoopBackOff, anti-padrões e a relação das probes com réplicas, PDB e desligamento gracioso
+
+## O que a liveness resolve
+
+A liveness responde a uma pergunta só: **este contêiner ficou num estado do qual não sai sozinho, e reiniciá-lo resolve?** As duas metades importam. Ela é a ferramenta certa quando o processo está vivo, mas inútil:
+
+| Situação | Exemplo no `ingressos` | Reiniciar resolve? |
+|---|---|---|
+| Deadlock | Duas threads do `pagamentos` esperando locks uma da outra | Sim |
+| Laço infinito | Um bug no cálculo de lotes prende o worker em `while` sem saída | Sim, até o bug ser corrigido |
+| Event loop bloqueado | Uma rota `async def` do `pedidos` chama `requests.get` ou `time.sleep` | Sim, por um tempo |
+| Pool interno esgotado e corrompido | Conexões vazadas que nunca voltam ao pool do SQLAlchemy | Sim |
+| Banco fora do ar | Postgres reiniciando | Não: o contêiner novo encontra o mesmo banco fora |
+| Dependência lenta | Gateway de pagamento respondendo em 30 segundos | Não: piora, porque joga fora o trabalho em andamento |
+| Erro de configuração | Variável obrigatória ausente | Não: vira CrashLoopBackOff |
+| Vazamento de memória | Cache sem limite | Quem age é o limite de memória (`OOMKilled`), não a liveness |
+
+A regra que sai da tabela: a liveness deve falhar só quando o problema está **dentro** do contêiner. Problema fora dele é assunto da readiness, que tira o Pod do tráfego sem destruir nada.
+
+## Os quatro mecanismos
+
+Toda probe é executada pelo kubelet do nó onde o Pod roda, e cada uma usa um destes mecanismos:
+
+| Mecanismo | Sucesso quando | Detecta event loop travado? | Uso típico |
+|---|---|---|---|
+| `httpGet` | Status de 200 a 399 dentro do timeout | Sim | APIs Django e FastAPI |
+| `tcpSocket` | A conexão TCP é aceita | Não | Serviços sem HTTP, como bancos |
+| `exec` | O comando termina com código 0 | Depende do comando | Consumidores, workers, heartbeat em arquivo |
+| `grpc` | O serviço responde `SERVING` ao Health Checking Protocol do gRPC | Sim | Serviços gRPC |
+
+O `httpGet` é o padrão para as APIs. No `pedidos`, em FastAPI, o endpoint de liveness é `async def` de propósito: ele roda no próprio event loop, então só responde se o loop estiver girando.
+
+```yaml
+# base/pedidos.yaml (dentro de spec.template.spec.containers[0])
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+```
+
+O `tcpSocket` é o mais fraco dos quatro. Quem completa o handshake TCP é o kernel, que coloca a conexão na fila de `listen` mesmo que a aplicação nunca chame `accept`. Um uvicorn com o loop bloqueado continua passando numa probe TCP. Use-o só quando não houver nada melhor, como num serviço que fala um protocolo binário próprio:
+
+```yaml
+# base/rabbitmq.yaml (dentro do contêiner rabbitmq)
+          livenessProbe:
+            tcpSocket:
+              port: amqp
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+```
+
+O `exec` roda um comando dentro do contêiner. É flexível, mas cada execução cria um processo: um `python -c` a cada 10 segundos em cada réplica custa CPU e memória, e numa imagem distroless pode nem haver interpretador. Mais adiante ele resolve o caso do consumidor sem HTTP.
+
+O `grpc` é nativo desde o Kubernetes 1.27. Se o `pagamentos` expusesse uma interface gRPC com o pacote `grpcio-health-checking`, a probe seria:
+
+```yaml
+# base/pagamentos.yaml (variante gRPC, dentro do contêiner)
+          livenessProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 10
+            timeoutSeconds: 2
+```
+
+A porta precisa ser numérica (o `grpc` não aceita nome de porta), e o campo opcional `service` escolhe qual nome de serviço consultar no protocolo de saúde.
+
+## Parâmetros e a conta até o reinício
+
+| Parâmetro | Padrão | O que controla |
+|---|---|---|
+| `initialDelaySeconds` | 0 | Espera antes da primeira execução |
+| `periodSeconds` | 10 | Intervalo entre execuções |
+| `timeoutSeconds` | 1 | Tempo máximo de cada execução; estourar conta como falha |
+| `failureThreshold` | 3 | Falhas seguidas para agir |
+| `successThreshold` | 1 | Sucessos seguidos para voltar a "ok"; na liveness e na startup só aceita 1 |
+| `terminationGracePeriodSeconds` | o do Pod | Prazo entre SIGTERM e SIGKILL quando esta probe manda reiniciar |
+
+Com `periodSeconds: 10`, `timeoutSeconds: 2` e `failureThreshold: 3`, a aplicação que trava logo depois de uma probe bem-sucedida leva, no pior caso, cerca de `3 × 10 + 2 = 32` segundos até o kubelet decidir reiniciar. Depois disso vem o encerramento: o kubelet roda o `preStop`, se houver, envia SIGTERM e espera o prazo de graça antes do SIGKILL. Um processo travado raramente atende o SIGTERM, então esse prazo costuma ser consumido inteiro.
+
+É aqui que entra o `terminationGracePeriodSeconds` no nível da probe, estável desde o 1.28. O Deployment da API usa 45 segundos de graça para que um deploy termine as requisições em andamento; num travamento, esperar 45 segundos é só indisponibilidade a mais. A probe pode ter um prazo próprio, que vale apenas para reinícios causados por ela:
+
+```yaml
+# api-deployment.yaml (dentro de spec.template.spec)
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: api
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: api.ingressos.local
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+            terminationGracePeriodSeconds: 10
+```
+
+A conta completa fica: até 32 segundos para detectar, até 10 para encerrar, mais o tempo de subida do contêiner novo. Diminuir `periodSeconds` e `failureThreshold` reduz a detecção, mas aumenta o risco de reinício por um soluço passageiro. Reiniciar é caro: prefira detectar em 30 segundos com certeza do que em 5 com falsos positivos. A readiness pode e deve ser mais rápida, porque errar nela custa pouco.
+
+## Liveness, readiness e startup juntas
+
+As três probes rodam de forma independente, e entender a interação entre elas é o que evita metade dos incidentes:
+
+| | Startup | Readiness | Liveness |
+|---|---|---|---|
+| Quando roda | Só no início, até passar uma vez | O tempo todo, depois da startup | O tempo todo, depois da startup |
+| Ao falhar | Reinicia o contêiner após `failureThreshold` | Tira o Pod dos endpoints | Reinicia o contêiner |
+| Pode olhar dependências? | Não | Sim, as essenciais | Não |
+| Rigor | Folgada no tempo total | Rápida | Tolerante |
+
+Enquanto a startup não passa, readiness e liveness ficam suspensas. Isso resolve a aplicação de boot lento sem afrouxar a liveness. Suponha que o `catalogo` carregue o mapa de assentos de todos os eventos na memória ao iniciar, o que leva até 90 segundos em produção. A tentação é colocar `initialDelaySeconds: 120` na liveness. O resultado é ruim duas vezes: todo Pod espera dois minutos para ter liveness ativa, inclusive os que sobem em 10 segundos, e se o boot um dia passar de 120 segundos, o contêiner entra num ciclo de reinícios sem nunca terminar de subir.
+
+```yaml
+# base/catalogo.yaml (dentro de spec.template.spec.containers[0])
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36        # até 180 segundos para subir
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+```
+
+A startup aceita até 180 segundos, mas libera as outras assim que a aplicação responde: um Pod que sobe em 10 segundos tem liveness ativa em 10 segundos. Depois disso, a liveness pode ser estrita sem matar ninguém no meio do boot.
+
+Repare na ordem dos eventos num travamento real: a readiness, mais rápida, tira o Pod do balanceamento em cerca de 10 segundos, e só depois a liveness o reinicia. As outras réplicas absorvem o tráfego no intervalo. É a combinação que dá autocura sem erro visível para o cliente.
+
+## O endpoint de liveness em Python
+
+O endpoint de liveness não consulta banco, cache, fila nem outro serviço. Ele prova uma coisa: o processo ainda consegue executar código e responder. No Django, o `/healthz` do capítulo anterior já está certo. Vale só tirá-lo do caminho de middlewares caros, como autenticação, sessão e logging pesado, para que ele não falhe por motivo alheio. No FastAPI do `pedidos`:
+
+```python
+# pedidos/saude.py
+from fastapi import APIRouter, Response
+
+from pedidos.dependencias import banco_responde, broker_conectado
+
+router = APIRouter()
+
+
+@router.get("/healthz", include_in_schema=False)
+async def healthz() -> dict[str, str]:
+    # async de propósito: só responde se o event loop estiver livre
+    return {"status": "ok"}
+
+
+@router.get("/readyz", include_in_schema=False)
+async def readyz(response: Response) -> dict[str, str]:
+    if not (await banco_responde() and broker_conectado()):
+        response.status_code = 503
+        return {"status": "indisponivel"}
+    return {"status": "ok"}
+```
+
+Se o `healthz` fosse `def`, o FastAPI o executaria num pool de threads, e ele poderia falhar só porque o pool está ocupado com chamadas lentas, sem que o loop tenha problema. Com `async def`, a probe mede exatamente o recurso que você quer vigiar.
+
+Há um segundo nível de cuidado para a API Django. O gunicorn já tem um vigia interno: com workers síncronos, o master mata e recria todo worker que fica mais de `timeout` segundos sem dar sinal de vida. Um único worker preso é resolvido pelo próprio gunicorn, sem a liveness perceber. A liveness do Kubernetes cobre o que escapa disso: todos os workers presos ao mesmo tempo, o master travado, ou um servidor ASGI como o uvicorn rodando num processo único, sem vigia nenhum.
+
+### Liveness sem HTTP: heartbeat do consumidor
+
+O consumidor do `notificacoes` não tem porta. A solução é um **heartbeat em arquivo**: o laço principal atualiza a data de modificação de um arquivo a cada volta, e uma probe `exec` verifica se essa data é recente. Se o laço travar, o arquivo envelhece e o contêiner é reiniciado. O mesmo consumidor trata o SIGTERM para encerrar sem perder mensagens:
+
+```python
+# notificacoes/consumidor.py
+import signal
+from pathlib import Path
+
+import pika
+
+HEARTBEAT = Path("/tmp/heartbeat")
+encerrando = False
+
+
+def pedir_encerramento(signum, frame):
+    global encerrando
+    encerrando = True
+
+
+def processar(body: bytes) -> None:
+    ...  # envia o e-mail do ingresso
+
+
+def main() -> None:
+    signal.signal(signal.SIGTERM, pedir_encerramento)
+    conexao = pika.BlockingConnection(pika.URLParameters("amqp://rabbitmq:5672"))
+    canal = conexao.channel()
+    canal.basic_qos(prefetch_count=10)
+
+    for metodo, _propriedades, body in canal.consume("notificacoes", inactivity_timeout=1):
+        HEARTBEAT.touch()
+        if metodo is not None:
+            processar(body)
+            canal.basic_ack(metodo.delivery_tag)
+        if encerrando:
+            break
+
+    canal.cancel()
+    conexao.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```yaml
+# base/notificacoes.yaml (dentro de spec.template.spec.containers[0])
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/heartbeat') > 60)"
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+```
+
+O `inactivity_timeout=1` faz o laço acordar a cada segundo mesmo sem mensagens, então uma fila vazia não é confundida com travamento. O limite de 60 segundos precisa ser maior que o tempo do processamento mais lento de uma mensagem, senão um e-mail demorado vira reinício. Se o sistema de arquivos for somente leitura, monte um `emptyDir` em `/tmp`.
+
+O mesmo padrão serve para outros consumidores. Num consumidor Kafka, atualize o arquivo a cada volta do `poll(timeout=1.0)`; lembre que o próprio Kafka tem um vigia parecido, o `max.poll.interval.ms`, que tira da partição o consumidor que demora a chamar `poll`, mas não reinicia o processo. Num worker Celery, evite `celery inspect ping` como liveness: o comando passa pelo broker e falha quando o RabbitMQ oscila, reiniciando todos os workers juntos. Um heartbeat local mede só o worker. Em qualquer caso, quem atualiza o arquivo é o laço de trabalho, nunca uma thread à parte, que continuaria batendo com o laço travado.
+
+## Praticando: travando a aplicação de propósito
+
+A única forma de confiar na autocura é vê-la acontecer. Adicione ao `pedidos` uma rota de diagnóstico que bloqueia o event loop, ligada só por variável de ambiente:
+
+```python
+# pedidos/diagnostico.py
+import os
+import time
+
+from fastapi import APIRouter, HTTPException
+
+router = APIRouter()
+
+
+@router.post("/_diag/travar", include_in_schema=False)
+async def travar(segundos: int = 300) -> dict[str, bool]:
+    if os.environ.get("PERMITIR_DIAGNOSTICO") != "1":
+        raise HTTPException(status_code=404)
+    time.sleep(segundos)  # bloqueia o event loop inteiro, de propósito
+    return {"ok": True}
+```
+
+Com `PERMITIR_DIAGNOSTICO=1` só no overlay de desenvolvimento, abra dois terminais. No primeiro, acompanhe os Pods; no segundo, trave um deles:
+
+```bash
+# terminal 1
+kubectl get pods -n ingressos-dev -l app=pedidos -w
+
+# terminal 2
+kubectl port-forward -n ingressos-dev pod/pedidos-6d8f7c9b4-k2xzp 8000:8000 &
+curl -X POST --max-time 2 "http://localhost:8000/_diag/travar?segundos=300"
+```
+
+O `curl` desiste em 2 segundos, mas a requisição já chegou e o loop está preso. No primeiro terminal, em poucos segundos a coluna `READY` vai para `0/1` (a readiness falhou e o Pod saiu do balanceamento); por volta de 30 segundos, `RESTARTS` vira `1` e logo depois `READY` volta a `1/1`. O nome do Pod não muda: a liveness reinicia o **contêiner** no mesmo Pod e no mesmo nó, não cria um Pod novo.
+
+```bash
+kubectl describe pod pedidos-6d8f7c9b4-k2xzp -n ingressos-dev
+kubectl logs pedidos-6d8f7c9b4-k2xzp -n ingressos-dev --previous
+```
+
+No `describe`, os eventos contam a história em ordem:
+
+```text
+# saída resumida de kubectl describe pod
+    Last State:     Terminated
+      Reason:       Error
+      Exit Code:    137
+    Restart Count:  1
+Events:
+  Warning  Unhealthy  Readiness probe failed: Get "http://10.244.1.7:8000/readyz": context deadline exceeded
+  Warning  Unhealthy  Liveness probe failed: Get "http://10.244.1.7:8000/healthz": context deadline exceeded
+  Normal   Killing    Container pedidos failed liveness probe, will be restarted
+  Normal   Pulled     Container image "ghcr.io/ingressos/pedidos:2.3.1" already present on machine
+  Normal   Started    Started container pedidos
+```
+
+O código 137 significa SIGKILL (128 + 9): o processo travado não atendeu o SIGTERM a tempo. O `logs --previous` mostra a saída do contêiner que morreu, onde está a última pista do que ele fazia; o log atual é do contêiner novo e não sabe de nada.
+
+Uma segunda forma de simular é congelar o processo com SIGSTOP. Há uma pegadinha: dentro do contêiner, o servidor costuma ser o PID 1, e o kernel ignora sinais enviados ao PID 1 do próprio namespace quando o processo não instalou tratador, o que inclui sempre o SIGSTOP. Um `kubectl exec ... -- kill -STOP 1` não faz nada. No kind, envie o sinal a partir do nó onde o Pod está (veja com `kubectl get pods -o wide`), que enxerga o processo com outro PID:
+
+```bash
+docker exec ingressos-worker pkill -STOP -f "uvicorn pedidos.main:app"
+```
+
+O processo congelado não responde à probe HTTP, mas a porta continua aceitando conexões no kernel: troque a liveness para `tcpSocket` e repita o teste para ver, na prática, por que ela não detecta o travamento.
+
+<Callout type="warning" title="Rota de diagnóstico não vai para produção">
+A rota `/_diag/travar` é uma forma de derrubar réplicas com uma requisição. Proteja-a com a variável de ambiente desligada por padrão, não a exponha pelo Ingress e remova-a do overlay de produção. Para testar resiliência em produção, use uma ferramenta de chaos engineering com escopo e janela controlados.
+</Callout>
+
+## CrashLoopBackOff e o backoff exponencial
+
+Se o contêiner reiniciado volta a falhar, o kubelet não tenta de novo imediatamente. A espera entre tentativas dobra a cada falha, começando em 10 segundos (10, 20, 40, 80, 160) até o teto de 5 minutos, e é zerada depois que o contêiner roda 10 minutos sem problemas. Enquanto espera, o Pod mostra o estado `CrashLoopBackOff`. O backoff protege o nó e as dependências de um contêiner que reinicia em laço, e é a razão de um erro de configuração demorar cada vez mais para "tentar de novo".
+
+A liveness participa do CrashLoopBackOff de duas formas. Uma liveness agressiva demais, que mata o contêiner antes de ele ficar responsivo, produz exatamente esse estado com a aplicação saudável; o sintoma é `Liveness probe failed` nos eventos e a mensagem de inicialização normal no `logs --previous`. A outra é uma startup curta demais para o boot real. Em ambos os casos, a correção está nos números, não na aplicação. O capítulo seguinte traz uma tabela de diagnóstico que separa esse caso dos demais motivos de CrashLoopBackOff.
+
+## Anti-padrões
+
+| Anti-padrão | O que acontece | Correção |
+|---|---|---|
+| Liveness consultando o banco | O Postgres oscila, todas as réplicas falham juntas, são reiniciadas juntas e reconectam juntas: reinício em cascata | Dependências só na readiness |
+| Liveness igual à readiness | Toda falha de dependência vira reinício | Endpoints diferentes, liveness mais tolerante |
+| `timeoutSeconds: 1` sob carga | No pico, o worker demora 1,2 s para atender a probe e o Pod é reiniciado justamente quando mais faz falta | Timeout de 2 a 5 segundos e `failureThreshold` maior que 1 |
+| Limite de CPU apertado | O processo é contido pelo limite, a probe estoura o tempo e o contêiner reinicia sem estar travado | Requests realistas e limite de CPU com folga |
+| `initialDelaySeconds` alto | Liveness desligada por minutos em todo Pod, e reinício em laço se o boot ficar mais lento | `startupProbe` |
+| Liveness em tudo, por padrão | Probes copiadas para serviços que nunca travam só criam formas novas de reiniciar | Liveness quando existe um modo de travamento conhecido |
+| Restart como solução | Um deadlock que acontece a cada duas horas fica escondido pelos reinícios | Restart é alarme: alerte e investigue |
+
+O último merece atenção. A liveness é um curativo que mantém o sistema no ar enquanto alguém descobre a causa, não a causa resolvida. Crie um alerta sobre o aumento de reinícios por contêiner (a métrica `kube_pod_container_status_restarts_total`, do kube-state-metrics) e trate cada reinício por liveness como um incidente pequeno: ver o `logs --previous`, achar o ponto em que o processo parou, corrigir o código. Um `py-spy dump` no processo travado, antes de a liveness agir, mostra a pilha de cada thread e costuma apontar o lock ou a chamada bloqueante na hora.
+
+<Callout type="tip" title="Comece sem liveness e acrescente com motivo">
+Readiness e startup quase sempre valem a pena. A liveness só ajuda se existir um jeito de o processo travar sem morrer, e cada liveness mal calibrada é um novo modo de falha. Ao adicioná-la, faça o teste de travamento deste capítulo para provar que ela detecta o problema, e um teste de carga para provar que ela não reinicia Pods saudáveis.
+</Callout>
+
+## restartPolicy, réplicas, PDB e desligamento gracioso
+
+Quem executa o reinício é a `restartPolicy` do Pod. Em Deployments ela é sempre `Always`, a única aceita. Em Jobs, `OnFailure` reinicia o contêiner no mesmo Pod e `Never` deixa o Pod falhar, e o Job cria outro, contando para o `backoffLimit`. A liveness funciona nos três casos: ela apenas mata o contêiner, e a política decide o que vem depois.
+
+A autocura de um contêiner só é invisível para o cliente se houver outras réplicas atendendo enquanto ele reinicia. Três réplicas com readiness bem feita absorvem o reinício de uma. Se a causa é comum a todas (uma liveness que olha o banco, um limite de CPU apertado no pico), as três reiniciam juntas, e nenhum recurso do Kubernetes protege contra isso. O **PodDisruptionBudget** também não ajuda aqui: ele limita despejos voluntários, como drenar um nó na atualização do cluster, e não interfere em reinícios por probe. Mesmo assim, ele completa a estratégia de disponibilidade:
+
+```yaml
+# api-pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: ingressos
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: api
+```
+
+Com ele, um `kubectl drain` despeja um Pod da API por vez e espera o substituto ficar pronto, e aqui a readiness volta a ser decisiva, porque "pronto" é o que ela diz.
+
+Por fim, o encerramento. Num deploy ou num drain, o Pod sai dos endpoints e, em paralelo, recebe o `preStop` e depois o SIGTERM. Um `preStop` curto segura o SIGTERM enquanto a remoção se propaga, e o servidor termina as requisições em andamento dentro do prazo de graça:
+
+```yaml
+# api-deployment.yaml (dentro de spec.template.spec)
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: api
+          command: ["gunicorn", "ingressos.wsgi:application", "-c", "/etc/ingressos/gunicorn.conf.py"]
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
+```
+
+A ação `sleep` nativa no `preStop` dispensa o binário `sleep` na imagem. A conta precisa fechar: 10 segundos de `preStop` mais o `graceful_timeout = 25` do gunicorn (ou `--timeout-graceful-shutdown 25` no uvicorn) cabem nos 45. Use a forma exec no Dockerfile, `CMD ["gunicorn", ...]`: na forma shell, o PID 1 é o `/bin/sh`, que não repassa o SIGTERM, e o servidor só morre no SIGKILL. Num reinício por liveness, o mesmo `preStop` roda, mas limitado pelos 10 segundos do `terminationGracePeriodSeconds` da probe, e é por isso que os dois prazos existem separados.
+
+## Na entrevista
+
+**Qual a diferença entre liveness, readiness e startup probe?** A startup diz se a aplicação terminou de subir e suspende as outras até passar. A readiness diz se o Pod pode receber tráfego agora; ao falhar, ele sai dos endpoints sem reinício. A liveness diz se o contêiner travou sem volta; ao falhar, ele é reiniciado. Dependências externas entram só na readiness.
+
+**Que tipo de problema a liveness probe resolve?** Processo vivo mas incapaz de trabalhar: deadlock, laço infinito, event loop bloqueado, pool interno corrompido. Ela não resolve dependência fora do ar, lentidão externa, erro de configuração nem vazamento de memória, e em vários desses casos piora a situação.
+
+**Por que usar startupProbe em vez de initialDelaySeconds alto?** O `initialDelaySeconds` atrasa a liveness de todos os Pods pelo pior caso e, se o boot ficar mais lento que o valor, causa reinícios em laço. A startup libera as outras probes assim que a aplicação responde e permite um prazo máximo generoso sem afrouxar a liveness depois.
+
+**Quanto tempo leva para uma liveness reiniciar um contêiner travado?** Até aproximadamente `periodSeconds × failureThreshold + timeoutSeconds` para detectar, mais o prazo de graça entre SIGTERM e SIGKILL, que pode ser reduzido com o `terminationGracePeriodSeconds` da própria probe, mais o tempo de subida.
+
+**Como fazer liveness de um worker que não tem HTTP?** Com um heartbeat local: o laço principal atualiza um arquivo e uma probe `exec` verifica se ele é recente. Evito comandos que passam pelo broker, como `celery inspect ping`, porque uma oscilação do broker reiniciaria todos os workers.
+
+**Um Pod reinicia a cada poucas horas por liveness. O que você faz?** Trato como bug, não como autocura. Leio os eventos e o `logs --previous`, capturo a pilha do processo travado com `py-spy dump` antes do reinício e procuro o lock, a chamada bloqueante ou o recurso esgotado. Se os reinícios coincidem com picos, confiro se não é timeout curto ou limite de CPU.
+
+## Pratique
+
+1. Implemente `/healthz` como `async def` e `/readyz` com banco e broker no `pedidos`, e configure startup, readiness e liveness. Calcule por escrito quanto tempo cada uma leva para agir.
+2. Adicione a rota `/_diag/travar`, trave um Pod e registre a sequência em `kubectl get pods -w`: momento do `0/1`, momento do reinício, código de saída no `describe` e conteúdo do `logs --previous`.
+3. Troque a liveness para `tcpSocket`, congele o processo com `pkill -STOP` a partir do nó do kind e confirme que a probe não detecta o travamento. Volte para `httpGet` e repita.
+4. Adicione o heartbeat em arquivo ao consumidor do `notificacoes` com a probe `exec`, simule um laço preso no `processar` e veja o reinício. Ajuste o limite de idade para o processamento mais lento.
+5. Coloque de propósito uma liveness que consulta o Postgres, reinicie o banco e observe o reinício em cascata das réplicas. Corrija, configure `terminationGracePeriodSeconds: 10` na probe e o `preStop` de 10 segundos, e meça o tempo total de recuperação.
+
+<Quiz question="A liveness do pedidos usa periodSeconds 10, timeoutSeconds 2 e failureThreshold 3. O event loop trava logo após uma probe bem-sucedida. Em quanto tempo, no pior caso, o kubelet decide reiniciar?" options={["Cerca de 2 segundos","Cerca de 10 segundos","Cerca de 32 segundos","Cerca de 5 minutos"]} answer={2} explanation="São necessárias 3 falhas seguidas com 10 segundos de intervalo, e a última só é contada depois de estourar o timeout de 2 segundos. Depois disso ainda vem o prazo de encerramento." />
+
+<Quiz question="O uvicorn do pedidos está com o event loop bloqueado, mas a liveness com tcpSocket continua passando. Por quê?" options={["O kubelet ignora falhas de TCP","O kernel completa o handshake TCP mesmo que a aplicação nunca aceite a conexão","O tcpSocket só roda na inicialização","O Service responde no lugar do Pod"]} answer={1} explanation="A conexão entra na fila de listen do kernel sem participação da aplicação. Para detectar o loop travado, a probe precisa de uma resposta da própria aplicação, como um httpGet num endpoint async." />
+
+<Quiz question="A liveness de todas as réplicas da API consulta o Postgres, e o banco fica lento por um minuto. Qual o efeito mais provável?" options={["As réplicas saem do balanceamento e voltam sozinhas","Nada, porque a liveness só olha o processo","O PodDisruptionBudget impede que mais de uma réplica reinicie","Todas as réplicas reiniciam juntas e reconectam ao mesmo tempo, ampliando a falha"]} answer={3} explanation="Com a dependência na liveness, uma lentidão externa vira reinício em massa. O PDB não se aplica a reinícios por probe. A dependência deveria estar só na readiness." />
+
+<Quiz question="O catalogo leva até 90 segundos para subir em produção. Qual a configuração mais adequada?" options={["livenessProbe com initialDelaySeconds 120","startupProbe com periodSeconds 5 e failureThreshold 36, e liveness estrita depois","Remover todas as probes do catalogo","readinessProbe com successThreshold 20"]} answer={1} explanation="A startup permite até 180 segundos de boot e libera readiness e liveness assim que a aplicação responde, sem atrasar Pods que sobem rápido nem afrouxar a liveness." />
+
+## Base no CodeForge
+
+- [Kubernetes: Deployments, Volumes e escalabilidade](/learn/carreira-python/kubernetes-deployments-volumes-escalabilidade): a primeira configuração das três probes e dos endpoints `/healthz` e `/readyz`.
+- [Kubernetes com microsserviços: Subindo e gerenciando uma aplicação](/learn/carreira-python/kubernetes-microsservicos-subindo-gerenciando-aplicacao): o diagnóstico de CrashLoopBackOff e os demais estados de falha.
+- [Heartbeats](/learn/system-design/heartbeats) e [Lidando com falhas](/learn/system-design/lidando-com-falhas): o conceito por trás da liveness e do heartbeat em arquivo.
+- [Deadlock](/learn/concorrencia/deadlock): o tipo de travamento que a liveness contorna e que só o código resolve.
+- [Alertas](/learn/system-design/alertas) e [Disponibilidade](/learn/system-design/disponibilidade): reinícios como sinal e réplicas como proteção.
+
+## Referências
+
+- [Kubernetes: Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
+- [Kubernetes: Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+- [Kubernetes: Pod Lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [Kubernetes: Container Lifecycle Hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
+- [Kubernetes: Disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)
