@@ -1,11 +1,11 @@
 ---
-title: "Mensageria com Python e Kafka: Integração assíncrona em larga escala"
+title: "Mensageria com Python e Kafka: Integração assíncrona em sistemas distribuídos"
 kind: lesson
 ---
 
-O RabbitMQ resolve bem a entrega de tarefas e eventos entre os serviços da plataforma de ingressos. Mas surgem pedidos de outra natureza: o time de dados quer reprocessar todos os pedidos dos últimos sete dias para recalcular uma métrica, o antifraude quer ler o fluxo de compras em tempo real sem atrapalhar ninguém, e na abertura das vendas do maior festival do ano o volume chega a dezenas de milhares de eventos por segundo. Uma fila apaga a mensagem depois do ack; para esses casos você precisa de um registro que fique guardado, que vários leitores percorram cada um no seu ritmo, e que escale dividindo o trabalho entre máquinas.
+A plataforma de ingressos já é um sistema distribuído: `pedidos`, `catalogo`, `pagamentos`, `notificacoes` e o antifraude rodam separados, cada um com seu banco, e precisam saber o que acontece nos outros sem se chamarem a todo instante. O RabbitMQ resolve bem a entrega de tarefas e comandos entre eles. Mas surgem necessidades de outra natureza: o time de dados quer reprocessar todos os pedidos dos últimos sete dias para recalcular uma métrica, o antifraude quer ler o fluxo de compras em tempo real sem atrapalhar ninguém, e na abertura das vendas do maior festival do ano o volume chega a dezenas de milhares de eventos por segundo. Uma fila apaga a mensagem depois do ack; para esses casos você precisa de um registro que fique guardado, que vários leitores percorram cada um no seu ritmo, e que escale dividindo o trabalho entre máquinas.
 
-O Apache Kafka é esse registro: um log distribuído, particionado e replicado. Este capítulo explica o modelo (tópicos, partições, offsets, grupos de consumidores), as decisões que determinam ordenação e durabilidade (chave, réplicas, `acks`), e a parte em que os sistemas costumam errar (produtor idempotente, commit manual, rebalanceamento, esquemas), com o cliente `confluent-kafka` e o Kafka em modo KRaft, sem ZooKeeper.
+O Apache Kafka é esse registro: um log distribuído, particionado e replicado, que vira a espinha dorsal de eventos entre os serviços. Este capítulo explica o modelo (tópicos, partições, offsets, grupos de consumidores), as decisões que determinam ordenação e durabilidade (chave, réplicas, `acks`), a parte em que os sistemas costumam errar (produtor idempotente, commit manual, rebalanceamento, esquemas) e como os padrões de integração vistos antes (outbox, CDC e saga) ficam sobre o Kafka. Tudo com o cliente `confluent-kafka` e o Kafka em modo KRaft, sem ZooKeeper.
 
 **Você vai aprender:**
 
@@ -13,6 +13,7 @@ O Apache Kafka é esse registro: um log distribuído, particionado e replicado. 
 - Escolher a chave de partição para garantir ordenação onde ela importa
 - Configurar produtores duráveis e idempotentes com replicação e `acks`
 - Consumir em grupo com commit manual e lidar com rebalanceamento
+- Integrar serviços pelo Kafka com outbox via Debezium, eventos que carregam estado e saga coreografada
 - Comparar Kafka e RabbitMQ e explicar o exactly-once e seus limites
 
 ## O log distribuído
@@ -244,6 +245,78 @@ O Kafka guarda dados por política, não por consumo:
 
 Como o tópico guarda dados por dias e é lido por vários times, o formato das mensagens é um contrato de longo prazo. JSON sem esquema funciona até alguém renomear um campo. O caminho maduro é um **registro de esquemas** (o Schema Registry da Confluent e alternativas compatíveis) com Avro, Protobuf ou JSON Schema: o produtor registra o esquema, a mensagem carrega só o id dele, e o registro recusa mudanças incompatíveis segundo a regra de compatibilidade configurada. O `confluent-kafka` traz serializadores para isso no módulo `confluent_kafka.schema_registry`. Mesmo sem registro, adote as regras: só adicionar campos opcionais, nunca renomear nem mudar tipo, e uma versão nova do evento quando a mudança for incompatível.
 
+## Integrando serviços pelo Kafka
+
+Até aqui o Kafka foi um tubo de eventos. Num sistema distribuído, ele vira o meio pelo qual os serviços se mantêm informados uns dos outros, e três padrões do capítulo [Padrões de Integração em Sistemas Distribuídos](/learn/carreira-python/padroes-integracao-sistemas-distribuidos) ganham forma concreta.
+
+### Outbox publicado por CDC
+
+O serviço `pedidos` não pode gravar o pedido no PostgreSQL e depois publicar no Kafka como duas operações soltas: se cair entre elas, o banco e o resto do sistema discordam para sempre. O outbox grava o evento numa tabela na mesma transação do pedido; falta levá-lo ao Kafka. Em vez de um laço que consulta a tabela, o **Debezium**, rodando no **Kafka Connect**, lê o log de replicação do PostgreSQL (o WAL) e publica cada linha nova do outbox como mensagem. O transformador *outbox event router* do Debezium usa as colunas da tabela para escolher o tópico, a chave e o conteúdo:
+
+```json
+// connect/pedidos-outbox.json
+{
+  "name": "pedidos-outbox",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "pedidos-db",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/opt/kafka/secrets/pedidos.properties:senha}",
+    "database.dbname": "pedidos",
+    "topic.prefix": "pedidos",
+    "plugin.name": "pgoutput",
+    "table.include.list": "public.outbox",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.key": "agregado_id",
+    "transforms.outbox.route.by.field": "agregado_tipo",
+    "transforms.outbox.route.topic.replacement": "${routedByValue}.eventos"
+  }
+}
+```
+
+Com `agregado_tipo` igual a `pedidos` e `agregado_id` igual ao id do pedido, o evento cai em `pedidos.eventos` com a chave certa, e a ordem por pedido se mantém do banco até o consumidor. A senha vem de um arquivo de segredos pelo provedor de configuração do Kafka Connect, nunca escrita no JSON. O Debezium entrega pelo menos uma vez (depois de uma queda, pode republicar as últimas linhas), então o `id` do evento e o consumidor idempotente continuam necessários. A tabela de outbox pode ser limpa periodicamente, porque o Debezium lê o WAL, não a tabela.
+
+### Eventos que carregam estado
+
+Há dois jeitos de desenhar o evento. Na **notificação**, ele diz só o que aconteceu (`pedido.pago` e o `pedido_id`), e quem precisar dos detalhes chama a API de `pedidos`. É simples, mas recria o acoplamento síncrono que o Kafka devia tirar: se `pedidos` estiver fora do ar, o antifraude para. Na **transferência de estado pelo evento** (*event-carried state transfer*), o evento leva os dados de que os consumidores precisam: itens, valores, cliente. Cada serviço mantém a própria cópia, a **projeção**, com só o que lhe interessa:
+
+```python
+# ingressos/antifraude/projecao.py
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
+
+from ingressos.antifraude.modelos import CompraVista
+
+
+def aplicar(evento: dict, sessao: Session) -> None:
+    if evento["tipo"] != "pedido.pago":
+        return
+    dados = evento["dados"]
+    sessao.execute(
+        insert(CompraVista)
+        .values(
+            pedido_id=dados["pedido_id"],
+            cliente_id=dados["cliente_id"],
+            total_centavos=dados["total_centavos"],
+            pago_em=evento["ocorrido_em"],
+        )
+        .on_conflict_do_nothing(index_elements=["pedido_id"])
+    )
+```
+
+O `ON CONFLICT DO NOTHING` torna a aplicação idempotente: reprocessar o mesmo evento não muda nada. E como o tópico guarda a história, um serviço novo constrói sua projeção do zero lendo desde o início (ou de um tópico compactado com o estado atual). O preço é a **consistência eventual**: a projeção do antifraude fica milissegundos, ou segundos sob carga, atrás de `pedidos`. Desenhe telas e regras sabendo disso: depois de pagar, a tela de confirmação lê de `pedidos`, a fonte da verdade, não de uma projeção. E não ponha no evento dado pessoal de que nenhum consumidor precisa: ele fica guardado no tópico por toda a retenção.
+
+### Saga coreografada sobre tópicos
+
+A compra envolve reservar estoque no `catalogo`, cobrar em `pagamentos` e confirmar em `pedidos`. Na saga coreografada, cada serviço consome os eventos de que depende e publica os seus: `pedido.criado` leva o `catalogo` a reservar e publicar `estoque.reservado`; isso leva `pagamentos` a cobrar e publicar `pagamento.aprovado` ou `pagamento.recusado`; a recusa leva o `catalogo` a liberar a reserva (a compensação). Com o Kafka, duas decisões fazem a saga funcionar:
+
+- **A mesma chave em todos os tópicos da saga.** Usando `pedido_id` como chave em `pedidos.eventos`, `catalogo.eventos` e `pagamentos.eventos`, os passos de um mesmo pedido chegam em ordem a cada consumidor. Uma compensação nunca é processada antes da reserva que ela desfaz.
+- **Cada passo grava e publica pelo outbox.** O `catalogo` reserva o estoque e grava `estoque.reservado` no próprio outbox na mesma transação; o Debezium publica. Sem isso, a saga trava num pedido com estoque reservado e nenhum evento.
+
+Coreografia funciona bem com três ou quatro passos. Acima disso, o fluxo fica espalhado entre serviços e difícil de acompanhar; um orquestrador (um serviço que guarda o estado da saga e publica comandos) ou um motor de workflow passa a compensar.
+
 ## Exactly-once e Kafka x RabbitMQ
 
 O Kafka oferece **exactly-once** num escopo preciso: ler de tópicos, processar e escrever em tópicos, tudo no mesmo cluster. O produtor transacional (`transactional.id`, `init_transactions`, `begin_transaction`, `commit_transaction`) escreve as mensagens de saída e os offsets do consumidor numa transação atômica; consumidores com `isolation.level=read_committed` só enxergam mensagens de transações confirmadas. Se o processo cair no meio, a transação é abortada e nada aparece pela metade. É a base do Kafka Streams e de pipelines de transformação.
@@ -277,6 +350,10 @@ Na plataforma, uma divisão razoável é: RabbitMQ para comandos e tarefas (gera
 
 **O Kafka tem exactly-once?** Sim, para o ciclo de ler, processar e escrever dentro do Kafka, com produtor transacional e consumidores `read_committed`. Efeitos fora do Kafka, como banco ou e-mail, continuam exigindo idempotência.
 
+**Como você publica eventos no Kafka sem perder consistência com o banco?** Com outbox: o evento é gravado numa tabela na mesma transação da mudança, e o Debezium lê o WAL e publica no Kafka. Nunca gravar no banco e publicar como dois passos soltos. O Debezium entrega pelo menos uma vez, então o consumidor é idempotente.
+
+**Notificação ou evento com estado?** A notificação obriga o consumidor a chamar a API de origem, recriando acoplamento síncrono. O evento com estado leva os dados, e cada serviço mantém sua projeção, aceitando consistência eventual. Para integração entre serviços, prefiro o evento com estado, sem dados de que ninguém precisa.
+
 **Quando um tópico compactado é útil?** Quando o tópico representa estado atual por chave, como a disponibilidade de cada setor. O Kafka mantém o último valor de cada chave, e um consumidor novo reconstrói o estado completo lendo do início.
 
 ## Pratique
@@ -286,6 +363,8 @@ Na plataforma, uma divisão razoável é: RabbitMQ para comandos e tarefas (gera
 3. Escreva o consumidor do grupo `antifraude` com commit manual a cada 100 mensagens e idempotência pela tabela de ids processados; mate o processo no meio e confira que nada se perde nem duplica efeito.
 4. Rode três instâncias do consumidor, derrube uma e observe nos logs dos callbacks como as partições são redistribuídas com `cooperative-sticky`.
 5. Crie o tópico compactado `setores.disponibilidade`, publique atualizações e escreva um serviço que reconstrói o estado em memória lendo-o desde o início.
+6. Suba o Kafka Connect com o Debezium, registre o conector de outbox do serviço `pedidos` e confira que um pedido criado aparece em `pedidos.eventos` com a chave `pedido_id`, sem código de publicação na aplicação.
+7. Implemente a saga coreografada de compra com `catalogo` e `pagamentos` e simule um pagamento recusado: a reserva deve ser liberada pela compensação.
 
 <Quiz question="Um tópico tem 6 partições e o grupo de consumidores tem 8 instâncias. O que acontece?" options={["Cada partição é dividida entre instâncias","As mensagens são duplicadas para todas as instâncias","O Kafka cria duas partições a mais automaticamente","Seis instâncias recebem uma partição cada e duas ficam ociosas"]} answer={3} explanation="Dentro de um grupo, cada partição é lida por no máximo um consumidor. O número de partições limita o paralelismo do grupo." />
 
@@ -293,8 +372,12 @@ Na plataforma, uma divisão razoável é: RabbitMQ para comandos e tarefas (gera
 
 <Quiz question="O consumidor faz commit do offset só depois de processar a mensagem. Que garantia isso dá?" options={["Pelo menos uma vez","No máximo uma vez","Exatamente uma vez em qualquer cenário","Nenhuma garantia"]} answer={0} explanation="Se o processo cair depois de processar e antes do commit, a mensagem será lida de novo. Nada se perde, mas pode haver reprocessamento, tratado com idempotência." />
 
+<Quiz question="Numa saga coreografada sobre o Kafka, por que usar pedido_id como chave em todos os tópicos da saga?" options={["Para o Kafka apagar os eventos do pedido juntos","Para que os passos de um mesmo pedido, inclusive a compensação, cheguem em ordem a cada consumidor","Porque o Debezium exige chave numérica","Para concentrar todos os pedidos numa única partição"]} answer={1} explanation="Mesma chave, mesma partição, mesma ordem. Assim a liberação da reserva nunca é processada antes da própria reserva." />
+
 ## Base no CodeForge
 
+- [Padrões de Integração em Sistemas Distribuídos](/learn/carreira-python/padroes-integracao-sistemas-distribuidos): outbox, CDC e saga, que este capítulo leva para o Kafka.
+- [Outbox](/learn/system-design/outbox), [CDC](/learn/system-design/cdc) e [Saga](/learn/system-design/saga): os padrões em detalhe.
 - [Mensageria com Python e RabbitMQ: Integração assíncrona entre serviços](/learn/carreira-python/mensageria-python-rabbitmq-integracao-assincrona): o broker de filas, para comparar.
 - [Motores de streaming](/learn/system-design/motores-de-streaming) e [Batch vs stream](/learn/system-design/batch-vs-stream): onde o Kafka se encaixa no processamento de dados.
 - [Particionamento](/learn/system-design/particionamento) e [Replicação](/learn/system-design/replicacao): os fundamentos de partições e ISR.
@@ -307,3 +390,4 @@ Na plataforma, uma divisão razoável é: RabbitMQ para comandos e tarefas (gera
 - [Apache Kafka: Introduction](https://kafka.apache.org/intro)
 - [confluent-kafka-python: documentação da API](https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html)
 - [Apache Kafka: KRaft](https://kafka.apache.org/documentation/#kraft)
+- [Debezium: Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html)

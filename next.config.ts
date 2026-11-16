@@ -15,6 +15,26 @@ const nextConfig: NextConfig = {
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },
+  // Capítulos renomeados: o endereço antigo continua valendo para favoritos e links já compartilhados.
+  async redirects() {
+    return [
+      {
+        source: "/learn/carreira-python/django-rest-framework-autenticacao-permissoes-limites",
+        destination: "/learn/carreira-python/django-rest-framework-permissoes-documentacao-limitacoes-cors-deploy-aws",
+        permanent: true,
+      },
+      {
+        source: "/learn/carreira-python/kubernetes-praticando-garantindo-aplicacao-alta-disponibilidade",
+        destination: "/learn/carreira-python/kubernetes-praticando-garantindo-aplicacao-livenessprobe",
+        permanent: true,
+      },
+      {
+        source: "/learn/carreira-python/kubernetes-garantindo-protegendo-aplicacao",
+        destination: "/learn/carreira-python/kubernetes-garantindo-protegendo-aplicacao-istio",
+        permanent: true,
+      },
+    ];
+  },
   // Pacotes nativos/WASM ficam fora do bundle (o @node-rs/argon2 carrega um binário .node).
   serverExternalPackages: ["@electric-sql/pglite", "pg", "@node-rs/argon2"],
   // Servidor Node autocontido em .next/standalone (imagem Docker para o Azure Container Apps).
