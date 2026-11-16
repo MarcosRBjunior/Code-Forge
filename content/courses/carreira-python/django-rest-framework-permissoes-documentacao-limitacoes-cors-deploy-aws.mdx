@@ -1,19 +1,20 @@
 ---
-title: "Django REST Framework: Trabalhando com autenticação, permissões e limites de requisição"
+title: "Django REST Framework: Trabalhando com permissões, documentação, limitações, CORS e deploy na AWS"
 kind: lesson
 ---
 
-Até aqui a API de `ingressos` responde a qualquer um. Qualquer pessoa cria um evento, altera o preço de um setor ou lista os pedidos de todos os clientes. Antes de abrir a compra de ingressos pela API, três perguntas precisam de resposta em cada requisição: **quem é você** (autenticação), **o que você pode fazer** (permissão) e **quantas vezes pode fazer** (limite de requisições). O DRF trata as três como etapas separadas e configuráveis, que rodam antes do código da view.
+Até aqui a API de `ingressos` responde a qualquer um e só roda no seu computador. Qualquer pessoa cria um evento, altera o preço de um setor ou lista os pedidos de todos os clientes, e ninguém de fora consegue usá-la. Este capítulo leva a API do `runserver` até a internet, em cinco passos: **o que cada usuário pode fazer** (permissões), **como os outros times descobrem o que a API faz** (documentação), **quantas vezes um cliente pode chamar** (limitações), **quais sites podem chamá-la pelo navegador** (CORS) e, por fim, **onde ela roda** (deploy na AWS).
 
-Este capítulo parte dos usuários e do login que você montou nos capítulos de autenticação de Django e leva isso para a API: sessão para o próprio site, token para integrações simples e JWT com SimpleJWT para o aplicativo e o front separado. Depois vêm as classes de permissão, inclusive por objeto, os limites de requisição e o CORS para o navegador conseguir chamar a API de outro domínio.
+Permissão depende de saber quem é o usuário, então o capítulo começa ligando a API ao login que você montou nos capítulos de autenticação de Django: sessão para o próprio site e JWT com SimpleJWT para o aplicativo e o front separado.
 
 **Você vai aprender:**
 
 - Como o DRF processa autenticação, permissão e throttling em cada requisição, e quando responde 401 ou 403
-- Configurar autenticação por sessão, por token e por JWT com SimpleJWT
 - Escrever classes de permissão globais e por objeto, e filtrar o queryset pelo usuário
+- Gerar a documentação OpenAPI da API com drf-spectacular e decidir quem pode vê-la
 - Limitar requisições por usuário, por IP e por escopo
 - Configurar CORS com django-cors-headers sem abrir mais do que o necessário
+- Preparar as configurações de produção e publicar a API na AWS com EC2, RDS e ElastiCache
 
 ## O caminho de uma requisição
 
@@ -50,45 +51,17 @@ REST_FRAMEWORK = {
 
 O padrão global é **fechado**: toda rota exige usuário autenticado, e você abre explicitamente as que são públicas. O contrário (padrão aberto e fechar rota a rota) é como nascem os endpoints esquecidos sem proteção. O DRF, sem configuração, usa `AllowAny`: mude isso no primeiro dia.
 
-## Autenticação por sessão
+## Quem é o usuário: sessão, token ou JWT
 
-`SessionAuthentication` reaproveita o login do Django: o cookie `sessionid` que o navegador já tem depois de entrar no site. É a escolha certa quando o front é servido pelo próprio Django, no mesmo domínio, e para usar a interface navegável.
+O DRF traz três formas prontas de identificar o usuário, e a API de `ingressos` usa duas delas.
 
-Ela tem uma consequência importante: para usuários autenticados por sessão, o DRF **exige o token CSRF** em métodos que alteram estado (`POST`, `PUT`, `PATCH`, `DELETE`). Isso é proteção, não incômodo: como o navegador envia o cookie automaticamente, um site malicioso poderia disparar uma compra em nome do usuário. O JavaScript do front lê o cookie `csrftoken` e envia o valor no cabeçalho `X-CSRFToken`. Requisições anônimas não passam pela verificação, porque não há sessão a explorar.
+**Sessão.** `SessionAuthentication` reaproveita o login do Django: o cookie `sessionid` que o navegador já tem depois de entrar no site. É a escolha certa quando o front é servido pelo próprio Django, no mesmo domínio, e para usar a interface navegável. Para usuários autenticados por sessão, o DRF **exige o token CSRF** em métodos que alteram estado (`POST`, `PUT`, `PATCH`, `DELETE`): como o navegador envia o cookie automaticamente, um site malicioso poderia disparar uma compra em nome do usuário. O JavaScript do front lê o cookie `csrftoken` e envia o valor no cabeçalho `X-CSRFToken`.
 
-## Autenticação por token
+**Token do DRF.** O app `rest_framework.authtoken` guarda uma chave aleatória por usuário, enviada como `Authorization: Token <chave>`. É fácil de revogar (apague a linha), mas não expira e fica em texto puro no banco. Serve para integrações de servidor a servidor de baixo risco, como um parceiro que só consulta eventos.
 
-O DRF traz um modelo simples de token: uma chave aleatória por usuário, guardada no banco e enviada no cabeçalho `Authorization: Token <chave>`.
+**JWT.** Para o aplicativo e o front em outro domínio, a escolha comum é JWT, configurada a seguir.
 
-```python
-# ingressos/settings.py
-INSTALLED_APPS = [
-    # ...
-    "rest_framework",
-    "rest_framework.authtoken",
-]
-```
-
-```python
-# ingressos/urls.py
-from rest_framework.authtoken.views import obtain_auth_token
-
-urlpatterns = [
-    # ...
-    path("api/auth/token/", obtain_auth_token),
-]
-```
-
-```bash
-python manage.py migrate
-curl -s -X POST http://localhost:8000/api/auth/token/ -d "username=ana&password=..."
-# {"token": "9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"}
-curl -s http://localhost:8000/api/pedidos/ -H "Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b"
-```
-
-Para que funcione nas requisições, inclua `rest_framework.authentication.TokenAuthentication` em `DEFAULT_AUTHENTICATION_CLASSES`. É fácil de entender e de revogar (apague a linha), mas tem limitações: um token por usuário, sem expiração e guardado em texto puro no banco. Serve bem para integrações de servidor a servidor de baixo risco, como um parceiro que só consulta eventos. Para usuários finais, a escolha comum é JWT.
-
-## JWT com SimpleJWT
+### JWT com SimpleJWT
 
 Um JWT é um token assinado que carrega as informações (claims) dentro dele: quem é o usuário e até quando o token vale. A API valida a assinatura e a expiração sem consultar o banco. O SimpleJWT implementa o par clássico: um **access token** curto, enviado em toda requisição, e um **refresh token** longo, usado só para obter um novo access.
 
@@ -272,6 +245,53 @@ O `perform_create` mostra outra regra: o dono do pedido vem de `request.user`, n
 Para cada recurso protegido, escreva os testes do outro lado: anônimo recebe 401, cliente comum não cria evento (403), cliente A não lê nem altera o pedido do cliente B (404). Controle de acesso quebrado é a categoria número um do OWASP Top 10, e quase sempre é uma rota em que ninguém testou o caso negativo.
 </Callout>
 
+## Documentação
+
+Com permissões diferentes por rota, a pergunta seguinte do time do aplicativo é: quais rotas existem, o que cada uma recebe e devolve, e qual exige login? A resposta que não envelhece é gerar a documentação a partir do próprio código, no formato OpenAPI. O gerador nativo do DRF está em modo de manutenção, e a própria documentação do DRF recomenda o **drf-spectacular**, que entende serializers, viewsets, filtros, paginação e as classes de autenticação.
+
+```bash
+pip install drf-spectacular
+```
+
+```python
+# ingressos/settings.py
+INSTALLED_APPS = [
+    # ...
+    "drf_spectacular",
+]
+
+REST_FRAMEWORK = {
+    # ... configurações anteriores
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "API de Ingressos",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+}
+```
+
+```python
+# ingressos/urls.py
+from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+
+urlpatterns = [
+    # ...
+    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+    path("api/docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+]
+```
+
+Em `/api/docs/` aparece o Swagger UI com todas as rotas. O drf-spectacular lê `JWTAuthentication` e `SessionAuthentication` e declara os esquemas de segurança no documento, então o botão **Authorize** aceita o access token e as requisições de teste saem autenticadas.
+
+Duas decisões que dependem das permissões da seção anterior:
+
+- **Quem vê a documentação.** As views do schema herdam o `DEFAULT_PERMISSION_CLASSES` fechado: sem login, `/api/docs/` responde 401. Para uma API de parceiros, abra com `SpectacularAPIView.as_view(permission_classes=[AllowAny])` (e o mesmo na view do Swagger). Para uma API interna, deixe fechada ou restrinja a `IsAdminUser`.
+- **A documentação não é a proteção.** Esconder uma rota do schema com `@extend_schema(exclude=True)` não a protege; ela continua respondendo a quem souber a URL. Quem protege é a permissão.
+
+Exemplos, respostas de erro, versões e a verificação do contrato no CI ficam para o capítulo [Swagger: Documentando suas APIs](/learn/carreira-python/swagger-documentando-apis), que aprofunda o drf-spectacular.
+
 ## Limites de requisição
 
 Throttling limita quantas requisições um cliente faz num intervalo. Protege contra abuso (força bruta no login, varredura de pedidos), contra um cliente com bug em laço e contra o custo de rotas caras. As classes prontas:
@@ -359,6 +379,156 @@ CORS_EXPOSE_HEADERS = ["Retry-After"]
 
 `CORS_ALLOW_ALL_ORIGINS = True` aparece em muito tutorial. Para uma API pública sem cookies, que só aceita token no cabeçalho, ele não abre uma brecha de autenticação, mas deixa qualquer site usar a API pelo navegador dos seus usuários. Prefira a lista explícita. E lembre: CORS é uma regra que **o navegador** aplica. Ele não impede `curl`, outro servidor ou um script de chamar a API. A proteção é autenticação e permissão.
 
+## Deploy na AWS
+
+Com acesso controlado, documentação, limites e CORS no lugar, a API pode sair do computador. Este é o primeiro deploy, feito à mão para você ver cada peça; os capítulos de integração contínua do Nível 2 automatizam o mesmo caminho com Docker e GitHub Actions.
+
+| Peça | Serviço da AWS | Por quê |
+|---|---|---|
+| Aplicação (gunicorn atrás do Nginx) | EC2 | Um servidor Linux que você controla por inteiro |
+| Banco de dados | RDS para PostgreSQL | Backup, atualização e failover gerenciados |
+| Cache dos limites de requisição | ElastiCache (Redis ou Valkey) | Contadores compartilhados entre todos os processos |
+| Segredos | Systems Manager Parameter Store | `SECRET_KEY` e senha do banco fora do código |
+| HTTPS | Application Load Balancer + ACM | Certificado gratuito e renovado sozinho |
+
+### Configurações de produção
+
+O `settings.py` do desenvolvimento não pode ir para produção. O mínimo, lendo tudo do ambiente:
+
+```python
+# ingressos/settings.py
+import os
+
+import dj_database_url
+
+DEBUG = os.environ.get("DJANGO_DEBUG", "false") == "true"
+SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
+ALLOWED_HOSTS = os.environ["DJANGO_ALLOWED_HOSTS"].split(",")
+CSRF_TRUSTED_ORIGINS = os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",")
+CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+
+DATABASES = {"default": dj_database_url.config(conn_max_age=60, ssl_require=not DEBUG)}
+
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": os.environ["REDIS_URL"],
+    }
+}
+
+# Atrás do load balancer, o HTTPS termina nele
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_SSL_REDIRECT = not DEBUG
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SECURE_HSTS_SECONDS = 0 if DEBUG else 31536000
+
+STATIC_ROOT = BASE_DIR / "staticfiles"
+```
+
+- `DEBUG=True` em produção mostra código, configurações e consultas SQL a qualquer um que provoque um erro. O padrão lido do ambiente é `false`: esquecer a variável deixa o sistema seguro, não exposto.
+- `os.environ["DJANGO_SECRET_KEY"]`, com colchetes, faz a aplicação **não subir** sem a chave, em vez de subir com um valor padrão conhecido.
+- `SECURE_PROXY_SSL_HEADER` diz ao Django que a requisição veio por HTTPS quando o load balancer avisa. Sem isso, `SECURE_SSL_REDIRECT` entra em laço de redirecionamento. Só é seguro porque o servidor aceita conexões apenas do load balancer (o security group garante isso); exposto direto, o cliente poderia forjar o cabeçalho.
+- O `REDIS_URL` aponta para o ElastiCache: é ele que torna globais os limites de requisição. O `NUM_PROXIES` do `REST_FRAMEWORK` também precisa refletir os proxies reais, como você verá abaixo.
+
+O próprio Django confere essa lista:
+
+```bash
+DJANGO_DEBUG=false python manage.py check --deploy
+```
+
+Ele avisa sobre HSTS, cookies sem `Secure`, `SECRET_KEY` fraca e outros itens. Rode antes do primeiro deploy e no CI.
+
+### Os serviços gerenciados
+
+1. **VPC e security groups.** Três grupos: o do load balancer aceita 443 da internet; o da aplicação aceita 8000 só do grupo do load balancer; o do banco e o do Redis aceitam 5432 e 6379 só do grupo da aplicação. Banco e Redis ficam em sub-redes privadas, sem IP público.
+2. **RDS.** Uma instância PostgreSQL pequena (`db.t4g.micro`), com backup automático ligado e acesso público desligado. A URL de conexão vira o parâmetro `/ingressos/prod/DATABASE_URL` no Parameter Store, do tipo `SecureString`.
+3. **ElastiCache.** Um cluster Redis ou Valkey pequeno, na mesma VPC. O endpoint vira `/ingressos/prod/REDIS_URL`.
+4. **Parameter Store.** Grave também `DJANGO_SECRET_KEY` (gere com `python -c "import secrets; print(secrets.token_urlsafe(50))"`), `DJANGO_ALLOWED_HOSTS` e as origens de CORS e CSRF.
+
+### O servidor
+
+Uma instância EC2 com Amazon Linux 2023 e um **perfil de instância** (IAM role) com permissão de ler só os parâmetros `/ingressos/prod/*`. Com o perfil, o servidor busca os segredos sem nenhuma chave de acesso gravada nele. Entre pelo Session Manager do Systems Manager em vez de abrir a porta 22.
+
+```bash
+sudo dnf install -y python3.13 git nginx
+sudo useradd --system --create-home --home-dir /opt/ingressos app
+sudo -u app git clone https://github.com/sua-conta/ingressos.git /opt/ingressos/app
+cd /opt/ingressos/app
+sudo -u app python3.13 -m venv .venv
+sudo -u app .venv/bin/pip install -r requirements.txt gunicorn
+```
+
+Um script versionado no repositório, `deploy/gerar-env.sh`, monta o arquivo de ambiente `/opt/ingressos/app.env` a partir do Parameter Store (`aws ssm get-parameters-by-path --path /ingressos/prod/ --with-decryption`), com dono `app` e permissão `600`. As migrações e os arquivos estáticos rodam uma vez por deploy, antes de reiniciar a aplicação:
+
+```bash
+sudo -u app bash -c "set -a && . /opt/ingressos/app.env && set +a && .venv/bin/python manage.py migrate --noinput && .venv/bin/python manage.py collectstatic --noinput"
+```
+
+O gunicorn roda sob o systemd, como usuário sem privilégios, e volta sozinho se cair ou se a instância reiniciar:
+
+```ini
+# /etc/systemd/system/ingressos.service
+[Unit]
+Description=API de ingressos
+After=network-online.target
+
+[Service]
+User=app
+WorkingDirectory=/opt/ingressos/app
+EnvironmentFile=/opt/ingressos/app.env
+ExecStart=/opt/ingressos/app/.venv/bin/gunicorn ingressos.wsgi:application --bind 127.0.0.1:8001 --workers 3 --access-logfile -
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+O Nginx escuta a porta 8000, a que o load balancer chama, serve `/static/` direto do disco e repassa o resto ao gunicorn:
+
+```nginx
+# /etc/nginx/conf.d/ingressos.conf
+server {
+    listen 8000;
+    client_max_body_size 5m;
+
+    location /static/ {
+        alias /opt/ingressos/app/staticfiles/;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+    }
+}
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ingressos nginx
+```
+
+Repare no `X-Forwarded-Proto`: o Nginx repassa o valor que o load balancer mandou, para o `SECURE_PROXY_SSL_HEADER` funcionar. E agora há dois proxies confiáveis na frente do Django (load balancer e Nginx), então `NUM_PROXIES` é 2. Com o valor errado, o throttling por IP limita o endereço do proxy, e todos os anônimos dividem o mesmo contador.
+
+### O load balancer
+
+Crie um Application Load Balancer com um listener HTTPS (443) usando um certificado do ACM para `api.ingressos.com`, e um listener HTTP (80) que só redireciona para HTTPS. O target group aponta para a porta 8000 da instância, com health check numa rota leve e pública, como `/saude/`, que responde 200 sem consultar nada caro. Aponte o DNS de `api.ingressos.com` para o load balancer e confira:
+
+```bash
+curl -si https://api.ingressos.com/api/eventos/ | head -1
+# HTTP/2 200
+curl -si https://api.ingressos.com/api/pedidos/ | head -1
+# HTTP/2 401
+```
+
+<Callout type="warning" title="Cuidado com a conta da AWS">
+Configure um alerta no AWS Budgets antes de criar qualquer recurso. Load balancer, RDS e ElastiCache cobram por hora mesmo sem tráfego, e um ambiente de estudo esquecido ligado vira fatura no fim do mês. Ao terminar os exercícios, apague tudo.
+</Callout>
+
+Esse deploy funciona, mas cada atualização é um `git pull`, `pip install`, `migrate` e `systemctl restart` feitos à mão, e o servidor vai acumulando diferenças em relação ao repositório. Os capítulos de integração contínua resolvem isso: a aplicação vira uma imagem Docker imutável, o pipeline faz o deploy no EC2 sem chaves de acesso e, depois, no Amazon ECS.
+
 ## Testando
 
 O `APIClient` do DRF tem atalhos para autenticar nos testes. Com pytest-django:
@@ -419,13 +589,22 @@ def test_login_jwt_e_chamada_autenticada(usuarios):
 
 **CORS protege a API?** Não. É uma regra do navegador sobre qual origem pode ler a resposta. Não impede chamadas de fora do navegador. A proteção é autenticação e autorização; CORS só define quais fronts podem usar a API pelo navegador.
 
+**Esconder uma rota da documentação a protege?** Não. Ela continua respondendo a quem souber a URL. A documentação descreve; quem protege é a permissão. E as próprias rotas de documentação seguem a permissão padrão: decida se são públicas ou internas.
+
+**O que muda no `settings.py` para produção?** `DEBUG` falso por padrão, `SECRET_KEY` e banco lidos do ambiente (sem valor padrão), `ALLOWED_HOSTS` restrito, cookies `Secure`, HSTS, `SECURE_PROXY_SSL_HEADER` atrás do load balancer e cache compartilhado. O `manage.py check --deploy` confere a maior parte.
+
+**Por que gunicorn atrás de Nginx, e não o `runserver`?** O `runserver` é um servidor de desenvolvimento, sem desempenho nem revisão de segurança para produção. O gunicorn roda vários workers da aplicação WSGI; o Nginx serve arquivos estáticos, segura conexões lentas e repassa só requisições completas ao gunicorn.
+
 ## Pratique
 
 1. Configure o padrão global com `IsAuthenticated`, JWT e sessão, e abra explicitamente a listagem e o detalhe de eventos. Confira com `curl` que as demais rotas devolvem 401.
 2. Implemente `EhOrganizadorOuSomenteLeitura` e `EhDonoDoPedido`, filtre o queryset de pedidos pelo usuário e escreva os testes de acesso negado para anônimo, cliente comum e cliente tentando ler pedido alheio.
 3. Configure SimpleJWT com access de 15 minutos, rotação e lista de bloqueio, e escreva um teste que prova que um refresh já usado é recusado.
 4. Adicione os limites `login` e `compra`, configure o cache Redis e escreva um teste que faz seis tentativas de login e espera 429 na sexta.
-5. Configure o django-cors-headers lendo as origens de variável de ambiente e verifique o preflight com `curl -X OPTIONS` enviando `Origin` e `Access-Control-Request-Method`.
+5. Instale o drf-spectacular, sirva o Swagger UI em `/api/docs/` e deixe a documentação pública. Use o botão Authorize com um access token e crie um pedido pela página.
+6. Configure o django-cors-headers lendo as origens de variável de ambiente e verifique o preflight com `curl -X OPTIONS` enviando `Origin` e `Access-Control-Request-Method`.
+7. Separe as configurações de produção lendo do ambiente e faça `manage.py check --deploy` passar sem avisos.
+8. Publique a API na AWS com EC2, RDS e ElastiCache atrás de um load balancer com HTTPS. Confirme que `/api/pedidos/` devolve 401 pela internet, que o banco não aceita conexões de fora da VPC e, ao final, apague todos os recursos.
 
 <Quiz question="Uma view tem JWTAuthentication e permission_classes igual a AllowAny. Uma requisição sem token chega. O que acontece?" options={["401, pois a autenticação está configurada","A requisição é atendida, com request.user anônimo","403, pois o usuário é anônimo","500, pois request.user fica vazio"]} answer={1} explanation="Autenticação só identifica. Sem credencial, request.user vira AnonymousUser, e AllowAny permite a requisição." />
 
@@ -433,12 +612,16 @@ def test_login_jwt_e_chamada_autenticada(usuarios):
 
 <Quiz question="Com quatro workers do gunicorn e o cache padrão LocMemCache, um limite de 5 por minuto no login permite, na prática:" options={["Até cerca de 20 tentativas por minuto, pois cada processo conta separado","Exatamente 5 tentativas por minuto","Nenhuma tentativa, pois o cache local bloqueia tudo","Tentativas ilimitadas, pois o throttling exige Redis para funcionar"]} answer={0} explanation="LocMemCache é por processo. Cada worker mantém o próprio contador. Um cache compartilhado como Redis torna o limite global." />
 
+<Quiz question="Em produção atrás de um load balancer que termina o HTTPS, a API entra em laço de redirecionamento com SECURE_SSL_REDIRECT ligado. Qual configuração falta?" options={["ALLOWED_HOSTS com o domínio","SECURE_PROXY_SSL_HEADER, para o Django saber que a requisição original veio por HTTPS","CORS_ALLOW_ALL_ORIGINS","SECURE_HSTS_SECONDS"]} answer={1} explanation="O load balancer fala HTTP com o servidor. Sem ler o X-Forwarded-Proto, o Django acha que toda requisição é HTTP e redireciona para HTTPS de novo, para sempre." />
+
 ## Base no CodeForge
 
 - [Django: Autenticação de formulários e alerta](/learn/carreira-python/django-autenticacao-formularios-alerta): os usuários, o login e a sessão que esta API reaproveita.
 - [JWT](/learn/system-design/jwt), [Sessão vs token](/learn/system-design/sessao-vs-token) e [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao): os conceitos por trás de cada escolha.
 - [Rate limiting](/learn/system-design/rate-limiting) e [Rate limiter](/learn/lld/rate-limiter-lld): algoritmos de limite de requisições e como implementá-los.
 - [RBAC](/learn/system-design/rbac): controle de acesso por papéis, além de grupos simples.
+- [Swagger: Documentando suas APIs](/learn/carreira-python/swagger-documentando-apis): exemplos, erros e contrato no CI com drf-spectacular.
+- [Integração Contínua: Pipeline de entrega e implementação contínua na EC2](/learn/carreira-python/integracao-continua-pipeline-entrega-implementacao-continua-ec2): o mesmo deploy na AWS, automatizado com Docker e GitHub Actions.
 - [Java e Spring Security: Proteja suas APIs REST](/learn/carreira-java/java-spring-security-proteja-apis-rest): o mesmo problema, com JWT e CORS em Spring, bom para comparar.
 
 ## Referências
@@ -447,3 +630,7 @@ def test_login_jwt_e_chamada_autenticada(usuarios):
 - [Django REST Framework: Permissions](https://www.django-rest-framework.org/api-guide/permissions/) e [Throttling](https://www.django-rest-framework.org/api-guide/throttling/)
 - [Simple JWT: documentação](https://django-rest-framework-simplejwt.readthedocs.io/en/latest/)
 - [django-cors-headers](https://github.com/adamchainz/django-cors-headers)
+- [drf-spectacular: documentação](https://drf-spectacular.readthedocs.io/en/latest/)
+- [Django: Deployment checklist](https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/)
+- [Gunicorn: Deploying](https://docs.gunicorn.org/en/stable/deploy.html)
+- [Amazon RDS for PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_PostgreSQL.html) e [Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html)
