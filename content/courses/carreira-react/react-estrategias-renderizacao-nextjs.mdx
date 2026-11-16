@@ -1,0 +1,364 @@
+---
+title: "React: explorando estratégias de renderização do Next.js"
+kind: lesson
+---
+
+A Quitanda já roda no Next.js, mas cada página ainda renderiza "do jeito que saiu". A home com as ofertas da semana é gerada a cada requisição, embora mude uma vez por dia. A página de produto busca o preço na API a cada visita, multiplicando a carga no pico de sábado. A página de pedidos, que depende de quem está logado, chegou a ser servida em cache por um erro de configuração e mostrou o pedido de um cliente para outro. E o painel do lojista, cheio de gráficos interativos, envia um HTML enorme que ninguém precisa no primeiro carregamento.
+
+Cada rota tem um perfil diferente: quão frequente o dado muda, se ele depende do usuário, se precisa estar no HTML para SEO. O Next.js oferece estratégias para cada perfil, e a decisão certa é por rota, às vezes por componente. Este capítulo percorre as estratégias (CSR, SSR, SSG, ISR, streaming e Partial Prerendering com Cache Components), como o cache e a revalidação funcionam e como Server Actions fecham o ciclo de escrita.
+
+**Você vai aprender:**
+
+- O que significam CSR, SSR, SSG e ISR e como cada uma aparece no App Router
+- Como o Next.js decide se uma rota é estática ou dinâmica
+- Usar streaming com `loading.tsx` e `Suspense` para entregar a página em partes
+- Ativar Cache Components e combinar `'use cache'`, `cacheLife`, `cacheTag` e Suspense (PPR)
+- Revalidar por tempo e sob demanda com `revalidateTag`, `updateTag` e `revalidatePath`
+- Escrever Server Actions com validação e escolher a estratégia de cada rota da Quitanda
+
+## As estratégias, em uma tabela
+
+| Sigla | Nome | Quando o HTML é gerado | Exemplo na Quitanda |
+|---|---|---|---|
+| CSR | Client-Side Rendering | No navegador, depois do JavaScript | Gráficos do painel, filtros interativos |
+| SSR | Server-Side Rendering | No servidor, a cada requisição | Página de pedidos do cliente logado |
+| SSG | Static Site Generation | No build | Página "Como funciona a entrega" |
+| ISR | Incremental Static Regeneration | No build e de novo, em segundo plano, após um tempo ou evento | Catálogo e páginas de produto |
+| Streaming | Renderização em partes | No servidor, enviada aos pedaços | Produto com avaliações lentas |
+| PPR | Partial Prerendering | Casca estática no build, partes dinâmicas na requisição | Home com ofertas estáticas e carrinho do usuário |
+
+No App Router essas siglas não são modos que você escolhe num menu; são consequências do que cada componente faz. Um Server Component que só lê dados cacheáveis vira estático; um que lê cookies vira dinâmico; um Client Component que busca com TanStack Query faz CSR daquela parte.
+
+## Estático ou dinâmico: o modelo clássico
+
+Sem Cache Components ligado (o padrão em projetos que vêm do Next.js 15), o Next.js tenta pré-renderizar cada rota no build. A rota passa a ser **dinâmica** quando usa uma API que só existe na requisição:
+
+- `cookies()` ou `headers()` de `next/headers`;
+- a prop `searchParams` da página;
+- `connection()` de `next/server`;
+- `fetch` com `cache: "no-store"`, ou a configuração `export const dynamic = "force-dynamic"`.
+
+O `next build` imprime cada rota com um símbolo: estática (pré-renderizada) ou dinâmica (renderizada sob demanda). Confira essa saída depois de cada mudança; é o jeito mais rápido de descobrir que uma página que deveria ser estática virou dinâmica por causa de um `cookies()` perdido num componente.
+
+### fetch e cache no modelo clássico
+
+Desde o Next.js 15, `fetch` não é cacheado por padrão. Você opta pelo cache:
+
+```tsx
+// src/servicos/produtos.ts (modelo clássico)
+export async function listarProdutos() {
+  const resposta = await fetch(`${process.env.API_URL}/produtos`, {
+    next: { revalidate: 300, tags: ["produtos"] }, // ISR: até 5 minutos de idade
+  });
+  return listaDeProdutosSchema.parse(await resposta.json());
+}
+```
+
+- `cache: "force-cache"`: guarda indefinidamente (até revalidação).
+- `next: { revalidate: N }`: guarda e regenera em segundo plano depois de N segundos (stale-while-revalidate).
+- `next: { tags: [...] }`: permite invalidar sob demanda.
+- `export const revalidate = 300` num `page.tsx` ou `layout.tsx`: vale para o segmento inteiro.
+
+### Rotas dinâmicas pré-geradas
+
+Páginas de produto têm um segmento dinâmico, `[id]`. Para gerá-las no build (SSG/ISR), informe os parâmetros:
+
+```tsx
+// src/app/produtos/[id]/page.tsx (trecho)
+export async function generateStaticParams() {
+  const maisVendidos = await listarMaisVendidos(100);
+  return maisVendidos.map((p) => ({ id: p.id }));
+}
+```
+
+Os 100 mais vendidos saem prontos do build; os demais são gerados na primeira visita e guardados para as seguintes. Para que ids fora da lista retornem 404, use `export const dynamicParams = false`.
+
+## Streaming
+
+Mesmo uma página dinâmica não precisa esperar o dado mais lento para começar a aparecer. Com streaming, o servidor envia o HTML em partes: primeiro a casca e os fallbacks, depois cada trecho conforme os dados chegam, tudo na mesma resposta HTTP.
+
+`loading.tsx` faz isso para a página inteira. Para granularidade fina, use `Suspense` dentro da página:
+
+```tsx
+// src/app/produtos/[id]/page.tsx
+import { Suspense } from "react";
+
+export default async function PaginaDoProduto({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const produto = await buscarProduto(id); // rápido, cacheado
+  if (!produto) notFound();
+
+  return (
+    <>
+      <DetalhesDoProduto produto={produto} />
+      <Suspense fallback={<EsqueletoDeAvaliacoes />}>
+        <Avaliacoes produtoId={id} /> {/* serviço lento: chega depois */}
+      </Suspense>
+      <Suspense fallback={<EsqueletoDeVitrine />}>
+        <QuemComprouTambemLevou produtoId={id} />
+      </Suspense>
+    </>
+  );
+}
+
+async function Avaliacoes({ produtoId }: { produtoId: string }) {
+  const avaliacoes = await buscarAvaliacoes(produtoId);
+  return <ListaDeAvaliacoes avaliacoes={avaliacoes} />;
+}
+```
+
+Os dois `Suspense` buscam em paralelo, e cada um aparece quando fica pronto. Cuidado com cascatas: se a página fizer `await` de três buscas em sequência antes de renderizar, o tempo é a soma. Inicie as buscas independentes juntas (`Promise.all`) ou divida em componentes com seus próprios `Suspense`.
+
+Uma Promise também pode ser passada sem `await` de um Server Component para um Client Component, que a lê com `use` dentro de um `Suspense`. É útil quando a parte interativa precisa do dado lento.
+
+## Cache Components e Partial Prerendering
+
+O Next.js 16 introduziu **Cache Components**, um modelo de cache explícito que substitui as configurações por segmento e torna o Partial Prerendering o comportamento padrão. Ative no `next.config.ts`:
+
+```ts
+// next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  cacheComponents: true,
+};
+
+export default config;
+```
+
+Com ele ligado, todo conteúdo da rota cai em uma de três categorias:
+
+1. **Estático**: código síncrono, imports, JSX sem dados de requisição. Vai para a casca pré-renderizada no build.
+2. **Cacheado**: funções ou componentes marcados com `'use cache'`. O resultado entra na casca e é revalidado conforme `cacheLife`.
+3. **Dinâmico**: o que lê `cookies()`, `headers()`, `searchParams` ou dados não cacheados. Precisa estar dentro de um `Suspense`; o fallback entra na casca e o conteúdo chega por streaming na requisição.
+
+Se um componente faz acesso dinâmico fora de `Suspense` e sem `'use cache'`, o Next.js acusa o erro em desenvolvimento e no build, em vez de transformar silenciosamente a rota inteira em dinâmica. Essa é a grande mudança: a decisão fica explícita no código.
+
+```tsx
+// src/app/page.tsx (home da Quitanda)
+import { Suspense } from "react";
+import { cookies } from "next/headers";
+import { cacheLife, cacheTag } from "next/cache";
+
+export default function Home() {
+  return (
+    <>
+      <Banner />                                   {/* estático */}
+      <OfertasDaSemana />                          {/* cacheado */}
+      <Suspense fallback={<EsqueletoDeRecomendacoes />}>
+        <RecomendadosParaVoce />                   {/* dinâmico, por usuário */}
+      </Suspense>
+    </>
+  );
+}
+
+async function OfertasDaSemana() {
+  "use cache";
+  cacheLife("hours");
+  cacheTag("ofertas");
+  const ofertas = await listarOfertas();
+  return <GradeDeProdutos produtos={ofertas} />;
+}
+
+async function RecomendadosParaVoce() {
+  const clienteId = (await cookies()).get("cliente")?.value;
+  const produtos = await recomendar(clienteId);
+  return <GradeDeProdutos produtos={produtos} />;
+}
+```
+
+O visitante recebe instantaneamente, de uma CDN, a casca com banner, ofertas e o esqueleto das recomendações; as recomendações chegam pelo mesmo stream. Isso é PPR: uma única rota com partes estáticas e dinâmicas, sem escolher entre SSG e SSR para a página inteira.
+
+### 'use cache' e cacheLife
+
+`'use cache'` pode ficar no topo de um arquivo, de um componente ou de uma função de dados. A chave do cache é calculada automaticamente a partir dos argumentos serializáveis e das variáveis capturadas, então `buscarProduto("42")` e `buscarProduto("43")` são entradas diferentes.
+
+```ts
+// src/servicos/produtos.ts (com Cache Components)
+import "server-only";
+import { cacheLife, cacheTag } from "next/cache";
+
+export async function buscarProduto(id: string) {
+  "use cache";
+  cacheLife("hours");
+  cacheTag("produtos", `produto-${id}`);
+  const resposta = await fetch(`${process.env.API_URL}/produtos/${id}`);
+  if (resposta.status === 404) return null;
+  return produtoSchema.parse(await resposta.json());
+}
+```
+
+`cacheLife` aceita perfis prontos (`"seconds"`, `"minutes"`, `"hours"`, `"days"`, `"weeks"`, `"max"`) ou um objeto com `stale`, `revalidate` e `expire` em segundos. É o equivalente ao ISR por tempo.
+
+Dentro de `'use cache'` não é permitido ler `cookies()`, `headers()` nem `searchParams`: um valor do usuário guardado num cache compartilhado é exatamente o vazamento descrito na abertura. Leia o dado fora e passe como argumento; ele passa a fazer parte da chave.
+
+### Migrando do modelo clássico
+
+| Modelo clássico | Com Cache Components |
+|---|---|
+| `export const dynamic = "force-dynamic"` | Remover; dinâmico é o padrão para dados não cacheados |
+| `export const dynamic = "force-static"` | `'use cache'` com `cacheLife("max")` |
+| `export const revalidate = N` | `cacheLife` com `revalidate: N` |
+| `unstable_cache(fn, chaves, opcoes)` | Função com `'use cache'`, `cacheTag` e `cacheLife` |
+| `experimental.ppr` | `cacheComponents: true` |
+
+As opções de segmento `dynamic` e `revalidate` não são compatíveis com Cache Components: ao ligar a flag, remova-as. Cache Components também não funciona com o runtime Edge nem com exportação estática (`output: "export"`).
+
+<Callout type="warning" title="Dados por usuário nunca em cache compartilhado">
+Carrinho, pedidos, endereço e qualquer coisa que dependa da sessão ficam fora de `'use cache'` e dentro de `Suspense`. No modelo clássico, confira que essas rotas aparecem como dinâmicas no `next build`. Um teste e2e que loga com dois usuários e confere que cada um vê só os próprios pedidos vale mais que qualquer revisão de código.
+</Callout>
+
+## Revalidação sob demanda
+
+Esperar uma hora para o preço novo do tomate aparecer não serve. Quando o lojista altera um produto, invalide as entradas com a tag correspondente:
+
+| Função | Onde chamar | Comportamento |
+|---|---|---|
+| `revalidateTag(tag, "max")` | Server Actions e Route Handlers | Marca como velho; a próxima visita recebe o antigo enquanto o novo é gerado (stale-while-revalidate) |
+| `updateTag(tag)` | Só em Server Actions | Expira na hora; a mesma requisição já lê o dado novo (leia o que você escreveu) |
+| `revalidatePath("/produtos/42")` | Server Actions e Route Handlers | Invalida uma rota específica |
+| `refresh()` | Só em Server Actions | Atualiza dados não cacheados da página atual no cliente |
+
+No Next.js 16, `revalidateTag` recebe um segundo argumento com o perfil de `cacheLife`; a forma com só a tag foi descontinuada. Use `updateTag` quando o próprio autor da mudança precisa ver o resultado imediatamente (o lojista salvou e a tela recarrega) e `revalidateTag` quando a atualização pode chegar aos visitantes em segundo plano.
+
+Se a mudança vem de fora (um ERP atualiza o estoque), crie um Route Handler protegido por segredo:
+
+```ts
+// src/app/api/revalidar/route.ts
+import { revalidateTag } from "next/cache";
+
+export async function POST(request: Request) {
+  if (request.headers.get("x-segredo") !== process.env.REVALIDACAO_SEGREDO) {
+    return Response.json({ erro: "não autorizado" }, { status: 401 });
+  }
+  const { produtoId } = (await request.json()) as { produtoId: string };
+  revalidateTag(`produto-${produtoId}`, "max");
+  revalidateTag("produtos", "max");
+  return Response.json({ revalidado: true });
+}
+```
+
+## Server Actions
+
+Server Actions são funções assíncronas marcadas com `'use server'` que rodam no servidor e podem ser chamadas pelo cliente, inclusive como `action` de um formulário. O Next.js cria o endpoint por você. Elas fecham o ciclo: a leitura vem cacheada dos Server Components, a escrita passa pela Action, e a Action invalida o cache.
+
+```ts
+// src/app/painel/produtos/acoes.ts
+"use server";
+
+import { updateTag, revalidateTag } from "next/cache";
+import { produtoSchema } from "@/esquemas/produto";
+import { exigirLojista } from "@/lib/sessao";
+
+const edicaoSchema = produtoSchema.pick({ id: true, nome: true, precoEmCentavos: true, estoque: true });
+
+export type EstadoDoFormulario = { ok: boolean; erros?: Record<string, string[]> };
+
+export async function salvarProduto(
+  _anterior: EstadoDoFormulario,
+  dados: FormData,
+): Promise<EstadoDoFormulario> {
+  await exigirLojista(); // Actions são endpoints públicos: autorize sempre
+
+  const resultado = edicaoSchema.safeParse({
+    id: dados.get("id"),
+    nome: dados.get("nome"),
+    precoEmCentavos: Math.round(Number(dados.get("preco")) * 100),
+    estoque: Number(dados.get("estoque")),
+  });
+  if (!resultado.success) {
+    return { ok: false, erros: resultado.error.flatten().fieldErrors };
+  }
+
+  await atualizarProdutoNaApi(resultado.data);
+  updateTag(`produto-${resultado.data.id}`); // o lojista vê na hora
+  revalidateTag("produtos", "max");          // o catálogo atualiza em segundo plano
+  return { ok: true };
+}
+```
+
+```tsx
+// src/app/painel/produtos/[id]/FormularioDeProduto.tsx
+"use client";
+
+import { useActionState } from "react";
+import { salvarProduto } from "../acoes";
+
+export function FormularioDeProduto({ produto }: { produto: Produto }) {
+  const [estado, acao, pendente] = useActionState(salvarProduto, { ok: false });
+
+  return (
+    <form action={acao}>
+      <input type="hidden" name="id" value={produto.id} />
+      <label>Nome <input name="nome" defaultValue={produto.nome} /></label>
+      {estado.erros?.nome && <p role="alert">{estado.erros.nome[0]}</p>}
+      <label>Preço (R$) <input name="preco" defaultValue={produto.precoEmCentavos / 100} inputMode="decimal" /></label>
+      <label>Estoque <input name="estoque" type="number" defaultValue={produto.estoque} /></label>
+      <button disabled={pendente}>{pendente ? "Salvando…" : "Salvar"}</button>
+      {estado.ok && <p role="status">Produto salvo.</p>}
+    </form>
+  );
+}
+```
+
+O formulário funciona mesmo antes de o JavaScript carregar (progressive enhancement), porque é um `form` com `action` real. `useActionState` entrega o estado devolvido pela Action e o indicador de pendência. O mesmo esquema Zod do capítulo de TypeScript valida a entrada; o `flatten()` está descontinuado no Zod 4 em favor de `z.flattenError(erro)`, mas ainda funciona.
+
+<Callout type="tip" title="Action não é só para formulário">
+Uma Server Action pode ser chamada de um `onClick` dentro de `startTransition`, combinada com `useOptimistic` (como a troca de status do pedido do capítulo de aplicações robustas). Para leitura de dados no cliente, porém, prefira Server Components ou um Route Handler: Actions são pensadas para mutações e executam uma de cada vez por cliente.
+</Callout>
+
+## Escolhendo a estratégia de cada rota da Quitanda
+
+| Rota | Dado | Estratégia |
+|---|---|---|
+| `/` (home) | Ofertas mudam por dia; recomendações por usuário | PPR: ofertas com `'use cache'` e `cacheLife("hours")`, recomendações em `Suspense` |
+| `/produtos/[id]` | Preço e estoque mudam algumas vezes ao dia; avaliações lentas | Cache com tag por produto, revalidação sob demanda; avaliações em streaming |
+| `/como-funciona` | Texto institucional | Estático puro |
+| `/carrinho` | Por usuário, muito interativo | Casca estática, conteúdo em Client Component com estado local |
+| `/pedidos` e `/pedidos/[id]` | Por usuário, muda com o status | Dinâmico (lê a sessão) em `Suspense`; status em tempo real no cliente |
+| `/painel/*` | Por lojista, gráficos interativos | Dinâmico protegido; gráficos como Client Components com TanStack Query |
+
+O raciocínio é sempre o mesmo: o dado depende de quem está pedindo? Então é dinâmico. Não depende? Então pode ser cacheado, e a pergunta passa a ser quanto tempo ele pode ficar velho e quem avisa quando muda.
+
+## Na entrevista
+
+**Qual a diferença entre SSR, SSG e ISR?** SSR gera o HTML a cada requisição; SSG gera no build; ISR gera no build ou na primeira visita e regenera em segundo plano depois de um tempo ou de uma invalidação, servindo a versão anterior enquanto isso. No App Router, isso decorre do cache dos dados e das APIs dinâmicas usadas, não de uma função especial por página.
+
+**O que é Partial Prerendering?** É renderizar uma casca estática da rota no build, com os trechos dinâmicos representados pelos fallbacks de `Suspense`, e completar esses trechos por streaming na requisição. No Next.js 16, é o comportamento de Cache Components.
+
+**O que torna uma rota dinâmica no Next.js?** Ler APIs de requisição como `cookies()`, `headers()`, `searchParams` ou `connection()`, ou buscar dados não cacheados. Com Cache Components, esse acesso precisa estar dentro de `Suspense` ou o build acusa erro.
+
+**Qual a diferença entre `revalidateTag` e `updateTag`?** `revalidateTag` marca o cache como velho e regenera em segundo plano, então o próximo visitante ainda pode ver a versão anterior. `updateTag` expira imediatamente e só pode ser chamado em Server Actions, para quem fez a mudança ver o resultado na mesma resposta.
+
+**Server Actions precisam de autenticação?** Sim. Cada Action vira um endpoint HTTP que pode ser chamado diretamente, sem passar pela interface. Valido a sessão e as permissões e valido a entrada com Zod dentro de cada Action.
+
+## Pratique
+
+1. Rode `next build` na Quitanda e anote quais rotas saíram estáticas e quais dinâmicas; investigue qualquer surpresa.
+2. Adicione `generateStaticParams` para os 50 produtos mais vendidos e confira que os demais são gerados sob demanda.
+3. Divida a página de produto com `Suspense` para as avaliações e simule um atraso de 3s na API para ver o streaming na aba Network.
+4. Ative `cacheComponents`, migre as funções de dados para `'use cache'` com `cacheTag` e corrija os erros de acesso dinâmico fora de `Suspense`.
+5. Escreva a Server Action de edição de produto com Zod, autorização e `updateTag`, e confirme que o catálogo atualiza sem esperar o `cacheLife`.
+6. Crie o Route Handler de revalidação por segredo e acione-o com `curl` simulando o ERP.
+
+<Quiz question="Com Cache Components ativo, um componente lê cookies() fora de qualquer Suspense e sem use cache. O que acontece?" options={["A rota inteira vira estática e ignora o cookie","O Next.js acusa erro em desenvolvimento e no build, pedindo Suspense ou cache","O cookie é lido no build","O componente é convertido em Client Component"]} answer={1} explanation="Com Cache Components, acessos dinâmicos precisam estar dentro de Suspense para que a casca estática possa ser pré-renderizada." />
+
+<Quiz question="O lojista salva o novo preço de um produto e a tela dele deve mostrar o valor atualizado na mesma resposta. O que usar na Server Action?" options={["revalidateTag com perfil max","Esperar o cacheLife expirar","Um fetch com cache no-store na página","updateTag com a tag do produto"]} answer={3} explanation="updateTag expira o cache imediatamente e garante que a mesma requisição leia o dado novo. revalidateTag regenera em segundo plano." />
+
+<Quiz question="Por que a lista de pedidos do cliente não pode estar dentro de uma função com use cache sem receber o id do cliente como argumento?" options={["Porque o cache é compartilhado, e sem o id na chave um cliente veria os pedidos de outro","Porque use cache só aceita dados estáticos do build","Porque pedidos são grandes demais para o cache","Porque funções com use cache não podem ser assíncronas"]} answer={0} explanation="A chave do cache vem dos argumentos e variáveis capturadas. Dados por usuário precisam ser dinâmicos ou ter o identificador na chave, e cookies não podem ser lidos dentro de use cache." />
+
+## Base no CodeForge
+
+- [React: migrando componentes para Next.js](/learn/carreira-react/react-migrando-componentes-nextjs): Server e Client Components, base deste capítulo.
+- [Estratégias de cache](/learn/system-design/estrategias-de-cache): stale-while-revalidate e as alternativas por trás do ISR.
+- [Invalidação de cache](/learn/system-design/invalidacao-de-cache): por que tags e eventos são melhores que esperar o tempo expirar.
+- [CDN](/learn/system-design/cdn): onde a casca estática do PPR é servida.
+- [React: modernizando rotas e dados com Remix](/learn/carreira-react/react-rotas-dados-remix): o outro modelo de dados por rota, para comparar.
+
+## Referências
+
+- [Next.js: Cache Components](https://nextjs.org/docs/app/getting-started/cache-components)
+- [Next.js: use cache](https://nextjs.org/docs/app/api-reference/directives/use-cache)
+- [Next.js: Caching and Revalidating](https://nextjs.org/docs/app/getting-started/caching-and-revalidating)
+- [Next.js: Updating Data (Server Actions)](https://nextjs.org/docs/app/getting-started/updating-data)
+- [React: useActionState](https://react.dev/reference/react/useActionState)

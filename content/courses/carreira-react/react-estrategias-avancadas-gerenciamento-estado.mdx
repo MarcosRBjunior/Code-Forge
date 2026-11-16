@@ -1,0 +1,426 @@
+---
+title: "React: implementando estratégias avançadas de gerenciamento de estado"
+kind: lesson
+---
+
+Abra o código da Quitanda depois de dois níveis e conte as fontes de verdade: o carrinho está num slice do Redux, o usuário num Context, a lista de produtos num `useState` alimentado por `useEffect`, os filtros do catálogo noutro `useState` (que some quando o cliente recarrega ou compartilha o link), o status do pedido no cache do TanStack Query e o checkout numa coleção de booleanos: `carregando`, `pagando`, `erro`, `mostrarEndereco`, `confirmado`. Já aconteceu de `pagando` e `erro` estarem verdadeiros ao mesmo tempo, e o botão "Pagar" foi clicado duas vezes.
+
+O problema raramente é a biblioteca escolhida. É tratar como "estado" coisas de naturezas diferentes. Dados do servidor têm cache e ficam velhos; filtros pertencem à URL; formulários têm validação e campos sujos; o carrinho é estado do cliente que precisa persistir; o checkout é um fluxo com etapas que não podem se misturar. Este capítulo classifica o estado da Quitanda, dá a cada categoria a ferramenta certa e termina com uma máquina de estados para o checkout.
+
+**Você vai aprender:**
+
+- Classificar estado em servidor, URL, formulário, global de cliente e local
+- Usar recursos avançados do TanStack Query: fábricas de query, prefetch, atualização otimista e hidratação no Next.js
+- Guardar filtros e paginação na URL para que o link seja compartilhável
+- Comparar Zustand, Redux Toolkit e Jotai para estado global de cliente
+- Modelar o checkout como máquina de estados com XState
+- Evitar estado duplicado e derivar em vez de sincronizar
+
+## As categorias de estado
+
+| Categoria | Exemplos na Quitanda | Dono da verdade | Ferramenta |
+|---|---|---|---|
+| Servidor | Produtos, pedidos, estoque, perfil | O back-end; o front tem uma cópia em cache | TanStack Query, Server Components, RTK Query |
+| URL | Categoria, busca, ordenação, página, aba do painel | A barra de endereços | `useSearchParams`, `searchParams` da página, nuqs |
+| Formulário | Endereço, cadastro de produto, cupom | O formulário até o envio | React Hook Form + Zod, `useActionState` |
+| Global de cliente | Carrinho, tema, preferências, gaveta aberta | O navegador | Zustand, Redux Toolkit, Jotai, Context |
+| Local | Modal aberto, hover, texto do input de busca | O componente | `useState`, `useReducer` |
+| Fluxo | Checkout em etapas, onboarding do lojista | Um modelo explícito de estados | `useReducer` bem desenhado ou XState |
+
+A pergunta para classificar: **se o usuário recarregar a página, abrir em outra aba ou mandar o link para alguém, o que deveria acontecer com esse dado?** Pedido vem do servidor de novo. Filtro deveria estar no link. Carrinho deveria sobreviver ao recarregamento. Modal aberto pode sumir.
+
+E uma regra que elimina metade dos bugs: **derive, não sincronize**. O total do carrinho não é estado, é `itens.reduce(...)`. A lista filtrada não é estado, é `produtos.filter(...)` com os filtros da URL. Todo `useEffect` que copia um estado para outro é um candidato a virar uma derivação.
+
+## Estado de servidor com TanStack Query
+
+O Nível 1 apresentou `useQuery` e `useMutation`. No nível avançado, quatro técnicas fazem diferença.
+
+### Fábricas de query
+
+Chaves espalhadas como strings levam a invalidações que não pegam. Centralize com `queryOptions`, que também carrega o tipo do resultado:
+
+```ts
+// src/consultas/produtos.ts
+import { queryOptions } from "@tanstack/react-query";
+import { buscarProduto, listarProdutos, type FiltrosDoCatalogo } from "@/servicos/api";
+
+export const consultasDeProdutos = {
+  todas: () => ["produtos"] as const,
+  lista: (filtros: FiltrosDoCatalogo) =>
+    queryOptions({
+      queryKey: [...consultasDeProdutos.todas(), "lista", filtros],
+      queryFn: () => listarProdutos(filtros),
+      staleTime: 60_000,
+    }),
+  detalhe: (id: string) =>
+    queryOptions({
+      queryKey: [...consultasDeProdutos.todas(), "detalhe", id],
+      queryFn: () => buscarProduto(id),
+      staleTime: 5 * 60_000,
+    }),
+};
+```
+
+`useQuery(consultasDeProdutos.detalhe(id))` e `queryClient.invalidateQueries({ queryKey: consultasDeProdutos.todas() })` usam a mesma fonte, e a hierarquia da chave permite invalidar tudo de produtos de uma vez.
+
+`staleTime` diz por quanto tempo o dado é considerado fresco (sem refetch ao montar ou focar a janela). `gcTime` diz por quanto tempo um dado sem observadores fica no cache antes de ser descartado. Catálogo pode ter `staleTime` de minutos; estoque no checkout, zero.
+
+### Prefetch na intenção
+
+Quando o cliente passa o mouse sobre um produto, há tempo de buscar o detalhe antes do clique:
+
+```tsx
+// src/componentes/LinkDoProduto.tsx
+"use client";
+import Link from "next/link";
+import { useQueryClient } from "@tanstack/react-query";
+import { consultasDeProdutos } from "@/consultas/produtos";
+
+export function LinkDoProduto({ id, children }: { id: string; children: React.ReactNode }) {
+  const queryClient = useQueryClient();
+  const prefetch = () => queryClient.prefetchQuery(consultasDeProdutos.detalhe(id));
+  return (
+    <Link href={`/produtos/${id}`} onMouseEnter={prefetch} onFocus={prefetch}>
+      {children}
+    </Link>
+  );
+}
+```
+
+### Atualização otimista com rollback
+
+Favoritar um produto deve ser instantâneo. O padrão: cancelar buscas em andamento, guardar o valor anterior, aplicar a mudança e desfazer se a mutação falhar.
+
+```ts
+// src/hooks/useAlternarFavorito.ts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { alternarFavorito } from "@/servicos/api";
+
+const chave = ["favoritos"] as const;
+
+export function useAlternarFavorito() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: alternarFavorito,
+    onMutate: async (produtoId: string) => {
+      await queryClient.cancelQueries({ queryKey: chave });
+      const anterior = queryClient.getQueryData<string[]>(chave) ?? [];
+      queryClient.setQueryData<string[]>(chave, (ids = []) =>
+        ids.includes(produtoId) ? ids.filter((id) => id !== produtoId) : [...ids, produtoId],
+      );
+      return { anterior };
+    },
+    onError: (_erro, _id, contexto) => queryClient.setQueryData(chave, contexto?.anterior),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: chave }),
+  });
+}
+```
+
+Para casos simples e locais a um componente, o `useOptimistic` do React 19 com uma Action é uma alternativa sem mexer no cache.
+
+### Hidratação no Next.js
+
+Com App Router, o Server Component pode buscar no servidor e entregar o cache pronto ao cliente:
+
+```tsx
+// src/app/produtos/[id]/page.tsx
+import { dehydrate, HydrationBoundary, QueryClient } from "@tanstack/react-query";
+import { consultasDeProdutos } from "@/consultas/produtos";
+import { DetalheDoProduto } from "@/componentes/DetalheDoProduto";
+
+export default async function Pagina({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const queryClient = new QueryClient();
+  await queryClient.prefetchQuery(consultasDeProdutos.detalhe(id));
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      <DetalheDoProduto id={id} />
+    </HydrationBoundary>
+  );
+}
+```
+
+`DetalheDoProduto` é um Client Component que chama `useQuery(consultasDeProdutos.detalhe(id))` e encontra o dado já no cache: sem spinner, e com revalidação e mutações funcionando no cliente. Se a página não tem interação com o dado, um Server Component que busca e renderiza direto é ainda mais simples, sem TanStack Query.
+
+## Estado na URL
+
+Filtros, busca, ordenação e página são estado que o usuário espera compartilhar e recuperar com o botão voltar. Lugar deles é a URL.
+
+```tsx
+// src/app/catalogo/page.tsx
+import { ListaDeProdutos } from "@/componentes/ListaDeProdutos";
+import { FiltrosDoCatalogo } from "@/componentes/FiltrosDoCatalogo";
+
+type Busca = { categoria?: string; ordem?: "preco" | "nome"; pagina?: string };
+
+export default async function Catalogo({ searchParams }: { searchParams: Promise<Busca> }) {
+  const { categoria, ordem = "nome", pagina = "1" } = await searchParams;
+  return (
+    <>
+      <FiltrosDoCatalogo />
+      <ListaDeProdutos categoria={categoria} ordem={ordem} pagina={Number(pagina)} />
+    </>
+  );
+}
+```
+
+```tsx
+// src/componentes/FiltrosDoCatalogo.tsx
+"use client";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+
+export function FiltrosDoCatalogo() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const params = useSearchParams();
+
+  function alterar(nome: string, valor: string | null) {
+    const novos = new URLSearchParams(params);
+    if (valor) novos.set(nome, valor);
+    else novos.delete(nome);
+    novos.delete("pagina"); // mudar filtro volta para a página 1
+    router.replace(`${pathname}?${novos.toString()}`, { scroll: false });
+  }
+
+  return (
+    <select value={params.get("categoria") ?? ""} onChange={(e) => alterar("categoria", e.target.value || null)}>
+      <option value="">Todas</option>
+      <option value="frutas">Frutas</option>
+      <option value="verduras">Verduras</option>
+      <option value="legumes">Legumes</option>
+    </select>
+  );
+}
+```
+
+`replace` em vez de `push` evita encher o histórico a cada filtro; use `push` quando cada mudança deve ser um passo do botão voltar (paginação, por exemplo). Para muitos parâmetros tipados, a biblioteca nuqs oferece um `useQueryState` com parsers e funciona com Next.js e React Router. Numa SPA com React Router 7, o equivalente é `useSearchParams` do próprio router.
+
+<Callout type="tip" title="O campo de busca é local; o termo buscado é URL">
+Atualizar a URL a cada tecla gera navegação e re-render demais. Mantenha o texto do input em `useState` e escreva na URL com debounce ou no envio. O valor confirmado mora na URL; o rascunho, no componente.
+</Callout>
+
+## Estado global de cliente: Zustand, Redux Toolkit e Jotai
+
+Depois de tirar dados de servidor, URL e formulários, sobra pouco estado global: carrinho, preferências, a gaveta do carrinho aberta. Três boas opções:
+
+| Critério | Zustand | Redux Toolkit | Jotai |
+|---|---|---|---|
+| Modelo | Uma store por domínio, hook com seletor | Store única, slices, ações e reducers | Átomos pequenos combináveis |
+| Cerimônia | Mínima | Média (bem menor que o Redux antigo) | Mínima |
+| Re-render | Só quem seleciona a parte que mudou | Só quem seleciona com `useSelector` | Só quem lê o átomo |
+| Ferramentas | Middleware `persist`, `devtools` | Redux DevTools completo, middleware, RTK Query | Utilitários como `atomWithStorage` |
+| Bom para | Estado global pequeno e médio | Times grandes, regras complexas, auditoria de ações | Estado muito granular e derivado |
+
+### Carrinho com Zustand
+
+```ts
+// src/estado/carrinho.ts
+import { create } from "zustand";
+import { persist } from "zustand/middleware";
+
+type EstadoDoCarrinho = {
+  itens: Record<string, number>; // produtoId -> quantidade
+  adicionar: (produtoId: string, quantidade?: number) => void;
+  remover: (produtoId: string) => void;
+  limpar: () => void;
+};
+
+export const useCarrinhoStore = create<EstadoDoCarrinho>()(
+  persist(
+    (set) => ({
+      itens: {},
+      adicionar: (id, quantidade = 1) =>
+        set((s) => ({ itens: { ...s.itens, [id]: (s.itens[id] ?? 0) + quantidade } })),
+      remover: (id) =>
+        set((s) => {
+          const { [id]: _removido, ...resto } = s.itens;
+          return { itens: resto };
+        }),
+      limpar: () => set({ itens: {} }),
+    }),
+    { name: "quitanda-carrinho" },
+  ),
+);
+```
+
+```tsx
+// src/componentes/BotaoAdicionar.tsx
+"use client";
+import { useCarrinhoStore } from "@/estado/carrinho";
+
+export function BotaoAdicionar({ produtoId }: { produtoId: string }) {
+  const quantidade = useCarrinhoStore((s) => s.itens[produtoId] ?? 0);
+  const adicionar = useCarrinhoStore((s) => s.adicionar);
+  return <button onClick={() => adicionar(produtoId)}>Adicionar ({quantidade})</button>;
+}
+```
+
+O seletor faz o botão do tomate re-renderizar só quando a quantidade de tomate muda. Para selecionar vários campos num objeto, use `useShallow` de `zustand/react/shallow` para não recriar o objeto a cada render. Com SSR, o `persist` lê o `localStorage` só no cliente; para evitar diferença de hidratação, mostre a contagem do carrinho apenas depois de montar, ou use a opção `skipHydration` e reidrate manualmente.
+
+O carrinho guarda só ids e quantidades. Nome, preço e estoque são estado de servidor e vêm do TanStack Query: assim o preço exibido nunca fica velho por estar copiado no `localStorage`.
+
+### Quando Redux Toolkit
+
+Se a Quitanda já tem Redux Toolkit e ele funciona, não há motivo para migrar. RTK continua ótimo quando muitas pessoas mexem nas mesmas regras, quando o histórico de ações no DevTools ajuda a depurar e quando middleware (logs, sincronização entre abas) é central. O RTK Query cobre estado de servidor dentro do mesmo ecossistema, fazendo o papel do TanStack Query.
+
+### Quando Jotai
+
+Jotai brilha em estado granular e derivado, como o comparador de preços do painel, em que cada linha da tabela tem seu átomo e um átomo derivado calcula o total com `atom((get) => ...)`. Só os componentes que leem um átomo re-renderizam quando ele muda.
+
+## Máquina de estados para o checkout
+
+Booleanos independentes permitem combinações impossíveis: `pagando && erro`, `confirmado && mostrarEndereco`. Com 5 booleanos há 32 combinações, e o checkout tem talvez 6 estados válidos. Uma máquina de estados torna explícitos os estados e as transições permitidas: em `processando`, o evento `PAGAR` simplesmente não existe, então o clique duplo não faz nada.
+
+```bash
+npm install xstate @xstate/react
+```
+
+```ts
+// src/maquinas/checkout.ts
+import { assign, fromPromise, setup } from "xstate";
+import type { ServicoDePagamento } from "@/dominio/pagamento";
+
+type Endereco = { cep: string; numero: string };
+
+export const criarMaquinaDoCheckout = (pagamento: ServicoDePagamento) =>
+  setup({
+    types: {
+      context: {} as { totalEmCentavos: number; endereco: Endereco | null; erro: string | null; pedidoId: string | null },
+      events: {} as
+        | { type: "CONTINUAR" }
+        | { type: "VOLTAR" }
+        | { type: "DEFINIR_ENDERECO"; endereco: Endereco }
+        | { type: "PAGAR"; token: string },
+      input: {} as { totalEmCentavos: number },
+    },
+    actors: {
+      cobrar: fromPromise(async ({ input }: { input: { totalEmCentavos: number; token: string } }) => {
+        const r = await pagamento.cobrar("novo", input.totalEmCentavos, input.token);
+        if (!r.ok) throw new Error(r.motivo);
+        return { pedidoId: r.transacaoId };
+      }),
+    },
+    guards: {
+      temEndereco: ({ context }) => context.endereco !== null,
+    },
+  }).createMachine({
+    id: "checkout",
+    context: ({ input }) => ({ totalEmCentavos: input.totalEmCentavos, endereco: null, erro: null, pedidoId: null }),
+    initial: "revisando",
+    states: {
+      revisando: { on: { CONTINUAR: "endereco" } },
+      endereco: {
+        on: {
+          DEFINIR_ENDERECO: { actions: assign({ endereco: ({ event }) => event.endereco }) },
+          CONTINUAR: { target: "pagamento", guard: "temEndereco" },
+          VOLTAR: "revisando",
+        },
+      },
+      pagamento: {
+        on: { PAGAR: "processando", VOLTAR: "endereco" },
+      },
+      processando: {
+        invoke: {
+          src: "cobrar",
+          input: ({ context, event }) => ({
+            totalEmCentavos: context.totalEmCentavos,
+            token: event.type === "PAGAR" ? event.token : "",
+          }),
+          onDone: { target: "confirmado", actions: assign({ pedidoId: ({ event }) => event.output.pedidoId, erro: null }) },
+          onError: { target: "pagamento", actions: assign({ erro: ({ event }) => (event.error as Error).message }) },
+        },
+      },
+      confirmado: { type: "final" },
+    },
+  });
+```
+
+```tsx
+// src/componentes/Checkout.tsx
+"use client";
+import { useMachine } from "@xstate/react";
+import { useState } from "react";
+import { criarMaquinaDoCheckout } from "@/maquinas/checkout";
+import { useServicos } from "@/contextos/ServicosContext";
+
+export function Checkout({ totalEmCentavos }: { totalEmCentavos: number }) {
+  const { pagamento } = useServicos();
+  const [maquina] = useState(() => criarMaquinaDoCheckout(pagamento));
+  const [estado, enviar] = useMachine(maquina, { input: { totalEmCentavos } });
+
+  if (estado.matches("confirmado")) return <p>Pedido {estado.context.pedidoId} confirmado!</p>;
+
+  return (
+    <section>
+      {estado.matches("revisando") && <button onClick={() => enviar({ type: "CONTINUAR" })}>Escolher endereço</button>}
+      {estado.matches("endereco") && (
+        <FormularioDeEndereco
+          aoSalvar={(endereco) => enviar({ type: "DEFINIR_ENDERECO", endereco })}
+          podeContinuar={estado.can({ type: "CONTINUAR" })}
+          aoContinuar={() => enviar({ type: "CONTINUAR" })}
+        />
+      )}
+      {(estado.matches("pagamento") || estado.matches("processando")) && (
+        <FormularioDePagamento
+          ocupado={estado.matches("processando")}
+          erro={estado.context.erro}
+          aoPagar={(token) => enviar({ type: "PAGAR", token })}
+        />
+      )}
+    </section>
+  );
+}
+```
+
+O que se ganha:
+
+- **Estados impossíveis não existem.** Não há como estar em `processando` e `confirmado` ao mesmo tempo.
+- **Eventos ignorados por construção.** Um segundo `PAGAR` durante `processando` não tem transição; nada acontece.
+- **Regras visíveis.** `estado.can({ type: "CONTINUAR" })` usa o guard `temEndereco` para habilitar o botão, sem repetir a regra na UI.
+- **Testável sem React.** Com `createActor(maquina, { input })`, você envia eventos e verifica `getSnapshot().value`, injetando um `ServicoDePagamento` falso.
+
+<Callout type="warning" title="Máquina de estados não é para todo componente">
+Um toggle de menu não precisa de XState. Use máquinas para fluxos com várias etapas, efeitos assíncronos e regras de transição (checkout, onboarding, upload com retentativa). Para fluxos médios, um `useReducer` com um campo `etapa` de tipo união já elimina boa parte dos estados impossíveis sem nova dependência.
+</Callout>
+
+## Na entrevista
+
+**Como você decide onde guardar um estado?** Classifico: dado do servidor vai para uma camada de cache (TanStack Query ou Server Components); o que deve estar no link vai para a URL; formulário fica com a biblioteca de formulário; o que é do navegador e compartilhado vai para uma store global; o resto é local. E derivo tudo que pode ser calculado.
+
+**Qual a diferença entre `staleTime` e `gcTime`?** `staleTime` define por quanto tempo o dado é considerado fresco e não dispara refetch automático. `gcTime` define por quanto tempo um dado sem componentes observando continua no cache antes de ser removido.
+
+**Como implementar uma atualização otimista com TanStack Query?** No `onMutate`, cancelo as queries afetadas, guardo o valor anterior, aplico a mudança com `setQueryData` e devolvo o anterior como contexto. No `onError`, restauro; no `onSettled`, invalido para sincronizar com o servidor.
+
+**Por que colocar filtros na URL?** Porque o link fica compartilhável, o botão voltar funciona, o recarregamento preserva a busca e o servidor pode renderizar a lista filtrada direto.
+
+**Quando usar uma máquina de estados?** Quando um fluxo tem etapas, efeitos assíncronos e transições que só valem em certos momentos. Ela elimina combinações impossíveis de booleanos e torna explícito quais eventos cada estado aceita.
+
+## Pratique
+
+1. Faça o inventário de estado da sua Quitanda: liste cada estado, classifique-o numa das categorias e marque os que deveriam ser derivados.
+2. Crie a fábrica `consultasDeProdutos` com `queryOptions` e troque todas as chaves soltas por ela.
+3. Mova os filtros do catálogo para a URL, com a página voltando a 1 quando o filtro muda, e confirme que recarregar e compartilhar o link preservam a busca.
+4. Implemente o carrinho com Zustand e `persist`, guardando só ids e quantidades, e meça com o React DevTools Profiler quantos componentes re-renderizam ao adicionar um item.
+5. Implemente favoritos com atualização otimista e rollback, e simule falha no MSW para ver o desfazer.
+6. Modele o checkout com XState e escreva um teste que envia `PAGAR` duas vezes seguidas e prova que o serviço de pagamento foi chamado uma vez só.
+
+<Quiz question="Em qual categoria fica o filtro de categoria do catálogo da Quitanda?" options={["Estado global em Zustand","Estado local com useState","Estado de servidor no TanStack Query","Estado na URL, para ser compartilhável e sobreviver ao recarregamento"]} answer={3} explanation="Filtros que o usuário espera compartilhar e recuperar com o botão voltar pertencem à URL." />
+
+<Quiz question="No onMutate de uma atualização otimista, por que chamar cancelQueries antes de setQueryData?" options={["Para evitar que uma busca em andamento sobrescreva o valor otimista quando terminar","Para limpar o cache inteiro","Porque setQueryData só funciona sem queries ativas","Para disparar o refetch imediatamente"]} answer={0} explanation="Uma resposta antiga chegando depois da mudança otimista apagaria o valor aplicado. Cancelar evita essa corrida." />
+
+<Quiz question="O checkout modelado em XState está no estado processando e o usuário clica em Pagar de novo. O que acontece?" options={["A cobrança é feita duas vezes","A máquina lança um erro","Nada, pois o estado processando não tem transição para o evento PAGAR","A máquina volta para o estado revisando"]} answer={2} explanation="Eventos sem transição definida no estado atual são ignorados. Clique duplo deixa de ser um bug possível." />
+
+## Base no CodeForge
+
+- [React: gerenciando estados com Redux e Context API](/learn/carreira-react/react-redux-context-api): a base de Redux Toolkit e Context.
+- [React: consumindo APIs HTTP no seu projeto](/learn/carreira-react/react-consumindo-apis-http): o primeiro contato com TanStack Query.
+- [Máquina de estados](/learn/lld/maquina-de-estados) e [State](/learn/lld/state): o conceito por trás do XState.
+- [Estratégias de cache](/learn/system-design/estrategias-de-cache): stale-while-revalidate e invalidação, as mesmas ideias do TanStack Query.
+
+## Referências
+
+- [TanStack Query: Query Options](https://tanstack.com/query/latest/docs/framework/react/guides/query-options)
+- [TanStack Query: Optimistic Updates](https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates)
+- [Zustand: documentação](https://zustand.docs.pmnd.rs/)
+- [XState: documentação](https://stately.ai/docs/xstate)
+- [Next.js: useSearchParams](https://nextjs.org/docs/app/api-reference/functions/use-search-params)

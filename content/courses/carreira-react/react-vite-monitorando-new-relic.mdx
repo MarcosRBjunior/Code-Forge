@@ -1,0 +1,336 @@
+---
+title: "React Vite: monitorando aplicações com New Relic"
+kind: lesson
+---
+
+A Quitanda tem uma terceira aplicação: o app do entregador, uma SPA em React com Vite e React Router 7, instalada como PWA nos celulares da equipe de entrega (`apps/entregador` no monorepo). Ela lista as entregas do dia, abre o mapa e marca cada pedido como entregue, o que dispara o evento em tempo real do capítulo de Socket.io. Na segunda-feira, três entregadores disseram que "o botão de entregue não funciona às vezes". Ninguém conseguiu reproduzir. O log do BFF não mostra erro. A pergunta "o que aconteceu no celular dele?" não tinha resposta.
+
+Monitoramento de front-end (RUM, Real User Monitoring) responde a essa pergunta: cada navegador envia carregamentos de página, navegações da SPA, chamadas HTTP, erros de JavaScript e métricas de performance para uma plataforma onde você filtra por usuário, versão, rota e aparelho. Este capítulo instala o agente New Relic Browser na SPA com Vite, entende o que ele coleta, ensina a nomear rotas, a capturar erros do React, a publicar source maps e a enriquecer os dados com atributos, sem atropelar a privacidade de quem usa o app.
+
+**Você vai aprender:**
+
+- Instalar o agente New Relic Browser numa SPA com Vite, pelo snippet ou pelo pacote npm
+- Entender os eventos coletados: page views, interações de SPA, AJAX, erros e timings
+- Dar nomes estáveis às rotas da SPA e ligar as chamadas do front ao back-end com distributed tracing
+- Capturar erros do React 19 com contexto e publicar source maps para ler stack traces
+- Enriquecer os dados com atributos customizados, usuário e versão
+- Respeitar privacidade e LGPD: o que nunca enviar e como mascarar
+
+## O que o agente Browser coleta
+
+O agente é um script que roda na página, observa APIs do navegador (navegação, `fetch`, `XMLHttpRequest`, `PerformanceObserver`, erros não tratados) e envia os dados em lotes para o New Relic. Cada tipo de dado vira um tipo de evento, consultável com NRQL no próximo capítulo:
+
+| Evento | O que representa | Pergunta que responde |
+|---|---|---|
+| `PageView` | Carregamento completo de uma página (hard navigation) | Quanto tempo o app leva para abrir? |
+| `PageViewTiming` | Métricas de pintura e Web Vitals (LCP, INP, CLS, FCP) | Os Core Web Vitals estão bons em campo? |
+| `BrowserInteraction` | Navegações de rota dentro da SPA e o carregamento inicial | Quanto demora para abrir a tela de entrega? |
+| `AjaxRequest` | Chamadas `fetch` e XHR, com status e duração | O BFF está lento ou falhando para o app? |
+| `JavaScriptError` | Erros não tratados e erros enviados pela API | O que quebrou, em qual versão e para quem? |
+| `PageAction` | Eventos customizados enviados pelo código | Quantos entregadores marcaram pedidos como entregues? |
+
+Além disso, o agente pode gravar sessões (session replay, com mascaramento) e montar traces da página, dependendo do plano e da configuração.
+
+## Criando a aplicação e instalando o agente
+
+No New Relic, crie uma aplicação Browser do tipo "copy/paste" ou "npm" (Add data, Browser monitoring) e escolha o tipo de agente **Pro + SPA**, que é o adequado para aplicações com rotas no cliente. A tela mostra os identificadores: `accountID`, `trustKey`, `agentID`, `applicationID` e a `licenseKey` de browser.
+
+| Forma de instalar | Como | Quando usar |
+|---|---|---|
+| Snippet copy/paste | Script colado no início do `head` do `index.html` | Começa a medir antes de qualquer código seu; não depende do bundle |
+| Pacote npm `@newrelic/browser-agent` | Importado no ponto de entrada da aplicação | Versão travada no `package.json`, configuração em TypeScript, revisão no pull request |
+| Integração APM (para apps com servidor) | O agente de APM injeta o script no HTML | Apps renderizados no servidor que já usam APM, como a loja em Next.js |
+
+Para a SPA com Vite, o pacote npm deixa a configuração versionada e revisável:
+
+```bash
+npm install @newrelic/browser-agent
+```
+
+```ts
+// apps/entregador/src/observabilidade/newrelic.ts
+import { BrowserAgent } from "@newrelic/browser-agent/loaders/browser-agent";
+
+const ids = {
+  accountID: import.meta.env.VITE_NR_ACCOUNT_ID,
+  trustKey: import.meta.env.VITE_NR_TRUST_KEY,
+  agentID: import.meta.env.VITE_NR_AGENT_ID,
+  licenseKey: import.meta.env.VITE_NR_BROWSER_KEY,
+  applicationID: import.meta.env.VITE_NR_APP_ID,
+};
+
+export const agente = new BrowserAgent({
+  init: {
+    distributed_tracing: {
+      enabled: true,
+      allowed_origins: ["https://api.quitanda.com.br"],
+    },
+    privacy: { cookies_enabled: true },
+    ajax: { deny_list: ["bam.nr-data.net"] },
+    session_replay: {
+      enabled: true,
+      sampling_rate: 5,
+      error_sampling_rate: 50,
+      mask_all_inputs: true,
+      mask_text_selector: "*",
+    },
+  },
+  info: {
+    beacon: "bam.nr-data.net",
+    errorBeacon: "bam.nr-data.net",
+    licenseKey: ids.licenseKey,
+    applicationID: ids.applicationID,
+    sa: 1,
+  },
+  loader_config: ids,
+});
+
+agente.setApplicationVersion(import.meta.env.VITE_VERSAO ?? "dev");
+```
+
+```tsx
+// apps/entregador/src/main.tsx
+import "./observabilidade/newrelic"; // primeiro import: o agente começa a observar cedo
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { App } from "./App";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+```
+
+A `licenseKey` de browser é uma chave de ingestão pública por natureza: ela vai para o navegador de qualquer jeito. Não confunda com a **User API key** (usada para consultar dados e publicar source maps), que nunca pode ir para o bundle. Use variáveis `VITE_` só para o que pode ser público.
+
+<Callout type="warning" title="Só envie dados de produção para a aplicação de produção">
+Se o agente rodar no `npm run dev` de cada pessoa do time, os dashboards misturam a máquina do desenvolvedor com os celulares dos entregadores. Crie aplicações separadas por ambiente (homologação e produção) ou não inicialize o agente quando `import.meta.env.DEV` for verdadeiro.
+</Callout>
+
+## Rotas de SPA
+
+Numa SPA, só o primeiro carregamento é um `PageView` completo. As trocas de tela com React Router são navegações suaves (soft navigations): o agente Pro + SPA detecta a mudança de URL pela History API e registra um `BrowserInteraction`, medindo desde o clique até o fim das chamadas AJAX e da renderização disparadas por ele.
+
+O problema é o nome. `/entregas/8f3c2a`, `/entregas/91be07` e milhares de outras URLs viram milhares de linhas diferentes em vez de uma rota "Detalhe da entrega". Dê ao agente o padrão da rota, não a URL concreta:
+
+```tsx
+// apps/entregador/src/observabilidade/NomeDaRota.tsx
+import { useEffect } from "react";
+import { useMatches } from "react-router";
+import { agente } from "./newrelic";
+
+export function NomeDaRota() {
+  const matches = useMatches();
+  const atual = matches.at(-1);
+
+  useEffect(() => {
+    if (!atual) return;
+    const nome = (atual.handle as { nomeNoMonitoramento?: string } | undefined)?.nomeNoMonitoramento ?? atual.id;
+    agente.setCurrentRouteName(nome);
+  }, [atual]);
+
+  return null;
+}
+```
+
+```tsx
+// apps/entregador/src/rotas.tsx
+import { createBrowserRouter } from "react-router";
+
+export const router = createBrowserRouter([
+  {
+    path: "/",
+    Component: Layout, // renderiza NomeDaRota e o Outlet
+    children: [
+      { index: true, Component: ListaDeEntregas, handle: { nomeNoMonitoramento: "entregas/lista" } },
+      { path: "entregas/:id", Component: DetalheDaEntrega, handle: { nomeNoMonitoramento: "entregas/detalhe" } },
+      { path: "mapa", Component: Mapa, handle: { nomeNoMonitoramento: "mapa" } },
+    ],
+  },
+]);
+```
+
+O `handle` das rotas é o lugar natural para metadados como esse, e o nome sobrevive a mudanças de URL. Alternativa sem API: regras de agrupamento de URL na interface do New Relic, que transformam `/entregas/*` num segmento só.
+
+## AJAX e distributed tracing
+
+Toda chamada `fetch` vira um `AjaxRequest` com método, URL, status e duração. Com `distributed_tracing.enabled` e o domínio do BFF em `allowed_origins`, o agente adiciona cabeçalhos de trace (`traceparent` e `newrelic`) nas chamadas para esses domínios. Se o BFF NestJS também tiver o agente de APM do New Relic, o trace mostra a cadeia completa: clique no botão "Entregue" no celular, chamada ao BFF, chamada ao serviço de pedidos, consulta ao banco.
+
+Para isso funcionar entre domínios diferentes, o BFF precisa aceitar esses cabeçalhos no CORS:
+
+```ts
+// apps/bff/src/main.ts (trecho)
+app.enableCors({
+  origin: [process.env.FRONT_URL!, process.env.ENTREGADOR_URL!],
+  credentials: true,
+  allowedHeaders: ["Content-Type", "traceparent", "tracestate", "newrelic"],
+});
+```
+
+Sem isso, o preflight falha e o app quebra assim que o tracing é ligado. Teste em homologação antes de ativar em produção.
+
+## Erros de JavaScript com contexto
+
+O agente captura sozinho erros não tratados e rejeições de promise sem `catch`. Mas erros que o React captura num error boundary não chegam a ser "não tratados", e erros que o seu código trata (um `catch` que mostra toast) também não. Para eles, use `noticeError`.
+
+No React 19, `createRoot` aceita callbacks para cada categoria de erro, o lugar ideal para conectar o monitoramento:
+
+```tsx
+// apps/entregador/src/main.tsx (versão completa)
+import { agente } from "./observabilidade/newrelic"; // continua sendo o primeiro import
+import { createRoot } from "react-dom/client";
+import { App } from "./App";
+
+const reportar = (origem: string) => (erro: unknown, info: { componentStack?: string }) => {
+  agente.noticeError(erro instanceof Error ? erro : new Error(String(erro)), {
+    origem,
+    pilhaDeComponentes: info.componentStack?.slice(0, 1000) ?? "",
+  });
+};
+
+createRoot(document.getElementById("root")!, {
+  onCaughtError: reportar("error-boundary"),
+  onUncaughtError: reportar("nao-capturado"),
+  onRecoverableError: reportar("recuperavel"),
+}).render(<App />);
+```
+
+E nos fluxos de negócio, envie o erro com os atributos que permitem investigar:
+
+```ts
+// apps/entregador/src/hooks/useMarcarEntregue.ts
+import { useMutation } from "@tanstack/react-query";
+import { agente } from "@/observabilidade/newrelic";
+import { marcarComoEntregue } from "@/servicos/api";
+
+export function useMarcarEntregue() {
+  return useMutation({
+    mutationFn: marcarComoEntregue,
+    onSuccess: (_r, pedidoId) => agente.addPageAction("entregaConfirmada", { pedidoId }),
+    onError: (erro, pedidoId) =>
+      agente.noticeError(erro, { acao: "marcarEntregue", pedidoId, online: navigator.onLine }),
+  });
+}
+```
+
+Foi assim que o mistério da segunda-feira se resolveu: os erros de "marcar entregue" tinham `online: false`. O app não tratava falta de rede no prédio de garagem; a correção foi enfileirar a confirmação e reenviar quando a conexão voltasse.
+
+## Source maps: stack traces legíveis
+
+O bundle de produção é minificado: o erro aparece como `at e (index-B4x9.js:1:48213)`. Com source maps publicados no New Relic, o stack trace mostra `useMarcarEntregue.ts:12`. Duas regras:
+
+1. **Gere os mapas, mas não os sirva publicamente.** No Vite, `build.sourcemap: "hidden"` gera os arquivos `.map` sem o comentário que aponta para eles no bundle.
+2. **Publique no New Relic a cada deploy**, associados à URL exata do arquivo JS e à versão.
+
+```ts
+// apps/entregador/vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: { sourcemap: "hidden" },
+});
+```
+
+No CI, exporte `VITE_VERSAO=$GITHUB_SHA` antes do `vite build`: o mesmo valor vai para `setApplicationVersion` e para o `releaseName` dos source maps, e os erros ficam ligados ao deploy exato.
+
+```bash
+# .github/workflows/deploy-entregador.yml (passo após o build)
+for mapa in apps/entregador/dist/assets/*.js.map; do
+  arquivo=$(basename "$mapa" .map)
+  npx @newrelic/publish-sourcemap "$mapa" "https://entregador.quitanda.com.br/assets/$arquivo" \
+    --apiKey="$NR_USER_API_KEY" --applicationId="$NR_APP_ID" --releaseName="$GITHUB_SHA"
+done
+rm apps/entregador/dist/assets/*.js.map
+```
+
+O `rm` no final garante que os mapas não sejam enviados ao servidor de arquivos estáticos. A `NR_USER_API_KEY` fica nos segredos do CI.
+
+## Atributos customizados
+
+Atributos transformam "houve 40 erros" em "houve 40 erros, todos na versão 1.8.2, em Android, na região Zona Sul". O agente aceita atributos globais, que passam a ir em todos os eventos seguintes:
+
+```ts
+// apps/entregador/src/observabilidade/contexto.ts
+import { agente } from "./newrelic";
+
+export function definirContextoDoEntregador(entregador: { id: string; regiao: string; turno: "manha" | "tarde" }) {
+  agente.setUserId(entregador.id); // id interno, nunca e-mail ou CPF
+  agente.setCustomAttribute("regiao", entregador.regiao);
+  agente.setCustomAttribute("turno", entregador.turno);
+}
+
+export function limparContexto() {
+  agente.setUserId(null);
+}
+```
+
+| Bom atributo | Por quê |
+|---|---|
+| Versão do app, região, turno, papel | Baixa cardinalidade, ótimo para agrupar (FACET) |
+| Id interno do usuário | Permite investigar um caso específico sem expor dados pessoais |
+| Feature flag ativa | Compara o comportamento de quem está com a versão nova |
+
+| Evite | Por quê |
+|---|---|
+| E-mail, CPF, telefone, endereço | Dados pessoais: risco de LGPD e de vazamento |
+| Valores únicos por evento como atributo global (timestamps, ids de requisição) | Explodem a cardinalidade e encarecem consultas |
+| Objetos grandes serializados | Atributos têm limite de tamanho e são truncados |
+
+## Privacidade e LGPD
+
+Monitoramento coleta dados de comportamento, e isso tem regras. Princípios para a Quitanda:
+
+- **Minimização:** colete o necessário para operar o app. Id interno sim; nome e endereço do cliente que recebeu o pedido, não.
+- **URLs também são dados.** Se alguma rota tiver dados pessoais na query string (`?cpf=...`), o agente os envia junto com a URL. Corrija a rota e, como defesa, configure as regras de ofuscação do agente (`init.obfuscate`, com expressões regulares e substituições).
+- **Session replay com mascaramento total**: `mask_all_inputs` e `mask_text_selector: "*"` gravam a estrutura da tela sem texto; libere seletivamente com atributos de desmascaramento apenas onde não há dado pessoal.
+- **Consentimento:** para a loja pública, siga a política de cookies; o agente permite desligar cookies (`privacy.cookies_enabled: false`) e adiar o início da coleta até haver consentimento (consulte a seção de API do agente para a sua versão).
+- **Retenção e acesso:** defina por quanto tempo os dados ficam e quem acessa a conta.
+
+<Callout type="tip" title="Escreva a política de dados do monitoramento">
+Um arquivo `docs/observabilidade.md` com o que é coletado, quais atributos existem, onde ficam as chaves e quem tem acesso evita que cada pessoa do time invente atributos novos com dados pessoais. Revise esse arquivo em todo pull request que mexa em `src/observabilidade/`.
+</Callout>
+
+## Na entrevista
+
+**O que é RUM e por que ele complementa o monitoramento do servidor?** Real User Monitoring coleta dados dos navegadores dos usuários: tempo de carregamento, navegações, chamadas, erros de JavaScript e Web Vitals. O servidor pode estar saudável enquanto o app quebra por rede ruim, erro de renderização ou JavaScript pesado, coisas que só o navegador vê.
+
+**Como o agente mede navegações numa SPA?** O agente com suporte a SPA observa a History API e registra cada troca de rota como uma interação, medindo do gatilho até o fim das chamadas e da renderização. É preciso dar nomes estáveis às rotas para agrupar URLs com ids.
+
+**Como você torna legíveis os erros de produção minificados?** Gerando source maps no build sem servi-los publicamente (`sourcemap: "hidden"` no Vite) e publicando-os no New Relic a cada deploy, associados à URL do arquivo e à versão.
+
+**Que cuidados de privacidade você toma?** Nunca envio dados pessoais em atributos ou URLs, uso id interno para o usuário, ativo mascaramento total no session replay, configuro ofuscação de URL e respeito o consentimento de cookies.
+
+**Por que erros capturados por um error boundary precisam de tratamento especial?** Porque o React os trata, então eles não chegam ao `window.onerror`. No React 19, os callbacks `onCaughtError` e `onUncaughtError` do `createRoot` são o lugar para enviá-los com `noticeError`.
+
+## Pratique
+
+1. Crie as aplicações Browser de homologação e produção, instale o agente via npm no app do entregador e confirme a chegada de `PageView` e `BrowserInteraction`.
+2. Adicione `handle.nomeNoMonitoramento` a todas as rotas e verifique que as navegações aparecem agrupadas pelo nome, não por URL.
+3. Ative o distributed tracing para o BFF, ajuste o CORS e encontre no New Relic um trace que comece no clique de "Entregue".
+4. Conecte `onCaughtError` e `onUncaughtError` ao `noticeError`, provoque um erro dentro de um error boundary e encontre-o com a pilha de componentes.
+5. Configure `sourcemap: "hidden"` e o passo de publicação de source maps no CI, e confira que o stack trace mostra o arquivo TypeScript original.
+6. Escreva o `docs/observabilidade.md` da Quitanda listando cada atributo customizado, seu propósito e a confirmação de que nenhum contém dado pessoal.
+
+<Quiz question="Qual chave do New Relic pode aparecer no bundle do app do entregador?" options={["A User API key","A license key de browser, que é uma chave de ingestão pública","A chave de administração da conta","Nenhuma; o agente funciona sem chave"]} answer={1} explanation="A license key de browser vai para o navegador por natureza. User API keys permitem consultar e alterar dados e ficam só em segredos do servidor ou do CI." />
+
+<Quiz question="Por que configurar build.sourcemap como hidden no Vite antes de publicar os mapas no New Relic?" options={["Para gerar os arquivos .map sem o comentário que os referencia no bundle, evitando servi-los publicamente","Para desativar os source maps","Porque o New Relic só aceita mapas ocultos","Para reduzir o tamanho dos mapas pela metade"]} answer={0} explanation="Os mapas são gerados para upload, mas o bundle não aponta para eles e eles não vão para o servidor estático, então o código-fonte não fica exposto." />
+
+<Quiz question="As navegações para /entregas/8f3c2a e /entregas/91be07 aparecem como linhas separadas nos relatórios. Qual a correção?" options={["Desativar o tracking de SPA","Trocar React Router por recarregamento completo","Usar um id sequencial nas URLs","Definir um nome de rota estável, como entregas/detalhe, com setCurrentRouteName ou regras de agrupamento de URL"]} answer={3} explanation="Agrupar por padrão de rota mantém os relatórios legíveis e com baixa cardinalidade." />
+
+## Base no CodeForge
+
+- [Os três pilares da observabilidade](/learn/system-design/tres-pilares): logs, métricas e traces.
+- [Tracing distribuído](/learn/system-design/tracing-distribuido): o que o `traceparent` conecta.
+- [React: otimização avançada de performance](/learn/carreira-react/react-otimizacao-avancada-performance): os Web Vitals que o agente coleta em campo.
+- [React: implementando técnicas modernas de Debugging e Release com Next.js](/learn/carreira-react/react-debugging-release-nextjs): depuração e versões, a base deste capítulo.
+
+## Referências
+
+- [New Relic: Introduction to browser monitoring](https://docs.newrelic.com/docs/browser/browser-monitoring/getting-started/introduction-browser-monitoring/)
+- [New Relic Browser agent no npm](https://www.npmjs.com/package/@newrelic/browser-agent)
+- [New Relic: Browser agent API](https://docs.newrelic.com/docs/browser/new-relic-browser/browser-apis/using-browser-apis/)
+- [New Relic: Upload source maps](https://docs.newrelic.com/docs/browser/new-relic-browser/browser-pro-features/upload-source-maps-api/)
+- [Vite: build.sourcemap](https://vite.dev/config/build-options#build-sourcemap)

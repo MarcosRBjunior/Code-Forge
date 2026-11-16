@@ -1,0 +1,448 @@
+---
+title: "React: integrando temas com styled-components"
+kind: lesson
+---
+
+Os pedidos da Quitanda chegam muito à noite: gente que lembra no fim do dia que acabou o tomate. Os dados do New Relic mostram picos depois das 22h, e o pedido mais votado no formulário de feedback é um modo escuro. Ao mesmo tempo, as feiras parceiras que agora consomem a Quitanda UI pelo npm querem a própria identidade: a Feira do Zé usa laranja, outra usa azul. A mesma loja, os mesmos componentes, aparências diferentes.
+
+Os dois pedidos são o mesmo problema: trocar os valores dos tokens semânticos sem tocar nos componentes. Este capítulo implementa tema claro e escuro, respeita a preferência do sistema operacional, persiste a escolha do usuário, elimina o flash de tema errado na renderização do Next.js no servidor e fecha com temas por marca (white label).
+
+**Você vai aprender:**
+
+- Usar o `ThemeProvider` do styled-components, temas aninhados e `createGlobalStyle`
+- Implementar modo claro, escuro e "sistema" com `prefers-color-scheme` e variáveis CSS
+- Persistir a escolha em cookie ou `localStorage`, conhecendo o custo de cada opção
+- Evitar o flash de tema errado e o CSS ausente no SSR do Next.js com App Router
+- Montar temas por marca combinando tokens, configuração e o tema do styled-components
+
+## Duas formas de trocar o tema
+
+A forma clássica do styled-components é ter dois objetos de tema com valores concretos e trocar o objeto passado ao `ThemeProvider`:
+
+```tsx
+// exemplo da abordagem clássica (não usada na Quitanda)
+const temaClaro = { cor: { fundo: "#ffffff", texto: "#111827", acaoPrimaria: "#15803d" } };
+const temaEscuro = { cor: { fundo: "#111827", texto: "#f9fafb", acaoPrimaria: "#4ade80" } };
+
+function App() {
+  const [escuro, setEscuro] = useState(false);
+  return (
+    <ThemeProvider theme={escuro ? temaEscuro : temaClaro}>
+      <Loja />
+    </ThemeProvider>
+  );
+}
+```
+
+Funciona, mas tem dois custos. Trocar o tema muda o valor do contexto, e todo componente estilizado da árvore re-renderiza e gera classes novas. E, mais grave no Next.js, o servidor não sabe qual tema o usuário quer: renderiza o claro, o navegador pinta o claro, a hidratação lê a preferência e troca para o escuro. O usuário vê um clarão branco a cada carregamento.
+
+A Quitanda já está preparada para a segunda forma. No capítulo de tokens, o objeto de tema aponta para variáveis CSS (`var(--qt-cor-acao-primaria)`) e nunca muda. O que muda é o valor das variáveis, decidido pelo CSS a partir de um atributo no `html`.
+
+| Critério | Trocar o objeto de tema | Trocar variáveis CSS |
+|---|---|---|
+| Custo da troca | Re-render da árvore e novas classes | Só repintura do navegador |
+| Respeitar o sistema sem JavaScript | Não | Sim, com media query |
+| Flash no SSR | Difícil de evitar | Evitável com cookie ou script mínimo |
+| Funciona fora do React (CSS puro, Tailwind) | Não | Sim |
+| Valores calculados em JS (canvas, gráficos) | Direto | Exige ler `getComputedStyle` |
+
+## Tokens do modo escuro
+
+O modo escuro redefine apenas os tokens **semânticos**. Os primitivos são os mesmos; o mapeamento muda.
+
+```json
+// packages/tokens/src/temas/escuro.tokens.json
+{
+  "cor": {
+    "$type": "color",
+    "fundo": {
+      "padrao": { "$value": "{cor.cinza.900}" }, "sutil": { "$value": "{cor.cinza.700}" }
+    },
+    "texto": {
+      "padrao": { "$value": "{cor.cinza.50}" },
+      "suave": { "$value": "{cor.cinza.200}" },
+      "sobreAcao": { "$value": "{cor.cinza.900}" }
+    },
+    "acao": {
+      "primaria": { "$value": "{cor.verde.400}" },
+      "primariaHover": { "$value": "{cor.verde.100}" }
+    },
+    "borda": { "padrao": { "$value": "{cor.cinza.700}" } }
+  }
+}
+```
+
+No build, uma segunda instância do Style Dictionary gera só esses tokens, sob um seletor próprio. Os primitivos entram por `include`, para os aliases resolverem, e o filtro `isSource` deixa de fora o que veio de `include`:
+
+```js
+// packages/tokens/build.mjs (trecho)
+const escuro = new StyleDictionary({
+  include: ["src/primitivos.tokens.json"],
+  source: ["src/temas/escuro.tokens.json"],
+  platforms: {
+    css: {
+      transformGroup: "css",
+      prefix: "qt",
+      buildPath: "dist/",
+      files: [
+        {
+          destination: "tema-escuro.css",
+          format: "css/variables",
+          filter: (token) => token.isSource,
+          options: { selector: ':root[data-tema="escuro"]', outputReferences: true },
+        },
+      ],
+    },
+  },
+});
+await escuro.buildAllPlatforms();
+```
+
+### Claro, escuro e "sistema" no CSS
+
+São três escolhas possíveis: claro, escuro ou seguir o sistema operacional. O atributo `data-tema` no `html` representa a escolha explícita; sem atributo, vale o sistema. A media query `prefers-color-scheme` resolve o caso "sistema" sem nenhum JavaScript:
+
+```css
+/* packages/tokens/src/temas/sistema.css */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-tema="claro"]) {
+    --qt-cor-fundo-padrao: var(--qt-cor-cinza-900);
+    --qt-cor-texto-padrao: var(--qt-cor-cinza-50);
+    --qt-cor-acao-primaria: var(--qt-cor-verde-400);
+    /* os mesmos valores de tema-escuro.css */
+  }
+}
+
+:root { color-scheme: light; }
+:root[data-tema="escuro"] { color-scheme: dark; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-tema="claro"]) { color-scheme: dark; }
+}
+```
+
+Em projeto real, esse bloco também é gerado pelo Style Dictionary a partir do mesmo `escuro.tokens.json` (um formato próprio que embrulha as variáveis na media query), para os valores nunca divergirem. A propriedade `color-scheme` avisa o navegador para usar barras de rolagem, campos de formulário e o fundo padrão escuros, detalhe que muita implementação esquece. Os arquivos gerados (`tema-escuro.css` e `sistema.css`) entram no `exports` do pacote de tokens, por exemplo com o padrão `"./*.css": "./dist/*.css"`.
+
+## O tema global com `createGlobalStyle`
+
+```tsx
+// packages/ui/src/tema/EstiloGlobal.tsx
+"use client";
+import { createGlobalStyle } from "styled-components";
+
+export const EstiloGlobal = createGlobalStyle`
+  body {
+    margin: 0;
+    background: ${({ theme }) => theme.cor.fundo};
+    color: ${({ theme }) => theme.cor.texto};
+    font-family: system-ui, sans-serif;
+  }
+
+  @media (prefers-reduced-motion: no-preference) { body { transition: background-color 150ms, color 150ms; } }
+`;
+```
+
+`createGlobalStyle` cria um componente que injeta CSS global e tem acesso ao tema. Ele entra uma vez, dentro do `ThemeProvider`.
+
+## Persistindo a escolha: cookie ou `localStorage`
+
+A escolha do usuário precisa sobreviver ao recarregamento. Existem dois lugares para guardá-la, com consequências bem diferentes no Next.js.
+
+### Opção 1: cookie lido no servidor
+
+Com cookie, o servidor sabe o tema antes de renderizar e já entrega o `html` com o atributo certo. Sem flash, sem script inline.
+
+```tsx
+// apps/loja/src/app/layout.tsx
+import { cookies } from "next/headers";
+import "@quitanda/tokens/tokens.css";
+import "@quitanda/tokens/tema-escuro.css";
+import "@quitanda/tokens/sistema.css";
+import { RegistroDeEstilos } from "@/lib/RegistroDeEstilos";
+import { ProvedorDeTema, EstiloGlobal } from "@quitanda/ui";
+
+export default async function LayoutRaiz({ children }: { children: React.ReactNode }) {
+  const preferencia = (await cookies()).get("quitanda-tema")?.value;
+  const tema = preferencia === "claro" || preferencia === "escuro" ? preferencia : undefined;
+
+  return (
+    <html lang="pt-BR" data-tema={tema}>
+      <body>
+        <RegistroDeEstilos>
+          <ProvedorDeTema>
+            <EstiloGlobal />
+            {children}
+          </ProvedorDeTema>
+        </RegistroDeEstilos>
+      </body>
+    </html>
+  );
+}
+```
+
+```ts
+// apps/loja/src/acoes/tema.ts
+"use server";
+import { cookies } from "next/headers";
+
+export async function definirTema(tema: "claro" | "escuro" | "sistema") {
+  const jar = await cookies();
+  if (tema === "sistema") jar.delete("quitanda-tema");
+  else jar.set("quitanda-tema", tema, { maxAge: 60 * 60 * 24 * 365, sameSite: "lax", path: "/" });
+}
+```
+
+O custo: ler `cookies()` no layout raiz torna **todas** as rotas dinâmicas. O catálogo da Quitanda, que podia ser pré-renderizado e servido da CDN, passa a ser renderizado a cada requisição. Para um painel autenticado, que já é dinâmico, o cookie é a melhor escolha. Para uma loja pública que vive de cache, é caro.
+
+### Opção 2: `localStorage` e um script que roda antes da pintura
+
+A alternativa mantém o HTML estático e corrige o atributo no navegador antes da primeira pintura, com um script pequeno e bloqueante no `head`. É a técnica usada por bibliotecas como o `next-themes`.
+
+```tsx
+// apps/loja/src/app/layout.tsx (variação com script)
+const scriptTema = `(function () {
+  try {
+    var t = localStorage.getItem("quitanda-tema");
+    if (t === "claro" || t === "escuro") document.documentElement.dataset.tema = t;
+  } catch (e) {}
+})();`;
+
+export default function LayoutRaiz({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="pt-BR" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: scriptTema }} />
+      </head>
+      <body>{/* provedores e children como antes */}</body>
+    </html>
+  );
+}
+```
+
+O script roda antes de o navegador pintar o `body`, então o primeiro quadro já sai no tema certo. O `suppressHydrationWarning` no `html` é necessário porque o atributo `data-tema` existe no DOM e não no HTML do servidor; ele vale só para os atributos daquele elemento, não para os filhos. O conteúdo do script é uma string fixa, sem dado do usuário, o que é importante: se a loja usar Content Security Policy com nonce (tema do capítulo de segurança), esse script precisa receber o nonce.
+
+| Critério | Cookie no servidor | `localStorage` com script |
+|---|---|---|
+| Flash de tema errado | Nenhum | Nenhum, se o script estiver no `head` |
+| Páginas estáticas e cache de CDN | Perdidos no layout raiz | Mantidos |
+| Script inline | Não precisa | Precisa (e o nonce, com CSP) |
+| Preferência disponível no servidor | Sim | Não |
+| Bom para | Painel, áreas autenticadas | Loja pública, conteúdo cacheado |
+
+<Callout type="tip" title="O modo sistema não precisa de nada">
+Quem nunca escolheu um tema não tem cookie nem entrada no `localStorage`, e o HTML sai sem `data-tema`. A media query cuida de tudo. Só quem escolheu explicitamente depende da persistência, o que torna o caso mais comum também o mais robusto.
+</Callout>
+
+## O hook `useTema` e o seletor
+
+A versão abaixo é a da loja, com `localStorage`. No painel, que usa cookie, a função `escolher` chama a Server Action `definirTema` além de atualizar o atributo.
+
+Os componentes que mostram ou trocam o tema precisam saber a escolha atual e o tema efetivamente aplicado (no modo sistema, depende do SO). A preferência do sistema é uma fonte externa ao React, que pode mudar a qualquer momento; `useSyncExternalStore` é o hook feito para isso:
+
+```tsx
+// apps/loja/src/tema/useTema.ts
+"use client";
+import { useCallback, useSyncExternalStore } from "react";
+
+export type Escolha = "claro" | "escuro" | "sistema";
+const consulta = "(prefers-color-scheme: dark)";
+
+function assinarSistema(aoMudar: () => void) {
+  const mql = window.matchMedia(consulta);
+  mql.addEventListener("change", aoMudar);
+  return () => mql.removeEventListener("change", aoMudar);
+}
+
+function lerEscolha(): Escolha {
+  const t = document.documentElement.dataset.tema;
+  return t === "claro" || t === "escuro" ? t : "sistema";
+}
+
+export function useTema() {
+  const sistemaEscuro = useSyncExternalStore(
+    assinarSistema,
+    () => window.matchMedia(consulta).matches,
+    () => false,
+  );
+  const escolha = useSyncExternalStore(assinarAtributo, lerEscolha, () => "sistema" as Escolha);
+  const aplicado = escolha === "sistema" ? (sistemaEscuro ? "escuro" : "claro") : escolha;
+
+  const escolher = useCallback((nova: Escolha) => {
+    const raiz = document.documentElement;
+    if (nova === "sistema") delete raiz.dataset.tema;
+    else raiz.dataset.tema = nova;
+    try {
+      if (nova === "sistema") localStorage.removeItem("quitanda-tema");
+      else localStorage.setItem("quitanda-tema", nova);
+    } catch {}
+  }, []);
+
+  return { escolha, aplicado, escolher };
+}
+
+function assinarAtributo(aoMudar: () => void) {
+  const obs = new MutationObserver(aoMudar);
+  obs.observe(document.documentElement, { attributes: true, attributeFilter: ["data-tema"] });
+  return () => obs.disconnect();
+}
+```
+
+O terceiro argumento de cada `useSyncExternalStore` é o valor usado no servidor e na hidratação. Ele precisa ser estável e igual nos dois lados; por isso o seletor mostra "sistema" no primeiro render e se corrige logo depois. O atributo no `html` é a fonte da verdade, e o `MutationObserver` mantém todas as instâncias do hook sincronizadas.
+
+```tsx
+// apps/loja/src/componentes/SeletorDeTema.tsx
+"use client";
+import { useTema, type Escolha } from "@/tema/useTema";
+
+const opcoes: { valor: Escolha; rotulo: string }[] = [
+  { valor: "claro", rotulo: "Claro" },
+  { valor: "escuro", rotulo: "Escuro" },
+  { valor: "sistema", rotulo: "Sistema" },
+];
+
+export function SeletorDeTema() {
+  const { escolha, escolher } = useTema();
+  return (
+    <fieldset>
+      <legend>Tema</legend>
+      {opcoes.map((o) => (
+        <label key={o.valor}>
+          <input
+            type="radio"
+            name="tema"
+            value={o.valor}
+            checked={escolha === o.valor}
+            onChange={() => escolher(o.valor)}
+          />
+          {o.rotulo}
+        </label>
+      ))}
+    </fieldset>
+  );
+}
+```
+
+Três opções mutuamente exclusivas são um grupo de rádio: teclado, leitor de tela e estado já vêm do HTML. Um botão único que alterna claro e escuro esconde a opção "sistema" e confunde quem não sabe o estado atual.
+
+## styled-components no SSR do App Router
+
+Há um segundo flash, independente do tema: o do CSS ausente. O styled-components gera o CSS enquanto renderiza. No servidor, se ninguém coletar esse CSS e colocá-lo no HTML, a página chega crua e só ganha estilo depois que o JavaScript roda. No App Router, a coleta é feita por um registro de estilos com `useServerInsertedHTML`:
+
+```tsx
+// apps/loja/src/lib/RegistroDeEstilos.tsx
+"use client";
+import { useState, type ReactNode } from "react";
+import { useServerInsertedHTML } from "next/navigation";
+import { ServerStyleSheet, StyleSheetManager } from "styled-components";
+
+export function RegistroDeEstilos({ children }: { children: ReactNode }) {
+  const [folha] = useState(() => new ServerStyleSheet());
+
+  useServerInsertedHTML(() => {
+    const estilos = folha.getStyleElement();
+    folha.instance.clearTag();
+    return <>{estilos}</>;
+  });
+
+  if (typeof window !== "undefined") return <>{children}</>;
+  return <StyleSheetManager sheet={folha.instance}>{children}</StyleSheetManager>;
+}
+```
+
+Durante o streaming, o Next.js chama a função registrada a cada trecho de HTML enviado, e as regras novas vão junto. Ative também o suporte do compilador, que gera nomes de classe legíveis em desenvolvimento e consistentes entre servidor e cliente:
+
+```ts
+// apps/loja/next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  compiler: { styledComponents: true },
+  transpilePackages: ["@quitanda/ui"],
+};
+
+export default config;
+```
+
+<Callout type="warning" title="Dois flashes diferentes">
+Página sem estilo nenhum no primeiro quadro é falta do registro de estilos. Página estilizada, mas no tema errado, é falta de persistência legível antes da pintura (cookie no servidor ou script no `head`). Os sintomas parecem iguais num vídeo rápido; as correções são diferentes.
+</Callout>
+
+## Temas por marca (white label)
+
+A Feira do Zé usa a Quitanda UI com outra identidade. A marca é mais uma camada sobre os mesmos tokens semânticos, e quase sempre pequena: cor de ação, talvez raio e fonte. Logo, nome e textos não são tokens; são configuração.
+
+```json
+// packages/tokens/src/marcas/feira-do-ze.tokens.json
+{
+  "cor": {
+    "$type": "color",
+    "laranja": { "600": { "$value": "#ea580c" }, "800": { "$value": "#9a3412" }, "300": { "$value": "#fdba74" } },
+    "acao": {
+      "primaria": { "$value": "{cor.laranja.800}" },
+      "primariaHover": { "$value": "{cor.laranja.600}" }
+    }
+  },
+  "raio": { "$type": "dimension", "m": { "$value": "16px" } }
+}
+```
+
+O Style Dictionary gera `marca-feira-do-ze.css` com o seletor `:root[data-marca="feira-do-ze"]`, e o caso combinado (marca no modo escuro, com `laranja.300` como ação) sob `:root[data-marca="feira-do-ze"][data-tema="escuro"]`. Mantenha as marcas pequenas: cada token sobrescrito multiplica as combinações que precisam passar no teste de contraste.
+
+A parte que não é CSS (logo, nome, telefone do WhatsApp) vai num objeto de configuração e chega aos componentes por um `ThemeProvider` aninhado. Quando recebe uma função, o `ThemeProvider` interno recebe o tema do externo e devolve o novo, o que permite estender sem repetir:
+
+```tsx
+// apps/loja/src/marca/ProvedorDeMarca.tsx
+"use client";
+import type { ReactNode } from "react";
+import { ThemeProvider } from "styled-components";
+import type { Marca } from "./marcas";
+
+export function ProvedorDeMarca({ marca, children }: { marca: Marca; children: ReactNode }) {
+  return <ThemeProvider theme={(pai) => ({ ...pai, marca })}>{children}</ThemeProvider>;
+}
+```
+
+Com `marca` adicionada ao `DefaultTheme`, um cabeçalho estilizado lê `theme.marca.logo` e `theme.marca.nome`. Qual marca usar pode ser decidido de duas formas:
+
+- **Por deploy**: cada feira tem o próprio deploy, com `NEXT_PUBLIC_MARCA=feira-do-ze`. Simples, estático e cacheável; uma build por marca.
+- **Por domínio**: um deploy só atende vários domínios, e o layout lê o host com `(await headers()).get("host")` para escolher a marca. Uma build para todas, mas as rotas ficam dinâmicas, com o mesmo custo do cookie visto acima.
+
+## Na entrevista
+
+**Como você implementaria modo escuro numa aplicação Next.js com styled-components?** Com tokens semânticos em variáveis CSS, sobrescritos por um seletor como `data-tema="escuro"` e por uma media query de `prefers-color-scheme` para o modo sistema. O tema do styled-components aponta para as variáveis e não muda. A escolha fica em cookie (lido no layout) ou em `localStorage` com um script no `head` que aplica o atributo antes da pintura.
+
+**O que causa o flash de tema errado e como evitar?** O HTML vem do servidor sem saber a preferência e é pintado antes de o JavaScript corrigir. Evita-se entregando o atributo certo pelo servidor (cookie) ou aplicando-o com um script bloqueante no `head`, antes do `body` ser pintado.
+
+**Por que preferir variáveis CSS a trocar o objeto do ThemeProvider?** Trocar o objeto re-renderiza todos os componentes estilizados e não funciona antes da hidratação. Trocar variáveis é só repintura, funciona sem JavaScript para o modo sistema e serve também para CSS puro e Tailwind.
+
+**Para que serve o registro de estilos do styled-components no App Router?** Para coletar o CSS gerado durante a renderização no servidor e inseri-lo no HTML com `useServerInsertedHTML`. Sem ele, a página chega sem estilo e só se arruma após o JavaScript carregar.
+
+**Como você organiza temas para várias marcas?** A marca sobrescreve poucos tokens semânticos, gerados como CSS sob um seletor de marca. O que não é estilo (logo, nome) vai em configuração, entregue por um `ThemeProvider` aninhado ou contexto. Testes de contraste rodam para cada combinação de marca e modo.
+
+## Pratique
+
+1. Gere `tema-escuro.css` e o bloco de `prefers-color-scheme` com o Style Dictionary a partir de um único `escuro.tokens.json` e confira no DevTools (emulação de tema do sistema) que a loja muda sem JavaScript.
+2. Implemente a persistência por cookie no painel do lojista e por `localStorage` com script na loja. Rode `next build` e compare quais rotas ficaram estáticas em cada app.
+3. Grave a tela da loja carregando com rede lenta no modo escuro, sem o script no `head`, e depois com ele. Repita removendo o registro de estilos para ver o outro tipo de flash.
+4. Escreva o `useTema` com `useSyncExternalStore` e um teste que simula a mudança de `prefers-color-scheme` com um `matchMedia` falso.
+5. Crie a marca Feira do Zé com laranja e raio maior, escolhida por variável de ambiente, e acrescente ao teste de contraste dos tokens as quatro combinações de marca e modo.
+
+<Quiz question="A loja da Quitanda lê o cookie de tema com cookies() no layout raiz. Qual efeito colateral isso tem?" options={["Nenhum, cookies são lidos no cliente","O tema só funciona depois da hidratação","Todas as rotas passam a ser renderizadas dinamicamente, perdendo a pré-renderização estática","O cookie é enviado ao New Relic"]} answer={2} explanation="Ler cookies no layout raiz torna cada requisição dependente do pedido do usuário. Para páginas públicas e cacheáveis, um script no head com localStorage preserva a renderização estática." />
+
+<Quiz question="Um usuário nunca escolheu tema e o sistema dele está no modo escuro. Na implementação da Quitanda, o que garante o tema escuro?" options={["A media query prefers-color-scheme sobre o html sem atributo data-tema","O script inline no head","O ThemeProvider com o objeto escuro","Um useEffect que lê matchMedia"]} answer={0} explanation="Sem escolha explícita, o html não tem data-tema e a media query aplica os tokens escuros, sem depender de JavaScript." />
+
+<Quiz question="A página da loja aparece sem estilo nenhum por um instante e depois se arruma. Qual a causa mais provável?" options={["Falta suppressHydrationWarning no html","O CSS gerado pelo styled-components no servidor não está sendo coletado e inserido no HTML","O token cor.fundo.padrao não existe","O tema escuro foi carregado antes do claro"]} answer={1} explanation="Sem o registro de estilos com useServerInsertedHTML, o HTML do servidor chega sem as regras do styled-components, que só aparecem quando o JavaScript roda." />
+
+## Base no CodeForge
+
+- [React: desenvolvendo design tokens com styled-components](/learn/carreira-react/react-design-tokens-styled-components): os tokens semânticos que os temas sobrescrevem.
+- [React: explorando estratégias de renderização do Next.js](/learn/carreira-react/react-estrategias-renderizacao-nextjs): por que ler cookies e headers torna rotas dinâmicas.
+- [React: implementando segurança web com padrões OWASP](/learn/carreira-react/react-seguranca-web-owasp): CSP e nonce para o script de tema.
+- [CDN](/learn/system-design/cdn): o cache que a escolha entre cookie e script preserva ou perde.
+
+## Referências
+
+- [styled-components: Theming](https://styled-components.com/docs/advanced#theming)
+- [Next.js: CSS-in-JS](https://nextjs.org/docs/app/guides/css-in-js)
+- [MDN: prefers-color-scheme](https://developer.mozilla.org/en-US/docs/Web/CSS/@media/prefers-color-scheme)
+- [MDN: color-scheme](https://developer.mozilla.org/en-US/docs/Web/CSS/color-scheme)
+- [React: useSyncExternalStore](https://react.dev/reference/react/useSyncExternalStore)

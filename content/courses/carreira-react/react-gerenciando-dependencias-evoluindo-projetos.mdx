@@ -1,0 +1,307 @@
+---
+title: "React: gerenciando dependências e evoluindo projetos com segurança"
+kind: lesson
+---
+
+O monorepo da Quitanda declara umas 80 dependências diretas. Com as dependências delas, o `pnpm-lock.yaml` lista mais de 1.400 pacotes, escritos por centenas de pessoas que ninguém no time conhece. Há 23 PRs de atualização abertos há semanas, o `pnpm audit` mostra vulnerabilidades que ninguém sabe se importam, e a loja está uma major atrás do Next.js porque "da última vez que atualizamos, quebrou o checkout". Enquanto isso, em 2025, o ecossistema npm viu pacotes populares serem comprometidos por phishing contra mantenedores e um worm (o Shai-Hulud) que se espalhava publicando versões maliciosas com tokens roubados.
+
+Dependência não é algo que se instala e esquece: é código de terceiros rodando na sua máquina, no CI e no navegador do cliente. Este capítulo trata da rotina de manter dependências: travar o que está instalado, enxergar o que existe, decidir o que corrigir, automatizar atualizações sem ser atropelado por elas, fazer upgrades major de React e Next.js com codemods e se proteger da cadeia de suprimentos.
+
+**Você vai aprender:**
+
+- Usar lockfile, `npm ci` e versões fixadas de Node.js e gerenciador para builds reproduzíveis
+- Investigar a árvore de dependências e tratar vulnerabilidades do `npm audit` com critério
+- Configurar Renovate ou Dependabot com agrupamento, agenda, automerge e tempo mínimo de publicação
+- Planejar upgrades major de React e Next.js com guias oficiais e codemods
+- Reduzir o risco de cadeia de suprimentos: scripts de instalação, provenance, typosquatting e depreciação
+
+## Reprodutibilidade: o lockfile e as versões da ferramenta
+
+O `package.json` declara faixas (`"next": "^16.0.0"`); o lockfile registra a versão exata resolvida de cada pacote da árvore, com a origem e o hash de integridade. Sem lockfile, dois `install` em dias diferentes produzem árvores diferentes, e o bug "na minha máquina funciona" ganha uma explicação.
+
+| Comando | O que faz | Onde usar |
+|---|---|---|
+| `npm install` | Resolve faixas, pode atualizar o `package-lock.json` | Desenvolvimento, ao adicionar ou mudar dependências |
+| `npm ci` | Instala exatamente o lockfile; falha se ele divergir do `package.json`; apaga o `node_modules` antes | CI e builds de produção |
+| `pnpm install --frozen-lockfile` | Equivalente ao `npm ci` no pnpm (padrão quando detecta CI) | CI e builds de produção |
+
+Regras que evitam metade dos problemas:
+
+- **Commite o lockfile** e revise as mudanças nele nos PRs. Uma linha `resolved` que passou a apontar para outro registro é sinal de alerta.
+- **Um gerenciador só.** O campo `packageManager` no `package.json` da raiz declara qual e em que versão (`"pnpm@10.x.y"`). Dois lockfiles no repositório são duas verdades.
+- **Versão do Node.js fixada** em `.nvmrc` (ou `.node-version`) e em `engines`, igual no CI, no Dockerfile e na máquina de cada pessoa. Node 24 LTS na Quitanda.
+
+```json
+// package.json (raiz, trecho)
+{
+  "packageManager": "pnpm@10.18.0",
+  "engines": { "node": ">=24 <25" }
+}
+```
+
+## Enxergando a árvore
+
+Antes de corrigir, entenda. As perguntas mais comuns e os comandos que as respondem:
+
+```bash
+pnpm why react-is                 # quem depende deste pacote (npm: npm explain react-is)
+pnpm ls react --recursive --depth 0   # que versão de React cada workspace usa
+pnpm outdated --recursive         # o que tem versão nova, por workspace
+npm ls --all --omit=dev | wc -l   # tamanho da árvore que vai para produção
+```
+
+Duas distinções mudam a prioridade de qualquer problema:
+
+- **Produção ou desenvolvimento.** Uma vulnerabilidade no Storybook não chega ao cliente; uma no Next.js chega.
+- **Servidor ou navegador.** Um pacote usado só no build ou no BFF não está no bundle; um usado num Client Component está em todos os navegadores.
+
+## Vulnerabilidades: `npm audit` com critério
+
+O `npm audit` (e o `pnpm audit`) compara a árvore com o banco de avisos de segurança do GitHub e lista os pacotes afetados com a severidade e a versão corrigida. O relatório cru assusta; o trabalho é triá-lo.
+
+```bash
+npm audit --omit=dev     # só o que vai para produção
+npm audit fix            # aplica correções compatíveis com as faixas declaradas
+npm audit fix --force    # pode instalar majors: só com testes e revisão
+```
+
+Para cada aviso, três perguntas: o código vulnerável vai para produção? O caminho vulnerável é alcançável na Quitanda (uma falha num parser de YAML não importa se nenhum YAML do usuário é lido)? Existe correção? Se a correção está numa dependência transitiva cujo pai ainda não atualizou, force a versão com `overrides`:
+
+```json
+// package.json (raiz, trecho)
+{
+  "overrides": {
+    "cookie": "^0.7.0"
+  }
+}
+```
+
+No pnpm, o equivalente é a seção `overrides` na configuração do workspace. Toda substituição forçada é uma dívida: registre o motivo e remova-a quando o pacote pai atualizar.
+
+<Callout type="warning" title="Severidade não é prioridade">
+Um aviso "crítico" num pacote de desenvolvimento usado só no build pode esperar; um "moderado" num pacote de sanitização de HTML exposto ao cliente não pode. Times que tratam todo aviso como urgente se cansam e passam a ignorar todos. Triagem com critério é o que mantém o `audit` útil.
+</Callout>
+
+## Atualização contínua com Renovate ou Dependabot
+
+Atualizar muito de uma vez é arriscado; não atualizar nunca é pior. O meio-termo é atualizar sempre, em pedaços pequenos, com um robô abrindo os PRs e o CI decidindo.
+
+O Renovate é o mais configurável e entende monorepos, workspaces do pnpm e grupos de pacotes:
+
+```json
+// renovate.json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "America/Sao_Paulo",
+  "schedule": ["before 9am on monday"],
+  "minimumReleaseAge": "3 days",
+  "prConcurrentLimit": 8,
+  "packageRules": [
+    {
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": true
+    },
+    { "groupName": "react", "matchPackageNames": ["react", "react-dom", "@types/react", "@types/react-dom"] },
+    { "groupName": "next", "matchPackageNames": ["next", "eslint-config-next", "@next/**"] },
+    { "groupName": "storybook", "matchPackageNames": ["storybook", "@storybook/**"] },
+    { "matchUpdateTypes": ["major"], "labels": ["major"], "automerge": false }
+  ]
+}
+```
+
+O que cada escolha resolve:
+
+- **`schedule`** concentra os PRs numa janela, em vez de interrupções o dia inteiro.
+- **`minimumReleaseAge`** só propõe versões publicadas há pelo menos três dias. A maioria das versões maliciosas e das versões quebradas é detectada e removida nesse intervalo; é uma das defesas mais baratas contra ataques de cadeia de suprimentos.
+- **Grupos** mantêm juntos pacotes que precisam subir juntos (`react` e `react-dom`, os pacotes do Storybook).
+- **Automerge** de patch e minor de desenvolvimento, com o CI verde, tira do humano o que não precisa dele. Majors sempre passam por revisão.
+- O Renovate mantém uma issue de painel com tudo que está pendente, útil para enxergar a dívida de atualização.
+
+O Dependabot, integrado ao GitHub, cobre o essencial com menos configuração, inclusive agrupamento e um período de espera antes de propor versões novas:
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 3
+    groups:
+      react:
+        patterns: ["react", "react-dom", "@types/react*"]
+      dev-minor:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+```
+
+Nada disso funciona sem testes. O robô só é seguro se um PR verde significar algo: testes unitários dos componentes, testes de integração das telas e um teste end-to-end do caminho crítico (catálogo, carrinho, checkout).
+
+## Upgrades major: React e Next.js
+
+Uma major é um projeto pequeno, não um PR de robô. O roteiro que funciona:
+
+1. **Leia o guia de atualização oficial**, não só o changelog. Liste as mudanças que afetam a Quitanda.
+2. **Atualize em isolamento**: uma major por vez, numa branch própria, sem misturar com funcionalidades.
+3. **Rode os codemods** oficiais, que reescrevem o código automaticamente para os padrões novos.
+4. **Corrija o resto à mão**, guiado pelo TypeScript, pelos avisos do console e pelos testes.
+5. **Valide além dos testes**: regressão visual das stories, um passeio manual pelas jornadas e, em produção, um canário ou feature flag, com os dashboards do New Relic abertos.
+
+### React
+
+A migração para o React 19 tem um conjunto de codemods reunidos numa receita, e outro para os tipos:
+
+```bash
+npx codemod@latest react/19/migration-recipe
+npx types-react-codemod@latest preset-19 ./src
+```
+
+Eles tratam remoções de APIs antigas (como `ReactDOM.render`, substituído por `createRoot`, e as string refs), a troca de `forwardRef` por `ref` como prop onde aplicável e mudanças nos tipos (por exemplo, `useRef` passou a exigir argumento). O que nenhum codemod resolve: bibliotecas de terceiros que ainda não declaram suporte à versão nova no `peerDependencies`. Verifique isso **antes** de começar, com `pnpm outdated` e as issues dos projetos.
+
+### Next.js
+
+O Next.js tem um comando que atualiza as dependências e oferece os codemods relevantes para o salto de versão:
+
+```bash
+npx @next/codemod@canary upgrade latest
+```
+
+Na passagem para o Next.js 16, as mudanças que mais aparecem em projetos como a Quitanda são:
+
+| Mudança | O que fazer |
+|---|---|
+| APIs de requisição só assíncronas (`cookies()`, `headers()`, `params`, `searchParams`) | `await` em todo uso; o codemod converte a maioria |
+| `middleware.ts` renomeado para `proxy.ts` | Renomear o arquivo e a função exportada |
+| Turbopack como bundler padrão em desenvolvimento e build | Revisar configurações específicas de webpack; plugins de webpack não rodam |
+| Comando `next lint` removido | Rodar o ESLint diretamente, com a configuração em formato flat |
+
+A primeira linha da tabela é a que mais toca código. Uma página de produto da Quitanda escrita na época em que `params` era um objeto comum precisa passar a esperar a Promise:
+
+```tsx
+// apps/loja/src/app/produtos/[slug]/page.tsx (depois do upgrade)
+import { obterProduto } from "@/servicos/produtos";
+
+export default async function PaginaProduto({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params; // antes: params.slug, acesso síncrono
+  const produto = await obterProduto(slug);
+  return <h1>{produto.nome}</h1>;
+}
+```
+
+O codemod faz essa conversão na maioria dos arquivos e deixa um comentário onde não conseguiu decidir sozinho, por exemplo em Client Components, que leem a Promise com o hook `use`. Procure esses comentários antes de abrir o PR.
+
+<Callout type="tip" title="Upgrade pequeno e frequente">
+Ficar uma versão atrás é barato; ficar três é um projeto de um trimestre, porque as mudanças se acumulam e os guias de migração assumem que você veio da versão anterior. Agende os upgrades major no planejamento, como qualquer outro trabalho, em vez de esperar sobrar tempo.
+</Callout>
+
+## Cadeia de suprimentos: o que mais pode dar errado
+
+As vulnerabilidades do `audit` são bugs conhecidos. Os ataques de cadeia de suprimentos são outra categoria: código malicioso entrando de propósito pela árvore de dependências.
+
+| Ameaça | Como acontece | Defesa |
+|---|---|---|
+| Conta de mantenedor comprometida | Phishing rouba o acesso e uma versão maliciosa é publicada | Tempo mínimo de publicação; preferir pacotes com provenance; lockfile |
+| Script de instalação malicioso | `postinstall` roda código arbitrário no `install`, inclusive no CI com segredos | pnpm não roda scripts de dependências por padrão; liste as permitidas |
+| Typosquatting | `reactt-dom` ou `loadsh` instalados por erro de digitação | Revisar o `package.json` no PR; desconfiar de pacotes novos e pouco baixados |
+| Confusão de dependência | Pacote público com o nome do seu pacote interno | Escopo próprio (`@quitanda/...`) registrado no npm |
+| Token de publicação vazado | Alguém publica no seu nome | Trusted publishing com OIDC, sem token de longa duração |
+
+### Scripts de instalação
+
+Por padrão, o npm executa os scripts `preinstall`, `install` e `postinstall` de todas as dependências. Muitos ataques se espalham exatamente assim: o script lê variáveis de ambiente e arquivos de credenciais da máquina e os envia para fora. O pnpm, a partir da versão 10, não executa scripts de dependências a menos que você os permita explicitamente:
+
+```yaml
+# pnpm-workspace.yaml (trecho)
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+minimumReleaseAge: 4320   # em minutos: só instala versões com pelo menos 3 dias
+```
+
+No npm, `ignore-scripts=true` no `.npmrc` tem efeito parecido, mas é tudo ou nada: pacotes que compilam binários no `install` deixam de funcionar e precisam ser tratados à parte.
+
+### Provenance e assinaturas
+
+Pacotes publicados com provenance (como a Quitanda UI do capítulo de publicação) trazem a prova de qual repositório e qual build os produziram. `npm audit signatures` confere as assinaturas do registro e as atestações de provenance de tudo que está instalado. Não prova que o código é bom, mas prova que ele veio de onde diz ter vindo.
+
+### Depreciação e escolha de dependências
+
+`npm WARN deprecated` no `install` é o mantenedor avisando que o pacote não deve mais ser usado. Trate como dívida com prazo, não como ruído. Melhor ainda é não adicionar o problema. Antes de instalar algo novo, um checklist rápido:
+
+- A plataforma já resolve? `fetch`, `structuredClone`, `Intl.NumberFormat` para preços, `crypto.randomUUID()` e o `dialog` nativo eliminaram muitas dependências clássicas.
+- Quem mantém, com que frequência publica, quantos mantenedores tem?
+- Quanto pesa no bundle e quantas dependências transitivas traz?
+- Tem tipos, licença compatível, provenance?
+
+Remover uma dependência é a atualização mais segura que existe.
+
+## Duplicatas e peso no bundle
+
+Com o tempo, a árvore acumula várias versões do mesmo pacote: a loja usa `date-fns` 4, uma biblioteca de calendário puxa a 3, e o navegador baixa as duas. Além do peso, cópias duplicadas de bibliotecas com estado global (React, styled-components, o cliente do TanStack Query) causam bugs difíceis: dois contextos que não se enxergam.
+
+```bash
+pnpm dedupe --check         # mostra se o lockfile pode ser simplificado (falha no CI se puder)
+pnpm dedupe                 # reescreve o lockfile com o mínimo de versões
+pnpm why styled-components  # confirma que só existe uma versão
+```
+
+Para medir o efeito no cliente, analise o bundle de produção. O `@next/bundle-analyzer` gera um mapa interativo dos módulos de cada rota em builds com webpack, e o Next.js passou a oferecer um analisador experimental compatível com o Turbopack; confira na documentação da sua versão qual está disponível. Um limite de tamanho por rota, verificado no CI, transforma "a loja ficou pesada" num PR que falha com um número.
+
+## Uma política de dependências para o time
+
+Ferramenta sem acordo vira PR esquecido. Uma política curta, escrita no README do repositório, resolve a maior parte das discussões:
+
+| Situação | Prazo combinado | Quem |
+|---|---|---|
+| Vulnerabilidade explorável em código de produção exposto ao usuário | Mesmo dia | Quem está de plantão |
+| Vulnerabilidade em produção sem caminho alcançável conhecido | Até o próximo ciclo de atualização | Guardião da semana |
+| PRs de patch e minor do Renovate | Revisados toda segunda | Guardião da semana |
+| Major de React, Next.js, NestJS | Planejada no trimestre, no máximo uma versão atrás | Time, com dono definido |
+| Nova dependência de produção | Aprovação no PR com o checklist acima | Revisor do PR |
+
+O "guardião da semana" é um rodízio: alguém do time reserva algumas horas para olhar o painel do Renovate, triar avisos do `audit` e destravar PRs vermelhos. Rodízio espalha o conhecimento e evita que uma pessoa só vire a dona eterna do `node_modules`.
+
+## Na entrevista
+
+**Qual a diferença entre `npm install` e `npm ci`?** O `install` resolve as faixas e pode atualizar o lockfile; o `ci` instala exatamente o que está no lockfile, falha se houver divergência com o `package.json` e começa de um `node_modules` limpo. No CI e em builds de produção, uso `npm ci` (ou o modo congelado do pnpm) para builds reproduzíveis.
+
+**Como você trata um relatório do npm audit com dezenas de avisos?** Triagem: separo produção de desenvolvimento, verifico se o caminho vulnerável é alcançável e se há correção. Aplico correções compatíveis, uso `overrides` para transitivas com motivo registrado e trato com urgência o que é exposto ao usuário, independentemente do rótulo de severidade.
+
+**Como manter dependências atualizadas sem quebrar a aplicação?** Com Renovate ou Dependabot abrindo PRs pequenos e agrupados numa agenda, tempo mínimo de publicação, automerge só para o que é de baixo risco com CI verde, e uma suíte de testes que dê confiança. Majors são planejadas, com guia oficial, codemods e canário.
+
+**O que é um ataque de cadeia de suprimentos no npm e como se proteger?** É código malicioso que entra por uma dependência: conta de mantenedor comprometida, script de instalação, typosquatting. As defesas são lockfile revisado, esperar alguns dias por versões novas, não executar scripts de instalação por padrão, preferir pacotes com provenance e publicar os próprios pacotes com trusted publishing.
+
+**Para que servem codemods?** São transformações automáticas do código-fonte, baseadas na árvore sintática, que aplicam mudanças repetitivas de uma migração, como renomear APIs ou adaptar assinaturas. Reduzem o trabalho manual de um upgrade major e o risco de esquecer ocorrências.
+
+## Pratique
+
+1. Garanta builds reproduzíveis na Quitanda: `packageManager`, `.nvmrc`, `engines` e `pnpm install --frozen-lockfile` no CI. Quebre o lockfile de propósito e veja o CI falhar.
+2. Rode `pnpm audit --prod` e classifique cada aviso em corrigir agora, corrigir no próximo ciclo ou aceitar com justificativa. Resolva uma transitiva com `overrides` e documente o motivo.
+3. Configure o Renovate com agenda, grupos para React, Next.js e Storybook, `minimumReleaseAge` e automerge de patches de desenvolvimento. Acompanhe uma semana de PRs.
+4. Numa branch, simule o upgrade de uma major: rode os codemods do React e do Next.js, liste o que eles não resolveram e o que os testes pegaram.
+5. Ative a restrição de scripts de instalação do pnpm, descubra quais pacotes da Quitanda precisam de build e libere só esses. Rode `npm audit signatures` num app que consuma a Quitanda UI publicada.
+
+<Quiz question="Qual comando o CI da Quitanda deve usar para instalar dependências?" options={["npm install, para pegar as versões mais novas","npm update","npm ci, que instala exatamente o lockfile e falha se ele divergir","npm audit fix"]} answer={2} explanation="O npm ci garante que o CI instala a mesma árvore que foi testada e revisada, sem resolver faixas de novo." />
+
+<Quiz question="Para que serve a opção minimumReleaseAge no Renovate e no pnpm?" options={["Ignorar pacotes sem atualização há muito tempo","Só considerar versões publicadas há um tempo mínimo, dando chance de versões maliciosas ou quebradas serem detectadas e removidas","Limitar a quantidade de PRs abertos","Forçar a atualização de pacotes antigos"]} answer={1} explanation="Muitas versões comprometidas são retiradas do registro em horas ou poucos dias. Esperar esse intervalo antes de instalar é uma defesa barata." />
+
+<Quiz question="O npm audit aponta uma vulnerabilidade crítica num pacote usado apenas pelo Storybook. Qual a avaliação mais adequada?" options={["Prioridade menor: o pacote não vai para produção, e a correção entra no fluxo normal de atualizações","Parar tudo e corrigir agora, porque é crítica","Remover o Storybook do projeto","Ignorar para sempre, já que é de desenvolvimento"]} answer={0} explanation="A severidade do aviso precisa ser lida no contexto. Dependência só de desenvolvimento não chega ao usuário, mas ainda roda no CI e nas máquinas do time, então não deve ser esquecida." />
+
+## Base no CodeForge
+
+- [React: publicando pacotes no npm com versionamento semântico](/learn/carreira-react/react-publicando-pacotes-npm-versionamento-semantico): faixas, semver e provenance do lado de quem publica.
+- [React: implementando segurança web com padrões OWASP](/learn/carreira-react/react-seguranca-web-owasp): a cadeia de suprimentos como categoria do OWASP Top 10.
+- [React: garantindo qualidade de código e automações de deploy](/learn/carreira-react/react-qualidade-codigo-automacoes-deploy): os testes e o pipeline que tornam o automerge seguro.
+- [Canary](/learn/system-design/canary): como expor uma major a uma fração dos usuários antes de todos.
+
+## Referências
+
+- [npm Docs: npm ci](https://docs.npmjs.com/cli/commands/npm-ci)
+- [npm Docs: npm audit](https://docs.npmjs.com/cli/commands/npm-audit)
+- [Renovate: configuração](https://docs.renovatebot.com/configuration-options/)
+- [React 19 Upgrade Guide](https://react.dev/blog/2024/04/25/react-19-upgrade-guide)
+- [Next.js: Upgrading to version 16](https://nextjs.org/docs/app/guides/upgrading/version-16)

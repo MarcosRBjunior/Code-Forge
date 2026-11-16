@@ -1,0 +1,400 @@
+---
+title: "React: consumindo APIs HTTP no seu projeto"
+kind: lesson
+---
+
+A Quitanda em React já tem páginas, mas os produtos ainda vêm de um arquivo em `src/dados/`. No Nível base você montou uma API REST de verdade com `json-server` e um `db.json` com produtos e pedidos, e consumiu essa API com `fetch` e JavaScript puro. Agora é hora de ligar as duas pontas: o catálogo precisa refletir o estoque real, o checkout precisa gravar o pedido e o painel do lojista precisa ver os pedidos novos sem que ninguém aperte F5.
+
+Buscar dados em React parece simples (um `useEffect` com `fetch`), mas o código ingênuo esconde condições de corrida, requisições duplicadas, estados de erro esquecidos e telas que mostram dados velhos depois de uma alteração. Este capítulo organiza o acesso à API numa camada de serviço, trata carregamento, erro e cancelamento à mão para você entender o problema, e depois entrega esse trabalho ao TanStack Query 5, o padrão do mercado para estado de servidor.
+
+**Você vai aprender:**
+
+- Ligar o Vite ao `json-server` com proxy e variáveis de ambiente
+- Isolar o HTTP numa camada de serviço com tratamento de erro consistente
+- Comparar `fetch` e axios e escolher conscientemente
+- Tratar carregamento, erro e cancelamento com `AbortController`
+- Buscar e alterar dados com `useQuery` e `useMutation` do TanStack Query 5
+- Controlar cache, `staleTime` e invalidação depois de uma mutação
+
+## Ligando o front à API
+
+Rode o `json-server` do Nível base na porta 3000:
+
+```bash
+npx json-server db.json --port 3000
+```
+
+O front roda em `localhost:5173` e a API em `localhost:3000`. Origens diferentes significam CORS. Em desenvolvimento, o jeito mais limpo é o proxy do Vite: o navegador fala só com o Vite, que repassa `/api` para a API. Em produção, a API costuma ficar no mesmo domínio sob `/api` (por um proxy reverso), e o código não muda.
+
+```js
+// vite.config.js
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  server: {
+    proxy: {
+      "/api": {
+        target: "http://localhost:3000",
+        rewrite: (caminho) => caminho.replace(/^\/api/, ""),
+      },
+    },
+  },
+});
+```
+
+Quando a API morar em outro domínio, use uma variável de ambiente. O Vite só expõe ao código do navegador as variáveis com prefixo `VITE_`, lidas em `import.meta.env`:
+
+```bash
+# .env.production
+VITE_API_URL=https://api.quitanda.exemplo/v1
+```
+
+Tudo o que começa com `VITE_` vai parar no JavaScript público. Nunca coloque segredos (chaves privadas, senhas de banco) nessas variáveis.
+
+## A camada de serviço
+
+Componentes não devem saber a URL da API, montar cabeçalhos nem interpretar status HTTP. Concentre isso num cliente pequeno, e crie funções de domínio por cima dele:
+
+```js
+// src/servicos/api.js
+const BASE = import.meta.env.VITE_API_URL ?? "/api";
+
+export class ErroDeApi extends Error {
+  constructor(status, mensagem) {
+    super(mensagem);
+    this.name = "ErroDeApi";
+    this.status = status;
+  }
+}
+
+export async function requisitar(caminho, { metodo = "GET", corpo, signal } = {}) {
+  const resposta = await fetch(`${BASE}${caminho}`, {
+    method: metodo,
+    headers: corpo ? { "Content-Type": "application/json" } : undefined,
+    body: corpo ? JSON.stringify(corpo) : undefined,
+    signal,
+  });
+  if (!resposta.ok) {
+    throw new ErroDeApi(resposta.status, `Falha em ${metodo} ${caminho}: ${resposta.status}`);
+  }
+  return resposta.status === 204 ? null : resposta.json();
+}
+```
+
+```js
+// src/servicos/produtos.js
+import { ErroDeApi, requisitar } from "./api.js";
+
+export async function listarProdutos({ q = "", categoria = "" } = {}, { signal } = {}) {
+  const params = new URLSearchParams();
+  if (categoria) params.set("categoria", categoria);
+  const produtos = await requisitar(`/produtos?${params}`, { signal });
+  // o json-server filtra por igualdade; a busca por trecho do nome fica aqui
+  return produtos.filter((p) => p.nome.toLowerCase().includes(q.toLowerCase()));
+}
+
+export async function buscarProduto(id, { signal } = {}) {
+  try {
+    return await requisitar(`/produtos/${id}`, { signal });
+  } catch (erro) {
+    if (erro instanceof ErroDeApi && erro.status === 404) return null;
+    throw erro;
+  }
+}
+```
+
+```js
+// src/servicos/pedidos.js
+import { requisitar } from "./api.js";
+
+export function criarPedido({ itens, ...cliente }) {
+  return requisitar("/pedidos", {
+    metodo: "POST",
+    corpo: {
+      cliente, // nome, endereço e o que mais o checkout coletar
+      itens: itens.map(({ produto, quantidade }) => ({ produtoId: produto.id, quantidade, precoEmCentavos: produto.precoEmCentavos })),
+      status: "recebido",
+      criadoEm: new Date().toISOString(),
+    },
+  });
+}
+
+export const listarPedidos = ({ signal } = {}) => requisitar("/pedidos", { signal });
+export const buscarPedido = (id, { signal } = {}) => requisitar(`/pedidos/${id}`, { signal });
+export const atualizarStatus = (id, status) => requisitar(`/pedidos/${id}`, { metodo: "PATCH", corpo: { status } });
+```
+
+As assinaturas são as mesmas do capítulo de rotas, então os loaders continuam funcionando sem mudar uma linha. O `json-server` só filtra por igualdade de campo, por isso a busca por nome é feita depois da resposta; numa API real a busca iria para o servidor, e só esse arquivo mudaria. Esse é o ganho da camada de serviço: trocar de API, de biblioteca HTTP ou acrescentar autenticação acontece num lugar só.
+
+Um detalhe do `fetch` que confunde muita gente: ele **só rejeita a promise em falha de rede**. Uma resposta 404 ou 500 é uma resposta válida para o `fetch`, com `ok` falso. Por isso `requisitar` confere `resposta.ok` e lança o erro explicitamente.
+
+### fetch ou axios?
+
+| Aspecto | `fetch` | axios |
+|---|---|---|
+| Instalação | Nativo no navegador e no Node | Dependência extra |
+| Status de erro (4xx, 5xx) | Não rejeita; confira `ok` | Rejeita automaticamente |
+| JSON | `JSON.stringify` e `resposta.json()` à mão | Automático nos dois sentidos |
+| Interceptadores | Você escreve um wrapper | `axios.interceptors` prontos |
+| Cancelamento | `AbortController` | `AbortController` (via `signal`) |
+| Progresso de upload | Limitado | Suportado |
+
+Com um wrapper de vinte linhas como `requisitar`, o `fetch` cobre a maioria dos casos sem dependências. O axios ainda é comum em projetos existentes, e a versão com axios fica assim:
+
+```js
+// src/servicos/api.js (alternativa com axios)
+import axios from "axios";
+
+export const cliente = axios.create({ baseURL: import.meta.env.VITE_API_URL ?? "/api", timeout: 10000 });
+
+export async function requisitar(caminho, { metodo = "GET", corpo, signal } = {}) {
+  const { data } = await cliente.request({ url: caminho, method: metodo, data: corpo, signal });
+  return data;
+}
+```
+
+## Buscando à mão: carregamento, erro e cancelamento
+
+Antes da biblioteca, vale escrever uma vez a versão manual para ver tudo o que ela precisa resolver. A página de pedido busca o pedido pelo id:
+
+```jsx
+// src/paginas/PaginaPedido.jsx (versão manual)
+import { useEffect, useState } from "react";
+import { useParams } from "react-router";
+import { buscarPedido } from "../servicos/pedidos.js";
+
+export default function PaginaPedido() {
+  const { id } = useParams();
+  const [pedido, setPedido] = useState(null);
+  const [status, setStatus] = useState("carregando"); // "carregando" | "sucesso" | "erro"
+
+  useEffect(() => {
+    const controle = new AbortController();
+    setStatus("carregando");
+    buscarPedido(id, { signal: controle.signal })
+      .then((dados) => {
+        setPedido(dados);
+        setStatus("sucesso");
+      })
+      .catch((erro) => {
+        if (erro.name === "AbortError") return; // cancelado de propósito
+        setStatus("erro");
+      });
+    return () => controle.abort();
+  }, [id]);
+
+  if (status === "carregando") return <p aria-live="polite">Carregando pedido...</p>;
+  if (status === "erro") return <p role="alert">Não foi possível carregar o pedido.</p>;
+  return <h1>Pedido {pedido.id}: {pedido.status}</h1>;
+}
+```
+
+O `AbortController` resolve a **condição de corrida**: se o usuário passa do pedido 7 para o 8 e a resposta do 7 chega depois, sem o cancelamento ela sobrescreveria a tela do 8. A limpeza do efeito aborta a requisição anterior sempre que o `id` muda ou o componente sai da tela. Em desenvolvimento, o `StrictMode` monta duas vezes e você verá uma requisição cancelada na aba de rede; isso é esperado.
+
+Mesmo assim, faltam coisas: voltar a esta página refaz a requisição, duas telas que mostram o mesmo pedido buscam duas vezes, nada atualiza quando a aba volta ao foco, não há nova tentativa em falha de rede e, depois de alterar o status, alguém precisa lembrar de buscar de novo. Isso é **estado de servidor**: uma cópia local de dados que pertencem a outro sistema e que podem ficar velhos. É um problema diferente de estado de interface, e merece uma ferramenta própria.
+
+## TanStack Query 5
+
+```bash
+npm install @tanstack/react-query @tanstack/react-query-devtools
+```
+
+```jsx
+// src/main.jsx (trecho)
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { staleTime: 30_000, retry: 2 },
+  },
+});
+
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={roteador} />
+      <ReactQueryDevtools />
+    </QueryClientProvider>
+  </StrictMode>,
+);
+```
+
+Na prática, deixe o `queryClient` num arquivo próprio (`src/servicos/queryClient.js`) para importá-lo também nos loaders.
+
+### useQuery
+
+```jsx
+// src/paginas/PaginaPedido.jsx (com TanStack Query)
+import { useQuery } from "@tanstack/react-query";
+import { useParams } from "react-router";
+import { buscarPedido } from "../servicos/pedidos.js";
+
+export default function PaginaPedido() {
+  const { id } = useParams();
+  const { data: pedido, isPending, isError, error, isFetching } = useQuery({
+    queryKey: ["pedidos", id],
+    queryFn: ({ signal }) => buscarPedido(id, { signal }),
+    refetchInterval: 15_000, // acompanha o status enquanto a página está aberta
+  });
+
+  if (isPending) return <p aria-live="polite">Carregando pedido...</p>;
+  if (isError) return <p role="alert">Erro ao carregar: {error.message}</p>;
+  return (
+    <section>
+      <h1>Pedido {pedido.id}</h1>
+      <p>Status: {pedido.status}</p>
+      {isFetching && <small>Atualizando...</small>}
+    </section>
+  );
+}
+```
+
+O que cada peça faz:
+
+- **`queryKey`** identifica os dados no cache. É um array, e tudo de que a busca depende entra nele (`["pedidos", id]`, `["produtos", { q, categoria }]`). Mudou a chave, muda a consulta.
+- **`queryFn`** é qualquer função que devolve uma promise. Ela recebe um `signal`, e o TanStack Query cancela a requisição quando ninguém mais precisa dela.
+- **`isPending`** é verdadeiro quando ainda não há dados. **`isFetching`** é verdadeiro sempre que há uma requisição em andamento, inclusive revalidações em segundo plano com dados já na tela.
+
+O cache é compartilhado: dois componentes com a mesma chave fazem uma requisição só. Ao voltar para uma página, os dados aparecem na hora e uma revalidação silenciosa corre por trás se eles estiverem velhos.
+
+### staleTime, gcTime e revalidação
+
+| Opção | Padrão | Significado |
+|---|---|---|
+| `staleTime` | 0 | Por quanto tempo os dados são considerados frescos e não são buscados de novo |
+| `gcTime` | 5 minutos | Por quanto tempo dados sem nenhum componente usando ficam no cache antes de serem descartados |
+| `refetchOnWindowFocus` | `true` | Revalida dados velhos quando a aba volta ao foco |
+| `retry` | 3 | Novas tentativas em erro, com espera crescente |
+| `enabled` | `true` | `false` impede a busca, útil quando falta um parâmetro |
+
+Com `staleTime` em zero, qualquer novo uso dispara revalidação. Para o catálogo da Quitanda, 30 segundos é razoável: preço e estoque mudam, mas não a cada segundo. Para o status do pedido, `refetchInterval` faz sondagem periódica; no Nível 3, esse acompanhamento passa a chegar por Socket.io.
+
+<Callout type="warning" title="Não copie dados do Query para useState">
+Fazer `const [produtos, setProdutos] = useState(data)` cria uma segunda cópia que não acompanha revalidações nem invalidações. Use `data` diretamente. Se precisar transformar os dados, faça o cálculo na renderização ou use a opção `select` da query.
+</Callout>
+
+### useMutation e invalidação
+
+Mutações são operações que alteram o servidor. O lojista muda o status de um pedido no painel:
+
+```jsx
+// src/componentes/AlterarStatus.jsx
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { atualizarStatus } from "../servicos/pedidos.js";
+
+const proximos = { recebido: "separando", separando: "saiu para entrega", "saiu para entrega": "entregue" };
+
+export default function AlterarStatus({ pedido }) {
+  const queryClient = useQueryClient();
+  const mutacao = useMutation({
+    mutationFn: (status) => atualizarStatus(pedido.id, status),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["pedidos"] });
+    },
+  });
+
+  const proximo = proximos[pedido.status];
+  if (!proximo) return <span>Entregue</span>;
+
+  return (
+    <>
+      <button type="button" disabled={mutacao.isPending} onClick={() => mutacao.mutate(proximo)}>
+        {mutacao.isPending ? "Salvando..." : `Marcar como ${proximo}`}
+      </button>
+      {mutacao.isError && <p role="alert">Não foi possível alterar o status.</p>}
+    </>
+  );
+}
+```
+
+`invalidateQueries({ queryKey: ["pedidos"] })` marca como velhas todas as consultas cuja chave **começa** com `["pedidos"]`: a lista e cada pedido individual. As que estão na tela são buscadas de novo na hora; as outras, quando forem usadas. Essa correspondência por prefixo é o motivo de organizar as chaves de forma hierárquica.
+
+No checkout, a mesma ideia: depois de criar o pedido, invalide `["pedidos"]` e `["produtos"]` (o estoque mudou), esvazie o carrinho e navegue para a página do pedido no `onSuccess`. Para uma resposta instantânea na interface, o TanStack Query aceita atualizações otimistas, assunto do Nível 2.
+
+### Com os loaders do React Router
+
+Os dois se complementam. O loader garante que os dados estejam no cache antes da navegação; o componente lê do cache com `useQuery` e ganha revalidação e invalidação:
+
+```jsx
+// src/paginas/Catalogo.jsx (trecho)
+import { useQuery } from "@tanstack/react-query";
+import { queryClient } from "../servicos/queryClient.js";
+import { listarProdutos } from "../servicos/produtos.js";
+
+const consultaProdutos = (filtros) => ({
+  queryKey: ["produtos", filtros],
+  queryFn: ({ signal }) => listarProdutos(filtros, { signal }),
+});
+
+export async function carregarCatalogo({ request }) {
+  const url = new URL(request.url);
+  const filtros = { q: url.searchParams.get("q") ?? "", categoria: url.searchParams.get("categoria") ?? "" };
+  await queryClient.ensureQueryData(consultaProdutos(filtros));
+  return { filtros };
+}
+
+export default function Catalogo() {
+  const { filtros } = useLoaderData();
+  const { data: produtos } = useQuery(consultaProdutos(filtros));
+  // ...
+}
+```
+
+Definir a consulta numa função (`consultaProdutos`) garante que loader e componente usem exatamente a mesma chave.
+
+| Ferramenta | Bom para | Limite |
+|---|---|---|
+| `useEffect` com `fetch` | Aprender o problema, casos isolados | Sem cache, deduplicação nem invalidação |
+| Loader do React Router | Dados necessários antes de mostrar a página | Sem cache entre rotas nem revalidação em segundo plano |
+| TanStack Query | Estado de servidor em geral | Mais um conceito para aprender |
+| RTK Query | Projetos que já usam Redux Toolkit | Acoplado ao Redux |
+
+<Callout type="tip" title="Use os Devtools do Query">
+O botão flutuante dos Devtools mostra cada chave do cache, se está fresca ou velha, quantos componentes a observam e quando foi buscada. Quando uma tela não atualiza depois de uma mutação, a resposta quase sempre está ali: a chave invalidada não é a que a tela usa.
+</Callout>
+
+## Na entrevista
+
+**Por que o fetch não lança erro numa resposta 404?** Porque para o `fetch` um 404 é uma resposta HTTP válida. A promise só rejeita em falha de rede ou cancelamento. É preciso conferir `response.ok` ou o status e lançar o erro, o que costuma ficar num wrapper da camada de serviço.
+
+**O que é uma condição de corrida ao buscar dados num efeito e como evitar?** Duas requisições em sequência podem responder fora de ordem, e a resposta antiga sobrescreve a nova. A solução é cancelar a requisição anterior com `AbortController` na limpeza do efeito, ou ignorar a resposta quando o efeito já foi limpo.
+
+**Qual a diferença entre estado de servidor e estado de interface?** Estado de interface pertence à aplicação, como um modal aberto ou a aba selecionada. Estado de servidor é uma cópia de dados de outro sistema, que pode ficar velha, ser alterada por outras pessoas e precisa de cache, revalidação e sincronização. Ferramentas como TanStack Query existem para o segundo tipo.
+
+**O que staleTime e gcTime controlam?** `staleTime` define por quanto tempo os dados são considerados frescos e não disparam nova busca. `gcTime` define por quanto tempo dados sem nenhum observador permanecem em memória antes de serem descartados.
+
+**Como manter a lista atualizada depois de criar um item?** Invalidando as consultas afetadas no `onSuccess` da mutação, com `invalidateQueries` e um prefixo de chave. As consultas visíveis são buscadas de novo; as outras ficam marcadas como velhas.
+
+## Pratique
+
+1. Configure o proxy do Vite, crie `src/servicos/api.js` com `requisitar` e `ErroDeApi` e faça `produtos.js` e `pedidos.js` chamarem o `json-server`.
+2. Escreva a versão manual da página de pedido com `AbortController` e confirme na aba de rede, trocando de pedido rápido, que a requisição anterior é cancelada.
+3. Instale o TanStack Query e converta catálogo e página de pedido para `useQuery`. Desligue o `json-server` e veja as novas tentativas e a mensagem de erro.
+4. No painel do lojista, liste os pedidos e implemente `AlterarStatus` com `useMutation`, invalidando `["pedidos"]`. Abra duas abas e observe a revalidação ao focar cada uma.
+5. Faça o checkout usar `useMutation` para criar o pedido, invalidar produtos e pedidos, esvaziar o carrinho e navegar para `/pedidos/:id`.
+6. Reescreva `requisitar` com axios mantendo a mesma assinatura e confirme que nenhum componente precisou mudar.
+
+<Quiz question="A API responde 500 a um fetch. O que acontece com a promise devolvida pelo fetch?" options={["Rejeita com um TypeError","Rejeita com um erro contendo o status","Resolve normalmente, com response.ok igual a false","Fica pendente até o timeout"]} answer={2} explanation="fetch só rejeita em falha de rede ou cancelamento. Respostas de erro HTTP resolvem com ok falso, e o código precisa verificar isso." />
+
+<Quiz question="Depois de mudar o status de um pedido, a lista do painel continua mostrando o status antigo. Qual a correção mais adequada com TanStack Query?" options={["Recarregar a página com window.location.reload","Chamar queryClient.invalidateQueries com a chave pedidos no onSuccess da mutação","Copiar os dados da query para um useState e atualizá-lo","Definir staleTime como Infinity"]} answer={1} explanation="Invalidar a chave pedidos marca a lista e os detalhes como velhos e busca de novo os que estão na tela." />
+
+<Quiz question="Para que serve o AbortController numa busca dentro de useEffect?" options={["Cancelar a requisição anterior quando a dependência muda ou o componente sai da tela, evitando respostas fora de ordem","Aumentar o timeout padrão do fetch","Repetir a requisição em caso de erro","Converter a resposta em JSON automaticamente"]} answer={0} explanation="A limpeza do efeito aborta a requisição em andamento, de modo que uma resposta antiga não sobrescreve a mais recente." />
+
+## Base no CodeForge
+
+- [JavaScript: implementando CRUD com requisições HTTP](/learn/carreira-react/javascript-crud-requisicoes-http): a API com `json-server` e o `fetch` sem framework.
+- [React: construindo SPAs com React Router](/learn/carreira-react/react-spas-react-router): os loaders e actions que agora usam a API.
+- [Caching](/learn/system-design/caching) e [Invalidação de cache](/learn/system-design/invalidacao-de-cache): os conceitos por trás de `staleTime` e `invalidateQueries`.
+- [REST](/learn/system-design/rest): recursos, verbos e status codes da API consumida.
+
+## Referências
+
+- [MDN: Using the Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch)
+- [MDN: AbortController](https://developer.mozilla.org/en-US/docs/Web/API/AbortController)
+- [TanStack Query: Overview](https://tanstack.com/query/latest/docs/framework/react/overview)
+- [TanStack Query: Query Invalidation](https://tanstack.com/query/latest/docs/framework/react/guides/query-invalidation)
+- [Vite: Env Variables and Modes](https://vite.dev/guide/env-and-mode)

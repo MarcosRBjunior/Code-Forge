@@ -1,0 +1,367 @@
+---
+title: "React: modernizando rotas e dados com Remix"
+kind: lesson
+---
+
+Antes de decidir pelo Next.js, o time da Quitanda discutiu outra opção: a SPA já usa React Router 7 com `createBrowserRouter`, e parte das rotas tem `loader`. Será que não dá para ganhar renderização no servidor, formulários que funcionam sem JavaScript e dados por rota sem trocar de roteador? Dá, e essa é a história do Remix.
+
+O Remix nasceu dos criadores do React Router com uma ideia central: cada rota declara como carrega seus dados (`loader`) e como processa mutações (`action`), e o framework cuida do resto, apoiado nos fundamentos da web (formulários HTML, requisições HTTP, cache do navegador). Em 2024, o Remix v2 foi incorporado ao React Router 7 como **modo framework**. Quem quer "usar Remix" num projeto React hoje instala o React Router 7. Este capítulo mostra esse modelo na Quitanda e compara com o Next.js.
+
+**Você vai aprender:**
+
+- O que aconteceu com o Remix e os três modos do React Router 7
+- Configurar rotas aninhadas com `routes.ts` e tipos gerados por rota
+- Carregar dados com `loader` e `clientLoader` e mutar com `action` e `Form`
+- Usar `useFetcher` para mutações sem navegação e interfaces otimistas
+- Aplicar progressive enhancement e tratar erros por rota
+- Comparar React Router em modo framework com o Next.js App Router
+
+## De Remix para React Router 7
+
+Por alguns anos, Remix e React Router conviveram: o Remix era um framework construído sobre o React Router, e a cada versão as APIs de dados (loaders, actions, `Form`, `useFetcher`) foram sendo levadas para o próprio React Router. Com o React Router 7, a fusão se completou. O que seria o Remix v3 foi lançado como React Router 7, e a migração de um app Remix v2 é basicamente trocar os imports de `@remix-run/*` por `react-router` e ajustar a configuração.
+
+A equipe passou a usar o nome "Remix" para um projeto novo e separado, que não é uma nova versão do React Router. Para apps React, o caminho é o React Router 7, e é dele que este capítulo trata.
+
+O React Router 7 tem três modos, que são degraus de adoção:
+
+| Modo | Como se usa | O que entrega |
+|---|---|---|
+| Declarativo | `BrowserRouter`, `Routes`, `Route` | Só roteamento no cliente |
+| Dados | `createBrowserRouter` com `loader`, `action`, `lazy` | Dados e mutações por rota, ainda SPA |
+| Framework | Plugin do Vite, `routes.ts`, servidor | SSR, pré-renderização, code splitting automático, tipos gerados: o antigo Remix |
+
+A Quitanda do Nível 1 está no modo dados. Subir para o modo framework reaproveita loaders e actions quase sem mudança.
+
+## Criando o projeto e as rotas
+
+```bash
+npx create-react-router@latest quitanda-rr
+```
+
+O template traz o plugin do Vite, o arquivo de configuração e a estrutura `app/`:
+
+```ts
+// vite.config.ts
+import { reactRouter } from "@react-router/dev/vite";
+import tailwindcss from "@tailwindcss/vite";
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  plugins: [tailwindcss(), reactRouter()],
+});
+```
+
+```ts
+// react-router.config.ts
+import type { Config } from "@react-router/dev/config";
+
+export default {
+  ssr: true, // false gera uma SPA; prerender gera páginas estáticas no build
+  async prerender() {
+    return ["/", "/como-funciona"];
+  },
+} satisfies Config;
+```
+
+As rotas são declaradas em `app/routes.ts`. Diferente do Next.js, a URL não depende do caminho do arquivo (existe um pacote opcional para rotas por convenção de arquivos, `@react-router/fs-routes`):
+
+```ts
+// app/routes.ts
+import { type RouteConfig, index, layout, prefix, route } from "@react-router/dev/routes";
+
+export default [
+  layout("rotas/loja.tsx", [
+    index("rotas/catalogo.tsx"),
+    route("produtos/:id", "rotas/produto.tsx"),
+    route("carrinho", "rotas/carrinho.tsx"),
+    route("pedidos", "rotas/pedidos.tsx", [
+      route(":id", "rotas/pedido.tsx"),
+    ]),
+  ]),
+  ...prefix("painel", [
+    layout("rotas/painel/layout.tsx", [
+      index("rotas/painel/inicio.tsx"),
+      route("produtos", "rotas/painel/produtos.tsx"),
+    ]),
+  ]),
+] satisfies RouteConfig;
+```
+
+### Rotas aninhadas
+
+Rotas aninhadas são a ideia mais forte do modelo. A URL `/pedidos/123` ativa três módulos ao mesmo tempo: `loja.tsx` (cabeçalho e carrinho), `pedidos.tsx` (a lista à esquerda) e `pedido.tsx` (o detalhe à direita). Cada um renderiza um `Outlet` onde o filho aparece, e cada um tem o próprio loader.
+
+```tsx
+// app/rotas/pedidos.tsx
+import { NavLink, Outlet } from "react-router";
+import type { Route } from "./+types/pedidos";
+
+export async function loader({ request }: Route.LoaderArgs) {
+  const cliente = await exigirCliente(request);
+  return { pedidos: await listarPedidos(cliente.id) };
+}
+
+export default function Pedidos({ loaderData }: Route.ComponentProps) {
+  return (
+    <div className="grid grid-cols-[280px_1fr] gap-6">
+      <nav aria-label="Seus pedidos">
+        {loaderData.pedidos.map((p) => (
+          <NavLink key={p.id} to={p.id}>Pedido {p.id}</NavLink>
+        ))}
+      </nav>
+      <Outlet />
+    </div>
+  );
+}
+```
+
+Ao navegar de `/pedidos/123` para `/pedidos/124`, só o loader de `pedido.tsx` roda de novo; a lista e o layout continuam. Os loaders de rotas aninhadas rodam **em paralelo**, não em cascata, o que evita o problema clássico de `useEffect` dentro de `useEffect`.
+
+### Tipos gerados por rota
+
+O import `./+types/pedidos` não é um arquivo que você escreve: o React Router gera os tipos de cada rota a partir de `routes.ts` (com `react-router typegen`, que o template roda junto com o `tsc`). `Route.LoaderArgs` conhece os parâmetros da URL (`params.id` como string) e `Route.ComponentProps` traz `loaderData` com o tipo exato do retorno do loader. Mudou o loader, mudou o tipo do componente.
+
+## loader: dados antes de renderizar
+
+```tsx
+// app/rotas/produto.tsx
+import { data } from "react-router";
+import type { Route } from "./+types/produto";
+
+export async function loader({ params }: Route.LoaderArgs) {
+  const produto = await buscarProduto(params.id);
+  if (!produto) throw data("Produto não encontrado", { status: 404 });
+  return { produto };
+}
+
+export function meta({ data }: Route.MetaArgs) {
+  return [
+    { title: `${data?.produto.nome ?? "Produto"} | Quitanda` },
+    { name: "description", content: `Compre ${data?.produto.nome} fresquinho na Quitanda.` },
+  ];
+}
+
+export default function Produto({ loaderData }: Route.ComponentProps) {
+  const { produto } = loaderData;
+  return (
+    <article>
+      <h1>{produto.nome}</h1>
+      <p>{formatarPreco(produto.precoEmCentavos)} / {produto.unidade}</p>
+      <FormularioAdicionar produtoId={produto.id} />
+    </article>
+  );
+}
+```
+
+No modo framework com SSR, o `loader` roda **no servidor**, tanto na primeira requisição (o HTML já vem com o produto) quanto nas navegações seguintes (o cliente busca os dados do loader por uma requisição). Ele pode ler banco e segredos, e o código dele não vai para o bundle do cliente. `data()` permite devolver ou lançar uma resposta com status e cabeçalhos; lançar interrompe a renderização e leva ao `ErrorBoundary` da rota.
+
+Para dados que só existem no navegador (preferências no `localStorage`, por exemplo), exporte um `clientLoader`, que roda no cliente. Os dois podem coexistir: o `clientLoader` recebe `serverLoader()` para combinar o dado do servidor com um cache local.
+
+Para dados lentos, devolva uma Promise sem `await` no objeto do loader e leia-a no componente com o `Await` do React Router (ou com `use`) dentro de um `Suspense`: o restante da página chega antes, por streaming.
+
+## action e Form: mutações pela web
+
+Uma `action` é a contraparte do loader para requisições que não são `GET`. O componente `Form` do React Router envia o formulário para a action da rota:
+
+```tsx
+// app/rotas/carrinho.tsx
+import { data, Form, redirect, useNavigation } from "react-router";
+import type { Route } from "./+types/carrinho";
+
+export async function loader({ request }: Route.LoaderArgs) {
+  return { carrinho: await obterCarrinho(request) };
+}
+
+export async function action({ request }: Route.ActionArgs) {
+  const dados = await request.formData();
+  const intencao = dados.get("intencao");
+
+  if (intencao === "remover") {
+    await removerItem(request, String(dados.get("produtoId")));
+    return { ok: true };
+  }
+  if (intencao === "finalizar") {
+    const pedido = await finalizarPedido(request);
+    return redirect(`/pedidos/${pedido.id}`);
+  }
+  return data({ erro: "Ação desconhecida" }, { status: 400 });
+}
+
+export default function Carrinho({ loaderData }: Route.ComponentProps) {
+  const navegacao = useNavigation();
+  const finalizando = navegacao.formData?.get("intencao") === "finalizar";
+
+  return (
+    <section>
+      <h1>Seu carrinho</h1>
+      {loaderData.carrinho.itens.map((item) => (
+        <Form method="post" key={item.produtoId}>
+          <span>{item.nome}</span>
+          <input type="hidden" name="produtoId" value={item.produtoId} />
+          <button name="intencao" value="remover">Remover</button>
+        </Form>
+      ))}
+      <Form method="post">
+        <button name="intencao" value="finalizar" disabled={finalizando}>
+          {finalizando ? "Finalizando…" : "Finalizar pedido"}
+        </button>
+      </Form>
+    </section>
+  );
+}
+```
+
+O ciclo completo é: o `Form` envia um `POST`, a action roda no servidor, e depois **todos os loaders das rotas ativas rodam de novo automaticamente**. Não há cache a invalidar manualmente nem estado a sincronizar: o contador do carrinho no cabeçalho, que vem do loader de `loja.tsx`, atualiza sozinho. Se precisar evitar uma revalidação cara, a rota pode exportar `shouldRevalidate`.
+
+O padrão de vários botões com `name="intencao"` deixa uma única action tratar várias operações, como um `switch` por intenção.
+
+## Progressive enhancement
+
+O `Form` renderiza um `form` HTML de verdade, com `method` e `action` apontando para a rota. Se o JavaScript ainda não carregou (rede 3G, bundle grande) ou falhou, o navegador envia o formulário normalmente, o servidor executa a action e responde com a página atualizada ou com o redirect. Quando o JavaScript carrega, o React Router intercepta o envio, faz a requisição com `fetch`, mostra estados pendentes e revalida sem recarregar a página.
+
+Na prática, isso significa que finalizar o pedido funciona no celular antigo do cliente com JavaScript travado. É a mesma propriedade das Server Actions do Next.js usadas como `action` de formulário; o Remix popularizou a ideia.
+
+<Callout type="tip" title="Comece pelo HTML">
+Escreva primeiro a versão que funciona sem JavaScript: `Form`, `button` com `name` e `value`, action que redireciona. Depois acrescente melhorias com `useNavigation` e `useFetcher`. Desative o JavaScript no DevTools de tempos em tempos para conferir que o fluxo de compra ainda fecha.
+</Callout>
+
+## useFetcher: mutações sem navegar
+
+`Form` provoca uma navegação: muda o histórico e o estado global de navegação. Para interações pontuais (adicionar ao carrinho a partir do catálogo, favoritar, mudar o status de um pedido no painel), o usuário não deve sair da página. `useFetcher` chama loaders e actions sem navegar, com estado próprio:
+
+```tsx
+// app/componentes/FormularioAdicionar.tsx
+import { useFetcher } from "react-router";
+
+export function FormularioAdicionar({ produtoId }: { produtoId: string }) {
+  const fetcher = useFetcher<{ ok: boolean; erro?: string }>();
+  const adicionando = fetcher.state !== "idle";
+
+  return (
+    <fetcher.Form method="post" action="/carrinho/itens">
+      <input type="hidden" name="produtoId" value={produtoId} />
+      <input type="number" name="quantidade" defaultValue={1} min={1} aria-label="Quantidade" />
+      <button disabled={adicionando}>{adicionando ? "Adicionando…" : "Adicionar"}</button>
+      {fetcher.data?.erro && <p role="alert">{fetcher.data.erro}</p>}
+    </fetcher.Form>
+  );
+}
+```
+
+A rota `/carrinho/itens` pode ser uma **resource route**: um módulo com `action` (ou `loader`) e sem componente, que funciona como endpoint. Depois da action, os loaders ativos revalidam e o contador do carrinho atualiza.
+
+Cada `useFetcher` tem estado independente, então dez cartões de produto podem estar adicionando ao mesmo tempo, cada um com seu indicador. Outros usos: `fetcher.load("/busca?q=ban")` para autocompletar e `fetcher.submit(dados, { method: "post" })` para enviar programaticamente.
+
+### UI otimista com fetcher.formData
+
+Enquanto a requisição está em andamento, `fetcher.formData` contém o que foi enviado. Renderize a partir dele:
+
+```tsx
+// app/rotas/painel/componentes/StatusDoPedido.tsx
+import { useFetcher } from "react-router";
+
+export function StatusDoPedido({ pedido }: { pedido: Pedido }) {
+  const fetcher = useFetcher();
+  const status = (fetcher.formData?.get("status") as StatusDoPedido | undefined) ?? pedido.status;
+
+  return (
+    <fetcher.Form method="post" action={`/painel/pedidos/${pedido.id}/status`}>
+      <select name="status" defaultValue={status} onChange={(e) => fetcher.submit(e.currentTarget.form)}>
+        {Object.entries(rotulosDeStatus).map(([valor, rotulo]) => (
+          <option key={valor} value={valor}>{rotulo}</option>
+        ))}
+      </select>
+      <span>Status atual: {rotulosDeStatus[status]}</span>
+    </fetcher.Form>
+  );
+}
+```
+
+Se a action falhar, `fetcher.formData` some, os loaders revalidam e o valor real volta. É o mesmo princípio do `useOptimistic` do capítulo de aplicações robustas, com a reversão vindo da revalidação.
+
+## Erros por rota
+
+Cada módulo de rota pode exportar um `ErrorBoundary`. Um erro lançado no loader, na action ou na renderização é capturado pelo boundary mais próximo, e as rotas acima continuam funcionando:
+
+```tsx
+// app/rotas/produto.tsx (trecho)
+import { isRouteErrorResponse, Link } from "react-router";
+
+export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
+  if (isRouteErrorResponse(error) && error.status === 404) {
+    return <p>Esse produto saiu do catálogo. <Link to="/">Ver outros</Link></p>;
+  }
+  return <p role="alert">Não foi possível carregar o produto.</p>;
+}
+```
+
+O cabeçalho e o carrinho, que vêm de `loja.tsx`, continuam na tela.
+
+## Migrando a Quitanda do modo dados para o modo framework
+
+1. Instale `@react-router/dev`, troque o plugin do React no `vite.config.ts` pelo `reactRouter()` e crie `react-router.config.ts` com `ssr: false`. A aplicação continua SPA.
+2. Crie `app/root.tsx` (o documento HTML com `Links`, `Meta`, `Scripts` e `ScrollRestoration`) e `app/routes.ts` a partir do array de `createBrowserRouter`.
+3. Mova cada rota para um módulo com `export default` do componente e os `loader`/`action` existentes como `clientLoader`/`clientAction`.
+4. Ligue `ssr: true` e converta, rota a rota, `clientLoader` em `loader` de servidor, começando pelas públicas (catálogo, produto).
+5. Troque os `useQuery` de leitura que só existiam para carregar a página pelos dados do loader; mantenha o TanStack Query onde há polling ou cache de cliente.
+
+## React Router framework ou Next.js?
+
+| Aspecto | React Router 7 (modo framework) | Next.js 16 (App Router) |
+|---|---|---|
+| Definição de rotas | `routes.ts` em código (convenção de arquivos opcional) | Estrutura de pastas em `app/` |
+| Leitura de dados | `loader` por rota, em paralelo | Server Components `async` em qualquer nível |
+| Mutações | `action` + `Form` / `useFetcher` | Server Actions + `form action` / `useActionState` |
+| Depois de mutar | Revalida todos os loaders ativos automaticamente | Invalidação explícita com `updateTag`, `revalidateTag`, `revalidatePath` |
+| Cache | Cabeçalhos HTTP e CDN; nenhum cache de dados próprio | Cache de dados integrado (`'use cache'`, `cacheLife`, tags) |
+| Server Components | Suporte em evolução; o modelo principal é loader + componente cliente | Modelo central |
+| Bundler e base | Vite; roda em qualquer servidor Node ou runtime compatível | Turbopack; melhor integração com a Vercel, mas auto-hospedável |
+| Migração a partir de SPA com React Router | Natural: mesmas APIs | Reescrita de rotas e navegação |
+
+Nenhum é melhor em absoluto. O React Router em modo framework é a evolução natural de uma SPA que já usa React Router, com um modelo mental simples (requisição, loader, action, revalidação) e muito alinhado ao HTTP. O Next.js oferece mais recursos integrados de cache e renderização (PPR, Server Components maduros, otimização de imagens e fontes) em troca de mais conceitos. A Quitanda segue com Next.js no restante da carreira, mas os padrões deste capítulo (dados por rota, formulários que funcionam sem JavaScript, revalidação depois da mutação) valem nos dois.
+
+<Callout type="warning" title="Não misture modelos de dados sem critério">
+Loader, TanStack Query e estado global carregando o mesmo dado criam três fontes de verdade que divergem. No modo framework, deixe o loader ser a fonte dos dados da página e use TanStack Query só para o que o loader não cobre bem, como polling do status do pedido.
+</Callout>
+
+## Na entrevista
+
+**O que aconteceu com o Remix?** O Remix v2 foi incorporado ao React Router 7 como modo framework. Loaders, actions, `Form`, `useFetcher` e SSR passaram a ser recursos do React Router. Para apps React, quem quer o modelo do Remix usa o React Router 7.
+
+**Qual a diferença entre `loader` e `clientLoader`?** O `loader` roda no servidor, na primeira requisição e nas navegações seguintes, e pode acessar banco e segredos. O `clientLoader` roda só no navegador, útil para dados locais ou para SPAs sem servidor; ele pode chamar `serverLoader` para combinar os dois.
+
+**Quando usar `Form` e quando usar `useFetcher`?** `Form` é para mutações que levam a uma navegação, como finalizar o pedido e ir para a página dele. `useFetcher` é para interações que não mudam de página, como adicionar ao carrinho a partir do catálogo, e permite vários envios simultâneos com estados independentes.
+
+**O que é progressive enhancement nesse contexto?** O formulário é HTML real que funciona sem JavaScript: o navegador envia, o servidor processa e responde. Quando o JavaScript carrega, o framework intercepta o envio para dar estados pendentes e atualização sem recarregar. A funcionalidade básica não depende do bundle.
+
+**Como os dados ficam atualizados depois de uma action?** O React Router revalida automaticamente os loaders de todas as rotas ativas depois de uma action. Não há invalidação manual de cache; `shouldRevalidate` permite otimizar quando necessário.
+
+## Pratique
+
+1. Crie um projeto com `create-react-router` e implemente as rotas aninhadas `loja`, `pedidos` e `pedidos/:id` com loaders em paralelo.
+2. Escreva o loader da página de produto com `data()` lançando 404 e um `ErrorBoundary` específico, e exporte `meta` com nome e descrição.
+3. Implemente o carrinho com uma action que trata as intenções `remover`, `alterarQuantidade` e `finalizar`; desative o JavaScript e confira que todas funcionam.
+4. Crie a resource route `/carrinho/itens` e o `FormularioAdicionar` com `useFetcher`, mostrando o contador do cabeçalho atualizando sozinho.
+5. Implemente a troca otimista de status no painel com `fetcher.formData` e simule uma falha na action.
+6. Escreva um parágrafo para o README da Quitanda justificando a escolha entre React Router framework e Next.js com base na tabela comparativa.
+
+<Quiz question="Depois que uma action do React Router termina com sucesso, o que acontece com os dados da página?" options={["Nada; é preciso invalidar o cache manualmente","Só o loader da rota da action roda de novo","Os loaders das rotas ativas são executados de novo automaticamente","A página é recarregada inteira pelo navegador"]} answer={2} explanation="Após uma action, o React Router revalida os loaders de todas as rotas ativas, mantendo cabeçalho, listas e detalhes em sincronia." />
+
+<Quiz question="Qual é a situação adequada para useFetcher em vez de Form?" options={["Adicionar um produto ao carrinho a partir do catálogo sem sair da página","Finalizar o pedido e ir para a página de confirmação","Fazer login e redirecionar para a home","Trocar de rota pelo menu principal"]} answer={0} explanation="useFetcher executa actions e loaders sem navegação e com estado próprio, ideal para interações pontuais na mesma página." />
+
+<Quiz question="Como o Remix v2 se relaciona com o React Router 7?" options={["O React Router 7 foi descontinuado em favor do Remix","São projetos independentes com APIs diferentes","O Remix passou a ser um plugin do Next.js","O Remix v2 foi incorporado ao React Router 7 como modo framework"]} answer={3} explanation="As APIs do Remix (loaders, actions, Form, useFetcher, SSR) passaram a fazer parte do React Router 7 no modo framework." />
+
+## Base no CodeForge
+
+- [React: construindo SPAs com React Router](/learn/carreira-react/react-spas-react-router): o modo declarativo e o modo dados que este capítulo evolui.
+- [React: explorando estratégias de renderização do Next.js](/learn/carreira-react/react-estrategias-renderizacao-nextjs): o modelo de cache e Server Actions para comparar.
+- [HTTP/1.1](/learn/redes/http-1): métodos, formulários e cabeçalhos de cache em que o modelo do Remix se apoia.
+- [REST](/learn/system-design/rest): recursos e verbos, a mesma lógica de loaders (GET) e actions (POST).
+
+## Referências
+
+- [React Router: Picking a Mode](https://reactrouter.com/start/modes)
+- [React Router: Routing (framework mode)](https://reactrouter.com/start/framework/routing)
+- [React Router: Data Loading](https://reactrouter.com/start/framework/data-loading) e [Actions](https://reactrouter.com/start/framework/actions)
+- [React Router: Upgrading from Remix](https://reactrouter.com/upgrading/remix)
+- [Remix blog: Merging Remix and React Router](https://remix.run/blog/merging-remix-and-react-router)

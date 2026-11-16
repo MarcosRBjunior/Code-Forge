@@ -1,0 +1,437 @@
+---
+title: "React: utilizando hooks para gerenciar estados"
+kind: lesson
+---
+
+A Quitanda em React já mostra o catálogo e tem um carrinho com `useState`. Agora as regras crescem: a quantidade não pode passar do estoque, o carrinho precisa sobreviver a um recarregamento da página como na versão em JavaScript puro, o campo de busca deve receber o foco com um atalho, e a função `adicionar` em `App.jsx` já tem dez linhas de `map` e `find` misturadas com o JSX. Cada nova regra espalha mais `setItens` pela árvore, e fica difícil responder à pergunta mais básica: quais são todas as formas de o carrinho mudar?
+
+Hooks são as funções que dão aos componentes de função memória, ciclo de vida e acesso ao DOM. Este capítulo aprofunda o `useState`, organiza o carrinho com `useReducer`, usa `useEffect` só onde ele é necessário, e mostra `useRef`, `useMemo` e `useCallback` com critério, sem espalhar otimizações por reflexo.
+
+**Você vai aprender:**
+
+- Entender como o `useState` agenda renderizações e agrupa atualizações
+- Centralizar as regras do carrinho num reducer testável com `useReducer`
+- Usar `useEffect` para sincronizar com sistemas externos e reconhecer quando ele sobra
+- Guardar valores e referências ao DOM com `useRef`
+- Decidir quando `useMemo` e `useCallback` valem o custo
+- Seguir as regras dos hooks e levantar estado para o ancestral comum
+
+## useState a fundo
+
+Cada chamada de `setAlgo` não altera a variável na hora: ela pede ao React uma nova renderização com o valor novo. Dentro de um mesmo evento, o React **agrupa** todas as atualizações (batching) e renderiza uma vez só no fim. Isso explica um bug clássico:
+
+```jsx
+// src/componentes/SeletorQuantidade.jsx
+import { useState } from "react";
+
+export default function SeletorQuantidade({ maximo }) {
+  const [quantidade, setQuantidade] = useState(1);
+
+  function somarTres() {
+    // errado: as três leem o mesmo valor desta renderização (1) e o resultado é 2
+    // setQuantidade(quantidade + 1); setQuantidade(quantidade + 1); setQuantidade(quantidade + 1);
+
+    // certo: cada função recebe o resultado da anterior, e o resultado é 4
+    setQuantidade((q) => Math.min(q + 1, maximo));
+    setQuantidade((q) => Math.min(q + 1, maximo));
+    setQuantidade((q) => Math.min(q + 1, maximo));
+  }
+
+  return (
+    <div>
+      <button type="button" onClick={() => setQuantidade((q) => Math.max(q - 1, 1))}>-</button>
+      <output>{quantidade}</output>
+      <button type="button" onClick={somarTres}>+3</button>
+    </div>
+  );
+}
+```
+
+Mais três detalhes que aparecem em código real:
+
+- **Inicialização preguiçosa.** `useState(lerCarrinhoSalvo())` executa a função em **toda** renderização e descarta o resultado depois da primeira. Passe a função sem chamar: `useState(lerCarrinhoSalvo)`. O React só a executa na montagem.
+- **Valor igual não renderiza.** Se o novo valor for igual ao atual pela comparação `Object.is`, o React pode pular a renderização.
+- **Estado é por posição na árvore.** Dois `SeletorQuantidade` na tela têm estados independentes. Se o componente sair da árvore, o estado some. Trocar a `key` de um componente força o React a tratá-lo como novo e zerar seu estado, um truque útil para reiniciar um formulário quando o produto selecionado muda.
+
+### Estrutura do estado
+
+Boa parte dos bugs de estado vem de modelar mal, não de usar mal o hook. Quatro princípios da documentação do React, aplicados à Quitanda:
+
+| Princípio | Errado | Certo |
+|---|---|---|
+| Agrupe o que muda junto | `rua`, `numero`, `cep` em três estados atualizados sempre juntos | um objeto `endereco` |
+| Evite contradições | `enviando` e `enviado` como dois booleanos | `status` com `"ocioso"`, `"enviando"` ou `"enviado"` |
+| Não duplique | `produtoSelecionado` como cópia do objeto | `idSelecionado` e o objeto encontrado na lista |
+| Não guarde derivados | `total` em estado | `total` calculado a partir de `itens` |
+
+## useReducer: todas as mudanças do carrinho num só lugar
+
+Quando um estado tem várias formas de mudar e regras entre elas, o `useReducer` separa **o que aconteceu** (uma ação) de **como o estado reage** (o reducer). O reducer é uma função pura: recebe o estado atual e a ação e devolve o próximo estado.
+
+```js
+// src/estado/carrinhoReducer.js
+export const carrinhoInicial = { itens: [] }; // itens: [{ produto, quantidade }]
+
+export function carrinhoReducer(estado, acao) {
+  switch (acao.type) {
+    case "adicionou": {
+      const { produto } = acao;
+      const existente = estado.itens.find((i) => i.produto.id === produto.id);
+      if (!existente) {
+        if (produto.estoque === 0) return estado;
+        return { ...estado, itens: [...estado.itens, { produto, quantidade: 1 }] };
+      }
+      if (existente.quantidade >= produto.estoque) return estado;
+      return {
+        ...estado,
+        itens: estado.itens.map((i) =>
+          i.produto.id === produto.id ? { ...i, quantidade: i.quantidade + 1 } : i,
+        ),
+      };
+    }
+    case "alterou_quantidade": {
+      const { id, quantidade } = acao;
+      if (quantidade <= 0) {
+        return { ...estado, itens: estado.itens.filter((i) => i.produto.id !== id) };
+      }
+      return {
+        ...estado,
+        itens: estado.itens.map((i) =>
+          i.produto.id === id ? { ...i, quantidade: Math.min(quantidade, i.produto.estoque) } : i,
+        ),
+      };
+    }
+    case "removeu":
+      return { ...estado, itens: estado.itens.filter((i) => i.produto.id !== acao.id) };
+    case "esvaziou":
+      return carrinhoInicial;
+    default:
+      throw new Error(`Ação desconhecida: ${acao.type}`);
+  }
+}
+
+export function calcularTotal(itens) {
+  return itens.reduce((soma, i) => soma + i.produto.precoEmCentavos * i.quantidade, 0);
+}
+```
+
+```jsx
+// src/App.jsx (trecho)
+import { useReducer } from "react";
+import { carrinhoReducer, carrinhoInicial } from "./estado/carrinhoReducer.js";
+
+export default function App() {
+  const [carrinho, dispatch] = useReducer(carrinhoReducer, carrinhoInicial);
+
+  return (
+    <>
+      <ListaDeProdutos
+        produtos={produtos}
+        onAdicionar={(produto) => dispatch({ type: "adicionou", produto })}
+      />
+      <Carrinho
+        itens={carrinho.itens}
+        onAlterarQuantidade={(id, quantidade) => dispatch({ type: "alterou_quantidade", id, quantidade })}
+        onRemover={(id) => dispatch({ type: "removeu", id })}
+      />
+    </>
+  );
+}
+```
+
+Os ganhos aparecem em três frentes. A leitura: os nomes das ações descrevem eventos do domínio ("adicionou", "esvaziou"), e o reducer é o índice de tudo o que pode acontecer ao carrinho. O teste: o reducer é uma função pura, testada sem React, como você fará no capítulo de testes. A depuração: um `console.log(acao)` no início do reducer mostra a sequência exata de eventos.
+
+| Critério | `useState` | `useReducer` |
+|---|---|---|
+| Formato do estado | Valor simples ou independente | Objeto com várias partes relacionadas |
+| Formas de mudar | Poucas e óbvias | Várias, com regras entre elas |
+| Onde fica a lógica | Nos manipuladores de evento | Num reducer fora do componente |
+| Testabilidade | Junto com o componente | Reducer testado isoladamente |
+
+Nomeie as ações no passado, pelo que o usuário fez ("adicionou"), e não pelo comando ao estado ("setItens"). Esse estilo é o mesmo que o Redux Toolkit adota mais adiante neste nível.
+
+## useEffect: sincronizar com o mundo de fora
+
+`useEffect` executa código **depois** que o React atualiza a tela, para sincronizar o componente com algo que o React não controla: localStorage, `document.title`, um timer, uma conexão, uma biblioteca de mapa. A forma geral:
+
+```jsx
+useEffect(() => {
+  // configura a sincronização
+  return () => {
+    // desfaz (opcional): roda antes do próximo efeito e na desmontagem
+  };
+}, [dependencias]);
+```
+
+O carrinho salvo no localStorage é o caso perfeito, porque o localStorage é um sistema externo:
+
+```jsx
+// src/App.jsx (trecho)
+import { useEffect, useReducer } from "react";
+
+function lerCarrinhoSalvo(inicial) {
+  try {
+    return JSON.parse(localStorage.getItem("quitanda:carrinho")) ?? inicial;
+  } catch {
+    return inicial;
+  }
+}
+
+export default function App() {
+  const [carrinho, dispatch] = useReducer(carrinhoReducer, carrinhoInicial, lerCarrinhoSalvo);
+
+  useEffect(() => {
+    localStorage.setItem("quitanda:carrinho", JSON.stringify(carrinho));
+  }, [carrinho]);
+
+  const quantidade = carrinho.itens.reduce((s, i) => s + i.quantidade, 0);
+  useEffect(() => {
+    document.title = quantidade > 0 ? `(${quantidade}) Quitanda` : "Quitanda";
+  }, [quantidade]);
+  // ...
+}
+```
+
+O terceiro argumento do `useReducer` é a função de inicialização preguiçosa: lê o localStorage uma vez, na montagem. O efeito grava sempre que `carrinho` muda.
+
+A lista de dependências diz quando o efeito roda de novo:
+
+| Dependências | Quando roda |
+|---|---|
+| omitida | Depois de toda renderização |
+| `[]` | Só depois da montagem (e a limpeza na desmontagem) |
+| `[carrinho]` | Na montagem e sempre que `carrinho` mudar de referência |
+
+A regra é declarar **todo** valor reativo usado dentro do efeito (props, estado, funções definidas no componente). O plugin `eslint-plugin-react-hooks`, já incluído no template do Vite, avisa quando falta algo. Silenciar o aviso costuma esconder um bug de valor desatualizado.
+
+Um timer mostra por que a limpeza existe. A faixa de promoção da Quitanda troca de mensagem a cada cinco segundos:
+
+```jsx
+// src/componentes/FaixaPromocao.jsx
+import { useEffect, useState } from "react";
+
+const mensagens = ["Frete grátis acima de R$ 80", "Orgânicos com 10% off às quartas", "Entrega no mesmo dia"];
+
+export default function FaixaPromocao() {
+  const [indice, setIndice] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setIndice((i) => (i + 1) % mensagens.length), 5000);
+    return () => clearInterval(id);
+  }, []);
+  return <p role="status">{mensagens[indice]}</p>;
+}
+```
+
+Sem o `clearInterval`, cada montagem cria um timer novo e os antigos continuam rodando. O `StrictMode` monta, desmonta e monta de novo em desenvolvimento justamente para expor efeitos sem limpeza.
+
+### Quando você não precisa de um efeito
+
+A documentação do React tem uma página inteira com esse título, e ela vale a leitura. Os casos mais comuns na Quitanda:
+
+```jsx
+// errado: estado derivado sincronizado por efeito (renderiza duas vezes e pode divergir)
+const [total, setTotal] = useState(0);
+useEffect(() => {
+  setTotal(calcularTotal(carrinho.itens));
+}, [carrinho.itens]);
+
+// certo: calcule durante a renderização
+const total = calcularTotal(carrinho.itens);
+```
+
+- **Transformar dados para exibir** (filtrar, ordenar, somar): calcule na renderização.
+- **Reagir a um evento do usuário** (mostrar um aviso porque ele clicou em "Adicionar"): faça no manipulador do evento, que sabe exatamente o que aconteceu.
+- **Reiniciar estado quando uma prop muda**: use `key` no componente, não um efeito que zera o estado.
+- **Buscar dados**: dá para fazer com efeito, mas há condições de corrida e repetição de código. O capítulo de APIs mostra por que bibliotecas como TanStack Query são o padrão.
+
+<Callout type="warning" title="Efeito com setState sem condição vira laço">
+Um `useEffect` sem lista de dependências que chama `setAlgo` com um objeto novo provoca renderização, que roda o efeito, que provoca outra renderização. O sintoma é a aba travada e o aviso "Maximum update depth exceeded". Se o valor pode ser calculado, ele não é estado; se é uma reação a um clique, ele pertence ao manipulador do clique.
+</Callout>
+
+## useRef: memória que não renderiza e acesso ao DOM
+
+`useRef` devolve um objeto `{ current }` que persiste entre renderizações. Alterar `current` **não** provoca renderização. Dois usos:
+
+**Referência a um elemento do DOM**, para foco, rolagem ou medição:
+
+```jsx
+// src/componentes/Busca.jsx
+import { useEffect, useRef } from "react";
+
+export default function Busca({ valor, onMudar }) {
+  const campoRef = useRef(null);
+
+  useEffect(() => {
+    function aoTeclar(evento) {
+      if (evento.key === "/" && document.activeElement !== campoRef.current) {
+        evento.preventDefault();
+        campoRef.current.focus();
+      }
+    }
+    window.addEventListener("keydown", aoTeclar);
+    return () => window.removeEventListener("keydown", aoTeclar);
+  }, []);
+
+  return (
+    <input ref={campoRef} type="search" aria-label="Buscar produtos" value={valor} onChange={(e) => onMudar(e.target.value)} />
+  );
+}
+```
+
+**Um valor que não aparece na tela**, como o id de um timer ou a contagem de cliques para análise. Se o valor aparece na interface, ele é estado, não ref. Não leia nem escreva `ref.current` durante a renderização; use refs em manipuladores de evento e efeitos.
+
+No React 19, `ref` é uma prop comum para componentes de função. Um componente próprio pode receber a ref e repassá-la ao input sem `forwardRef`:
+
+```jsx
+// src/componentes/CampoTexto.jsx
+export default function CampoTexto({ rotulo, id, ref, ...resto }) {
+  return (
+    <>
+      <label htmlFor={id}>{rotulo}</label>
+      <input id={id} ref={ref} {...resto} />
+    </>
+  );
+}
+```
+
+## useMemo e useCallback com critério
+
+Cada renderização recalcula tudo no corpo do componente e recria todas as funções. Na maior parte do tempo isso é barato. `useMemo` guarda o **resultado** de um cálculo e `useCallback` guarda **a própria função**, ambos até que as dependências mudem.
+
+```jsx
+// src/paginas/Catalogo.jsx (trecho)
+import { memo, useCallback, useMemo } from "react";
+
+const visiveis = useMemo(
+  () =>
+    produtos
+      .filter((p) => p.nome.toLowerCase().includes(busca.toLowerCase()))
+      .sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR")),
+  [produtos, busca],
+);
+
+const adicionar = useCallback((produto) => dispatch({ type: "adicionou", produto }), []);
+
+// CartaoProduto envolvido em memo só re-renderiza se as props mudarem de referência
+export const CartaoProdutoMemo = memo(CartaoProduto);
+```
+
+Quando vale usar:
+
+- **`useMemo`** para cálculo mensuravelmente caro (milhares de itens, ordenações pesadas) ou para manter estável um objeto passado a um componente com `memo` ou usado como dependência de efeito.
+- **`useCallback`** para funções passadas a componentes envolvidos em `memo` ou usadas como dependência de outro hook. Sem um `memo` do outro lado, ele não economiza nada.
+- **Nunca como correção de bug.** Se o código só funciona com `useMemo`, há um problema de lógica; a memorização é uma otimização que o React pode descartar.
+
+Meça antes, com a aba Profiler do React DevTools. Se um cálculo leva menos de um milissegundo, a memorização só acrescenta complexidade. O **React Compiler**, que aplica essas memorizações automaticamente em tempo de build, está estável e pode ser ligado no Vite com o plugin de Babel; projetos novos que o adotam raramente escrevem `useMemo` à mão. Ele aparece com detalhes nos capítulos de desempenho do Nível 2.
+
+## Regras dos hooks
+
+1. **Chame hooks só no nível superior** do componente ou de outro hook: nunca dentro de `if`, laço, função aninhada ou depois de um `return` antecipado.
+2. **Chame hooks só de componentes React ou de hooks próprios** (funções cujo nome começa com `use`), nunca de funções comuns.
+
+O motivo é mecânico: o React identifica cada hook pela **ordem de chamada**. Se um `useState` é pulado numa renderização por causa de um `if`, todos os hooks seguintes recebem o estado do vizinho.
+
+```jsx
+// errado
+if (!produto) return <p>Carregando...</p>;
+const [quantidade, setQuantidade] = useState(1); // nem sempre é chamado
+
+// certo: hooks primeiro, condições depois
+const [quantidade, setQuantidade] = useState(1);
+if (!produto) return <p>Carregando...</p>;
+```
+
+O plugin de lint dos hooks verifica as duas regras. A exceção documentada é o `use` do React 19, que lê uma promise ou um contexto e pode ser chamado dentro de condições.
+
+## Levantando o estado
+
+O cabeçalho mostra a quantidade de itens, a lista adiciona e o carrinho altera. Os três precisam do mesmo estado, então ele fica no **ancestral comum mais próximo** (`App`), desce por props e as mudanças sobem por funções. Esse é o fluxo de dados unidirecional do React.
+
+```text
+App  (carrinho, dispatch)
+├── Cabecalho        <- recebe quantidade
+├── ListaDeProdutos  <- recebe onAdicionar
+└── Carrinho         <- recebe itens, onAlterarQuantidade, onRemover
+```
+
+O oposto também vale: estado que só um componente usa (um menu aberto, o texto de um campo) deve ficar nele, perto de onde é usado. Quando a árvore crescer e as props precisarem atravessar cinco níveis só para chegar ao destino, o capítulo de Context e Redux mostra as alternativas. Antes disso, um passo simples ajuda: extrair `useReducer`, o efeito de persistência e o total para um hook próprio, `useCarrinho`, em `src/estado/useCarrinho.js`. Hooks próprios são o assunto de um capítulo inteiro no Nível 2.
+
+```js
+// src/estado/useCarrinho.js
+import { useEffect, useReducer } from "react";
+import { carrinhoReducer, carrinhoInicial, calcularTotal } from "./carrinhoReducer.js";
+
+function lerCarrinhoSalvo(inicial) {
+  try {
+    return JSON.parse(localStorage.getItem("quitanda:carrinho")) ?? inicial;
+  } catch {
+    return inicial;
+  }
+}
+
+export function useCarrinho() {
+  const [carrinho, dispatch] = useReducer(carrinhoReducer, carrinhoInicial, lerCarrinhoSalvo);
+
+  useEffect(() => {
+    localStorage.setItem("quitanda:carrinho", JSON.stringify(carrinho));
+  }, [carrinho]);
+
+  return {
+    itens: carrinho.itens,
+    total: calcularTotal(carrinho.itens),
+    quantidadeTotal: carrinho.itens.reduce((soma, i) => soma + i.quantidade, 0),
+    adicionar: (produto) => dispatch({ type: "adicionou", produto }),
+    alterarQuantidade: (id, quantidade) => dispatch({ type: "alterou_quantidade", id, quantidade }),
+    remover: (id) => dispatch({ type: "removeu", id }),
+    esvaziar: () => dispatch({ type: "esvaziou" }),
+  };
+}
+```
+
+Os próximos capítulos usam esse formato (`itens`, `total`, `quantidadeTotal`, `adicionar`, `alterarQuantidade`, `remover`, `esvaziar`) sempre que falarem do carrinho.
+
+<Callout type="tip" title="Uma pergunta antes de criar estado">
+Antes de cada `useState`, pergunte: isso muda com o tempo? Vem de props? Dá para calcular a partir de outro estado? Se a resposta para alguma das duas últimas for sim, não é estado. Essa pergunta elimina metade dos efeitos e das sincronizações de um projeto.
+</Callout>
+
+## Na entrevista
+
+**Por que chamar setContador(contador + 1) três vezes soma só um?** Porque as três chamadas leem o mesmo valor da renderização atual e o React agrupa as atualizações. A forma funcional, `setContador((c) => c + 1)`, recebe o resultado da atualização anterior e soma três.
+
+**Quando você usaria useReducer em vez de useState?** Quando o estado tem várias partes relacionadas e várias formas de mudar com regras entre elas, como um carrinho. O reducer concentra a lógica numa função pura, fácil de ler e de testar sem React.
+
+**Para que serve a função de limpeza do useEffect?** Para desfazer o que o efeito configurou: cancelar timer, remover listener, fechar conexão. Ela roda antes de o efeito executar de novo e quando o componente sai da tela, evitando vazamentos e handlers duplicados.
+
+**Qual a diferença entre useRef e useState?** Os dois persistem entre renderizações, mas mudar `ref.current` não renderiza a tela. Ref serve para valores que não aparecem na interface e para acessar elementos do DOM; o que aparece na tela é estado.
+
+**Você usa useMemo em todo cálculo?** Não. Uso quando o cálculo é caro de verdade, medido no Profiler, ou quando preciso de referência estável para um componente com `memo` ou para dependência de efeito. Com o React Compiler ligado, quase não escrevo à mão.
+
+## Pratique
+
+1. Mova a lógica do carrinho para `carrinhoReducer` com as ações `adicionou`, `alterou_quantidade`, `removeu` e `esvaziou`, e garanta que nenhuma delas permite quantidade acima do estoque.
+2. Persista o carrinho no localStorage com inicialização preguiçosa e um efeito. Teste com o JSON corrompido manualmente no DevTools: a aplicação deve abrir com o carrinho vazio, sem quebrar.
+3. Procure na Quitanda todo `useEffect` que só calcula valores a partir de props ou estado e substitua por cálculo durante a renderização.
+4. Implemente o atalho de teclado "/" para focar a busca com `useRef` e confirme, com o `StrictMode` ligado, que só existe um listener ativo.
+5. Gere uma lista de 5 mil produtos falsos, meça no Profiler o tempo de filtrar e ordenar a cada tecla, aplique `useMemo` e compare os números.
+6. Use o `useCarrinho()` em `App` e acrescente a ele uma função `quantidadeDe(id)` usada pelo `CartaoProduto` para mostrar quantas unidades já estão no carrinho.
+
+<Quiz question="Qual destes usos de useEffect é adequado na Quitanda?" options={["Calcular o total do carrinho e guardar num estado","Gravar o carrinho no localStorage quando ele mudar","Mostrar um aviso porque o usuário clicou em Adicionar","Filtrar a lista de produtos quando a busca mudar"]} answer={1} explanation="localStorage é um sistema externo, e sincronizar com ele é o papel do efeito. Os outros casos são cálculos durante a renderização ou lógica do próprio manipulador de evento." />
+
+<Quiz question="Por que hooks não podem ser chamados dentro de um if?" options={["Porque o React identifica cada hook pela ordem de chamada, que precisa ser a mesma em toda renderização","Porque o compilador do JSX não aceita","Porque hooks só funcionam em componentes de classe","Porque isso desativa o StrictMode"]} answer={0} explanation="O estado de cada hook é associado à sua posição na sequência de chamadas. Pular um hook desloca todos os seguintes." />
+
+<Quiz question="Um componente faz useState(lerCarrinhoSalvo()). Qual o problema?" options={["Nenhum, é a forma recomendada","O estado nunca é inicializado","lerCarrinhoSalvo é executada em toda renderização, embora o resultado só seja usado na primeira","O React lança erro por receber uma chamada de função"]} answer={2} explanation="Passar a chamada executa a função sempre. Passar a referência, useState(lerCarrinhoSalvo), faz o React chamá-la apenas na montagem." />
+
+## Base no CodeForge
+
+- [React 19: JSX, componentes, form action e useState](/learn/carreira-react/react-19-jsx-componentes-form-action-usestate): o ponto de partida deste capítulo.
+- [JavaScript: explorando a manipulação de elementos e da localStorage](/learn/carreira-react/javascript-manipulacao-elementos-localstorage): a persistência que o efeito reaproveita.
+- [Máquina de estados](/learn/lld/maquina-de-estados): o raciocínio por trás de reducers com ações nomeadas.
+- [React: gerenciando estados com Redux e Context API](/learn/carreira-react/react-redux-context-api): quando o estado precisa sair do componente.
+
+## Referências
+
+- [React: Managing State](https://react.dev/learn/managing-state)
+- [React: useReducer](https://react.dev/reference/react/useReducer)
+- [React: You Might Not Need an Effect](https://react.dev/learn/you-might-not-need-an-effect)
+- [React: Rules of Hooks](https://react.dev/reference/rules/rules-of-hooks)
+- [React Compiler](https://react.dev/learn/react-compiler)

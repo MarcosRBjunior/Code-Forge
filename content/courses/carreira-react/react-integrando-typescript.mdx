@@ -1,0 +1,450 @@
+---
+title: "React: integrando TypeScript em projetos"
+kind: lesson
+---
+
+A Quitanda do Nível 1 funciona: catálogo, carrinho, checkout, React Router, TanStack Query, Redux Toolkit e formulários com React Hook Form e Zod. Mas o código cresceu, e os bugs que chegam ao lojista têm um padrão: `produto.precoEmCentavos.toFixed` quebrando porque a API mandou `null`, um componente `CartaoProduto` recebendo `quantidade` em vez de `qtd` depois de uma refatoração, um `status` de pedido escrito `"saiu para entrega"` num lugar e `"saiu_para_entrega"` em outro. Nenhum teste pegou, porque ninguém pensou em testar isso.
+
+TypeScript transforma essa categoria de erro em erro de compilação. A proposta deste capítulo é migrar a Quitanda aos poucos, sem parar o desenvolvimento: configurar o compilador, tipar o que é próprio do React (props, `children`, eventos, estado, reducer, contexto), escrever componentes genéricos e, principalmente, fazer o contrato da API ter uma única fonte de verdade com Zod.
+
+**Você vai aprender:**
+
+- Planejar uma migração gradual de `.jsx` para `.tsx` com `allowJs` e checagem por etapas
+- Ler e ajustar o `tsconfig` de um projeto Vite com React
+- Tipar props, `children`, `ref`, eventos, `useState`, `useReducer` e Context sem `any`
+- Escrever componentes genéricos, como uma lista que funciona para produtos e pedidos
+- Derivar os tipos da API de esquemas Zod com `z.infer` e validar as respostas em tempo de execução
+
+## Por que TypeScript num projeto React
+
+TypeScript é JavaScript com anotações de tipo que o compilador (`tsc`) verifica e depois apaga. O navegador continua recebendo JavaScript. O ganho vem em três frentes: contratos entre componentes (quem usar `CartaoProduto` com a prop errada vê o erro no editor), refatoração segura (renomear um campo de `Produto` aponta todos os lugares que precisam mudar) e autocompletar que conhece o domínio (o editor sabe que `pedido.status` só pode ser um de quatro valores).
+
+O custo é real: mais sintaxe, tipos de bibliotecas para entender e alguma fricção com código dinâmico. Por isso a migração é gradual e começa pelas fronteiras com mais risco: a camada de API e os tipos de domínio.
+
+## O tsconfig de um projeto Vite
+
+O template `react-ts` do Vite (`npm create vite@latest quitanda -- --template react-ts`) separa a configuração em três arquivos: um `tsconfig.json` raiz que só referencia os outros, `tsconfig.app.json` para o código de `src/` e `tsconfig.node.json` para o `vite.config.ts`. Ao migrar um projeto existente, copie essa estrutura e ajuste o `tsconfig.app.json`:
+
+```json
+// tsconfig.app.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "allowJs": true,
+    "checkJs": false,
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] }
+  },
+  "include": ["src"]
+}
+```
+
+| Opção | O que faz | Por que importa na Quitanda |
+|---|---|---|
+| `jsx: "react-jsx"` | Usa o runtime automático de JSX | Não precisa importar React em cada arquivo |
+| `moduleResolution: "bundler"` | Resolve imports como o Vite resolve | Imports sem extensão e `exports` de pacotes funcionam |
+| `noEmit` | O `tsc` só checa, não gera arquivos | Quem gera o JavaScript é o Vite (via esbuild) |
+| `verbatimModuleSyntax` | Exige `import type` para imports só de tipo | Evita imports que somem ou sobram no bundle |
+| `strict` | Liga `strictNullChecks`, `noImplicitAny` e outras | É onde mora o valor: `null` deixa de passar despercebido |
+| `noUncheckedIndexedAccess` | `itens[0]` passa a ser `Item` ou `undefined` | Pega acesso a posição que não existe |
+| `allowJs` | Permite importar `.js`/`.jsx` de arquivos `.ts` | Viabiliza a migração arquivo por arquivo |
+
+O alias `@/*` precisa existir também no Vite. Com o plugin `vite-tsconfig-paths` ele é lido do tsconfig; sem plugin, declare `resolve.alias` no `vite.config.ts`.
+
+<Callout type="warning" title="O Vite não checa tipos">
+O Vite remove as anotações e segue em frente, mesmo com erro de tipo. A checagem é responsabilidade do `tsc`. Por isso o template usa `"build": "tsc -b && vite build"` e vale ter `"typecheck": "tsc -b"` rodando no CI. Sem isso, o projeto tem TypeScript no editor e JavaScript sem garantia em produção.
+</Callout>
+
+## Migração gradual, em etapas
+
+Reescrever tudo de uma vez trava o time por semanas. A ordem que funciona:
+
+1. **Instale e configure.** `npm i -D typescript @types/react @types/react-dom`, crie os tsconfigs com `allowJs: true` e renomeie `main.jsx` para `main.tsx`. O projeto continua rodando com os `.jsx` antigos.
+2. **Tipos de domínio e camada de API primeiro.** `src/esquemas/` e `src/servicos/api.ts` viram TypeScript. Todo componente que consumir a API ganha tipos de graça.
+3. **Folhas antes da raiz.** Migre componentes sem dependências internas (`Preco`, `BotaoQuantidade`, `CartaoProduto`) e suba até páginas e layouts.
+4. **Estado global.** Store do Redux, slices e contexts.
+5. **Aperte as regras.** Quando sobrar pouco `.jsx`, ligue `checkJs`, remova `allowJs` e proíba `any` explícito com a regra `@typescript-eslint/no-explicit-any`.
+
+Durante a migração, `// @ts-expect-error` com um comentário explicando o motivo é melhor que `any`: quando o erro deixar de existir, o próprio compilador avisa que a diretiva sobrou.
+
+## Tipos de domínio com Zod como fonte de verdade
+
+A Quitanda já usa Zod 4 nos formulários. A mesma biblioteca resolve o problema mais caro da migração: manter o tipo `Produto` igual ao que a API realmente devolve. Em vez de escrever uma `interface` e um esquema separados, escreva o esquema e derive o tipo.
+
+```ts
+// src/esquemas/produto.ts
+import { z } from "zod";
+
+export const unidadeSchema = z.enum(["kg", "un"]);
+
+export const produtoSchema = z.object({
+  id: z.string(),
+  nome: z.string().min(1),
+  precoEmCentavos: z.number().int().nonnegative(),
+  unidade: unidadeSchema,
+  categoria: z.string(),
+  estoque: z.number().int().nonnegative(),
+  foto: z.string().url(),
+});
+
+export const listaDeProdutosSchema = z.array(produtoSchema);
+
+export type Produto = z.infer<typeof produtoSchema>;
+export type Unidade = z.infer<typeof unidadeSchema>; // "kg" | "un"
+```
+
+```ts
+// src/esquemas/pedido.ts
+import { z } from "zod";
+
+export const statusDoPedidoSchema = z.enum([
+  "recebido",
+  "separando",
+  "saiu_para_entrega",
+  "entregue",
+]);
+
+export const itemDoPedidoSchema = z.object({
+  produtoId: z.string(),
+  quantidade: z.number().positive(),
+  precoEmCentavos: z.number().int(),
+});
+
+export const pedidoSchema = z.object({
+  id: z.string(),
+  itens: z.array(itemDoPedidoSchema),
+  total: z.number().int(),
+  status: statusDoPedidoSchema,
+  criadoEm: z.coerce.date(),
+});
+
+export type StatusDoPedido = z.infer<typeof statusDoPedidoSchema>;
+export type Pedido = z.infer<typeof pedidoSchema>;
+```
+
+`z.coerce.date()` aceita a string ISO que vem no JSON e entrega um `Date`. Se você precisar do tipo de entrada (antes das transformações), use `z.input<typeof pedidoSchema>`; `z.infer` é o tipo de saída.
+
+### A camada de API valida a fronteira
+
+```ts
+// src/servicos/api.ts
+import type { z } from "zod";
+import { listaDeProdutosSchema, produtoSchema } from "@/esquemas/produto";
+
+const BASE = import.meta.env.VITE_API_URL ?? "/api";
+
+export class ErroDeApi extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = "ErroDeApi";
+  }
+}
+
+async function buscar<S extends z.ZodType>(caminho: string, schema: S): Promise<z.infer<S>> {
+  const resposta = await fetch(`${BASE}${caminho}`);
+  if (!resposta.ok) throw new ErroDeApi(resposta.status, `Falha em ${caminho}`);
+  const json: unknown = await resposta.json();
+  return schema.parse(json); // lança ZodError se o contrato mudou
+}
+
+export const api = {
+  listarProdutos: () => buscar("/produtos", listaDeProdutosSchema),
+  buscarProduto: (id: string) => buscar(`/produtos/${id}`, produtoSchema),
+};
+```
+
+O retorno de `response.json()` é `any` nos tipos do DOM. Atribuir a `unknown` força a validação antes do uso. Sem o `parse`, um tipo `Produto` seria só uma promessa que a API não assinou.
+
+Para tipar `import.meta.env.VITE_API_URL`, declare a interface `ImportMetaEnv` em `src/vite-env.d.ts`.
+
+Com o TanStack Query, o tipo flui sozinho: `useQuery({ queryKey: ["produtos"], queryFn: api.listarProdutos })` devolve `data` como `Produto[]` ou `undefined`. Não passe genéricos manualmente ao `useQuery`; deixe a inferência vir do `queryFn`.
+
+## Tipando props e children
+
+Props são um objeto; descreva-o com `type` (ou `interface`, a escolha é de estilo do time).
+
+```tsx
+// src/componentes/CartaoProduto.tsx
+import type { Produto } from "@/esquemas/produto";
+import { formatarPreco } from "@/utilidades/formatarPreco";
+
+type CartaoProdutoProps = {
+  produto: Produto;
+  onAdicionar: (produtoId: string, quantidade: number) => void;
+  destaque?: boolean;
+};
+
+export function CartaoProduto({ produto, onAdicionar, destaque = false }: CartaoProdutoProps) {
+  return (
+    <article className={destaque ? "ring-2 ring-green-600" : undefined}>
+      <img src={produto.foto} alt={produto.nome} />
+      <h3>{produto.nome}</h3>
+      <p>
+        {formatarPreco(produto.precoEmCentavos)} / {produto.unidade}
+      </p>
+      <button onClick={() => onAdicionar(produto.id, 1)}>Adicionar</button>
+    </article>
+  );
+}
+```
+
+Para `children`, use `React.ReactNode`, que aceita JSX, texto, número, `null` e arrays: `type SecaoProps = { titulo: string; children: ReactNode; acoes?: ReactNode }`. Props do tipo `ReactNode` além de `children` funcionam como slots, assunto do próximo capítulo.
+
+### Herdando props de elementos nativos e ref como prop
+
+Um botão da Quitanda deve aceitar tudo que um `button` aceita. `ComponentProps<"button">` traz `onClick`, `disabled`, `type`, atributos `aria-*` e, no React 19, `ref`, que agora é uma prop comum (não precisa mais de `forwardRef`).
+
+```tsx
+// src/componentes/Botao.tsx
+import type { ComponentProps } from "react";
+
+type BotaoProps = ComponentProps<"button"> & {
+  variante?: "primario" | "secundario";
+};
+
+export function Botao({ variante = "primario", className, ...resto }: BotaoProps) {
+  const base = variante === "primario" ? "bg-green-700 text-white" : "border border-green-700";
+  return <button className={`${base} rounded px-4 py-2 ${className ?? ""}`} {...resto} />;
+}
+```
+
+## Eventos
+
+O React passa eventos sintéticos tipados pelo elemento de origem. Quando o handler está inline, o tipo é inferido; quando é uma função separada, anote:
+
+```tsx
+// src/componentes/BuscaDeProdutos.tsx
+import { useState, type ChangeEvent, type FormEvent } from "react";
+
+export function BuscaDeProdutos({ onBuscar }: { onBuscar: (termo: string) => void }) {
+  const [termo, setTermo] = useState("");
+
+  function aoDigitar(evento: ChangeEvent<HTMLInputElement>) {
+    setTermo(evento.target.value);
+  }
+
+  function aoEnviar(evento: FormEvent<HTMLFormElement>) {
+    evento.preventDefault();
+    onBuscar(termo.trim());
+  }
+
+  return (
+    <form onSubmit={aoEnviar} role="search">
+      <label htmlFor="busca">Buscar</label>
+      <input id="busca" value={termo} onChange={aoDigitar} />
+    </form>
+  );
+}
+```
+
+| Situação | Tipo do evento |
+|---|---|
+| `onChange` de input | `ChangeEvent<HTMLInputElement>` |
+| `onChange` de select | `ChangeEvent<HTMLSelectElement>` |
+| `onSubmit` de form | `FormEvent<HTMLFormElement>` |
+| `onClick` de botão | `MouseEvent<HTMLButtonElement>` |
+| `onKeyDown` | `KeyboardEvent<HTMLInputElement>` |
+
+## Estado: useState e useReducer
+
+`useState` infere pelo valor inicial. Anote quando o inicial não representa todos os valores possíveis:
+
+```tsx
+const [quantidade, setQuantidade] = useState(1); // number, inferido
+const [selecionado, setSelecionado] = useState<Produto | null>(null);
+const [status, setStatus] = useState<"ocioso" | "enviando" | "erro">("ocioso");
+```
+
+Para o carrinho, um reducer com ações em união discriminada faz o compilador conferir cada `case`:
+
+```ts
+// src/estado/carrinhoReducer.ts
+import type { Produto } from "@/esquemas/produto";
+
+export type ItemDoCarrinho = { produto: Produto; quantidade: number };
+export type EstadoDoCarrinho = { itens: ItemDoCarrinho[] };
+
+export type AcaoDoCarrinho =
+  | { tipo: "adicionar"; produto: Produto; quantidade: number }
+  | { tipo: "remover"; produtoId: string }
+  | { tipo: "alterarQuantidade"; produtoId: string; quantidade: number }
+  | { tipo: "esvaziar" };
+
+export function carrinhoReducer(estado: EstadoDoCarrinho, acao: AcaoDoCarrinho): EstadoDoCarrinho {
+  switch (acao.tipo) {
+    case "adicionar": {
+      const existente = estado.itens.find((i) => i.produto.id === acao.produto.id);
+      if (existente) {
+        return {
+          itens: estado.itens.map((i) =>
+            i.produto.id === acao.produto.id ? { ...i, quantidade: i.quantidade + acao.quantidade } : i,
+          ),
+        };
+      }
+      return { itens: [...estado.itens, { produto: acao.produto, quantidade: acao.quantidade }] };
+    }
+    case "remover":
+      return { itens: estado.itens.filter((i) => i.produto.id !== acao.produtoId) };
+    case "alterarQuantidade":
+      return {
+        itens: estado.itens.map((i) =>
+          i.produto.id === acao.produtoId ? { ...i, quantidade: acao.quantidade } : i,
+        ),
+      };
+    case "esvaziar":
+      return { itens: [] };
+    default: {
+      const naoTratada: never = acao;
+      return naoTratada;
+    }
+  }
+}
+```
+
+Dentro de cada `case`, o TypeScript estreita `acao` para a variante certa: em `"remover"`, `acao.produto` não existe. A atribuição a `never` no `default` é a checagem de exaustividade: se alguém criar a ação `"aplicarCupom"` e esquecer o `case`, o build quebra.
+
+## Context tipado sem valor padrão falso
+
+O erro clássico é `createContext({} as CarrinhoContexto)`, que mente para o compilador. Prefira `null` e um hook que garante o provider:
+
+```tsx
+// src/estado/CarrinhoContext.tsx
+import { createContext, use, useReducer, type Dispatch, type ReactNode } from "react";
+import { carrinhoReducer, type AcaoDoCarrinho, type EstadoDoCarrinho } from "./carrinhoReducer";
+
+type CarrinhoContexto = { estado: EstadoDoCarrinho; despachar: Dispatch<AcaoDoCarrinho> };
+
+const CarrinhoContext = createContext<CarrinhoContexto | null>(null);
+
+export function CarrinhoProvider({ children }: { children: ReactNode }) {
+  const [estado, despachar] = useReducer(carrinhoReducer, { itens: [] });
+  return <CarrinhoContext value={{ estado, despachar }}>{children}</CarrinhoContext>;
+}
+
+export function useCarrinhoContext() {
+  const contexto = use(CarrinhoContext);
+  if (!contexto) throw new Error("useCarrinhoContext precisa estar dentro de CarrinhoProvider");
+  return contexto; // tipo CarrinhoContexto, sem null
+}
+```
+
+No React 19, o próprio contexto funciona como provider (`<CarrinhoContext value>`) e `use` lê o contexto; `useContext` continua valendo.
+
+### Redux Toolkit tipado
+
+Na parte da Quitanda que usa Redux, os tipos saem da própria store: `type RootState = ReturnType<typeof store.getState>` e `type AppDispatch = typeof store.dispatch`. Crie hooks pré-tipados uma vez, `export const useAppSelector = useSelector.withTypes<RootState>()` (e o equivalente com `useDispatch`), e use-os no lugar dos originais. Nos slices, tipe o `payload` com `PayloadAction<string>`; o resto o `createSlice` infere.
+
+## Componentes genéricos
+
+A Quitanda lista produtos no catálogo, pedidos no painel e itens no carrinho. A lógica de "lista com estado vazio" é a mesma; muda o tipo do item. Um componente genérico resolve sem `any`:
+
+```tsx
+// src/componentes/Lista.tsx
+import type { Key, ReactNode } from "react";
+
+type ListaProps<T> = {
+  itens: readonly T[];
+  obterChave: (item: T) => Key;
+  renderizarItem: (item: T) => ReactNode;
+  vazio?: ReactNode;
+};
+
+export function Lista<T>({ itens, obterChave, renderizarItem, vazio = "Nada por aqui." }: ListaProps<T>) {
+  if (itens.length === 0) return <p>{vazio}</p>;
+  return (
+    <ul>
+      {itens.map((item) => (
+        <li key={obterChave(item)}>{renderizarItem(item)}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+Em `<Lista itens={pedidos} ... />`, o `T` é inferido de `itens`, então o parâmetro de `renderizarItem` já é `Pedido`. Em arquivos `.tsx`, uma arrow function genérica precisa de `<T,>` (com vírgula) para o parser não confundir com JSX; com `function` não há esse problema.
+
+<Callout type="tip" title="Utility types que aparecem todo dia">
+`Pick<Produto, "id" | "nome">` para um resumo, `Omit<Produto, "id">` para o formulário de cadastro, `Partial<Produto>` para um PATCH, `Record<StatusDoPedido, string>` para o mapa de rótulos de status. O `Record` com a união como chave obriga a ter um rótulo para cada status, e o compilador avisa quando um novo status aparecer.
+</Callout>
+
+## Formulário tipado ponta a ponta
+
+```tsx
+// src/paginas/painel/NovoProduto.tsx
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { produtoSchema } from "@/esquemas/produto";
+import type { z } from "zod";
+
+const novoProdutoSchema = produtoSchema.omit({ id: true });
+type NovoProduto = z.infer<typeof novoProdutoSchema>;
+
+export function NovoProduto({ onSalvar }: { onSalvar: (p: NovoProduto) => Promise<void> }) {
+  const { register, handleSubmit, formState } = useForm<NovoProduto>({
+    resolver: zodResolver(novoProdutoSchema),
+  });
+
+  return (
+    <form onSubmit={handleSubmit(onSalvar)}>
+      <input {...register("nome")} aria-invalid={!!formState.errors.nome} />
+      <input type="number" {...register("precoEmCentavos", { valueAsNumber: true })} />
+      {/* register("prco") seria erro de compilação */}
+      <button disabled={formState.isSubmitting}>Salvar</button>
+    </form>
+  );
+}
+```
+
+O mesmo esquema valida a resposta da API, o formulário do lojista e, mais adiante, a Server Action do Next.js. Um campo novo em `produtoSchema` aparece nos três lugares.
+
+## Na entrevista
+
+**`type` ou `interface` para props?** Os dois funcionam. `interface` pode ser estendida e mesclada por declaração; `type` aceita uniões e tipos mapeados. Em props de componente, escolho um padrão e mantenho a consistência; uso `type` quando preciso de união, como variantes mutuamente exclusivas.
+
+**Por que evitar `React.FC`?** Ele não ajuda a inferência, já incluiu `children` implícito em versões antigas dos tipos e complica componentes genéricos. Tipar o parâmetro da função é mais direto e explícito.
+
+**Como você tipa a resposta de uma API?** Não confio só numa interface, porque ela não existe em tempo de execução. Escrevo um esquema Zod, derivo o tipo com `z.infer` e valido a resposta na camada de API. Assim o tipo estático e a validação real nunca divergem.
+
+**Como migraria um projeto React grande para TypeScript?** Gradualmente: `allowJs`, tipos de domínio e camada de API primeiro, depois componentes folha, estado global e páginas. `tsc` no CI desde o primeiro dia, `@ts-expect-error` comentado em vez de `any`, e regras mais estritas ligadas ao final.
+
+**O que é uma união discriminada e por que usar num reducer?** É uma união de objetos com um campo literal comum (`tipo`). O TypeScript estreita o tipo em cada `case` e, com `never` no `default`, garante que todas as ações foram tratadas.
+
+## Pratique
+
+1. Converta `src/servicos/api.ts` da Quitanda para TypeScript com validação Zod e force um erro mudando `precoEmCentavos` para string no `db.json`: confira que o erro aparece na fronteira, e não num componente.
+2. Migre `CartaoProduto`, `Botao` e `Secao` para `.tsx`, sem `any`, e use `ComponentProps<"button">` no botão.
+3. Reescreva o reducer do carrinho com união discriminada e adicione a ação `aplicarCupom`; confira que o build quebra até o `case` existir.
+4. Crie o componente genérico `Lista` e use-o no catálogo, no carrinho e na página de pedidos.
+5. Crie `rotulosDeStatus: Record<StatusDoPedido, string>` e veja o erro ao adicionar o status `"cancelado"` ao esquema.
+6. Adicione o script `typecheck` ao `package.json` e rode-o junto com os testes num hook de pre-commit ou no CI.
+
+<Quiz question="O build com Vite passou, mas o editor mostra erros de tipo. Por quê?" options={["O Vite usa uma versão diferente do TypeScript","O Vite só remove as anotações de tipo; a checagem precisa do tsc rodando à parte","Erros de tipo só aparecem em modo de desenvolvimento","O tsconfig.node.json desativa a checagem"]} answer={1} explanation="O Vite transforma TypeScript com esbuild sem checar tipos. Por isso o script de build do template roda tsc -b antes de vite build." />
+
+<Quiz question="Qual é a melhor forma de criar um contexto tipado para o carrinho?" options={["createContext com um objeto vazio convertido com as","createContext sem tipo e any no consumidor","createContext com null no tipo e um hook que lança erro fora do provider","Exportar o reducer e dispensar o contexto"]} answer={2} explanation="Com null no tipo, o hook verifica a presença do provider e devolve um valor sem null, sem mentir para o compilador." />
+
+<Quiz question="Para que serve z.infer em produtoSchema?" options={["Gerar o tipo estático Produto a partir do esquema, mantendo validação e tipo em sincronia","Converter o JSON da API em classe","Desligar a validação em produção","Gerar documentação OpenAPI"]} answer={0} explanation="z.infer extrai o tipo de saída do esquema. O esquema valida em tempo de execução e o tipo derivado é usado pelo compilador." />
+
+## Base no CodeForge
+
+- [TypeScript: interfaces e types](/learn/typescript/interfaces-e-types): a base para tipar props e domínio.
+- [TypeScript: generics](/learn/typescript/generics): o mecanismo por trás do componente `Lista`.
+- [TypeScript: uniões e narrowing](/learn/typescript/unioes-e-narrowing): uniões discriminadas e checagem de exaustividade.
+- [TypeScript: utility types](/learn/typescript/utility-types): `Pick`, `Omit`, `Partial` e `Record` no dia a dia.
+- [React: utilizando hooks para gerenciar estados](/learn/carreira-react/react-hooks-gerenciar-estados): o `useReducer` e o contexto que este capítulo tipou.
+
+## Referências
+
+- [React: Using TypeScript](https://react.dev/learn/typescript)
+- [TypeScript: TSConfig Reference](https://www.typescriptlang.org/tsconfig/)
+- [Vite: Features, TypeScript](https://vite.dev/guide/features.html#typescript)
+- [Zod: Basic usage e type inference](https://zod.dev/basics)
+- [Redux Toolkit: Usage with TypeScript](https://redux-toolkit.js.org/usage/usage-with-typescript)

@@ -1,0 +1,450 @@
+---
+title: "React e Nest: implementando um Backend for Front-end"
+kind: lesson
+---
+
+A tela "Meu pedido" da Quitanda faz seis chamadas quando abre: o pedido no serviço de pedidos, os itens, os produtos de cada item no catálogo, o status do pagamento no gateway, a previsão de entrega na transportadora e o endereço no perfil. No 4G, isso significa uma cascata de requisições, um JSON três vezes maior do que a tela precisa e uma lógica de junção duplicada no site e no app do entregador. Pior: para chamar o gateway direto, alguém sugeriu colocar a chave dele numa variável `NEXT_PUBLIC_`.
+
+O padrão Backend for Front-end (BFF) resolve isso com um servidor fino, dono da experiência: ele recebe uma chamada do front, conversa com as APIs internas, junta e recorta os dados e devolve exatamente o que a tela usa. Segredos e tokens ficam do lado do servidor. Este capítulo constrói o BFF da Quitanda com NestJS 11, do módulo ao cache, com autenticação por cookie e um contrato tipado compartilhado com o front.
+
+**Você vai aprender:**
+
+- Quando um BFF faz sentido e como ele difere de um API Gateway
+- Organizar um projeto NestJS 11 em módulos, controllers e services
+- Agregar várias APIs em paralelo com timeout e degradação parcial
+- Autenticar no BFF com cookie `httpOnly`, sem expor tokens ao JavaScript do navegador
+- Aplicar cache em memória ou Redis com `@nestjs/cache-manager`
+- Compartilhar um contrato tipado entre o BFF e o front com Zod
+
+## O padrão BFF
+
+| Abordagem | Como funciona | Problema |
+|---|---|---|
+| Front chama cada API direto | O navegador faz N chamadas e junta os dados | Cascata de requisições, payload grande, segredos expostos, lógica duplicada entre clientes |
+| API Gateway genérico | Um ponto de entrada roteia, autentica e limita taxa para todos os clientes | Não sabe o formato de cada tela; agregar ali vira um monolito de regras de todos os times |
+| BFF | Um back-end por experiência (web, app do entregador), mantido pelo time do front | Mais um serviço para operar e monitorar |
+
+O BFF costuma ficar **atrás** do API Gateway, não no lugar dele. O gateway cuida de preocupações transversais (TLS, rate limit, WAF); o BFF cuida de "o que a tela de pedido precisa".
+
+Responsabilidades típicas de um BFF:
+
+- Agregar e recortar dados de várias APIs num formato pronto para a tela
+- Guardar segredos e tokens de serviços internos e de terceiros
+- Traduzir autenticação: cookie de sessão do navegador para token de serviço
+- Cache de respostas caras e pouco voláteis (catálogo, frete por CEP)
+- Adaptar erros: uma falha na transportadora não derruba a tela inteira
+
+O que **não** pertence ao BFF: regras de negócio centrais (cálculo de estoque, aprovação de pagamento). Elas ficam nos serviços de domínio. Se o BFF começa a ter regra que o app do entregador também precisa, ela está no lugar errado.
+
+## Criando o projeto
+
+No monorepo da Quitanda (o Turborepo aparece no capítulo de design systems), o BFF vive em `apps/bff`:
+
+```bash
+npx @nestjs/cli new bff --package-manager npm --skip-git
+npm install cookie-parser class-validator class-transformer @nestjs/cache-manager cache-manager @keyv/redis zod
+npm install -D @types/cookie-parser
+```
+
+```ts
+// apps/bff/src/main.ts
+import { NestFactory } from "@nestjs/core";
+import { ValidationPipe } from "@nestjs/common";
+import cookieParser from "cookie-parser";
+import { AppModule } from "./app.module";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.setGlobalPrefix("bff");
+  app.use(cookieParser());
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+  app.enableCors({ origin: process.env.FRONT_URL, credentials: true });
+  await app.listen(process.env.PORT ?? 4000);
+}
+bootstrap();
+```
+
+`whitelist: true` remove do corpo qualquer campo que o DTO não declara, o que evita que alguém envie `status: "entregue"` junto com a criação do pedido.
+
+## Módulos, controllers e services
+
+O Nest organiza o código em **módulos** (agrupam uma funcionalidade), **controllers** (recebem HTTP, validam entrada, chamam services) e **providers/services** (lógica, injetados por inversão de dependência). A estrutura do BFF:
+
+```txt
+apps/bff/src/
+  app.module.ts
+  integracoes/   integracoes.module.ts, pedidos.client.ts, catalogo.client.ts,
+                 pagamentos.client.ts, entregas.client.ts (APIs internas e terceiros)
+  auth/          auth.module.ts, auth.controller.ts, auth.service.ts, sessao.guard.ts
+  pedidos/       pedidos.module.ts, pedidos.controller.ts, pedidos.service.ts
+  catalogo/      catalogo.module.ts, catalogo.controller.ts
+```
+
+Um cliente de API interna é um provider comum:
+
+```ts
+// apps/bff/src/integracoes/pedidos.client.ts
+import { Injectable, NotFoundException } from "@nestjs/common";
+
+export type PedidoInterno = { id: string; status: string; clienteId: string; itens: { produtoId: string; quantidade: number }[] };
+
+@Injectable()
+export class PedidosClient {
+  private readonly baseUrl = process.env.PEDIDOS_API_URL!;
+
+  async buscar(id: string, token: string): Promise<PedidoInterno> {
+    const resposta = await fetch(`${this.baseUrl}/pedidos/${id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (resposta.status === 404) throw new NotFoundException("Pedido não encontrado");
+    if (!resposta.ok) throw new Error(`pedidos-api respondeu ${resposta.status}`);
+    return resposta.json();
+  }
+}
+```
+
+O `IntegracoesModule` declara os quatro clientes em `providers` e os lista em `exports`, para que `PedidosModule` e `CatalogoModule` possam importá-lo e recebê-los por injeção no construtor. O `fetch` nativo do Node 24 basta. Se preferir Observables, o pacote `@nestjs/axios` oferece o `HttpService`.
+
+## Agregação: uma chamada, uma tela
+
+O service monta a resposta da tela "Meu pedido". Chamadas independentes vão em paralelo; dados opcionais degradam em vez de derrubar a resposta.
+
+```ts
+// apps/bff/src/pedidos/pedidos.service.ts
+import { Injectable } from "@nestjs/common";
+import type { DetalheDoPedido } from "@quitanda/contratos";
+import { PedidosClient } from "../integracoes/pedidos.client";
+import { CatalogoClient } from "../integracoes/catalogo.client";
+import { PagamentosClient } from "../integracoes/pagamentos.client";
+import { EntregasClient } from "../integracoes/entregas.client";
+
+@Injectable()
+export class PedidosService {
+  constructor(
+    private readonly pedidos: PedidosClient,
+    private readonly catalogo: CatalogoClient,
+    private readonly pagamentos: PagamentosClient,
+    private readonly entregas: EntregasClient,
+  ) {}
+
+  async detalhe(id: string, token: string): Promise<DetalheDoPedido> {
+    const pedido = await this.pedidos.buscar(id, token);
+    const ids = pedido.itens.map((i) => i.produtoId);
+
+    const [produtos, pagamento, entrega] = await Promise.allSettled([
+      this.catalogo.buscarVarios(ids),
+      this.pagamentos.status(id),
+      this.entregas.previsao(id),
+    ]);
+
+    const mapaDeProdutos = produtos.status === "fulfilled" ? produtos.value : new Map();
+
+    return {
+      id: pedido.id,
+      status: pedido.status as DetalheDoPedido["status"],
+      itens: pedido.itens.map((item) => {
+        const produto = mapaDeProdutos.get(item.produtoId);
+        return {
+          produtoId: item.produtoId,
+          nome: produto?.nome ?? "Produto",
+          foto: produto?.fotoUrl ?? null,
+          quantidade: item.quantidade,
+          unidade: produto?.unidade ?? "un",
+        };
+      }),
+      pagamento: pagamento.status === "fulfilled" ? pagamento.value.situacao : "indisponivel",
+      previsaoDeEntrega: entrega.status === "fulfilled" ? entrega.value.previsaoIso : null,
+    };
+  }
+}
+```
+
+Três decisões nesse código:
+
+- **O pedido é obrigatório**, então vem primeiro e propaga o erro (404 vira 404 para o front).
+- **Catálogo, pagamento e entrega são independentes**, então `Promise.allSettled` os executa em paralelo e não falha se um deles falhar.
+- **A resposta é recortada para a tela**: nada de `clienteId`, nada dos 30 campos do produto. Menos bytes, menos acoplamento.
+
+```ts
+// apps/bff/src/pedidos/pedidos.controller.ts
+import { Controller, Get, Param, ParseUUIDPipe, Req, UseGuards } from "@nestjs/common";
+import type { Request } from "express";
+import { SessaoGuard } from "../auth/sessao.guard";
+import { PedidosService } from "./pedidos.service";
+
+@Controller("pedidos")
+@UseGuards(SessaoGuard)
+export class PedidosController {
+  constructor(private readonly service: PedidosService) {}
+
+  @Get(":id")
+  detalhe(@Param("id", ParseUUIDPipe) id: string, @Req() req: Request & { token: string }) {
+    return this.service.detalhe(id, req.token);
+  }
+}
+```
+
+<Callout type="tip" title="Timeout em toda chamada">
+Sem timeout, uma transportadora lenta segura a requisição do cliente por 30 segundos e esgota conexões do BFF. `AbortSignal.timeout(2000)` em cada `fetch` e `Promise.allSettled` para os dados opcionais fazem o BFF responder rápido mesmo quando um parceiro está ruim. Para falhas repetidas, um circuit breaker evita insistir num serviço que já está fora.
+</Callout>
+
+## Autenticação no BFF com cookie
+
+No modelo BFF, o navegador não guarda token de acesso em `localStorage`. O fluxo:
+
+1. O front envia e-mail e senha para `POST /bff/auth/entrar`.
+2. O BFF autentica no provedor (serviço de auth interno, Supabase Auth, um IdP OAuth) e recebe os tokens.
+3. O BFF grava um cookie `httpOnly`, `Secure`, `SameSite=Lax` com a sessão (um id de sessão guardado no Redis, ou o próprio token criptografado).
+4. Nas próximas chamadas, o navegador envia o cookie automaticamente; o guard do BFF recupera o token e o repassa às APIs internas.
+
+```ts
+// apps/bff/src/auth/auth.controller.ts
+import { Body, Controller, HttpCode, Post, Res } from "@nestjs/common";
+import type { Response } from "express";
+import { IsEmail, IsString, MinLength } from "class-validator";
+import { AuthService } from "./auth.service";
+
+class EntrarDto {
+  @IsEmail() email!: string;
+  @IsString() @MinLength(8) senha!: string;
+}
+
+@Controller("auth")
+export class AuthController {
+  constructor(private readonly auth: AuthService) {}
+
+  @Post("entrar")
+  @HttpCode(204)
+  async entrar(@Body() dto: EntrarDto, @Res({ passthrough: true }) res: Response) {
+    const sessaoId = await this.auth.entrar(dto.email, dto.senha); // guarda tokens no Redis
+    res.cookie("quitanda_sessao", sessaoId, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      path: "/",
+      maxAge: 1000 * 60 * 60 * 8,
+    });
+  }
+  // POST /bff/auth/sair apaga a sessão no Redis e chama res.clearCookie("quitanda_sessao")
+}
+```
+
+```ts
+// apps/bff/src/auth/sessao.guard.ts
+import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
+import { AuthService } from "./auth.service";
+
+@Injectable()
+export class SessaoGuard implements CanActivate {
+  constructor(private readonly auth: AuthService) {}
+
+  async canActivate(contexto: ExecutionContext) {
+    const req = contexto.switchToHttp().getRequest();
+    const sessaoId = req.cookies?.quitanda_sessao;
+    if (!sessaoId) throw new UnauthorizedException();
+    const token = await this.auth.tokenDaSessao(sessaoId); // renova se estiver perto de expirar
+    if (!token) throw new UnauthorizedException();
+    req.token = token;
+    return true;
+  }
+}
+```
+
+Como o cookie vai automaticamente, qualquer rota que **altera** dados precisa de proteção contra CSRF. `SameSite=Lax` já bloqueia `POST` vindo de outros sites na maioria dos casos; para defesa em profundidade, exija um cabeçalho customizado (por exemplo, `X-Quitanda-Csrf`) ou um token CSRF, o que o capítulo de OWASP detalha.
+
+Para o cookie funcionar sem dor de CORS, o front e o BFF devem parecer o mesmo site. A forma mais simples no Next.js é um rewrite:
+
+```ts
+// apps/loja/next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  async rewrites() {
+    return [{ source: "/bff/:caminho*", destination: `${process.env.BFF_URL}/bff/:caminho*` }];
+  },
+};
+
+export default config;
+```
+
+O navegador chama `/bff/pedidos/123` na mesma origem da loja, e o Next.js repassa ao BFF.
+
+## Cache no BFF
+
+O catálogo muda poucas vezes por dia e é igual para todos. Cache de 60 segundos no BFF tira carga do serviço de catálogo sem impacto perceptível.
+
+```ts
+// apps/bff/src/app.module.ts
+import { Module } from "@nestjs/common";
+import { CacheModule } from "@nestjs/cache-manager";
+import { createKeyv } from "@keyv/redis";
+import { IntegracoesModule } from "./integracoes/integracoes.module";
+import { AuthModule } from "./auth/auth.module";
+import { PedidosModule } from "./pedidos/pedidos.module";
+import { CatalogoModule } from "./catalogo/catalogo.module";
+
+@Module({
+  imports: [
+    CacheModule.registerAsync({
+      isGlobal: true,
+      useFactory: () => ({
+        ttl: 60_000, // milissegundos nas versões atuais do cache-manager
+        stores: process.env.REDIS_URL ? [createKeyv(process.env.REDIS_URL)] : undefined,
+      }),
+    }),
+    IntegracoesModule,
+    AuthModule,
+    PedidosModule,
+    CatalogoModule,
+  ],
+})
+export class AppModule {}
+```
+
+```ts
+// apps/bff/src/catalogo/catalogo.controller.ts
+import { Controller, Get, Query, UseInterceptors } from "@nestjs/common";
+import { CacheInterceptor, CacheTTL } from "@nestjs/cache-manager";
+import { CatalogoClient } from "../integracoes/catalogo.client";
+
+@Controller("catalogo")
+@UseInterceptors(CacheInterceptor)
+export class CatalogoController {
+  constructor(private readonly catalogo: CatalogoClient) {}
+
+  @Get()
+  @CacheTTL(60_000)
+  listar(@Query("categoria") categoria?: string) {
+    return this.catalogo.listar(categoria);
+  }
+}
+```
+
+O `CacheInterceptor` usa a URL como chave e só atua em `GET`. Sem Redis, o cache é em memória por instância: com três réplicas do BFF, são três caches. Com Redis, todas compartilham.
+
+| Dado | Cache no BFF | Motivo |
+|---|---|---|
+| Catálogo e categorias | Sim, 1 a 5 min | Igual para todos, muda pouco |
+| Frete por CEP | Sim, por CEP, 1 h | Caro de calcular, estável |
+| Detalhe do pedido | Não (ou poucos segundos, por usuário) | Dado pessoal e volátil |
+| Carrinho | Não | Muda a cada clique |
+
+<Callout type="warning" title="Cache e dado pessoal não combinam por padrão">
+O `CacheInterceptor` usa a URL como chave. Se `/bff/pedidos/meus` for cacheado, o segundo cliente recebe os pedidos do primeiro. Nunca aplique o interceptor em rotas que dependem do usuário sem incluir o usuário na chave (sobrescrevendo `trackBy`) ou, melhor, não cacheie essas rotas.
+</Callout>
+
+## Contrato tipado com o front
+
+O BFF e o front estão no mesmo monorepo, então o contrato pode ser código compartilhado. Um pacote `@quitanda/contratos` com schemas Zod serve aos dois lados: o BFF tipa a resposta, o front valida o que recebe.
+
+```ts
+// packages/contratos/src/pedidos.ts
+import { z } from "zod";
+
+export const StatusDoPedido = z.enum(["recebido", "separando", "saiu_para_entrega", "entregue"]);
+
+export const DetalheDoPedido = z.object({
+  id: z.string().uuid(),
+  status: StatusDoPedido,
+  itens: z.array(
+    z.object({
+      produtoId: z.string(),
+      nome: z.string(),
+      foto: z.string().url().nullable(),
+      quantidade: z.number().positive(),
+      unidade: z.enum(["kg", "un"]),
+    }),
+  ),
+  pagamento: z.enum(["aprovado", "pendente", "recusado", "indisponivel"]),
+  previsaoDeEntrega: z.string().datetime().nullable(),
+});
+
+export type DetalheDoPedido = z.infer<typeof DetalheDoPedido>;
+```
+
+```ts
+// apps/loja/src/adaptadores/http/bff.ts
+import { DetalheDoPedido } from "@quitanda/contratos";
+
+export async function buscarDetalheDoPedido(id: string) {
+  const resposta = await fetch(`/bff/pedidos/${id}`, { credentials: "include" });
+  if (!resposta.ok) throw new Error(`BFF respondeu ${resposta.status}`);
+  return DetalheDoPedido.parse(await resposta.json());
+}
+```
+
+Se o BFF mudar o formato, o TypeScript acusa no build do front; se uma versão antiga do BFF ainda estiver no ar, o `parse` falha com uma mensagem clara em vez de um `undefined` na tela. Quando o BFF é consumido por um time fora do monorepo (o app móvel em outro repositório), a alternativa é gerar um documento OpenAPI com `@nestjs/swagger` e os tipos do cliente a partir dele.
+
+## Testando o BFF
+
+O Nest traz utilitários para montar o módulo com dependências trocadas:
+
+```ts
+// apps/bff/src/pedidos/pedidos.service.spec.ts
+import { Test } from "@nestjs/testing";
+import { PedidosService } from "./pedidos.service";
+import { PedidosClient } from "../integracoes/pedidos.client";
+import { CatalogoClient } from "../integracoes/catalogo.client";
+import { PagamentosClient } from "../integracoes/pagamentos.client";
+import { EntregasClient } from "../integracoes/entregas.client";
+
+it("devolve o pedido mesmo se a transportadora falhar", async () => {
+  const modulo = await Test.createTestingModule({
+    providers: [
+      PedidosService,
+      { provide: PedidosClient, useValue: { buscar: async () => ({ id: "p1", status: "separando", clienteId: "c1", itens: [] }) } },
+      { provide: CatalogoClient, useValue: { buscarVarios: async () => new Map() } },
+      { provide: PagamentosClient, useValue: { status: async () => ({ situacao: "aprovado" }) } },
+      { provide: EntregasClient, useValue: { previsao: async () => { throw new Error("timeout"); } } },
+    ],
+  }).compile();
+
+  const detalhe = await modulo.get(PedidosService).detalhe("p1", "token");
+  expect(detalhe.previsaoDeEntrega).toBeNull();
+  expect(detalhe.pagamento).toBe("aprovado");
+});
+```
+
+## Na entrevista
+
+**O que é um BFF e quando usar?** É um back-end dedicado a uma experiência de front-end, mantido pelo time do front. Uso quando a tela precisa agregar várias APIs, quando há segredos que não podem ir ao navegador, ou quando clientes diferentes (web, app) precisam de formatos diferentes dos mesmos dados.
+
+**Qual a diferença entre BFF e API Gateway?** O gateway é genérico e transversal: roteamento, TLS, rate limit, autenticação básica para todos os clientes. O BFF é específico de um cliente e conhece as telas. Normalmente o BFF fica atrás do gateway.
+
+**Como o BFF melhora a segurança da autenticação?** Os tokens ficam no servidor; o navegador só tem um cookie `httpOnly`, inacessível a JavaScript, o que reduz o impacto de XSS. O BFF troca o cookie pelo token ao chamar as APIs internas. Em contrapartida, é preciso proteger contra CSRF.
+
+**Como você evita que uma API lenta derrube o BFF?** Timeout em toda chamada, chamadas independentes em paralelo com `Promise.allSettled`, dados opcionais com valor de fallback e, para falhas recorrentes, circuit breaker.
+
+**Que riscos o cache no BFF traz?** Servir dado de um usuário para outro se a chave não incluir o usuário, e servir dado velho. Cacheio só dado público e estável, com TTL curto, e uso Redis quando há várias instâncias.
+
+## Pratique
+
+1. Crie `apps/bff` com o Nest CLI, configure prefixo global, `ValidationPipe` com `whitelist` e `cookie-parser`.
+2. Implemente `PedidosClient` e `CatalogoClient` contra o `json-server` dos capítulos anteriores, com timeout de 2 segundos.
+3. Escreva `GET /bff/pedidos/:id` agregando pedido, produtos e uma previsão de entrega simulada, e prove com um teste que a falha da entrega não derruba a resposta.
+4. Implemente login com cookie `httpOnly` e o `SessaoGuard`, e configure o rewrite no Next.js para chamar o BFF na mesma origem.
+5. Adicione cache de 60 segundos ao catálogo e meça, com logs, quantas chamadas chegam ao serviço de catálogo antes e depois.
+6. Crie o pacote `@quitanda/contratos` com o schema Zod do detalhe do pedido e use-o no BFF e no adaptador HTTP do front.
+
+<Quiz question="A tela de pedido precisa do pedido (obrigatório) e da previsão de entrega (opcional). Qual estratégia de agregação é mais adequada no BFF?" options={["Buscar tudo em sequência e falhar se qualquer chamada falhar","Buscar o pedido, depois os opcionais em paralelo com Promise.allSettled e valores de fallback","Deixar o front buscar a previsão de entrega direto na transportadora","Cachear a previsão por 24 horas para nunca depender da transportadora"]} answer={1} explanation="O dado obrigatório propaga erro; os opcionais rodam em paralelo e degradam com fallback, então uma falha parcial não derruba a tela." />
+
+<Quiz question="Por que guardar a sessão num cookie httpOnly emitido pelo BFF em vez de um token no localStorage?" options={["Cookies são mais rápidos que localStorage","O cookie dispensa HTTPS","O cookie httpOnly não pode ser lido por JavaScript, reduzindo o roubo de token via XSS","O cookie elimina a necessidade de autenticação nas APIs internas"]} answer={2} explanation="Scripts maliciosos não conseguem ler cookies httpOnly. O preço é proteger as rotas que alteram dados contra CSRF." />
+
+<Quiz question="O CacheInterceptor foi aplicado à rota que lista os pedidos do usuário logado. Qual o problema?" options={["A chave padrão é a URL, então um usuário pode receber os pedidos de outro","O interceptor só funciona com Redis","O Nest não permite cache em rotas com guard","Nenhum, o cache é sempre por usuário"]} answer={0} explanation="Sem incluir o usuário na chave, a mesma URL devolve a resposta cacheada do primeiro usuário para todos. Dados pessoais não devem usar o cache por URL." />
+
+## Base no CodeForge
+
+- [BFF (Backend for Frontend)](/learn/system-design/bff): o padrão do ponto de vista de arquitetura de sistemas.
+- [API Gateway](/learn/system-design/api-gateway) e [Circuit breaker](/learn/system-design/circuit-breaker): as peças ao redor do BFF.
+- [NestJS: adicionando funcionalidades com Redis, JWT e logging](/learn/carreira-nodejs/nestjs-adicionando-funcionalidades-redis-jwt-logging): Nest a fundo, do lado do back-end.
+- [Sessão vs token](/learn/system-design/sessao-vs-token): por que o BFF prefere sessão em cookie.
+- [React: integração com Supabase e arquitetura limpa](/learn/carreira-react/react-supabase-arquitetura-limpa): o adaptador HTTP que consome este BFF.
+
+## Referências
+
+- [NestJS: Modules](https://docs.nestjs.com/modules), [Controllers](https://docs.nestjs.com/controllers) e [Providers](https://docs.nestjs.com/providers)
+- [NestJS: Caching](https://docs.nestjs.com/techniques/caching)
+- [NestJS: Cookies](https://docs.nestjs.com/techniques/cookies)
+- [Sam Newman: Backends For Frontends](https://samnewman.io/patterns/architectural/bff/)
+- [MDN: Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)

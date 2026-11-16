@@ -1,0 +1,450 @@
+---
+title: "React: integração com Supabase e conceitos de arquitetura limpa na prática"
+kind: lesson
+---
+
+A Quitanda precisa de um back-end mais completo para o painel do lojista e para o acompanhamento de pedidos: banco relacional, autenticação, regras de acesso por usuário e notificações quando um pedido muda. O Supabase entrega tudo isso sobre um Postgres gerenciado, e o time de front consegue avançar sem esperar um back-end inteiro. O risco é conhecido: em poucas semanas, `supabase.from("pedidos")` aparece em 40 componentes, a regra de "pedido mínimo de R$ 30" está duplicada em três telas e trocar de fornecedor vira reescrita.
+
+Este capítulo faz as duas coisas juntas. Primeiro, integra o Supabase do jeito certo: Auth com cookies no Next.js, tabelas com Row Level Security, consultas tipadas e realtime. Depois, organiza o código com os conceitos de arquitetura limpa aplicados ao front: domínio, casos de uso, repositórios como portas e o Supabase como um adaptador entre outros. No fim, você troca o Supabase pelo BFF do próximo capítulo sem mexer em nenhum componente.
+
+**Você vai aprender:**
+
+- Configurar o cliente Supabase no Next.js para navegador e servidor com `@supabase/ssr`
+- Modelar tabelas da Quitanda e protegê-las com Row Level Security
+- Autenticar com Supabase Auth e ler o usuário de forma segura no servidor
+- Receber mudanças de pedidos em tempo real com Supabase Realtime
+- Separar domínio, casos de uso, repositórios e adaptadores no front
+- Trocar a fonte de dados sem reescrever a interface
+
+## O que o Supabase oferece
+
+| Peça | O que é | Uso na Quitanda |
+|---|---|---|
+| Banco | Postgres gerenciado, com SQL completo | Produtos, pedidos, itens, perfis |
+| API de dados | API REST gerada a partir do schema (PostgREST), acessada pelo `supabase-js` | Consultas do catálogo e do painel |
+| Auth | Cadastro, login por e-mail e senha, links mágicos, OAuth; emite JWT | Clientes e lojistas |
+| Row Level Security | Políticas do Postgres avaliadas por linha, usando o usuário do JWT | Cliente só vê os próprios pedidos |
+| Realtime | Assinatura de mudanças no banco, broadcast e presença por WebSocket | Status do pedido ao vivo |
+| Storage | Arquivos com políticas de acesso | Fotos dos produtos |
+
+O ponto central: o navegador fala **direto com o banco** pela API de dados, usando uma chave pública. Quem protege os dados não é o front, é o RLS. Sem RLS, a chave pública dá acesso à tabela inteira.
+
+## Configuração no Next.js
+
+```bash
+# .env.local (depois de npm install @supabase/supabase-js @supabase/ssr)
+NEXT_PUBLIC_SUPABASE_URL=https://xyzcompany.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=chave-publica-do-projeto
+```
+
+A chave pública (chamada de anon key nos projetos antigos e de publishable key nos novos) pode ir para o navegador. A chave `service_role` (ou secret key) ignora o RLS e **nunca** pode ter o prefixo `NEXT_PUBLIC_` nem aparecer em código de cliente.
+
+O pacote `@supabase/ssr` cria clientes que guardam a sessão em cookies, para que Server Components, Server Actions e o navegador enxerguem o mesmo usuário:
+
+```ts
+// src/adaptadores/supabase/clienteNavegador.ts
+import { createBrowserClient } from "@supabase/ssr";
+import type { Database } from "@/tipos/database";
+
+export const criarClienteNavegador = () =>
+  createBrowserClient<Database>(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!);
+```
+
+```ts
+// src/adaptadores/supabase/clienteServidor.ts
+import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
+import type { Database } from "@/tipos/database";
+
+export async function criarClienteServidor() {
+  const cookieStore = await cookies();
+  return createServerClient<Database>(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
+    cookies: {
+      getAll: () => cookieStore.getAll(),
+      setAll: (lista) => {
+        try {
+          lista.forEach(({ name, value, options }) => cookieStore.set(name, value, options));
+        } catch {
+          // chamado de um Server Component: quem renova a sessão é o proxy
+        }
+      },
+    },
+  });
+}
+```
+
+O guia oficial do Supabase para Next.js inclui também um `proxy.ts` (o antigo `middleware.ts`) que renova o token a cada requisição. Copie a versão do guia em vez de reescrever: os detalhes de cookies mudam entre versões.
+
+Os tipos do banco vêm do CLI, a partir do schema real:
+
+```bash
+npx supabase gen types typescript --project-id xyzcompany > src/tipos/database.ts
+```
+
+## Tabelas e Row Level Security
+
+```sql
+-- supabase/migrations/20261116_quitanda.sql
+create table produtos (
+  id uuid primary key default gen_random_uuid(),
+  nome text not null, categoria text not null, foto_url text,
+  preco_em_centavos integer not null check (preco_em_centavos > 0),
+  unidade text not null check (unidade in ('kg', 'un')),
+  estoque integer not null default 0
+);
+
+create table perfis (
+  id uuid primary key references auth.users on delete cascade, nome text,
+  papel text not null default 'cliente' check (papel in ('cliente', 'lojista'))
+);
+
+create table pedidos (
+  id uuid primary key default gen_random_uuid(),
+  cliente_id uuid not null references auth.users default auth.uid(),
+  status text not null default 'recebido'
+    check (status in ('recebido', 'separando', 'saiu_para_entrega', 'entregue')),
+  total_em_centavos integer not null,
+  criado_em timestamptz not null default now()
+);
+-- itens_do_pedido (pedido_id, produto_id, quantidade, preco_em_centavos) segue o mesmo padrão
+```
+
+Agora as políticas. Com RLS ligado e nenhuma política, ninguém acessa nada pela API: o padrão é negar.
+
+```sql
+-- supabase/migrations/20261116_rls.sql
+alter table produtos enable row level security;
+alter table pedidos enable row level security;
+alter table perfis enable row level security;
+
+-- catálogo é público para leitura
+create policy "catálogo visível" on produtos for select using (true);
+
+-- cliente vê e cria só os próprios pedidos
+create policy "cliente lê seus pedidos" on pedidos for select
+  using ((select auth.uid()) = cliente_id);
+
+create policy "cliente cria seus pedidos" on pedidos for insert
+  with check ((select auth.uid()) = cliente_id);
+
+-- lojista vê todos e altera o status
+create policy "lojista lê pedidos" on pedidos for select
+  using (exists (select 1 from perfis where id = (select auth.uid()) and papel = 'lojista'));
+
+create policy "lojista atualiza status" on pedidos for update
+  using (exists (select 1 from perfis where id = (select auth.uid()) and papel = 'lojista'));
+```
+
+`using` filtra as linhas que a operação enxerga; `with check` valida as linhas que a operação grava. Envolver `auth.uid()` num `select` é uma recomendação de performance do Supabase: o valor é calculado uma vez por consulta, não uma vez por linha. Crie índice nas colunas usadas nas políticas (`cliente_id`).
+
+<Callout type="warning" title="RLS é a sua autorização">
+Esconder o botão "Alterar status" para clientes não protege nada: qualquer pessoa pode abrir o console e chamar a API com a chave pública. Toda regra de acesso precisa estar numa política RLS (ou num back-end). Teste as políticas logando como cliente e tentando ler pedidos de outra pessoa.
+</Callout>
+
+Regras que envolvem várias tabelas, como "baixar o estoque e criar o pedido de forma atômica", ficam melhor numa função do Postgres chamada por `supabase.rpc("finalizar_pedido", ...)` ou numa Edge Function, em vez de três chamadas soltas do navegador.
+
+## Auth na prática
+
+Login com Server Action:
+
+```ts
+// src/app/entrar/actions.ts
+"use server";
+import { redirect } from "next/navigation";
+import { criarClienteServidor } from "@/adaptadores/supabase/clienteServidor";
+
+export async function entrar(_estado: { erro?: string }, formData: FormData) {
+  const supabase = await criarClienteServidor();
+  const credenciais = { email: String(formData.get("email")), password: String(formData.get("senha")) };
+  const { error } = await supabase.auth.signInWithPassword(credenciais);
+  if (error) return { erro: "E-mail ou senha inválidos" };
+  redirect("/pedidos");
+}
+```
+
+O formulário usa `useActionState(entrar, {})`, como no Nível 2. No servidor, para decidir acesso, use `supabase.auth.getUser()`, que valida o token com o Supabase. `getSession()` lê o que está no cookie sem validar e não deve ser a base de uma decisão de autorização no servidor.
+
+```tsx
+// src/app/pedidos/page.tsx
+import { redirect } from "next/navigation";
+import { criarClienteServidor } from "@/adaptadores/supabase/clienteServidor";
+
+export default async function PaginaDePedidos() {
+  const supabase = await criarClienteServidor();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/entrar");
+  const { data: pedidos } = await supabase.from("pedidos").select("id, status, total_em_centavos, criado_em");
+  return <ListaDePedidos pedidos={pedidos ?? []} />;
+}
+```
+
+Repare que a consulta não filtra por `cliente_id`: o RLS já garante que só voltam os pedidos do usuário logado.
+
+No navegador, `onAuthStateChange` avisa quando o usuário entra, sai ou o token é renovado, útil para atualizar o cabeçalho sem recarregar.
+
+## Realtime: pedidos mudando ao vivo
+
+Para receber mudanças do banco, a tabela precisa estar na publicação do Realtime:
+
+```sql
+alter publication supabase_realtime add table pedidos;
+```
+
+No navegador, você cria um canal com `supabase.channel("pedido-123")`, registra `.on("postgres_changes", ...)` com filtro `id=eq.123` para eventos `UPDATE` da tabela `pedidos` e chama `.subscribe()`. Ao desmontar, `supabase.removeChannel(canal)` encerra a assinatura. O código completo aparece no adaptador `RepositorioDePedidosSupabase`, mais abaixo, porque é lá que ele deve morar.
+
+As políticas RLS também valem para o Realtime de `postgres_changes`: o cliente só recebe eventos de linhas que ele pode ler. Para eventos que não são mudanças de tabela (por exemplo, "entregador a 2 minutos"), o canal tem `broadcast`; para "quem está online no painel", `presence`. O capítulo de Socket.io resolve o mesmo problema com um servidor próprio, e a comparação entre os dois é uma boa decisão para um ADR.
+
+## Arquitetura limpa no front
+
+Até aqui, o Supabase está espalhado: Server Components chamam `from("pedidos")`, o checkout chama `rpc`, o hook de status chama `channel`. A arquitetura limpa organiza isso com uma regra só: **as dependências apontam para dentro**. O núcleo (regras do negócio) não sabe que existe React, Next.js ou Supabase.
+
+| Camada | Pasta | Contém | Pode importar |
+|---|---|---|---|
+| Domínio | `src/dominio/` | Tipos e regras puras: `Pedido`, `calcularTotal`, `podeFinalizar` | Nada de fora |
+| Casos de uso | `src/casos-de-uso/` | Fluxos da aplicação: `finalizarPedido`, `acompanharPedido` | Domínio e portas |
+| Portas | `src/dominio/portas.ts` | Interfaces: `RepositorioDePedidos`, `RepositorioDeProdutos` | Domínio |
+| Adaptadores | `src/adaptadores/` | Implementações: Supabase, HTTP, memória | Portas, SDKs |
+| Interface | `src/app/`, `src/componentes/`, `src/hooks/` | Componentes e hooks que chamam casos de uso | Casos de uso, composição |
+
+### Domínio e portas
+
+```ts
+// src/dominio/pedido.ts
+export type StatusDoPedido = "recebido" | "separando" | "saiu_para_entrega" | "entregue";
+
+export type ItemDoCarrinho = { produtoId: string; quantidade: number; precoEmCentavos: number };
+
+export type Pedido = {
+  id: string;
+  status: StatusDoPedido;
+  itens: ItemDoCarrinho[];
+  totalEmCentavos: number;
+  criadoEm: Date;
+};
+
+export const PEDIDO_MINIMO_EM_CENTAVOS = 3000;
+
+export function calcularTotal(itens: ItemDoCarrinho[]) {
+  return itens.reduce((soma, item) => soma + Math.round(item.precoEmCentavos * item.quantidade), 0);
+}
+
+export function validarCarrinho(itens: ItemDoCarrinho[]): string | null {
+  if (itens.length === 0) return "O carrinho está vazio";
+  if (calcularTotal(itens) < PEDIDO_MINIMO_EM_CENTAVOS) return "O pedido mínimo é de R$ 30,00";
+  return null;
+}
+```
+
+```ts
+// src/dominio/portas.ts
+import type { ItemDoCarrinho, Pedido, StatusDoPedido } from "./pedido";
+
+export interface RepositorioDePedidos {
+  criar(itens: ItemDoCarrinho[]): Promise<Pedido>;
+  listarDoCliente(): Promise<Pedido[]>;
+  assinarStatus(pedidoId: string, aoMudar: (status: StatusDoPedido) => void): () => void;
+}
+```
+
+A interface fala a língua do domínio (`Pedido`, `StatusDoPedido`, camelCase), não a do banco (`total_em_centavos`, `snake_case`).
+
+### Caso de uso
+
+```ts
+// src/casos-de-uso/finalizarPedido.ts
+import { validarCarrinho, type ItemDoCarrinho, type Pedido } from "@/dominio/pedido";
+import type { RepositorioDePedidos } from "@/dominio/portas";
+
+export type ResultadoFinalizar = { ok: true; pedido: Pedido } | { ok: false; erro: string };
+
+export function criarFinalizarPedido(pedidos: RepositorioDePedidos) {
+  return async function finalizarPedido(itens: ItemDoCarrinho[]): Promise<ResultadoFinalizar> {
+    const erro = validarCarrinho(itens);
+    if (erro) return { ok: false, erro };
+    const pedido = await pedidos.criar(itens);
+    return { ok: true, pedido };
+  };
+}
+```
+
+O caso de uso recebe o repositório por parâmetro (inversão de dependência, como no capítulo de SOLID) e não importa nada do Supabase.
+
+### Adaptador Supabase
+
+```ts
+// src/adaptadores/supabase/RepositorioDePedidosSupabase.ts
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/tipos/database";
+import type { RepositorioDePedidos } from "@/dominio/portas";
+import type { Pedido, StatusDoPedido } from "@/dominio/pedido";
+
+type LinhaPedido = Database["public"]["Tables"]["pedidos"]["Row"];
+
+const paraDominio = (linha: LinhaPedido): Pedido => ({
+  id: linha.id,
+  status: linha.status as StatusDoPedido,
+  itens: [],
+  totalEmCentavos: linha.total_em_centavos,
+  criadoEm: new Date(linha.criado_em),
+});
+
+export function criarRepositorioDePedidosSupabase(supabase: SupabaseClient<Database>): RepositorioDePedidos {
+  return {
+    async criar(itens) {
+      const { data, error } = await supabase.rpc("finalizar_pedido", { itens });
+      if (error) throw new Error(error.message);
+      return paraDominio(data as LinhaPedido);
+    },
+    async listarDoCliente() {
+      const { data, error } = await supabase.from("pedidos").select("*").order("criado_em", { ascending: false });
+      if (error) throw new Error(error.message);
+      return data.map(paraDominio);
+    },
+    assinarStatus(pedidoId, aoMudar) {
+      const canal = supabase
+        .channel(`pedido-${pedidoId}`)
+        .on("postgres_changes", { event: "UPDATE", schema: "public", table: "pedidos", filter: `id=eq.${pedidoId}` }, (p) =>
+          aoMudar(p.new.status as StatusDoPedido),
+        )
+        .subscribe();
+      return () => void supabase.removeChannel(canal);
+    },
+  };
+}
+```
+
+A função `paraDominio` é a fronteira: tudo que é `snake_case` e detalhe do Supabase morre aqui.
+
+### Composição e uso na interface
+
+Um único arquivo decide qual adaptador usar. É o "composition root":
+
+```ts
+// src/composicao/navegador.ts
+import { criarClienteNavegador } from "@/adaptadores/supabase/clienteNavegador";
+import { criarRepositorioDePedidosSupabase } from "@/adaptadores/supabase/RepositorioDePedidosSupabase";
+import { criarFinalizarPedido } from "@/casos-de-uso/finalizarPedido";
+
+const repositorioDePedidos = criarRepositorioDePedidosSupabase(criarClienteNavegador());
+
+export const casosDeUso = {
+  finalizarPedido: criarFinalizarPedido(repositorioDePedidos),
+  assinarStatus: repositorioDePedidos.assinarStatus,
+};
+```
+
+Na interface, o hook `useFinalizarPedido` em `src/hooks/useFinalizarPedido.ts` é só `useMutation({ mutationFn: casosDeUso.finalizarPedido })`. O componente `Checkout` chama o hook e mostra `erro` ou redireciona. Ele não sabe de onde vêm os dados.
+
+### Testar sem banco
+
+```ts
+// src/adaptadores/memoria/RepositorioDePedidosEmMemoria.ts
+import type { RepositorioDePedidos } from "@/dominio/portas";
+import { calcularTotal, type Pedido } from "@/dominio/pedido";
+
+export function criarRepositorioEmMemoria(): RepositorioDePedidos & { pedidos: Pedido[] } {
+  const pedidos: Pedido[] = [];
+  const criar = async (itens: Pedido["itens"]) => {
+    const pedido: Pedido = { id: String(pedidos.length + 1), status: "recebido", itens, totalEmCentavos: calcularTotal(itens), criadoEm: new Date() };
+    pedidos.push(pedido);
+    return pedido;
+  };
+  return { pedidos, criar, listarDoCliente: async () => pedidos, assinarStatus: () => () => {} };
+}
+```
+
+```ts
+// src/casos-de-uso/finalizarPedido.test.ts
+test("recusa pedido abaixo do mínimo", async () => {
+  const repo = criarRepositorioEmMemoria();
+  const finalizar = criarFinalizarPedido(repo);
+  const resultado = await finalizar([{ produtoId: "tomate", quantidade: 1, precoEmCentavos: 899 }]);
+  expect(resultado).toEqual({ ok: false, erro: "O pedido mínimo é de R$ 30,00" });
+  expect(repo.pedidos).toHaveLength(0);
+});
+```
+
+Teste de regra de negócio em milissegundos, sem Supabase, sem MSW, sem React.
+
+## Trocar o Supabase sem reescrever a UI
+
+No próximo capítulo, a Quitanda ganha um BFF em NestJS que agrega pedidos, pagamento e frete. A troca é um adaptador novo e uma linha no composition root:
+
+```ts
+// src/adaptadores/http/RepositorioDePedidosHttp.ts
+import type { RepositorioDePedidos } from "@/dominio/portas";
+import type { Pedido } from "@/dominio/pedido";
+
+export function criarRepositorioDePedidosHttp(baseUrl: string): RepositorioDePedidos {
+  const paraDominio = (p: Omit<Pedido, "criadoEm"> & { criadoEm: string }): Pedido => ({ ...p, criadoEm: new Date(p.criadoEm) });
+  return {
+    async criar(itens) {
+      const init = { method: "POST", credentials: "include" as const, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itens }) };
+      const r = await fetch(`${baseUrl}/pedidos`, init);
+      if (!r.ok) throw new Error("Falha ao criar pedido");
+      return paraDominio(await r.json());
+    },
+    async listarDoCliente() {
+      const r = await fetch(`${baseUrl}/pedidos`, { credentials: "include" });
+      return (await r.json()).map(paraDominio);
+    },
+    assinarStatus: () => () => {}, // implementado com Socket.io no capítulo de eventos
+  };
+}
+```
+
+```ts
+// src/composicao/navegador.ts (trecho)
+const repositorioDePedidos = process.env.NEXT_PUBLIC_USAR_BFF === "1"
+  ? criarRepositorioDePedidosHttp(process.env.NEXT_PUBLIC_BFF_URL!)
+  : criarRepositorioDePedidosSupabase(criarClienteNavegador());
+```
+
+Componentes, hooks, casos de uso e testes de domínio não mudam. Com a variável como feature flag, dá para migrar aos poucos.
+
+<Callout type="tip" title="Quanto de arquitetura limpa vale a pena">
+Para um CRUD simples de categorias no painel, chamar o Supabase direto num Server Component é aceitável. Reserve domínio, casos de uso e portas para o que tem regra de negócio e chance real de mudar de fonte: checkout, pedidos, pagamento. Arquitetura limpa aplicada a tudo vira cerimônia.
+</Callout>
+
+## Na entrevista
+
+**Se a chave do Supabase fica no navegador, o que protege os dados?** O Row Level Security. A chave pública só identifica o projeto; cada consulta roda com o usuário do JWT, e as políticas do Postgres decidem linha a linha o que ele pode ler e gravar. A chave `service_role` ignora RLS e nunca vai para o cliente.
+
+**Qual a diferença entre `using` e `with check` numa política?** `using` filtra as linhas existentes que a operação pode ver ou alterar; `with check` valida as linhas novas ou alteradas que a operação tenta gravar. Um `insert` usa `with check`; um `update` pode usar os dois.
+
+**Por que usar `getUser` e não `getSession` no servidor?** `getSession` lê a sessão do cookie sem validar com o servidor de Auth, e o cookie pode ter sido adulterado. `getUser` valida o token, então é o adequado para decisões de autorização no servidor.
+
+**O que é a regra de dependência da arquitetura limpa?** As dependências apontam para dentro: domínio não importa nada; casos de uso importam domínio e portas; adaptadores implementam portas. Assim, React, Next.js e Supabase são detalhes trocáveis.
+
+**Como você trocaria o Supabase por uma API própria sem reescrever a UI?** Com repositórios como portas: escrevo um adaptador HTTP que implementa a mesma interface e troco a composição num único arquivo, opcionalmente atrás de uma feature flag.
+
+## Pratique
+
+1. Crie o projeto no Supabase, aplique as migrações de produtos, perfis, pedidos e itens, e gere os tipos com o CLI.
+2. Escreva as políticas RLS e prove que funcionam: logado como cliente A, tente ler um pedido do cliente B pela API e confirme que nada volta.
+3. Implemente login e logout com Server Actions e proteja `/pedidos` com `getUser`.
+4. Crie a função `finalizar_pedido` no Postgres que baixa o estoque e cria o pedido numa transação, e chame-a pelo adaptador.
+5. Extraia domínio, portas, caso de uso e o adaptador Supabase dos pedidos, e escreva três testes do caso de uso com o repositório em memória.
+6. Ligue o realtime da tabela `pedidos` e mostre o status mudando na tela quando o lojista altera o pedido no painel.
+
+<Quiz question="Uma tabela tem RLS ativado e nenhuma política criada. O que acontece com consultas feitas com a chave pública?" options={["Retornam todas as linhas","Retornam apenas as linhas do usuário logado","Não retornam nenhuma linha, pois o padrão é negar","Dão erro de sintaxe"]} answer={2} explanation="Com RLS ligado, sem política que permita, o acesso pela API é negado. É preciso criar políticas explícitas." />
+
+<Quiz question="Na arquitetura limpa aplicada à Quitanda, onde fica a regra de pedido mínimo de R$ 30?" options={["No domínio, numa função pura usada pelo caso de uso","No componente Checkout","No adaptador do Supabase","No arquivo de variáveis de ambiente"]} answer={0} explanation="Regras de negócio ficam no domínio, independentes de React e do banco, e podem ser testadas sem infraestrutura." />
+
+<Quiz question="Qual é o papel da função paraDominio no adaptador Supabase?" options={["Validar o JWT do usuário","Converter a linha do banco para o tipo de domínio, isolando nomes e formatos do Supabase","Criar o canal de realtime","Gerar os tipos do banco"]} answer={1} explanation="Ela é a fronteira entre o formato do banco e o domínio. Nada além do adaptador conhece snake_case ou tipos do Supabase." />
+
+## Base no CodeForge
+
+- [Arquitetura hexagonal](/learn/system-design/hexagonal): portas e adaptadores, a mesma ideia do lado do servidor.
+- [Repository](/learn/lld/repository): o padrão por trás dos repositórios de pedidos.
+- [SOLID aplicado ao React](/learn/carreira-react/solid-react-modularidade-flexibilidade): inversão de dependência, base deste capítulo.
+- [React: implementando técnicas seguras de autenticação](/learn/carreira-react/react-tecnicas-seguras-autenticacao): cookies, sessões e proteção de rotas no Next.js.
+- [JWT](/learn/system-design/jwt): o token que o Supabase Auth emite e o RLS lê.
+
+## Referências
+
+- [Supabase: Use Supabase with Next.js](https://supabase.com/docs/guides/getting-started/quickstarts/nextjs)
+- [Supabase: Server-Side Auth for Next.js](https://supabase.com/docs/guides/auth/server-side/nextjs)
+- [Supabase: Row Level Security](https://supabase.com/docs/guides/database/postgres/row-level-security)
+- [Supabase: Postgres Changes (Realtime)](https://supabase.com/docs/guides/realtime/postgres-changes)
+- [Robert C. Martin: The Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)

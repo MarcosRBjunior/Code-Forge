@@ -1,0 +1,301 @@
+---
+title: "React: explorando monitorações sintéticas e alertas avançados com New Relic"
+kind: lesson
+---
+
+Às 4h50 de um domingo, um certificado expirou no domínio do gateway de pagamento usado pelo checkout da Quitanda. Ninguém comprava naquele horário, então o RUM não registrou nada: sem usuários, não há eventos. O primeiro cliente tentou pagar às 7h12, viu um erro genérico e desistiu. O alerta de taxa de erros disparou às 7h40, quando já havia tráfego suficiente para a taxa subir. Quase três horas de checkout quebrado, uma delas com clientes reais perdidos.
+
+O monitoramento de usuários reais só enxerga o que os usuários fazem. Para saber se a loja funciona **antes** que alguém tente, você precisa de usuários robôs: monitores sintéticos que abrem o site, navegam e compram, de várias cidades, a cada poucos minutos. Este capítulo cria os monitores da Quitanda, do ping simples ao script que simula a compra inteira, define objetivos de nível de serviço (SLOs) com orçamento de erro, usa alertas de anomalia para métricas com sazonalidade e fecha com runbooks que dizem a quem recebe o alerta o que fazer.
+
+**Você vai aprender:**
+
+- Escolher entre monitores ping, browser, scripted browser, scripted API e checagem de certificado
+- Escrever um monitor scripted browser que simula a compra na Quitanda com credenciais seguras
+- Escolher localizações públicas e privadas e alertar por falha em várias localizações
+- Definir SLIs, SLOs e orçamento de erro com Service Levels e alertar pela taxa de consumo
+- Usar condições de anomalia para métricas com sazonalidade
+- Escrever runbooks curtos e acionáveis para cada alerta crítico
+
+## Sintético e real: dois olhares complementares
+
+| | Monitoramento sintético | RUM (Browser) |
+|---|---|---|
+| Quem gera o dado | Robôs com roteiro, em intervalos fixos | Usuários reais |
+| Funciona sem tráfego | Sim, às 4h50 de domingo | Não |
+| Representa a experiência real | Parcialmente: aparelho, rede e caminho fixos | Sim |
+| Detecta | Indisponibilidade, fluxo quebrado, certificado, regressão de performance numa condição controlada | Erros por navegador, Web Vitals de campo, impacto em conversão |
+| Linha de base estável | Sim, mesmas condições sempre | Varia com o tráfego |
+
+Os dois juntos fecham o quadro: o sintético responde "a loja funciona agora?" e o RUM responde "como está sendo a experiência de quem usa?".
+
+## Tipos de monitor
+
+| Monitor | O que faz | Uso na Quitanda |
+|---|---|---|
+| Ping | Requisição HTTP simples; valida status e, opcionalmente, um texto na resposta | Home da loja, `/bff/saude`, app do entregador |
+| Simple browser | Abre a URL num Chrome real e carrega a página completa com seus recursos | Página do catálogo: detecta JS, CSS ou imagem quebrados |
+| Step monitor | Sequência de passos configurada na interface, sem código | Fluxos simples, mantidos por quem não programa |
+| Scripted browser | Script JavaScript que controla o navegador (Selenium WebDriver) | Compra completa: catálogo, carrinho, login, pagamento |
+| Scripted API | Script que faz chamadas HTTP e valida as respostas | Contrato do BFF: catálogo, frete por CEP, criação de pedido |
+| Certificate check | Avisa dias antes de um certificado TLS expirar | Domínio da loja, do BFF e dos parceiros críticos |
+| Broken links | Verifica links de uma página | Páginas institucionais e de campanha |
+
+O incidente do domingo seria evitado por um certificate check no domínio do parceiro (alerta 30 dias antes) e detectado em minutos por um scripted browser comprando a cada 10 minutos.
+
+## Monitor ping para disponibilidade
+
+O mais barato e o primeiro a configurar. Para o BFF, crie uma rota de saúde que verifique as dependências essenciais:
+
+```ts
+// apps/bff/src/saude/saude.controller.ts
+import { Controller, Get, ServiceUnavailableException } from "@nestjs/common";
+import { PedidosClient } from "../integracoes/pedidos.client";
+import { CatalogoClient } from "../integracoes/catalogo.client";
+
+@Controller("saude")
+export class SaudeController {
+  constructor(private readonly pedidos: PedidosClient, private readonly catalogo: CatalogoClient) {}
+
+  @Get()
+  async verificar() {
+    // ping(): GET simples em cada API interna, com timeout de 1 s
+    const resultados = await Promise.allSettled([this.pedidos.ping(), this.catalogo.ping()]);
+    const falhas = resultados.filter((r) => r.status === "rejected").length;
+    if (falhas > 0) throw new ServiceUnavailableException({ status: "degradado", falhas });
+    return { status: "ok" };
+  }
+}
+```
+
+No monitor ping, configure a URL `https://quitanda.com.br/bff/saude`, frequência de 1 minuto, validação do texto `"ok"` e pelo menos três localizações. A rota de saúde não deve exigir autenticação nem expor detalhes internos (versões, nomes de hosts).
+
+## Scripted browser: o robô que compra
+
+O monitor mais valioso da Quitanda percorre o fluxo que gera receita. O script roda num Chrome controlado pelo New Relic, com os objetos globais `$webDriver` (a sessão do navegador), `$selenium` (os utilitários do Selenium, como `By` e `until`) e `$secure` (credenciais seguras).
+
+```js
+// synthetics/compra-completa.js
+const { By, until } = $selenium;
+const ESPERA = 15000;
+const BASE = "https://quitanda.com.br";
+
+async function clicar(seletor) {
+  const elemento = await $webDriver.wait(until.elementLocated(By.css(seletor)), ESPERA);
+  await $webDriver.wait(until.elementIsVisible(elemento), ESPERA);
+  await elemento.click();
+}
+
+// 1. Catálogo
+await $webDriver.get(`${BASE}/catalogo?categoria=frutas`);
+await clicar('[data-testid="cartao-produto"] [data-testid="adicionar"]');
+
+// 2. Carrinho
+await clicar('[data-testid="abrir-carrinho"]');
+await clicar('[data-testid="ir-para-checkout"]');
+
+// 3. Login com conta sintética
+await $webDriver.wait(until.elementLocated(By.css('input[name="email"]')), ESPERA);
+await $webDriver.findElement(By.css('input[name="email"]')).sendKeys($secure.QUITANDA_SINTETICO_EMAIL);
+await $webDriver.findElement(By.css('input[name="senha"]')).sendKeys($secure.QUITANDA_SINTETICO_SENHA);
+await clicar('button[type="submit"]');
+
+// 4. Endereço e pagamento com cartão de teste
+await clicar('[data-testid="endereco-salvo"]');
+await clicar('[data-testid="continuar"]');
+await clicar('[data-testid="pagar-cartao-teste"]');
+
+// 5. Confirmação
+const confirmacao = await $webDriver.wait(until.elementLocated(By.css('[data-testid="pedido-confirmado"]')), 30000);
+const texto = await confirmacao.getText();
+if (!texto.includes("confirmado")) {
+  throw new Error(`Texto inesperado na confirmação: ${texto}`);
+}
+```
+
+Cuidados que tornam esse monitor confiável e seguro:
+
+- **Seletores estáveis.** Use `data-testid`, os mesmos dos testes Playwright. Classes do Tailwind e textos mudam com o design; o monitor não deveria falhar porque o botão virou "Adicionar à cesta".
+- **Esperas explícitas**, nunca pausas fixas. `until.elementLocated` e `until.elementIsVisible` esperam o necessário e falham com mensagem clara.
+- **Conta e pagamento de teste.** O BFF reconhece a conta sintética, usa o modo de teste do gateway, não baixa estoque real e cancela o pedido automaticamente. Sem isso, o robô gera 144 pedidos falsos por dia para o lojista separar.
+- **Credenciais em `$secure`**, cadastradas como secure credentials no New Relic, nunca no texto do script.
+- **Um fluxo por monitor.** Se o monitor de compra também testa busca, cupom e favoritos, uma falha não diz o que quebrou. Monitores menores, cada um com seu alerta, dão diagnóstico melhor.
+
+<Callout type="tip" title="Reaproveite o e2e, mas não confunda os papéis">
+O teste Playwright do CI garante que o código novo funciona antes do deploy, num ambiente controlado. O monitor sintético garante que produção continua funcionando depois do deploy, com DNS, CDN, certificados e parceiros reais. Os seletores podem ser os mesmos; os objetivos são diferentes, e você precisa dos dois.
+</Callout>
+
+### Scripted API para o contrato do BFF
+
+Nem todo fluxo precisa de navegador. Um monitor scripted API chama o BFF diretamente e valida as respostas: `GET /bff/catalogo` devolve uma lista não vazia, o frete para um CEP de referência vem com valor e prazo, a criação de pedido da conta sintética responde 201. Ele é mais barato e mais rápido que o scripted browser, e a falha aponta direto para a API em vez de para a tela.
+
+Uma boa divisão é: scripted API para cada endpoint crítico do BFF, um scripted browser para o fluxo de compra de ponta a ponta. Quando os dois falham juntos, o problema está no back-end; quando só o de navegador falha, está no front, na CDN ou num script de terceiros.
+
+## Localizações e frequência
+
+**Localizações públicas** são servidores do New Relic em várias regiões do mundo. Para uma loja brasileira, escolha as mais próximas dos clientes (por exemplo, São Paulo, quando disponível na sua conta) e pelo menos uma em outra região, para diferenciar "a Quitanda caiu" de "uma rota de rede está com problema".
+
+**Localizações privadas** rodam um gerenciador de jobs (um contêiner do New Relic) dentro da sua rede. Servem para monitorar homologação, o painel interno ou serviços que não estão expostos na internet.
+
+A frequência é um equilíbrio entre detecção e custo (cada execução conta no consumo da conta) e carga no sistema:
+
+| Monitor | Frequência | Localizações |
+|---|---|---|
+| Ping da loja e do BFF | 1 minuto | 3 |
+| Simple browser do catálogo | 5 minutos | 2 |
+| Scripted browser da compra | 10 minutos | 2 |
+| Certificate check | 1 vez por dia | 1 |
+
+Para alertar, evite disparar com a falha de uma única localização, que costuma ser problema de rede do lado do robô. Uma condição de falha em várias localizações abre incidente quando, por exemplo, 2 de 3 localizações falham na mesma janela. Com NRQL sobre o evento `SyntheticCheck`:
+
+```sql
+SELECT uniqueCount(locationLabel) FROM SyntheticCheck
+WHERE monitorName = 'Quitanda: compra completa' AND result = 'FAILED'
+```
+
+com limite crítico "acima de 1" (duas ou mais localizações falhando) por pelo menos uma janela.
+
+## Sintéticos como linha de base de performance
+
+Como o robô usa sempre o mesmo navegador, a mesma localização e o mesmo roteiro, a duração das execuções é uma linha de base estável, livre do ruído de aparelhos e redes dos usuários. Uma regressão de performance aparece como um degrau no gráfico, normalmente alinhado a um deploy:
+
+```sql
+SELECT average(duration) FROM SyntheticCheck
+WHERE monitorName = 'Quitanda: compra completa'
+FACET locationLabel SINCE 7 days ago TIMESERIES 1 hour
+```
+
+O evento `SyntheticRequest` detalha cada recurso baixado pelos monitores de navegador (URL, tipo, tamanho e tempo), útil para descobrir qual script ou imagem nova engordou a página. Use esses números junto com os Web Vitals de campo: o sintético diz que a página ficou 800 ms mais lenta no laboratório controlado; o RUM diz quantos clientes sentiram isso.
+
+### Sintéticos depois do deploy
+
+O pipeline pode tratar os monitores como um último portão. Logo após publicar a versão nova, o job de deploy dispara uma execução dos monitores críticos (o New Relic oferece integração de testes sintéticos com CI/CD pela API NerdGraph) e aguarda o resultado. Se a compra sintética falhar em produção, o próprio pipeline aciona o rollback antes que o tráfego real encontre o problema. Combinado com um deploy canário, o robô compra na versão nova enquanto 95% dos clientes ainda estão na anterior.
+
+## SLIs, SLOs e orçamento de erro
+
+Alertas por limite respondem "algo está errado agora?". SLOs respondem uma pergunta mais útil para o negócio: "estamos entregando a confiabilidade que prometemos, e quanto ainda podemos errar?".
+
+- **SLI** (indicador): a proporção de eventos bons entre os válidos. Exemplo: page views da loja com LCP abaixo de 2,5 s, dividido por todas as page views com LCP medido.
+- **SLO** (objetivo): o alvo do SLI num período. Exemplo: 90% nos últimos 28 dias.
+- **Orçamento de erro**: o que sobra. Com SLO de 90%, até 10% das visitas podem ter LCP ruim no período sem violar o objetivo.
+
+No New Relic, o recurso **Service Levels** define o SLI com duas consultas, eventos válidos e eventos bons:
+
+| SLI da Quitanda | Eventos válidos | Eventos bons | SLO |
+|---|---|---|---|
+| LCP da loja | `FROM PageViewTiming WHERE appName = 'Quitanda Loja' AND timingName = 'largestContentfulPaint'` | O mesmo, com `AND largestContentfulPaint < 2500` | 90% em 28 dias |
+| Criação de pedido | `FROM AjaxRequest WHERE appName = 'Quitanda Loja' AND groupedRequestUrl LIKE '%/bff/pedidos' AND httpMethod = 'POST'` | O mesmo, com `AND httpResponseCode < 500 AND httpResponseCode > 0` | 99,5% em 28 dias |
+| Compra sintética | `FROM SyntheticCheck WHERE monitorName = 'Quitanda: compra completa'` | O mesmo, com `AND result = 'SUCCESS'` | 99% em 28 dias |
+
+O orçamento muda as conversas do time. Se o orçamento de criação de pedido está quase gasto na terceira semana, o próximo deploy arriscado espera e o time prioriza estabilidade. Se sobra orçamento, há espaço para experimentar.
+
+### Alertas de taxa de consumo (burn rate)
+
+Em vez de alertar quando o SLI cai abaixo do objetivo (tarde demais), alerte pela **velocidade** com que o orçamento está sendo gasto. Taxa de consumo 1 significa gastar o orçamento exatamente no fim do período; taxa 14 significa gastá-lo em dois dias.
+
+| Alerta | Condição típica | Ação |
+|---|---|---|
+| Consumo rápido | Taxa muito alta numa janela curta (ex.: 1 hora) | Aciona o plantão: algo quebrou agora |
+| Consumo lento | Taxa moderada numa janela longa (ex.: 6 horas a 1 dia) | Aviso no canal do time: degradação contínua para investigar no horário comercial |
+
+O Service Levels do New Relic sugere condições de burn rate ao criar o SLO; ajuste os valores ao seu período e à sua tolerância.
+
+## Alertas de anomalia
+
+Métricas com sazonalidade (page views, pedidos por minuto, conversão) não combinam com limite fixo: 50 pedidos por hora é ótimo às 6h e catastrófico no sábado às 10h. Condições de **anomalia** aprendem o comportamento esperado a partir do histórico, incluindo padrões por hora e dia da semana, e alertam quando o valor se afasta dele.
+
+```sql
+-- condição de anomalia: pedidos confirmados por minuto
+SELECT count(*) FROM PageAction
+WHERE appName = 'Quitanda Loja' AND actionName = 'pedidoConfirmado'
+```
+
+Configurações principais:
+
+- **Direção:** só abaixo do esperado (queda de pedidos é o problema; pico de pedidos é festa), só acima (erros) ou ambas.
+- **Sensibilidade:** quantos desvios-padrão de distância do esperado disparam o alerta. Comece conservador e ajuste com o histórico de disparos.
+- **Duração:** como nas condições estáticas, exija alguns minutos fora do normal.
+
+Anomalia é ótima para pegar o desconhecido ("pedidos caíram 60% e nenhum alerta técnico disparou"), mas precisa de histórico e gera falsos positivos em datas atípicas, como Black Friday ou feriados. Use regras de silenciamento ou ajuste a sensibilidade nesses dias.
+
+<Callout type="warning" title="Anomalia de negócio precisa de dono de negócio">
+Uma queda de conversão sem erro técnico pode ser preço errado, campanha que terminou ou concorrente em promoção. Encaminhe esse alerta também para o PM ou para quem cuida de operações da loja, não só para o plantão técnico, e deixe isso claro no runbook.
+</Callout>
+
+## Runbooks
+
+Um alerta crítico sem runbook transfere a investigação inteira para a pessoa sonolenta que recebeu a notificação. O runbook fica no repositório, ligado à condição pelo campo de URL de runbook:
+
+```md
+<!-- docs/runbooks/compra-sintetica-falhando.md -->
+# Compra sintética falhando em várias localizações
+
+## O que significa
+O robô não conseguiu concluir uma compra em 2 ou mais localizações.
+Clientes reais provavelmente também não conseguem comprar.
+
+## Impacto
+Perda direta de vendas. Prioridade máxima entre 7h e 22h.
+
+## Verificar (5 minutos)
+1. Abra o resultado do monitor: em qual passo falhou? Veja a captura de tela.
+2. Dashboard "Quitanda Operação": erros JS, falhas de AJAX e status do BFF.
+3. Houve deploy nos últimos 60 minutos? (canal #deploys, versão no dashboard)
+4. Status do gateway de pagamento e da CDN (páginas de status dos fornecedores).
+
+## Mitigar
+- Deploy recente: rollback pelo pipeline (job "rollback-loja").
+- Falha no passo de pagamento: desligar a flag `checkout-novo` para voltar ao fluxo anterior.
+- Gateway fora: ativar a flag `pagamento-pix-apenas` e avisar no site.
+
+## Escalar
+Sem mitigação em 20 minutos: acionar o tech lead do front e o responsável pelo BFF.
+
+## Depois
+Registrar o incidente e marcar a revisão pós-incidente (sem culpados) em até 3 dias úteis.
+```
+
+Boas práticas: o runbook começa pelo impacto, cabe em uma tela, traz links diretos (dashboard, pipeline, flags) e é revisado depois de cada incidente em que foi usado. A revisão pós-incidente sem culpados pergunta "o que no sistema permitiu isso?" e gera ações: um monitor novo, um alerta ajustado, um teste a mais.
+
+## Na entrevista
+
+**Por que ter monitoramento sintético se você já tem RUM?** Porque o RUM depende de tráfego. O sintético testa os fluxos críticos continuamente, inclusive sem usuários, de localizações e condições fixas, e detecta indisponibilidade, certificados vencendo e fluxos quebrados antes do primeiro cliente.
+
+**Como você evita falsos alarmes em monitores sintéticos?** Seletores estáveis, esperas explícitas, um fluxo por monitor e alertas que exigem falha em mais de uma localização. Também isolo os pedidos do robô com conta e pagamento de teste.
+
+**O que são SLI, SLO e orçamento de erro?** SLI é a proporção de eventos bons entre os válidos; SLO é o alvo para essa proporção num período; o orçamento de erro é a margem que sobra. O orçamento guia decisões, como segurar deploys arriscados quando está quase esgotado.
+
+**Por que alertar por taxa de consumo do orçamento?** Porque mostra a velocidade do problema: consumo rápido indica falha aguda e aciona o plantão; consumo lento indica degradação contínua e vai para o time investigar. Alertar só quando o SLO é violado é tarde demais.
+
+**Quando usar uma condição de anomalia em vez de limite fixo?** Em métricas com sazonalidade, como tráfego e pedidos, em que o valor normal varia por hora e dia da semana. Escolho a direção relevante e ajusto a sensibilidade com o histórico.
+
+**O que deve ter um bom runbook?** O significado do alerta, o impacto, verificações rápidas, ações de mitigação com links, critério de escalonamento e o que fazer depois. Curto o bastante para ser seguido às 3h da manhã.
+
+## Pratique
+
+1. Crie a rota `/bff/saude` e um monitor ping de 1 minuto em três localizações, validando o texto da resposta.
+2. Configure certificate checks para os domínios da loja, do BFF e do gateway de pagamento, com aviso 30 dias antes do vencimento.
+3. Escreva o monitor scripted browser da compra completa com `data-testid`, credenciais seguras e conta sintética cujos pedidos são cancelados automaticamente.
+4. Crie a condição de falha em várias localizações para o monitor de compra e associe o runbook do repositório.
+5. Defina os três SLIs da tabela no Service Levels, com seus SLOs, e configure alertas de consumo rápido e lento do orçamento.
+6. Crie uma condição de anomalia para pedidos confirmados por minuto, só na direção de queda, e uma regra de silenciamento para a janela de manutenção semanal.
+
+<Quiz question="A loja quebrou às 4h50 de domingo, sem tráfego. Qual ferramenta detectaria o problema antes do primeiro cliente?" options={["Um monitor sintético executando o fluxo de compra em intervalos fixos","Um alerta de taxa de erros JS do RUM","Um dashboard de Web Vitals","Um funil de PageAction"]} answer={0} explanation="Sem tráfego, o RUM não gera eventos. O monitor sintético executa o fluxo sozinho e detecta a falha a qualquer hora." />
+
+<Quiz question="Com SLO de 99,5% de pedidos criados com sucesso em 28 dias, o que é o orçamento de erro?" options={["Os 99,5% de pedidos bem-sucedidos","O custo da conta do New Relic","Os 0,5% de requisições que podem falhar no período sem violar o objetivo","O número de alertas permitidos por mês"]} answer={2} explanation="O orçamento de erro é a margem entre 100% e o SLO. Ele mede quanto ainda é possível falhar no período." />
+
+<Quiz question="Qual métrica é a melhor candidata a uma condição de anomalia em vez de limite fixo?" options={["Validade do certificado TLS","Pedidos confirmados por minuto, que variam por hora e dia da semana","Status HTTP da rota de saúde","Resultado de um monitor ping"]} answer={1} explanation="Métricas com sazonalidade não têm um limite fixo que sirva o dia inteiro; a anomalia compara com o comportamento esperado para aquele horário." />
+
+## Base no CodeForge
+
+- [Alertas](/learn/system-design/alertas) e [Dashboards e runbooks](/learn/system-design/dashboards-runbooks): a teoria de alertas acionáveis e runbooks.
+- [Disponibilidade](/learn/system-design/disponibilidade): os números de nove e o que eles custam.
+- [Canary](/learn/system-design/canary) e [Rollbacks](/learn/system-design/rollbacks): as mitigações que o runbook aciona.
+- [React: customizando alertas e dashboards com New Relic](/learn/carreira-react/react-alertas-dashboards-new-relic): NRQL e condições, a base deste capítulo.
+
+## Referências
+
+- [New Relic: Introduction to synthetic monitoring](https://docs.newrelic.com/docs/synthetics/synthetic-monitoring/getting-started/get-started-synthetic-monitoring/)
+- [New Relic: Scripted browser monitors](https://docs.newrelic.com/docs/synthetics/synthetic-monitoring/scripting-monitors/introduction-scripted-browser-monitors/)
+- [New Relic: Service levels](https://docs.newrelic.com/docs/service-level-management/intro-slm/)
+- [New Relic: Anomaly threshold conditions](https://docs.newrelic.com/docs/alerts/create-alert/set-thresholds/anomaly-detection/)
+- [Google SRE Workbook: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)

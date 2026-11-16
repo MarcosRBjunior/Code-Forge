@@ -1,0 +1,450 @@
+---
+title: "React: explorando padrões de composição com custom hooks"
+kind: lesson
+---
+
+Com a Quitanda em TypeScript, o próximo incômodo aparece nos componentes grandes. `PaginaDoCatalogo` busca produtos, guarda o termo de busca, faz debounce na mão com `setTimeout`, sincroniza o filtro com a URL, controla o modal de detalhes e ainda desenha a grade. O seletor de quantidade foi copiado para o carrinho e para a página de produto com pequenas diferenças. O painel do lojista precisa de abas, e alguém já começou a escrever um componente `Abas` com doze props booleanas.
+
+O React oferece duas ferramentas para separar responsabilidades sem herança: **custom hooks** para reaproveitar lógica com estado e **composição** para reaproveitar estrutura de interface. Este capítulo aplica as duas na Quitanda e mostra os padrões que aparecem em bibliotecas como Radix, React Aria, Headless UI e TanStack Table.
+
+**Você vai aprender:**
+
+- Extrair lógica com estado em custom hooks como `useCarrinho`, `useDebounce` e `useLocalStorage`
+- Montar compound components com contexto, como `Abas` e `Acordeao`
+- Usar `children` e props de slot em vez de dezenas de props de configuração
+- Desenhar componentes que funcionam controlados e não controlados
+- Separar comportamento de aparência com componentes e hooks headless
+- Testar hooks isolados com `renderHook`
+
+## Custom hooks: lógica reaproveitável, estado separado
+
+Um custom hook é uma função cujo nome começa com `use` e que chama outros hooks. Ele não compartilha estado entre quem o usa: cada componente que chama `useDebounce` tem o seu próprio estado. O que se compartilha é a lógica.
+
+As regras são as mesmas dos hooks nativos: chame no topo do componente ou de outro hook, nunca dentro de condição, laço ou callback. O prefixo `use` não é enfeite: é o que permite ao lint (`eslint-plugin-react-hooks`) e ao React Compiler verificarem as regras.
+
+### useDebounce
+
+A busca da Quitanda dispara uma requisição a cada tecla. Um hook que atrasa um valor resolve:
+
+```ts
+// src/hooks/useDebounce.ts
+import { useEffect, useState } from "react";
+
+export function useDebounce<T>(valor: T, atrasoMs = 300): T {
+  const [atrasado, setAtrasado] = useState(valor);
+
+  useEffect(() => {
+    const id = setTimeout(() => setAtrasado(valor), atrasoMs);
+    return () => clearTimeout(id);
+  }, [valor, atrasoMs]);
+
+  return atrasado;
+}
+```
+
+```tsx
+// src/paginas/Catalogo.tsx (trecho)
+const [termo, setTermo] = useState("");
+const termoAtrasado = useDebounce(termo, 300);
+
+const { data: produtos = [] } = useQuery({
+  queryKey: ["produtos", { termo: termoAtrasado }],
+  queryFn: () => api.buscarProdutos(termoAtrasado),
+});
+```
+
+### useLocalStorage com useSyncExternalStore
+
+O carrinho de visitante fica no `localStorage`. Ler com `useState` e gravar num `useEffect` funciona, mas não percebe mudanças feitas em outra aba. `useSyncExternalStore` é o hook feito para assinar fontes externas:
+
+```ts
+// src/hooks/useLocalStorage.ts
+import { useCallback, useSyncExternalStore } from "react";
+
+function assinar(callback: () => void) {
+  window.addEventListener("storage", callback);
+  return () => window.removeEventListener("storage", callback);
+}
+
+export function useLocalStorage<T>(chave: string, inicial: T) {
+  const bruto = useSyncExternalStore(
+    assinar,
+    () => localStorage.getItem(chave),
+    () => null, // no servidor não há localStorage
+  );
+
+  const valor: T = bruto === null ? inicial : (JSON.parse(bruto) as T);
+
+  const gravar = useCallback(
+    (novo: T) => {
+      localStorage.setItem(chave, JSON.stringify(novo));
+      window.dispatchEvent(new StorageEvent("storage", { key: chave }));
+    },
+    [chave],
+  );
+
+  return [valor, gravar] as const;
+}
+```
+
+O snapshot é a string crua, não o objeto parseado: `getSnapshot` precisa devolver o mesmo valor enquanto nada mudou, e `JSON.parse` criaria um objeto novo a cada render, causando laço infinito. O evento `storage` só dispara nas outras abas, por isso o hook emite um evento manual para a aba atual. O `as const` faz o retorno ser uma tupla, como o de `useState`.
+
+### useCarrinho: uma API de domínio
+
+O carrinho foi tipado no capítulo anterior com um reducer e um contexto. Os componentes não deveriam conhecer `despachar({ tipo: "adicionar", ... })`; eles querem verbos do domínio. Um hook expõe essa API e esconde a implementação:
+
+```ts
+// src/estado/useCarrinho.ts
+import { useCarrinhoContext } from "@/estado/CarrinhoContext";
+import type { Produto } from "@/esquemas/produto";
+
+export function useCarrinho() {
+  const { estado, despachar } = useCarrinhoContext();
+
+  const total = estado.itens.reduce((soma, i) => soma + i.produto.precoEmCentavos * i.quantidade, 0);
+  const quantidadeDeItens = estado.itens.length;
+
+  return {
+    itens: estado.itens,
+    total,
+    quantidadeDeItens,
+    vazio: quantidadeDeItens === 0,
+    adicionar: (produto: Produto, quantidade = 1) => despachar({ tipo: "adicionar", produto, quantidade }),
+    remover: (produtoId: string) => despachar({ tipo: "remover", produtoId }),
+    alterarQuantidade: (produtoId: string, quantidade: number) =>
+      despachar({ tipo: "alterarQuantidade", produtoId, quantidade }),
+    esvaziar: () => despachar({ tipo: "esvaziar" }),
+  };
+}
+```
+
+`total` é derivado, não guardado em estado: guardar seria criar uma segunda fonte de verdade que pode divergir dos itens. Se amanhã o carrinho for para o Redux ou para o Zustand, só o miolo do hook muda; `CartaoProduto`, `Carrinho` e `ResumoDoPedido` continuam chamando `adicionar` e lendo `total`.
+
+<Callout type="tip" title="Quando extrair um hook">
+Extraia quando a lógica se repete em dois lugares, quando um componente mistura comportamento e apresentação a ponto de ficar difícil de ler, ou quando você quer testar a lógica sem renderizar a interface. Não extraia `useEffect` soltos só para "esconder" código: um hook com nome vago como `useDados` piora a leitura. O nome deve dizer o que o hook entrega.
+</Callout>
+
+### Testando hooks com renderHook
+
+```ts
+// src/hooks/useDebounce.test.ts
+import { act, renderHook } from "@testing-library/react";
+import { useDebounce } from "./useDebounce";
+
+jest.useFakeTimers();
+
+test("só atualiza depois do atraso", () => {
+  const { result, rerender } = renderHook(({ valor }) => useDebounce(valor, 300), {
+    initialProps: { valor: "ba" },
+  });
+
+  rerender({ valor: "banana" });
+  expect(result.current).toBe("ba");
+
+  act(() => jest.advanceTimersByTime(300));
+  expect(result.current).toBe("banana");
+});
+```
+
+## Composição antes de configuração
+
+O primeiro instinto ao reaproveitar um componente é adicionar props: `mostrarCabecalho`, `iconeNoTitulo`, `rodapeComBotao`. Cada combinação nova vira um `if` dentro do componente. Composição inverte isso: o componente cuida da estrutura e quem o usa decide o conteúdo.
+
+### Slots via children e props
+
+`children` é o slot principal. Para mais de uma região, use props que recebem `ReactNode`:
+
+```tsx
+// src/componentes/Painel.tsx
+import type { ReactNode } from "react";
+
+type PainelProps = {
+  titulo: ReactNode;
+  acoes?: ReactNode;
+  rodape?: ReactNode;
+  children: ReactNode;
+};
+
+export function Painel({ titulo, acoes, rodape, children }: PainelProps) {
+  return (
+    <section className="rounded-lg border bg-white">
+      <header className="flex items-center justify-between border-b p-4">
+        <h2 className="font-semibold">{titulo}</h2>
+        {acoes && <div className="flex gap-2">{acoes}</div>}
+      </header>
+      <div className="p-4">{children}</div>
+      {rodape && <footer className="border-t p-4">{rodape}</footer>}
+    </section>
+  );
+}
+```
+
+```tsx
+// src/paginas/painel/Pedidos.tsx (trecho)
+<Painel
+  titulo="Pedidos de hoje"
+  acoes={<Botao onClick={exportar}>Exportar CSV</Botao>}
+>
+  <TabelaDePedidos pedidos={pedidos} />
+</Painel>
+```
+
+O `Painel` não sabe o que é um pedido nem um CSV. Ele não ganha uma prop nova quando a tela de produtos precisar de um filtro no cabeçalho.
+
+Composição também resolve prop drilling sem contexto. Se `Layout` repassa `usuario` por três níveis só para chegar ao `Avatar`, deixe quem tem o dado montar o `Avatar` e passá-lo como `children` ou slot. Os intermediários deixam de conhecer `usuario`.
+
+### Compound components
+
+Algumas peças só fazem sentido juntas: abas e seus painéis, um acordeão e seus itens, um `select` e suas opções. O padrão compound component expõe um componente pai que guarda o estado num contexto e filhos que o consomem:
+
+```tsx
+// src/componentes/Abas.tsx
+import { createContext, use, useId, useState, type ReactNode } from "react";
+
+type AbasContexto = { ativa: string; ativar: (valor: string) => void; idBase: string };
+const Contexto = createContext<AbasContexto | null>(null);
+
+function useAbas() {
+  const ctx = use(Contexto);
+  if (!ctx) throw new Error("Use Abas.Lista, Abas.Aba e Abas.Painel dentro de Abas");
+  return ctx;
+}
+
+function Abas({ inicial, children }: { inicial: string; children: ReactNode }) {
+  const [ativa, ativar] = useState(inicial);
+  const idBase = useId();
+  return <Contexto value={{ ativa, ativar, idBase }}>{children}</Contexto>;
+}
+
+function Lista({ children }: { children: ReactNode }) {
+  return <div role="tablist">{children}</div>;
+}
+
+function Aba({ valor, children }: { valor: string; children: ReactNode }) {
+  const { ativa, ativar, idBase } = useAbas();
+  const selecionada = ativa === valor;
+  return (
+    <button
+      role="tab"
+      id={`${idBase}-aba-${valor}`}
+      aria-selected={selecionada}
+      aria-controls={`${idBase}-painel-${valor}`}
+      tabIndex={selecionada ? 0 : -1}
+      onClick={() => ativar(valor)}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Painel({ valor, children }: { valor: string; children: ReactNode }) {
+  const { ativa, idBase } = useAbas();
+  if (ativa !== valor) return null;
+  return (
+    <div role="tabpanel" id={`${idBase}-painel-${valor}`} aria-labelledby={`${idBase}-aba-${valor}`}>
+      {children}
+    </div>
+  );
+}
+
+Abas.Lista = Lista;
+Abas.Aba = Aba;
+Abas.Painel = Painel;
+export { Abas };
+```
+
+```tsx
+// src/paginas/painel/Painel.tsx (trecho)
+<Abas inicial="pedidos">
+  <Abas.Lista>
+    <Abas.Aba valor="pedidos">Pedidos</Abas.Aba>
+    <Abas.Aba valor="produtos">Produtos</Abas.Aba>
+    <Abas.Aba valor="metricas">Métricas</Abas.Aba>
+  </Abas.Lista>
+  <Abas.Painel valor="pedidos"><TabelaDePedidos /></Abas.Painel>
+  <Abas.Painel valor="produtos"><TabelaDeProdutos /></Abas.Painel>
+  <Abas.Painel valor="metricas"><Metricas /></Abas.Painel>
+</Abas>
+```
+
+Quem usa decide a ordem, o conteúdo e até envolve uma aba num `Tooltip`, sem que `Abas` ganhe uma prop. O contexto é o canal implícito entre pai e filhos. `useId` gera ids estáveis e únicos (inclusive com renderização no servidor) para ligar abas e painéis via `aria-controls` e `aria-labelledby`. A navegação por setas do padrão WAI-ARIA de abas ficaria no `Lista`; omitimos aqui por espaço.
+
+Uma alternativa antiga é `React.Children.map` com `cloneElement` para injetar props nos filhos. Ela quebra quando alguém envolve um filho em outro componente ou fragmento, e por isso o contexto é o caminho preferido.
+
+## Controlado e não controlado
+
+Um `input` pode ser controlado (`value` + `onChange`, o estado mora no pai) ou não controlado (`defaultValue`, o estado mora no próprio elemento). Componentes reaproveitáveis da Quitanda se beneficiam de aceitar os dois modos, como os elementos nativos.
+
+O `SeletorQuantidade` aparece na página de produto (onde ninguém de fora precisa saber o valor até o clique em "Adicionar") e no carrinho (onde cada mudança atualiza o total, então o pai controla):
+
+```ts
+// src/hooks/useEstadoControlavel.ts
+import { useCallback, useState } from "react";
+
+type Opcoes<T> = { valor?: T; valorPadrao: T; onChange?: (novo: T) => void };
+
+export function useEstadoControlavel<T>({ valor, valorPadrao, onChange }: Opcoes<T>) {
+  const [interno, setInterno] = useState(valorPadrao);
+  const controlado = valor !== undefined;
+  const atual = controlado ? valor : interno;
+
+  const definir = useCallback(
+    (novo: T) => {
+      if (!controlado) setInterno(novo);
+      onChange?.(novo);
+    },
+    [controlado, onChange],
+  );
+
+  return [atual, definir] as const;
+}
+```
+
+```tsx
+// src/componentes/SeletorQuantidade.tsx
+import { useEstadoControlavel } from "@/hooks/useEstadoControlavel";
+
+type Props = {
+  valor?: number;
+  valorPadrao?: number;
+  onChange?: (quantidade: number) => void;
+  minimo?: number;
+  maximo: number;
+};
+
+export function SeletorQuantidade({ valor, valorPadrao = 1, onChange, minimo = 1, maximo }: Props) {
+  const [quantidade, definir] = useEstadoControlavel({ valor, valorPadrao, onChange });
+
+  return (
+    <div role="group" aria-label="Quantidade">
+      <button onClick={() => definir(Math.max(minimo, quantidade - 1))} aria-label="Diminuir">-</button>
+      <output aria-live="polite">{quantidade}</output>
+      <button onClick={() => definir(Math.min(maximo, quantidade + 1))} aria-label="Aumentar">+</button>
+    </div>
+  );
+}
+```
+
+```tsx
+// Não controlado, na página de produto
+<SeletorQuantidade maximo={produto.estoque} onChange={setQuantidadeEscolhida} />
+
+// Controlado, no carrinho
+<SeletorQuantidade
+  valor={item.quantidade}
+  maximo={item.produto.estoque}
+  onChange={(q) => alterarQuantidade(item.produto.id, q)}
+/>
+```
+
+| | Controlado | Não controlado |
+|---|---|---|
+| Onde mora o estado | No pai | No componente |
+| Props | `valor` + `onChange` | `valorPadrao` (e `onChange` opcional) |
+| Quando usar | O pai precisa reagir a cada mudança ou impor regras | O valor só importa num momento pontual |
+| Custo | Renderiza o pai a cada mudança | Menos renderizações, menos controle |
+
+## Headless: comportamento sem aparência
+
+Um componente headless entrega estado, comportamento e atributos de acessibilidade, e deixa o visual para quem usa. A forma mais pura é um hook que devolve "prop getters":
+
+```ts
+// src/hooks/useAutocompletar.ts
+import { useId, useState, type KeyboardEvent } from "react";
+
+export function useAutocompletar<T>({ itens, paraTexto, onSelecionar }: {
+  itens: T[];
+  paraTexto: (item: T) => string;
+  onSelecionar: (item: T) => void;
+}) {
+  const [aberto, setAberto] = useState(false);
+  const [indiceAtivo, setIndiceAtivo] = useState(-1);
+  const id = useId();
+
+  function aoTeclar(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "ArrowDown") setIndiceAtivo((i) => Math.min(itens.length - 1, i + 1));
+    if (e.key === "ArrowUp") setIndiceAtivo((i) => Math.max(0, i - 1));
+    if (e.key === "Enter" && itens[indiceAtivo]) onSelecionar(itens[indiceAtivo]);
+    if (e.key === "Escape") setAberto(false);
+  }
+
+  return {
+    aberto,
+    obterPropsDoInput: () => ({
+      role: "combobox" as const,
+      "aria-expanded": aberto,
+      "aria-controls": `${id}-lista`,
+      "aria-activedescendant": indiceAtivo >= 0 ? `${id}-opcao-${indiceAtivo}` : undefined,
+      onFocus: () => setAberto(true),
+      onKeyDown: aoTeclar,
+    }),
+    obterPropsDaLista: () => ({ id: `${id}-lista`, role: "listbox" as const }),
+    obterPropsDaOpcao: (item: T, indice: number) => ({
+      id: `${id}-opcao-${indice}`,
+      role: "option" as const,
+      "aria-selected": indice === indiceAtivo,
+      onClick: () => onSelecionar(item),
+      children: paraTexto(item),
+    }),
+  };
+}
+```
+
+A busca de produtos usa o hook com Tailwind; o painel do lojista usa o mesmo hook com outro visual. A acessibilidade, que é a parte difícil, foi escrita uma vez. Em produção, prefira bibliotecas maduras que seguem esse modelo: Radix Primitives e React Aria (componentes sem estilo), Downshift (hooks para combobox), TanStack Table (tabela headless). O shadcn/ui, por exemplo, copia componentes Radix estilizados com Tailwind para dentro do seu projeto.
+
+<Callout type="warning" title="Composição não é desculpa para contexto em tudo">
+Contexto re-renderiza todos os consumidores quando o valor muda. Num compound component pequeno como `Abas`, isso é irrelevante. Num `Formulario` com cinquenta campos lendo o mesmo contexto a cada tecla, não é. Divida o contexto por frequência de mudança ou use uma store com seletores (Redux, Zustand) quando muitos componentes leem fatias diferentes.
+</Callout>
+
+## Escolhendo o padrão
+
+| Problema | Padrão |
+|---|---|
+| Lógica com estado repetida em vários componentes | Custom hook |
+| Componente com muitas props booleanas de layout | Slots via `children` e props `ReactNode` |
+| Peças que só funcionam juntas (abas, acordeão, menu) | Compound components com contexto |
+| Componente que às vezes o pai precisa controlar | Controlado e não controlado com `useEstadoControlavel` |
+| Mesmo comportamento acessível com visuais diferentes | Hook ou componente headless |
+
+## Na entrevista
+
+**Dois componentes que chamam o mesmo custom hook compartilham estado?** Não. Cada chamada cria seu próprio estado, como se o código do hook estivesse escrito dentro de cada componente. Para compartilhar estado, o hook precisa ler de um contexto ou de uma store externa.
+
+**O que é um compound component e como ele se comunica?** É um conjunto de componentes que formam uma unidade, como `Abas`, `Abas.Aba` e `Abas.Painel`. O pai guarda o estado e o expõe por contexto; os filhos consomem. Quem usa ganha liberdade de estrutura sem que o pai precise de props novas.
+
+**Qual a diferença entre componente controlado e não controlado?** No controlado, o valor vem por prop e cada mudança passa pelo `onChange` do pai. No não controlado, o componente guarda o próprio estado e o pai só informa o valor inicial. Componentes de biblioteca bons aceitam os dois modos.
+
+**O que é um componente headless?** É um componente ou hook que entrega comportamento, estado e acessibilidade sem impor marcação nem estilo. Radix, React Aria e TanStack Table seguem esse modelo. A vantagem é reaproveitar a parte difícil em visuais diferentes.
+
+**Por que `useSyncExternalStore` em vez de `useEffect` para ler o `localStorage`?** Porque ele assina a fonte externa e garante leituras consistentes durante a renderização concorrente, evitando o "tearing" em que partes da tela mostram versões diferentes do dado. Também aceita um snapshot de servidor.
+
+## Pratique
+
+1. Extraia `useDebounce` e use-o na busca do catálogo; confira no DevTools de rede que digitar "banana" gera uma requisição, e não seis.
+2. Crie `useCarrinho` sobre o contexto do capítulo anterior e troque todos os `despachar` dos componentes por métodos do hook.
+3. Implemente `Abas` como compound component e adicione navegação por setas na `Abas.Lista` seguindo o padrão WAI-ARIA.
+4. Transforme o `SeletorQuantidade` num componente que aceita os modos controlado e não controlado e escreva um teste para cada modo.
+5. Refatore um componente da Quitanda com mais de cinco props booleanas de layout para usar slots.
+6. Escreva testes de `useCarrinho` com `renderHook` e o `CarrinhoProvider` como `wrapper`.
+
+<Quiz question="Por que o hook useLocalStorage usa a string crua como snapshot do useSyncExternalStore?" options={["Porque o localStorage só aceita strings","Para economizar memória","Porque JSON.parse cria um objeto novo a cada chamada, e o snapshot precisa ser estável para não causar renderizações infinitas","Porque o React exige que snapshots sejam strings"]} answer={2} explanation="getSnapshot deve devolver o mesmo valor enquanto a fonte não muda. Strings iguais são comparadas por valor; objetos novos sempre parecem diferentes." />
+
+<Quiz question="Qual é a vantagem de compound components com contexto sobre cloneElement com Children.map?" options={["Funcionam mesmo quando os filhos são envolvidos em outros componentes ou fragmentos","São mais rápidos em qualquer caso","Dispensam o uso de estado","Só funcionam com componentes de classe"]} answer={0} explanation="cloneElement só alcança os filhos diretos. O contexto chega a qualquer descendente, independentemente da estrutura intermediária." />
+
+<Quiz question="O SeletorQuantidade recebeu valor e onChange do componente Carrinho. Em que modo ele está?" options={["Não controlado","Controlado, com o estado no pai","Headless","Em modo de render prop"]} answer={1} explanation="Quando o valor vem por prop e as mudanças passam pelo onChange do pai, o componente é controlado." />
+
+## Base no CodeForge
+
+- [React: utilizando hooks para gerenciar estados](/learn/carreira-react/react-hooks-gerenciar-estados): os hooks nativos que os custom hooks combinam.
+- [React: integrando TypeScript em projetos](/learn/carreira-react/react-integrando-typescript): o reducer e o contexto tipados que `useCarrinho` encapsula.
+- [Composição sobre herança](/learn/lld/composicao-sobre-heranca): o princípio por trás dos padrões deste capítulo.
+- [Composite](/learn/lld/composite): o padrão estrutural que os compound components lembram.
+- [Observer](/learn/lld/observer): a ideia por trás de `useSyncExternalStore` e das stores externas.
+
+## Referências
+
+- [React: Reusing Logic with Custom Hooks](https://react.dev/learn/reusing-logic-with-custom-hooks)
+- [React: useSyncExternalStore](https://react.dev/reference/react/useSyncExternalStore)
+- [React: Passing Data Deeply with Context](https://react.dev/learn/passing-data-deeply-with-context)
+- [WAI-ARIA Authoring Practices: Tabs Pattern](https://www.w3.org/WAI/ARIA/apg/patterns/tabs/)
+- [Testing Library: renderHook](https://testing-library.com/docs/react-testing-library/api/#renderhook)

@@ -1,0 +1,450 @@
+---
+title: "React: realizando testes avançados com Jest e Testing Library"
+kind: lesson
+---
+
+No Nível 1 a Quitanda ganhou os primeiros testes: renderizar o `CartaoDeProduto`, clicar em "Adicionar" e conferir o texto. Agora a aplicação tem TypeScript, Next.js, Server Components, Server Actions, sessão no servidor, TanStack Query consultando o status do pedido e regras de frete. Os testes antigos continuam passando, mas não dizem nada sobre o que mais quebra: a tela de pedido quando a API demora, o checkout quando o estoque acabou, a action do painel chamada por quem não é lojista.
+
+Testes avançados não são testes mais complicados. São testes que simulam o ambiente real com fidelidade suficiente (rede, providers, tempo, permissões) sem ficar presos aos detalhes de implementação. Este capítulo monta a infraestrutura de testes da Quitanda com Jest 30 e Testing Library, simula a rede com MSW, testa hooks, Server Actions e Server Components, inclui acessibilidade na verificação e fecha com Playwright para os fluxos que só um navegador de verdade cobre.
+
+**Você vai aprender:**
+
+- Configurar Jest com `next/jest` e um `render` customizado com os providers da aplicação
+- Simular a API com MSW em vez de mockar `fetch` à mão
+- Testar custom hooks com `renderHook` e código assíncrono sem esperas frágeis
+- Testar Server Actions e Server Components dentro dos limites do Jest
+- Usar consultas por papel e `jest-axe` para tornar acessibilidade parte do teste
+- Definir uma meta de cobertura com critério e escrever testes ponta a ponta com Playwright
+
+## A estratégia antes das ferramentas
+
+| Nível | O que cobre na Quitanda | Ferramenta | Quantidade |
+|---|---|---|---|
+| Unidade | `calcularTotal`, `calcularFrete`, validações Zod | Jest | Muitos, rápidos |
+| Integração | Componente com hooks, providers e rede simulada | Jest + Testing Library + MSW | A maior parte do valor |
+| Ponta a ponta | Login, carrinho, checkout, painel | Playwright | Poucos, nos fluxos críticos |
+
+O princípio da Testing Library guia tudo: quanto mais o teste se parece com o uso real, mais confiança ele dá. Teste o que o usuário vê e faz, não o estado interno de um componente.
+
+## Configuração com next/jest
+
+```bash
+npm install -D jest jest-environment-jsdom jest-fixed-jsdom ts-node @types/jest \
+  @testing-library/react @testing-library/dom @testing-library/jest-dom \
+  @testing-library/user-event msw jest-axe @types/jest-axe
+```
+
+O `next/jest` configura a transformação com o compilador do Next.js, os aliases do `tsconfig`, os imports de CSS e imagens e as variáveis de `.env`:
+
+```ts
+// jest.config.ts
+import type { Config } from "jest";
+import nextJest from "next/jest.js";
+
+const criarConfig = nextJest({ dir: "./" });
+
+const config: Config = {
+  testEnvironment: "jest-fixed-jsdom",
+  setupFilesAfterEnv: ["<rootDir>/src/testes/setup.ts"],
+  moduleNameMapper: {
+    "^server-only$": "<rootDir>/src/testes/vazio.ts",
+  },
+  testPathIgnorePatterns: ["<rootDir>/e2e/"],
+  collectCoverageFrom: ["src/**/*.{ts,tsx}", "!src/**/*.d.ts", "!src/testes/**"],
+};
+
+export default criarConfig(config);
+```
+
+Dois detalhes que costumam custar uma tarde:
+
+- `jest-fixed-jsdom` é o jsdom com `fetch`, `Response`, `TextEncoder` e streams do Node disponíveis, o que o MSW 2 precisa. Com o `jsdom` puro, esses globais faltam.
+- O pacote `server-only` lança erro fora do ambiente de servidor do React. Como os arquivos de dados da Quitanda o importam, o `moduleNameMapper` troca por um arquivo vazio nos testes.
+
+<Callout type="tip" title="Vitest é a alternativa natural com Vite">
+Em projetos Vite (como a Quitanda do Nível 1), Vitest reaproveita a configuração do bundler e tem API compatível com Jest (`describe`, `it`, `expect`, `vi.fn` no lugar de `jest.fn`). Testing Library, MSW e user-event funcionam igual. Tudo deste capítulo se transfere com poucas trocas de nome.
+</Callout>
+
+## Rede simulada com MSW
+
+Mockar `fetch` com `jest.fn()` acopla o teste ao jeito de chamar a API: trocar `fetch` por `ky` ou mudar a URL quebra o teste sem quebrar a aplicação. O MSW intercepta requisições no nível da rede e responde como um servidor.
+
+```ts
+// src/testes/handlers.ts
+import { http, HttpResponse, delay } from "msw";
+
+export const pedidoBase = {
+  id: "p-101",
+  status: "separando",
+  totalEmCentavos: 4280,
+  itens: [{ produtoId: "banana-prata", nome: "Banana prata", quantidade: 2, unidade: "kg" }],
+};
+
+export const handlers = [
+  http.get("/api/pedidos/:id", async ({ params }) => {
+    await delay(50);
+    if (params.id === "inexistente") {
+      return HttpResponse.json({ erro: "Pedido não encontrado" }, { status: 404 });
+    }
+    return HttpResponse.json({ ...pedidoBase, id: params.id });
+  }),
+];
+```
+
+```ts
+// src/testes/servidor.ts
+import { setupServer } from "msw/node";
+import { handlers } from "./handlers";
+
+export const servidor = setupServer(...handlers);
+```
+
+```ts
+// src/testes/setup.ts
+import "@testing-library/jest-dom";
+import { toHaveNoViolations } from "jest-axe";
+import { servidor } from "./servidor";
+
+expect.extend(toHaveNoViolations);
+
+beforeAll(() => servidor.listen({ onUnhandledRequest: "error" }));
+afterEach(() => servidor.resetHandlers());
+afterAll(() => servidor.close());
+```
+
+`onUnhandledRequest: "error"` faz o teste falhar se o código chamar uma rota sem handler: nada de requisição real escapando. O `resetHandlers` desfaz as sobrescritas que cada teste faz com `servidor.use(...)`.
+
+## Um render com os providers da aplicação
+
+Componentes de cliente da Quitanda dependem do `QueryClientProvider` do TanStack Query e do provider do carrinho. Repetir isso em cada teste é ruído. Crie um `render` customizado:
+
+```tsx
+// src/testes/utilidades.tsx
+import type { ReactElement, ReactNode } from "react";
+import { render, type RenderOptions } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ProvedorDoCarrinho } from "@/features/carrinho";
+import type { ItemDoCarrinho } from "@/features/carrinho";
+
+function criarQueryClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+  });
+}
+
+type Opcoes = Omit<RenderOptions, "wrapper"> & { carrinhoInicial?: ItemDoCarrinho[] };
+
+export function criarWrapper(carrinhoInicial: ItemDoCarrinho[] = []) {
+  const queryClient = criarQueryClient();
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={queryClient}>
+        <ProvedorDoCarrinho itensIniciais={carrinhoInicial}>{children}</ProvedorDoCarrinho>
+      </QueryClientProvider>
+    );
+  };
+}
+
+export function renderComProviders(ui: ReactElement, { carrinhoInicial, ...opcoes }: Opcoes = {}) {
+  return {
+    usuario: userEvent.setup(),
+    ...render(ui, { wrapper: criarWrapper(carrinhoInicial), ...opcoes }),
+  };
+}
+
+export * from "@testing-library/react";
+```
+
+Um `QueryClient` novo por teste evita que o cache de um vaze para o outro, e `retry: false` impede que um erro esperado leve segundos de novas tentativas.
+
+## Testes assíncronos sem esperas frágeis
+
+```tsx
+// src/features/pedidos/componentes/AcompanharPedido.test.tsx
+import { http, HttpResponse } from "msw";
+import { servidor } from "@/testes/servidor";
+import { renderComProviders, screen } from "@/testes/utilidades";
+import { AcompanharPedido } from "./AcompanharPedido";
+
+describe("AcompanharPedido", () => {
+  it("mostra o carregamento e depois o status do pedido", async () => {
+    renderComProviders(<AcompanharPedido pedidoId="p-101" />);
+
+    expect(screen.getByRole("status")).toHaveTextContent(/carregando/i);
+    expect(await screen.findByText(/separando/i)).toBeInTheDocument();
+    expect(screen.getByText("R$ 42,80")).toBeInTheDocument();
+  });
+
+  it("mostra mensagem quando a API falha", async () => {
+    servidor.use(
+      http.get("/api/pedidos/:id", () => HttpResponse.json({ erro: "falhou" }, { status: 500 })),
+    );
+
+    renderComProviders(<AcompanharPedido pedidoId="p-101" />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/não foi possível carregar/i);
+  });
+});
+```
+
+As regras do assíncrono:
+
+- `findBy...` espera o elemento aparecer (até 1 segundo por padrão). Use para o que surge depois de uma requisição.
+- `waitFor` serve para asserções que não são "um elemento apareceu", e deve conter uma única asserção, sem efeitos colaterais dentro.
+- `queryBy...` devolve `null` em vez de lançar erro; use para afirmar ausência: `expect(screen.queryByRole("alert")).not.toBeInTheDocument()`. E nunca use `setTimeout` com espera fixa.
+
+Para lógica com tempo (um cupom que expira, um polling a cada 10 segundos), use timers falsos e avise o user-event:
+
+```ts
+// trecho de src/features/checkout/componentes/ContadorDoCupom.test.tsx
+jest.useFakeTimers();
+const usuario = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
+// ...
+act(() => jest.advanceTimersByTime(60_000));
+expect(screen.getByText(/cupom expirado/i)).toBeInTheDocument();
+```
+
+## Testando custom hooks com renderHook
+
+Quando o hook tem lógica própria e é usado por vários componentes, teste-o diretamente:
+
+```tsx
+// src/features/carrinho/useCarrinho.test.tsx
+import { act, renderHook } from "@testing-library/react";
+import { criarWrapper } from "@/testes/utilidades";
+import { useCarrinho } from "./useCarrinho";
+
+const banana = { produtoId: "banana-prata", precoEmCentavos: 790, quantidade: 1 };
+
+it("soma a quantidade ao adicionar o mesmo produto duas vezes", () => {
+  const { result } = renderHook(() => useCarrinho(), { wrapper: criarWrapper() });
+
+  act(() => result.current.adicionar(banana));
+  act(() => result.current.adicionar(banana));
+
+  expect(result.current.itens).toEqual([{ ...banana, quantidade: 2 }]);
+  expect(result.current.totalEmCentavos).toBe(1580 + 990); // subtotal + frete
+});
+```
+
+`result.current` sempre aponta para o retorno mais recente. Atualizações de estado ficam dentro de `act` para o React processá-las antes da asserção. Se o hook só existe para um componente, prefira testar pelo componente: é o que o usuário usa.
+
+## Server Actions
+
+Uma Server Action é uma função assíncrona. Teste-a como função, isolando as fronteiras (sessão, banco, cache do Next.js):
+
+```ts
+// src/features/checkout/acoes.test.ts
+import { finalizarPedido } from "./acoes";
+import { exigirUsuario } from "@/lib/sessao";
+import { db } from "@/lib/db";
+
+jest.mock("@/lib/sessao", () => ({ exigirUsuario: jest.fn() }));
+jest.mock("next/cache", () => ({ revalidatePath: jest.fn() }));
+jest.mock("@/lib/db", () => ({
+  db: { produto: { findMany: jest.fn() }, pedido: { create: jest.fn() } },
+}));
+
+function formulario(itens: unknown) {
+  const dados = new FormData();
+  dados.set("itens", JSON.stringify(itens));
+  return dados;
+}
+
+describe("finalizarPedido", () => {
+  beforeEach(() => {
+    jest.mocked(exigirUsuario).mockResolvedValue({ id: "u-1", papel: "cliente" } as never);
+  });
+
+  it("recalcula o total com o preço do banco, ignorando o enviado", async () => {
+    jest.mocked(db.produto.findMany).mockResolvedValue([
+      { id: "banana-prata", precoEmCentavos: 790, estoque: 10 },
+    ] as never);
+    jest.mocked(db.pedido.create).mockResolvedValue({ id: "p-1" } as never);
+
+    const resultado = await finalizarPedido(
+      null,
+      formulario([{ produtoId: "banana-prata", quantidade: 2, precoEmCentavos: 1 }]),
+    );
+
+    expect(resultado).toEqual({ erro: null, pedidoId: "p-1" });
+    expect(db.pedido.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ totalEmCentavos: 1580 + 990 }) }),
+    );
+  });
+
+  it("recusa quando falta estoque", async () => {
+    jest.mocked(db.produto.findMany).mockResolvedValue([
+      { id: "banana-prata", precoEmCentavos: 790, estoque: 1 },
+    ] as never);
+
+    const resultado = await finalizarPedido(null, formulario([{ produtoId: "banana-prata", quantidade: 5 }]));
+
+    expect(resultado.erro).toMatch(/estoque/i);
+    expect(db.pedido.create).not.toHaveBeenCalled();
+  });
+});
+```
+
+Repare no primeiro teste: o cliente manda `precoEmCentavos: 1` e a action usa o preço do banco. Esse é o tipo de regra de segurança que merece teste. Outra que merece: a action do painel rejeita usuário com `papel: "cliente"`.
+
+## Server Components
+
+A Testing Library renderiza no jsdom, como o navegador. Ela não executa o pipeline de Server Components do Next.js. Para um Server Component assíncrono simples, dá para chamá-lo como função e renderizar o resultado:
+
+```tsx
+// src/app/(loja)/produtos/page.test.tsx
+import { render, screen } from "@testing-library/react";
+import PaginaProdutos from "./page";
+import { listarProdutosPorCategoria } from "@/features/catalogo/dados";
+
+jest.mock("@/features/catalogo/dados", () => ({ listarProdutosPorCategoria: jest.fn() }));
+
+it("lista os produtos da categoria pedida", async () => {
+  jest.mocked(listarProdutosPorCategoria).mockResolvedValue([
+    { id: "1", nome: "Manga palmer", precoEmCentavos: 699, unidade: "kg", categoria: "frutas" },
+  ] as never);
+
+  render(await PaginaProdutos({ searchParams: Promise.resolve({ categoria: "frutas" }) }));
+
+  expect(screen.getByRole("heading", { name: "Manga palmer" })).toBeInTheDocument();
+  expect(listarProdutosPorCategoria).toHaveBeenCalledWith("frutas");
+});
+```
+
+Funciona porque os filhos (`ListaDeProdutos`) são componentes síncronos. Se a árvore tiver outros Server Components assíncronos, `Suspense` com streaming ou APIs como `cookies()`, esse truque deixa de valer. A orientação da documentação do Next.js é cobrir Server Components assíncronos com testes ponta a ponta, e manter a lógica deles em funções testáveis isoladamente.
+
+## Acessibilidade dentro do teste
+
+Consultas por papel já são um teste de acessibilidade: `getByRole("button", { name: "Adicionar banana ao carrinho" })` só encontra o botão se ele tiver o papel e o nome acessível corretos. Siga a ordem de prioridade: `getByRole`, `getByLabelText`, `getByText`; deixe `getByTestId` para o último caso.
+
+Para pegar o que as consultas não pegam (atributos ARIA inválidos, campos sem rótulo, IDs duplicados), use `jest-axe`. Contraste de cor fica de fora, porque o jsdom não calcula estilos de layout.
+
+```tsx
+// src/features/checkout/componentes/FormularioDeEntrega.test.tsx
+import { axe } from "jest-axe";
+import { renderComProviders } from "@/testes/utilidades";
+import { FormularioDeEntrega } from "./FormularioDeEntrega";
+
+it("não tem violações de acessibilidade detectáveis", async () => {
+  const { container } = renderComProviders(<FormularioDeEntrega />);
+  expect(await axe(container)).toHaveNoViolations();
+});
+```
+
+## Cobertura com critério
+
+Cobertura mede o que foi executado, não o que foi verificado. Um teste sem `expect` cobre linhas. Use o número como alarme, não como meta:
+
+```ts
+// jest.config.ts (trecho)
+coverageThreshold: {
+  global: { lines: 70, branches: 60 },
+  "./src/features/carrinho/dominio.ts": { lines: 100, branches: 100 },
+  "./src/features/checkout/": { lines: 90 },
+},
+```
+
+Exija mais onde o erro custa dinheiro (domínio do carrinho, checkout) e menos em telas de conteúdo. Em PRs, olhe as linhas novas sem teste, não a porcentagem total. Rode com `npx jest --coverage`.
+
+<Callout type="warning" title="Não teste a implementação">
+Verificar que `setState` foi chamado, inspecionar o estado interno ou fazer snapshot de árvores enormes gera testes que quebram a cada refatoração e passam com bugs reais. Se você renomeia uma função interna e vinte testes falham, eles estão testando o código, não o comportamento.
+</Callout>
+
+## Ponta a ponta com Playwright
+
+Algumas coisas só um navegador real com o servidor real valida: o cookie de sessão, o proxy redirecionando, a Server Action gravando no banco e a página revalidando.
+
+```bash
+npm init playwright@latest
+npm install -D @axe-core/playwright
+```
+
+```ts
+// playwright.config.ts
+import { defineConfig, devices } from "@playwright/test";
+
+export default defineConfig({
+  testDir: "./e2e",
+  use: { baseURL: "http://localhost:3000", trace: "on-first-retry" },
+  retries: process.env.CI ? 2 : 0,
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "celular", use: { ...devices["Pixel 7"] } },
+  ],
+  webServer: {
+    command: "npm run build && npm run start",
+    url: "http://localhost:3000",
+    reuseExistingServer: !process.env.CI,
+  },
+});
+```
+
+```ts
+// e2e/checkout.spec.ts
+import { test, expect } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
+
+test("cliente compra bananas e acompanha o pedido", async ({ page }) => {
+  await page.goto("/entrar");
+  await page.getByLabel("E-mail").fill("cliente@quitanda.test");
+  await page.getByLabel("Senha").fill("senha-de-teste-123");
+  await page.getByRole("button", { name: "Entrar" }).click();
+
+  await page.goto("/produtos?categoria=frutas");
+  await page.getByRole("button", { name: /adicionar banana prata/i }).click();
+  await page.getByRole("link", { name: /carrinho/i }).click();
+  await page.getByRole("button", { name: "Finalizar pedido" }).click();
+
+  await expect(page.getByRole("heading", { name: /pedido recebido/i })).toBeVisible();
+  await expect(page.getByText("Recebido")).toBeVisible();
+
+  const acessibilidade = await new AxeBuilder({ page }).analyze();
+  expect(acessibilidade.violations).toEqual([]);
+});
+```
+
+O Playwright espera automaticamente os elementos ficarem prontos, então não há `sleep`. Para não repetir o login em todo teste, um projeto de setup salva a sessão com `storageState` e os demais reaproveitam. Rode contra um banco de teste populado por um script de seed, nunca contra produção. O `trace` gravado na retentativa mostra cada passo, a rede e o DOM quando um teste falha no CI.
+
+## Na entrevista
+
+**Por que usar MSW em vez de mockar fetch?** Porque o MSW simula a rede, não a função usada para chamá-la. O teste continua válido se eu trocar o cliente HTTP ou a forma de montar a requisição, e os mesmos handlers servem para testes, Storybook e desenvolvimento sem backend.
+
+**Como você testa um custom hook?** Com `renderHook`, passando um `wrapper` com os providers de que ele depende, e envolvendo atualizações em `act`. Se o hook só serve a um componente, prefiro testar pelo componente, que é o que o usuário usa.
+
+**Quando usar findBy, waitFor e queryBy?** `findBy` para esperar um elemento que aparece de forma assíncrona; `waitFor` para outras asserções que precisam de tempo, com uma asserção só dentro; `queryBy` para afirmar que algo não está na tela.
+
+**Como testar Server Components e Server Actions?** Actions são funções: testo com Jest isolando sessão, banco e `next/cache`. Server Components síncronos ou com filhos simples podem ser chamados como função e renderizados; os assíncronos com streaming e APIs de requisição eu cubro com Playwright, mantendo a lógica em funções testáveis.
+
+**Qual meta de cobertura você define?** Uma linha de base global modesta para detectar queda, e metas altas nas áreas críticas, como cálculo de total e checkout. Cobertura alta com asserções fracas engana; reviso as linhas novas sem teste em cada PR.
+
+## Pratique
+
+1. Configure Jest com `next/jest`, `jest-fixed-jsdom` e o mapeamento de `server-only`, e faça os testes antigos do Nível 1 passarem na versão Next.js.
+2. Escreva os handlers MSW de `/api/pedidos/:id` e teste o `AcompanharPedido` nos estados carregando, sucesso, 404 e erro 500.
+3. Crie `renderComProviders` e teste o `Carrinho` começando com dois itens, removendo um e conferindo o total e o frete.
+4. Teste a action `atualizarPreco` do painel: aceita lojista, recusa cliente e rejeita preço negativo.
+5. Adicione `jest-axe` ao formulário de entrega e corrija o que ele apontar. Defina `coverageThreshold` com 100% para `dominio.ts` do carrinho.
+6. Escreva o teste Playwright do fluxo de compra com login via `storageState` e rode-o nos projetos de desktop e celular.
+
+<Quiz question="Por que o render customizado da Quitanda cria um QueryClient novo para cada teste?" options={["Porque o TanStack Query proíbe reutilizar o cliente","Para deixar os testes mais rápidos","Para que o cache de um teste não vaze para o próximo e cause resultados dependentes da ordem","Porque o MSW exige um cliente por handler"]} answer={2} explanation="Um cliente compartilhado guardaria respostas em cache entre testes. Isolar o cache torna cada teste independente." />
+
+<Quiz question="Qual consulta da Testing Library você usa para afirmar que uma mensagem de erro NÃO está na tela?" options={["queryByRole, que devolve null quando não encontra","getByRole, que devolve undefined","findByRole com timeout curto","getByTestId"]} answer={0} explanation="getBy lança erro se não encontra e findBy espera aparecer. queryBy devolve null, o que permite a asserção de ausência." />
+
+<Quiz question="Qual o motivo de mapear o pacote server-only para um arquivo vazio na configuração do Jest?" options={["Para acelerar a transformação com o compilador do Next.js","Para permitir que Client Components importem o banco","Para desligar a verificação no build de produção","Porque o pacote lança erro fora do ambiente de servidor do React, e o jsdom não é esse ambiente"]} answer={3} explanation="server-only protege o build contra importações indevidas. Nos testes de Jest, que rodam no jsdom, ele é substituído para que os módulos de dados possam ser importados e mockados." />
+
+## Base no CodeForge
+
+- [React: escrevendo seus primeiros testes com Jest e Testing Library](/learn/carreira-react/react-primeiros-testes-jest-testing-library): a base de consultas, user-event e asserções.
+- [React: explorando padrões de composição com custom hooks](/learn/carreira-react/react-padroes-composicao-custom-hooks): os hooks testados aqui.
+- [Node.js: implementando testes em uma API](/learn/carreira-nodejs/nodejs-implementando-testes-api): o lado servidor da mesma pirâmide.
+- [Integração contínua: pipelines com testes automatizados no GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipelines-testes-automatizados-github-actions): rodar tudo isso a cada push.
+
+## Referências
+
+- [Next.js: Setting up Jest](https://nextjs.org/docs/app/guides/testing/jest)
+- [Testing Library: Guiding principles e queries](https://testing-library.com/docs/queries/about)
+- [MSW: Node.js integration](https://mswjs.io/docs/integrations/node)
+- [React Testing Library: renderHook](https://testing-library.com/docs/react-testing-library/api/#renderhook)
+- [Playwright: Writing tests](https://playwright.dev/docs/writing-tests)

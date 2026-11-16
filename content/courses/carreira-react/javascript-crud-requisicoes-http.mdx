@@ -1,0 +1,446 @@
+---
+title: "JavaScript: implementando CRUD com requisições HTTP"
+kind: lesson
+---
+
+O catálogo da Quitanda ainda mora num arquivo `produtos.js`. Para mudar o preço do tomate, alguém edita código e publica o site de novo; o estoque não baixa quando um pedido é feito; e o pedido confirmado no checkout não vai para lugar nenhum. Uma loja de verdade guarda esses dados num servidor e o front conversa com ele por HTTP, pedindo a lista de produtos, enviando pedidos e, no caso do lojista, criando, editando e removendo produtos.
+
+Este capítulo coloca uma API REST de exemplo no ar com o `json-server`, escreve uma camada de serviço em `js/servicos/api.js` com `fetch` e `async`/`await` e constrói o **painel do lojista**: uma página que lista, cadastra, edita e exclui produtos e muda o status dos pedidos. No caminho, você vai tratar o que os tutoriais costumam pular: erros HTTP que o `fetch` não considera erro, estados de carregamento, botões que não podem ser clicados duas vezes e requisições que demoram demais.
+
+**Você vai aprender:**
+
+- Subir uma API REST falsa com `json-server` a partir de um `db.json`
+- Entender Promises e escrever código assíncrono com `async`, `await`, `try`, `catch` e `finally`
+- Usar `fetch` com `GET`, `POST`, `PUT`, `PATCH` e `DELETE`, enviando e recebendo JSON
+- Centralizar as chamadas numa camada de serviço que trata status de erro
+- Exibir estados de carregamento, erro e lista vazia e evitar envios duplicados
+- Cancelar requisições com `AbortController` e definir tempo limite
+
+## A API de exemplo com json-server
+
+O `json-server` cria uma API REST completa a partir de um arquivo JSON, sem escrever backend. Ele roda com Node.js (instale a versão LTS em nodejs.org se ainda não tiver; o próximo capítulo explica o Node e o npm a fundo).
+
+```json
+// db.json
+{
+  "produtos": [
+    { "id": "1", "nome": "Tomate italiano", "precoEmCentavos": 899, "unidade": "kg", "categoria": "legumes", "estoque": 40, "foto": "img/tomate.jpg" },
+    { "id": "2", "nome": "Banana prata", "precoEmCentavos": 649, "unidade": "kg", "categoria": "frutas", "estoque": 25, "foto": "img/banana.jpg" },
+    { "id": "3", "nome": "Alface crespa", "precoEmCentavos": 350, "unidade": "un", "categoria": "verduras", "estoque": 0, "foto": "img/alface.jpg" }
+  ],
+  "pedidos": []
+}
+```
+
+Na pasta da Quitanda, num terminal:
+
+```bash
+# terminal
+npx json-server db.json
+```
+
+A API sobe em `http://localhost:3000`, com rotas geradas a partir das chaves do JSON:
+
+| Rota | Operação |
+|---|---|
+| `GET /produtos` | Lista todos |
+| `GET /produtos/1` | Um produto (404 se não existir) |
+| `GET /produtos?categoria=frutas` | Filtra por campo |
+| `GET /produtos?_sort=nome` | Ordena |
+| `POST /produtos` | Cria; o servidor gera o `id` |
+| `PUT /produtos/1` | Substitui o produto inteiro |
+| `PATCH /produtos/1` | Altera só os campos enviados |
+| `DELETE /produtos/1` | Remove |
+
+As alterações são gravadas no próprio `db.json`. Abra `http://localhost:3000/produtos` no navegador para ver a resposta. Os parâmetros de paginação e operadores de filtro mudaram entre a série 0.x e a 1.x do `json-server`; confira o README da versão instalada antes de usá-los (na 0.x, acrescente `--watch` ao comando para recarregar o arquivo).
+
+<Callout type="tip" title="Duas origens, CORS liberado">
+A página roda no Live Server (`localhost:5500`) e a API em `localhost:3000`: portas diferentes são origens diferentes, e o navegador aplica as regras de CORS. O `json-server` já responde com os cabeçalhos que liberam qualquer origem. Numa API real, o backend precisa autorizar explicitamente a origem do front. Antes de um `POST` com JSON, a aba Network mostra uma requisição `OPTIONS`: é o preflight, em que o navegador pergunta à API se aquela origem pode usar aquele método e aqueles cabeçalhos.
+</Callout>
+
+## Assincronia em uma página
+
+Uma requisição leva de milissegundos a segundos. Se o JavaScript ficasse parado esperando, a página congelaria. Por isso operações de rede são **assíncronas**: a função devolve na hora uma **Promise**, um objeto que representa um valor que vai chegar (ou falhar) no futuro.
+
+Uma Promise está em um de três estados: pendente, cumprida (com um valor) ou rejeitada (com um erro). Você pode consumi-la encadeando `.then` e `.catch`, mas a forma moderna e mais legível é `async`/`await`, que lê o fluxo de cima para baixo e trata erros com `try` e `catch`:
+
+```js
+// js/exemplos/assincronia.js
+async function carregar() {
+  try {
+    const resposta = await fetch("http://localhost:3000/produtos");
+    const produtos = await resposta.json();
+    console.log(produtos);
+  } catch (erro) {
+    console.error(erro);
+  }
+}
+```
+
+`await` pausa só a função `async` até a Promise resolver; o resto da página continua respondendo. Uma função `async` sempre devolve uma Promise. Em módulos ES, você pode usar `await` direto no topo do arquivo.
+
+Para várias requisições independentes, dispare todas e espere juntas: `const [produtos, pedidos] = await Promise.all([listarProdutos(), listarPedidos()])`. `Promise.all` rejeita se qualquer uma falhar; `Promise.allSettled` espera todas e informa o resultado de cada, útil quando uma falha parcial é aceitável.
+
+## fetch por dentro
+
+```js
+// js/exemplos/fetch.js
+const resposta = await fetch(url, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(dados),
+});
+```
+
+O objeto `Response` tem `status` (200, 404...), `ok` (verdadeiro para 200 a 299), `headers` e métodos para ler o corpo: `json()`, `text()`, `blob()`. O corpo só pode ser lido uma vez.
+
+<Callout type="warning" title="fetch não rejeita em 404 nem em 500">
+A Promise do `fetch` só rejeita em falha de rede (servidor fora do ar, DNS, CORS bloqueado, requisição cancelada). Uma resposta 404 ou 500 **é uma resposta**, e a Promise cumpre normalmente. Se você não verificar `resposta.ok`, vai tentar ler a página de erro como se fosse a lista de produtos.
+</Callout>
+
+## A camada de serviço
+
+Espalhar `fetch` pela interface repete URL, cabeçalhos e tratamento de erro em todo lugar. Centralize num módulo:
+
+```js
+// js/servicos/api.js
+const URL_BASE = "http://localhost:3000";
+
+export class ErroHttp extends Error {
+  constructor(status, mensagem) {
+    super(mensagem);
+    this.name = "ErroHttp";
+    this.status = status;
+  }
+}
+
+async function requisitar(caminho, { method = "GET", corpo, signal } = {}) {
+  const resposta = await fetch(`${URL_BASE}${caminho}`, {
+    method,
+    headers: corpo ? { "Content-Type": "application/json" } : undefined,
+    body: corpo ? JSON.stringify(corpo) : undefined,
+    signal: signal ?? AbortSignal.timeout(8000),
+  });
+
+  if (!resposta.ok) {
+    throw new ErroHttp(resposta.status, `Erro ${resposta.status} em ${method} ${caminho}`);
+  }
+
+  if (resposta.status === 204) return null;
+  return resposta.json();
+}
+
+// produtos
+export const listarProdutos = (filtros = {}, signal) =>
+  requisitar(`/produtos?${new URLSearchParams(filtros)}`, { signal });
+export const buscarProduto = (id) => requisitar(`/produtos/${id}`);
+export const criarProduto = (produto) => requisitar("/produtos", { method: "POST", corpo: produto });
+export const substituirProduto = (id, produto) =>
+  requisitar(`/produtos/${id}`, { method: "PUT", corpo: produto });
+export const alterarProduto = (id, campos) =>
+  requisitar(`/produtos/${id}`, { method: "PATCH", corpo: campos });
+export const excluirProduto = (id) => requisitar(`/produtos/${id}`, { method: "DELETE" });
+
+// pedidos
+export const listarPedidos = () => requisitar("/pedidos");
+export const criarPedido = (pedido) => requisitar("/pedidos", { method: "POST", corpo: pedido });
+export const atualizarStatusPedido = (id, status) =>
+  requisitar(`/pedidos/${id}`, { method: "PATCH", corpo: { status } });
+```
+
+Vantagens que você vai sentir já neste capítulo:
+
+- A interface chama `listarProdutos({ categoria: "frutas" })` e não sabe de URL, cabeçalho ou JSON.
+- Todo status fora de 2xx vira um `ErroHttp` com o código, e a interface decide a mensagem.
+- Trocar o `json-server` pela API real, ou adicionar o cabeçalho `Authorization` no Nível 2, muda um arquivo.
+- No Nível 1, este mesmo módulo vira `src/servicos/api.ts` e é usado pelos hooks do React e pelo TanStack Query.
+
+A `URL_BASE` aponta direto para o `json-server` por enquanto. No próximo capítulo, o servidor de desenvolvimento do Vite passa a encaminhar `/api` para ele, e a constante vira `"/api"`: o front chama `/api/produtos`, como fará em produção.
+
+`AbortSignal.timeout(8000)` cancela a requisição após 8 segundos; sem isso, uma API travada deixaria o painel carregando para sempre. `URLSearchParams` monta a query string com a codificação correta.
+
+## CRUD na prática: o painel do lojista
+
+O painel é uma página separada, `painel.html`, com uma tabela de produtos e um formulário que serve tanto para criar quanto para editar.
+
+```html
+<!-- painel.html (dentro do main) -->
+<h1>Painel do lojista</h1>
+
+<form id="form-produto" class="formulario">
+  <input type="hidden" name="id" />
+  <div class="campo">
+    <label for="nome">Nome</label>
+    <input id="nome" name="nome" required minlength="2" />
+  </div>
+  <div class="campo">
+    <label for="preco">Preço (R$)</label>
+    <input id="preco" name="preco" inputmode="decimal" required pattern="\d+([,.]\d{1,2})?" />
+  </div>
+  <div class="campo">
+    <label for="unidade">Unidade</label>
+    <select id="unidade" name="unidade"><option value="kg">kg</option><option value="un">un</option></select>
+  </div>
+  <div class="campo">
+    <label for="estoque">Estoque</label>
+    <input id="estoque" name="estoque" type="number" min="0" required />
+  </div>
+  <button type="submit" class="botao">Salvar</button>
+  <p id="mensagem-form" role="status"></p>
+</form>
+
+<p id="estado-lista" role="status">Carregando produtos...</p>
+<table id="tabela-produtos" hidden>
+  <thead><tr><th>Nome</th><th>Preço</th><th>Estoque</th><th>Ações</th></tr></thead>
+  <tbody></tbody>
+</table>
+```
+
+### Read: carregando com estados
+
+Toda tela que busca dados tem pelo menos quatro estados: **carregando**, **erro**, **vazio** e **com dados**. Esquecer qualquer um deles é bug.
+
+```js
+// js/painel.js
+import { listarProdutos, excluirProduto, criarProduto, alterarProduto } from "./servicos/api.js";
+import { formatarPreco } from "./formatacao.js";
+
+const estado = document.querySelector("#estado-lista");
+const tabela = document.querySelector("#tabela-produtos");
+const corpo = tabela.querySelector("tbody");
+let produtos = [];
+
+async function carregarProdutos() {
+  estado.textContent = "Carregando produtos...";
+  estado.hidden = false;
+  tabela.hidden = true;
+
+  try {
+    produtos = await listarProdutos({ _sort: "nome" });
+    if (produtos.length === 0) {
+      estado.textContent = "Nenhum produto cadastrado ainda.";
+      return;
+    }
+    renderizarTabela();
+    estado.hidden = true;
+    tabela.hidden = false;
+  } catch (erro) {
+    estado.textContent = "Não foi possível carregar os produtos. Verifique sua conexão e tente de novo.";
+    console.error(erro);
+  }
+}
+
+function renderizarTabela() {
+  corpo.replaceChildren(
+    ...produtos.map((produto) => {
+      const linha = document.createElement("tr");
+      linha.dataset.id = produto.id;
+      linha.innerHTML = `
+        <td></td><td></td><td></td>
+        <td>
+          <button type="button" data-acao="editar">Editar</button>
+          <button type="button" data-acao="excluir">Excluir</button>
+        </td>`;
+      const [nome, preco, estoque] = linha.children;
+      nome.textContent = produto.nome;
+      preco.textContent = `${formatarPreco(produto.precoEmCentavos)} / ${produto.unidade}`;
+      estoque.textContent = produto.estoque;
+      return linha;
+    }),
+  );
+}
+
+carregarProdutos();
+```
+
+O `innerHTML` aqui só recebe a marcação fixa escrita por você; os dados do servidor entram por `textContent`, como no capítulo de DOM.
+
+### Create e Update: o mesmo formulário
+
+```js
+// js/painel.js
+const form = document.querySelector("#form-produto");
+const mensagem = document.querySelector("#mensagem-form");
+
+function paraCentavos(texto) {
+  return Math.round(Number(texto.replace(",", ".")) * 100);
+}
+
+form.addEventListener("submit", async (evento) => {
+  evento.preventDefault();
+  const dados = Object.fromEntries(new FormData(form));
+  const produto = {
+    nome: dados.nome.trim(),
+    precoEmCentavos: paraCentavos(dados.preco),
+    unidade: dados.unidade,
+    estoque: Number(dados.estoque),
+  };
+
+  const botao = form.querySelector('[type="submit"]');
+  botao.disabled = true;
+  mensagem.textContent = "Salvando...";
+
+  try {
+    if (dados.id) {
+      await alterarProduto(dados.id, produto);
+    } else {
+      await criarProduto({ ...produto, categoria: "frutas", foto: "img/sem-foto.jpg" });
+    }
+    mensagem.textContent = "Produto salvo.";
+    form.reset();
+    await carregarProdutos();
+  } catch (erro) {
+    mensagem.textContent =
+      erro.status === 400 ? "Confira os dados do produto." : "Erro ao salvar. Tente de novo.";
+  } finally {
+    botao.disabled = false;
+  }
+});
+```
+
+O `finally` reabilita o botão em qualquer caminho, sucesso ou erro. Desabilitar durante o envio impede o clique duplo que, num `POST`, criaria dois produtos. A edição usa `PATCH` porque o formulário não tem todos os campos do produto (categoria e foto ficam como estão); um `PUT` com esse objeto apagaria os campos ausentes.
+
+| | `PUT` | `PATCH` |
+|---|---|---|
+| Corpo | O recurso inteiro | Só os campos alterados |
+| Campo omitido | É removido ou volta ao padrão | Fica como estava |
+| Idempotente | Sim | Depende da operação (definir status, sim; incrementar, não) |
+| Na Quitanda | Raramente | Editar produto, mudar status do pedido, baixar estoque |
+
+### Delete com confirmação
+
+```js
+// js/painel.js
+corpo.addEventListener("click", async (evento) => {
+  const botao = evento.target.closest("button[data-acao]");
+  if (!botao) return;
+  const id = botao.closest("tr").dataset.id;
+  const produto = produtos.find((p) => p.id === id);
+
+  if (botao.dataset.acao === "editar") {
+    form.elements.id.value = produto.id;
+    form.elements.nome.value = produto.nome;
+    form.elements.preco.value = (produto.precoEmCentavos / 100).toFixed(2).replace(".", ",");
+    form.elements.unidade.value = produto.unidade;
+    form.elements.estoque.value = produto.estoque;
+    form.elements.nome.focus();
+    return;
+  }
+
+  if (!confirm(`Excluir ${produto.nome}?`)) return;
+  botao.disabled = true;
+  try {
+    await excluirProduto(id);
+    produtos = produtos.filter((p) => p.id !== id);
+    renderizarTabela();
+  } catch (erro) {
+    botao.disabled = false;
+    alert(erro.status === 404 ? "Este produto já foi removido." : "Não foi possível excluir.");
+  }
+});
+```
+
+Depois da exclusão, a lista local é atualizada sem buscar tudo de novo. Uma variação é a **atualização otimista**: remover da tela antes da resposta e restaurar se der erro. A interface parece instantânea, ao custo de desfazer em caso de falha. O React 19 tem um hook para isso, `useOptimistic`.
+
+## Pedidos: do checkout ao painel
+
+O checkout passa a enviar o pedido de verdade:
+
+```js
+// js/checkout.js
+import { criarPedido } from "./servicos/api.js";
+import { obterItens, esvaziar } from "./estado-carrinho.js";
+
+formulario.addEventListener("submit", async (evento) => {
+  evento.preventDefault();
+  const cliente = Object.fromEntries(new FormData(formulario));
+  const botao = formulario.querySelector('[type="submit"]');
+  botao.disabled = true;
+
+  try {
+    const pedido = await criarPedido({
+      cliente,
+      itens: obterItens().map(({ produtoId, quantidade }) => ({ produtoId, quantidade })),
+      status: "recebido",
+      criadoEm: new Date().toISOString(),
+    });
+    esvaziar();
+    location.href = `pedido.html?id=${pedido.id}`;
+  } catch {
+    botao.disabled = false;
+    document.querySelector("#erro-checkout").textContent =
+      "Não conseguimos registrar seu pedido. Seu carrinho foi mantido; tente de novo.";
+  }
+});
+```
+
+Só `produtoId` e `quantidade` vão no corpo: numa API real, o servidor busca os preços no banco e calcula o total, porque um preço vindo do navegador pode ter sido alterado. O `json-server` grava o que receber; ele serve para praticar o contrato, não as regras de negócio.
+
+No painel, um `select` por pedido muda o status com `PATCH /pedidos/:id` e o corpo `{ "status": "separando" }`, passando por `recebido`, `separando`, `saiu_para_entrega` e `entregue`. No Nível 3, esse status chega ao cliente em tempo real pelo Socket.io.
+
+## Cancelando requisições
+
+Na busca da vitrine, cada letra digitada dispara uma requisição. Se a resposta de "ba" chegar depois da de "banana", a tela mostra o resultado errado. Cancele a anterior:
+
+```js
+// js/ui/vitrine.js
+import { listarProdutos } from "../servicos/api.js";
+
+let controlador;
+
+campoBusca.addEventListener("input", async () => {
+  controlador?.abort();
+  controlador = new AbortController();
+  try {
+    const lista = await listarProdutos({ nome: campoBusca.value }, controlador.signal);
+    renderizarProdutos(lista);
+  } catch (erro) {
+    if (erro.name !== "AbortError") mostrarErro();
+  }
+});
+```
+
+Uma requisição cancelada rejeita com `AbortError`, que não é um erro para o usuário. (O filtro `nome` do `json-server` compara o valor exato; para busca parcial, filtre a lista no front ou consulte o README da sua versão.) Esse problema, e o cache das respostas, é o que o TanStack Query resolve no Nível 1.
+
+## Na entrevista
+
+**O `fetch` rejeita a Promise em um 404?** Não. Ele só rejeita em falha de rede ou cancelamento. É preciso checar `response.ok` ou `response.status` e tratar o erro explicitamente.
+
+**Qual a diferença entre `PUT` e `PATCH`?** `PUT` substitui o recurso inteiro com o corpo enviado e é idempotente; `PATCH` aplica uma alteração parcial, mantendo os campos não enviados.
+
+**Por que desabilitar o botão durante o envio?** Para evitar requisições duplicadas. `POST` não é idempotente, e dois cliques criariam dois pedidos.
+
+**O que são os estados de uma tela que busca dados?** Carregando, erro, vazio e sucesso. Cada um precisa de uma representação, e o erro deve oferecer uma saída, como tentar de novo.
+
+**Para que serve o `AbortController`?** Para cancelar requisições em andamento, seja por tempo limite, seja porque o resultado deixou de interessar (o usuário digitou de novo ou saiu da página), evitando condições de corrida.
+
+## Pratique
+
+1. Crie o `db.json` com pelo menos oito produtos, suba o `json-server` e explore as rotas de listagem, filtro, ordenação e detalhe pelo navegador.
+2. Escreva `js/servicos/api.js` com `requisitar` e as funções de produtos e pedidos; troque a vitrine para carregar os produtos da API com os quatro estados.
+3. Construa o `painel.html` com listagem, criação, edição com `PATCH` e exclusão com confirmação; derrube o `json-server` e confira as mensagens de erro.
+4. Faça o checkout enviar o pedido com `POST /pedidos` e criar a página `pedido.html` que lê o `id` da URL e mostra o status.
+5. No painel, liste os pedidos e permita mudar o status com um `select`, usando `PATCH`.
+6. Implemente a exclusão otimista: remova a linha na hora, restaure-a se a API responder com erro e anuncie o resultado numa região `aria-live`.
+
+<Quiz question="A API responde 500 a um fetch. O que acontece com a Promise retornada por fetch?" options={["Ela rejeita e cai no catch","Ela fica pendente para sempre","Ela é cancelada automaticamente","Ela cumpre com um Response cujo ok é false"]} answer={3} explanation="O fetch só rejeita em falha de rede ou cancelamento. Um 500 é uma resposta válida do ponto de vista do protocolo; é preciso checar response.ok." />
+
+<Quiz question="O formulário de edição envia apenas nome, preço, unidade e estoque. Qual método preserva a categoria e a foto do produto?" options={["PUT","PATCH","POST","GET"]} answer={1} explanation="PATCH altera só os campos enviados. PUT substituiria o recurso inteiro pelo corpo, descartando os campos omitidos." />
+
+<Quiz question="Na busca, a resposta de uma requisição antiga chega depois da mais recente e sobrescreve a lista. Qual a solução?" options={["Cancelar a requisição anterior com AbortController antes de disparar a nova","Usar Promise.all","Trocar GET por POST","Aumentar o tempo limite"]} answer={0} explanation="Cancelar a requisição anterior garante que só a resposta da busca mais recente seja usada, eliminando a condição de corrida." />
+
+## Base no CodeForge
+
+- [REST](/learn/system-design/rest): recursos, verbos e status codes por trás desta API.
+- [Idempotência](/learn/system-design/idempotencia): por que um `POST` repetido cria dois pedidos.
+- [Promises](/learn/typescript/promises) e [async/await](/learn/typescript/async-await): a assincronia em profundidade.
+- [JavaScript: explorando a manipulação de elementos e da localStorage](/learn/carreira-react/javascript-manipulacao-elementos-localstorage): os módulos e o estado do carrinho usados no checkout.
+- [React: consumindo APIs HTTP no seu projeto](/learn/carreira-react/react-consumindo-apis-http): esta mesma camada de serviço, agora com React.
+
+## Referências
+
+- [MDN: Using the Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch)
+- [MDN: async function](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/async_function)
+- [MDN: AbortController](https://developer.mozilla.org/en-US/docs/Web/API/AbortController)
+- [MDN: HTTP request methods](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Methods)
+- [json-server no GitHub](https://github.com/typicode/json-server)

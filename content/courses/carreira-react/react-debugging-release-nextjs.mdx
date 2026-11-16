@@ -1,0 +1,391 @@
+---
+title: "React: implementando técnicas modernas de Debugging e Release com Next.js"
+kind: lesson
+---
+
+Sexta-feira, 18h: um cliente avisa que o carrinho da Quitanda mostra "R$ 0,00" no total, mas só às vezes, e só depois de entrar na conta. No terminal do `next dev` aparece um aviso de hidratação, no navegador nada quebra de forma óbvia, e o deploy que entrou de manhã juntou vinte commits. Achar a causa com `console.log` espalhado e torcer para o próximo deploy dar certo não é um processo.
+
+Com o App Router o código roda em dois lugares (servidor e navegador) e o bug pode estar em qualquer um deles, ou na fronteira entre os dois. Este capítulo monta a caixa de ferramentas para investigar cada lado e o processo para colocar mudanças no ar com segurança: previews por pull request, flags para desligar uma funcionalidade sem deploy, versão rastreável e rollback em segundos.
+
+**Você vai aprender:**
+
+- Depurar código de servidor e de cliente com o debugger do VS Code e as DevTools do navegador
+- Usar React DevTools para inspecionar props, estado, renderizações e o motivo de cada render
+- Ler e corrigir erros de hidratação, e tratar falhas com `error.tsx`, `global-error.tsx` e `not-found.tsx`
+- Registrar logs úteis no servidor e capturar erros com `instrumentation.ts`
+- Liberar funcionalidades com feature flags e validar cada mudança em preview deployments
+- Versionar, gerar changelog e fazer rollback sem pânico
+
+## Onde o código roda
+
+Antes de abrir qualquer ferramenta, responda: este trecho executa no servidor, no navegador ou nos dois?
+
+| Código | Onde roda | Onde aparece o `console.log` |
+|---|---|---|
+| Server Component (`page.tsx` sem diretiva) | Servidor | Terminal do `next dev` (e, em dev, repassado ao console do navegador com a marca do servidor) |
+| Server Action, route handler, `proxy.ts` | Servidor | Terminal |
+| Client Component (`"use client"`) | Servidor no primeiro HTML e depois no navegador | Terminal e console do navegador |
+| `useEffect`, handlers de evento | Só no navegador | Console do navegador |
+
+A linha do Client Component é a que confunde: ele também é renderizado no servidor para gerar o HTML inicial. Código que lê `window`, `localStorage` ou a hora local no corpo do componente roda nos dois lados e pode produzir resultados diferentes.
+
+## Debugger no VS Code
+
+`console.log` serve para uma olhada rápida. Para entender um fluxo, pare a execução e inspecione variáveis. O Next.js documenta uma configuração de `launch.json` que cobre os dois lados:
+
+```json
+// .vscode/launch.json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Next.js: servidor",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev"
+    },
+    {
+      "name": "Next.js: cliente",
+      "type": "chrome",
+      "request": "launch",
+      "url": "http://localhost:3000"
+    },
+    {
+      "name": "Next.js: full stack",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/next/dist/bin/next",
+      "runtimeArgs": ["--inspect"],
+      "skipFiles": ["<node_internals>/**"],
+      "serverReadyAction": {
+        "action": "debugWithChrome",
+        "killOnServerStop": true,
+        "pattern": "- Local:.+(https?://.+)",
+        "uriFormat": "%s",
+        "webRoot": "${workspaceFolder}"
+      }
+    }
+  ]
+}
+```
+
+Com "full stack", um breakpoint em `src/servicos/pedidos.ts` pausa quando o Server Component consulta o banco, e outro em `src/componentes/Carrinho.tsx` pausa no clique do navegador. Sem VS Code, rode `next dev --inspect`, abra `chrome://inspect` e conecte as DevTools do Chrome ao processo Node.
+
+A instrução `debugger;` no código também funciona como breakpoint quando há um depurador conectado. Use durante a investigação e remova antes do commit (o ESLint tem a regra `no-debugger` para isso).
+
+### Breakpoints mais espertos
+
+- **Condicional**: clique com o botão direito no breakpoint e informe `pedido.status === "separando"`. A execução só para no caso que interessa.
+- **Logpoint**: imprime uma mensagem sem pausar e sem editar o código.
+- **Pausar em exceções**: nas DevTools, em Sources, ative "Pause on caught exceptions" para achar o `catch` que engole o erro.
+
+## Source maps
+
+O código que roda é o resultado do bundler, minificado. Source maps ligam cada trecho ao arquivo TypeScript original. Em desenvolvimento estão sempre ativos. Em produção, o Next.js não publica os do navegador por padrão, para não expor o código-fonte. As opções:
+
+```ts
+// next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  productionBrowserSourceMaps: false, // true publica os .map junto com o JS
+};
+
+export default config;
+```
+
+O caminho mais comum em produção é gerar os mapas no build, enviá-los ao serviço de monitoramento (Sentry, New Relic, Datadog) e não servi-los publicamente. A pilha de erro chega minificada e o serviço a traduz para `Carrinho.tsx:42`.
+
+## React DevTools
+
+A extensão React DevTools acrescenta duas abas às ferramentas do navegador:
+
+- **Components**: a árvore de componentes com props, estado, hooks e contexto. Selecione o `Carrinho` e edite o estado ali mesmo para testar o caso de carrinho vazio. O botão de "olho" leva ao elemento DOM; o de código leva ao arquivo-fonte.
+- **Profiler**: grave uma interação (adicionar uma banana ao carrinho) e veja quais componentes renderizaram, quanto tempo levaram e, com a opção "Record why each component rendered" ligada nas configurações, o motivo de cada render.
+
+Server Components não aparecem como componentes interativos na árvore, porque não existem no navegador; você vê os Client Components e o que eles recebem como props. Para depurar um Server Component, use o debugger do servidor.
+
+Em desenvolvimento, o Next.js também mostra um indicador no canto da tela com os erros e avisos da página e informações da rota (estática ou dinâmica). Ele é o primeiro lugar para olhar quando "algo está estranho".
+
+## Erros de hidratação
+
+Hidratação é o momento em que o React no navegador assume o HTML que veio do servidor. Se o primeiro render do cliente produz uma árvore diferente, o React avisa e regenera o trecho no cliente, o que custa desempenho e pode piscar a tela. Causas típicas na Quitanda:
+
+```tsx
+// src/componentes/ResumoDoCarrinho.tsx (versão com bug)
+"use client";
+
+export function ResumoDoCarrinho() {
+  const itens = JSON.parse(localStorage.getItem("carrinho") ?? "[]"); // não existe no servidor
+  const atualizadoEm = new Date().toLocaleTimeString("pt-BR"); // hora diferente nos dois lados
+  return <p>{itens.length} itens, atualizado às {atualizadoEm}</p>;
+}
+```
+
+A correção é deixar o primeiro render igual nos dois lados e ler dados exclusivos do navegador depois da montagem:
+
+```tsx
+// src/componentes/ResumoDoCarrinho.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+
+export function ResumoDoCarrinho() {
+  const [quantidade, setQuantidade] = useState<number | null>(null);
+
+  useEffect(() => {
+    const itens = JSON.parse(localStorage.getItem("carrinho") ?? "[]");
+    setQuantidade(itens.length);
+  }, []);
+
+  if (quantidade === null) return <p aria-busy="true">Carregando carrinho...</p>;
+  return <p>{quantidade} itens no carrinho</p>;
+}
+```
+
+Outras causas: HTML inválido (um `div` dentro de `p`, um `a` dentro de outro `a`), `Math.random()` ou `Date.now()` no render, formatação de moeda ou data que depende do fuso do servidor, e extensões do navegador que alteram o DOM. Para um texto que legitimamente difere (um horário), `suppressHydrationWarning` no elemento silencia o aviso daquele nó apenas; não use como solução geral.
+
+<Callout type="tip" title="Leia o diff da mensagem">
+O React 19 mostra o trecho da árvore com as linhas marcadas com `+` (cliente) e `-` (servidor). Comece pelo primeiro nó diferente: ele aponta o componente e, quase sempre, a expressão que depende do ambiente.
+</Callout>
+
+## Tratando falhas na interface
+
+No App Router, arquivos especiais criam limites de erro por segmento de rota.
+
+```tsx
+// src/app/pedidos/error.tsx
+"use client";
+
+import { useEffect } from "react";
+
+export default function ErroEmPedidos({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  useEffect(() => {
+    console.error(error);
+  }, [error]);
+
+  return (
+    <div role="alert">
+      <h2>Não conseguimos carregar seus pedidos.</h2>
+      <p>Código para o suporte: {error.digest ?? "indisponível"}</p>
+      <button onClick={reset}>Tentar de novo</button>
+    </div>
+  );
+}
+```
+
+- `error.tsx` precisa ser Client Component. Ele captura erros dos componentes do segmento e dos filhos, mas não do `layout.tsx` do mesmo nível (para isso, o `error.tsx` do segmento pai).
+- Em produção, a mensagem de erros vindos do servidor é substituída por uma genérica, para não vazar detalhes. O `digest` é um identificador que também aparece no log do servidor: é a ponte entre o que o cliente relata e o que você procura.
+- `global-error.tsx` na raiz de `app` captura erros do layout raiz e precisa renderizar as próprias tags `html` e `body`.
+- `not-found.tsx` é exibido quando você chama `notFound()`, por exemplo quando `buscarProduto(id)` não acha nada.
+
+```tsx
+// src/app/produtos/[id]/page.tsx
+import { notFound } from "next/navigation";
+import { buscarProduto } from "@/servicos/produtos";
+import { DetalheDoProduto } from "@/componentes/DetalheDoProduto";
+
+export default async function PaginaProduto({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const produto = await buscarProduto(id);
+  if (!produto) notFound();
+  return <DetalheDoProduto produto={produto} />;
+}
+```
+
+Erros esperados (estoque insuficiente, cupom vencido) não devem virar exceção. Numa Server Action, devolva um objeto `{ erro: "..." }` e mostre com `useActionState`; reserve `error.tsx` para o inesperado.
+
+## Logs e captura de erros no servidor
+
+Log útil responde "o que aconteceu, com quem, em qual requisição". Prefira logs estruturados em JSON, que o provedor indexa e filtra:
+
+```ts
+// src/lib/log.ts
+import "server-only";
+
+type Nivel = "info" | "warn" | "error";
+
+export function log(nivel: Nivel, mensagem: string, contexto: Record<string, unknown> = {}) {
+  console[nivel](JSON.stringify({ nivel, mensagem, ...contexto, em: new Date().toISOString() }));
+}
+```
+
+```ts
+// uso em src/app/checkout/acoes.ts
+log("info", "pedido criado", { pedidoId: pedido.id, clienteId: usuario.id, totalEmCentavos: total });
+```
+
+Nunca registre senha, token, cookie ou número de cartão.
+
+O arquivo `instrumentation.ts` na raiz (ou em `src/`) roda uma vez ao iniciar o servidor e pode exportar `onRequestError`, chamado para cada erro não tratado em Server Components, route handlers, Server Actions e proxy:
+
+```ts
+// src/instrumentation.ts
+import type { Instrumentation } from "next";
+
+export async function register() {
+  // inicialize aqui o SDK de monitoramento ou o OpenTelemetry
+}
+
+export const onRequestError: Instrumentation.onRequestError = async (erro, requisicao, contexto) => {
+  const e = erro as Error & { digest?: string };
+  console.error(
+    JSON.stringify({
+      nivel: "error",
+      mensagem: e.message,
+      digest: e.digest,
+      caminho: requisicao.path,
+      rota: contexto.routePath,
+      tipo: contexto.routeType,
+    }),
+  );
+};
+```
+
+É o ponto de encaixe de Sentry, New Relic ou OpenTelemetry. O capítulo de observabilidade do Nível 3 aprofunda métricas e traces.
+
+## Release: do pull request à produção
+
+Debugging resolve o bug de hoje. Um bom processo de release diminui o tamanho do bug de amanhã: mudanças pequenas, testadas num ambiente real, que podem ser desligadas ou revertidas rápido.
+
+### Preview deployments
+
+Na Vercel (e em Netlify, Cloudflare e outros), cada pull request ganha uma URL própria com o build daquele branch. O revisor clica, testa o checkout no celular e comenta. Cuidados:
+
+- Previews usam as variáveis do ambiente "Preview": aponte para um banco de homologação, nunca para o de produção.
+- Proteja os previews com autenticação da plataforma se o código ainda não for público.
+- Callbacks de OAuth e webhooks precisam aceitar a URL do preview, ou use um provedor de teste.
+
+### Feature flags
+
+Flag separa **deploy** (o código está no servidor) de **release** (o usuário vê). A nova página de receitas da Quitanda pode ir para produção desligada, ligar para o time, depois para 10% dos clientes, depois para todos. Se algo der errado, desliga-se a flag em vez de reverter o deploy.
+
+O pacote `flags` (Flags SDK) declara flags avaliadas no servidor:
+
+```ts
+// src/flags.ts
+import { flag } from "flags/next";
+
+export const mostrarReceitas = flag<boolean>({
+  key: "mostrar-receitas",
+  defaultValue: false,
+  decide() {
+    return process.env.FLAG_RECEITAS === "ligada";
+  },
+});
+```
+
+```tsx
+// src/app/page.tsx
+import { mostrarReceitas } from "@/flags";
+import { Vitrine } from "@/componentes/Vitrine";
+import { SecaoDeReceitas } from "@/componentes/SecaoDeReceitas";
+
+export default async function PaginaInicial() {
+  const receitasLigadas = await mostrarReceitas();
+  return (
+    <>
+      <Vitrine />
+      {receitasLigadas && <SecaoDeReceitas />}
+    </>
+  );
+}
+```
+
+O `decide` pode consultar um provedor (Vercel Flags, LaunchDarkly, Statsig, GrowthBook) para regras por usuário e porcentagem. Avaliar no servidor evita o "pisca" de uma interface que muda depois de carregar.
+
+<Callout type="warning" title="Flag tem data para morrer">
+Cada flag é um `if` a mais e dois caminhos para testar. Ao criar, registre o dono e quando ela sai do código. Flags esquecidas viram débito técnico e, no pior caso, um interruptor que ninguém sabe o que faz.
+</Callout>
+
+### Versionamento e changelog
+
+Uma aplicação não é publicada no npm, mas o time ainda precisa responder "o que mudou na versão que está no ar?". Duas práticas resolvem:
+
+- **Commits convencionais** (`feat(carrinho): aplica cupom de frete`, `fix(checkout): total com desconto`), que o capítulo de qualidade de código automatiza com commitlint.
+- **Versão semântica com tag no Git e changelog gerado**: ferramentas como release-please ou Changesets leem os commits (ou arquivos de mudança) e abrem um PR de release com o `CHANGELOG.md` e a nova versão.
+
+Exponha a versão para facilitar o suporte. O Next.js permite injetar valores no build:
+
+```ts
+// next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  env: {
+    // o npm define npm_package_version ao rodar "npm run build"
+    NEXT_PUBLIC_VERSAO: process.env.npm_package_version ?? "dev",
+  },
+};
+
+export default config;
+```
+
+Mostre `process.env.NEXT_PUBLIC_VERSAO` no rodapé do painel do lojista e envie-a junto com cada erro ao monitoramento. "O erro começou na 2.4.0" encurta a investigação.
+
+### Rollback
+
+Quando a versão nova quebra o checkout, a prioridade é restaurar o serviço, não achar o bug. Na Vercel, cada deploy é imutável e continua disponível: o rollback instantâneo aponta o domínio de produção para um deploy anterior, sem novo build.
+
+```bash
+vercel rollback          # volta para o deploy de produção anterior
+vercel promote <url>     # promove um deploy específico para produção
+```
+
+Rollback do código não desfaz migrações de banco. Por isso as mudanças de schema seguem o padrão expandir e contrair: primeiro adicione a coluna nova de forma compatível com as duas versões, depois migre o código, e só remova a coluna antiga num deploy posterior.
+
+| Situação | Primeira ação |
+|---|---|
+| Funcionalidade nova com problema e atrás de flag | Desligar a flag |
+| Deploy quebrou fluxo crítico | Rollback, investigar depois |
+| Bug pequeno, sem impacto amplo | Correção em PR normal, com preview |
+| Erro em migração de banco | Script de correção; rollback de código só se for compatível |
+
+## Na entrevista
+
+**Como você depura um Server Component?** Com o debugger do Node: `next dev --inspect` ou a configuração de servidor do VS Code, colocando breakpoints no componente ou na função de dados. O console do navegador não serve, porque o código não roda lá; os logs aparecem no terminal.
+
+**O que causa um erro de hidratação e como você corrige?** O primeiro render do cliente difere do HTML do servidor. Causas comuns: ler `localStorage` ou `window` no render, datas e números aleatórios, fuso horário, HTML inválido. Corrijo deixando o primeiro render determinístico e movendo leituras do navegador para `useEffect`, ou renderizando aquele trecho só no cliente.
+
+**Para que serve o digest no error.tsx?** Em produção a mensagem de erros do servidor é ocultada do cliente. O `digest` é um identificador que aparece para o usuário e no log do servidor, ligando o relato ao erro real sem expor detalhes.
+
+**Qual a diferença entre deploy e release?** Deploy é colocar o código no ambiente; release é expor a funcionalidade ao usuário. Feature flags separam os dois, permitindo deploys frequentes com a funcionalidade desligada e liberação gradual.
+
+**Como você faria rollback de uma versão que quebrou o checkout?** Promovendo de volta o deploy anterior, que na Vercel é instantâneo porque os builds são imutáveis. Antes, confiro se houve migração de banco incompatível. Só depois do serviço restaurado investigo a causa com logs e o diff entre as versões.
+
+## Pratique
+
+1. Configure o `launch.json` da Quitanda e coloque um breakpoint condicional em `listarPedidosDoCliente` que só pare para pedidos com status `"saiu para entrega"`.
+2. Reproduza o bug do `ResumoDoCarrinho` lendo `localStorage` no render, leia a mensagem de hidratação e corrija com `useEffect`.
+3. Crie `error.tsx` para `/pedidos` e `/painel`, `not-found.tsx` para produtos inexistentes e `global-error.tsx`. Force um erro numa consulta e encontre o mesmo `digest` na tela e no terminal.
+4. Escreva `src/instrumentation.ts` com `onRequestError` emitindo JSON e a função `log` em `src/lib/log.ts`; registre a criação de cada pedido.
+5. Coloque a seção de receitas atrás da flag `mostrar-receitas`, faça deploy com ela desligada e ligue só no ambiente de preview.
+6. Mostre a versão do `package.json` no rodapé do painel, gere um deploy com bug proposital e faça o rollback pela CLI ou pelo painel da Vercel.
+
+<Quiz question="Um Client Component lê localStorage diretamente no corpo da função. O que acontece no primeiro carregamento da página?" options={["Nada, Client Components só rodam no navegador","O build falha","O componente é ignorado pelo servidor e renderizado vazio sem aviso","O componente também é renderizado no servidor, onde localStorage não existe, gerando erro ou divergência de hidratação"]} answer={3} explanation="Client Components geram o HTML inicial no servidor. APIs exclusivas do navegador devem ser lidas depois da montagem, em useEffect ou em handlers." />
+
+<Quiz question="Qual arquivo captura um erro lançado pelo layout raiz da aplicação?" options={["error.tsx na raiz de app","global-error.tsx, que precisa renderizar as próprias tags html e body","not-found.tsx","instrumentation.ts"]} answer={1} explanation="O error.tsx de um segmento não captura erros do layout do mesmo nível. Para o layout raiz existe o global-error.tsx, que substitui o layout inteiro." />
+
+<Quiz question="Uma funcionalidade nova, publicada atrás de uma feature flag, está causando erros. Qual a ação mais rápida e segura?" options={["Desligar a flag","Fazer rollback de todo o deploy","Escrever a correção direto na branch principal","Apagar o cache da CDN"]} answer={0} explanation="A flag existe para separar release de deploy: desligá-la remove a funcionalidade na hora, sem build e sem levar junto as outras mudanças do deploy." />
+
+## Base no CodeForge
+
+- [Feature flags](/learn/system-design/feature-flags): tipos de flag, liberação gradual e o custo de mantê-las.
+- [Rollbacks](/learn/system-design/rollbacks) e [Estratégias de deploy](/learn/system-design/estrategias-de-deploy): canary, blue-green e quando voltar atrás.
+- [Logging](/learn/system-design/logging): logs estruturados e o que registrar.
+- [React: explorando estratégias de renderização do Next.js](/learn/carreira-react/react-estrategias-renderizacao-nextjs): onde cada componente roda, base para entender a hidratação.
+- [React: observabilidade, manutenção e produção em aplicações](/learn/carreira-react/react-observabilidade-manutencao-producao): o passo seguinte, com métricas e traces.
+
+## Referências
+
+- [Next.js: Debugging](https://nextjs.org/docs/app/guides/debugging)
+- [Next.js: Error Handling](https://nextjs.org/docs/app/getting-started/error-handling)
+- [Next.js: instrumentation.js](https://nextjs.org/docs/app/api-reference/file-conventions/instrumentation)
+- [React: React Developer Tools](https://react.dev/learn/react-developer-tools)
+- [Flags SDK](https://flags-sdk.dev)

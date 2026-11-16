@@ -1,0 +1,443 @@
+---
+title: "React: desenvolvendo design tokens com styled-components"
+kind: lesson
+---
+
+A Quitanda UI já vive no monorepo, mas as cores ainda estão escritas à mão: `#166534` no botão, `#15803d` no selo, `#14532d` no link do painel. Três verdes que deveriam ser um. Quando o time de marca decide escurecer o verde para melhorar o contraste, alguém precisa caçar hexadecimais pelo código e torcer para não esquecer nenhum. E o designer, no Figma, tem a própria lista de cores, que diverge da do código em silêncio.
+
+Design tokens resolvem isso. Um token é uma decisão de design com nome: `cor.acao.primaria`, `espaco.4`, `raio.m`. Ele é escrito uma vez, num formato neutro, e transformado em tudo que cada plataforma precisa: variáveis CSS, constantes TypeScript, um tema do styled-components. Este capítulo cria o pacote `@quitanda/tokens`, gera os artefatos com o Style Dictionary e passa a estilizar a Quitanda UI com styled-components 6, com o tema tipado.
+
+**Você vai aprender:**
+
+- Separar tokens primitivos, semânticos e de componente, e por que essa hierarquia importa
+- Escrever tokens no formato do W3C Design Tokens Community Group (DTCG)
+- Gerar variáveis CSS e TypeScript com o Style Dictionary
+- Consumir os tokens com styled-components 6 e tipar o tema com `DefaultTheme`
+- Avaliar o estado do styled-components e a tendência das variáveis CSS
+
+## Os três níveis de token
+
+| Nível | Exemplo | Responde a | Quem usa |
+|---|---|---|---|
+| Primitivo | `cor.verde.700` = `#15803d` | Quais valores existem na paleta? | Só outros tokens |
+| Semântico | `cor.acao.primaria` = `cor.verde.700` | Para que serve este valor? | Componentes e apps |
+| Componente | `botao.primario.fundo` = `cor.acao.primaria` | Qual valor esta peça usa? | Um componente específico |
+
+Os **primitivos** são a paleta crua: todos os verdes, cinzas, tamanhos e raios disponíveis. Eles não têm significado; `verde.700` não diz onde usar. Os **semânticos** dão significado: `cor.acao.primaria`, `cor.texto.padrao`, `cor.feedback.erro`. Componentes devem consumir semânticos, nunca primitivos. A razão aparece no capítulo de temas: no modo escuro, `cor.acao.primaria` passa a apontar para `verde.400`, e nenhum componente precisa mudar. Os tokens de **componente** são opcionais e úteis quando um componente precisa de ajuste fino sem afetar o resto.
+
+<Callout type="tip" title="Nomeie pelo uso, não pela aparência">
+`cor.fundo.destaque` sobrevive a um rebranding; `cor.verde.claro` vira mentira no dia em que o destaque ficar laranja. Nos tokens semânticos, o nome descreve o papel. A aparência fica nos primitivos.
+</Callout>
+
+## O formato DTCG
+
+O W3C Design Tokens Community Group especifica um formato JSON para tokens, que ferramentas de design (Figma, Tokens Studio) e de código (Style Dictionary, Terrazzo) conseguem trocar entre si. As regras principais:
+
+- Cada token é um objeto com `$value` e, de preferência, `$type` (`color`, `dimension`, `fontFamily`, `fontWeight`, `duration`, `shadow`, `typography` e outros).
+- Grupos são objetos aninhados; o caminho forma o nome (`cor.verde.700`).
+- `$type` pode ser declarado no grupo e é herdado pelos tokens dentro dele.
+- Um alias referencia outro token com chaves: o valor `{cor.verde.700}`.
+- `$description` documenta a intenção, e aparece em ferramentas e na documentação gerada.
+
+```json
+// packages/tokens/src/primitivos.tokens.json
+{
+  "cor": {
+    "$type": "color",
+    "verde": {
+      "100": { "$value": "#dcfce7" },
+      "400": { "$value": "#4ade80" },
+      "700": { "$value": "#15803d" },
+      "900": { "$value": "#14532d" }
+    },
+    "cinza": {
+      "50": { "$value": "#f9fafb" },
+      "200": { "$value": "#e5e7eb" },
+      "700": { "$value": "#374151" },
+      "900": { "$value": "#111827" }
+    },
+    "vermelho": { "700": { "$value": "#b91c1c" } },
+    "ambar": { "500": { "$value": "#f59e0b" } },
+    "branco": { "$value": "#ffffff" }
+  },
+  "espaco": {
+    "$type": "dimension",
+    "1": { "$value": "4px" },
+    "2": { "$value": "8px" },
+    "3": { "$value": "12px" },
+    "4": { "$value": "16px" },
+    "6": { "$value": "24px" }
+  },
+  "raio": {
+    "$type": "dimension",
+    "p": { "$value": "4px" },
+    "m": { "$value": "8px" },
+    "total": { "$value": "9999px" }
+  }
+}
+```
+
+```json
+// packages/tokens/src/semanticos.tokens.json
+{
+  "cor": {
+    "$type": "color",
+    "fundo": {
+      "padrao": { "$value": "{cor.branco}" },
+      "sutil": { "$value": "{cor.cinza.50}" }
+    },
+    "texto": {
+      "padrao": { "$value": "{cor.cinza.900}", "$description": "Texto principal sobre fundo padrão" },
+      "suave": { "$value": "{cor.cinza.700}" },
+      "sobreAcao": { "$value": "{cor.branco}" }
+    },
+    "acao": {
+      "primaria": { "$value": "{cor.verde.700}", "$description": "Botões e links de ação principal" },
+      "primariaHover": { "$value": "{cor.verde.900}" }
+    },
+    "borda": { "padrao": { "$value": "{cor.cinza.200}" } },
+    "feedback": {
+      "erro": { "$value": "{cor.vermelho.700}" },
+      "aviso": { "$value": "{cor.ambar.500}" }
+    },
+    "foco": { "$value": "#1d4ed8" }
+  }
+}
+```
+
+A especificação estável do DTCG descreve cores e dimensões como objetos estruturados (espaço de cor e componentes; valor e unidade), e as ferramentas estão migrando aos poucos. Strings como `"#15803d"` e `"8px"` continuam sendo o formato mais aceito; confira o que a sua versão do Style Dictionary espera antes de trocar.
+
+## Style Dictionary: do JSON para cada plataforma
+
+O Style Dictionary lê os arquivos de tokens, resolve os aliases, aplica transformações (nome em kebab-case, cor em hexadecimal ou rgb, unidades) e escreve um arquivo por formato. A partir da versão 4 ele entende o formato DTCG nativamente e é um módulo ESM com API assíncrona.
+
+```json
+// packages/tokens/package.json
+{
+  "name": "@quitanda/tokens",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./tokens.css": "./dist/tokens.css",
+    ".": { "types": "./dist/tokens.d.ts", "import": "./dist/tokens.js" }
+  },
+  "files": ["dist"],
+  "scripts": { "build": "node build.mjs" },
+  "devDependencies": { "style-dictionary": "^4.0.0" }
+}
+```
+
+```js
+// packages/tokens/build.mjs
+import StyleDictionary from "style-dictionary";
+
+const sd = new StyleDictionary({
+  source: ["src/**/*.tokens.json"],
+  platforms: {
+    css: {
+      transformGroup: "css",
+      prefix: "qt",
+      buildPath: "dist/",
+      files: [
+        {
+          destination: "tokens.css",
+          format: "css/variables",
+          options: { outputReferences: true },
+        },
+      ],
+    },
+    js: {
+      transformGroup: "js",
+      buildPath: "dist/",
+      files: [
+        { destination: "tokens.js", format: "javascript/es6" },
+        { destination: "tokens.d.ts", format: "typescript/es6-declarations" },
+      ],
+    },
+  },
+});
+
+await sd.buildAllPlatforms();
+```
+
+O resultado em CSS mantém a hierarquia graças a `outputReferences`: o semântico aponta para o primitivo por `var()`, e trocar o primitivo propaga para todos os semânticos.
+
+```css
+/* packages/tokens/dist/tokens.css (gerado) */
+:root {
+  --qt-cor-verde-700: #15803d;
+  --qt-cor-cinza-900: #111827;
+  --qt-espaco-4: 16px;
+  --qt-raio-m: 8px;
+  --qt-cor-texto-padrao: var(--qt-cor-cinza-900);
+  --qt-cor-acao-primaria: var(--qt-cor-verde-700);
+  --qt-cor-acao-primaria-hover: var(--qt-cor-verde-900);
+  /* ... */
+}
+```
+
+```ts
+// packages/tokens/dist/tokens.js (gerado, trecho)
+export const CorVerde700 = "#15803d";
+export const CorAcaoPrimaria = "#15803d";
+export const Espaco4 = "16px";
+```
+
+As constantes TypeScript trazem o valor final resolvido. Servem para onde CSS não chega: um gráfico em canvas no painel do lojista, a cor do tema no manifest do PWA, um e-mail transacional. No Turborepo, `packages/tokens` ganha um `build` com `outputs: ["dist/**"]`, e a UI depende dele pelo `^build`.
+
+### Transformações e formatos próprios
+
+Os grupos de transformação prontos (`css`, `js`, `scss`, `android`, `ios-swift`) resolvem a maioria dos casos. Quando não resolvem, o Style Dictionary aceita transformações e formatos registrados por você, por exemplo para converter `dimension` de px para rem ou gerar o bloco `@theme` do Tailwind 4 a partir dos mesmos tokens.
+
+```js
+// packages/tokens/build.mjs (trecho)
+StyleDictionary.registerTransform({
+  name: "dimensao/px-para-rem",
+  type: "value",
+  filter: (token) => token.$type === "dimension" && token.$value.endsWith("px"),
+  transform: (token) => `${parseFloat(token.$value) / 16}rem`,
+});
+```
+
+Registre a transformação antes de criar a instância e inclua-a na plataforma com `transforms` (uma lista que substitui o `transformGroup`) ou estendendo um grupo existente.
+
+## Consumindo com styled-components 6
+
+O styled-components escreve CSS dentro do JavaScript com template literals: cada `styled.button` vira um componente com uma classe gerada. A Quitanda UI passa a usá-lo no lugar dos CSS Modules, e o tema é a ponte com os tokens.
+
+### O objeto de tema aponta para as variáveis CSS
+
+```ts
+// packages/ui/src/tema/tema.ts
+export const tema = {
+  cor: {
+    fundo: "var(--qt-cor-fundo-padrao)",
+    fundoSutil: "var(--qt-cor-fundo-sutil)",
+    texto: "var(--qt-cor-texto-padrao)",
+    textoSuave: "var(--qt-cor-texto-suave)",
+    textoSobreAcao: "var(--qt-cor-texto-sobre-acao)",
+    acaoPrimaria: "var(--qt-cor-acao-primaria)",
+    acaoPrimariaHover: "var(--qt-cor-acao-primaria-hover)",
+    borda: "var(--qt-cor-borda-padrao)",
+    erro: "var(--qt-cor-feedback-erro)",
+    aviso: "var(--qt-cor-feedback-aviso)",
+    foco: "var(--qt-cor-foco)",
+  },
+  espaco: (n: 1 | 2 | 3 | 4 | 6) => `var(--qt-espaco-${n})`,
+  raio: { p: "var(--qt-raio-p)", m: "var(--qt-raio-m)", total: "var(--qt-raio-total)" },
+} as const;
+
+export type Tema = typeof tema;
+```
+
+Por que o tema aponta para `var(--qt-...)` em vez de conter o hexadecimal? Porque o valor real passa a ser decidido pelo CSS, em tempo de execução, sem re-renderizar nenhum componente React. É isso que torna o modo escuro barato e sem flash no capítulo de temas. O objeto de tema continua útil: dá autocompletar, impede nomes inexistentes e documenta quais tokens a UI usa. A desvantagem é que o objeto e o JSON podem divergir; um teste simples que confere se cada `var(--qt-...)` do tema existe no `tokens.css` gerado fecha essa brecha.
+
+### Tipando o tema
+
+Por padrão, o `theme` recebido nas interpolações é do tipo `DefaultTheme`, uma interface vazia. A extensão de módulo (module augmentation) diz ao TypeScript qual é o formato:
+
+```ts
+// packages/ui/src/tema/styled.d.ts
+import "styled-components";
+import type { Tema } from "./tema";
+
+declare module "styled-components" {
+  export interface DefaultTheme extends Tema {}
+}
+```
+
+A partir daí, `theme.cor.acaoPrimaria` tem autocompletar, e `theme.cor.verdeLimao` é erro de compilação.
+
+### O botão com tokens
+
+```tsx
+// packages/ui/src/Botao/Botao.tsx
+"use client";
+import type { ComponentPropsWithRef } from "react";
+import styled, { css } from "styled-components";
+
+type Variante = "primario" | "secundario" | "perigo";
+type Tamanho = "p" | "m" | "g";
+
+const variantes = {
+  primario: css`
+    background: ${({ theme }) => theme.cor.acaoPrimaria};
+    color: ${({ theme }) => theme.cor.textoSobreAcao};
+    &:hover:not(:disabled) { background: ${({ theme }) => theme.cor.acaoPrimariaHover}; }
+  `,
+  secundario: css`
+    background: transparent;
+    color: ${({ theme }) => theme.cor.acaoPrimaria};
+    border: 1px solid currentColor;
+  `,
+  perigo: css`
+    background: ${({ theme }) => theme.cor.erro};
+    color: ${({ theme }) => theme.cor.textoSobreAcao};
+  `,
+};
+
+const alturas: Record<Tamanho, string> = { p: "32px", m: "40px", g: "48px" };
+
+const BotaoEstilizado = styled.button<{ $variante: Variante; $tamanho: Tamanho }>`
+  display: inline-flex;
+  align-items: center;
+  gap: ${({ theme }) => theme.espaco(2)};
+  min-height: ${({ $tamanho }) => alturas[$tamanho]};
+  padding: 0 ${({ theme }) => theme.espaco(4)};
+  border: 0;
+  border-radius: ${({ theme }) => theme.raio.m};
+  font: inherit;
+  cursor: pointer;
+  ${({ $variante }) => variantes[$variante]}
+
+  &:focus-visible {
+    outline: 3px solid ${({ theme }) => theme.cor.foco};
+    outline-offset: 2px;
+  }
+  &:disabled { opacity: 0.6; cursor: not-allowed; }
+`;
+
+export type BotaoProps = ComponentPropsWithRef<"button"> & { variante?: Variante; tamanho?: Tamanho };
+
+export function Botao({ variante = "primario", tamanho = "m", type = "button", ...resto }: BotaoProps) {
+  return <BotaoEstilizado type={type} $variante={variante} $tamanho={tamanho} {...resto} />;
+}
+```
+
+As props com `$` são **props transitórias**: o styled-components as usa no estilo e não as repassa ao DOM. Na versão 6 isso ficou mais importante, porque a biblioteca deixou de filtrar automaticamente props desconhecidas; sem o `$`, `variante="primario"` chegaria ao `button` do HTML e geraria aviso no console. A API pública continua sem `$` (`variante`), e o componente interno traduz.
+
+### Variáveis CSS e ThemeProvider no app
+
+```tsx
+// packages/ui/src/tema/ProvedorDeTema.tsx
+"use client";
+import type { ReactNode } from "react";
+import { ThemeProvider } from "styled-components";
+import { tema } from "./tema";
+
+export function ProvedorDeTema({ children }: { children: ReactNode }) {
+  return <ThemeProvider theme={tema}>{children}</ThemeProvider>;
+}
+```
+
+```tsx
+// apps/loja/src/app/layout.tsx
+import "@quitanda/tokens/tokens.css";
+import { ProvedorDeTema } from "@quitanda/ui";
+import { RegistroDeEstilos } from "@/lib/RegistroDeEstilos";
+
+export default function LayoutRaiz({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="pt-BR">
+      <body>
+        <RegistroDeEstilos>
+          <ProvedorDeTema>{children}</ProvedorDeTema>
+        </RegistroDeEstilos>
+      </body>
+    </html>
+  );
+}
+```
+
+O `RegistroDeEstilos` é o componente que coleta o CSS gerado durante a renderização no servidor e o injeta no HTML, para a página não chegar sem estilo. Ele está detalhado no capítulo de temas, junto com o problema do flash no SSR.
+
+<Callout type="warning" title="styled-components exige componentes de cliente">
+O styled-components depende de contexto do React em tempo de execução, e contexto não existe em Server Components. Todo arquivo que cria um `styled.x` precisa de `"use client"`, e o tema só chega via `ThemeProvider`, que também é de cliente. Na Quitanda isso é aceitável porque a UI é interativa, mas significa que até um `Selo` puramente visual vai para o bundle do cliente.
+</Callout>
+
+## O estado do styled-components e a tendência das variáveis CSS
+
+Em 2025, os mantenedores do styled-components anunciaram que a biblioteca entrou em **modo de manutenção**: correções de bugs e de segurança continuam, recursos novos não, e a recomendação para projetos novos é avaliar alternativas. Os motivos são os mesmos que você acabou de ver: CSS-in-JS em tempo de execução custa JavaScript no cliente, gera estilos durante a renderização e não combina com Server Components.
+
+Isso não torna o styled-components inútil. Há milhares de aplicações com ele em produção, e saber manter, tipar e migrar essas bases é uma habilidade que as vagas pedem. Mas a direção do ecossistema é clara: tokens viram **variáveis CSS**, e quem as consome pode ser qualquer coisa.
+
+| Abordagem | Onde o estilo é gerado | Server Components | Tema dinâmico |
+|---|---|---|---|
+| styled-components, Emotion | Em tempo de execução, no JS | Só em componentes de cliente | Via `ThemeProvider` ou variáveis CSS |
+| CSS Modules com variáveis CSS | No build | Sim | Via variáveis CSS |
+| Tailwind CSS 4 | No build, com tokens em `@theme` | Sim | Via variáveis CSS |
+| vanilla-extract, Panda CSS, StyleX | No build, escrito em TS | Sim | Via variáveis CSS |
+
+Repare na última coluna: em todas as opções, o tema dinâmico passa por variáveis CSS. Por isso o design da Quitanda UI coloca os tokens em `tokens.css` e faz o objeto de tema apontar para eles. Se um dia a UI migrar para CSS Modules ou Tailwind, os tokens, o pacote `@quitanda/tokens` e o modo escuro continuam iguais; só a camada de componentes muda. No Tailwind 4, por exemplo, os mesmos nomes entram no bloco de tema:
+
+```css
+/* apps/painel/src/app/globals.css */
+@import "tailwindcss";
+@import "@quitanda/tokens/tokens.css";
+
+@theme inline {
+  --color-acao-primaria: var(--qt-cor-acao-primaria);
+  --color-texto: var(--qt-cor-texto-padrao);
+  --radius-m: var(--qt-raio-m);
+}
+```
+
+E o painel ganha classes como `bg-acao-primaria` e `rounded-m`, ligadas aos mesmos tokens que a loja usa via styled-components.
+
+## Tokens como contrato com o design
+
+Os tokens só cumprem a promessa se forem a fonte única também para quem desenha. O fluxo mais comum hoje:
+
+1. O designer mantém as variáveis no Figma (ou num plugin como o Tokens Studio) com os mesmos nomes semânticos.
+2. As variáveis são exportadas em formato DTCG para `packages/tokens/src` e entram por PR, revisado como código.
+3. O CI roda o `build` dos tokens, a regressão visual das stories da Quitanda UI e os testes de contraste.
+4. A mudança chega aos apps na próxima versão do pacote.
+
+Um teste de contraste automatizado vale ouro aqui, porque trocar um primitivo pode quebrar a legibilidade de dezenas de combinações:
+
+```ts
+// packages/tokens/src/contraste.test.ts
+import { describe, expect, it } from "vitest";
+import * as t from "../dist/tokens.js";
+import { razaoDeContraste } from "./contraste";
+
+describe("contraste dos tokens semânticos", () => {
+  it.each([
+    ["texto padrão sobre fundo", t.CorTextoPadrao, t.CorFundoPadrao],
+    ["texto sobre ação primária", t.CorTextoSobreAcao, t.CorAcaoPrimaria],
+  ])("%s atinge 4.5:1 (WCAG AA)", (_, frente, fundo) => {
+    expect(razaoDeContraste(frente, fundo)).toBeGreaterThanOrEqual(4.5);
+  });
+});
+```
+
+## Na entrevista
+
+**O que são design tokens e qual a diferença entre primitivos e semânticos?** São decisões de design com nome, armazenadas num formato neutro e transformadas para cada plataforma. Primitivos descrevem a paleta (`verde.700`); semânticos descrevem o uso (`acao.primaria`) e apontam para primitivos. Componentes consomem semânticos, o que permite trocar tema ou marca mudando só o mapeamento.
+
+**Para que serve o Style Dictionary?** Ele lê tokens em JSON, resolve aliases, aplica transformações e gera artefatos para cada plataforma: variáveis CSS, constantes JS e TS, recursos Android e iOS. Assim, o mesmo arquivo de tokens alimenta web, mobile e documentação.
+
+**Como tipar o tema do styled-components?** Com module augmentation: declarar `DefaultTheme` estendendo o tipo do objeto de tema. O `theme` nas interpolações passa a ter autocompletar e verificação de nomes.
+
+**O que são props transitórias no styled-components?** Props com prefixo `$`, que ficam disponíveis no estilo mas não são repassadas ao elemento DOM. Na versão 6 elas são o jeito recomendado de passar variantes, já que a filtragem automática de props foi removida.
+
+**Você adotaria styled-components num projeto novo hoje?** Provavelmente não. A biblioteca está em modo de manutenção, adiciona custo em tempo de execução e só funciona em componentes de cliente. Para projetos novos eu usaria tokens em variáveis CSS com CSS Modules, Tailwind ou uma solução de build como vanilla-extract. Em bases existentes, manteria e migraria aos poucos, começando por mover os valores do tema para variáveis CSS.
+
+## Pratique
+
+1. Crie `packages/tokens` com os arquivos primitivos e semânticos em DTCG e gere `tokens.css` e `tokens.js` com o Style Dictionary. Confirme que `--qt-cor-acao-primaria` aponta para o primitivo via `var()`.
+2. Adicione a tarefa `build` do pacote de tokens ao Turborepo e verifique que alterar um primitivo invalida o cache da Quitanda UI e dos apps.
+3. Migre `Botao`, `Selo` e `CampoTexto` da Quitanda UI para styled-components, consumindo só tokens semânticos pelo tema, e tipe o `DefaultTheme`.
+4. Escreva o teste que confere se todo `var(--qt-...)` usado no objeto de tema existe no `tokens.css` gerado.
+5. Configure o painel do lojista com Tailwind 4 consumindo os mesmos tokens no bloco `@theme` e compare o tamanho do JavaScript de cliente de uma página do painel com uma equivalente da loja.
+
+<Quiz question="O componente Botao da Quitanda UI deve usar qual token para a cor de fundo?" options={["cor.verde.700, porque é o valor real","O hexadecimal direto, para evitar uma indireção","cor.acao.primaria, o token semântico que descreve o papel","Qualquer um, desde que seja verde"]} answer={2} explanation="Componentes consomem tokens semânticos. Assim, um tema escuro ou outra marca muda o mapeamento do semântico sem alterar o componente." />
+
+<Quiz question="No styled-components 6, por que escrever $variante em vez de variante no componente estilizado?" options={["Props com cifrão são transitórias: usadas no estilo e não repassadas ao elemento do DOM","O cifrão ativa a tipagem do tema","É exigência do TypeScript para props opcionais","Props com cifrão são calculadas no build, sem custo em tempo de execução"]} answer={0} explanation="A versão 6 deixou de filtrar props automaticamente. O prefixo indica que a prop é só de estilo e evita atributos inválidos no HTML." />
+
+<Quiz question="Com outputReferences ativado no formato css/variables do Style Dictionary, como sai o token semântico cor.acao.primaria?" options={["Com o hexadecimal final copiado","Como uma referência var para a variável do primitivo","Como um comentário apontando o alias","Ele é omitido, só primitivos são gerados"]} answer={1} explanation="outputReferences preserva o alias: o semântico vira var da variável do primitivo, e a hierarquia continua visível e alterável no CSS." />
+
+## Base no CodeForge
+
+- [React: desenvolvendo design systems modulares com Turborepo](/learn/carreira-react/react-design-systems-modulares-turborepo): o monorepo e a Quitanda UI que recebem os tokens.
+- [React: utilizando CSS Modules e Tailwind para estilização de componentes](/learn/carreira-react/react-css-modules-tailwind): as alternativas de build que consomem os mesmos tokens.
+- [React: integrando temas com styled-components](/learn/carreira-react/react-temas-styled-components): o modo escuro e as marcas construídos sobre os semânticos.
+- [Utility types](/learn/typescript/utility-types): `typeof`, `as const` e os tipos derivados usados no tema.
+
+## Referências
+
+- [Design Tokens Community Group: especificação do formato](https://www.designtokens.org/)
+- [Style Dictionary: documentação](https://styledictionary.com/)
+- [styled-components: documentação](https://styled-components.com/docs)
+- [MDN: Using CSS custom properties](https://developer.mozilla.org/en-US/docs/Web/CSS/Using_CSS_custom_properties)
+- [Tailwind CSS: Theme variables](https://tailwindcss.com/docs/theme)

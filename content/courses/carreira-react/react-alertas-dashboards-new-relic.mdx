@@ -1,0 +1,306 @@
+---
+title: "React: customizando alertas e dashboards com New Relic"
+kind: lesson
+---
+
+O agente Browser está coletando dados da loja e do app do entregador há duas semanas. Os dados existem, mas ninguém olha: as telas padrão do New Relic mostram médias gerais, e o time só abre a ferramenta depois que um cliente reclama no Instagram. Na sexta passada, uma versão quebrou o botão de cupom em Safari por 6 horas; o erro estava registrado desde o primeiro minuto.
+
+Dados só viram operação com duas peças: **dashboards** que respondem às perguntas do time num relance e **alertas** que avisam a pessoa certa quando algo sai do normal, sem acordar ninguém à toa. As duas são construídas com NRQL, a linguagem de consulta do New Relic. Este capítulo ensina NRQL a partir dos eventos de browser, monta o dashboard de Web Vitals e erros da Quitanda, cria condições de alerta com limites bem escolhidos, conecta as notificações e trata o maior inimigo de qualquer sistema de alertas: a fadiga.
+
+**Você vai aprender:**
+
+- Escrever consultas NRQL sobre `PageViewTiming`, `JavaScriptError`, `AjaxRequest` e `PageAction`
+- Montar um dashboard de Web Vitals, erros e funil de compra com variáveis e filtros
+- Criar condições de alerta NRQL com janelas, duração e limites de aviso e crítico
+- Encaminhar issues com workflows e destinos (Slack, e-mail, PagerDuty)
+- Versionar dashboards e alertas como código
+- Evitar fadiga de alertas com alertas acionáveis, donos e revisão periódica
+
+## NRQL em uma página
+
+NRQL lembra SQL, mas consulta eventos com tempo. A estrutura:
+
+```sql
+-- forma geral
+SELECT funcao(atributo) FROM TipoDeEvento
+WHERE condicao
+FACET atributo            -- agrupa, como GROUP BY
+SINCE 1 day ago UNTIL now -- intervalo de tempo
+TIMESERIES 15 minutes     -- transforma em série temporal
+COMPARE WITH 1 week ago   -- sobrepõe o período anterior
+LIMIT 20
+```
+
+Funções mais usadas: `count(*)`, `average()`, `percentile(attr, 75, 95)`, `uniqueCount()`, `percentage(count(*), WHERE ...)`, `filter(funcao, WHERE ...)`, `rate(count(*), 1 minute)`, `latest()` e `funnel()`.
+
+Na Quitanda, as aplicações se chamam "Quitanda Loja" (Next.js) e "Quitanda Entregador" (Vite), e o atributo `appName` separa uma da outra.
+
+## Consultas de Web Vitals
+
+O evento `PageViewTiming` traz um registro por métrica coletada, identificado por `timingName`:
+
+```sql
+-- LCP p75 por rota na loja, últimas 24 h
+SELECT percentile(largestContentfulPaint, 75) FROM PageViewTiming
+WHERE appName = 'Quitanda Loja' AND timingName = 'largestContentfulPaint'
+FACET pageUrl SINCE 1 day ago LIMIT 10
+```
+
+```sql
+-- INP p75 ao longo do tempo, comparando com a semana anterior
+SELECT percentile(interactionToNextPaint, 75) FROM PageViewTiming
+WHERE appName = 'Quitanda Loja' AND timingName = 'interactionToNextPaint'
+SINCE 1 day ago TIMESERIES 1 hour COMPARE WITH 1 week ago
+```
+
+```sql
+-- CLS: porcentagem de visitas com classificação boa
+SELECT percentage(count(*), WHERE cumulativeLayoutShift <= 0.1) AS 'CLS bom'
+FROM PageViewTiming
+WHERE appName = 'Quitanda Loja' AND timingName = 'cumulativeLayoutShift'
+FACET deviceType SINCE 7 days ago
+```
+
+`pageUrl` funciona bem na loja, que tem URLs legíveis. Para rotas com ids, use o nome de rota definido com `setCurrentRouteName` ou as regras de agrupamento do capítulo anterior. Quebrar por `deviceType` é obrigatório para Web Vitals: o desktop do escritório esconde o problema do Android intermediário.
+
+## Consultas de erros, AJAX e negócio
+
+```sql
+-- erros JS mais frequentes, com versão e navegador
+SELECT count(*) FROM JavaScriptError
+WHERE appName = 'Quitanda Loja'
+FACET errorClass, errorMessage, appVersion, userAgentName
+SINCE 1 day ago LIMIT 20
+```
+
+Contagem absoluta de erros sobe quando o tráfego sobe. A taxa é mais útil:
+
+```sql
+-- erros por 100 page views
+SELECT filter(count(*), WHERE eventType() = 'JavaScriptError')
+     / filter(count(*), WHERE eventType() = 'PageView') * 100 AS 'Erros por 100 page views'
+FROM JavaScriptError, PageView
+WHERE appName = 'Quitanda Loja'
+SINCE 1 day ago TIMESERIES 30 minutes
+```
+
+```sql
+-- taxa de falha das chamadas ao BFF por endpoint agrupado
+SELECT percentage(count(*), WHERE httpResponseCode >= 500 OR httpResponseCode = 0) AS 'Falhas'
+FROM AjaxRequest
+WHERE appName = 'Quitanda Entregador' AND requestUrl LIKE '%/bff/%'
+FACET groupedRequestUrl SINCE 3 hours ago TIMESERIES
+```
+
+`httpResponseCode = 0` indica uma requisição que não chegou a ter resposta (rede caiu, CORS bloqueou, timeout): para um app de entregador na rua, essa é muitas vezes a falha mais comum.
+
+As `PageAction`s enviadas pelo código permitem medir o negócio. Com as ações `carrinhoAberto`, `checkoutIniciado` e `pedidoConfirmado`:
+
+```sql
+SELECT funnel(session,
+  WHERE actionName = 'carrinhoAberto' AS 'Abriu o carrinho',
+  WHERE actionName = 'checkoutIniciado' AS 'Iniciou o checkout',
+  WHERE actionName = 'pedidoConfirmado' AS 'Confirmou o pedido')
+FROM PageAction WHERE appName = 'Quitanda Loja' SINCE 1 week ago
+```
+
+Cruzar o funil com a versão (`appVersion`) mostra se o deploy de ontem derrubou a conversão, que é o argumento mais forte para o negócio investir em qualidade.
+
+## O dashboard da Quitanda
+
+Um bom dashboard responde perguntas específicas em ordem de importância, de cima para baixo. A proposta para a loja:
+
+| Linha | Widgets | Pergunta |
+|---|---|---|
+| 1. Saúde agora | Billboards: page views por minuto, erros por 100 page views, % de AJAX com falha, pedidos confirmados na última hora | Está tudo bem neste momento? |
+| 2. Web Vitals | Linhas de LCP, INP e CLS p75 com `COMPARE WITH 1 week ago`; tabela por rota e dispositivo | A experiência piorou? Onde? |
+| 3. Erros | Tabela dos erros por mensagem e versão; série de erros por versão | O que quebrou e desde quando? |
+| 4. Negócio | Funil de compra; conversão por versão | Os problemas estão custando vendas? |
+
+Recursos que fazem o dashboard ser usado:
+
+- **Variáveis de dashboard.** Crie uma variável `versao` alimentada por uma consulta (`SELECT uniques(appVersion) FROM PageView SINCE 1 week ago`) e use `WHERE appVersion IN ({{versao}})` nos widgets. Um seletor no topo filtra a página inteira.
+- **Facetas como filtro.** Ligue a opção de filtrar o dashboard pelo clique numa faceta: clicar em "Safari" numa tabela filtra todos os outros widgets.
+- **Billboards com limites.** Um billboard pode ter limites de aviso e crítico que mudam a cor do número, chamando atenção sem precisar ler.
+- **Uma página por público.** Página "Operação" para o plantão, página "Produto" com funil e conversão para o PM.
+
+<Callout type="tip" title="Dashboard sem dono vira papel de parede">
+Cada dashboard deve ter um dono e uma ocasião de uso: "aberto na daily das segundas", "a primeira tela do plantão". Se ninguém consegue dizer quando o dashboard é olhado, apague-o ou junte-o a outro. Dez dashboards abandonados escondem o único que importa.
+</Callout>
+
+## Do dashboard à causa: o caso do cupom no Safari
+
+Refazendo a sexta-feira do cupom com o dashboard pronto, a investigação levaria minutos:
+
+1. O billboard de erros por 100 page views fica vermelho: 3,4 contra 0,6 de costume.
+2. Na série de erros por versão, a linha nova começa exatamente no horário do deploy `a91f2c3`.
+3. A tabela de erros mostra `TypeError: Cannot read properties of undefined (reading 'replaceAll')` em `AreaDoCupom`.
+4. Clicando na faceta `userAgentName = Safari`, o dashboard inteiro filtra: o erro aparece só em versões antigas do Safari no iOS.
+5. O funil mostra a queda: a etapa "Iniciou o checkout" para "Confirmou o pedido" caiu 18% para quem usa Safari.
+
+Com o stack trace legível graças aos source maps, a causa (um método de string sem suporte naquele navegador, sem polyfill) e o impacto em vendas ficam claros na mesma tela. O passo seguinte é não depender de alguém olhar o dashboard: é para isso que existem os alertas.
+
+## Alertas: condições NRQL
+
+Uma **condição** de alerta é uma consulta NRQL avaliada continuamente, com limites. Condições ficam dentro de uma **política**, e quando um limite é violado o New Relic abre um **incidente**, agrupado em uma **issue**, que os **workflows** encaminham aos **destinos** (Slack, e-mail, PagerDuty, webhook).
+
+Na condição, a consulta não leva `SINCE` nem `TIMESERIES`: o próprio motor de alertas avalia janela a janela.
+
+```sql
+-- condição: taxa de erro JS na loja
+SELECT filter(count(*), WHERE eventType() = 'JavaScriptError')
+     / filter(count(*), WHERE eventType() = 'PageView') * 100
+FROM JavaScriptError, PageView
+WHERE appName = 'Quitanda Loja'
+```
+
+As configurações que mais importam:
+
+| Configuração | O que faz | Escolha na Quitanda |
+|---|---|---|
+| Janela de agregação | Tamanho de cada bloco de dados avaliado | 5 minutos: suaviza picos de poucos usuários |
+| Método de agregação | Quando a janela é fechada: event flow (pelo fluxo de dados), event timer (por tempo sem novos dados) ou cadence | Event flow para tráfego constante; event timer para tráfego esparso, como o app do entregador de madrugada |
+| Limite crítico | Valor e duração que abrem incidente | Acima de 2 erros por 100 page views por pelo menos 10 minutos |
+| Limite de aviso | Valor menor, sem notificar o plantão | Acima de 1 por 10 minutos, só no canal do time |
+| Perda de sinal | O que fazer se os dados pararem de chegar | Abrir incidente se não houver page views por 15 minutos em horário comercial: o agente ou o site caiu |
+| Preenchimento de lacunas | Como tratar janelas sem dados | Nenhum, ou zero, quando ausência de evento significa zero erros |
+| URL de runbook | Link para o procedimento | `docs/runbooks/erros-js.md` no repositório |
+
+A duração (`for at least 10 minutes`) é o que separa um alerta útil de um alarme de incêndio: um pico de erros de um único usuário com extensão quebrada não deve acordar ninguém.
+
+Outras condições essenciais para a Quitanda:
+
+```sql
+-- LCP p75 da página de produto (crítico acima de 4000 ms por 30 min)
+SELECT percentile(largestContentfulPaint, 75) FROM PageViewTiming
+WHERE appName = 'Quitanda Loja' AND timingName = 'largestContentfulPaint' AND pageUrl LIKE '%/produtos/%'
+```
+
+```sql
+-- falhas ao confirmar entrega (crítico acima de 10% por 10 min)
+SELECT percentage(count(*), WHERE httpResponseCode >= 500 OR httpResponseCode = 0)
+FROM AjaxRequest
+WHERE appName = 'Quitanda Entregador' AND groupedRequestUrl LIKE '%/bff/entregas/*/confirmar%'
+```
+
+## Workflows e destinos
+
+A antiga noção de "canais de notificação" foi substituída por **destinos** (para onde enviar) e **workflows** (quais issues enviar, com qual filtro e qual formato). Um desenho simples:
+
+| Workflow | Filtro | Destino |
+|---|---|---|
+| Plantão front | Política "Quitanda Front", prioridade crítica | PagerDuty (aciona quem está de plantão) e canal `#quitanda-incidentes` |
+| Avisos do time | Política "Quitanda Front", prioridade alta (aviso) | Canal `#quitanda-front` no Slack, sem acionar ninguém |
+| Negócio | Condição "Conversão abaixo do normal" | E-mail para o PM e canal de produto |
+
+A **preferência de issues** da política define o agrupamento: uma issue por política (menos ruído, mas esconde problemas diferentes), por condição (o padrão mais equilibrado) ou por condição e sinal (uma issue por faceta, útil quando cada faceta tem um dono diferente).
+
+## Alertas e dashboards como código
+
+Configurar tudo clicando funciona até alguém apagar uma condição sem querer. O provider Terraform do New Relic permite versionar e revisar no pull request:
+
+```hcl
+# infra/newrelic/alertas.tf
+resource "newrelic_alert_policy" "quitanda_front" {
+  name                = "Quitanda Front"
+  incident_preference = "PER_CONDITION"
+}
+
+resource "newrelic_nrql_alert_condition" "taxa_erros_js" {
+  policy_id                    = newrelic_alert_policy.quitanda_front.id
+  type                         = "static"
+  name                         = "Loja: erros JS por 100 page views"
+  enabled                      = true
+  runbook_url                  = "https://github.com/quitanda/quitanda/blob/main/docs/runbooks/erros-js.md"
+  violation_time_limit_seconds = 86400
+  aggregation_window           = 300
+  aggregation_method           = "event_flow"
+  aggregation_delay            = 120
+
+  nrql {
+    query = "SELECT filter(count(*), WHERE eventType() = 'JavaScriptError') / filter(count(*), WHERE eventType() = 'PageView') * 100 FROM JavaScriptError, PageView WHERE appName = 'Quitanda Loja'"
+  }
+
+  critical {
+    operator              = "above"
+    threshold             = 2
+    threshold_duration    = 600
+    threshold_occurrences = "all"
+  }
+
+  warning {
+    operator              = "above"
+    threshold             = 1
+    threshold_duration    = 600
+    threshold_occurrences = "all"
+  }
+}
+```
+
+Dashboards seguem o mesmo caminho com o recurso `newrelic_one_dashboard`, ou exportando o JSON pela interface e guardando no repositório. Com o código versionado, criar o ambiente de homologação com os mesmos alertas é uma variável a mais.
+
+## Fadiga de alertas
+
+Quando um canal recebe 50 alertas por dia, as pessoas silenciam o canal, e o alerta importante passa despercebido. Fadiga é o modo de falha mais comum de um sistema de alertas, e evitar exige disciplina:
+
+| Alerta ruim | Por que é ruim | Versão melhor |
+|---|---|---|
+| "CPU do BFF acima de 70%" | Causa, não sintoma; pode não afetar ninguém | "Falha ou lentidão nas chamadas ao BFF vistas pelo usuário" |
+| Erro JS acima de 0 | Sempre há algum erro (extensões, bots) | Taxa de erros acima do normal por 10 minutos |
+| Alerta crítico sem runbook | Quem recebe às 3h não sabe o que fazer | Runbook com verificação, mitigação e escalonamento |
+| Alerta que ninguém resolve há semanas | Ensina o time a ignorar alertas | Corrigir a causa, ajustar o limite ou apagar |
+| Mesmo problema avisado por 5 condições | Cinco notificações para um incidente | Agrupar em uma issue ou manter só o sintoma |
+
+Regras práticas:
+
+- **Todo alerta crítico precisa ser acionável**: alguém precisa fazer algo agora. Se a resposta é "esperar passar", não é crítico.
+- **Alerte em sintomas** (o que o usuário sente: erros, lentidão, falha de checkout) e use as causas (CPU, memória) nos dashboards de investigação.
+- **Cada condição tem dono e runbook.**
+- **Use regras de silenciamento (muting)** em janelas de manutenção e deploys planejados.
+- **Revise os alertas a cada mês**: quantos dispararam, quantos foram acionáveis, quantos foram ignorados. Ajuste ou apague.
+
+<Callout type="warning" title="Limite fixo em métrica com sazonalidade">
+O tráfego da Quitanda cai à noite e dispara no sábado de manhã. Um limite fixo de "menos de 100 page views por minuto" alerta toda madrugada. Para métricas que variam por hora ou dia da semana, use taxas em vez de contagens ou condições de anomalia, assunto do próximo capítulo.
+</Callout>
+
+## Na entrevista
+
+**Como você mediria o LCP real de uma página no New Relic?** Consulto `PageViewTiming` filtrando `timingName = 'largestContentfulPaint'`, calculo o percentil 75 e quebro por rota e tipo de dispositivo, comparando com a semana anterior.
+
+**Por que alertar em taxa e não em contagem?** Contagem cresce com o tráfego e gera alertas falsos em horários de pico ou silêncio quando o tráfego cai. Taxa (erros por page view, porcentagem de falhas) é estável e reflete a experiência do usuário.
+
+**O que é perda de sinal numa condição e quando configurá-la?** É o comportamento quando os dados param de chegar. Configuro para abrir incidente em métricas que sempre deveriam existir, como page views em horário comercial, porque silêncio pode significar que o site ou o agente caiu.
+
+**O que é fadiga de alertas e como evitar?** É quando o volume de alertas faz o time ignorá-los. Evito com alertas críticos só para sintomas acionáveis, duração mínima nas condições, runbook e dono em cada condição, agrupamento de issues e revisão periódica.
+
+**Por que versionar alertas e dashboards como código?** Para revisar mudanças em pull request, recuperar o que foi apagado, replicar em outros ambientes e ter histórico de quem mudou cada limite e por quê.
+
+## Pratique
+
+1. Escreva as consultas de LCP, INP e CLS p75 da loja por rota e tipo de dispositivo, e identifique a pior combinação.
+2. Monte o dashboard da Quitanda com as quatro linhas da tabela, uma variável de versão e filtro por clique nas facetas.
+3. Instrumente as `PageAction`s do funil de compra e crie o widget de funil comparando as duas últimas versões.
+4. Crie a condição de taxa de erros JS com limites de aviso e crítico, duração de 10 minutos e um runbook no repositório.
+5. Configure dois workflows: crítico para um canal de incidentes e aviso para o canal do time, e teste disparando um erro em homologação.
+6. Exporte a política e uma condição para Terraform e aplique em homologação a partir do código.
+
+<Quiz question="Qual consulta NRQL mostra corretamente o LCP no percentil 75?" options={["SELECT average(largestContentfulPaint) FROM PageView","SELECT count(*) FROM PageViewTiming WHERE largestContentfulPaint > 2500","SELECT percentile(largestContentfulPaint, 75) FROM PageViewTiming WHERE timingName = 'largestContentfulPaint'","SELECT max(largestContentfulPaint) FROM JavaScriptError"]} answer={2} explanation="Web Vitals são avaliados no p75, e o LCP vem do evento PageViewTiming com timingName igual a largestContentfulPaint." />
+
+<Quiz question="Uma condição alerta quando há qualquer erro JS por 1 minuto, e o canal recebe dezenas de alertas por dia. Qual é a melhor correção?" options={["Silenciar o canal","Alertar na taxa de erros por page view acima de um limite, com duração mínima de 10 minutos","Remover o agente Browser","Aumentar a janela para 24 horas"]} answer={1} explanation="Taxa com duração mínima filtra ruído de usuários isolados e só dispara quando a experiência piora de fato." />
+
+<Quiz question="Em uma condição de alerta NRQL, para que serve a configuração de perda de sinal?" options={["Para decidir o que fazer quando os dados param de chegar, por exemplo abrir um incidente se não houver page views","Para apagar dados antigos","Para reduzir a latência das consultas","Para silenciar alertas durante deploys"]} answer={0} explanation="Ausência de dados pode significar que o site ou o agente caiu. A perda de sinal transforma esse silêncio num incidente." />
+
+## Base no CodeForge
+
+- [Alertas](/learn/system-design/alertas) e [Dashboards e runbooks](/learn/system-design/dashboards-runbooks): os princípios gerais por trás deste capítulo.
+- [Métricas](/learn/system-design/metricas): percentis, taxas e cardinalidade.
+- [React Vite: monitorando aplicações com New Relic](/learn/carreira-react/react-vite-monitorando-new-relic): a instrumentação que gera os eventos consultados aqui.
+- [React: otimização avançada de performance](/learn/carreira-react/react-otimizacao-avancada-performance): o que fazer quando o dashboard mostra Web Vitals ruins.
+
+## Referências
+
+- [New Relic: NRQL syntax, clauses, and functions](https://docs.newrelic.com/docs/nrql/nrql-syntax-clauses-functions/)
+- [New Relic: Data dictionary (eventos e atributos)](https://docs.newrelic.com/attribute-dictionary/)
+- [New Relic: Create NRQL alert conditions](https://docs.newrelic.com/docs/alerts/create-alert/create-alert-condition/alert-conditions/)
+- [New Relic: Workflows](https://docs.newrelic.com/docs/alerts/get-notified/incident-workflows/)
+- [Terraform: newrelic_nrql_alert_condition](https://registry.terraform.io/providers/newrelic/newrelic/latest/docs/resources/nrql_alert_condition)

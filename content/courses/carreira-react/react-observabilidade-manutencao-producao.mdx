@@ -1,0 +1,316 @@
+---
+title: "React: observabilidade, manutenção e produção em aplicações"
+kind: lesson
+---
+
+Sexta-feira, 19h10. O alerta do New Relic dispara: a taxa de erro do checkout passou de 0,3% para 6%. O dashboard mostra que o problema é real e começou às 18h52, mas não diz por quê. É só no Safari? Só para quem paga com Pix? O erro nasce no navegador, na Server Action do Next.js, no BFF em NestJS ou no gateway de pagamento? Quem está de plantão abre quatro ferramentas, compara horários na mão e leva quarenta minutos para descobrir que um deploy do BFF mudou o formato de um campo.
+
+Monitorar diz **que** algo está errado; observabilidade permite perguntar **por quê** sem ter previsto a pergunta. Os capítulos de New Relic montaram dashboards, alertas e monitores sintéticos. Este capítulo trata do que vem antes e depois: instrumentar o código com OpenTelemetry, capturar erros com contexto no Sentry, correlacionar uma ação do usuário com tudo que ela disparou no servidor e organizar o trabalho humano de manter a Quitanda em produção, do plantão ao postmortem.
+
+**Você vai aprender:**
+
+- Distinguir logs, métricas e traces, e o que cada sinal responde no front-end
+- Instrumentar o Next.js com OpenTelemetry pelo `instrumentation.ts` e exportar para qualquer backend compatível
+- Capturar erros do cliente e do servidor com Sentry, source maps e error boundaries
+- Correlacionar navegador, Next.js e BFF com o padrão W3C Trace Context
+- Definir SLOs, alertar por sintoma e conduzir plantão e postmortem sem culpados
+
+## Os sinais e o que cada um responde
+
+| Sinal | Pergunta que responde | Exemplo na Quitanda | Custo |
+|---|---|---|---|
+| Métrica | Quanto e com que frequência? | Taxa de erro do checkout, LCP no p75, pedidos por minuto | Baixo, agregado |
+| Log | O que exatamente aconteceu neste evento? | "Pedido 8812 recusado: estoque insuficiente para produto X" | Médio, cresce com o volume |
+| Trace | Por onde a requisição passou e onde demorou? | Clique em "Finalizar" até a resposta do gateway, com cada etapa | Médio, controlado por amostragem |
+| Erro com contexto | Qual exceção, em que linha, para quem? | `TypeError` no componente Carrinho, Safari 18, versão 2.14.0 | Baixo a médio |
+| RUM | Como a experiência real está para os usuários? | Web Vitals por página, por dispositivo, por região | Médio |
+
+No front-end há uma particularidade: o código roda em milhares de máquinas que você não controla, com navegadores, extensões e redes diferentes. Um erro que nunca aparece no seu computador pode atingir 5% dos clientes. Sem telemetria vinda do navegador, esse erro simplesmente não existe para o time.
+
+## OpenTelemetry no Next.js
+
+O OpenTelemetry (OTel) é o padrão aberto para gerar e transportar telemetria: uma API para criar spans, métricas e logs, SDKs por linguagem e um protocolo (OTLP) que qualquer backend moderno aceita, incluindo New Relic, Grafana, Datadog e Honeycomb. Instrumentar com OTel separa duas decisões: o que medir (no código) e para onde mandar (na configuração). Trocar de fornecedor deixa de exigir reescrever a instrumentação.
+
+O Next.js tem um ponto de entrada próprio para isso: o arquivo `instrumentation.ts` na raiz do projeto (ou em `src/`). A função `register` roda uma vez quando o servidor inicia, antes de qualquer requisição.
+
+```ts
+// apps/loja/src/instrumentation.ts
+import { registerOTel } from "@vercel/otel";
+
+export function register() {
+  registerOTel({
+    serviceName: "quitanda-loja",
+    attributes: { "deployment.environment": process.env.AMBIENTE ?? "local" },
+  });
+}
+```
+
+O `@vercel/otel` é um empacotamento do SDK do OpenTelemetry que funciona nos runtimes Node.js e Edge, dentro ou fora da Vercel. O destino vem de variáveis de ambiente padrão do OTel, sem mudar código:
+
+```bash
+# variáveis de ambiente do container da loja
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp.nr-data.net
+OTEL_EXPORTER_OTLP_HEADERS=api-key=SUA_CHAVE_DE_INGESTAO
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.2
+```
+
+Com isso, o Next.js já produz spans para cada requisição, renderização de rota, Server Action e `fetch` feito no servidor. Para etapas de negócio que merecem um span próprio, use a API do OTel:
+
+```ts
+// apps/loja/src/servicos/frete.ts
+import { trace, SpanStatusCode } from "@opentelemetry/api";
+
+const tracer = trace.getTracer("quitanda-loja");
+
+export async function calcularFrete(cep: string, pesoEmGramas: number) {
+  return tracer.startActiveSpan("frete.calcular", async (span) => {
+    span.setAttributes({ "frete.cep_prefixo": cep.slice(0, 5), "frete.peso_g": pesoEmGramas });
+    try {
+      const resposta = await fetch(`${process.env.BFF_URL}/frete?cep=${cep}&peso=${pesoEmGramas}`);
+      if (!resposta.ok) throw new Error(`BFF respondeu ${resposta.status}`);
+      return (await resposta.json()) as { valorEmCentavos: number; prazoEmDias: number };
+    } catch (erro) {
+      span.recordException(erro as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw erro;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+Repare no atributo `frete.cep_prefixo`: só os cinco primeiros dígitos. Telemetria é dado, e a LGPD vale para ela. CEP completo, e-mail, CPF e endereço não entram em atributos, logs nem nomes de span.
+
+### Erros do servidor com `onRequestError`
+
+O mesmo arquivo pode exportar `onRequestError`, chamada pelo Next.js sempre que um erro escapa da renderização, de um Route Handler, de uma Server Action ou do proxy. Ela recebe o erro, a requisição e o contexto da rota, e é o gancho para enviar o erro à ferramenta de sua escolha. O Sentry, a seguir, fornece uma implementação pronta.
+
+## Erros com contexto: Sentry
+
+Métricas dizem que a taxa de erro subiu; o Sentry diz qual erro, em que linha do código original, em qual navegador, depois de quais cliques, desde qual versão. O instalador configura quase tudo:
+
+```bash
+npx @sentry/wizard@latest -i nextjs
+```
+
+Ele cria a configuração do servidor e do Edge, a do cliente em `instrumentation-client.ts` (arquivo que o Next.js executa no navegador antes da hidratação), o `global-error.tsx` e embrulha o `next.config.ts` com `withSentryConfig`. O que importa revisar:
+
+```ts
+// apps/loja/src/instrumentation-client.ts
+import * as Sentry from "@sentry/nextjs";
+
+Sentry.init({
+  dsn: process.env.NEXT_PUBLIC_SENTRY_DSN,
+  environment: process.env.NEXT_PUBLIC_AMBIENTE,
+  release: process.env.NEXT_PUBLIC_VERSAO,
+  tracesSampleRate: 0.1,
+  tracePropagationTargets: ["localhost", /^https:\/\/api\.quitanda\.com\.br/],
+  integrations: [Sentry.replayIntegration({ maskAllText: true, blockAllMedia: true })],
+  replaysSessionSampleRate: 0,
+  replaysOnErrorSampleRate: 0.5,
+});
+
+export const onRouterTransitionStart = Sentry.captureRouterTransitionStart;
+```
+
+```ts
+// apps/loja/src/instrumentation.ts (com Sentry)
+import * as Sentry from "@sentry/nextjs";
+
+export async function register() {
+  if (process.env.NEXT_RUNTIME === "nodejs") await import("../sentry.server.config");
+  if (process.env.NEXT_RUNTIME === "edge") await import("../sentry.edge.config");
+}
+
+export const onRequestError = Sentry.captureRequestError;
+```
+
+- **`release`** liga cada erro à versão implantada. É o que permite dizer "começou na 2.14.0" e comparar versões.
+- **`tracePropagationTargets`** lista os destinos que recebem os cabeçalhos de trace. Só os seus domínios: mandar cabeçalhos extras para APIs de terceiros pode quebrar o CORS delas.
+- **Session Replay** grava a sessão como uma reconstrução do DOM, não como vídeo. `maskAllText` e `blockAllMedia` evitam capturar nome, endereço e dados de pagamento. Gravar só sessões com erro reduz custo e exposição.
+- **Source maps.** O bundle de produção é minificado; sem source maps, o erro aponta para `a.js:1:48213`. O `withSentryConfig` envia os mapas no build (com um token de autenticação só no CI) e pode apagá-los da saída, para não serem servidos ao público.
+
+### Error boundaries que reportam
+
+No App Router, um `error.tsx` é um error boundary para o segmento de rota. Ele precisa ser Client Component e é o lugar para reportar o erro e oferecer uma saída ao usuário:
+
+```tsx
+// apps/loja/src/app/checkout/error.tsx
+"use client";
+import { useEffect } from "react";
+import * as Sentry from "@sentry/nextjs";
+import { Botao } from "@quitanda/ui";
+
+export default function ErroNoCheckout({ error, reset }: { error: Error & { digest?: string }; reset: () => void }) {
+  useEffect(() => {
+    Sentry.captureException(error, { tags: { area: "checkout" } });
+  }, [error]);
+
+  return (
+    <section role="alert">
+      <h2>Não conseguimos carregar o checkout</h2>
+      <p>Seu carrinho está salvo. Tente de novo em instantes.</p>
+      {error.digest && <p>Código para o suporte: {error.digest}</p>}
+      <Botao onClick={reset}>Tentar de novo</Botao>
+    </section>
+  );
+}
+```
+
+O `digest` é o identificador que o Next.js gera para erros do servidor; ele aparece no log do servidor e na tela, e liga o chamado do cliente ao erro exato.
+
+<Callout type="tip" title="Ruído também é um bug">
+Erros de extensões do navegador, scripts de terceiros e `ResizeObserver loop` enchem o Sentry e escondem o que importa. Use `ignoreErrors`, `denyUrls` e filtros por release desde o primeiro dia. Uma ferramenta de erros com dez mil eventos que ninguém lê é igual a não ter ferramenta.
+</Callout>
+
+## Correlação: um clique, uma história
+
+O valor real aparece quando o clique em "Finalizar pedido" no navegador, a Server Action no Next.js, a chamada ao BFF e a consulta ao gateway viram **um único trace**. O mecanismo é o padrão W3C Trace Context: cada salto propaga o cabeçalho `traceparent`, que carrega o id do trace e o id do span pai.
+
+```text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             versão-trace id (32 hex)--------------span pai (16 hex)-flags
+```
+
+Na Quitanda, o caminho fica assim:
+
+1. O SDK do Sentry (ou o agente do New Relic Browser, com distributed tracing ativo) inicia o trace no navegador e envia `traceparent` nas requisições para os domínios permitidos.
+2. O Next.js, instrumentado com OTel, continua o trace e propaga o cabeçalho nos `fetch` que faz ao BFF.
+3. O BFF em NestJS, com o SDK do OpenTelemetry para Node.js e as instrumentações automáticas de HTTP, continua o mesmo trace até o banco e o gateway.
+
+```ts
+// apps/bff/src/telemetria.ts (importado antes de tudo no main.ts)
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+
+const sdk = new NodeSDK({
+  serviceName: "quitanda-bff",
+  traceExporter: new OTLPTraceExporter(),
+  instrumentations: [getNodeAutoInstrumentations()],
+});
+
+sdk.start();
+```
+
+Para os logs participarem da mesma história, cada linha leva o `trace_id` do span ativo. Com logs estruturados em JSON (por exemplo, com pino), a busca por um trace id traz os logs de todos os serviços:
+
+```ts
+// apps/bff/src/pedidos/pedidos.service.ts (trecho)
+import { trace } from "@opentelemetry/api";
+
+const span = trace.getActiveSpan();
+this.logger.info(
+  { pedidoId: pedido.id, status: pedido.status, trace_id: span?.spanContext().traceId },
+  "pedido criado",
+);
+```
+
+O Socket.io não carrega cabeçalhos HTTP por mensagem. Quando o BFF emite `pedido:status-alterado` para o navegador, inclua o `trace_id` no payload do evento; assim o "saiu para entrega" que o cliente vê pode ser ligado ao processamento que o gerou.
+
+## Métricas de experiência e de negócio
+
+O New Relic Browser já coleta Web Vitals de usuários reais (RUM). Quando você quiser enviá-los para outro destino, ou acrescentar dimensões próprias, o Next.js expõe o hook `useReportWebVitals`:
+
+```tsx
+// apps/loja/src/componentes/RelatorDeVitals.tsx
+"use client";
+import { useReportWebVitals } from "next/web-vitals";
+
+export function RelatorDeVitals() {
+  useReportWebVitals((metrica) => {
+    navigator.sendBeacon(
+      "/api/vitals",
+      JSON.stringify({ nome: metrica.name, valor: metrica.value, nota: metrica.rating, rota: location.pathname }),
+    );
+  });
+  return null;
+}
+```
+
+Métricas técnicas não bastam. As que o negócio entende, e que mais rápido denunciam um problema, são as de funil: carrinhos criados, checkouts iniciados, pedidos concluídos, por minuto. Uma queda de 40% em pedidos concluídos com taxa de erro normal costuma ser um bug de interface (um botão que não aparece no Safari) que nenhum alerta técnico pegaria.
+
+## SLOs e alertas por sintoma
+
+Um SLO (Service Level Objective) é uma meta de confiabilidade medida do ponto de vista do usuário:
+
+| SLI (o que se mede) | SLO (a meta) | Janela |
+|---|---|---|
+| Checkouts concluídos sem erro sobre checkouts iniciados | 99,5% | 28 dias |
+| Páginas do catálogo com LCP abaixo de 2,5 s (p75) | 90% das visitas | 28 dias |
+| Atualizações de status entregues pelo Socket.io em até 5 s | 99% | 28 dias |
+
+Os 0,5% que sobram no primeiro SLO são o **orçamento de erro**. Se ele está sendo consumido rápido demais, o alerta toca; se está sobrando, o time pode arriscar mais (deploys mais frequentes, experimentos). Alertar pela velocidade de consumo do orçamento (burn rate) é alertar por **sintoma**: o usuário está sendo afetado. Alertas por **causa** (CPU a 80%, fila com 1000 mensagens) geram plantões acordados por coisas que não afetavam ninguém, e o time aprende a ignorar o pager.
+
+<Callout type="warning" title="Todo alerta precisa de uma ação">
+Se a resposta a um alerta é "olhar e esperar", ele não deveria acordar ninguém: vira um item de dashboard. Cada alerta que pagina precisa de um runbook com o que verificar primeiro e como mitigar (rollback, desligar a feature flag, escalar para o time do BFF).
+</Callout>
+
+## Manutenção: mudar com rede de segurança
+
+A maioria dos incidentes começa numa mudança. Três práticas reduzem o raio de explosão:
+
+- **Marcadores de deploy.** Registre cada deploy no New Relic e cada release no Sentry. A primeira pergunta de um incidente é "o que mudou?", e o gráfico com a linha do deploy responde em segundos.
+- **Feature flags como interruptor.** A nova tela de checkout entra desligada, liga para 5% dos clientes, depois 50%, depois todos. Se a taxa de erro sobe, desligar a flag é mais rápido que qualquer rollback.
+- **Rollback ensaiado.** Voltar para a versão anterior precisa ser um botão ou um comando conhecido, testado em dia calmo, e não uma descoberta durante o incidente.
+
+## Plantão e postmortem
+
+Plantão (on-call) é a escala de quem responde a alertas fora do horário. Ele funciona quando é sustentável: rodízio semanal, alguém de segundo nível para escalar, alertas com runbook e compensação pelo tempo. E quando cada incidente vira aprendizado.
+
+O postmortem é o documento escrito depois de um incidente relevante, e a palavra-chave é **sem culpados** (blameless). A pergunta não é "quem errou?", mas "o que no sistema permitiu que um erro humano previsível chegasse à produção?". Se uma pessoa conseguiu quebrar o checkout com um deploy de sexta, faltou um teste de contrato, um canário ou uma revisão, não sobrou descuido.
+
+| Seção | Conteúdo no incidente do checkout |
+|---|---|
+| Resumo | 6% dos checkouts falharam por 47 minutos; cerca de 180 pedidos perdidos |
+| Linha do tempo | 18h52 deploy do BFF; 19h10 alerta; 19h35 causa achada; 19h39 rollback |
+| Impacto | Clientes, receita estimada, chamados no suporte |
+| Causa raiz e fatores contribuintes | Campo `valorEmCentavos` virou string no BFF; sem teste de contrato entre loja e BFF; alerta só disparou 18 min depois |
+| O que funcionou | Rollback em 4 minutos; o `digest` nos chamados acelerou a busca |
+| Ações | Teste de contrato no CI (dono, prazo); alerta por burn rate; deploy do BFF com canário |
+
+As ações são a parte que importa. Um postmortem sem ações com dono e prazo é só uma história triste.
+
+## Na entrevista
+
+**Qual a diferença entre monitoramento e observabilidade?** Monitoramento acompanha sinais conhecidos e alerta quando saem do esperado. Observabilidade é a capacidade de investigar problemas que você não previu, cruzando métricas, logs e traces com contexto suficiente (versão, usuário anonimizado, rota, trace id) para fazer perguntas novas.
+
+**Como você instrumentaria uma aplicação Next.js?** Com OpenTelemetry no `instrumentation.ts`, exportando por OTLP para o backend do time, spans próprios nas etapas de negócio, `onRequestError` para erros do servidor, uma ferramenta de erros como o Sentry no cliente com source maps e release, e RUM para Web Vitals.
+
+**Como correlacionar um erro no navegador com o que aconteceu no BFF?** Propagando o contexto de trace pelo cabeçalho `traceparent` do navegador ao Next.js e ao BFF, com instrumentação OTel em cada salto, e incluindo o trace id nos logs estruturados. Assim, um único id leva do erro do usuário a cada span e linha de log.
+
+**O que é um orçamento de erro?** A margem que um SLO deixa: com 99,5% de sucesso, 0,5% das tentativas podem falhar na janela. Se o orçamento acaba, o time prioriza confiabilidade; se sobra, pode arriscar mais. Alertas pela velocidade de consumo do orçamento refletem impacto real no usuário.
+
+**Como deve ser um postmortem?** Sem culpados, com linha do tempo, impacto, causa raiz e fatores contribuintes, o que funcionou e ações com dono e prazo. O foco é corrigir o sistema que permitiu o erro, não a pessoa que o cometeu.
+
+## Pratique
+
+1. Adicione o `instrumentation.ts` com `@vercel/otel` à loja e ao BFF com o SDK do Node.js, exportando para o New Relic por OTLP. Encontre um trace que vá da Server Action de checkout até o banco.
+2. Crie um span `frete.calcular` com atributos sem dados pessoais e um alerta para quando ele passar de 2 segundos no p95.
+3. Configure o Sentry na loja com release, source maps enviados no CI e replay só em sessões com erro. Provoque um erro no componente Carrinho e confira a linha do código original no evento.
+4. Inclua o `trace_id` nos logs do BFF e no payload do evento `pedido:status-alterado` do Socket.io, e mostre como chegar de um chamado do suporte (com o `digest`) aos logs do pedido.
+5. Escreva os SLOs do checkout e do catálogo, configure um alerta por burn rate e escreva o postmortem do incidente fictício da sexta-feira com pelo menos três ações.
+
+<Quiz question="O erro do checkout aparece no Sentry apontando para a linha 1, coluna 48213 de um arquivo minificado. O que está faltando?" options={["O replay de sessão","O envio dos source maps da versão implantada para o Sentry","A variável tracesSampleRate","Um error boundary no layout"]} answer={1} explanation="Sem os source maps da release, a ferramenta não consegue traduzir a posição no bundle minificado para o arquivo e a linha originais." />
+
+<Quiz question="Qual cabeçalho permite que o trace iniciado no navegador continue no Next.js e no BFF?" options={["X-Request-Id","Authorization","traceparent, do padrão W3C Trace Context","Content-Security-Policy"]} answer={2} explanation="O traceparent carrega o id do trace e do span pai; cada serviço instrumentado o lê e cria spans filhos no mesmo trace." />
+
+<Quiz question="Qual destes alertas é por sintoma e não por causa?" options={["Checkouts concluídos estão consumindo o orçamento de erro do SLO dez vezes mais rápido que o normal","CPU do container do BFF acima de 80%","Fila de e-mails com mais de mil mensagens","Uso de memória do Node.js crescendo"]} answer={0} explanation="O consumo acelerado do orçamento de erro mede o impacto direto no usuário. Os outros são causas possíveis que podem ou não afetar alguém." />
+
+## Base no CodeForge
+
+- [React: customizando alertas e dashboards com New Relic](/learn/carreira-react/react-alertas-dashboards-new-relic): onde a telemetria deste capítulo vira painel e alerta.
+- [Os três pilares da observabilidade](/learn/system-design/tres-pilares): logs, métricas e traces em profundidade.
+- [Tracing distribuído](/learn/system-design/tracing-distribuido): propagação de contexto entre serviços.
+- [Dashboards e runbooks](/learn/system-design/dashboards-runbooks): o material que o plantão consulta às duas da manhã.
+- [Feature flags](/learn/system-design/feature-flags): o interruptor que encurta incidentes.
+
+## Referências
+
+- [Next.js: OpenTelemetry](https://nextjs.org/docs/app/guides/open-telemetry)
+- [Next.js: instrumentation.js](https://nextjs.org/docs/app/api-reference/file-conventions/instrumentation)
+- [OpenTelemetry: documentação de JavaScript](https://opentelemetry.io/docs/languages/js/)
+- [Sentry para Next.js](https://docs.sentry.io/platforms/javascript/guides/nextjs/)
+- [W3C Trace Context](https://www.w3.org/TR/trace-context/)

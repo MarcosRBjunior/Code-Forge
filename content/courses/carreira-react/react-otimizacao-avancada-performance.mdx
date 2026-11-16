@@ -1,0 +1,360 @@
+---
+title: "React: otimização avançada de performance"
+kind: lesson
+---
+
+O time de marketing da Quitanda trouxe um número: no celular, quem espera mais de 3 segundos para ver o catálogo abandona a compra duas vezes mais. No Nível 2 você aplicou `memo`, `useMemo`, `lazy` e as estratégias de renderização do Next.js. A loja melhorou no notebook do time, mas os relatórios de campo mostram outra história: o LCP da página de produto passa de 4 segundos em aparelhos Android intermediários, o filtro do catálogo trava ao digitar e o banner de frete grátis empurra o conteúdo quando aparece.
+
+Otimização avançada começa por medir o que os usuários reais sentem, não o que o Lighthouse mostra na sua máquina. Depois, ataca cada métrica com a técnica certa: menos JavaScript com Server Components, imagens e fontes bem carregadas, tarefas longas quebradas, renderizações eliminadas pelo React Compiler e trabalho pesado fora da thread principal. Este capítulo segue essa ordem.
+
+**Você vai aprender:**
+
+- Interpretar LCP, INP e CLS e seus limites, sempre no percentil 75 de campo
+- Coletar Web Vitals de usuários reais e diferenciar dados de campo e de laboratório
+- Analisar o bundle e cortar JavaScript com Server Components e importação dinâmica
+- Usar o React Compiler, `useTransition` e `useDeferredValue` para melhorar a responsividade
+- Carregar imagens e fontes sem prejudicar LCP e CLS, e antecipar navegações com prefetch
+- Tirar trabalho pesado da thread principal com Web Workers
+
+## Core Web Vitals
+
+| Métrica | Mede | Bom | Ruim |
+|---|---|---|---|
+| LCP (Largest Contentful Paint) | Quando o maior elemento visível (foto do produto, título) é pintado | até 2,5 s | acima de 4 s |
+| INP (Interaction to Next Paint) | Latência das interações (clique, toque, tecla) até a próxima pintura, ao longo de toda a visita | até 200 ms | acima de 500 ms |
+| CLS (Cumulative Layout Shift) | Quanto o layout se desloca inesperadamente | até 0,1 | acima de 0,25 |
+
+Os limites são avaliados no **percentil 75** das visitas, separando celular e desktop. Se 75% das visitas ao produto têm LCP de até 2,5 s, a página passa. INP substituiu o FID em 2024 e é mais exigente: considera todas as interações da visita, não só a primeira, e inclui o tempo de processamento e de pintura, não só o atraso de entrada.
+
+Métricas auxiliares ajudam no diagnóstico: **TTFB** (tempo até o primeiro byte, mostra servidor e rede) e **FCP** (primeira pintura de qualquer conteúdo).
+
+## Campo versus laboratório
+
+| | Laboratório | Campo (RUM) |
+|---|---|---|
+| Ferramentas | Lighthouse, painel Performance do DevTools, WebPageTest | CrUX (dados do Chrome), biblioteca `web-vitals`, New Relic Browser |
+| Condições | Uma máquina, rede e CPU simuladas | Aparelhos, redes e comportamentos reais |
+| INP | Não mede de verdade (não há usuário interagindo); usa TBT como aproximação | Mede |
+| Bom para | Reproduzir, depurar, comparar antes e depois de uma mudança | Saber se o problema existe e para quem |
+
+O fluxo saudável: o campo diz **onde** dói (página de produto, Android, 4G), o laboratório ajuda a descobrir **por quê** e a validar a correção, e o campo confirma que melhorou.
+
+Para coletar no campo sem ferramenta paga, a biblioteca `web-vitals` com o build de atribuição informa também a causa provável:
+
+```tsx
+// src/componentes/ColetorDeVitals.tsx
+"use client";
+import { useEffect } from "react";
+import { onCLS, onINP, onLCP, type Metric } from "web-vitals/attribution";
+
+function enviar(metrica: Metric) {
+  const corpo = JSON.stringify({
+    nome: metrica.name,
+    valor: metrica.value,
+    classificacao: metrica.rating,
+    rota: location.pathname,
+    atribuicao: metrica.attribution,
+  });
+  navigator.sendBeacon?.("/api/vitals", corpo) || fetch("/api/vitals", { method: "POST", body: corpo, keepalive: true });
+}
+
+export function ColetorDeVitals() {
+  useEffect(() => {
+    onLCP(enviar);
+    onINP(enviar);
+    onCLS(enviar);
+  }, []);
+  return null;
+}
+```
+
+No Next.js, o hook `useReportWebVitals` de `next/web-vitals` faz o mesmo papel. Os capítulos de New Relic mostram como esses dados viram dashboards e alertas.
+
+## LCP: o maior elemento na tela
+
+Na página de produto, o elemento LCP é a foto. O LCP se decompõe em quatro partes, e a atribuição do `web-vitals` mostra cada uma:
+
+1. **TTFB**: servidor lento, sem cache, redirecionamentos.
+2. **Atraso de carregamento**: o navegador demora a descobrir a imagem (ela só aparece depois que o JavaScript roda, ou está com `loading="lazy"`).
+3. **Duração do carregamento**: imagem grande demais, formato pesado.
+4. **Atraso de renderização**: a imagem chegou, mas a pintura espera JavaScript ou CSS bloqueante.
+
+```tsx
+// src/app/produtos/[id]/page.tsx (trecho)
+import Image from "next/image";
+
+<Image
+  src={produto.fotoUrl}
+  alt={produto.nome}
+  width={640}
+  height={640}
+  sizes="(max-width: 768px) 100vw, 640px"
+  preload
+/>
+```
+
+O `next/image` gera versões redimensionadas em formatos modernos (AVIF ou WebP) e um `srcset` com base em `sizes`. A prop `preload` (no Next.js 16, substituindo a antiga `priority`; confira a documentação da sua versão) faz a imagem ser descoberta cedo, com prioridade alta e sem lazy loading. Use-a só na imagem LCP; marcar tudo como prioritário é o mesmo que não marcar nada. Fora do Next.js, o equivalente é `<img fetchpriority="high">` sem `loading="lazy"` e, se a imagem vem de outro domínio, um `<link rel="preconnect">`.
+
+Renderizar a página no servidor (Server Component, estático ou com cache) ataca os itens 1 e 2: o HTML já chega com a tag da imagem, sem esperar o bundle.
+
+## CLS: nada pula na tela
+
+Causas comuns na Quitanda e as correções:
+
+| Causa | Correção |
+|---|---|
+| Imagens sem dimensão | `width` e `height` (ou `aspect-ratio` no CSS) para o navegador reservar o espaço; o `next/image` exige |
+| Banner de frete grátis que aparece depois | Reservar a altura desde o primeiro render, ou exibir sobreposto em vez de empurrar o conteúdo |
+| Fonte web trocando a fonte de fallback | `next/font`, que hospeda a fonte e ajusta as métricas do fallback com `size-adjust` |
+| Skeleton menor que o conteúdo final | Skeleton com as mesmas dimensões do componente real |
+| Conteúdo injetado acima do que o usuário lê | Inserir abaixo da dobra ou só após interação |
+
+```tsx
+// src/app/layout.tsx
+import { Inter } from "next/font/google";
+
+const inter = Inter({ subsets: ["latin"], display: "swap" });
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="pt-BR" className={inter.className}>
+      <body>{children}</body>
+    </html>
+  );
+}
+```
+
+Animações também contam: animar `transform` e `opacity` não causa deslocamento de layout; animar `top`, `height` ou `margin` causa.
+
+## INP: responder rápido a cada interação
+
+Uma interação lenta tem três partes: **atraso de entrada** (a thread principal estava ocupada quando o usuário clicou), **processamento** (seus handlers e as renderizações que eles disparam) e **atraso de apresentação** (layout e pintura do resultado). O painel Performance do DevTools mostra as tarefas longas (acima de 50 ms) que causam tudo isso.
+
+O filtro do catálogo é o caso clássico: cada tecla filtra 2 mil produtos e re-renderiza a lista inteira.
+
+```tsx
+// src/componentes/BuscaDoCatalogo.tsx
+"use client";
+import { useDeferredValue, useState } from "react";
+import { ListaDeProdutos } from "./ListaDeProdutos";
+
+export function BuscaDoCatalogo({ produtos }: { produtos: Produto[] }) {
+  const [termo, setTermo] = useState("");
+  const termoAdiado = useDeferredValue(termo);
+  const desatualizado = termo !== termoAdiado;
+
+  return (
+    <>
+      <input value={termo} onChange={(e) => setTermo(e.target.value)} aria-label="Buscar produtos" />
+      <div style={{ opacity: desatualizado ? 0.6 : 1 }}>
+        <ListaDeProdutos produtos={produtos} termo={termoAdiado} />
+      </div>
+    </>
+  );
+}
+```
+
+O input atualiza imediatamente com `termo`; a lista renderiza com `termoAdiado` numa renderização de baixa prioridade que o React interrompe se o usuário continuar digitando. `ListaDeProdutos` precisa ser memoizado (pelo React Compiler ou por `memo`) para que a renderização urgente não a refaça. `useTransition` é o equivalente quando você controla a atualização de estado: `startTransition(() => setFiltro(novo))`.
+
+Outras técnicas para INP:
+
+- **Virtualizar listas longas** (TanStack Virtual): renderizar 20 linhas visíveis em vez de 2 mil.
+- **Quebrar tarefas longas em JavaScript fora do React**: ceder a thread principal entre blocos com `await scheduler.yield()` onde disponível, ou `await new Promise((r) => setTimeout(r, 0))`.
+- **Dar retorno visual antes do trabalho pesado**: mostrar o estado pressionado, depois processar.
+- **Evitar trabalho síncrono caro em handlers**: analytics, serialização de objetos grandes e `localStorage` grande podem ir para depois da pintura.
+
+## React Compiler
+
+O React Compiler, estável desde o fim de 2025, analisa seus componentes e hooks em tempo de build e insere a memoização automaticamente: valores, funções e JSX são reaproveitados enquanto as dependências não mudam. Na prática, ele faz o trabalho de `memo`, `useMemo` e `useCallback`, com granularidade maior do que a escrita à mão.
+
+```ts
+// next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  reactCompiler: true,
+};
+
+export default config;
+```
+
+Num projeto Vite, o compilador entra como plugin Babel (`babel-plugin-react-compiler`) na configuração do `@vitejs/plugin-react`; siga o guia de instalação do React Compiler para a versão do plugin que você usa.
+
+Pontos de atenção:
+
+- O compilador assume que o código segue as **Regras do React** (componentes puros, sem mutar props nem estado, hooks no topo). Código que viola essas regras é pulado ou pode mudar de comportamento. O plugin `eslint-plugin-react-hooks` traz regras que apontam essas violações.
+- Ele **reduz renderizações**, não deixa uma renderização cara mais barata, e não diminui o bundle. Lista de 2 mil itens continua precisando de virtualização.
+- Os `useMemo` e `useCallback` existentes podem ficar; remova-os aos poucos, medindo.
+- Use a diretiva `"use no memo"` para excluir temporariamente um componente problemático enquanto investiga.
+
+## Menos JavaScript: bundle e Server Components
+
+Todo JavaScript enviado é baixado, analisado, compilado e executado, e no celular intermediário isso custa caro para LCP e INP. Antes de otimizar, veja o que está no bundle.
+
+| Ferramenta | Onde |
+|---|---|
+| `@next/bundle-analyzer` | Next.js com build webpack; gera um mapa interativo dos chunks |
+| Analisador do Turbopack (`next experimental-analyze`) | Versões recentes do Next.js, com Turbopack |
+| `rollup-plugin-visualizer` | Projetos Vite |
+| Aba Coverage do DevTools | Quanto do JS baixado foi realmente executado |
+
+Achados típicos na Quitanda: uma biblioteca de gráficos do painel vazando para a loja, uma biblioteca de datas inteira por causa de uma função, um arquivo `index.ts` que reexporta todos os ícones (barrel file) e puxa todos para o bundle.
+
+As correções, em ordem de impacto:
+
+**1. Empurrar `"use client"` para as folhas.** Em App Router, componentes são Server Components por padrão e não enviam JavaScript. O erro comum é marcar a página inteira como cliente por causa de um botão.
+
+```tsx
+// src/app/produtos/[id]/page.tsx: Server Component, zero JS para esta parte
+import { BotaoAdicionar } from "@/componentes/BotaoAdicionar"; // só ele é "use client"
+import { formatarPreco } from "@/utils/formatarPreco";
+import { buscarProduto } from "@/servicos/api";
+
+export default async function PaginaDoProduto({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const produto = await buscarProduto(id);
+  return (
+    <article>
+      <h1>{produto.nome}</h1>
+      <p>{formatarPreco(produto.precoEmCentavos)} / {produto.unidade}</p>
+      <div dangerouslySetInnerHTML={{ __html: produto.descricaoHtmlSanitizada }} />
+      <BotaoAdicionar produtoId={produto.id} />
+    </article>
+  );
+}
+```
+
+Formatação, markdown da descrição e a busca dos dados rodam no servidor. O navegador recebe HTML e o JavaScript de um botão.
+
+**2. Importação dinâmica para o que não aparece de cara.** O modal de cupom e o mapa de entrega só carregam quando usados:
+
+```tsx
+// src/componentes/AreaDoCupom.tsx
+"use client";
+import dynamic from "next/dynamic";
+import { useState } from "react";
+
+const ModalDeCupom = dynamic(() => import("./ModalDeCupom"), { loading: () => <p>Carregando...</p> });
+
+export function AreaDoCupom() {
+  const [aberto, setAberto] = useState(false);
+  return (
+    <>
+      <button onClick={() => setAberto(true)}>Tenho um cupom</button>
+      {aberto && <ModalDeCupom aoFechar={() => setAberto(false)} />}
+    </>
+  );
+}
+```
+
+Numa SPA com Vite, `React.lazy(() => import("./ModalDeCupom"))` com `Suspense` faz o mesmo.
+
+**3. Imports diretos em vez de barrels**, ou a opção `optimizePackageImports` do Next.js para bibliotecas com muitos módulos.
+
+<Callout type="tip" title="Orçamento de performance no CI">
+Otimização sem guarda regride em poucas semanas. Defina um orçamento (por exemplo, no máximo 170 KB de JS comprimido na rota de produto e LCP de laboratório abaixo de 2,5 s) e faça o pipeline falhar quando ele for estourado, com Lighthouse CI ou uma checagem do tamanho dos chunks. A discussão sobre "vale adicionar essa biblioteca?" passa a acontecer no pull request.
+</Callout>
+
+## Prefetch: chegar antes do clique
+
+- O `Link` do Next.js já faz prefetch das rotas visíveis na viewport em produção. Para rotas dinâmicas, o prefetch traz a parte estática e os limites de `loading.tsx`.
+- Dados de rotas prováveis podem ser antecipados na intenção, com `queryClient.prefetchQuery` no `onMouseEnter` ou `onFocus`, como no capítulo de estado.
+- `<link rel="preconnect">` para domínios críticos (CDN de imagens, API) economiza DNS, TCP e TLS.
+
+Prefetch consome dados do usuário. Em listas longas, não antecipe tudo; prefira a intenção (hover, foco) e respeite o modo de economia de dados quando possível.
+
+## Web Workers para trabalho pesado
+
+O painel do lojista importa uma planilha CSV com 20 mil linhas de preços. Fazer o parsing e a validação na thread principal congela a tela por vários segundos. Um Web Worker roda em outra thread:
+
+```ts
+// src/workers/importarPrecos.worker.ts
+self.onmessage = (evento: MessageEvent<string>) => {
+  const linhas = evento.data.split("\n").slice(1);
+  const validas: { sku: string; precoEmCentavos: number }[] = [];
+  const erros: number[] = [];
+  linhas.forEach((linha, i) => {
+    const [sku, preco] = linha.split(";");
+    const valor = Math.round(Number(preco?.replace(",", ".")) * 100);
+    if (sku && Number.isFinite(valor) && valor > 0) validas.push({ sku, precoEmCentavos: valor });
+    else erros.push(i + 2);
+  });
+  self.postMessage({ validas, erros });
+};
+```
+
+```tsx
+// src/componentes/ImportarPrecos.tsx
+"use client";
+import { useState } from "react";
+
+export function ImportarPrecos() {
+  const [resumo, setResumo] = useState<string | null>(null);
+
+  async function aoEscolher(arquivo: File) {
+    const worker = new Worker(new URL("../workers/importarPrecos.worker.ts", import.meta.url), { type: "module" });
+    worker.onmessage = (e) => {
+      setResumo(`${e.data.validas.length} preços válidos, ${e.data.erros.length} linhas com erro`);
+      worker.terminate();
+    };
+    worker.postMessage(await arquivo.text());
+  }
+
+  return (
+    <>
+      <input type="file" accept=".csv" onChange={(e) => e.target.files?.[0] && aoEscolher(e.target.files[0])} />
+      {resumo && <p role="status">{resumo}</p>}
+    </>
+  );
+}
+```
+
+O padrão `new Worker(new URL(...), import.meta.url)` é reconhecido pelo Vite, pelo webpack e pelo Turbopack. Workers não acessam o DOM e a troca de mensagens copia os dados, então eles valem para cálculo pesado (parsing, compressão, busca em listas grandes), não para tarefas pequenas. A biblioteca Comlink deixa a comunicação parecida com chamar funções assíncronas.
+
+<Callout type="warning" title="Não otimize no escuro">
+Cada técnica deste capítulo tem custo de complexidade. Antes de aplicar, tenha o número de campo que justifica (qual página, qual métrica, qual percentil) e meça depois. Um `useDeferredValue` numa lista de 30 itens ou um worker para somar o carrinho só deixam o código mais difícil.
+</Callout>
+
+## Na entrevista
+
+**Quais são os Core Web Vitals e seus limites?** LCP até 2,5 s, INP até 200 ms e CLS até 0,1, medidos no percentil 75 das visitas reais, separando celular e desktop.
+
+**Qual a diferença entre dados de campo e de laboratório?** Laboratório é uma execução controlada (Lighthouse, DevTools), boa para depurar e comparar. Campo vem de usuários reais (CrUX, RUM), mostra a experiência de verdade e é o único que mede INP. Uso o campo para achar o problema e o laboratório para entender e validar a correção.
+
+**Como você melhoraria o LCP de uma página de produto?** Renderizo no servidor para a imagem estar no HTML, dou prioridade alta só à imagem LCP sem lazy loading, sirvo tamanhos e formatos adequados, reduzo TTFB com cache e removo JS ou CSS que bloqueiam a renderização.
+
+**O que o React Compiler faz e o que ele não faz?** Insere memoização automática em componentes e hooks que seguem as Regras do React, reduzindo re-renderizações. Não diminui o bundle, não torna uma renderização cara mais barata e não substitui virtualização ou Server Components.
+
+**Como Server Components ajudam a performance?** Eles rodam só no servidor e não enviam seu código ao navegador. Mantendo `"use client"` nas folhas interativas, o bundle cai, a hidratação fica menor e LCP e INP melhoram.
+
+**Quando usar um Web Worker?** Para processamento pesado e independente do DOM, como parsing de arquivos grandes ou busca em listas enormes, que bloquearia a thread principal e prejudicaria o INP.
+
+## Pratique
+
+1. Adicione o `ColetorDeVitals` à Quitanda, grave as métricas numa rota `/api/vitals` e calcule o p75 de LCP e INP por rota após um dia de uso.
+2. Identifique o elemento LCP da página de produto no DevTools, decomponha o tempo nas quatro partes e aplique as correções até ficar abaixo de 2,5 s com throttling de 4G e CPU 4x.
+3. Rode o analisador de bundle, encontre as três maiores dependências da rota de produto e elimine ou adie pelo menos uma.
+4. Ative o React Compiler, rode o lint das regras do React e compare com o Profiler quantos componentes renderizam ao adicionar um item ao carrinho antes e depois.
+5. Meça o INP do filtro do catálogo com 2 mil produtos, aplique `useDeferredValue` e virtualização, e meça de novo.
+6. Implemente a importação de preços por CSV num Web Worker e confirme no painel Performance que a thread principal não tem tarefas longas durante o processamento.
+
+<Quiz question="A página de produto tem LCP ruim porque a foto só aparece depois que o JavaScript renderiza a página no cliente. Qual a correção mais eficaz?" options={["Adicionar loading=lazy na foto","Envolver o componente da foto em memo","Usar useDeferredValue na foto","Renderizar a página no servidor e dar prioridade alta à imagem LCP"]} answer={3} explanation="Com o HTML já trazendo a imagem e prioridade alta, o navegador a descobre e baixa cedo. Lazy loading na imagem LCP piora a métrica." />
+
+<Quiz question="Por que o INP só pode ser medido de forma confiável com dados de campo?" options={["Porque o Lighthouse não roda em celulares","Porque depende de interações reais de usuários ao longo da visita","Porque o INP é calculado no servidor","Porque o DevTools não mostra tarefas longas"]} answer={1} explanation="INP considera as interações reais durante toda a visita. Em laboratório, usa-se o TBT como aproximação." />
+
+<Quiz question="O React Compiler foi ativado e a lista de 2 mil produtos continua lenta ao rolar. Qual é a explicação mais provável?" options={["O compilador reduz re-renderizações, mas não diminui o custo de renderizar 2 mil itens; é preciso virtualizar","O compilador só funciona com componentes de classe","O compilador aumenta o tamanho do bundle em 2 mil vezes","O compilador desativa o Server Components"]} answer={0} explanation="Memoização evita trabalho repetido, mas renderizar e manter milhares de nós no DOM continua caro. Virtualização resolve esse problema." />
+
+## Base no CodeForge
+
+- [React: técnicas avançadas de otimização e desempenho](/learn/carreira-react/react-tecnicas-avancadas-otimizacao-desempenho): memo, lazy e Profiler, a base deste capítulo.
+- [React: explorando estratégias de renderização do Next.js](/learn/carreira-react/react-estrategias-renderizacao-nextjs): SSR, estático e streaming, que atacam LCP e TTFB.
+- [CDN](/learn/system-design/cdn): imagens e estáticos perto do usuário.
+- [Latência e throughput](/learn/system-design/latencia-throughput): os conceitos por trás das métricas.
+
+## Referências
+
+- [web.dev: Web Vitals](https://web.dev/articles/vitals)
+- [web.dev: Optimize INP](https://web.dev/articles/optimize-inp)
+- [React: React Compiler](https://react.dev/learn/react-compiler)
+- [Next.js: Image Component](https://nextjs.org/docs/app/api-reference/components/image)
+- [MDN: Using Web Workers](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers)

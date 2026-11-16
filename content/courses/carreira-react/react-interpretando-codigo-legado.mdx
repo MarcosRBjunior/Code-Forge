@@ -1,0 +1,380 @@
+---
+title: "React: interpretando código legado"
+kind: lesson
+---
+
+A Quitanda cresceu e comprou uma concorrente menor, a Hortaliça Express, junto com o painel de pedidos que ela usava. O código tem seis anos: foi criado com `create-react-app`, os componentes são classes com `componentDidMount` e `this.setState`, o estado global usa Redux escrito à mão com constantes de tipo e `connect`, metade dos componentes vem embrulhada em `withRouter` e `withPermissao`, e os tipos das props estão descritos com `PropTypes`. O time precisa integrar esse painel à Quitanda, corrigir bugs nele já na primeira semana e, aos poucos, trazê-lo para o React moderno sem parar a operação.
+
+Código legado não é código ruim: é código que funciona, gera receita e foi escrito com as ferramentas da época. Boa parte das vagas de React envolve manter sistemas assim. Este capítulo ensina a ler cada padrão antigo, traduzindo-o para o equivalente moderno que você já conhece, e mostra uma estratégia segura para migrar: primeiro testes que congelam o comportamento, depois mudanças pequenas e reversíveis.
+
+**Você vai aprender:**
+
+- Ler componentes de classe: estado, `setState`, `this` e métodos de ciclo de vida
+- Mapear cada método de ciclo de vida para o hook equivalente e reconhecer onde a tradução não é direta
+- Entender HOCs e render props e por que os hooks os substituíram
+- Interpretar `PropTypes`, `create-react-app` e Redux antigo com `connect`
+- Proteger o comportamento com testes de caracterização antes de mexer
+- Migrar aos poucos, componente por componente, para hooks e ferramentas atuais
+
+## Componentes de classe
+
+Antes dos hooks (React 16.8, 2019), só componentes de classe tinham estado e ciclo de vida. Este é o painel de pedidos herdado:
+
+```jsx
+// legado/src/components/OrdersPanel.js
+import React, { Component } from "react";
+import PropTypes from "prop-types";
+import { fetchOrders } from "../api";
+
+class OrdersPanel extends Component {
+  static propTypes = {
+    status: PropTypes.oneOf(["recebido", "separando", "saiu para entrega", "entregue"]),
+    refreshMs: PropTypes.number,
+    onSelect: PropTypes.func.isRequired,
+  };
+
+  static defaultProps = { status: "recebido", refreshMs: 15000 };
+
+  state = { orders: [], loading: true, error: null };
+
+  componentDidMount() {
+    this.load();
+    this.timer = setInterval(this.load, this.props.refreshMs);
+  }
+
+  componentDidUpdate(prevProps) {
+    if (prevProps.status !== this.props.status) {
+      this.setState({ loading: true });
+      this.load();
+    }
+  }
+
+  componentWillUnmount() {
+    clearInterval(this.timer);
+  }
+
+  load = () => {
+    fetchOrders(this.props.status)
+      .then((orders) => this.setState({ orders, loading: false, error: null }))
+      .catch((error) => this.setState({ error, loading: false }));
+  };
+
+  render() {
+    const { orders, loading, error } = this.state;
+    if (loading) return <p>Carregando...</p>;
+    if (error) return <p>Erro ao carregar pedidos.</p>;
+    return (
+      <ul>
+        {orders.map((o) => (
+          <li key={o.id} onClick={() => this.props.onSelect(o.id)}>
+            #{o.id} - {o.customer}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+}
+
+export default OrdersPanel;
+```
+
+Como ler cada parte:
+
+- **`state`** é um objeto único. **`this.setState(parcial)`** faz um merge raso com o estado atual, ao contrário do `useState`, que substitui o valor. Assim como no hook, a atualização não é imediata; quando o novo estado depende do anterior, a forma correta é `this.setState((anterior) => ({ contagem: anterior.contagem + 1 }))`.
+- **`this.props`** traz as props, sempre lidas no momento do uso, o que causa bugs sutis: dentro de um `setTimeout`, `this.props` já pode ser de uma renderização posterior. Componentes de função capturam as props de cada renderização.
+- **`this` e o binding.** Métodos comuns perdem o `this` quando passados como callback. Por isso o código usa arrow function como campo de classe (`load = () => {}`). Em código mais antigo ainda, você verá `this.handleClick = this.handleClick.bind(this)` no `constructor`.
+- **`render()`** é a função de renderização. Precisa ser pura, igual ao corpo de um componente de função.
+
+### Ciclo de vida e o equivalente com hooks
+
+| Classe | Quando roda | Equivalente moderno |
+|---|---|---|
+| `constructor` | Uma vez, antes da primeira renderização | Inicialização de `useState` (preguiçosa, se cara) |
+| `componentDidMount` | Depois da primeira renderização | `useEffect(() => {...}, [])` |
+| `componentDidUpdate(prevProps, prevState)` | Depois de cada atualização | `useEffect` com as dependências que importam |
+| `componentWillUnmount` | Antes de sair da tela | Função de limpeza do `useEffect` |
+| `shouldComponentUpdate` e `PureComponent` | Antes de renderizar, para pular | `memo` (ou o React Compiler) |
+| `static getDerivedStateFromProps` | Antes de cada renderização | Calcular na renderização ou trocar a `key` |
+| `getSnapshotBeforeUpdate` | Logo antes de aplicar no DOM | Sem hook equivalente; raro |
+| `componentDidCatch` e `getDerivedStateFromError` | Erro em um descendente | Sem hook: error boundaries ainda são classes |
+
+A tradução não é um para um. Em classes, o código fica organizado **por momento** (tudo o que acontece na montagem em um método, tudo da desmontagem em outro). Com hooks, ele fica organizado **por assunto**: o timer de atualização vira um efeito com sua própria limpeza, o carregamento por status vira outro. No `OrdersPanel`, o timer é criado em `componentDidMount` e destruído em `componentWillUnmount`, a dez linhas de distância, e o `componentDidUpdate` esquece de reiniciar o timer quando `refreshMs` muda. Esse tipo de bug é quase impossível num efeito bem escrito, em que configuração e limpeza ficam juntas e as dependências são verificadas pelo lint.
+
+### Métodos que você vai encontrar e que não existem mais
+
+`componentWillMount`, `componentWillReceiveProps` e `componentWillUpdate` foram renomeados com o prefixo `UNSAFE_` no React 16.3, porque quebram com a renderização concorrente. Se aparecerem, a lógica deve ir para `componentDidMount`, `componentDidUpdate` ou ser calculada na renderização. O React 19 também removeu APIs que ainda aparecem em código antigo: `ReactDOM.render` (substituído por `createRoot`), refs em string (`ref="campo"`), o contexto legado com `contextTypes` e `childContextTypes` e o `findDOMNode`. Um projeto que usa qualquer uma delas não sobe para o React 19 sem ajustes.
+
+<Callout type="warning" title="Error boundaries continuam sendo classes">
+Não existe hook para capturar erros de renderização dos filhos. Mesmo em projetos totalmente modernos, o error boundary é uma classe com `getDerivedStateFromError` e `componentDidCatch`, ou vem pronto de uma biblioteca como `react-error-boundary`. No React Router, o `errorElement` cumpre esse papel por rota. Não tente "migrar" o error boundary do legado para hooks.
+</Callout>
+
+## HOCs e render props
+
+Antes dos hooks, reaproveitar lógica com estado entre componentes exigia envolvê-los. Dois padrões dominaram.
+
+**Higher-Order Component (HOC)** é uma função que recebe um componente e devolve outro, com props a mais:
+
+```jsx
+// legado/src/hocs/withPermissao.js
+import React from "react";
+import { getUser } from "../auth";
+
+export default function withPermissao(papel) {
+  return function (WrappedComponent) {
+    function ComPermissao(props) {
+      const user = getUser();
+      if (!user || user.role !== papel) return <p>Acesso negado.</p>;
+      return <WrappedComponent {...props} user={user} />;
+    }
+    ComPermissao.displayName = `withPermissao(${WrappedComponent.displayName || WrappedComponent.name})`;
+    return ComPermissao;
+  };
+}
+
+// uso típico, empilhado
+export default withRouter(withPermissao("lojista")(connect(mapState)(OrdersPage)));
+```
+
+**Render props** passam uma função que o componente chama para decidir o que renderizar:
+
+```jsx
+// legado/src/components/WindowWidth.js
+class WindowWidth extends React.Component {
+  state = { width: window.innerWidth };
+  componentDidMount() { window.addEventListener("resize", this.onResize); }
+  componentWillUnmount() { window.removeEventListener("resize", this.onResize); }
+  onResize = () => this.setState({ width: window.innerWidth });
+  render() { return this.props.children(this.state.width); }
+}
+
+// uso
+<WindowWidth>{(width) => (width < 640 ? <MenuCompacto /> : <MenuCompleto />)}</WindowWidth>
+```
+
+Os dois funcionam, mas têm custos: a árvore no React DevTools vira um "wrapper hell" de componentes aninhados, props de HOCs diferentes podem colidir com o mesmo nome sem aviso, e fica difícil saber de onde veio a prop `user`. Hooks próprios resolvem o mesmo problema sem aninhamento:
+
+```jsx
+// src/estado/useLarguraDaJanela.js
+import { useEffect, useState } from "react";
+
+export function useLarguraDaJanela() {
+  const [largura, setLargura] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const aoRedimensionar = () => setLargura(window.innerWidth);
+    window.addEventListener("resize", aoRedimensionar);
+    return () => window.removeEventListener("resize", aoRedimensionar);
+  }, []);
+  return largura;
+}
+```
+
+| Padrão legado | Substituto moderno |
+|---|---|
+| `withRouter(Componente)` | `useNavigate`, `useParams`, `useLocation` (o `withRouter` foi removido no React Router 6) |
+| `connect(mapState, mapDispatch)` | `useSelector` e `useDispatch` |
+| HOC de permissão | Loader com `redirect` na rota ou hook `useUsuario` |
+| Render prop de dados | Hook próprio ou `useQuery` |
+| `Context.Consumer` com função | `use(Contexto)` ou `useContext` |
+
+HOCs e render props não estão proibidos: render props ainda aparecem em bibliotecas (o `Controller` do React Hook Form usa `render`) e HOCs ainda servem para envolver componentes de terceiros. O ponto é reconhecê-los e não criar novos onde um hook resolve.
+
+## PropTypes
+
+`PropTypes` era a verificação de tipos das props em tempo de execução, com avisos no console em desenvolvimento:
+
+```jsx
+OrdersPanel.propTypes = {
+  status: PropTypes.oneOf(["recebido", "separando"]),
+  onSelect: PropTypes.func.isRequired,
+  filtros: PropTypes.shape({ bairro: PropTypes.string, desde: PropTypes.instanceOf(Date) }),
+};
+```
+
+Leia-os como documentação das props: são o contrato do componente. Mas saiba que o **React 19 deixou de verificar `propTypes`**: a declaração é ignorada silenciosamente, e os avisos que o time talvez espere não aparecem mais. O React 19 também removeu `defaultProps` de componentes de função (classes ainda aceitam); o substituto são valores padrão na desestruturação, como `function OrdersPanel({ status = "recebido" })`. Na migração, os `PropTypes` viram tipos TypeScript, assunto do primeiro capítulo do Nível 2, e são um ótimo ponto de partida para escrevê-los.
+
+## create-react-app
+
+O `create-react-app` (CRA) foi por anos a forma oficial de começar um projeto React. Ele foi oficialmente descontinuado em 2025, e a documentação do React passou a recomendar frameworks ou ferramentas como o Vite. Sinais de um projeto CRA: `react-scripts` no `package.json`, scripts `react-scripts start` e `react-scripts build`, variáveis com prefixo `REACT_APP_`, `index.html` dentro de `public/` com `%PUBLIC_URL%` e, às vezes, uma pasta `config/` gerada por `eject`.
+
+Migrar para o Vite costuma ser um trabalho de horas, não de semanas:
+
+1. Instale `vite` e `@vitejs/plugin-react`, crie o `vite.config.js` e remova `react-scripts`.
+2. Mova o `index.html` de `public/` para a raiz, remova `%PUBLIC_URL%` e acrescente `<script type="module" src="/src/index.jsx">`.
+3. Renomeie arquivos com JSX de `.js` para `.jsx`; o Vite não processa JSX em `.js` por padrão.
+4. Troque `process.env.REACT_APP_API_URL` por `import.meta.env.VITE_API_URL` e renomeie as variáveis nos arquivos `.env`.
+5. Ajuste os scripts (`dev`, `build`, `preview`) e os testes: o CRA trazia Jest configurado; mantenha-o com a configuração do capítulo anterior ou migre para o Vitest.
+
+## Redux antigo
+
+```js
+// legado/src/store/orders.js
+export const FETCH_ORDERS_REQUEST = "FETCH_ORDERS_REQUEST";
+export const FETCH_ORDERS_SUCCESS = "FETCH_ORDERS_SUCCESS";
+export const FETCH_ORDERS_FAILURE = "FETCH_ORDERS_FAILURE";
+
+const initialState = { items: [], loading: false, error: null };
+
+export default function ordersReducer(state = initialState, action) {
+  switch (action.type) {
+    case FETCH_ORDERS_REQUEST:
+      return { ...state, loading: true };
+    case FETCH_ORDERS_SUCCESS:
+      return { ...state, loading: false, items: action.payload };
+    case FETCH_ORDERS_FAILURE:
+      return { ...state, loading: false, error: action.error };
+    default:
+      return state;
+  }
+}
+
+export const fetchOrders = (status) => async (dispatch) => {
+  dispatch({ type: FETCH_ORDERS_REQUEST });
+  try {
+    const res = await fetch(`/api/orders?status=${status}`);
+    dispatch({ type: FETCH_ORDERS_SUCCESS, payload: await res.json() });
+  } catch (error) {
+    dispatch({ type: FETCH_ORDERS_FAILURE, error });
+  }
+};
+```
+
+```js
+// legado/src/store/index.js
+import { createStore, applyMiddleware, combineReducers, compose } from "redux";
+import thunk from "redux-thunk";
+import orders from "./orders";
+
+const composeEnhancers = window.__REDUX_DEVTOOLS_EXTENSION_COMPOSE__ || compose;
+export default createStore(combineReducers({ orders }), composeEnhancers(applyMiddleware(thunk)));
+```
+
+```jsx
+// legado/src/pages/OrdersPage.js (trecho)
+const mapStateToProps = (state) => ({ orders: state.orders.items, loading: state.orders.loading });
+const mapDispatchToProps = { fetchOrders };
+export default connect(mapStateToProps, mapDispatchToProps)(OrdersPage);
+```
+
+Lendo com os olhos do capítulo de Redux Toolkit: as constantes e o `switch` são o que `createSlice` gera; o spread em cada `case` é o que o Immer faz por você; o thunk com três ações (`REQUEST`, `SUCCESS`, `FAILURE`) é o que `createAsyncThunk` gera; o `createStore` com middleware e DevTools é o que `configureStore` faz numa linha; e `connect` com `mapStateToProps` é o `useSelector`. Note também o que esse reducer está guardando: pedidos vindos da API, com `loading` e `error`. É estado de servidor, e no código moderno ele iria para o TanStack Query ou o RTK Query, e não para um slice.
+
+O `createStore` continua funcionando, mas está marcado como obsoleto no pacote `redux` para incentivar o Redux Toolkit. Uma vantagem do Redux: `configureStore` aceita os reducers antigos sem mudança, então dá para trocar a store primeiro e converter os reducers um por um.
+
+## Como migrar sem parar a operação
+
+### 1. Leia antes de mudar
+
+Abra o React DevTools no painel herdado e navegue pela árvore de componentes. Identifique as fontes de estado (store, estado local, contexto legado), os pontos de chamada à API e os HOCs empilhados. Anote no README o mapa do que encontrou: ele vale ouro para o próximo dev.
+
+### 2. Congele o comportamento com testes de caracterização
+
+Testes de caracterização descrevem o que o código **faz hoje**, certo ou errado, para que qualquer mudança de comportamento seja percebida. Com a Testing Library, o teste não sabe se o componente é classe ou função, e sobrevive à migração intacto:
+
+```jsx
+// legado/src/components/OrdersPanel.test.js
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import OrdersPanel from "./OrdersPanel";
+import { fetchOrders } from "../api";
+
+jest.mock("../api", () => ({ fetchOrders: jest.fn() }));
+
+test("lista os pedidos do status e informa o selecionado", async () => {
+  fetchOrders.mockResolvedValue([{ id: 71, customer: "Ana" }]);
+  const onSelect = jest.fn();
+  const user = userEvent.setup();
+
+  render(<OrdersPanel status="separando" onSelect={onSelect} />);
+
+  await user.click(await screen.findByText("#71 - Ana"));
+  expect(fetchOrders).toHaveBeenCalledWith("separando");
+  expect(onSelect).toHaveBeenCalledWith(71);
+});
+```
+
+### 3. Migre de fora para dentro, em passos pequenos
+
+A estratégia segura é a do estrangulador (strangler fig): o código novo cresce em volta do antigo e o substitui por partes, sempre com o sistema funcionando.
+
+1. **Infraestrutura primeiro**: CRA para Vite, `ReactDOM.render` para `createRoot`, `createStore` para `configureStore`. Mudanças mecânicas, com a suíte de testes como rede de proteção. O React publica codemods para a atualização (`npx codemod@latest react/19/migration-recipe`), que automatizam boa parte das trocas de API.
+2. **Folhas antes de raízes**: converta primeiro componentes pequenos, sem filhos com estado, para função e hooks.
+3. **Um padrão por vez**: num PR, troque `connect` por `useSelector`; em outro, `withRouter` pelos hooks do roteador; em outro, o thunk de pedidos por `useQuery`.
+4. **Código novo já nasce moderno**: nenhuma classe nova, nenhum HOC novo. Classes e hooks convivem no mesmo projeto sem problema, porque o React suporta os dois.
+5. **Não migre o que não muda**: um componente de classe estável, testado e que ninguém toca há anos pode ficar como está. Migre quando for preciso mexer nele.
+
+O `OrdersPanel` migrado, com o mesmo teste passando:
+
+```jsx
+// src/componentes/painel/PainelDePedidos.jsx
+import { useQuery } from "@tanstack/react-query";
+import { listarPedidosPorStatus } from "../../servicos/pedidos.js";
+// listarPedidosPorStatus(status, { signal }) chama requisitar(`/pedidos?status=${encodeURIComponent(status)}`, { signal })
+
+export default function PainelDePedidos({ status = "recebido", intervaloMs = 15000, onSelecionar }) {
+  const { data: pedidos, isPending, isError } = useQuery({
+    queryKey: ["pedidos", { status }],
+    queryFn: ({ signal }) => listarPedidosPorStatus(status, { signal }),
+    refetchInterval: intervaloMs,
+  });
+
+  if (isPending) return <p>Carregando...</p>;
+  if (isError) return <p role="alert">Erro ao carregar pedidos.</p>;
+  return (
+    <ul>
+      {pedidos.map((p) => (
+        <li key={p.id}>
+          <button type="button" onClick={() => onSelecionar(p.id)}>#{p.id} - {p.cliente.nome}</button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+O timer, o recarregamento ao trocar o status, a limpeza na desmontagem e o bug do `refreshMs` desapareceram: o `refetchInterval` e a `queryKey` cuidam disso. A troca de `li` com `onClick` por um `button` corrige ainda um problema de acessibilidade do original, que não funcionava com teclado. Mudanças de nome de props e de campos (`onSelect` para `onSelecionar`, `customer` para `cliente.nome`) pedem ajuste do teste de caracterização num passo separado, depois que a versão migrada já se provou equivalente.
+
+<Callout type="tip" title="Migração é trabalho de produto, não só técnico">
+Proponha a migração atrelada a valor: "ao migrar o painel para o TanStack Query, o lojista passa a ver pedidos novos sem recarregar e o bug do intervalo some". Migrações vendidas como "modernizar o código" perdem prioridade na primeira semana de aperto. O capítulo de débitos técnicos do Nível 3 aprofunda como negociar esse trabalho.
+</Callout>
+
+## Na entrevista
+
+**Como você traduz componentDidMount, componentDidUpdate e componentWillUnmount para hooks?** Com `useEffect`: o corpo do efeito cobre montagem e atualizações conforme as dependências, e a função de limpeza cobre a desmontagem e a troca de dependências. A diferença é que hooks agrupam o código por assunto, e não por momento do ciclo de vida.
+
+**Qual a diferença entre this.setState e o setter do useState?** `this.setState` faz merge raso do objeto parcial com o estado atual; o setter do `useState` substitui o valor inteiro. Os dois agendam a atualização em vez de aplicá-la na hora e aceitam uma função que recebe o estado anterior.
+
+**O que é um HOC e por que hooks o substituíram?** Uma função que recebe um componente e devolve outro com comportamento ou props extras. Hooks reaproveitam a mesma lógica sem aninhar componentes, sem colisão de nomes de props e deixando explícito de onde cada valor vem.
+
+**Ainda existe algum caso que exige componente de classe?** Sim, error boundaries: não há hook para `getDerivedStateFromError` e `componentDidCatch`. Na prática, usa-se uma classe pequena ou a biblioteca `react-error-boundary`.
+
+**Como você migraria um projeto legado grande para hooks?** Primeiro testes de caracterização com Testing Library, que não dependem de ser classe ou função. Depois atualizo a infraestrutura, migro componentes das folhas para a raiz, um padrão por PR, faço todo código novo já moderno e deixo como estão componentes estáveis que ninguém precisa alterar.
+
+## Pratique
+
+1. Leia o `OrdersPanel` e encontre o bug do `refreshMs`. Escreva um teste com `jest.useFakeTimers()` que o demonstre.
+2. Escreva testes de caracterização para `OrdersPanel` cobrindo carregamento, erro, lista e seleção, e confirme que passam com o componente de classe.
+3. Converta `OrdersPanel` para um componente de função com `useState` e `useEffect`, sem TanStack Query, mantendo os testes passando sem alterações.
+4. Substitua `withRouter(withPermissao("lojista")(connect(mapState)(OrdersPage)))` por hooks e um loader de rota protegida, um padrão por commit.
+5. Migre o projeto legado de `create-react-app` para Vite seguindo os cinco passos deste capítulo e liste o que precisou de ajuste manual.
+6. Troque a store legada por `configureStore` mantendo os reducers antigos e, em seguida, converta o `ordersReducer` para `useQuery`, explicando no PR por que ele não virou um slice.
+
+<Quiz question="Em um componente de classe, o estado é { orders: [], loading: true }. O que this.setState com loading igual a false faz?" options={["Substitui o estado inteiro, apagando orders","Faz merge raso: altera loading e mantém orders","Lança erro porque falta a chave orders","Altera o estado imediatamente, antes da próxima linha"]} answer={1} explanation="setState em classes faz merge raso do objeto parcial com o estado atual. O setter do useState, ao contrário, substitui o valor." />
+
+<Quiz question="Qual padrão legado ainda não tem substituto em hooks no React 19?" options={["componentDidMount","Render props para compartilhar lógica","connect do React-Redux","Error boundary com getDerivedStateFromError e componentDidCatch"]} answer={3} explanation="Não existe hook para capturar erros de renderização de descendentes. Error boundaries continuam sendo classes ou vêm de bibliotecas como react-error-boundary." />
+
+<Quiz question="Antes de migrar um componente de classe para hooks, qual o passo mais importante?" options={["Escrever testes de caracterização com Testing Library que descrevem o comportamento atual","Reescrever o componente inteiro do zero num branch longo","Converter primeiro os PropTypes em comentários","Remover o StrictMode para evitar avisos"]} answer={0} explanation="Testes que exercitam o componente pela tela não dependem de ele ser classe ou função e mostram imediatamente se a migração mudou o comportamento." />
+
+## Base no CodeForge
+
+- [React: utilizando hooks para gerenciar estados](/learn/carreira-react/react-hooks-gerenciar-estados): os hooks que substituem o ciclo de vida.
+- [React: escrevendo seus primeiros testes com Jest e Testing Library](/learn/carreira-react/react-primeiros-testes-jest-testing-library): a base dos testes de caracterização.
+- [Strangler fig](/learn/system-design/strangler-fig): a estratégia de migração incremental em escala de sistema.
+- [Decorator](/learn/lld/decorator): o padrão de projeto por trás dos HOCs.
+- [React: gerenciamento de débitos técnicos e refatoração sustentável](/learn/carreira-react/react-debitos-tecnicos-refatoracao-sustentavel): como priorizar e negociar migrações.
+
+## Referências
+
+- [React: Component (classes)](https://react.dev/reference/react/Component)
+- [React 19 Upgrade Guide](https://react.dev/blog/2024/04/25/react-19-upgrade-guide)
+- [React: Sunsetting Create React App](https://react.dev/blog/2025/02/14/sunsetting-create-react-app)
+- [Redux: Migrating to Modern Redux](https://redux.js.org/usage/migrating-to-modern-redux)
+- [React: Reusing Logic with Custom Hooks](https://react.dev/learn/reusing-logic-with-custom-hooks)
