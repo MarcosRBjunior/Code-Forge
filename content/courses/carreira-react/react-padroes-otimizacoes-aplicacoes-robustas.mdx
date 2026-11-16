@@ -1,0 +1,382 @@
+---
+title: "React: lidando com padrões e otimizações para aplicações web robustas"
+kind: lesson
+---
+
+Num sábado de manhã, pico de pedidos da Quitanda, a API de frete ficou instável por dez minutos. O resultado: a página de checkout ficou em branco para quem estava finalizando a compra (um `undefined.map` derrubou a árvore inteira), o botão "Adicionar" não dava retorno nenhum quando a rede falhava, e o carrinho mostrava "0 itens" durante o carregamento, o que fez clientes acharem que tinham perdido as compras. Nada disso é um bug de lógica; é falta de tratamento para o caminho que não é o feliz.
+
+Uma aplicação robusta é a que se comporta bem quando algo dá errado: a rede cai, a API demora, um componente lança uma exceção, o usuário navega com teclado ou leitor de tela, o celular é lento. Este capítulo reúne os padrões que fazem a Quitanda aguentar esses cenários e as métricas que mostram se ela aguenta de verdade.
+
+**Você vai aprender:**
+
+- Isolar falhas com error boundaries, inclusive por rota no React Router
+- Desenhar os estados de carregamento, vazio, erro e sucesso de forma explícita
+- Configurar retries com backoff e tratar erros de rede com TanStack Query e `fetch`
+- Aplicar optimistic UI com `useOptimistic` e com mutações do TanStack Query
+- Garantir acessibilidade em feedback dinâmico, foco e formulários
+- Medir LCP, INP e CLS com a biblioteca `web-vitals`
+
+## Error boundaries
+
+Se um componente lança um erro durante a renderização e ninguém o captura, o React desmonta a árvore inteira. Um error boundary é um componente que captura erros de renderização dos descendentes e mostra uma interface alternativa no lugar só daquela parte.
+
+Ainda não existe hook para isso: error boundaries são componentes de classe com `static getDerivedStateFromError` e `componentDidCatch`. Na prática, use a biblioteca `react-error-boundary`, que embrulha a classe numa API declarativa:
+
+```tsx
+// src/componentes/FalhaDeSecao.tsx
+import type { FallbackProps } from "react-error-boundary";
+
+export function FalhaDeSecao({ error, resetErrorBoundary }: FallbackProps) {
+  return (
+    <div role="alert" className="rounded border border-red-300 bg-red-50 p-4">
+      <p>Não conseguimos carregar esta parte da página.</p>
+      {import.meta.env.DEV && <pre>{error instanceof Error ? error.message : String(error)}</pre>}
+      <button onClick={resetErrorBoundary}>Tentar de novo</button>
+    </div>
+  );
+}
+```
+
+```tsx
+// src/paginas/Checkout.tsx (trecho)
+import { ErrorBoundary } from "react-error-boundary";
+
+<ErrorBoundary FallbackComponent={FalhaDeSecao} onError={registrarErro} resetKeys={[cep]}>
+  <OpcoesDeFrete cep={cep} />
+</ErrorBoundary>
+<ResumoDoPedido />   {/* continua funcionando se o frete quebrar */}
+```
+
+`resetKeys` reinicia o boundary quando o valor muda: o cliente corrige o CEP e o componente tenta de novo. `onError` é onde o erro vai para o monitoramento (no Nível 3, New Relic).
+
+### Onde colocar boundaries
+
+Pense em granularidade. Um boundary na raiz evita a tela branca, mas troca a página inteira por uma mensagem. Boundaries por região (frete, recomendações, gráfico de métricas) mantêm o resto utilizável. Uma regra prática: um na raiz, um por rota e um em cada widget que depende de serviço externo.
+
+### O que error boundaries não capturam
+
+- Erros em **handlers de evento** (um `onClick` que lança): use `try/catch` e estado de erro.
+- Erros em **código assíncrono** fora da renderização (`setTimeout`, promessas não aguardadas).
+- Erros no **próprio** boundary e erros durante renderização no servidor.
+
+Para levar um erro assíncrono até o boundary, `react-error-boundary` oferece o hook `useErrorBoundary`, cujo `showBoundary(erro)` dispara o fallback mais próximo.
+
+No React 19, `createRoot` aceita `onCaughtError`, `onUncaughtError` e `onRecoverableError`, pontos centrais para enviar ao monitoramento todos os erros capturados ou não por boundaries.
+
+### Error boundaries por rota
+
+O React Router tem o mesmo conceito integrado às rotas: um `ErrorBoundary` (ou `errorElement`) por rota captura erros de renderização, de loaders e de actions daquela rota.
+
+```tsx
+// src/paginas/ErroDeRota.tsx
+import { isRouteErrorResponse, useRouteError, Link } from "react-router";
+
+export function ErroDeRota() {
+  const erro = useRouteError();
+  if (isRouteErrorResponse(erro) && erro.status === 404) {
+    return <p>Produto não encontrado. <Link to="/">Voltar ao catálogo</Link></p>;
+  }
+  return <p role="alert">Algo deu errado ao abrir esta página.</p>;
+}
+```
+
+```tsx
+// src/rotas.tsx (trecho)
+{ path: "produtos/:id", Component: Produto, ErrorBoundary: ErroDeRota }
+```
+
+O layout da loja (cabeçalho, carrinho) continua na tela; só o miolo da rota troca.
+
+## Os quatro estados de toda tela com dados
+
+Cada componente que busca dados tem pelo menos quatro estados: carregando, erro, vazio e com dados. O bug do "0 itens" vem de tratar carregando como vazio.
+
+```tsx
+// src/paginas/Pedidos.tsx
+export function Pedidos() {
+  const { data: pedidos, isPending, isError, error, refetch, isFetching } = useQuery({
+    queryKey: ["pedidos"],
+    queryFn: api.listarPedidos,
+  });
+
+  if (isPending) return <EsqueletoDeLista linhas={4} />;
+  if (isError) return <MensagemDeErro erro={error} onTentarDeNovo={() => refetch()} />;
+  if (pedidos.length === 0) {
+    return (
+      <EstadoVazio
+        titulo="Você ainda não fez pedidos"
+        acao={<Link to="/">Ver o catálogo</Link>}
+      />
+    );
+  }
+
+  return (
+    <section aria-busy={isFetching}>
+      {isFetching && <span className="sr-only">Atualizando pedidos</span>}
+      <Lista itens={pedidos} obterChave={(p) => p.id} renderizarItem={(p) => <LinhaDePedido pedido={p} />} />
+    </section>
+  );
+}
+```
+
+| Estado | Erro comum | Padrão |
+|---|---|---|
+| Carregando (primeira vez) | Tela em branco ou "0 itens" | Skeleton com o formato do conteúdo; evita salto de layout |
+| Atualizando em segundo plano | Trocar a lista por um spinner | Manter os dados e indicar discretamente (`isFetching`) |
+| Erro | Mensagem técnica ou nada | Texto humano, ação de tentar de novo, dados antigos se houver |
+| Vazio | Igual ao carregando | Explicação e próximo passo (link, botão) |
+
+No TanStack Query 5, `isPending` significa "ainda não há dados"; `isFetching` significa "há uma requisição em andamento", inclusive refetch. Com `useSuspenseQuery`, o carregamento sobe para o `Suspense` e o erro para o error boundary, e o componente só lida com o caso com dados.
+
+<Callout type="tip" title="Evite spinners que piscam">
+Uma resposta que chega em 80ms com um spinner no meio parece mais lenta que uma que chega em 120ms sem spinner. Skeletons com o tamanho final do conteúdo, `placeholderData: keepPreviousData` na paginação e transições que mantêm a tela anterior até a nova estar pronta reduzem a sensação de espera e evitam deslocamento de layout.
+</Callout>
+
+## Erros de rede e retries
+
+### fetch não falha em 404 nem em 500
+
+`fetch` só rejeita a promessa em falha de rede (DNS, conexão recusada, CORS, abortado). Uma resposta 500 resolve normalmente com `ok: false`. Por isso a camada de API do capítulo de TypeScript verifica `resposta.ok` e lança `ErroDeApi` com o status. Acrescente um timeout, que o `fetch` não tem por padrão:
+
+```ts
+// src/servicos/api.ts (trecho)
+async function buscar<S extends z.ZodType>(caminho: string, schema: S, signal?: AbortSignal) {
+  const resposta = await fetch(`${BASE}${caminho}`, {
+    signal: AbortSignal.any([AbortSignal.timeout(8000), ...(signal ? [signal] : [])]),
+  });
+  if (!resposta.ok) throw new ErroDeApi(resposta.status, `Falha em ${caminho}`);
+  return schema.parse(await resposta.json());
+}
+```
+
+O TanStack Query passa um `signal` para o `queryFn`, que cancela a requisição quando o componente desmonta ou a chave muda. Repasse-o: `queryFn: ({ signal }) => api.listarPedidos(signal)`.
+
+### Retry com backoff, mas só quando faz sentido
+
+O TanStack Query tenta de novo 3 vezes por padrão no navegador, com espera exponencial (1s, 2s, 4s, até 30s). Tentar de novo um 404 ou um erro de validação é desperdício; tentar de novo um 503 ou uma queda de rede é exatamente o certo.
+
+```ts
+// src/servicos/queryClient.ts
+import { QueryClient } from "@tanstack/react-query";
+import { ErroDeApi } from "./api";
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (falhas, erro) => {
+        if (erro instanceof ErroDeApi && erro.status >= 400 && erro.status < 500) return false;
+        return falhas < 3;
+      },
+      staleTime: 30_000,
+    },
+    mutations: { retry: 0 },
+  },
+});
+```
+
+Mutações não fazem retry por padrão, e com razão: repetir um `POST /pedidos` que chegou ao servidor mas cuja resposta se perdeu cria um pedido duplicado. Se precisar de retry em mutação, a API deve aceitar uma chave de idempotência (um id gerado no cliente e enviado no cabeçalho), e o servidor descarta repetições.
+
+### Offline
+
+O TanStack Query acompanha o estado da conexão: com o padrão `networkMode: "online"`, consultas não disparam sem rede e ficam com `fetchStatus: "paused"`, retomando quando a conexão volta. Mostre isso ao usuário:
+
+```tsx
+// src/componentes/AvisoOffline.tsx
+import { useSyncExternalStore } from "react";
+
+function assinar(cb: () => void) {
+  window.addEventListener("online", cb);
+  window.addEventListener("offline", cb);
+  return () => {
+    window.removeEventListener("online", cb);
+    window.removeEventListener("offline", cb);
+  };
+}
+
+export function AvisoOffline() {
+  const online = useSyncExternalStore(assinar, () => navigator.onLine, () => true);
+  if (online) return null;
+  return <div role="status">Você está sem conexão. O carrinho continua salvo neste aparelho.</div>;
+}
+```
+
+`navigator.onLine` igual a `true` não garante internet (pode haver Wi-Fi sem saída), mas `false` é confiável.
+
+## Optimistic UI
+
+Quando o cliente clica em "Favoritar" ou o lojista muda o status de um pedido para "separando", esperar a resposta do servidor para atualizar a tela deixa a interface lenta. A interface otimista mostra o resultado esperado na hora e reverte se a operação falhar.
+
+### Com useOptimistic
+
+O hook do React 19 mantém um estado temporário enquanto uma Action está em andamento. Quando a Action termina, o estado otimista é descartado e o valor real (vindo das props ou do estado) assume.
+
+```tsx
+// src/paginas/painel/StatusDoPedido.tsx
+import { useOptimistic, useTransition } from "react";
+import type { Pedido, StatusDoPedido } from "@/esquemas/pedido";
+
+export function SeletorDeStatus({ pedido, onAlterar }: {
+  pedido: Pedido;
+  onAlterar: (id: string, status: StatusDoPedido) => Promise<void>;
+}) {
+  const [statusOtimista, definirStatusOtimista] = useOptimistic(pedido.status);
+  const [pendente, iniciarTransicao] = useTransition();
+
+  function alterar(novo: StatusDoPedido) {
+    iniciarTransicao(async () => {
+      definirStatusOtimista(novo);
+      try {
+        await onAlterar(pedido.id, novo); // atualiza o cache, que muda pedido.status
+      } catch {
+        avisar("Não foi possível alterar o status. Tente de novo.");
+      }
+    });
+  }
+
+  return (
+    <select
+      value={statusOtimista}
+      onChange={(e) => alterar(e.target.value as StatusDoPedido)}
+      aria-busy={pendente}
+    >
+      {Object.entries(rotulosDeStatus).map(([valor, rotulo]) => (
+        <option key={valor} value={valor}>{rotulo}</option>
+      ))}
+    </select>
+  );
+}
+```
+
+A função de atualização otimista precisa ser chamada dentro de uma transição ou de uma Action (como a `action` de um `form`). Se `onAlterar` falhar, a transição termina, o otimista é descartado e o `select` volta a mostrar `pedido.status`, o valor real. A reversão é automática.
+
+### Com mutações do TanStack Query
+
+Quando o dado vive no cache do TanStack Query, a forma mais simples é renderizar `variables` da mutação enquanto ela está pendente. Para atualizar o cache inteiro (o carrinho no servidor, por exemplo):
+
+```ts
+// src/hooks/useAdicionarAoCarrinho.ts
+export function useAdicionarAoCarrinho() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.adicionarItem,
+    onMutate: async (novo) => {
+      await queryClient.cancelQueries({ queryKey: ["carrinho"] });
+      const anterior = queryClient.getQueryData<ItemDoCarrinho[]>(["carrinho"]);
+      queryClient.setQueryData<ItemDoCarrinho[]>(["carrinho"], (itens = []) => [...itens, novo]);
+      return { anterior };
+    },
+    onError: (_erro, _novo, contexto) => {
+      queryClient.setQueryData(["carrinho"], contexto?.anterior);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["carrinho"] }),
+  });
+}
+```
+
+`cancelQueries` evita que um refetch em andamento sobrescreva o otimista; `onError` restaura o snapshot; `onSettled` sincroniza com o servidor no fim, com sucesso ou erro.
+
+<Callout type="warning" title="Nem tudo pode ser otimista">
+Use em operações que quase sempre dão certo e são fáceis de desfazer: favoritar, mudar quantidade, alterar status. Não use no pagamento nem na confirmação do pedido: mostrar "Pedido confirmado" e depois revogar é pior que esperar dois segundos com um indicador claro.
+</Callout>
+
+## Acessibilidade em interfaces dinâmicas
+
+SPAs quebram expectativas que o HTML estático cumpria sozinho. Os pontos que mais falham na Quitanda:
+
+- **Feedback dinâmico.** "Banana adicionada ao carrinho" precisa ser anunciado. Uma região `aria-live="polite"` (ou `role="status"`) que já existe no DOM e tem o texto trocado é lida pelo leitor de tela. Para erros urgentes, `role="alert"`.
+- **Foco após navegação.** Ao trocar de rota, mova o foco para o `h1` da nova página (com `tabIndex={-1}`) ou para o conteúdo principal. Ao abrir um modal, o foco vai para dentro dele e volta ao botão de origem ao fechar; o elemento nativo `dialog` com `showModal()` faz boa parte disso.
+- **Elementos certos.** Ação é `button`, navegação é `a`/`Link`. Um `div` com `onClick` não recebe foco nem responde a Enter.
+- **Formulários.** Todo campo com `label`; erros ligados ao campo por `aria-describedby` e marcados com `aria-invalid`; após um envio inválido, foco no primeiro campo com erro (o React Hook Form faz isso com `shouldFocusError`, ligado por padrão).
+- **Estados de carregamento.** `aria-busy` na região que atualiza e texto alternativo para skeletons.
+
+Automatize o básico: `eslint-plugin-jsx-a11y` no lint e `jest-axe` nos testes de componente. Ferramentas pegam talvez um terço dos problemas; o resto exige navegar só com teclado e com um leitor de tela (NVDA, VoiceOver).
+
+```tsx
+// src/componentes/Carrinho.test.tsx
+import { render } from "@testing-library/react";
+import { axe } from "jest-axe";
+
+test("carrinho não tem violações de acessibilidade detectáveis", async () => {
+  const { container } = render(<Carrinho />, { wrapper: Provedores });
+  expect(await axe(container)).toHaveNoViolations();
+});
+```
+
+(Registre o matcher com `expect.extend(toHaveNoViolations)` no arquivo de setup do Jest.)
+
+## Web Vitals: medindo a experiência real
+
+Core Web Vitals são as métricas do Google para experiência do usuário, medidas em usuários reais (o Chrome as reporta e elas influenciam a busca):
+
+| Métrica | Mede | Bom | O que piora na Quitanda |
+|---|---|---|---|
+| LCP (Largest Contentful Paint) | Quando o maior elemento visível aparece | até 2,5s | Foto de destaque grande, bundle pesado antes de renderizar |
+| INP (Interaction to Next Paint) | Latência das interações ao longo da visita | até 200ms | Renderizações caras ao digitar ou clicar |
+| CLS (Cumulative Layout Shift) | Quanto o layout pula | até 0,1 | Imagens sem dimensões, banners que entram depois |
+
+O INP substituiu o FID em 2024. Os limites valem para o percentil 75 das visitas. Colete-os com a biblioteca `web-vitals`:
+
+```ts
+// src/monitoramento/webVitals.ts
+import { onCLS, onINP, onLCP, type Metric } from "web-vitals";
+
+function enviar(metrica: Metric) {
+  const corpo = JSON.stringify({
+    nome: metrica.name,
+    valor: metrica.value,
+    classificacao: metrica.rating, // "good" | "needs-improvement" | "poor"
+    id: metrica.id,
+    pagina: location.pathname,
+  });
+  navigator.sendBeacon("/api/metricas", corpo);
+}
+
+onCLS(enviar);
+onINP(enviar);
+onLCP(enviar);
+```
+
+`sendBeacon` entrega o dado mesmo quando a página está sendo fechada, momento em que CLS e INP costumam ser finalizados. Lighthouse e a aba Performance medem em laboratório; os dados de campo é que contam. A tabela de diagnóstico do capítulo de desempenho mostra como agir em cada métrica.
+
+## Na entrevista
+
+**O que um error boundary captura e o que ele não captura?** Captura erros lançados durante a renderização, em métodos de ciclo de vida e em construtores dos descendentes. Não captura erros em handlers de evento, em código assíncrono fora da renderização, no servidor nem no próprio boundary. Para esses, uso `try/catch` ou `showBoundary` do `react-error-boundary`.
+
+**Por que mutações não deveriam ter retry automático?** Porque não são idempotentes em geral: se a requisição chegou ao servidor e só a resposta se perdeu, repetir duplica o efeito, como um pedido em dobro. Retry em mutação exige chave de idempotência no servidor.
+
+**Como funciona o `useOptimistic`?** Ele devolve um estado que reflete uma atualização otimista enquanto uma Action ou transição está em andamento. Quando ela termina, o estado volta a ser o valor real passado ao hook. Se a operação falhar e o valor real não mudar, a interface volta sozinha ao estado anterior.
+
+**Qual a diferença entre `isPending` e `isFetching` no TanStack Query?** `isPending` indica que ainda não há dados no cache para aquela chave. `isFetching` indica uma requisição em andamento, inclusive refetch em segundo plano com dados já exibidos. Uso o primeiro para skeleton e o segundo para um indicador discreto.
+
+**Quais são os Core Web Vitals hoje?** LCP para carregamento, INP para responsividade e CLS para estabilidade visual, avaliados no percentil 75 de usuários reais. O INP substituiu o FID em 2024.
+
+## Pratique
+
+1. Coloque um `ErrorBoundary` em volta do cálculo de frete do checkout, force um erro e confira que o resumo do pedido continua visível e que "Tentar de novo" funciona.
+2. Adicione `ErrorBoundary` por rota no React Router e uma página 404 específica para produto inexistente.
+3. Revise as telas de catálogo, carrinho e pedidos e garanta os quatro estados (carregando, erro, vazio, dados), com skeletons do tamanho final.
+4. Configure o `retry` do `QueryClient` para não repetir erros 4xx e teste com MSW devolvendo 503 duas vezes antes de responder 200.
+5. Implemente a troca de status do pedido no painel com `useOptimistic` e simule falha com MSW para ver a reversão.
+6. Integre `web-vitals` enviando para um endpoint do `json-server` e compare o LCP do catálogo antes e depois de definir `width` e `height` nas fotos.
+
+<Quiz question="Um onClick no botão Adicionar lança uma exceção. O error boundary em volta do catálogo mostra o fallback?" options={["Sim, error boundaries capturam qualquer erro dos descendentes","Sim, mas só em produção","Não, mas o React Router captura automaticamente","Não, erros em handlers de evento não são capturados por error boundaries"]} answer={3} explanation="Error boundaries capturam erros de renderização. Em handlers, use try/catch com estado de erro ou showBoundary do react-error-boundary." />
+
+<Quiz question="Por que a camada de API precisa verificar resposta.ok depois do fetch?" options={["Porque fetch só rejeita em falhas de rede; respostas 4xx e 5xx resolvem normalmente","Porque fetch lança exceção em qualquer status diferente de 200","Porque o TanStack Query exige essa propriedade","Para habilitar o cache HTTP"]} answer={0} explanation="Uma resposta 500 é uma resposta HTTP válida para o fetch. Sem a verificação, o código tenta ler o corpo de erro como se fosse o dado esperado." />
+
+<Quiz question="Qual métrica captura a demora para a tela responder a um clique no botão Adicionar?" options={["LCP","CLS","INP","TTFB"]} answer={2} explanation="O INP mede a latência entre a interação e a próxima pintura, considerando as interações ao longo da visita." />
+
+## Base no CodeForge
+
+- [React: técnicas avançadas de otimização e desempenho](/learn/carreira-react/react-tecnicas-avancadas-otimizacao-desempenho): as técnicas que melhoram INP e LCP.
+- [React: consumindo APIs HTTP no seu projeto](/learn/carreira-react/react-consumindo-apis-http): o TanStack Query que este capítulo tornou resiliente.
+- [Idempotência](/learn/system-design/idempotencia): por que retry de mutação exige cuidado.
+- [Circuit breaker](/learn/system-design/circuit-breaker): o padrão para parar de insistir num serviço que está caído.
+- [HTML e CSS: formulários, SEO e acessibilidade](/learn/carreira-react/html-css-formularios-seo-acessibilidade): a base de acessibilidade que as SPAs precisam preservar.
+
+## Referências
+
+- [React: Catching rendering errors with an error boundary](https://react.dev/reference/react/Component#catching-rendering-errors-with-an-error-boundary)
+- [React: useOptimistic](https://react.dev/reference/react/useOptimistic)
+- [TanStack Query: Optimistic Updates](https://tanstack.com/query/latest/docs/framework/react/guides/optimistic-updates)
+- [web.dev: Web Vitals](https://web.dev/articles/vitals)
+- [MDN: ARIA live regions](https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Guides/Live_regions)

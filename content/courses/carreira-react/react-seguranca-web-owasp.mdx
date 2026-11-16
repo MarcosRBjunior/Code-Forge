@@ -1,0 +1,310 @@
+---
+title: "React: implementando segurança web com padrões OWASP"
+kind: lesson
+---
+
+A Quitanda guarda endereços, histórico de pedidos e sessões de login, e o painel do lojista permite cadastrar descrições de produto com formatação. Um dia chega um e-mail de um pesquisador: a descrição do "Tomate italiano orgânico" executa JavaScript na página de quem a abre. Alguém com conta de lojista colou um `img` com `onerror` no campo de descrição, e a loja renderiza esse HTML para todos os clientes. A frase "React já protege contra XSS" é verdadeira até a primeira vez que alguém escreve `dangerouslySetInnerHTML`.
+
+Segurança no front-end não substitui segurança no servidor, mas o front é onde muitos ataques se materializam: é ali que o script injetado roda, que o segredo vaza no bundle, que a página é emoldurada num iframe malicioso. Este capítulo percorre o OWASP Top 10 pelo ponto de vista de quem escreve React e Next.js e aplica as defesas na Quitanda.
+
+**Você vai aprender:**
+
+- Relacionar as categorias do OWASP Top 10 com responsabilidades concretas do front-end
+- Reconhecer e fechar vetores de XSS em React: HTML bruto, URLs, refs e dados serializados
+- Configurar Content Security Policy com nonce no Next.js e defender contra clickjacking
+- Entender CSRF com cookies de sessão, Server Actions e o BFF
+- Evitar segredos e dados sensíveis no bundle e validar tudo no servidor
+- Configurar os cabeçalhos de segurança da aplicação
+
+## O OWASP Top 10 visto do front
+
+O OWASP Top 10 é a lista das categorias de risco mais relevantes em aplicações web, revisada a cada poucos anos com dados de vulnerabilidades reais. A edição de 2025 manteve controle de acesso no topo e trouxe falhas da cadeia de suprimentos de software como categoria própria. A tabela mostra onde cada categoria encosta no front-end da Quitanda.
+
+| Categoria (OWASP Top 10 2025) | Onde aparece no front e no BFF |
+|---|---|
+| A01 Quebra de controle de acesso | Server Action que retorna o pedido de outro cliente; rota do painel acessível a quem não é lojista |
+| A02 Configuração de segurança incorreta | Falta de CSP e cabeçalhos; source maps públicos; CORS liberado para qualquer origem |
+| A03 Falhas na cadeia de suprimentos de software | Dependência comprometida no `node_modules`; script de terceiro carregado de CDN sem controle |
+| A04 Falhas criptográficas | Token em `localStorage`; cookie sem `Secure`; dado sensível em query string |
+| A05 Injeção | XSS via `dangerouslySetInnerHTML`, URLs `javascript:`, HTML montado com strings |
+| A06 Design inseguro | Preço do carrinho enviado pelo cliente e aceito pelo servidor |
+| A07 Falhas de autenticação | Sessão sem expiração; recuperação de senha que revela se o e-mail existe |
+| A08 Falhas de integridade de software ou dados | Script externo sem verificação; desserialização de estado sem validação |
+| A09 Falhas de registro e alerta | Ataque em andamento sem log nem alerta no New Relic |
+| A10 Tratamento incorreto de condições excepcionais | Erro que mostra stack trace ao usuário; falha que deixa o checkout num estado inconsistente |
+
+Autenticação foi tema do capítulo de técnicas seguras de autenticação, e a cadeia de suprimentos ganha um capítulo próprio sobre dependências. Aqui o foco é injeção, configuração, controle de acesso e o que vaza para o navegador.
+
+## XSS em React: onde o escape automático não alcança
+
+Quando você escreve `{produto.descricao}` no JSX, o React insere o valor como texto: `<script>` vira literalmente os caracteres na tela, sem executar. Esse escape automático elimina a forma mais comum de XSS. Os vetores que sobram são os lugares onde você sai desse caminho.
+
+### 1. HTML bruto com `dangerouslySetInnerHTML`
+
+A descrição rica do produto é HTML escrito pelo lojista. Se precisa ser HTML, precisa ser sanitizado: removidos scripts, atributos de evento (`onerror`, `onclick`), `iframe`, URLs perigosas, deixando só uma lista de tags permitidas.
+
+```tsx
+// apps/loja/src/componentes/DescricaoProduto.tsx
+import DOMPurify from "isomorphic-dompurify";
+
+const permitido = {
+  ALLOWED_TAGS: ["p", "strong", "em", "ul", "ol", "li", "br", "a"],
+  ALLOWED_ATTR: ["href"],
+};
+
+export function DescricaoProduto({ html }: { html: string }) {
+  const limpo = DOMPurify.sanitize(html, permitido);
+  return <div className="descricao" dangerouslySetInnerHTML={{ __html: limpo }} />;
+}
+```
+
+O DOMPurify é a biblioteca de referência para isso; a versão `isomorphic-dompurify` funciona também no servidor, onde este Server Component roda. Duas recomendações extras: sanitize **também ao salvar** no BFF, para que o banco não guarde a carga maliciosa esperando o próximo consumidor desatento; e, se o lojista só precisa de negrito e listas, prefira Markdown renderizado por uma biblioteca que não aceite HTML bruto. O melhor `dangerouslySetInnerHTML` é o que não existe.
+
+### 2. URLs vindas do usuário
+
+O lojista cadastra o site do produtor. O React escapa o texto do atributo, mas um `href` com `javascript:alert(document.cookie)` continua sendo uma URL válida que executa ao clicar. Versões recentes do React bloqueiam URLs `javascript:` em atributos, mas a defesa correta é validar o protocolo antes, inclusive para `data:` e outros esquemas inesperados:
+
+```ts
+// apps/loja/src/utils/urlSegura.ts
+const protocolosPermitidos = new Set(["http:", "https:", "mailto:"]);
+
+export function urlSegura(valor: string): string | undefined {
+  try {
+    const url = new URL(valor, "https://quitanda.com.br");
+    return protocolosPermitidos.has(url.protocol) ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+```
+
+Use também `rel="noopener noreferrer"` em links externos com `target="_blank"`, e valide a URL no servidor no momento do cadastro, com Zod (`z.url()` aceita qualquer protocolo; acrescente uma checagem de protocolo).
+
+### 3. Escapes do React: refs, `innerHTML` e `eval`
+
+Qualquer manipulação direta do DOM passa por fora do React. `ref.current.innerHTML = texto`, `insertAdjacentHTML`, `document.write`, `eval`, `new Function` e `setTimeout` com string executam o que receberem. Bibliotecas de terceiros (editores de texto, widgets de mapa) às vezes fazem isso por dentro; leia a seção de segurança da documentação delas.
+
+### 4. Estado serializado dentro de `script`
+
+Colocar dados no HTML para o cliente ler é comum: `<script>window.__ESTADO__ = ...</script>`. Se o JSON contém a string `</script>`, o navegador encerra o script ali, e o resto vira HTML interpretado. `JSON.stringify` não escapa isso. Ao serializar à mão, troque `<` por `<`. No App Router, prefira passar dados como props de Server para Client Components; o Next.js faz a serialização com segurança.
+
+<Callout type="warning" title="Server Components não sanitizam nada">
+Renderizar no servidor não torna HTML seguro. Um `dangerouslySetInnerHTML` com conteúdo não sanitizado num Server Component gera exatamente o mesmo XSS, só que já no HTML inicial. O escape automático e os riscos são os mesmos no servidor e no cliente.
+</Callout>
+
+## Content Security Policy: o cinto de segurança
+
+Mesmo com todo cuidado, um XSS pode escapar. A Content Security Policy (CSP) é um cabeçalho que diz ao navegador de onde scripts, estilos, imagens e conexões podem vir. Com uma CSP estrita baseada em **nonce**, um script injetado não executa, porque não tem o valor aleatório gerado para aquela resposta.
+
+No Next.js 16, o lugar para gerar o nonce por requisição é o `proxy.ts` (o antigo `middleware.ts`, renomeado nesta versão):
+
+```ts
+// apps/loja/src/proxy.ts
+import { NextResponse, type NextRequest } from "next/server";
+
+export function proxy(request: NextRequest) {
+  const nonce = Buffer.from(crypto.randomUUID()).toString("base64");
+  const csp = [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' blob: data: https://cdn.quitanda.com.br",
+    "connect-src 'self' https://api.quitanda.com.br wss://tempo-real.quitanda.com.br https://*.nr-data.net",
+    "font-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "upgrade-insecure-requests",
+  ].join("; ");
+
+  const headersDaRequisicao = new Headers(request.headers);
+  headersDaRequisicao.set("x-nonce", nonce);
+  headersDaRequisicao.set("Content-Security-Policy", csp);
+
+  const resposta = NextResponse.next({ request: { headers: headersDaRequisicao } });
+  resposta.headers.set("Content-Security-Policy", csp);
+  return resposta;
+}
+
+export const config = {
+  matcher: [{ source: "/((?!api|_next/static|_next/image|favicon.ico).*)" }],
+};
+```
+
+O Next.js lê o nonce do cabeçalho da requisição e o aplica sozinho aos próprios scripts. Scripts seus, como o script de tema do capítulo anterior ou o agente do New Relic Browser, recebem o nonce explicitamente:
+
+```tsx
+// apps/loja/src/app/layout.tsx (trecho)
+import { headers } from "next/headers";
+
+export default async function LayoutRaiz({ children }: { children: React.ReactNode }) {
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
+  return (
+    <html lang="pt-BR" suppressHydrationWarning>
+      <head>
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: scriptTema }} />
+      </head>
+      <body>{children}</body>
+    </html>
+  );
+}
+```
+
+Algumas decisões dessa política, diretiva por diretiva:
+
+- **`'strict-dynamic'`** permite que um script autorizado pelo nonce carregue outros scripts (os chunks do Next.js), sem listar domínios.
+- **`style-src 'unsafe-inline'`** é uma concessão: o styled-components injeta tags `style` em tempo de execução. Estilo injetado é bem menos perigoso que script, e endurecer essa diretiva exige passar o nonce também à biblioteca de estilos.
+- **`connect-src`** lista o BFF, o servidor Socket.io dos status de pedido e o New Relic. Uma conexão para qualquer outro destino é bloqueada, o que dificulta exfiltrar dados mesmo com um XSS.
+- **`frame-ancestors 'none'`** proíbe a página de ser carregada num iframe de outro site (veja clickjacking, abaixo).
+
+O custo do nonce é que cada resposta precisa de um valor novo: as páginas passam a ser renderizadas dinamicamente, sem HTML estático em cache. Para páginas que precisam ficar estáticas, a alternativa é uma política baseada em hashes dos scripts inline ou uma CSP menos estrita nelas.
+
+<Callout type="tip" title="Comece em modo relatório">
+Publique a política primeiro como `Content-Security-Policy-Report-Only`, com a diretiva `report-to` apontando para um endpoint de coleta. O navegador não bloqueia nada, só relata as violações. Depois de alguns dias sem violações legítimas (aquele pixel de marketing esquecido, a fonte de outro domínio), troque para o cabeçalho que bloqueia.
+</Callout>
+
+## Clickjacking e os demais cabeçalhos
+
+Clickjacking é carregar a Quitanda num iframe invisível sobre um botão chamativo de outro site: a vítima acha que clica em "ganhe um cupom" e na verdade clica em "confirmar pedido". A defesa é proibir o enquadramento, com `frame-ancestors` na CSP e `X-Frame-Options: DENY` para navegadores antigos.
+
+Os cabeçalhos que não dependem de nonce podem ir no `next.config.ts`:
+
+```ts
+// apps/loja/next.config.ts
+import type { NextConfig } from "next";
+
+const cabecalhosDeSeguranca = [
+  { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
+  { key: "X-Content-Type-Options", value: "nosniff" },
+  { key: "X-Frame-Options", value: "DENY" },
+  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(self)" },
+];
+
+const config: NextConfig = {
+  poweredByHeader: false,
+  async headers() {
+    return [{ source: "/:path*", headers: cabecalhosDeSeguranca }];
+  },
+};
+
+export default config;
+```
+
+| Cabeçalho | O que faz |
+|---|---|
+| `Strict-Transport-Security` | Obriga HTTPS neste domínio pelos próximos dois anos, mesmo se o usuário digitar `http://` |
+| `X-Content-Type-Options: nosniff` | Impede o navegador de adivinhar o tipo de um arquivo e executar como script o que veio como texto |
+| `X-Frame-Options: DENY` | Proíbe iframes, complementando `frame-ancestors` |
+| `Referrer-Policy` | Evita mandar a URL completa (com possíveis tokens ou ids) para outros sites |
+| `Permissions-Policy` | Desliga APIs que a loja não usa; a geolocalização fica só para o próprio site, para o cálculo de frete |
+
+## CSRF: a requisição que o usuário não fez
+
+A sessão da Quitanda vive num cookie `HttpOnly`. O navegador envia esse cookie em toda requisição para o domínio, inclusive quando quem dispara a requisição é um formulário escondido em outro site. Isso é Cross-Site Request Forgery: o atacante não lê nada, mas faz a vítima executar uma ação.
+
+As defesas, em camadas:
+
+1. **`SameSite` no cookie de sessão.** Com `SameSite=Lax`, o cookie não é enviado em `POST` vindo de outro site; com `Strict`, nem em navegação a partir de outro site. Configure sempre explicitamente, junto com `Secure` e `HttpOnly`.
+2. **Server Actions.** O Next.js só aceita Server Actions por `POST` e compara o cabeçalho `Origin` com o host da requisição; se não baterem, a ação é recusada. Se a loja fica atrás de um proxy que muda o host, declare as origens legítimas em `experimental.serverActions.allowedOrigins`.
+3. **Endpoints do BFF.** Rotas REST do NestJS que mudam estado e dependem do cookie precisam da mesma checagem de origem, ou de um token CSRF (por exemplo, o padrão double submit: um valor aleatório num cookie legível e repetido num cabeçalho, conferido pelo servidor).
+4. **Nunca mude estado em `GET`.** Um `GET /api/pedidos/42/cancelar` é cancelado por qualquer `img` em qualquer página.
+
+CORS não é defesa contra CSRF. CORS controla quem pode **ler** a resposta de uma requisição feita por script; o formulário malicioso nem tenta ler, e a requisição chega ao servidor de qualquer forma.
+
+## O que vaza para o navegador
+
+Tudo que vai para o bundle do cliente é público: qualquer pessoa abre o DevTools e lê.
+
+- **Variáveis `NEXT_PUBLIC_`.** São copiadas para o JavaScript no build. Chave do gateway de pagamento, token do New Relic com permissão de escrita em API, credencial do banco: nunca com esse prefixo.
+- **Módulos de servidor importados no cliente.** Marque módulos que só podem rodar no servidor com `import "server-only"`. Se alguém importar `src/servicos/pagamento.ts` num Client Component, o build falha em vez de embutir a chave.
+- **Props de Server para Client Components.** Tudo que um Server Component passa a um Client Component é serializado no HTML. Passar o objeto `usuario` inteiro do banco envia o `senhaHash` e o `cpf` para o navegador, mesmo que o componente só mostre o nome. Passe objetos montados para a tela (DTOs) com os campos necessários.
+- **Source maps.** O Next.js não publica source maps do cliente em produção por padrão (`productionBrowserSourceMaps`). Se precisar deles para o Sentry ou o New Relic, envie-os à ferramenta no build e não os sirva publicamente.
+
+```ts
+// apps/loja/src/servicos/pagamento.ts
+import "server-only";
+
+const chave = process.env.GATEWAY_PAGAMENTO_CHAVE; // sem NEXT_PUBLIC_: só existe no servidor
+```
+
+## Validação e autorização no servidor
+
+Toda Server Action é um endpoint HTTP público. O formulário do checkout é só uma das formas de chamá-la; qualquer um pode chamá-la com o corpo que quiser. Duas falhas clássicas aparecem aqui.
+
+**Confiar em dados do cliente (design inseguro).** Se o carrinho envia o preço de cada item e o servidor o usa para cobrar, alguém altera o preço do quilo de picanha para um centavo. O cliente envia só ids e quantidades; preço, estoque e frete vêm do banco.
+
+**Não verificar a quem o recurso pertence (controle de acesso).** Buscar o pedido pelo id da URL sem conferir o dono permite ver o pedido de outro cliente trocando `/pedidos/42` por `/pedidos/43` (IDOR, referência direta insegura a objeto).
+
+```ts
+// apps/loja/src/features/checkout/acoes.ts
+"use server";
+import { z } from "zod";
+import { obterSessao } from "@/lib/sessao";
+import { bff } from "@/servicos/bff";
+
+const esquema = z.object({
+  itens: z.array(z.object({ produtoId: z.uuid(), quantidade: z.number().int().positive().max(50) })).min(1),
+  enderecoId: z.uuid(),
+});
+
+export async function finalizarPedido(_estado: unknown, dados: unknown) {
+  const sessao = await obterSessao();
+  if (!sessao) return { erro: "Faça login para finalizar o pedido." };
+
+  const resultado = esquema.safeParse(dados);
+  if (!resultado.success) return { erro: "Pedido inválido." };
+
+  // O BFF recalcula preços, confere estoque e verifica se o endereço pertence ao cliente.
+  return bff.criarPedido(sessao.usuarioId, resultado.data);
+}
+```
+
+A validação no cliente (React Hook Form com Zod) continua útil, mas pela experiência: mostra o erro sem ida ao servidor. Segurança é a validação do servidor. Esconder o botão "Excluir produto" de quem não é lojista também é experiência; a ação de excluir precisa conferir o papel do usuário por conta própria.
+
+## Erros sem vazamento
+
+O `error.tsx` do App Router recebe o erro, mas em produção o Next.js substitui a mensagem de erros do servidor por uma genérica e um `digest`, um identificador que liga a tela do usuário ao log do servidor. Mostre ao usuário uma mensagem útil e o `digest` para o suporte; nunca stack traces, consultas SQL ou nomes de serviços internos. E registre: tentativa de acessar pedido alheio e picos de falha de login são eventos de segurança que devem chegar ao New Relic com alerta, não só ao console.
+
+## Na entrevista
+
+**O React protege contra XSS?** Protege o caminho comum: valores em JSX são inseridos como texto. Não protege `dangerouslySetInnerHTML`, URLs com protocolos perigosos em `href`, manipulação direta do DOM por refs, `eval` e dados serializados em `script`. Para esses casos, sanitização (DOMPurify), validação de protocolo e uma CSP estrita como segunda camada.
+
+**Como funciona uma CSP baseada em nonce?** O servidor gera um valor aleatório por resposta, coloca na política (`script-src 'nonce-...'`) e nos scripts legítimos. O navegador só executa scripts com aquele nonce; um script injetado não o conhece. No Next.js, o nonce é gerado no proxy e lido no layout com `headers()`.
+
+**Server Actions são protegidas contra CSRF?** Têm proteções embutidas: só aceitam `POST` e comparam a origem com o host. Somadas a cookies `SameSite`, cobrem o caso comum. Mas continuam sendo endpoints públicos: autenticação, autorização e validação de entrada são responsabilidade de cada ação.
+
+**Como evitar que segredos cheguem ao bundle?** Não usar o prefixo `NEXT_PUBLIC_` para segredos, marcar módulos de servidor com `server-only`, passar a Client Components só os campos necessários e não servir source maps publicamente.
+
+**Qual a diferença entre CORS e proteção CSRF?** CORS decide se um script de outra origem pode ler a resposta. CSRF é sobre a requisição ser executada com o cookie da vítima, o que acontece mesmo sem leitura. Contra CSRF valem `SameSite`, checagem de origem e tokens.
+
+## Pratique
+
+1. Cadastre no painel uma descrição com `img` e `onerror` e veja o XSS acontecer com `dangerouslySetInnerHTML` sem sanitização. Corrija com DOMPurify no BFF (ao salvar) e na loja (ao exibir), com lista de tags permitidas.
+2. Implemente a CSP com nonce no `proxy.ts` da loja, primeiro em modo relatório. Liste as violações que aparecerem no console e ajuste `connect-src` e `img-src` até zerá-las.
+3. Adicione os cabeçalhos de segurança no `next.config.ts` e confira o resultado com o DevTools e com uma ferramenta de análise de cabeçalhos.
+4. Escreva um teste que chama a Server Action `finalizarPedido` com preço adulterado e com o `enderecoId` de outro usuário, e garanta que o BFF rejeita os dois.
+5. Procure no bundle de produção da loja (pasta `.next/static`) por qualquer variável de ambiente sensível e por campos que não deveriam estar no HTML de uma página de pedido.
+
+<Quiz question="A loja exibe um link para o site do produtor cadastrado pelo lojista. Qual a defesa adequada?" options={["Nenhuma, o React escapa atributos automaticamente","Validar a URL e aceitar só protocolos permitidos como https e mailto","Usar dangerouslySetInnerHTML para montar o link","Codificar a URL em base64"]} answer={1} explanation="O escape do React não impede uma URL com protocolo javascript de executar ao clicar. Validar o protocolo, no cadastro e na exibição, fecha o vetor." />
+
+<Quiz question="Por que CORS não protege a Quitanda contra CSRF?" options={["CORS só vale para requisições GET","CORS é desativado em Server Actions","CORS controla quem lê a resposta; o ataque CSRF só precisa que a requisição seja enviada com o cookie da vítima","CORS só funciona com HTTPS"]} answer={2} explanation="No CSRF o atacante não precisa ler nada. A requisição chega ao servidor com o cookie, e é por isso que SameSite, checagem de origem e tokens são as defesas." />
+
+<Quiz question="O checkout envia o preço de cada item junto com o pedido. Qual categoria do OWASP Top 10 melhor descreve o problema e qual a correção?" options={["Design inseguro: o servidor deve recalcular preços a partir do banco e aceitar do cliente só ids e quantidades","Falha criptográfica: o preço deve ser criptografado","Injeção: o preço deve passar por DOMPurify","Configuração incorreta: basta adicionar CSP"]} answer={0} explanation="Confiar em valores de negócio vindos do cliente é falha de design. O cliente pode enviar qualquer coisa; preço, estoque e frete são calculados no servidor." />
+
+## Base no CodeForge
+
+- [React: implementando técnicas seguras de autenticação](/learn/carreira-react/react-tecnicas-seguras-autenticacao): sessão, cookies e tokens que este capítulo pressupõe.
+- [Python e OWASP: Explorando vulnerabilidades e protegendo aplicações](/learn/carreira-python/python-owasp-explorando-vulnerabilidades-protegendo-aplicacoes): o mesmo Top 10 do lado do back-end.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): onde guardar as chaves que não podem ir para o bundle.
+- [Autenticação e autorização](/learn/system-design/autenticacao-autorizacao): a diferença que separa login de controle de acesso.
+- [TLS](/learn/redes/tls): a base do HTTPS que o HSTS torna obrigatório.
+
+## Referências
+
+- [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+- [OWASP Cheat Sheet: Cross Site Scripting Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)
+- [Next.js: Content Security Policy](https://nextjs.org/docs/app/guides/content-security-policy)
+- [Next.js: Data Security](https://nextjs.org/docs/app/guides/data-security)
+- [MDN: Content Security Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP)

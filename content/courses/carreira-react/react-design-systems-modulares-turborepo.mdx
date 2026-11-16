@@ -1,0 +1,449 @@
+---
+title: "React: desenvolvendo design systems modulares com Turborepo"
+kind: lesson
+---
+
+A Quitanda cresceu. A loja em Next.js conversa com o BFF em NestJS, o status do pedido chega pelo Socket.io e o New Relic mostra o que acontece em produção. Agora o painel do lojista vai virar uma aplicação separada, com time próprio, e alguém percebeu o óbvio: o botão verde da loja e o botão verde do painel já não são o mesmo. Um tem `border-radius` de 8px, o outro de 6px; um mostra o foco do teclado, o outro não. Cada cópia de componente é uma divergência esperando para acontecer.
+
+A resposta é um design system: um conjunto de componentes, tokens e regras de uso que vive num lugar só e é consumido por todas as interfaces. Este capítulo monta a **Quitanda UI** dentro de um monorepo gerenciado pelo Turborepo, com a loja e o painel consumindo o mesmo pacote, componentes acessíveis por padrão e o Storybook como vitrine e documentação viva. Os próximos capítulos acrescentam os tokens, a publicação no npm e os temas.
+
+**Você vai aprender:**
+
+- Organizar um monorepo com workspaces do pnpm (ou do npm) em `apps/` e `packages/`
+- Configurar tarefas do Turborepo com dependências entre pacotes, `outputs` e cache local e remoto
+- Criar o pacote interno `@quitanda/ui` e consumi-lo na loja e no painel
+- Escrever componentes acessíveis por padrão, com HTML nativo, foco visível e ARIA só quando necessário
+- Documentar e testar os componentes no Storybook com stories e o addon de acessibilidade
+
+## Por que um monorepo
+
+Há dois jeitos de compartilhar código entre a loja e o painel: publicar a Quitanda UI num registro e instalá-la como qualquer dependência, ou manter tudo no mesmo repositório e ligar os pacotes localmente. O segundo é o monorepo.
+
+| Critério | Vários repositórios | Monorepo |
+|---|---|---|
+| Mudar um componente e ver o efeito na loja | Publica, atualiza a versão, instala | Salva o arquivo, a loja recarrega |
+| Mudança que atravessa UI e apps | Vários PRs coordenados | Um PR atômico |
+| Configuração de lint, TS e testes | Duplicada e divergente | Compartilhada em pacotes de config |
+| Isolamento entre times | Natural | Exige convenções e ferramentas (filtros, CODEOWNERS) |
+| CI | Rápido por repositório | Precisa de cache e execução só do que mudou |
+
+O ponto fraco do monorepo é o último: sem ferramenta, o CI roda build e testes de tudo a cada commit. É exatamente o problema que o Turborepo resolve, executando as tarefas na ordem certa, em paralelo, e pulando o que já foi feito.
+
+Monorepo também não é monólito: é uma decisão sobre onde o código mora, não sobre como ele é implantado. A loja e o painel continuam com deploys independentes.
+
+## A estrutura da Quitanda
+
+```text
+quitanda/
+├── apps/
+│   ├── loja/          # Next.js 16, a loja pública
+│   ├── painel/        # Next.js 16, o painel do lojista
+│   └── bff/           # NestJS, o Backend for Frontend
+├── packages/
+│   ├── ui/            # @quitanda/ui, a Quitanda UI
+│   ├── tsconfig/      # @quitanda/tsconfig, configs base de TypeScript
+│   └── eslint-config/ # @quitanda/eslint-config
+├── package.json
+├── pnpm-workspace.yaml
+└── turbo.json
+```
+
+`apps/` guarda o que é implantado; `packages/` guarda o que é consumido. Um app nunca é dependência de outro app: se a loja e o painel precisam do mesmo código, ele vira um pacote.
+
+### Workspaces com pnpm
+
+O pnpm é a escolha mais comum em monorepos: instala rápido, guarda cada versão de pacote uma vez só no disco e é estrito, ou seja, um pacote só enxerga as dependências que declarou. Isso evita o bug clássico de um app usar uma biblioteca que só funciona porque outro pacote a instalou.
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - "apps/*"
+  - "packages/*"
+```
+
+```json
+// package.json (raiz)
+{
+  "name": "quitanda",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test"
+  },
+  "devDependencies": { "turbo": "^2.0.0" }
+}
+```
+
+Com npm o efeito é o mesmo, declarando `"workspaces": ["apps/*", "packages/*"]` no `package.json` da raiz. A diferença está na referência entre pacotes: no pnpm usa-se o protocolo `workspace:*`, que garante que a dependência aponta sempre para a cópia local; no npm, uma versão compatível com a do pacote local.
+
+```json
+// apps/loja/package.json
+{
+  "name": "loja",
+  "private": true,
+  "scripts": { "dev": "next dev --port 3000", "build": "next build", "lint": "eslint ." },
+  "dependencies": {
+    "@quitanda/ui": "workspace:*",
+    "next": "^16.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}
+```
+
+Depois de `pnpm install` na raiz, `node_modules/@quitanda/ui` dentro da loja é um link simbólico para `packages/ui`. Instalar uma dependência num pacote específico usa o filtro: `pnpm add zod --filter loja`.
+
+## Turborepo: tarefas, dependências e cache
+
+O Turborepo lê os workspaces, monta o grafo de dependências entre pacotes e executa as tarefas declaradas no `turbo.json`. Na versão 2 a chave se chama `tasks` (antes era `pipeline`, nome que você ainda vai encontrar em tutoriais antigos).
+
+```json
+// turbo.json
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "ui": "tui",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", ".env*"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**", "storybook-static/**"]
+    },
+    "lint": { "dependsOn": ["^lint"] },
+    "typecheck": { "dependsOn": ["^typecheck"] },
+    "test": { "dependsOn": ["^build"], "outputs": ["coverage/**"] },
+    "dev": { "cache": false, "persistent": true }
+  }
+}
+```
+
+As peças que importam:
+
+- **`dependsOn: ["^build"]`**: o circunflexo significa "a tarefa `build` das minhas dependências". Antes de construir a loja, o Turborepo constrói a Quitanda UI. Sem o circunflexo (`["lint"]`), a dependência é com outra tarefa do mesmo pacote.
+- **`outputs`**: os arquivos que a tarefa produz. São eles que vão para o cache e são restaurados quando a tarefa é pulada. Esquecer o `outputs` faz o Turborepo restaurar só o log, e o próximo passo do CI não encontra o `dist/`.
+- **`inputs`**: o que entra no cálculo do hash. O padrão (`$TURBO_DEFAULT$`) são os arquivos do pacote versionados no Git; aqui acrescentamos os `.env`.
+- **`cache: false` e `persistent: true`**: o `dev` é um processo que não termina e não tem resultado para guardar.
+
+### Como o cache funciona
+
+Antes de executar uma tarefa, o Turborepo calcula um hash com o conteúdo dos arquivos de entrada, as variáveis de ambiente declaradas, a configuração da tarefa e os hashes das dependências. Se esse hash já existe no cache, ele restaura os `outputs` e reproduz o log em vez de executar. Na prática, alterar um texto da loja não reconstrói a Quitanda UI, e um PR que só mexe no painel não roda os testes da loja.
+
+```bash
+pnpm turbo run build                 # tudo, na ordem do grafo
+pnpm turbo run build --filter=loja   # só a loja e o que ela precisa
+pnpm turbo run test --filter=...@quitanda/ui   # a UI e tudo que depende dela
+pnpm turbo run lint --affected       # só os pacotes alterados em relação à branch principal
+```
+
+Variáveis de ambiente são uma armadilha frequente. Se o build da loja lê `NEXT_PUBLIC_API_URL` e ela não entra no hash, dois builds com URLs diferentes compartilham o mesmo cache. Declare-as na chave `env` da tarefa (aceita curingas, como `NEXT_PUBLIC_NEW_RELIC_*`) ou em `globalEnv`, quando valem para todas.
+
+### Cache remoto
+
+O cache local acelera a sua máquina; o remoto é compartilhado entre o time e o CI. O build que o colega já fez é restaurado no seu `turbo run`. Com a Vercel, basta `npx turbo login` e `npx turbo link`; no CI, as variáveis `TURBO_TOKEN` e `TURBO_TEAM`. Também existem servidores de cache auto-hospedados que implementam a mesma API.
+
+<Callout type="warning" title="Cache errado é pior que cache nenhum">
+Se uma tarefa depende de algo que não está nos `inputs` nem em `env` (um arquivo fora do pacote, uma variável de ambiente, a data de hoje), o Turborepo vai restaurar um resultado antigo e ninguém vai entender o bug. Rode `turbo run build --dry=json` para ver o que entra no hash, e `--summarize` para investigar um cache inesperado.
+</Callout>
+
+## O pacote `@quitanda/ui`
+
+Há duas formas de montar um pacote interno. No **pacote compilado**, ele tem um passo de `build` que gera `dist/` com JavaScript e declarações de tipos, e os apps consomem o resultado. No **pacote just-in-time**, ele exporta o TypeScript direto e o bundler do app compila. O just-in-time é mais simples para começar e não tem passo de build, mas não aproveita o cache do Turborepo para a UI e exige que o app saiba compilar o pacote. Como no próximo capítulo a Quitanda UI vai para o npm, ela já nasce compilada; durante o desenvolvimento, o Next.js também consegue consumir a versão just-in-time.
+
+```json
+// packages/ui/package.json
+{
+  "name": "@quitanda/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
+  },
+  "peerDependencies": { "react": "^19.0.0", "react-dom": "^19.0.0" },
+  "devDependencies": { "@quitanda/tsconfig": "workspace:*", "tsup": "^8.0.0", "typescript": "^5.0.0" }
+}
+```
+
+React entra como `peerDependencies`: a UI usa o React do app, e não uma segunda cópia (duas cópias do React quebram os hooks com o erro "Invalid hook call"). O capítulo de publicação detalha `exports`, `peerDependencies` e o empacotamento.
+
+Cada componente mora numa pasta própria (`src/Botao/` com `Botao.tsx`, `Botao.stories.tsx` e `Botao.test.tsx`), e um `index.ts` reúne as exportações:
+
+```ts
+// packages/ui/src/index.ts
+export { Botao, type BotaoProps } from "./Botao/Botao";
+export { CampoTexto, type CampoTextoProps } from "./CampoTexto/CampoTexto";
+export { Selo, type SeloProps } from "./Selo/Selo";
+export { Dialogo, type DialogoProps } from "./Dialogo/Dialogo";
+```
+
+Exportar só pelo `index.ts` define a API pública do pacote. O que não está lá é detalhe interno e pode mudar sem aviso.
+
+## Componentes acessíveis por padrão
+
+Um design system multiplica tudo: um botão acessível torna acessíveis centenas de telas, e um botão inacessível espalha o problema na mesma proporção. A regra número um é usar o elemento HTML certo, que já traz teclado, foco e semântica de graça.
+
+```tsx
+// packages/ui/src/Botao/Botao.tsx
+import type { ComponentPropsWithRef } from "react";
+import styles from "./Botao.module.css";
+
+export type BotaoProps = ComponentPropsWithRef<"button"> & {
+  variante?: "primario" | "secundario" | "perigo";
+  tamanho?: "p" | "m" | "g";
+  carregando?: boolean;
+};
+
+export function Botao({
+  variante = "primario",
+  tamanho = "m",
+  carregando = false,
+  disabled,
+  children,
+  type = "button",
+  ...resto
+}: BotaoProps) {
+  return (
+    <button
+      type={type}
+      className={`${styles.botao} ${styles[variante]} ${styles[tamanho]}`}
+      disabled={disabled || carregando}
+      aria-busy={carregando || undefined}
+      {...resto}
+    >
+      {carregando ? <span className={styles.spinner} aria-hidden="true" /> : null}
+      {children}
+    </button>
+  );
+}
+```
+
+Repare em quatro decisões. `ComponentPropsWithRef<"button">` aceita tudo que um botão nativo aceita, inclusive `ref`, que no React 19 é uma prop comum (sem `forwardRef`). O `type` padrão é `"button"`, porque o padrão do HTML é `submit` e um botão dentro de um formulário enviaria o formulário sem querer. O spinner é decorativo, então leva `aria-hidden`. E o texto do botão continua visível durante o carregamento, para quem usa leitor de tela saber o que está acontecendo.
+
+```css
+/* packages/ui/src/Botao/Botao.module.css */
+.botao { display: inline-flex; align-items: center; gap: 0.5rem; border: 0; border-radius: 8px; font: inherit; }
+.botao:focus-visible { outline: 3px solid #1d4ed8; outline-offset: 2px; }
+.botao:disabled { opacity: 0.6; cursor: not-allowed; }
+.primario { background: #166534; color: #ffffff; }
+.p { min-height: 32px; padding: 0 0.75rem; }
+.m { min-height: 40px; padding: 0 1rem; }
+.g { min-height: 48px; padding: 0 1.25rem; }
+```
+
+`:focus-visible` mostra o contorno para quem navega pelo teclado sem incomodar quem clica. As cores fixas e o próprio CSS Module são provisórios: no próximo capítulo as cores viram tokens e o estilo passa para styled-components, que não depende de o bundler do app processar arquivos CSS vindos de um pacote.
+
+### Campo com rótulo, dica e erro ligados
+
+```tsx
+// packages/ui/src/CampoTexto/CampoTexto.tsx
+import { useId, type ComponentPropsWithRef } from "react";
+import styles from "./CampoTexto.module.css";
+
+export type CampoTextoProps = ComponentPropsWithRef<"input"> & { rotulo: string; dica?: string; erro?: string };
+
+export function CampoTexto({ rotulo, dica, erro, id, ...resto }: CampoTextoProps) {
+  const idGerado = useId();
+  const idCampo = id ?? idGerado;
+  const idDica = dica ? `${idCampo}-dica` : undefined;
+  const idErro = erro ? `${idCampo}-erro` : undefined;
+
+  return (
+    <div className={styles.campo}>
+      <label htmlFor={idCampo}>{rotulo}</label>
+      <input
+        id={idCampo}
+        aria-invalid={erro ? true : undefined}
+        aria-describedby={[idDica, idErro].filter(Boolean).join(" ") || undefined}
+        {...resto}
+      />
+      {dica && <p id={idDica} className={styles.dica}>{dica}</p>}
+      {erro && <p id={idErro} className={styles.erro} role="alert">{erro}</p>}
+    </div>
+  );
+}
+```
+
+`useId` gera um id estável e igual no servidor e no cliente, o que evita erros de hidratação no Next.js. O rótulo é obrigatório na API: o componente simplesmente não deixa alguém criar um campo sem `label`.
+
+### Diálogo com o elemento nativo
+
+Modal é o componente que mais erra acessibilidade quando é feito com `div`: o foco escapa, o Esc não fecha, o conteúdo de trás continua acessível. O elemento `dialog` com `showModal()` resolve isso no próprio navegador.
+
+```tsx
+// packages/ui/src/Dialogo/Dialogo.tsx
+"use client";
+import { useEffect, useId, useRef, type ReactNode } from "react";
+
+export type DialogoProps = { aberto: boolean; titulo: string; aoFechar: () => void; children: ReactNode };
+
+export function Dialogo({ aberto, titulo, aoFechar, children }: DialogoProps) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const idTitulo = useId();
+
+  useEffect(() => {
+    const dialogo = ref.current;
+    if (!dialogo) return;
+    if (aberto && !dialogo.open) dialogo.showModal();
+    if (!aberto && dialogo.open) dialogo.close();
+  }, [aberto]);
+
+  return (
+    <dialog ref={ref} aria-labelledby={idTitulo} onClose={aoFechar}>
+      <h2 id={idTitulo}>{titulo}</h2>
+      {children}
+      <button type="button" onClick={aoFechar}>Fechar</button>
+    </dialog>
+  );
+}
+```
+
+O `"use client"` no topo é necessário porque o componente usa hooks: a loja renderiza com Server Components, e só o que tem interatividade precisa ir para o cliente. Componentes puramente visuais, como `Selo`, ficam sem a diretiva e podem ser usados dentro de Server Components.
+
+| Necessidade | Use | Evite |
+|---|---|---|
+| Ação | `button` | `div` com `onClick` |
+| Navegação | `a` com `href` | `button` que muda a rota |
+| Modal | `dialog` com `showModal()` | `div` com `position: fixed` |
+| Rótulo de campo | `label` com `htmlFor` | só `placeholder` |
+| Estado de erro | `aria-invalid` e `aria-describedby` | só a cor vermelha |
+
+## Consumindo na loja e no painel
+
+```tsx
+// apps/loja/src/componentes/CartaoProduto.tsx
+import { Botao, Selo } from "@quitanda/ui";
+import type { Produto } from "@/tipos/produto";
+import { formatarPreco } from "@/utils/formatarPreco";
+import { adicionarAoCarrinho } from "@/acoes/carrinho";
+
+export function CartaoProduto({ produto }: { produto: Produto }) {
+  const esgotado = produto.estoque === 0;
+  return (
+    <article>
+      <h3>{produto.nome}</h3>
+      <p>{formatarPreco(produto.precoEmCentavos)} / {produto.unidade}</p>
+      {esgotado && <Selo tom="aviso">Esgotado</Selo>}
+      <form action={adicionarAoCarrinho.bind(null, produto.id)}>
+        <Botao type="submit" disabled={esgotado}>Adicionar ao carrinho</Botao>
+      </form>
+    </article>
+  );
+}
+```
+
+Se a UI for consumida como just-in-time (exportando `.tsx` direto), o Next.js precisa compilá-la: liste o pacote em `transpilePackages: ["@quitanda/ui"]` no `next.config.ts` do app.
+
+Com `pnpm dev` na raiz, o Turborepo sobe a loja, o painel, o BFF e o `tsup --watch` da UI em paralelo, e a interface de terminal (`"ui": "tui"`) mostra o log de cada um separadamente.
+
+## Storybook: a vitrine e a documentação
+
+O Storybook roda os componentes isolados, fora da loja, cada um em vários estados. Para o time do painel, é o catálogo do que existe; para quem desenvolve a UI, é a bancada de trabalho; para o designer, é o lugar de revisar.
+
+Dentro de `packages/ui`, rode `pnpm dlx storybook@latest init`. O instalador detecta React com Vite e cria `.storybook/main.ts` e `.storybook/preview.ts`. Uma story no formato CSF (Component Story Format) é um objeto por estado:
+
+```tsx
+// packages/ui/src/Botao/Botao.stories.tsx
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { fn } from "storybook/test";
+import { Botao } from "./Botao";
+
+const meta = {
+  title: "Ações/Botao",
+  component: Botao,
+  tags: ["autodocs"],
+  args: { children: "Adicionar ao carrinho", onClick: fn() },
+} satisfies Meta<typeof Botao>;
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const Primario: Story = {};
+export const Secundario: Story = { args: { variante: "secundario" } };
+export const Carregando: Story = { args: { carregando: true, children: "Finalizando pedido" } };
+export const Desabilitado: Story = { args: { disabled: true } };
+```
+
+A tag `autodocs` gera uma página de documentação com a tabela de props tirada dos tipos do TypeScript. O `fn()` registra os cliques no painel de ações.
+
+### Acessibilidade e interação dentro do Storybook
+
+O addon de acessibilidade roda o axe-core em cada story e lista as violações (contraste, rótulos ausentes, papéis ARIA errados). Adicione com `pnpm dlx storybook add @storybook/addon-a11y`. Para testar comportamento, a story ganha uma função `play`, que simula o usuário:
+
+```tsx
+// packages/ui/src/CampoTexto/CampoTexto.stories.tsx
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, userEvent, within } from "storybook/test";
+import { CampoTexto } from "./CampoTexto";
+
+const meta = { title: "Formulários/CampoTexto", component: CampoTexto } satisfies Meta<typeof CampoTexto>;
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const ComErro: Story = {
+  args: { rotulo: "CEP", erro: "CEP inválido", dica: "Somente números" },
+  play: async ({ canvasElement }) => {
+    const tela = within(canvasElement);
+    const campo = tela.getByLabelText("CEP");
+    await userEvent.type(campo, "123");
+    await expect(campo).toHaveAttribute("aria-invalid", "true");
+    await expect(campo).toHaveAccessibleDescription("Somente números CEP inválido");
+  },
+};
+```
+
+As mesmas consultas da Testing Library (`getByLabelText`, `getByRole`) funcionam aqui, o que reforça o hábito de testar pelo que o usuário percebe. O Storybook pode rodar essas stories como testes no CI pela integração com o Vitest, e o `build-storybook` gera um site estático para publicar junto com cada PR.
+
+<Callout type="tip" title="Stories são casos de teste">
+Cada estado que vale uma story (vazio, carregando, erro, texto longo, desabilitado) é um caso que o componente precisa suportar. Se você não consegue escrever a story, a API do componente provavelmente está confusa.
+</Callout>
+
+## Na entrevista
+
+**Por que usar um monorepo para um design system?** Porque a UI e os apps que a consomem mudam juntos com frequência. No monorepo, uma mudança que atravessa os dois é um PR só, testada contra os consumidores reais, e as configurações de lint e TypeScript são compartilhadas. O custo é precisar de uma ferramenta como o Turborepo para não rodar tudo a cada commit.
+
+**O que significa `dependsOn: ["^build"]` no Turborepo?** Que antes de rodar o `build` de um pacote é preciso rodar o `build` de todas as suas dependências internas. O circunflexo aponta para as dependências; sem ele, a referência é a outra tarefa do mesmo pacote.
+
+**Como o cache do Turborepo decide se pode pular uma tarefa?** Ele calcula um hash com os arquivos de entrada, as variáveis de ambiente declaradas, a configuração da tarefa e os hashes das dependências. Se o hash existe no cache local ou remoto, restaura os `outputs` e o log. Por isso variáveis de ambiente que afetam o build precisam estar declaradas.
+
+**Por que o React é `peerDependency` na biblioteca de componentes?** Para que a biblioteca use a mesma instância de React do app. Com duas cópias, hooks e contexto quebram. A peer dependency declara a faixa compatível e deixa a instalação a cargo do consumidor.
+
+**Como você garante acessibilidade num design system?** Partindo de elementos HTML nativos, tornando obrigatório o que é essencial (como o rótulo do campo), mostrando foco visível, testando com consultas por papel e rótulo e rodando o axe nas stories. Testes manuais com teclado e leitor de tela continuam necessários, porque ferramentas automáticas pegam só parte dos problemas.
+
+## Pratique
+
+1. Converta a Quitanda num monorepo com pnpm: mova a loja para `apps/loja`, crie `apps/painel` com um Next.js vazio e `packages/ui` com o `Botao`. Confirme com `pnpm ls -r --depth -1` que os workspaces foram reconhecidos.
+2. Escreva o `turbo.json` com `build`, `lint`, `typecheck`, `test` e `dev`. Rode `pnpm build` duas vezes e compare o tempo; altere um texto da loja e confirme que a UI aparece como cache hit.
+3. Declare uma variável de ambiente lida no build da loja sem colocá-la em `env`, mude o valor e observe o cache restaurando o resultado antigo. Depois corrija.
+4. Crie `CampoTexto`, `Selo` e `Dialogo` na Quitanda UI e substitua as versões locais da loja e do painel por eles.
+5. Configure o Storybook na UI com o addon de acessibilidade, escreva stories para todos os estados do `Botao` e uma função `play` para o `Dialogo` que confere se o Esc fecha o modal.
+
+<Quiz question="No turbo.json, a tarefa build da loja tem dependsOn com ^build. O que acontece ao rodar turbo run build --filter=loja?" options={["Só a loja é construída, as dependências são ignoradas","O Turborepo constrói antes a Quitanda UI e os demais pacotes internos de que a loja depende","Todos os apps do monorepo são construídos","O build falha porque o filtro não aceita dependências"]} answer={1} explanation="O circunflexo indica a tarefa build das dependências internas. O filtro seleciona a loja, e o Turborepo inclui no grafo o que ela precisa." />
+
+<Quiz question="O build da loja passou a usar NEXT_PUBLIC_API_URL, mas o turbo.json não declara essa variável. Qual o risco?" options={["Nenhum, o Turborepo lê todas as variáveis automaticamente","O build falha por variável desconhecida","A variável deixa de chegar ao Next.js","Builds com valores diferentes compartilham o mesmo hash, e o cache restaura um bundle com a URL errada"]} answer={3} explanation="Variáveis que afetam o resultado precisam entrar no hash pela chave env ou globalEnv; caso contrário, o cache não distingue os dois cenários." />
+
+<Quiz question="Qual a forma mais acessível de implementar o botão Adicionar ao carrinho na Quitanda UI?" options={["Elemento button nativo com type explícito, foco visível e texto descritivo","Uma div com onClick e role button","Um link com href igual a cerquilha","Um span estilizado com tabIndex 0"]} answer={0} explanation="O button nativo já é focável, responde a Enter e Espaço e é anunciado corretamente. Recriar isso em div exige role, tabIndex e tratamento de teclado manuais." />
+
+## Base no CodeForge
+
+- [Arquitetura no front-end: estruturando aplicações com decisões técnicas sustentáveis](/learn/carreira-react/arquitetura-front-end-decisoes-tecnicas-sustentaveis): onde o monorepo entra entre as decisões de arquitetura.
+- [HTML e CSS: formulários, SEO e acessibilidade](/learn/carreira-react/html-css-formularios-seo-acessibilidade): a base de acessibilidade que os componentes aplicam.
+- [React: explorando padrões de composição com custom hooks](/learn/carreira-react/react-padroes-composicao-custom-hooks): composição, o princípio por trás de uma API de componentes enxuta.
+- [React: desenvolvendo design tokens com styled-components](/learn/carreira-react/react-design-tokens-styled-components): o próximo passo da Quitanda UI.
+- [CI/CD](/learn/system-design/ci-cd): onde o cache remoto do Turborepo economiza minutos de pipeline.
+
+## Referências
+
+- [Turborepo: Configuring tasks](https://turborepo.com/docs/crafting-your-repository/configuring-tasks)
+- [Turborepo: Caching](https://turborepo.com/docs/crafting-your-repository/caching)
+- [pnpm: Workspaces](https://pnpm.io/workspaces)
+- [Storybook: Writing stories](https://storybook.js.org/docs/writing-stories)
+- [MDN: The dialog element](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/dialog)

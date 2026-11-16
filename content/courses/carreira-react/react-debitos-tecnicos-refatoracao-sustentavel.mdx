@@ -1,0 +1,313 @@
+---
+title: "React: gerenciamento de débitos técnicos e refatoração sustentável"
+kind: lesson
+---
+
+A Quitanda percorreu a carreira inteira: nasceu como HTML estático, virou SPA em React com Vite, migrou para TypeScript e Next.js, ganhou BFF, eventos em tempo real, design system, monitoramento e micro frontends. Cada etapa deixou rastros. A área "Minha conta" ainda é a SPA do Nível 1, servida à parte. O hook `useCarrinho` tem 600 linhas e ninguém mexe nele sem medo. Há 140 `any` no código, 30 testes marcados como `skip` e três funções diferentes para formatar preço. Na reunião de planejamento, a gerente de produto pergunta, com razão: "por que trocar o texto de um botão no checkout levou três dias?".
+
+Esse atraso tem nome: débito técnico. Ele não é vergonha nem acidente; é consequência natural de entregar software sob restrições reais. O problema é o débito invisível, sem dono e sem plano, que cobra juros a cada mudança. Este capítulo mostra como identificar, medir e priorizar débitos, como proteger o comportamento atual antes de mexer, como refatorar aos poucos sem parar as entregas, como substituir partes inteiras com o padrão strangler fig e como conversar sobre tudo isso com quem decide o que o time faz.
+
+**Você vai aprender:**
+
+- Classificar débitos técnicos e distinguir o que é débito do que é só código de que você não gosta
+- Encontrar os débitos que mais custam com hotspots, métricas e um registro de débitos
+- Escrever testes de caracterização para proteger código legado antes de mudá-lo
+- Refatorar de forma incremental com mudança paralela, branch by abstraction, codemods e catracas de lint
+- Aplicar o strangler fig no front-end para substituir a SPA legada rota por rota
+- Negociar tempo de refatoração com o negócio em termos de custo, risco e prazo
+
+## O que é (e o que não é) débito técnico
+
+Ward Cunningham cunhou a metáfora: entregar código que ainda não reflete bem o entendimento do problema é como pegar um empréstimo. Acelera agora, e cobra **juros** depois, na forma de tempo extra em cada mudança que passa por ali. Pagar o principal é refatorar.
+
+A metáfora traz um critério importante: **só há juros onde há mudança**. Um módulo feio que ninguém toca há dois anos não está custando nada. Um módulo razoável que muda toda semana e sempre quebra está custando muito. Débito é o que torna as próximas mudanças mais caras, não tudo que você escreveria de outro jeito.
+
+Martin Fowler organizou as origens do débito em quatro quadrantes:
+
+| | Imprudente | Prudente |
+|---|---|---|
+| **Deliberado** | "Não temos tempo para testes." | "Vamos lançar a Black Friday assim e refatorar o checkout na semana seguinte." |
+| **Inadvertido** | "O que é separação de responsabilidades?" | "Agora que entendemos o domínio, vemos como deveríamos ter modelado o carrinho." |
+
+O débito deliberado e prudente é uma ferramenta legítima de negócio, desde que registrado e pago. O inadvertido e prudente é inevitável: o time aprende, e o código antigo reflete o entendimento antigo. Os imprudentes são os que uma cultura de revisão, testes e padrões ajuda a evitar.
+
+### Os tipos de débito num front-end
+
+| Tipo | Exemplo na Quitanda | Como aparece |
+|---|---|---|
+| Código | `useCarrinho` com 600 linhas e cinco responsabilidades | Mudanças lentas, bugs recorrentes no mesmo lugar |
+| Arquitetura | "Minha conta" ainda na SPA do Nível 1, com sessão própria | Toda funcionalidade de conta é feita duas vezes |
+| Testes | 30 testes em `skip`, checkout sem teste end-to-end | Medo de mudar, bugs que voltam |
+| Tipos | 140 `any`, respostas do BFF sem tipo | Erros em produção que o compilador pegaria |
+| Dependências | styled-components em modo de manutenção, Next.js uma major atrás | Upgrades cada vez mais caros |
+| Design e UX | Três tons de verde, botões fora da Quitanda UI | Inconsistência visual, retrabalho de design |
+| Acessibilidade | Modais antigos feitos com `div` | Risco legal e clientes que não conseguem comprar |
+| Conhecimento | Só uma pessoa entende o cálculo de frete | Gargalo e risco quando ela sai de férias |
+
+## Medir para priorizar
+
+"O código está ruim" não convence ninguém e não ajuda a escolher por onde começar. Dados ajudam.
+
+### Hotspots: complexidade onde há mudança
+
+O cruzamento mais útil é entre **frequência de mudança** e **complexidade**. Arquivos complexos que mudam muito são onde os juros estão. O histórico do Git dá a primeira metade:
+
+```bash
+# arquivos da loja mais alterados nos últimos 12 meses
+git log --since="12 months ago" --format= --name-only -- apps/loja/src \
+  | grep -E "\.(ts|tsx)$" | sort | uniq -c | sort -rn | head -15
+```
+
+A outra metade vem do tamanho e da complexidade de cada arquivo (linhas, a regra `complexity` do ESLint, número de dependências). Um arquivo no topo das duas listas é candidato forte. Na Quitanda, `useCarrinho.ts`, `Checkout.tsx` e `servicos/frete.ts` aparecem nas duas.
+
+### Indicadores que dá para acompanhar
+
+```js
+// scripts/contar-debitos.mjs
+import { execSync } from "node:child_process";
+
+const contar = (padrao) =>
+  Number(execSync(`git grep -E "${padrao}" -- "apps/*/src" "packages/*/src" | wc -l`).toString().trim());
+
+console.table({
+  any: contar(": any\\b|as any\\b"),
+  "ts-expect-error / ts-ignore": contar("@ts-(expect-error|ignore)"),
+  "eslint-disable": contar("eslint-disable"),
+  "testes em skip": contar("\\b(it|test|describe)\\.skip\\("),
+  "imports do legado": contar("from ['\"]@/legado"),
+});
+```
+
+Rodado no CI e enviado a um dashboard, esse script transforma impressão em tendência: o número de `any` está caindo ou subindo? Some a isso os indicadores de entrega que o negócio já entende, como o tempo entre o início de uma mudança e o deploy e a taxa de deploys que causam incidentes (duas das métricas DORA). Débito técnico aparece neles antes de aparecer em qualquer outro lugar.
+
+### O registro de débitos
+
+Débito que só existe na cabeça das pessoas não é priorizado. Um registro simples, no backlog ou num documento do repositório, torna-o visível:
+
+| Débito | Impacto (juros) | Custo para pagar | Proposta | Dono |
+|---|---|---|---|---|
+| `useCarrinho` monolítico | Toda mudança no carrinho leva 2 a 3 dias e gera 1 bug por mês | 2 semanas | Dividir em hooks por responsabilidade, com testes de caracterização antes | Time Checkout |
+| "Minha conta" na SPA legada | Funcionalidades de conta feitas duas vezes; sessão duplicada | 6 a 8 semanas, incremental | Strangler fig rota por rota | Time Conta |
+| Respostas do BFF sem tipo | 4 incidentes no ano por mudança de contrato | 1 semana | Tipos gerados do OpenAPI do BFF e teste de contrato | Time Plataforma |
+
+Priorize por juros sobre custo: o que mais cobra a cada mudança e menos custa para pagar vem primeiro. E prefira pagar débitos **no caminho do roadmap**: se o próximo trimestre tem três funcionalidades no carrinho, o `useCarrinho` sobe na fila; se ninguém vai tocar na página "Sobre", ela pode esperar indefinidamente.
+
+## Antes de mexer: testes de caracterização
+
+Michael Feathers define código legado como código sem testes. Refatorar sem testes é trocar o motor com o carro andando e de olhos vendados. O primeiro passo é um **teste de caracterização**: um teste que não verifica o que o código deveria fazer, e sim o que ele **faz hoje**, inclusive as esquisitices.
+
+O cálculo do total do carrinho legado tem um arredondamento estranho no desconto de produtos vendidos por quilo. Antes de reescrevê-lo, registre o comportamento atual:
+
+```ts
+// apps/loja/src/legado/carrinho/calcularTotal.caracterizacao.test.ts
+import { calcularTotal } from "./calcularTotal";
+
+describe("calcularTotal (caracterização do comportamento atual)", () => {
+  it.each([
+    { caso: "carrinho vazio", itens: [], cupom: undefined, esperado: 0 },
+    { caso: "um item por unidade", itens: [{ precoEmCentavos: 450, quantidade: 2, unidade: "un" }], cupom: undefined, esperado: 900 },
+    { caso: "item por quilo fracionado", itens: [{ precoEmCentavos: 1299, quantidade: 0.75, unidade: "kg" }], cupom: undefined, esperado: 974 },
+    // Comportamento atual: o desconto é arredondado para baixo antes de aplicar. Decidir com o negócio se é bug.
+    { caso: "cupom de 10% em item por quilo", itens: [{ precoEmCentavos: 1299, quantidade: 0.75, unidade: "kg" }], cupom: "DEZ", esperado: 877 },
+  ])("$caso", ({ itens, cupom, esperado }) => {
+    expect(calcularTotal(itens, cupom)).toBe(esperado);
+  });
+});
+```
+
+Como chegar aos valores esperados: rode a função com entradas representativas (de preferência tiradas de pedidos reais, anonimizados) e copie o resultado. Se algum valor parecer errado, **não corrija no teste**: anote, como no comentário acima, e leve ao negócio. Muitas vezes o "bug" é uma regra que alguém pediu há dois anos. A caracterização separa duas decisões que costumam ser misturadas: mudar a estrutura (refatorar) e mudar o comportamento (corrigir).
+
+Para componentes, a mesma ideia com a Testing Library: renderize o componente legado com dados representativos e afirme o que o usuário vê e consegue fazer (textos, papéis, o que acontece ao clicar). Evite snapshots do HTML inteiro: eles quebram com qualquer mudança de estrutura e viram ruído exatamente durante a refatoração, quando você precisa que os testes digam algo.
+
+<Callout type="tip" title="Cobertura onde vai haver mudança">
+Não é preciso caracterizar o sistema inteiro antes de começar. Cubra o caminho que a próxima mudança vai atravessar. Cada refatoração deixa um pedaço a mais protegido, e a rede de segurança cresce no mesmo ritmo que o código melhora.
+</Callout>
+
+## Refatoração incremental
+
+A tentação, diante de muito débito, é a grande reescrita: "vamos refazer a loja do zero, direito desta vez". Ela quase sempre demora o dobro do previsto, congela as funcionalidades enquanto isso e redescobre, um a um, os casos que o código antigo tratava sem documentação. A alternativa é mudar aos poucos, com o sistema sempre funcionando e sempre implantável.
+
+Kent Beck resume a postura: primeiro torne a mudança fácil (isso pode ser difícil), depois faça a mudança fácil. Antes de adicionar o frete expresso, refatore `calcularFrete` até que adicionar uma modalidade seja trivial; então adicione.
+
+### Mudança paralela (expandir e contrair)
+
+Para mudar uma interface usada em muitos lugares sem um PR gigante, a mudança é feita em três fases: expandir (a nova forma passa a existir ao lado da antiga), migrar (os usos passam para a nova, aos poucos) e contrair (a antiga é removida). Na Quitanda UI, a troca de `aoFechar` por `onClose` no `Dialogo`:
+
+```tsx
+// packages/ui/src/Dialogo/Dialogo.tsx (fase de expansão)
+export type DialogoProps = {
+  aberto: boolean;
+  titulo: string;
+  onClose?: () => void;
+  /** @deprecated Use onClose. Será removido na 2.0. */
+  aoFechar?: () => void;
+  children: ReactNode;
+};
+
+export function Dialogo({ onClose, aoFechar, ...resto }: DialogoProps) {
+  if (process.env.NODE_ENV !== "production" && aoFechar) {
+    console.warn("Dialogo: a prop aoFechar está obsoleta; use onClose.");
+  }
+  const fechar = onClose ?? aoFechar ?? (() => {});
+  return <DialogoInterno {...resto} onClose={fechar} />;
+}
+```
+
+A tag `@deprecated` faz o editor riscar os usos antigos, o aviso no console aparece em desenvolvimento, e a remoção entra numa major, como visto no capítulo de publicação.
+
+### Codemods para migrações em massa
+
+Quando os usos são centenas, migrar à mão é lento e propenso a erro. Um codemod manipula a árvore sintática do código e aplica a mudança em todos os arquivos de uma vez. Com o jscodeshift, renomear a prop em todos os usos do `Dialogo`:
+
+```js
+// codemods/dialogo-onclose.js
+export default function transformar(arquivo, api) {
+  const j = api.jscodeshift;
+  return j(arquivo.source)
+    .findJSXElements("Dialogo")
+    .find(j.JSXAttribute, { name: { name: "aoFechar" } })
+    .forEach((caminho) => {
+      caminho.node.name.name = "onClose";
+    })
+    .toSource();
+}
+```
+
+```bash
+npx jscodeshift -t codemods/dialogo-onclose.js --parser=tsx apps/*/src
+```
+
+Revise o diff gerado como qualquer PR. Codemods acertam o caso comum; usos dinâmicos (props espalhadas com `...props`) costumam precisar de ajuste manual.
+
+### Branch by abstraction
+
+Para trocar uma implementação inteira (o cliente HTTP antigo baseado em `axios` com interceptadores mágicos pelo `src/servicos/api.ts` novo), crie primeiro uma abstração que os dois lados implementam, aponte todos os usos para a abstração e troque a implementação por trás dela, se preciso com uma feature flag para alternar e comparar em produção. Quando a nova estiver estável, apague a antiga e, se fizer sentido, a abstração.
+
+### Catracas: impedir que o débito cresça
+
+Pagar débito não adianta se ele continua entrando. Uma catraca permite que os números só andem numa direção. Proíba no lint o que não deve mais aparecer em código novo:
+
+```js
+// eslint.config.mjs (trecho)
+export default [
+  {
+    files: ["apps/*/src/**/*.{ts,tsx}"],
+    ignores: ["apps/*/src/legado/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { group: ["@/legado/*"], message: "Código novo não importa do legado. Use o equivalente em src/servicos." },
+          ],
+          paths: [{ name: "axios", message: "Use o cliente de src/servicos/api.ts." }],
+        },
+      ],
+      "@typescript-eslint/no-explicit-any": "error",
+    },
+  },
+];
+```
+
+Ligar `no-explicit-any` como erro com 140 ocorrências existentes travaria o CI. A saída é congelar as ocorrências atuais e exigir que o número só caia: o ESLint oferece supressões em massa (o comando com `--suppress-all` grava as violações existentes num arquivo de supressões), e qualquer violação nova falha. O mesmo vale para o script de contagem: o CI pode falhar se algum indicador subir em relação à `main`.
+
+## Strangler fig no front-end
+
+O strangler fig (figueira-estranguladora) é uma planta que cresce em volta de uma árvore hospedeira até substituí-la. Martin Fowler usou a imagem para descrever a substituição gradual de um sistema: o novo cresce ao redor do antigo, assumindo uma funcionalidade por vez, até que o antigo possa ser removido. Na Quitanda, o alvo é a SPA legada de "Minha conta".
+
+O Next.js tem a peça certa para isso: rewrites de **fallback**, aplicados só depois que o Next.js verificou todas as suas próprias rotas e arquivos. Rota que já existe no app novo é servida por ele; qualquer outra vai para o legado.
+
+```ts
+// apps/zona-conta/next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  async rewrites() {
+    return {
+      beforeFiles: [],
+      afterFiles: [],
+      fallback: [{ source: "/conta/:caminho*", destination: `${process.env.LEGADO_CONTA_URL}/conta/:caminho*` }],
+    };
+  },
+};
+
+export default config;
+```
+
+O plano de migração passa a ser uma lista de rotas:
+
+1. **Fachada primeiro.** Todo o tráfego de `/conta` passa pelo app novo, que no início não tem nenhuma rota de conta e encaminha tudo ao legado. Nada muda para o usuário, mas o ponto de controle está no lugar.
+2. **Uma rota por vez.** `/conta/enderecos` é reescrita no Next.js com a Quitanda UI e os testes. Ao fazer deploy, ela passa a ser servida pelo app novo; o resto continua no legado. Comece por rotas simples e de baixo risco para validar o caminho.
+3. **Estado compartilhado pelo servidor.** Sessão em cookie no mesmo domínio, dados no BFF. As duas aplicações leem a mesma fonte, e o usuário navega entre rotas novas e antigas sem perceber.
+4. **Medir o avanço.** Percentual de rotas e de tráfego servido pelo app novo, no dashboard. É o número que mostra ao negócio que o investimento está andando.
+5. **Remover o legado.** Quando a última rota migra, o fallback sai, o deploy da SPA antiga é desligado e o código é apagado. Esse passo precisa estar no plano desde o início; estranguladores que nunca terminam deixam dois sistemas para manter para sempre.
+
+A mesma ideia funciona dentro do código: o componente legado `BotaoVerde` passa a ser só um invólucro que renderiza o `Botao` da Quitanda UI; os usos migram aos poucos, e o invólucro some no fim.
+
+<Callout type="warning" title="Uma migração de cada vez">
+Strangler fig, troca de biblioteca de estilos, upgrade de Next.js e migração para micro frontends ao mesmo tempo é receita para um trimestre sem entregas e um time exausto. Escolha a migração de maior retorno, termine-a e só então comece a próxima.
+</Callout>
+
+## Negociando com o negócio
+
+Pedidos de "tempo para refatorar" costumam ser negados porque são feitos na língua errada. Quem decide prioridades pensa em prazo, risco, custo e receita. Traduza:
+
+| Em vez de dizer | Diga |
+|---|---|
+| "O `useCarrinho` está horrível." | "Mudanças no carrinho levam 3 dias e geram um bug por mês. Com 2 semanas de trabalho, passam a levar 1 dia." |
+| "Precisamos reescrever a área de conta." | "Toda funcionalidade de conta custa o dobro porque existe em dois sistemas. Podemos migrar rota a rota, sem parar entregas, em 8 semanas." |
+| "Precisamos atualizar o Next.js." | "Estamos uma versão atrás. Cada mês de atraso torna a atualização mais cara, e a versão atual deixa de receber correções de segurança em breve." |
+| "O código não tem testes." | "No último trimestre, 4 dos 6 incidentes foram em áreas sem teste. Cada incidente custou em média X em pedidos perdidos." |
+
+Algumas práticas que funcionam melhor que a grande negociação anual:
+
+- **Embuta no trabalho de produto.** A refatoração do carrinho entra na estimativa da próxima funcionalidade do carrinho, como parte do custo real de entregá-la.
+- **Reserve capacidade fixa.** Uma fração constante do tempo do time (muitos times usam entre 15% e 20%) para débito, sem precisar justificar item por item.
+- **Mostre os juros com dados**: hotspots, indicadores DORA, incidentes por área, tempo das últimas mudanças em cada módulo.
+- **Entregue e mostre o retorno.** Depois da refatoração do carrinho, apresente o tempo das mudanças seguintes. Confiança ganha uma vez facilita a próxima conversa.
+
+## Na entrevista
+
+**O que é débito técnico?** É o custo extra que mudanças futuras pagam por atalhos ou entendimento incompleto do passado. Como num empréstimo, ele cobra juros em cada mudança que passa pelo código afetado. Só importa onde há mudança: código ruim que ninguém toca não custa nada agora.
+
+**Como você prioriza débitos técnicos?** Pelos juros que cobram e pelo custo de pagar: cruzo frequência de mudança e complexidade (hotspots), olho incidentes e tempo de entrega por área e favoreço o que está no caminho do roadmap. Mantenho um registro com impacto, custo, proposta e dono.
+
+**O que é um teste de caracterização?** Um teste que registra o comportamento atual do código legado, mesmo o que parece errado, para servir de rede de segurança durante a refatoração. Ele separa mudar a estrutura de mudar o comportamento; possíveis bugs são anotados e decididos com o negócio.
+
+**Como você substituiria uma aplicação legada no front-end sem parar as entregas?** Com strangler fig: coloco uma fachada que recebe todo o tráfego e encaminha ao legado o que ainda não migrou (no Next.js, rewrites de fallback), migro rota a rota começando pelas de menor risco, compartilho sessão e dados pelo servidor, meço o avanço e removo o legado no fim.
+
+**Como você convence o negócio a investir em refatoração?** Falando em prazo, risco e custo, com dados: quanto tempo as mudanças levam hoje, quantos incidentes vêm da área, quanto melhora depois. Prefiro embutir a refatoração nas funcionalidades que passam pela área e reservar uma capacidade fixa, em vez de pedir uma grande reescrita.
+
+## Pratique
+
+1. Rode o comando de hotspots na Quitanda, cruze com o tamanho dos arquivos e escolha os três maiores candidatos. Crie o registro de débitos com impacto, custo, proposta e dono para cada um.
+2. Escreva testes de caracterização para o `calcularTotal` legado e para o componente de resumo do pedido, com casos tirados de pedidos reais anonimizados. Anote os comportamentos suspeitos sem corrigi-los.
+3. Divida o `useCarrinho` em hooks menores (itens, cálculo, sincronização com o BFF) sem mudar o comportamento, com os testes de caracterização verdes a cada commit.
+4. Faça a mudança paralela de `aoFechar` para `onClose` na Quitanda UI, escreva o codemod com jscodeshift, aplique-o nos apps e configure a catraca no ESLint para impedir o uso antigo.
+5. Configure o rewrite de fallback na zona de conta, migre `/conta/enderecos` para o Next.js e acompanhe no dashboard o percentual do tráfego de conta servido pelo app novo.
+
+<Quiz question="Qual módulo da Quitanda deve ter prioridade de refatoração?" options={["A página Sobre, escrita com componentes de classe e sem alterações há dois anos","O arquivo de configuração do Storybook","Um utilitário de datas pequeno e bem testado","O hook useCarrinho, muito complexo e alterado quase toda semana"]} answer={3} explanation="Débito cobra juros onde há mudança. Código complexo e alterado com frequência é o hotspot com maior retorno; código feio e estável pode esperar." />
+
+<Quiz question="Durante a caracterização, um caso do cálculo de desconto parece arredondar errado. O que fazer?" options={["Registrar no teste o valor atual, anotar a suspeita e levar a decisão ao negócio antes de mudar o comportamento","Corrigir o valor esperado no teste e ajustar a função","Remover o caso do teste para não atrapalhar a refatoração","Marcar o teste como skip"]} answer={0} explanation="O teste de caracterização protege o comportamento atual. Corrigir durante a refatoração mistura duas mudanças e pode quebrar uma regra de negócio que alguém pediu." />
+
+<Quiz question="Na estratégia de strangler fig com Next.js, para que serve o rewrite do tipo fallback?" options={["Para redirecionar usuários sem login","Para encaminhar ao legado apenas as rotas que o app novo ainda não implementa","Para servir arquivos estáticos do legado antes das páginas novas","Para fazer cache das páginas do legado"]} answer={1} explanation="Rewrites de fallback são aplicados depois que o Next.js verificou todas as suas rotas. O que já migrou é servido pelo app novo, e o resto segue para o legado." />
+
+## Base no CodeForge
+
+- [Strangler fig](/learn/system-design/strangler-fig): o padrão no contexto de sistemas e serviços.
+- [React: interpretando código legado](/learn/carreira-react/react-interpretando-codigo-legado): a leitura de código antigo que antecede qualquer refatoração.
+- [React: realizando testes avançados com Jest e Testing Library](/learn/carreira-react/react-testes-avancados-jest-testing-library): a base para os testes de caracterização.
+- [Código limpo](/learn/lld/codigo-limpo): o destino de cada pequena refatoração.
+- [Apresentar para a liderança](/learn/behavioral/apresentar-para-lideranca): como levar a conversa sobre débito para quem decide.
+
+## Referências
+
+- [Martin Fowler: Technical Debt Quadrant](https://martinfowler.com/bliki/TechnicalDebtQuadrant.html)
+- [Martin Fowler: Strangler Fig Application](https://martinfowler.com/bliki/StranglerFigApplication.html)
+- [Next.js: rewrites](https://nextjs.org/docs/app/api-reference/config/next-config-js/rewrites)
+- [jscodeshift](https://github.com/facebook/jscodeshift)
+- [ESLint: Bulk suppressions](https://eslint.org/docs/latest/use/suppressions)
+
+## Encerramento da carreira
+
+Aqui termina a jornada. A Quitanda começou como uma página HTML com uma lista de frutas e chegou a um sistema com design system publicado, BFF, eventos em tempo real, observabilidade, segurança revisada e um plano para os próprios débitos. O caminho que você percorreu com ela é o mesmo que separa quem escreve componentes de quem cuida de um front-end em produção: entender o navegador, escrever React com clareza, medir antes de otimizar, proteger o usuário e tomar decisões que o time consegue sustentar. Leve a Quitanda (ou um projeto seu construído do mesmo jeito) para o portfólio, conte nas entrevistas as decisões e os erros que encontrou no caminho e continue: o front-end muda todo ano, e o hábito de aprender, testar e refatorar com calma é o que faz a carreira durar.

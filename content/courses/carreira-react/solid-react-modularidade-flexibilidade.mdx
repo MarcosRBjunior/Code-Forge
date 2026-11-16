@@ -1,0 +1,408 @@
+---
+title: "SOLID aplicado ao React: melhorando a modularidade e flexibilidade do código"
+kind: lesson
+---
+
+O componente `Checkout` da Quitanda começou com 80 linhas no Nível 1. Hoje tem 600: busca o carrinho, calcula frete por bairro, valida o cupom, formata preços, chama o gateway de pagamento, grava o pedido, mostra toasts e ainda decide se o cliente é lojista para exibir o desconto de atacado. Toda mudança nele quebra outra coisa, o teste precisa mockar meia aplicação e duas pessoas não conseguem trabalhar nele ao mesmo tempo sem conflito no Git.
+
+SOLID são cinco princípios de design orientado a objetos, formulados por Robert C. Martin, que atacam exatamente esse tipo de problema: código que muda por motivos demais, que precisa ser editado para ganhar comportamento novo, que depende de detalhes concretos. React não usa classes, mas as ideias se traduzem bem para componentes, props, hooks e módulos. Cada princípio aparece aqui com um antes e depois na Quitanda, e no fim vem a parte que separa o sênior do entusiasta: quando aplicar SOLID vira exagero.
+
+**Você vai aprender:**
+
+- Dividir componentes e hooks por responsabilidade (SRP) sem criar fragmentos sem sentido
+- Estender comportamento por composição e configuração em vez de editar o componente (OCP)
+- Garantir que variações de um componente sejam substituíveis sem surpresas (LSP)
+- Enxugar props e contratos de hooks para o que o consumidor usa (ISP)
+- Inverter dependências com injeção por props e Context para testar e trocar implementações (DIP)
+- Reconhecer o ponto em que mais abstração atrapalha
+
+## Tradução dos princípios para React
+
+| Princípio | Ideia original | Em React |
+|---|---|---|
+| S: Single Responsibility | Uma classe deve ter um único motivo para mudar | Um componente ou hook cuida de uma preocupação: dados, regra ou apresentação |
+| O: Open/Closed | Aberto para extensão, fechado para modificação | Estender por props, `children`, composição e mapas de configuração |
+| L: Liskov Substitution | Subtipos substituem o tipo base sem quebrar quem usa | Variações de um componente respeitam o mesmo contrato de props e comportamento |
+| I: Interface Segregation | Clientes não dependem do que não usam | Props mínimas; hooks pequenos em vez de um hook que devolve tudo |
+| D: Dependency Inversion | Dependa de abstrações, não de implementações | Componentes recebem serviços por props ou Context; não importam o `fetch` concreto |
+
+## S: responsabilidade única
+
+O sintoma clássico é o componente que você descreve com "e": "o `CartaoDeProduto` busca o estoque **e** formata o preço **e** adiciona ao carrinho **e** registra o evento de analytics".
+
+```tsx
+// src/componentes/CartaoDeProduto.tsx (antes)
+"use client";
+import { useEffect, useState } from "react";
+
+export function CartaoDeProduto({ produtoId }: { produtoId: string }) {
+  const [produto, setProduto] = useState<Produto | null>(null);
+  const [carregando, setCarregando] = useState(true);
+
+  useEffect(() => {
+    fetch(`/api/produtos/${produtoId}`)
+      .then((r) => r.json())
+      .then((dados) => setProduto(dados))
+      .finally(() => setCarregando(false));
+  }, [produtoId]);
+
+  if (carregando) return <p>Carregando...</p>;
+  if (!produto) return null;
+
+  const preco = (produto.precoEmCentavos / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+
+  function adicionar() {
+    const carrinho = JSON.parse(localStorage.getItem("carrinho") ?? "[]");
+    localStorage.setItem("carrinho", JSON.stringify([...carrinho, { id: produto!.id, quantidade: 1 }]));
+    window.gtag?.("event", "add_to_cart", { item_id: produto!.id });
+  }
+
+  return (
+    <article>
+      <img src={produto.foto} alt={produto.nome} />
+      <h3>{produto.nome}</h3>
+      <p>{preco} / {produto.unidade}</p>
+      <button onClick={adicionar} disabled={produto.estoque === 0}>Adicionar</button>
+    </article>
+  );
+}
+```
+
+Quatro motivos para mudar: a API, o formato de preço, o armazenamento do carrinho e a ferramenta de analytics. Separando:
+
+```ts
+// src/utils/formatarPreco.ts
+const formatador = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+export const formatarPreco = (centavos: number) => formatador.format(centavos / 100);
+```
+
+```ts
+// src/hooks/useProduto.ts
+import { useQuery } from "@tanstack/react-query";
+import { buscarProduto } from "@/servicos/api";
+
+export function useProduto(id: string) {
+  return useQuery({ queryKey: ["produtos", id], queryFn: () => buscarProduto(id) });
+}
+```
+
+```tsx
+// src/componentes/CartaoDeProduto.tsx (depois)
+"use client";
+import { useProduto } from "@/hooks/useProduto";
+import { useCarrinho } from "@/hooks/useCarrinho";
+import { formatarPreco } from "@/utils/formatarPreco";
+
+export function CartaoDeProduto({ produtoId }: { produtoId: string }) {
+  const { data: produto, isPending } = useProduto(produtoId);
+  const { adicionar } = useCarrinho();
+
+  if (isPending) return <p>Carregando...</p>;
+  if (!produto) return null;
+
+  return (
+    <article>
+      <img src={produto.foto} alt={produto.nome} />
+      <h3>{produto.nome}</h3>
+      <p>{formatarPreco(produto.precoEmCentavos)} / {produto.unidade}</p>
+      <button onClick={() => adicionar(produto)} disabled={produto.estoque === 0}>
+        Adicionar
+      </button>
+    </article>
+  );
+}
+```
+
+O analytics foi para dentro de `useCarrinho` (ou de um observador do carrinho), o armazenamento também. O componente agora só muda se a apresentação mudar. Em Next.js, a busca poderia ir para um Server Component pai e o cartão receberia o `produto` pronto por prop, o que é ainda mais simples.
+
+<Callout type="tip" title="Responsabilidade não é tamanho">
+SRP não manda quebrar todo componente em pedaços de 20 linhas. Um formulário de endereço com 150 linhas de JSX e uma única preocupação está ótimo. O critério é o número de motivos para mudar, não o número de linhas.
+</Callout>
+
+## O: aberto para extensão, fechado para modificação
+
+O selo de destaque dos produtos começou com "orgânico". Depois veio "promoção", "últimas unidades", "da estação". A versão ingênua cresce com um `if` por tipo:
+
+```tsx
+// src/componentes/SeloDoProduto.tsx (antes)
+export function SeloDoProduto({ tipo }: { tipo: string }) {
+  if (tipo === "organico") return <span className="bg-green-100 text-green-800">Orgânico</span>;
+  if (tipo === "promocao") return <span className="bg-red-100 text-red-800">Promoção</span>;
+  if (tipo === "ultimas") return <span className="bg-amber-100 text-amber-800">Últimas unidades</span>;
+  // cada selo novo exige editar este arquivo
+  return null;
+}
+```
+
+Uma versão aberta para extensão troca o `if` por um mapa de configuração tipado. Adicionar um selo é adicionar uma entrada, sem mexer na lógica:
+
+```tsx
+// src/componentes/SeloDoProduto.tsx (depois)
+const selos = {
+  organico: { rotulo: "Orgânico", classe: "bg-green-100 text-green-800" },
+  promocao: { rotulo: "Promoção", classe: "bg-red-100 text-red-800" },
+  ultimas: { rotulo: "Últimas unidades", classe: "bg-amber-100 text-amber-800" },
+  estacao: { rotulo: "Da estação", classe: "bg-sky-100 text-sky-800" },
+} as const satisfies Record<string, { rotulo: string; classe: string }>;
+
+export type TipoDeSelo = keyof typeof selos;
+
+export function SeloDoProduto({ tipo }: { tipo: TipoDeSelo }) {
+  const { rotulo, classe } = selos[tipo];
+  return <span className={`rounded px-2 text-xs ${classe}`}>{rotulo}</span>;
+}
+```
+
+A outra ferramenta de OCP em React é a **composição**. Um `Modal` que aceita `children` e slots está fechado para modificação e aberto para qualquer conteúdo:
+
+```tsx
+// src/componentes/Modal.tsx
+type ModalProps = {
+  aberto: boolean;
+  aoFechar: () => void;
+  titulo: React.ReactNode;
+  rodape?: React.ReactNode;
+  children: React.ReactNode;
+};
+
+export function Modal({ aberto, aoFechar, titulo, rodape, children }: ModalProps) {
+  if (!aberto) return null;
+  return (
+    <div role="dialog" aria-modal="true" className="fixed inset-0 grid place-items-center bg-black/40">
+      <div className="w-full max-w-md rounded-lg bg-white p-6">
+        <header className="mb-4 flex justify-between">
+          <h2 className="text-lg font-semibold">{titulo}</h2>
+          <button onClick={aoFechar} aria-label="Fechar">×</button>
+        </header>
+        {children}
+        {rodape && <footer className="mt-6">{rodape}</footer>}
+      </div>
+    </div>
+  );
+}
+```
+
+O modal de confirmação de pedido, o de cupom e o de endereço usam o mesmo `Modal` sem que ele precise saber que existem. Uma prop `tipo="cupom"` com um `switch` interno seria o contrário de OCP.
+
+## L: substituição de Liskov
+
+Em React, Liskov aparece quando há variações de um componente que deveriam ser intercambiáveis. Se a Quitanda tem `Botao`, `BotaoPrimario` e `BotaoLink`, quem usa um deve poder trocar pelo outro sem surpresa.
+
+A violação típica é uma variante que aceita as mesmas props mas ignora parte delas ou muda o significado:
+
+```tsx
+// src/componentes/BotaoLink.tsx (viola LSP)
+export function BotaoLink({ children, onClick, disabled }: BotaoProps) {
+  // ignora disabled: o link continua clicável
+  return <a href="#" onClick={onClick} className="underline">{children}</a>;
+}
+```
+
+Quem trocou `Botao` por `BotaoLink` no carrinho vazio descobre em produção que o cliente conseguiu clicar em "Finalizar" com o carrinho vazio. A correção é respeitar o contrato herdado: se aceita `disabled`, honra `disabled`.
+
+```tsx
+// src/componentes/Botao.tsx
+import type { ComponentProps } from "react";
+
+type Variante = "primario" | "secundario" | "link";
+
+type BotaoProps = ComponentProps<"button"> & { variante?: Variante };
+
+const estilos: Record<Variante, string> = {
+  primario: "bg-green-700 text-white hover:bg-green-800",
+  secundario: "border border-green-700 text-green-700",
+  link: "text-green-700 underline",
+};
+
+export function Botao({ variante = "primario", className = "", ...props }: BotaoProps) {
+  return (
+    <button
+      {...props}
+      className={`rounded px-4 py-2 disabled:cursor-not-allowed disabled:opacity-50 ${estilos[variante]} ${className}`}
+    />
+  );
+}
+```
+
+Herdar `ComponentProps<"button">` e repassar o resto com spread garante que `disabled`, `type`, `aria-*` e `ref` (que no React 19 é uma prop comum) funcionem em todas as variantes. A aparência varia; o comportamento é o mesmo. Para navegação de verdade, use um componente separado baseado em `Link`, com contrato de link, em vez de fingir que um link é um botão.
+
+O mesmo vale para hooks com implementações alternativas: se `useCarrinhoLocal` e `useCarrinhoRemoto` devolvem a mesma forma, ambos precisam ter o mesmo comportamento observável (por exemplo, `adicionar` de um produto sem estoque deve falhar do mesmo jeito nos dois).
+
+## I: segregação de interfaces
+
+Um componente que recebe o objeto inteiro quando usa dois campos depende de tudo que muda nesse objeto e fica difícil de reaproveitar e testar.
+
+```tsx
+// src/componentes/ResumoDoPedido.tsx (antes)
+type Props = { pedido: Pedido }; // Pedido tem 25 campos, inclusive dados de pagamento
+
+export function ResumoDoPedido({ pedido }: Props) {
+  return <p>{pedido.itens.length} itens, total {formatarPreco(pedido.totalEmCentavos)}</p>;
+}
+```
+
+```tsx
+// src/componentes/ResumoDoPedido.tsx (depois)
+type Props = { quantidadeDeItens: number; totalEmCentavos: number };
+
+export function ResumoDoPedido({ quantidadeDeItens, totalEmCentavos }: Props) {
+  return <p>{quantidadeDeItens} itens, total {formatarPreco(totalEmCentavos)}</p>;
+}
+```
+
+Agora o mesmo resumo serve para o carrinho (que ainda não é um pedido) e o teste não precisa montar um `Pedido` falso completo. Quando a lista de props cresce, `Pick` ajuda a manter a ligação com o tipo de domínio sem exigir o todo: `Pick<Pedido, "id" | "status">`.
+
+Com hooks, o equivalente é o hook gigante:
+
+```ts
+// src/hooks/useLoja.ts (antes): todo componente que usa um pedaço re-renderiza com tudo
+export function useLoja() {
+  return { usuario, carrinho, adicionar, remover, cupom, aplicarCupom, frete, calcularFrete, favoritos, alternarFavorito };
+}
+```
+
+Divida em `useUsuario`, `useCarrinho`, `useCupom`, `useFrete`, `useFavoritos`. Cada consumidor importa só o que usa, os testes ficam focados e, se o estado vier de um Context, a divisão também reduz re-renderizações (ou use seletores, como mostra o capítulo de estado avançado).
+
+## D: inversão de dependência
+
+O checkout chama o gateway de pagamento direto:
+
+```tsx
+// src/componentes/Checkout.tsx (antes)
+import { GatewayXClient } from "gateway-x-sdk";
+
+const gateway = new GatewayXClient(process.env.NEXT_PUBLIC_GATEWAY_KEY!);
+
+export function Checkout() {
+  async function pagar(dados: DadosDoCartao) {
+    const resposta = await gateway.charges.create({ amount: total, card: dados });
+    // ...
+  }
+}
+```
+
+O componente de alto nível (a tela de checkout) depende de um detalhe de baixo nível (o SDK de um fornecedor). Para testar, é preciso mockar o módulo; para trocar de gateway, editar a tela. A inversão é definir a abstração do lado de quem usa:
+
+```ts
+// src/dominio/pagamento.ts
+export type ResultadoDoPagamento = { ok: true; transacaoId: string } | { ok: false; motivo: string };
+
+export interface ServicoDePagamento {
+  cobrar(pedidoId: string, totalEmCentavos: number, token: string): Promise<ResultadoDoPagamento>;
+}
+```
+
+```ts
+// src/adaptadores/pagamentoViaApi.ts
+import type { ServicoDePagamento } from "@/dominio/pagamento";
+
+export const pagamentoViaApi: ServicoDePagamento = {
+  async cobrar(pedidoId, totalEmCentavos, token) {
+    const resposta = await fetch("/api/pagamentos", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pedidoId, totalEmCentavos, token }),
+    });
+    if (!resposta.ok) return { ok: false, motivo: "Pagamento recusado" };
+    return { ok: true, transacaoId: (await resposta.json()).id };
+  },
+};
+```
+
+A injeção em React acontece por props (simples, explícito) ou por Context (quando a dependência atravessa muitas camadas):
+
+```tsx
+// src/contextos/ServicosContext.tsx
+"use client";
+import { createContext, use } from "react";
+import type { ServicoDePagamento } from "@/dominio/pagamento";
+import { pagamentoViaApi } from "@/adaptadores/pagamentoViaApi";
+
+type Servicos = { pagamento: ServicoDePagamento };
+
+const ServicosContext = createContext<Servicos>({ pagamento: pagamentoViaApi });
+
+export function ServicosProvider({ servicos, children }: { servicos: Servicos; children: React.ReactNode }) {
+  return <ServicosContext value={servicos}>{children}</ServicosContext>;
+}
+
+export const useServicos = () => use(ServicosContext);
+```
+
+No React 19, o próprio contexto pode ser usado como provider (`<ServicosContext value={...}>`) e lido com `use`. No teste, basta injetar um serviço falso:
+
+```tsx
+// src/componentes/Checkout.test.tsx
+const pagamentoFalso: ServicoDePagamento = {
+  cobrar: jest.fn().mockResolvedValue({ ok: false, motivo: "Cartão recusado" }),
+};
+
+render(
+  <ServicosProvider servicos={{ pagamento: pagamentoFalso }}>
+    <Checkout />
+  </ServicosProvider>,
+);
+await user.click(screen.getByRole("button", { name: /pagar/i }));
+expect(await screen.findByText("Cartão recusado")).toBeInTheDocument();
+```
+
+Esse é o mesmo mecanismo que o capítulo de arquitetura limpa usa para trocar o Supabase sem reescrever a UI.
+
+## Quando SOLID vira exagero
+
+Princípios são ferramentas para reduzir o custo de mudança. Aplicados onde não há mudança à vista, eles aumentam o custo de leitura sem devolver nada.
+
+| Sinal de exagero | Exemplo | O que fazer |
+|---|---|---|
+| Interface com uma única implementação e nenhuma perspectiva de segunda | `IFormatadorDePreco` com `FormatadorDePrecoImpl` | Use a função direto; extraia a interface quando a segunda implementação aparecer |
+| Componentes de 10 linhas que só repassam props | `CartaoWrapper` dentro de `CartaoContainer` dentro de `CartaoBase` | Junte; indireção sem decisão é ruído |
+| Mapa de configuração para dois casos que nunca vão crescer | Selo com só "ativo" e "inativo" | Um ternário é mais legível |
+| Context para injetar algo usado em um componente | `FormatadorContext` usado só no rodapé | Passe por prop ou importe |
+| Hooks divididos tão finos que todo componente importa cinco | `useNomeDoUsuario`, `useEmailDoUsuario`... | Agrupe pelo que muda junto |
+
+Os princípios KISS e YAGNI equilibram SOLID: comece simples e aplique a separação quando o segundo caso real chegar (a "regra de três" de refatoração é um bom gatilho). O objetivo é que a próxima mudança provável seja barata, não que toda mudança imaginável seja.
+
+<Callout type="warning" title="SOLID não substitui conhecer o React">
+Separar um componente em vários pode piorar a performance se você passar objetos novos por props a cada render, e um Context mal desenhado re-renderiza a árvore inteira. Princípios de design andam junto com o modelo de renderização do React, não acima dele.
+</Callout>
+
+## Na entrevista
+
+**Como o SRP se aplica a componentes React?** Um componente ou hook deve ter um motivo para mudar. Separo busca de dados (hook ou Server Component), regras de negócio (funções puras ou casos de uso) e apresentação (componente que recebe dados por props). O critério é o motivo de mudança, não o número de linhas.
+
+**Dê um exemplo de Open/Closed em React.** Um `Modal` que recebe `children` e slots como `rodape`: qualquer conteúdo novo entra sem editar o modal. Outro é trocar uma cadeia de `if` por um mapa de configuração tipado com `satisfies`.
+
+**Como você aplica inversão de dependência no front-end?** Defino uma interface do lado de quem usa (por exemplo, `ServicoDePagamento`), escrevo o adaptador concreto e injeto por props ou Context. A tela não importa SDK nem `fetch`, e o teste injeta uma implementação falsa sem mockar módulos.
+
+**O que é violar Liskov num componente?** Uma variante que aceita o mesmo contrato mas muda o comportamento, como um `BotaoLink` que ignora `disabled`. Quem troca uma variante pela outra quebra sem perceber. Herdar as props nativas com `ComponentProps` e repassá-las ajuda a manter o contrato.
+
+**Quando SOLID atrapalha?** Quando cria abstrações sem segunda implementação, camadas que só repassam props ou Contexts para dependências locais. Aplico quando a mudança é provável, seguindo KISS e YAGNI.
+
+## Pratique
+
+1. Pegue o maior componente da sua Quitanda, liste os motivos para ele mudar e divida-o em hook de dados, funções puras e componente de apresentação.
+2. Transforme o `SeloDoProduto` (ou outro componente cheio de `if`) num mapa de configuração com `satisfies` e adicione um selo novo sem tocar na lógica.
+3. Crie `Botao` com três variantes herdando `ComponentProps<"button">` e escreva um teste que garante que `disabled` funciona nas três.
+4. Encontre um componente que recebe um objeto de domínio inteiro e reduza as props ao que ele usa. Reaproveite-o em outro lugar.
+5. Introduza `ServicoDePagamento` com um adaptador real e um falso, injete por Context e escreva o teste de pagamento recusado sem `jest.mock`.
+6. Revise o código e encontre uma abstração que não se paga. Remova-a e explique o porquê no pull request.
+
+<Quiz question="O componente CartaoDeProduto busca dados, formata preço, grava no localStorage e envia analytics. Qual princípio ele viola mais diretamente?" options={["Liskov","Segregação de interfaces","Responsabilidade única","Aberto/fechado"]} answer={2} explanation="Ele tem vários motivos para mudar (API, formato, armazenamento, analytics). Separar em hooks e funções puras aplica o SRP." />
+
+<Quiz question="Qual técnica aplica inversão de dependência no checkout da Quitanda?" options={["Definir a interface ServicoDePagamento e injetar a implementação por props ou Context","Importar o SDK do gateway direto no componente","Mover o SDK para uma variável global","Usar useMemo para guardar a instância do SDK"]} answer={0} explanation="A tela passa a depender de uma abstração definida do lado dela; o adaptador concreto é injetado, o que facilita testes e troca de fornecedor." />
+
+<Quiz question="Qual destes é um sinal de que SOLID virou exagero?" options={["Um hook useCarrinho separado de useUsuario","Um mapa de configuração para doze tipos de selo","Um Modal que aceita children","Uma interface IFormatadorDePreco com uma única implementação e nenhuma segunda à vista"]} answer={3} explanation="Interface sem segunda implementação adiciona indireção sem benefício. Extraia a abstração quando o segundo caso real aparecer." />
+
+## Base no CodeForge
+
+- [SOLID em Low Level Design](/learn/lld/srp): os cinco princípios em detalhe, a partir do SRP.
+- [Inversão de dependência](/learn/lld/dip) e [Injeção de dependência](/learn/lld/injecao-de-dependencia): a base do padrão de serviços injetados.
+- [YAGNI](/learn/lld/yagni) e [KISS](/learn/lld/kiss): o contrapeso para não exagerar.
+- [React: explorando padrões de composição com custom hooks](/learn/carreira-react/react-padroes-composicao-custom-hooks): composição e hooks, as ferramentas de SOLID em React.
+
+## Referências
+
+- [React: Thinking in React](https://react.dev/learn/thinking-in-react)
+- [React: Passing Data Deeply with Context](https://react.dev/learn/passing-data-deeply-with-context)
+- [React: Reusing Logic with Custom Hooks](https://react.dev/learn/reusing-logic-with-custom-hooks)
+- [TypeScript: the satisfies operator](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html)

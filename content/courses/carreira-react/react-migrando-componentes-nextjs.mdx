@@ -1,0 +1,395 @@
+---
+title: "React: migrando componentes para Next.js"
+kind: lesson
+---
+
+A Quitanda em Vite é uma SPA: o servidor entrega um `index.html` quase vazio e todo o catálogo aparece depois que o JavaScript baixa, executa e busca os produtos na API. Isso tem preço. O Google indexa mal páginas de produto que dependem de JavaScript, o link compartilhado no WhatsApp não mostra foto nem preço, e o LCP no celular sofre porque nada útil chega no primeiro HTML. Além disso, o time mantém à mão coisas que um framework daria pronto: rotas, otimização de imagens, carregamento de fontes, código de servidor para esconder chaves de API.
+
+Next.js é o framework React mais usado para resolver isso. Com o App Router, cada rota pode renderizar no servidor, componentes podem buscar dados direto do banco ou da API sem enviar esse código ao navegador, e o resto da experiência React continua igual. Este capítulo migra a Quitanda de Vite + React Router para Next.js 16, aos poucos e sem reescrever os componentes.
+
+**Você vai aprender:**
+
+- A estrutura do App Router: `app/`, `page.tsx`, `layout.tsx` e arquivos especiais
+- A diferença entre Server Components e Client Components e onde colocar `'use client'`
+- Uma estratégia de migração incremental a partir de uma SPA Vite com React Router
+- Como traduzir rotas, navegação, parâmetros e providers do React Router para o Next.js
+- Otimizar imagens e fontes com `next/image` e `next/font`
+- Tratar variáveis de ambiente e código que só pode rodar no servidor
+
+## Criando o projeto e a estrutura de app/
+
+```bash
+npx create-next-app@latest quitanda-next
+# TypeScript, ESLint, Tailwind CSS, diretório src/ e App Router: sim
+```
+
+O Next.js 16 exige Node.js 20.9 ou superior (use o 24 LTS), usa o Turbopack como bundler padrão em desenvolvimento e build, e não tem mais o comando `next lint`: o ESLint roda direto pelo seu script. Em vez de `middleware.ts`, a interceptação de requisições agora fica em `proxy.ts`, tema do capítulo de autenticação.
+
+No App Router, **pastas definem rotas** e arquivos com nomes especiais definem o que cada rota renderiza:
+
+```text
+src/app/
+├── layout.tsx                 # layout raiz: html, body, cabeçalho
+├── page.tsx                   # /  (catálogo)
+├── loading.tsx                # fallback de carregamento das rotas abaixo
+├── error.tsx                  # error boundary das rotas abaixo
+├── not-found.tsx              # 404
+├── produtos/
+│   └── [id]/
+│       └── page.tsx           # /produtos/:id
+├── carrinho/
+│   └── page.tsx               # /carrinho
+├── (conta)/                   # grupo de rotas: não aparece na URL
+│   ├── layout.tsx
+│   └── pedidos/
+│       ├── page.tsx           # /pedidos
+│       └── [id]/page.tsx      # /pedidos/:id
+└── painel/
+    ├── layout.tsx             # layout do lojista com menu lateral
+    ├── page.tsx               # /painel
+    └── produtos/page.tsx      # /painel/produtos
+```
+
+| Arquivo | Papel |
+|---|---|
+| `page.tsx` | A interface da rota; sem ele, a pasta não é uma rota pública |
+| `layout.tsx` | Envolve as páginas abaixo e persiste entre navegações (não re-monta) |
+| `loading.tsx` | Vira um `Suspense` automático em volta da página |
+| `error.tsx` | Vira um error boundary em volta da página; precisa ser Client Component |
+| `not-found.tsx` | Renderizado quando a página chama `notFound()` |
+| `route.ts` | Endpoint HTTP (GET, POST...) em vez de página, como `app/api/metricas/route.ts` |
+
+Pastas entre parênteses, como `(conta)`, agrupam rotas para compartilhar um layout sem afetar a URL. Pastas que começam com `_` são privadas e não viram rota, úteis para `_componentes/` junto da rota.
+
+```tsx
+// src/app/layout.tsx
+import type { Metadata } from "next";
+import { Inter } from "next/font/google";
+import { Provedores } from "./provedores";
+import { Cabecalho } from "@/componentes/Cabecalho";
+import "./globals.css";
+
+const inter = Inter({ subsets: ["latin"], variable: "--fonte-inter" });
+
+export const metadata: Metadata = {
+  title: { default: "Quitanda", template: "%s | Quitanda" },
+  description: "Frutas, verduras e legumes frescos entregues em casa.",
+};
+
+export default function LayoutRaiz({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="pt-BR" className={inter.variable}>
+      <body>
+        <Provedores>
+          <Cabecalho />
+          <main>{children}</main>
+        </Provedores>
+      </body>
+    </html>
+  );
+}
+```
+
+O layout raiz substitui o `index.html` e o `main.tsx` do Vite: é ele que renderiza `html` e `body`. A exportação `metadata` gera `title` e `meta` sem `react-helmet`.
+
+## Server Components e Client Components
+
+No App Router, **todo componente é Server Component por padrão**. Ele roda no servidor (no build ou a cada requisição), pode ser `async`, pode acessar banco, sistema de arquivos e segredos, e seu código não vai para o navegador. O que chega ao cliente é o resultado renderizado.
+
+```tsx
+// src/app/produtos/[id]/page.tsx
+import { notFound } from "next/navigation";
+import { buscarProduto } from "@/servicos/produtos";
+import { BotaoAdicionar } from "@/componentes/BotaoAdicionar";
+import { formatarPreco } from "@/utilidades/formatarPreco";
+
+export default async function PaginaDoProduto({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const produto = await buscarProduto(id);
+  if (!produto) notFound();
+
+  return (
+    <article>
+      <h1>{produto.nome}</h1>
+      <p>{formatarPreco(produto.precoEmCentavos)} / {produto.unidade}</p>
+      <BotaoAdicionar produto={produto} />
+    </article>
+  );
+}
+```
+
+Desde o Next.js 15, `params` e `searchParams` são Promises: aguarde-os com `await` (ou `use` num Client Component). O Next.js 16 também gera tipos auxiliares globais como `PageProps<"/produtos/[id]">` para não escrever o formato à mão.
+
+Server Components não podem usar estado, efeitos, handlers de evento nem APIs do navegador. Para isso existe o Client Component, marcado com a diretiva `'use client'` no topo do arquivo:
+
+```tsx
+// src/componentes/BotaoAdicionar.tsx
+"use client";
+
+import { useCarrinho } from "@/estado/useCarrinho";
+import type { Produto } from "@/esquemas/produto";
+
+export function BotaoAdicionar({ produto }: { produto: Produto }) {
+  const { adicionar } = useCarrinho();
+  return <button onClick={() => adicionar(produto)}>Adicionar ao carrinho</button>;
+}
+```
+
+Client Components também são pré-renderizados em HTML no servidor; a diferença é que o código deles vai para o navegador e eles são hidratados para ficarem interativos. `'use client'` não significa "só no cliente", significa "a partir daqui, este módulo e o que ele importa fazem parte do bundle do cliente".
+
+| | Server Component | Client Component |
+|---|---|---|
+| Diretiva | Nenhuma (padrão) | `'use client'` no topo do arquivo |
+| Pode ser `async` e buscar dados direto | Sim | Não (use TanStack Query ou `use`) |
+| `useState`, `useEffect`, handlers | Não | Sim |
+| Acesso a segredos, banco, `fs` | Sim | Não |
+| Vai para o bundle do navegador | Não | Sim |
+
+### A fronteira
+
+`'use client'` marca uma **fronteira**: tudo que o arquivo importa vira código de cliente. Por isso, coloque a diretiva o mais fundo possível na árvore, nas folhas interativas (`BotaoAdicionar`, `SeletorQuantidade`, `BuscaDeProdutos`), e mantenha páginas e layouts como Server Components.
+
+Duas regras práticas:
+
+- **Props que cruzam a fronteira precisam ser serializáveis**: strings, números, objetos simples, arrays, `Date`, Promises. Funções não podem ser passadas de um Server Component para um Client Component (exceto Server Actions).
+- **Server Components podem entrar num Client Component como `children`**. Um `Modal` com `'use client'` pode receber como filho uma lista renderizada no servidor; o padrão de composição do capítulo de custom hooks resolve a fronteira.
+
+Para garantir que um módulo com segredos nunca seja importado por engano num Client Component, importe o pacote `server-only` no topo dele: o build falha se isso acontecer.
+
+```ts
+// src/servicos/produtos.ts
+import "server-only";
+import { produtoSchema } from "@/esquemas/produto";
+
+export async function buscarProduto(id: string) {
+  const resposta = await fetch(`${process.env.API_URL}/produtos/${id}`, {
+    headers: { Authorization: `Bearer ${process.env.API_TOKEN}` },
+  });
+  if (resposta.status === 404) return null;
+  if (!resposta.ok) throw new Error(`Falha ao buscar produto ${id}`);
+  return produtoSchema.parse(await resposta.json());
+}
+```
+
+## Estratégia de migração incremental
+
+A documentação do Next.js descreve uma migração a partir do Vite em dois tempos, que evita parar o time:
+
+1. **Rodar a SPA dentro do Next.js.** Instale o Next.js no projeto, crie o layout raiz a partir do `index.html` e uma rota opcional que captura tudo, `app/[[...slug]]/page.tsx`, que renderiza o `App` antigo só no cliente. A aplicação continua sendo a mesma SPA com React Router, mas já roda sobre o Next.js, com as variáveis de ambiente e scripts ajustados.
+2. **Mover rota por rota.** Crie `app/produtos/[id]/page.tsx` como página real; as rotas específicas têm precedência sobre o catch-all. Repita até o catch-all não ter mais nada e o React Router sair do projeto.
+
+```tsx
+// src/app/[[...slug]]/cliente.tsx
+"use client";
+
+import dynamic from "next/dynamic";
+
+const App = dynamic(() => import("../../App"), { ssr: false });
+
+export function ClienteSpa() {
+  return <App />;
+}
+```
+
+```tsx
+// src/app/[[...slug]]/page.tsx
+import { ClienteSpa } from "./cliente";
+
+export function generateStaticParams() {
+  return [{ slug: [""] }];
+}
+
+export default function Pagina() {
+  return <ClienteSpa />;
+}
+```
+
+`dynamic` com `ssr: false` só é permitido em Client Components, por isso o arquivo intermediário. Como o `App` só roda no navegador, o React Router antigo continua cuidando da navegação; o catch-all garante que qualquer URL (um deep link como `/produtos/42`) chegue a ele. Troque `import.meta.env.VITE_*` por `process.env.NEXT_PUBLIC_*` já nesta etapa.
+
+Ordem recomendada de migração das rotas: primeiro as que mais ganham com servidor e são simples (página de produto, catálogo), por último as mais interativas e autenticadas (checkout, painel).
+
+## Do React Router para o App Router
+
+| React Router 7 (Vite) | Next.js App Router |
+|---|---|
+| `createBrowserRouter([...])` em `rotas.tsx` | Estrutura de pastas em `app/` |
+| `path: "produtos/:id"` | Pasta `produtos/[id]/` |
+| `path: "*"` | `not-found.tsx` ou `[...slug]` |
+| Rota de layout com `Outlet` | `layout.tsx` com `children` |
+| `Link to="/carrinho"` | `Link href="/carrinho"` de `next/link` |
+| `useNavigate()` | `useRouter()` de `next/navigation` (`router.push`) |
+| `useParams()` | Prop `params` (servidor) ou `useParams()` (cliente) |
+| `useSearchParams()` | Prop `searchParams` (servidor) ou `useSearchParams()` (cliente) |
+| `useLocation().pathname` | `usePathname()` |
+| `loader` da rota | Server Component `async` buscando o dado |
+| `errorElement` / `ErrorBoundary` | `error.tsx` |
+| `lazy` na rota | Automático: cada rota é um chunk |
+
+```tsx
+// src/componentes/LinkDoMenu.tsx
+"use client";
+
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+
+export function LinkDoMenu({ href, children }: { href: string; children: React.ReactNode }) {
+  const caminho = usePathname();
+  const ativo = caminho === href || caminho.startsWith(`${href}/`);
+  return (
+    <Link href={href} aria-current={ativo ? "page" : undefined} className={ativo ? "font-bold" : ""}>
+      {children}
+    </Link>
+  );
+}
+```
+
+Os hooks de navegação vêm de `next/navigation`, não de `next/router` (que é do Pages Router antigo). O `Link` faz prefetch das rotas visíveis na tela em produção. Um Client Component que usa `useSearchParams` precisa estar dentro de um `Suspense` para não forçar a rota inteira a renderizar só no cliente.
+
+## Providers: TanStack Query, Redux e contexto
+
+Providers usam contexto, que só existe em Client Components. Concentre todos num único arquivo cliente e use-o no layout raiz:
+
+```tsx
+// src/app/provedores.tsx
+"use client";
+
+import { useState } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Provider as ReduxProvider } from "react-redux";
+import { criarStore, type AppStore } from "@/estado/store";
+import { CarrinhoProvider } from "@/estado/CarrinhoContext";
+
+export function Provedores({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient({ defaultOptions: { queries: { staleTime: 60_000 } } }));
+  const [store] = useState<AppStore>(() => criarStore());
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ReduxProvider store={store}>
+        <CarrinhoProvider>{children}</CarrinhoProvider>
+      </ReduxProvider>
+    </QueryClientProvider>
+  );
+}
+```
+
+Duas mudanças importantes em relação à SPA. Primeiro, o `QueryClient` e a store do Redux não podem ser variáveis de módulo: no servidor, o módulo é compartilhado entre requisições de usuários diferentes, e o carrinho de um cliente vazaria para outro. Crie-os por instância, como acima (`criarStore` é uma função que chama `configureStore`). Segundo, os providers ficam o mais perto possível de quem precisa, e `children` passados por eles continuam sendo Server Components.
+
+Com dados buscados no servidor, boa parte do TanStack Query deixa de ser necessária para leitura. Ele continua útil no cliente para dados que mudam com interação (o status do pedido sendo acompanhado, filtros do painel) e pode receber dados iniciais do servidor por hidratação.
+
+## Imagens com next/image
+
+O componente `Image` gera versões redimensionadas, serve formatos modernos (WebP, AVIF), aplica lazy loading e reserva o espaço da imagem para evitar CLS.
+
+```tsx
+// src/componentes/CartaoProduto.tsx (trecho)
+import Image from "next/image";
+
+<Image
+  src={produto.foto}
+  alt={produto.nome}
+  width={320}
+  height={240}
+  sizes="(max-width: 640px) 50vw, 320px"
+  className="rounded object-cover"
+/>
+```
+
+Imagens remotas precisam ser autorizadas no `next.config.ts`:
+
+```ts
+// next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  images: {
+    remotePatterns: [new URL("https://cdn.quitanda.example/fotos/**")],
+  },
+};
+
+export default config;
+```
+
+Para a foto de destaque da home, que provavelmente é o elemento de LCP, use `preload` (no Next.js 16, substitui a antiga prop `priority`) para que ela seja carregada cedo, sem lazy loading. Imagens de tamanho desconhecido podem usar `fill` dentro de um contêiner com posição relativa e dimensões definidas.
+
+## Fontes com next/font
+
+`next/font` baixa a fonte no build e a serve do próprio domínio, sem requisição ao Google no navegador do usuário, e aplica `size-adjust` para reduzir o salto de layout quando a fonte carrega. O layout raiz acima já usa `Inter` com uma variável CSS; no Tailwind CSS 4, conecte a variável ao tema:
+
+```css
+/* src/app/globals.css */
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--fonte-inter);
+}
+```
+
+Para fontes próprias, `next/font/local` recebe o caminho do arquivo.
+
+## Variáveis de ambiente
+
+| Vite | Next.js |
+|---|---|
+| `import.meta.env.VITE_API_URL` | `process.env.NEXT_PUBLIC_API_URL` (exposta ao navegador) |
+| Sem equivalente seguro | `process.env.API_TOKEN` (só no servidor) |
+| `.env`, `.env.local`, `.env.production` | Os mesmos nomes de arquivo |
+
+Variáveis com prefixo `NEXT_PUBLIC_` são embutidas no JavaScript do cliente **no momento do build**: mudar o valor depois exige novo build. Variáveis sem o prefixo só existem no servidor; num Client Component, `process.env.API_TOKEN` é `undefined`. É aqui que a migração traz um ganho de segurança: o token da API de frete, que na SPA ficava exposto no bundle, passa a ser lido só em Server Components, Route Handlers e Server Actions.
+
+<Callout type="warning" title="Segredo com NEXT_PUBLIC_ é segredo publicado">
+Qualquer valor com o prefixo `NEXT_PUBLIC_` pode ser lido por qualquer pessoa que abra o DevTools. Nunca coloque chaves de API privadas, tokens de pagamento ou senhas nesse prefixo. Se um Client Component precisa de um dado protegido, ele chama um Route Handler ou uma Server Action, que usa o segredo no servidor.
+</Callout>
+
+## Armadilhas comuns na migração
+
+- **`window` ou `localStorage` no topo de um componente.** Client Components também renderizam no servidor. Acesse APIs do navegador dentro de `useEffect`, em handlers ou com `useSyncExternalStore` e um snapshot de servidor (como o `useLocalStorage` do capítulo de custom hooks).
+- **Erro de hidratação.** O HTML do servidor difere do primeiro render no cliente: datas com `new Date()`, `Math.random()`, formatação dependente de fuso. Calcule no servidor e passe por prop, ou renderize depois da montagem.
+- **`'use client'` no layout raiz** para "resolver" erros: transforma a aplicação inteira em cliente e joga fora os ganhos. Isole a parte interativa.
+- **Biblioteca sem `'use client'`.** Componentes de bibliotecas antigas que usam hooks podem quebrar em Server Components; reexporte-os num arquivo seu com a diretiva.
+
+<Callout type="tip" title="Testes continuam valendo">
+Componentes cliente se testam com Jest e Testing Library como antes; o `next/jest` configura o transformador e os aliases. Server Components `async` ainda não têm bom suporte em testes de unidade com Testing Library: teste a lógica de dados separadamente e cubra as páginas com testes end-to-end no Playwright.
+</Callout>
+
+## Na entrevista
+
+**Qual a diferença entre Server Component e Client Component?** Server Components rodam só no servidor, podem ser `async`, acessam dados e segredos diretamente e não enviam código ao navegador. Client Components têm estado, efeitos e eventos; são pré-renderizados no servidor e hidratados no cliente, e seu código vai para o bundle.
+
+**O que `'use client'` faz exatamente?** Marca uma fronteira de módulo: o arquivo e tudo que ele importa passam a fazer parte do bundle do cliente. Não significa que o componente deixa de ser renderizado no servidor. Coloco a diretiva nas folhas interativas.
+
+**Como você migraria uma SPA grande para o Next.js?** Primeiro rodo a SPA inteira dentro do Next.js com uma rota catch-all renderizada no cliente, ajustando build, variáveis e deploy. Depois migro rota por rota para páginas do App Router, começando pelas públicas e mais simples, até remover o React Router.
+
+**Por que o QueryClient ou a store do Redux não podem ser globais no Next.js?** Porque o módulo no servidor é compartilhado entre requisições, e o estado de um usuário vazaria para outro. Crio as instâncias por requisição ou por montagem do provider, com `useState` ou `useRef`.
+
+**Qual a diferença entre `NEXT_PUBLIC_API_URL` e `API_TOKEN`?** A primeira é embutida no bundle do cliente durante o build e é pública. A segunda só existe no servidor. Segredos nunca recebem o prefixo `NEXT_PUBLIC_`.
+
+## Pratique
+
+1. Crie o projeto Next.js 16 da Quitanda, rode a SPA atual numa rota catch-all e confirme que todas as rotas antigas continuam funcionando.
+2. Migre a página de produto para `app/produtos/[id]/page.tsx` como Server Component, com `notFound()` para id inexistente e `metadata` dinâmica via `generateMetadata`.
+3. Identifique os componentes que precisam de `'use client'` no catálogo e mantenha a página e o layout como Server Components.
+4. Crie `app/provedores.tsx` com TanStack Query, Redux e o contexto do carrinho, garantindo instâncias por montagem.
+5. Troque todas as `img` por `next/image` com `remotePatterns` e compare o CLS do catálogo antes e depois.
+6. Mova o token da API de frete para uma variável sem `NEXT_PUBLIC_` e confirme, buscando no bundle gerado, que ele não aparece mais.
+
+<Quiz question="Um componente usa useState e foi importado numa página do App Router sem nenhuma diretiva. O que acontece?" options={["Funciona, porque páginas são sempre Client Components","O Next.js adiciona use client automaticamente","O estado é mantido no servidor entre requisições","Dá erro, porque sem a diretiva ele é tratado como Server Component, que não pode usar hooks de estado"]} answer={3} explanation="No App Router, componentes são Server Components por padrão. Hooks como useState exigem a diretiva use client no arquivo do componente." />
+
+<Quiz question="Qual prop pode ser passada de um Server Component para um Client Component?" options={["Um objeto produto com strings e números","Uma função de callback comum","Uma instância de classe com métodos","Uma conexão de banco de dados"]} answer={0} explanation="Props que cruzam a fronteira são serializadas. Objetos simples passam; funções comuns, instâncias de classe e recursos de servidor não." />
+
+<Quiz question="Onde fica a definição da rota /produtos/:id no App Router?" options={["Num array de rotas em app/rotas.ts","No arquivo app/produtos/[id]/page.tsx","No next.config.ts","Em pages/produtos.tsx com useParams"]} answer={1} explanation="Pastas definem segmentos de rota; colchetes indicam segmento dinâmico, e page.tsx torna a rota acessível." />
+
+## Base no CodeForge
+
+- [React: construindo SPAs com React Router](/learn/carreira-react/react-spas-react-router): as rotas que este capítulo migra.
+- [React: explorando estratégias de renderização do Next.js](/learn/carreira-react/react-estrategias-renderizacao-nextjs): o próximo passo, decidir como cada rota renderiza.
+- [Strangler fig](/learn/system-design/strangler-fig): o padrão de migração incremental aplicado aqui com a rota catch-all.
+- [Gestão de segredos](/learn/system-design/gestao-de-segredos): por que tokens não podem ir para o bundle.
+
+## Referências
+
+- [Next.js: Project Structure](https://nextjs.org/docs/app/getting-started/project-structure)
+- [Next.js: Server and Client Components](https://nextjs.org/docs/app/getting-started/server-and-client-components)
+- [Next.js: Migrating from Vite](https://nextjs.org/docs/app/guides/migrating/from-vite)
+- [Next.js: Upgrading to version 16](https://nextjs.org/docs/app/guides/upgrading/version-16)
+- [React: 'use client'](https://react.dev/reference/rsc/use-client)

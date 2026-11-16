@@ -1,0 +1,428 @@
+---
+title: "React: utilizando GraphQL para integração de dados"
+kind: lesson
+---
+
+O painel do lojista da Quitanda cresceu. A tela de pedidos mostra, para cada pedido, o nome do cliente, o bairro, os itens com nome e foto do produto e o total. Com a API REST, isso virou uma cascata: `GET /pedidos`, depois um `GET /clientes/:id` por pedido e um `GET /produtos/:id` por item, ou então um endpoint sob medida, `/painel/pedidos-resumo`, que o time de back-end precisa alterar toda vez que a tela ganha uma coluna. Ao mesmo tempo, o aplicativo de entregadores quer os mesmos pedidos com outros campos, e o catálogo baixa a descrição completa de cada produto só para mostrar nome e preço.
+
+GraphQL ataca esse descompasso entre o que a tela precisa e o que o endpoint entrega. O cliente descreve exatamente os dados que quer, numa única requisição, e o servidor responde no mesmo formato. Este capítulo apresenta os conceitos, escreve queries, mutations e fragments para a Quitanda, integra o React com o Apollo Client e mostra como o cache normalizado mantém a tela coerente, terminando com uma comparação honesta com REST.
+
+**Você vai aprender:**
+
+- Entender schema, tipos, queries, mutations e variáveis do GraphQL
+- Reaproveitar seleções de campos com fragments
+- Configurar o Apollo Client 4 num projeto Vite
+- Buscar e alterar dados com `useQuery` e `useMutation`
+- Entender o cache normalizado e as políticas de busca
+- Decidir entre GraphQL e REST para cada contexto
+
+## Os conceitos em uma página
+
+Uma API GraphQL tem **um endpoint** (normalmente `POST /graphql`) e um **schema** tipado que descreve tudo o que pode ser consultado. O schema é o contrato entre front e back. O servidor da Quitanda, construído com Node.js como no capítulo de GraphQL da carreira Node.js, expõe:
+
+```graphql
+# servidor/schema.graphql
+enum StatusPedido {
+  RECEBIDO
+  SEPARANDO
+  SAIU_PARA_ENTREGA
+  ENTREGUE
+}
+
+type Produto {
+  id: ID!
+  nome: String!
+  precoEmCentavos: Int!
+  unidade: String!
+  categoria: String!
+  estoque: Int!
+  foto: String
+}
+
+type ItemPedido {
+  produto: Produto!
+  quantidade: Int!
+  precoEmCentavos: Int!
+}
+
+type Cliente {
+  id: ID!
+  nome: String!
+  bairro: String!
+}
+
+type Pedido {
+  id: ID!
+  cliente: Cliente!
+  itens: [ItemPedido!]!
+  totalEmCentavos: Int!
+  status: StatusPedido!
+  criadoEm: String!
+}
+
+type Query {
+  produtos(categoria: String): [Produto!]!
+  produto(id: ID!): Produto
+  pedidos(status: StatusPedido): [Pedido!]!
+}
+
+type Mutation {
+  atualizarStatusPedido(id: ID!, status: StatusPedido!): Pedido!
+}
+```
+
+O `!` marca campos que nunca são nulos. `[ItemPedido!]!` é uma lista não nula de itens não nulos. `Query` e `Mutation` são os pontos de entrada: leituras e escritas.
+
+### Queries e variáveis
+
+A tela de pedidos pede só o que mostra:
+
+```graphql
+query PedidosDoPainel($status: StatusPedido) {
+  pedidos(status: $status) {
+    id
+    status
+    totalEmCentavos
+    cliente {
+      nome
+      bairro
+    }
+    itens {
+      quantidade
+      produto {
+        nome
+        foto
+      }
+    }
+  }
+}
+```
+
+A resposta tem exatamente esse formato, dentro de `data`:
+
+```json
+{
+  "data": {
+    "pedidos": [
+      {
+        "id": "71",
+        "status": "SEPARANDO",
+        "totalEmCentavos": 4590,
+        "cliente": { "nome": "Ana", "bairro": "Centro" },
+        "itens": [{ "quantidade": 2, "produto": { "nome": "Banana prata", "foto": "/fotos/banana.jpg" } }]
+      }
+    ]
+  }
+}
+```
+
+Uma requisição, sem campos sobrando (overfetching) e sem idas e voltas para completar dados (underfetching). Os valores dinâmicos vão em **variáveis** (`$status`), nunca concatenados na string da query: isso permite cache de queries no servidor e evita injeção.
+
+Um detalhe importante: erros de GraphQL costumam vir com status HTTP 200. A resposta traz um array `errors` ao lado de `data`, que pode ser parcial. O cliente precisa olhar esse array, não só o status.
+
+### Mutations e fragments
+
+```graphql
+mutation AtualizarStatus($id: ID!, $status: StatusPedido!) {
+  atualizarStatusPedido(id: $id, status: $status) {
+    id
+    status
+  }
+}
+```
+
+Uma mutation devolve dados como uma query. Pedir de volta `id` e os campos alterados é o que permite ao cache do cliente se atualizar sozinho, como você verá adiante.
+
+**Fragments** são seleções de campos com nome, reaproveitáveis. O cartão de produto declara de que campos precisa, e toda query que mostra um cartão inclui o fragment:
+
+```graphql
+fragment CamposCartaoProduto on Produto {
+  id
+  nome
+  precoEmCentavos
+  unidade
+  estoque
+  foto
+}
+
+query Catalogo($categoria: String) {
+  produtos(categoria: $categoria) {
+    ...CamposCartaoProduto
+  }
+}
+```
+
+Assim, quando o cartão passa a mostrar a categoria, você altera um fragment e todas as queries que o usam passam a buscar o campo novo.
+
+## Apollo Client 4 no Vite
+
+O Apollo Client é o cliente GraphQL mais usado com React: faz as requisições, guarda as respostas num cache normalizado e oferece hooks. Na versão 4, os hooks de React passaram a ser importados de `@apollo/client/react`, e a conexão HTTP é configurada explicitamente com um `HttpLink`.
+
+```bash
+npm install @apollo/client graphql rxjs
+```
+
+```js
+// vite.config.js (trecho de server.proxy)
+"/graphql": { target: "http://localhost:4000" },
+```
+
+```js
+// src/servicos/apollo.js
+import { ApolloClient, HttpLink, InMemoryCache } from "@apollo/client";
+
+export const clienteApollo = new ApolloClient({
+  link: new HttpLink({ uri: import.meta.env.VITE_GRAPHQL_URL ?? "/graphql" }),
+  cache: new InMemoryCache(),
+});
+```
+
+```jsx
+// src/main.jsx (trecho)
+import { ApolloProvider } from "@apollo/client/react";
+import { clienteApollo } from "./servicos/apollo.js";
+
+createRoot(document.getElementById("root")).render(
+  <StrictMode>
+    <ApolloProvider client={clienteApollo}>
+      <RouterProvider router={roteador} />
+    </ApolloProvider>
+  </StrictMode>,
+);
+```
+
+Em código anterior à versão 4 você vai encontrar tudo importado de `@apollo/client` e a opção `uri` passada direto ao `ApolloClient`. A ideia é a mesma.
+
+As operações ficam em arquivos próprios, escritas com a tag `gql`, que transforma a string num documento analisado:
+
+```js
+// src/graphql/operacoes.js
+import { gql } from "@apollo/client";
+
+export const CAMPOS_CARTAO_PRODUTO = gql`
+  fragment CamposCartaoProduto on Produto {
+    id
+    nome
+    precoEmCentavos
+    unidade
+    estoque
+    foto
+  }
+`;
+
+export const CATALOGO = gql`
+  query Catalogo($categoria: String) {
+    produtos(categoria: $categoria) {
+      ...CamposCartaoProduto
+    }
+  }
+  ${CAMPOS_CARTAO_PRODUTO}
+`;
+
+export const PEDIDOS_DO_PAINEL = gql`
+  query PedidosDoPainel($status: StatusPedido) {
+    pedidos(status: $status) {
+      id
+      status
+      totalEmCentavos
+      cliente { nome bairro }
+      itens { quantidade produto { id nome foto } }
+    }
+  }
+`;
+
+export const ATUALIZAR_STATUS = gql`
+  mutation AtualizarStatus($id: ID!, $status: StatusPedido!) {
+    atualizarStatusPedido(id: $id, status: $status) {
+      id
+      status
+    }
+  }
+`;
+```
+
+## useQuery
+
+```jsx
+// src/paginas/PedidosDoPainel.jsx
+import { useQuery } from "@apollo/client/react";
+import { PEDIDOS_DO_PAINEL } from "../graphql/operacoes.js";
+import { formatarPreco } from "../utilidades/formatarPreco.js";
+import AlterarStatusGraphQL from "../componentes/AlterarStatusGraphQL.jsx";
+
+export default function PedidosDoPainel({ status }) {
+  const { data, loading, error, refetch } = useQuery(PEDIDOS_DO_PAINEL, {
+    variables: { status },
+    fetchPolicy: "cache-and-network",
+  });
+
+  if (loading && !data) return <p aria-live="polite">Carregando pedidos...</p>;
+  if (error) {
+    return (
+      <div role="alert">
+        <p>Não foi possível carregar os pedidos.</p>
+        <button type="button" onClick={() => refetch()}>Tentar de novo</button>
+      </div>
+    );
+  }
+
+  return (
+    <table>
+      <caption>Pedidos</caption>
+      <thead>
+        <tr><th scope="col">Cliente</th><th scope="col">Itens</th><th scope="col">Total</th><th scope="col">Status</th></tr>
+      </thead>
+      <tbody>
+        {data.pedidos.map((pedido) => (
+          <tr key={pedido.id}>
+            <td>{pedido.cliente.nome} ({pedido.cliente.bairro})</td>
+            <td>{pedido.itens.map((i) => `${i.quantidade}x ${i.produto.nome}`).join(", ")}</td>
+            <td>{formatarPreco(pedido.totalEmCentavos)}</td>
+            <td><AlterarStatusGraphQL pedido={pedido} /></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+Mudar `status` muda as variáveis, e o hook busca de novo. A opção `skip: true` impede a busca quando falta um parâmetro, como o `enabled` do TanStack Query.
+
+## useMutation e o cache normalizado
+
+```jsx
+// src/componentes/AlterarStatusGraphQL.jsx
+import { useMutation } from "@apollo/client/react";
+import { ATUALIZAR_STATUS } from "../graphql/operacoes.js";
+
+const proximos = { RECEBIDO: "SEPARANDO", SEPARANDO: "SAIU_PARA_ENTREGA", SAIU_PARA_ENTREGA: "ENTREGUE" };
+
+export default function AlterarStatusGraphQL({ pedido }) {
+  const [atualizar, { loading, error }] = useMutation(ATUALIZAR_STATUS);
+  const proximo = proximos[pedido.status];
+
+  if (!proximo) return <span>Entregue</span>;
+  return (
+    <>
+      <button
+        type="button"
+        disabled={loading}
+        onClick={() => atualizar({ variables: { id: pedido.id, status: proximo } })}
+      >
+        {pedido.status} para {proximo}
+      </button>
+      {error && <span role="alert">Falhou: {error.message}</span>}
+    </>
+  );
+}
+```
+
+Repare que não há invalidação nem `refetch` depois da mutation, e a tabela atualiza mesmo assim. O motivo é o **cache normalizado** do `InMemoryCache`:
+
+1. Cada objeto da resposta que tem `__typename` e `id` vira uma entrada única no cache, com a chave `Pedido:71`. O Apollo acrescenta `__typename` às queries automaticamente.
+2. Listas e objetos aninhados guardam **referências** a essas entradas, não cópias.
+3. A mutation devolve `{ __typename: "Pedido", id: "71", status: "SAIU_PARA_ENTREGA" }`. O Apollo mescla isso na entrada `Pedido:71`.
+4. Toda query que referencia `Pedido:71` (a lista do painel, o detalhe do pedido) é notificada e renderiza de novo.
+
+| Situação | Cache atualiza sozinho? | O que fazer |
+|---|---|---|
+| Mutation altera campos de um objeto existente e devolve `id` e os campos | Sim | Nada |
+| Mutation cria um objeto novo que deve entrar numa lista | Não | `refetchQueries` ou `update` com `cache.modify` |
+| Mutation remove um objeto | Não | `cache.evict` no `update`, ou `refetchQueries` |
+| Tipo sem campo `id` | Não normaliza | Configure `keyFields` em `typePolicies` |
+
+Para listas, o caminho mais simples é pedir que certas queries rodem de novo:
+
+```js
+// trecho de um componente
+const [criar] = useMutation(CRIAR_PRODUTO, { refetchQueries: ["Catalogo"] });
+```
+
+E, quando um tipo usa outro identificador, como um `sku`, ensine o cache:
+
+```js
+// src/servicos/apollo.js (trecho)
+cache: new InMemoryCache({
+  typePolicies: {
+    Produto: { keyFields: ["sku"] },
+  },
+}),
+```
+
+Compare com o TanStack Query do capítulo anterior: lá o cache é organizado por **chave de consulta**, e você invalida prefixos depois de uma alteração. Aqui o cache é organizado por **entidade**, e alterações de campos se propagam sozinhas. São modelos diferentes para o mesmo problema.
+
+### Políticas de busca
+
+| `fetchPolicy` | Comportamento | Bom para |
+|---|---|---|
+| `cache-first` (padrão) | Usa o cache se tiver todos os campos; senão, busca | Catálogo, dados que mudam pouco |
+| `cache-and-network` | Mostra o cache e busca em paralelo para atualizar | Painel de pedidos |
+| `network-only` | Sempre busca, mas grava no cache | Dados que precisam estar exatos ao abrir a tela |
+| `no-cache` | Sempre busca e não grava | Dados sensíveis ou descartáveis |
+| `cache-only` | Nunca busca | Leitura de algo que você garante estar no cache |
+
+<Callout type="warning" title="O id na seleção não é opcional">
+Se a query do painel não pedir o `id` de `Pedido`, o Apollo não consegue normalizar o objeto, e a mutation que devolve o pedido atualizado não chega à lista. O sintoma é a tela que só atualiza ao recarregar. Peça sempre `id` em todo tipo que tiver um, inclusive dentro de fragments.
+</Callout>
+
+## GraphQL ou REST?
+
+| Critério | REST | GraphQL |
+|---|---|---|
+| Formato da resposta | Definido pelo servidor, por endpoint | Definido pelo cliente, por query |
+| Número de requisições para telas compostas | Várias ou endpoint sob medida | Uma |
+| Cache HTTP (CDN, navegador) | Natural com GET e URLs estáveis | Difícil com POST; exige cache no cliente ou queries persistidas |
+| Contrato | OpenAPI, opcional | Schema tipado, obrigatório e introspectável |
+| Erros | Status HTTP | `errors` no corpo, geralmente com 200 |
+| Upload de arquivos | Simples | Exige convenções extras |
+| Custo no servidor | Previsível por endpoint | Queries arbitrárias exigem limites de profundidade e complexidade |
+| Ferramentas no front | `fetch`, TanStack Query | Apollo Client, urql, Relay, ou TanStack Query com um cliente leve |
+
+GraphQL compensa quando há muitos clientes diferentes (web, app, parceiros) consumindo dados relacionados, telas compostas de várias entidades e um time de front que muda telas mais rápido do que o back consegue criar endpoints. REST continua melhor para APIs públicas simples, recursos que se beneficiam de cache HTTP e times pequenos em que o mesmo dev faz as duas pontas. Na Quitanda, uma divisão comum seria REST para o catálogo, que é público e cacheável em CDN, e GraphQL para o painel do lojista. Em arquiteturas maiores, um BFF pode expor GraphQL e falar REST com os serviços internos, assunto do Nível 3.
+
+<Callout type="tip" title="Tipos gerados a partir do schema">
+Como o schema é tipado e introspectável, ferramentas como o GraphQL Code Generator geram tipos TypeScript para cada query e mutation. Quando a Quitanda migrar para TypeScript no Nível 2, renomear um campo no schema vai quebrar o build exatamente nos componentes afetados.
+</Callout>
+
+## Na entrevista
+
+**Que problemas o GraphQL resolve em relação ao REST?** Overfetching (receber campos que a tela não usa) e underfetching (precisar de várias requisições para montar uma tela). O cliente declara os campos e as relações de que precisa e recebe tudo numa resposta com o mesmo formato.
+
+**O que é um fragment e por que usar?** Uma seleção de campos com nome, aplicada a um tipo, reaproveitada em várias queries. Ela permite que um componente declare os dados de que precisa e que as queries que o renderizam incluam esses campos, evitando divergência.
+
+**Como funciona o cache normalizado do Apollo?** Cada objeto com `__typename` e `id` é guardado uma vez, com chave como `Pedido:71`, e listas guardam referências. Quando uma mutation devolve esse objeto com campos novos, todas as queries que o referenciam são atualizadas sem nova requisição.
+
+**Por que uma lista não atualiza depois de criar um item com mutation?** Porque o cache não sabe em qual lista o novo objeto deve entrar. É preciso usar `refetchQueries` ou escrever no cache com `update` e `cache.modify`.
+
+**Quando você não usaria GraphQL?** Em APIs públicas simples, quando cache HTTP em CDN é importante, em uploads pesados ou quando o time é pequeno e o custo de manter schema, resolvers e limites de complexidade não se paga.
+
+## Pratique
+
+1. Suba o servidor GraphQL da Quitanda com o schema deste capítulo e explore-o pelo playground, escrevendo a query `PedidosDoPainel` com variáveis.
+2. Configure o Apollo Client 4 no Vite com proxy para `/graphql` e liste os produtos do catálogo usando o fragment `CamposCartaoProduto`.
+3. Implemente a tabela de pedidos do painel com filtro por status e a mutation de avanço de status. Confirme, nos Apollo DevTools, a entrada `Pedido:id` mudando.
+4. Remova o `id` da seleção da query do painel, repita a mutation e descreva o que deixa de funcionar e por quê.
+5. Crie a mutation de cadastro de produto e faça o catálogo mostrar o novo item usando `refetchQueries`; depois refaça com `update` e `cache.modify`.
+6. Escreva um parágrafo para o README justificando quais telas da Quitanda usam REST e quais usam GraphQL.
+
+<Quiz question="Uma mutation altera o status do pedido 71 e devolve id e status. A lista de pedidos do painel, buscada antes, atualiza sem refetch. Por quê?" options={["O Apollo refaz todas as queries depois de qualquer mutation","O servidor envia a lista nova por WebSocket","O cache normalizado guarda Pedido:71 uma vez e a lista só referencia essa entrada","O React Router revalida os loaders"]} answer={2} explanation="O InMemoryCache normaliza objetos por __typename e id. Mesclar os campos devolvidos na entrada Pedido:71 atualiza toda query que a referencia." />
+
+<Quiz question="Uma requisição GraphQL volta com status HTTP 200. O que isso garante?" options={["Nada sobre os dados: a resposta pode trazer um array errors e data parcial","Que todos os campos pedidos vieram sem erro","Que a query foi servida pelo cache","Que a mutation foi aplicada no banco"]} answer={0} explanation="Em GraphQL, erros de resolução costumam vir no campo errors do corpo, com status 200. O cliente precisa verificá-lo." />
+
+<Quiz question="Qual cenário favorece REST em vez de GraphQL na Quitanda?" options={["O painel do lojista, que combina pedidos, clientes e produtos numa tabela","O aplicativo de entregadores, que precisa de outros campos dos mesmos pedidos","Uma tela que muda de colunas toda semana","O catálogo público, que se beneficia de cache HTTP em CDN com URLs estáveis"]} answer={3} explanation="GET com URLs estáveis é cacheado naturalmente por navegador e CDN. GraphQL, geralmente via POST, exige outras estratégias de cache." />
+
+## Base no CodeForge
+
+- [GraphQL](/learn/system-design/graphql): o estilo de API do ponto de vista de arquitetura.
+- [Estilos de API](/learn/system-design/estilos-de-api): REST, GraphQL e gRPC lado a lado.
+- [GraphQL: criando APIs baseadas em esquemas](/learn/carreira-nodejs/graphql-criando-apis-baseadas-esquemas): o lado do servidor, com schema e resolvers.
+- [React: consumindo APIs HTTP no seu projeto](/learn/carreira-react/react-consumindo-apis-http): o cache por chave do TanStack Query, para comparar.
+
+## Referências
+
+- [GraphQL: Introduction](https://graphql.org/learn/)
+- [GraphQL: Queries](https://graphql.org/learn/queries/)
+- [Apollo Client: Get started](https://www.apollographql.com/docs/react/get-started)
+- [Apollo Client: Caching overview](https://www.apollographql.com/docs/react/caching/overview)
+- [Apollo Client: Mutations](https://www.apollographql.com/docs/react/data/mutations)

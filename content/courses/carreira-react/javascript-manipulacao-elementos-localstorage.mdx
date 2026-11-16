@@ -1,0 +1,391 @@
+---
+title: "JavaScript: explorando a manipulação de elementos e da localStorage"
+kind: lesson
+---
+
+A vitrine da Quitanda já reage a cliques, mas tem um defeito que qualquer cliente percebe em segundos: a pessoa monta a feira, recarrega a página ou fecha a aba para conferir o saldo no banco, e o carrinho volta vazio. O estado vive numa variável, e variáveis morrem junto com a página. Outro problema cresce em silêncio: o `vitrine.js` virou um arquivo longo, com dados, cálculos, renderização e eventos misturados, dependendo de variáveis globais que outros scripts também declaram.
+
+Este capítulo resolve as duas coisas. O carrinho passa a ser salvo no `localStorage` do navegador, em JSON, e sobrevive a recarregamentos e até sincroniza entre abas. E o código é reorganizado em **módulos ES**, com cada arquivo tendo uma responsabilidade e declarando o que importa e o que exporta. É a mesma organização (estado, lógica pura, interface) que você vai reencontrar em hooks e componentes React.
+
+**Você vai aprender:**
+
+- Converter dados com `JSON.stringify` e `JSON.parse` e conhecer o que o JSON não representa
+- Usar `localStorage` e `sessionStorage`, com seus limites e cuidados de segurança
+- Persistir o carrinho de forma robusta: chave com versão, leitura defensiva e reconciliação com o catálogo
+- Sincronizar abas com o evento `storage`
+- Organizar o código em módulos ES com `import` e `export`
+- Separar estado, lógica pura e interface com um pequeno padrão de assinatura
+
+## JSON
+
+O `localStorage` só guarda **texto**. Para salvar um array de objetos, você o converte em texto JSON (JavaScript Object Notation) e, na leitura, converte de volta:
+
+```js
+// js/exemplos/json.js
+const carrinho = [
+  { produtoId: "1", nome: "Tomate italiano", precoEmCentavos: 899, unidade: "kg", quantidade: 1.5 },
+];
+
+const texto = JSON.stringify(carrinho);
+// '[{"produtoId":"1","nome":"Tomate italiano","precoEmCentavos":899,"unidade":"kg","quantidade":1.5}]'
+
+const deVolta = JSON.parse(texto);
+console.log(deVolta[0].nome); // "Tomate italiano"
+console.log(deVolta === carrinho); // false: é uma cópia nova
+```
+
+JSON é o formato das APIs que você vai consumir no próximo capítulo, então vale conhecer as regras: chaves sempre entre aspas duplas, strings com aspas duplas, sem vírgula sobrando no fim, sem comentários.
+
+| Valor em JavaScript | Depois de `stringify` e `parse` |
+|---|---|
+| string, number, boolean, `null` | Iguais |
+| Arrays e objetos simples | Iguais (cópia profunda) |
+| `undefined` em propriedade | A propriedade some |
+| Funções | Somem |
+| `Date` | Vira string ISO (`"2026-11-16T12:00:00.000Z"`); não volta a ser `Date` |
+| `Map` e `Set` | Viram `{}` |
+| `NaN` e `Infinity` | Viram `null` |
+| `BigInt` | Lança `TypeError` |
+
+`JSON.stringify(dados, null, 2)` gera o texto indentado, útil para ler no console. E `JSON.parse` lança `SyntaxError` se o texto estiver corrompido, o que precisa ser tratado.
+
+## localStorage e sessionStorage
+
+As duas são a **Web Storage API**: um armazenamento chave e valor, só de strings, por **origem** (esquema + host + porta). `http://localhost:5500` e `http://localhost:5173` são origens diferentes e não enxergam os dados uma da outra.
+
+```js
+// console do navegador
+localStorage.setItem("quitanda:tema", "escuro");
+localStorage.getItem("quitanda:tema");      // "escuro"
+localStorage.getItem("chave-que-nao-existe"); // null
+localStorage.removeItem("quitanda:tema");
+localStorage.clear();                         // apaga tudo da origem (cuidado)
+```
+
+| | `localStorage` | `sessionStorage` | Cookie |
+|---|---|---|---|
+| Duração | Até ser apagado | Até fechar a aba | Definida pelo servidor (`Expires`, `Max-Age`) |
+| Compartilhado entre abas | Sim | Não, cada aba tem o seu | Sim |
+| Enviado ao servidor | Não | Não | Sim, em toda requisição |
+| Capacidade típica | Cerca de 5 MB por origem | Cerca de 5 MB | Cerca de 4 KB por cookie |
+| Acessível por JavaScript | Sim | Sim | Sim, exceto se `HttpOnly` |
+| Uso na Quitanda | Carrinho, tema, última busca | Passo atual do checkout | Sessão de login (Nível 2) |
+
+Veja e edite os dados em DevTools, aba **Application**, seção **Storage**. Apagar a chave ali é a forma mais rápida de testar o "carrinho vazio".
+
+<Callout type="warning" title="localStorage não é cofre">
+Qualquer script que roda na página lê o `localStorage`, inclusive um script injetado por XSS ou uma biblioteca de terceiros comprometida. Não guarde token de autenticação, dados de cartão ou dados pessoais sensíveis ali. Para sessão, o padrão é cookie `HttpOnly`, `Secure` e `SameSite`, assunto do capítulo de autenticação no Nível 2.
+</Callout>
+
+Outros limites que importam: a API é **síncrona** (gravar um objeto enorme trava a página), pode lançar exceção quando a cota estoura ou em alguns modos de navegação privada, e o usuário pode apagar tudo a qualquer momento. Trate o `localStorage` como cache conveniente, nunca como fonte única de dados importantes. O pedido confirmado vai para o servidor.
+
+## Módulos ES
+
+Antes de escrever a persistência, organize a casa. Com vários `<script>` clássicos, todas as funções e variáveis de topo viram globais compartilhadas: dois arquivos que declaram `const lista` se quebram, e a ordem das tags define o que existe quando. **Módulos ES** resolvem isso: cada arquivo tem escopo próprio, exporta o que quer expor e importa o que precisa.
+
+```html
+<!-- index.html (head) -->
+<script type="module" src="js/main.js"></script>
+```
+
+Só o ponto de entrada vai no HTML; ele importa o resto. Scripts `type="module"` já são adiados como `defer`, rodam em modo estrito e são carregados uma única vez, por mais que sejam importados.
+
+```js
+// js/formatacao.js
+const formatadorBRL = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+
+export function formatarPreco(centavos) {
+  return formatadorBRL.format(centavos / 100);
+}
+```
+
+```js
+// js/main.js
+import { formatarPreco } from "./formatacao.js";
+
+console.log(formatarPreco(1190)); // "R$ 11,90"
+```
+
+| Forma | Exportar | Importar |
+|---|---|---|
+| Nomeada | `export function calcularFrete() {}` | `import { calcularFrete } from "./carrinho.js"` |
+| Várias nomeadas | `export { a, b }` | `import { a, b } from "./x.js"` |
+| Renomear | | `import { formatarPreco as brl } from "./formatacao.js"` |
+| Tudo como objeto | | `import * as Carrinho from "./carrinho.js"` |
+| Padrão (default) | `export default function criarCard() {}` | `import criarCard from "./card.js"` |
+| Dinâmica | | `const modulo = await import("./painel.js")` |
+
+No navegador, o caminho precisa ser relativo e **com a extensão** (`./carrinho.js`, não `./carrinho`). Ferramentas como o Vite, no capítulo de Node.js, aceitam a forma curta e também importam pacotes do npm pelo nome. Módulos não funcionam abrindo o arquivo por `file://`: use o Live Server.
+
+Prefira exportações nomeadas: o nome é o mesmo em todo o projeto, o editor encontra e renomeia com segurança, e um erro de digitação aparece na hora.
+
+## A nova estrutura da Quitanda
+
+```text
+quitanda/
+├── index.html
+├── estilos.css
+└── js/
+    ├── main.js              ponto de entrada: liga tudo
+    ├── produtos.js          dados do catálogo (até a API chegar)
+    ├── formatacao.js        formatarPreco
+    ├── carrinho.js          funções puras: adicionar, remover, resumir
+    ├── armazenamento.js     ler e gravar JSON no localStorage
+    ├── estado-carrinho.js   o estado do carrinho, persistido, com assinatura
+    └── ui/
+        ├── vitrine.js       renderização e eventos da vitrine
+        └── resumo-carrinho.js  renderização e eventos do carrinho
+```
+
+A regra de dependência: `ui/` conhece o estado e as funções puras; as funções puras não conhecem nada de DOM nem de `localStorage`. Assim `carrinho.js` pode ser testado sem navegador, coisa que você vai fazer com Jest no Nível 1.
+
+```js
+// js/carrinho.js
+export const FRETE_EM_CENTAVOS = 990;
+export const FRETE_GRATIS_A_PARTIR_DE = 10000;
+
+export function adicionarAoCarrinho(itens, produto, quantidade) { /* do capítulo anterior */ }
+export function removerDoCarrinho(itens, produtoId) { /* do capítulo anterior */ }
+export function resumirCarrinho(itens, tipoEntrega = "entrega") { /* do capítulo de JavaScript */ }
+```
+
+## Lendo e gravando com segurança
+
+```js
+// js/armazenamento.js
+export function lerJSON(chave, valorPadrao) {
+  try {
+    const texto = localStorage.getItem(chave);
+    return texto === null ? valorPadrao : JSON.parse(texto);
+  } catch (erro) {
+    console.warn(`Não foi possível ler "${chave}"`, erro);
+    return valorPadrao;
+  }
+}
+
+export function salvarJSON(chave, valor) {
+  try {
+    localStorage.setItem(chave, JSON.stringify(valor));
+    return true;
+  } catch (erro) {
+    console.warn(`Não foi possível salvar "${chave}"`, erro);
+    return false;
+  }
+}
+```
+
+Os dois `try...catch` cobrem texto corrompido (alguém editou na mão, uma versão antiga gravou outro formato), cota estourada e armazenamento bloqueado. Em todos os casos a loja continua funcionando, só sem lembrar o carrinho.
+
+### Chave com prefixo e versão
+
+```js
+// js/estado-carrinho.js
+const CHAVE = "quitanda:carrinho";
+const VERSAO = 1;
+```
+
+O prefixo `quitanda:` evita colisão com outros dados da mesma origem (em desenvolvimento, `localhost` é compartilhado por todos os seus projetos). O campo de versão permite mudar o formato no futuro: se a versão gravada não for a atual, descarte ou converta, em vez de quebrar.
+
+## O estado do carrinho como módulo
+
+Em vez de uma variável `let carrinho` solta e de lembrar de chamar `atualizarCarrinho()` em todo lugar, o estado ganha um dono: um módulo que guarda o valor, grava no `localStorage` a cada mudança e avisa quem estiver interessado.
+
+```js
+// js/estado-carrinho.js
+import { lerJSON, salvarJSON } from "./armazenamento.js";
+import { adicionarAoCarrinho, removerDoCarrinho } from "./carrinho.js";
+
+const CHAVE = "quitanda:carrinho";
+const VERSAO = 1;
+
+let itens = carregar();
+const ouvintes = new Set();
+
+function carregar() {
+  const salvo = lerJSON(CHAVE, null);
+  if (!salvo || salvo.versao !== VERSAO || !Array.isArray(salvo.itens)) return [];
+  return salvo.itens;
+}
+
+function definir(novosItens) {
+  itens = novosItens;
+  salvarJSON(CHAVE, { versao: VERSAO, itens });
+  ouvintes.forEach((ouvinte) => ouvinte(itens));
+}
+
+export function obterItens() {
+  return itens;
+}
+
+export function assinar(ouvinte) {
+  ouvintes.add(ouvinte);
+  ouvinte(itens); // entrega o estado atual imediatamente
+  return () => ouvintes.delete(ouvinte); // função para cancelar
+}
+
+export function adicionar(produto, quantidade = 1) {
+  definir(adicionarAoCarrinho(itens, produto, quantidade));
+}
+
+export function remover(produtoId) {
+  definir(removerDoCarrinho(itens, produtoId));
+}
+
+export function esvaziar() {
+  definir([]);
+}
+```
+
+Esse é o padrão **observador** (ou pub/sub) em miniatura: quem quer saber do carrinho chama `assinar` e recebe os itens a cada mudança. Toda alteração passa por `definir`, então gravar e notificar nunca é esquecido. Quando você conhecer Zustand e Redux no Nível 1, vai reconhecer exatamente esta forma: estado privado, ações que o substituem por um novo, assinantes notificados.
+
+### A interface assina o estado
+
+```js
+// js/ui/resumo-carrinho.js
+import { assinar, remover } from "../estado-carrinho.js";
+import { resumirCarrinho } from "../carrinho.js";
+import { formatarPreco } from "../formatacao.js";
+
+export function montarResumoCarrinho() {
+  const lista = document.querySelector("#itens-carrinho");
+  const total = document.querySelector("#total-carrinho");
+  const contador = document.querySelector("#contador-carrinho");
+
+  lista.addEventListener("click", (evento) => {
+    const botao = evento.target.closest('[data-acao="remover"]');
+    if (botao) remover(botao.closest("li").dataset.id);
+  });
+
+  assinar((itens) => {
+    const resumo = resumirCarrinho(itens);
+    contador.textContent = `Carrinho (${resumo.quantidadeDeItens})`;
+    total.textContent = formatarPreco(resumo.total);
+    lista.replaceChildren(...itens.map(criarLinha));
+  });
+}
+
+function criarLinha(item) {
+  const li = document.createElement("li");
+  li.dataset.id = item.produtoId;
+  li.textContent = `${item.quantidade} ${item.unidade} de ${item.nome} `;
+  const botao = document.createElement("button");
+  botao.type = "button";
+  botao.dataset.acao = "remover";
+  botao.textContent = "Remover";
+  botao.setAttribute("aria-label", `Remover ${item.nome} do carrinho`);
+  li.append(botao);
+  return li;
+}
+```
+
+```js
+// js/main.js
+import { produtos } from "./produtos.js";
+import { montarVitrine } from "./ui/vitrine.js";
+import { montarResumoCarrinho } from "./ui/resumo-carrinho.js";
+
+montarVitrine(produtos);
+montarResumoCarrinho();
+```
+
+A vitrine só chama `adicionar(produto)` no clique; ela nem sabe que existe um resumo. Se amanhã surgir um terceiro lugar que mostra o carrinho (um selo flutuante no celular), ele só precisa assinar.
+
+## Reconciliando com o catálogo
+
+O carrinho salvo guarda o preço do momento em que o item foi adicionado. Se a manga subiu de preço desde ontem, ou saiu de linha, o carrinho de hoje estaria errado. Ao carregar, confira com o catálogo atual:
+
+```js
+// js/carrinho.js
+export function reconciliarComCatalogo(itens, produtos) {
+  return itens.flatMap((item) => {
+    const produto = produtos.find((p) => p.id === item.produtoId);
+    if (!produto || produto.estoque === 0) return []; // saiu de linha ou esgotou
+    return [{
+      ...item,
+      nome: produto.nome,
+      precoEmCentavos: produto.precoEmCentavos,
+      quantidade: Math.min(item.quantidade, produto.estoque),
+    }];
+  });
+}
+```
+
+`flatMap` permite remover (devolvendo `[]`) e transformar (devolvendo `[item]`) numa passada só. Chame essa função logo depois de carregar e avise o usuário se algo mudou. O preço que vale de verdade, porém, é o que o servidor calcula ao receber o pedido: o front nunca é a fonte final de preço.
+
+<Callout type="tip" title="Guarde o mínimo">
+Uma alternativa ainda mais simples é persistir só `produtoId` e `quantidade` e derivar nome e preço do catálogo na hora de exibir. Menos dado salvo é menos dado que fica velho. O mesmo princípio vale para o estado no React: guarde o essencial e derive o resto.
+</Callout>
+
+## Sincronizando abas
+
+Se a pessoa abre a Quitanda em duas abas e adiciona banana numa, a outra continua mostrando o carrinho antigo. O navegador dispara o evento `storage` nas **outras** abas da mesma origem sempre que o `localStorage` muda:
+
+```js
+// js/estado-carrinho.js
+window.addEventListener("storage", (evento) => {
+  if (evento.key !== CHAVE) return;
+  itens = carregar();
+  ouvintes.forEach((ouvinte) => ouvinte(itens));
+});
+```
+
+Repare que aqui não se chama `definir`, para não gravar de volta o que acabou de ser lido. O evento não dispara na própria aba que fez a alteração, o que é exatamente o desejado.
+
+## Lembrando preferências
+
+O mesmo `lerJSON` e `salvarJSON` servem para conveniências pequenas: o filtro de categoria escolhido, a última busca, o tema claro ou escuro. Para o passo atual de um checkout em várias etapas, `sessionStorage` é melhor: se a pessoa abrir outra aba, começa do zero, e ao fechar tudo some.
+
+```js
+// js/ui/vitrine.js
+import { lerJSON, salvarJSON } from "../armazenamento.js";
+
+let categoriaAtual = lerJSON("quitanda:categoria", "todas");
+
+function escolherCategoria(categoria) {
+  categoriaAtual = categoria;
+  salvarJSON("quitanda:categoria", categoria);
+  aplicarFiltros();
+}
+```
+
+## Na entrevista
+
+**Diferença entre `localStorage`, `sessionStorage` e cookies?** Os dois primeiros ficam só no navegador, guardam strings e não são enviados ao servidor; `localStorage` persiste até ser apagado e é compartilhado entre abas, `sessionStorage` dura a aba. Cookies são pequenos, vão em toda requisição e podem ser `HttpOnly`, inacessíveis ao JavaScript.
+
+**Por que não guardar o token de login no `localStorage`?** Porque qualquer script na página o lê; um XSS rouba a sessão. Cookie `HttpOnly`, `Secure` e `SameSite` é a opção padrão para sessão.
+
+**O que acontece com uma data em `JSON.stringify`?** Ela vira string ISO, e `JSON.parse` devolve a string, não um `Date`. É preciso converter de volta (`new Date(texto)`).
+
+**Quais as vantagens dos módulos ES sobre scripts clássicos?** Escopo próprio por arquivo (sem globais acidentais), dependências explícitas com `import` e `export`, carregamento adiado por padrão, execução única e base para ferramentas de build fazerem tree shaking.
+
+**Como sincronizar o estado entre abas?** Ouvindo o evento `storage` na janela, que dispara nas outras abas da mesma origem quando o `localStorage` muda, e recarregando o estado a partir dele.
+
+## Pratique
+
+1. Reorganize a Quitanda na estrutura de módulos do capítulo, com um único `script type="module"` no HTML, e confirme no console que não há variáveis globais novas (`window.carrinho` deve ser `undefined`).
+2. Implemente `armazenamento.js` e `estado-carrinho.js`; recarregue a página e confira que o carrinho permanece. Corrompa o valor na aba Application e confirme que a loja abre com carrinho vazio, sem erro.
+3. Abra duas abas e verifique a sincronização pelo evento `storage`.
+4. Implemente `reconciliarComCatalogo`, altere o preço de um produto em `produtos.js` e mostre um aviso "Alguns preços do seu carrinho foram atualizados".
+5. Mude o formato salvo para guardar só `produtoId` e `quantidade`, suba `VERSAO` para 2 e escreva a conversão da versão 1 para a 2 em `carregar`.
+6. Salve a última categoria escolhida e a busca, e restaure as duas ao abrir a página.
+
+<Quiz question="Qual o resultado de JSON.parse(JSON.stringify({ quando: new Date(), nota: undefined }))?" options={["Um objeto com quando como Date e nota como undefined","Um objeto com quando como string ISO e sem a propriedade nota","Um erro, porque Date não é serializável","Um objeto vazio"]} answer={1} explanation="Date é convertida para string ISO pelo toJSON, e propriedades com valor undefined são omitidas. O parse não reconstrói o Date." />
+
+<Quiz question="Por que o import do navegador precisa ser ./carrinho.js e não ./carrinho?" options={["Porque módulos só aceitam caminhos absolutos","Porque sem a extensão o arquivo é tratado como CSS","Porque o navegador resolve o especificador como URL, sem procurar extensões como fazem as ferramentas de build","Porque a extensão ativa o modo estrito"]} answer={2} explanation="No navegador, o especificador vira uma URL relativa ao módulo atual, e o servidor recebe exatamente esse caminho. Ferramentas como o Vite e o Node com bundlers é que completam extensões." />
+
+<Quiz question="O evento storage é disparado em qual aba quando o carrinho é salvo?" options={["Nas outras abas abertas da mesma origem, mas não na que fez a alteração","Só na aba que fez a alteração","Em todas as abas de todos os sites","Em nenhuma, é preciso consultar o localStorage periodicamente"]} answer={0} explanation="O evento storage notifica os outros contextos da mesma origem. A aba que gravou já sabe da mudança e não recebe o evento." />
+
+## Base no CodeForge
+
+- [JavaScript: manipulando elementos no DOM](/learn/carreira-react/javascript-manipulando-elementos-dom): a vitrine e o carrinho que este capítulo organiza e persiste.
+- [JavaScript: implementando CRUD com requisições HTTP](/learn/carreira-react/javascript-crud-requisicoes-http): o próximo passo, com o catálogo vindo de uma API.
+- [Formatos de dados](/learn/system-design/formatos-de-dados): JSON e alternativas para trocar dados.
+- [Sessão vs token](/learn/system-design/sessao-vs-token): por que credenciais não ficam no `localStorage`.
+- [React: utilizando hooks para gerenciar estados](/learn/carreira-react/react-hooks-gerenciar-estados): onde o estado com assinatura vira hook.
+
+## Referências
+
+- [MDN: Window.localStorage](https://developer.mozilla.org/en-US/docs/Web/API/Window/localStorage)
+- [MDN: Using the Web Storage API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Storage_API/Using_the_Web_Storage_API)
+- [MDN: JSON.stringify](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify)
+- [MDN: JavaScript modules](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules)

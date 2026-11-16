@@ -1,0 +1,366 @@
+---
+title: "React: gerenciando estados com Redux e Context API"
+kind: lesson
+---
+
+Com rotas, a Quitanda passou o carrinho do `Layout` para as páginas por `useOutletContext`. Funciona até o primeiro componente que não é filho direto de uma rota: o mini carrinho do cabeçalho, o botão de adicionar dentro de `CartaoProduto`, que mora dentro de `ListaDeProdutos`, que mora dentro de `Catalogo`. Cada um recebe `onAdicionar` por props, repassando para baixo funções que os intermediários nem usam. O tema claro e escuro e o usuário logado têm o mesmo problema: são necessários em toda parte, e passá-los por props camada a camada (prop drilling) deixa cada componente acoplado a dados que não lhe dizem respeito.
+
+O React tem uma resposta embutida, a Context API, e o ecossistema tem uma resposta mais estruturada, o Redux, hoje escrito com Redux Toolkit. Este capítulo usa Context para tema e usuário, mostra a armadilha de re-renderização que vem com ele, implementa o carrinho com Redux Toolkit e fecha com critérios para escolher, incluindo onde o TanStack Query e o Zustand entram nessa conversa.
+
+**Você vai aprender:**
+
+- Criar, prover e consumir contextos com a sintaxe do React 19
+- Evitar re-renderizações desnecessárias causadas por contexto
+- Montar uma store com Redux Toolkit: slices, reducers e `configureStore`
+- Ler e alterar o estado com `useSelector` e `useDispatch`, com seletores memorizados
+- Saber o que o RTK Query oferece e quando usá-lo
+- Escolher entre estado local, Context, Redux, Zustand e TanStack Query
+
+## Context API
+
+Um contexto permite que um componente forneça um valor para toda a subárvore abaixo dele, sem passar por props. Três passos: criar, prover, consumir.
+
+```jsx
+// src/estado/TemaContext.jsx
+import { createContext, use, useEffect, useState } from "react";
+
+const TemaContext = createContext(null);
+
+function temaInicial() {
+  const salvo = localStorage.getItem("quitanda:tema");
+  if (salvo === "claro" || salvo === "escuro") return salvo;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "escuro" : "claro";
+}
+
+export function TemaProvider({ children }) {
+  const [tema, setTema] = useState(temaInicial);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", tema === "escuro");
+    localStorage.setItem("quitanda:tema", tema);
+  }, [tema]);
+
+  const alternar = () => setTema((t) => (t === "claro" ? "escuro" : "claro"));
+
+  return <TemaContext value={{ tema, alternar }}>{children}</TemaContext>;
+}
+
+export function useTema() {
+  const contexto = use(TemaContext);
+  if (!contexto) throw new Error("useTema precisa estar dentro de TemaProvider");
+  return contexto;
+}
+```
+
+```jsx
+// src/componentes/BotaoTema.jsx
+import { useTema } from "../estado/TemaContext.jsx";
+
+export default function BotaoTema() {
+  const { tema, alternar } = useTema();
+  return (
+    <button type="button" onClick={alternar} aria-pressed={tema === "escuro"}>
+      Tema escuro
+    </button>
+  );
+}
+```
+
+Detalhes do React 19 e boas práticas:
+
+- **O contexto é o provider.** `<TemaContext value={...}>` substitui o antigo `<TemaContext.Provider value={...}>`, que continua funcionando e aparece em todo código anterior.
+- **`use(Contexto)`** lê o contexto e, ao contrário de `useContext`, pode ser chamado dentro de condições. `useContext` segue válido.
+- **Valor padrão `null` e um hook com verificação.** Usar o contexto fora do provider vira um erro claro, em vez de um `undefined` misterioso.
+- **Exporte o hook, não o contexto.** Os componentes dependem de `useTema()`, e a implementação pode mudar.
+
+O usuário logado segue o mesmo molde: `UsuarioProvider` com `usuario`, `entrar` e `sair`, consumido por `useUsuario()`. O loader da rota protegida do capítulo de rotas lê a sessão do serviço, e os componentes leem do contexto.
+
+```jsx
+// src/main.jsx (trecho)
+<TemaProvider>
+  <UsuarioProvider>
+    <RouterProvider router={roteador} />
+  </UsuarioProvider>
+</TemaProvider>
+```
+
+## A armadilha de re-render do Context
+
+Quando o `value` de um provider muda, **todos** os componentes que leem aquele contexto renderizam de novo, mesmo que usem só uma parte do valor. E há um detalhe sutil: `value={{ tema, alternar }}` cria um objeto novo a cada renderização do provider. Se o provider renderiza por outro motivo, todos os consumidores renderizam junto, ainda que `tema` não tenha mudado.
+
+Para dados que mudam raramente, como tema e usuário, isso não importa. Para dados que mudam a todo momento, como o carrinho, importa: cada clique em "Adicionar" faria renderizar o cabeçalho, todos os cartões do catálogo e o resumo do checkout.
+
+As mitigações, da mais simples para a mais estrutural:
+
+```jsx
+// 1. estabilizar o value com useMemo (desnecessário com o React Compiler ligado)
+const valor = useMemo(() => ({ tema, alternar }), [tema]);
+return <TemaContext value={valor}>{children}</TemaContext>;
+```
+
+```jsx
+// 2. separar estado e ações em contextos diferentes
+const CarrinhoEstadoContext = createContext(null);
+const CarrinhoAcoesContext = createContext(null);
+
+export function CarrinhoProvider({ children }) {
+  const [estado, dispatch] = useReducer(carrinhoReducer, carrinhoInicial);
+  // dispatch é estável: quem só adiciona itens não renderiza quando o carrinho muda
+  return (
+    <CarrinhoAcoesContext value={dispatch}>
+      <CarrinhoEstadoContext value={estado}>{children}</CarrinhoEstadoContext>
+    </CarrinhoAcoesContext>
+  );
+}
+```
+
+3. **Dividir por domínio**: um contexto para tema, outro para usuário, outro para carrinho, nunca um `AppContext` com tudo.
+4. **Usar uma ferramenta com assinaturas seletivas**, como Redux ou Zustand, em que cada componente escolhe a fatia do estado que observa e só renderiza quando ela muda.
+
+<Callout type="warning" title="Context não é gerenciador de estado">
+Context é um mecanismo de **transporte**: leva um valor do provider até os consumidores. Quem guarda e altera o estado continua sendo `useState` ou `useReducer`. Context não tem seletores, não tem ferramentas de depuração e não evita renderizações. Para valores estáveis ele é perfeito; para estado que muda muito e é lido em muitos lugares, compare com as alternativas abaixo.
+</Callout>
+
+## Redux Toolkit
+
+Redux é um padrão e uma biblioteca: todo o estado global fica numa **store** única, a interface **despacha ações** descrevendo o que aconteceu e **reducers puros** calculam o próximo estado. É o mesmo modelo do `useReducer` do capítulo de hooks, só que fora da árvore de componentes, com seletores e ferramentas de depuração que mostram cada ação e o estado antes e depois dela.
+
+Redux Toolkit (RTK) é a forma oficial de escrever Redux hoje. O Redux escrito à mão, com constantes de tipo, `switch` gigantes e spread em cada nível, é o que você vai encontrar no capítulo de código legado.
+
+```bash
+npm install @reduxjs/toolkit react-redux
+```
+
+### Slice do carrinho
+
+Um **slice** reúne o estado inicial, os reducers e os action creators gerados de uma fatia da store:
+
+```js
+// src/estado/carrinhoSlice.js
+import { createSelector, createSlice } from "@reduxjs/toolkit";
+
+const carrinhoSlice = createSlice({
+  name: "carrinho",
+  initialState: { itens: [] },
+  reducers: {
+    adicionou(estado, acao) {
+      const produto = acao.payload;
+      const item = estado.itens.find((i) => i.produto.id === produto.id);
+      if (!item) {
+        if (produto.estoque > 0) estado.itens.push({ produto, quantidade: 1 });
+      } else if (item.quantidade < produto.estoque) {
+        item.quantidade += 1;
+      }
+    },
+    alterouQuantidade(estado, acao) {
+      const { id, quantidade } = acao.payload;
+      const item = estado.itens.find((i) => i.produto.id === id);
+      if (!item) return;
+      if (quantidade <= 0) {
+        estado.itens = estado.itens.filter((i) => i.produto.id !== id);
+      } else {
+        item.quantidade = Math.min(quantidade, item.produto.estoque);
+      }
+    },
+    removeu(estado, acao) {
+      estado.itens = estado.itens.filter((i) => i.produto.id !== acao.payload);
+    },
+    esvaziou() {
+      return { itens: [] };
+    },
+  },
+});
+
+export const { adicionou, alterouQuantidade, removeu, esvaziou } = carrinhoSlice.actions;
+export default carrinhoSlice.reducer;
+
+// seletores
+export const selecionarItens = (estado) => estado.carrinho.itens;
+export const selecionarQuantidadeTotal = (estado) =>
+  estado.carrinho.itens.reduce((soma, i) => soma + i.quantidade, 0);
+export const selecionarTotal = createSelector([selecionarItens], (itens) =>
+  itens.reduce((soma, i) => soma + i.produto.precoEmCentavos * i.quantidade, 0),
+);
+export const selecionarQuantidadeDe = (estado, id) =>
+  estado.carrinho.itens.find((i) => i.produto.id === id)?.quantidade ?? 0;
+```
+
+O código parece mutar o estado (`push`, `item.quantidade += 1`), mas não muta. O RTK usa a biblioteca **Immer**: o reducer recebe um rascunho, registra as alterações e produz um objeto novo e imutável no fim. Isso só vale dentro de `createSlice` e `createReducer`. Um reducer pode alterar o rascunho **ou** devolver um valor novo (como em `esvaziou`), nunca os dois.
+
+`createSlice` gera os action creators: `adicionou(produto)` devolve `{ type: "carrinho/adicionou", payload: produto }`.
+
+### Store e provider
+
+```js
+// src/estado/store.js
+import { configureStore } from "@reduxjs/toolkit";
+import carrinhoReducer from "./carrinhoSlice.js";
+
+function carregar() {
+  try {
+    const salvo = JSON.parse(localStorage.getItem("quitanda:carrinho"));
+    return salvo ? { carrinho: salvo } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export const store = configureStore({
+  reducer: { carrinho: carrinhoReducer },
+  preloadedState: carregar(),
+});
+
+store.subscribe(() => {
+  localStorage.setItem("quitanda:carrinho", JSON.stringify(store.getState().carrinho));
+});
+```
+
+```jsx
+// src/main.jsx (trecho)
+import { Provider } from "react-redux";
+import { store } from "./estado/store.js";
+
+<Provider store={store}>
+  <TemaProvider>
+    <RouterProvider router={roteador} />
+  </TemaProvider>
+</Provider>
+```
+
+`configureStore` já liga o Redux DevTools, aplica o middleware de thunks e, em desenvolvimento, acrescenta verificações que acusam mutação acidental do estado e valores não serializáveis (como instâncias de classe ou funções) na store.
+
+### Hooks nos componentes
+
+```jsx
+// src/componentes/CartaoProduto.jsx (trecho)
+import { useDispatch, useSelector } from "react-redux";
+import { adicionou, selecionarQuantidadeDe } from "../estado/carrinhoSlice.js";
+
+export default function CartaoProduto({ produto }) {
+  const dispatch = useDispatch();
+  const noCarrinho = useSelector((estado) => selecionarQuantidadeDe(estado, produto.id));
+
+  return (
+    <article>
+      <h2>{produto.nome}</h2>
+      {noCarrinho > 0 && <span>{noCarrinho} no carrinho</span>}
+      <button type="button" onClick={() => dispatch(adicionou(produto))}>Adicionar</button>
+    </article>
+  );
+}
+```
+
+```jsx
+// src/componentes/MiniCarrinho.jsx
+import { useSelector } from "react-redux";
+import { Link } from "react-router";
+import { selecionarQuantidadeTotal } from "../estado/carrinhoSlice.js";
+
+export default function MiniCarrinho() {
+  const quantidade = useSelector(selecionarQuantidadeTotal);
+  return <Link to="/carrinho">Carrinho ({quantidade})</Link>;
+}
+```
+
+Repare que `CartaoProduto` não precisa mais de `onAdicionar` por props, e `ListaDeProdutos` deixa de repassá-lo.
+
+O ponto mais importante sobre `useSelector`: o componente só renderiza de novo quando **o valor devolvido pelo seletor** muda (comparação por referência). Ao adicionar uma banana, só o cartão da banana e o mini carrinho renderizam; os outros cartões devolvem o mesmo número e ficam quietos. É exatamente o que o Context não oferece.
+
+Por isso, cuidado com seletores que criam objetos ou arrays novos a cada chamada:
+
+```js
+// ruim: filter cria um array novo sempre, e o componente renderiza a cada ação despachada
+const caros = useSelector((estado) => estado.carrinho.itens.filter((i) => i.produto.precoEmCentavos > 2000));
+
+// bom: createSelector só recalcula quando os itens mudam, e devolve a mesma referência
+const selecionarItensCaros = createSelector([selecionarItens], (itens) =>
+  itens.filter((i) => i.produto.precoEmCentavos > 2000),
+);
+```
+
+Em desenvolvimento, o React-Redux avisa no console quando um seletor devolve referências diferentes para o mesmo estado.
+
+### RTK Query, em uma frase
+
+O Redux Toolkit inclui o **RTK Query**, uma camada de busca e cache de dados de API com `createApi`, que gera hooks como `useListarProdutosQuery` e invalida cache por tags. Ele resolve o mesmo problema que o TanStack Query resolveu no capítulo de APIs. Se o projeto já usa Redux, o RTK Query evita uma dependência a mais; se não usa, o TanStack Query costuma ser a escolha mais leve. O que não faz sentido é guardar respostas de API à mão num slice com `useEffect` e `dispatch`: isso é recriar mal o que essas bibliotecas já fazem.
+
+## Zustand, a alternativa enxuta
+
+Entre o Context e o Redux existe o Zustand: uma store criada com uma função, sem provider, consumida por um hook com seletores.
+
+```js
+// src/estado/usePreferencias.js
+import { create } from "zustand";
+
+export const usePreferencias = create((set) => ({
+  mostrarSoOrganicos: false,
+  ordenacao: "nome",
+  alternarOrganicos: () => set((s) => ({ mostrarSoOrganicos: !s.mostrarSoOrganicos })),
+  ordenarPor: (ordenacao) => set({ ordenacao }),
+}));
+
+// num componente: renderiza só quando ordenacao muda
+const ordenacao = usePreferencias((s) => s.ordenacao);
+```
+
+Ele tem as assinaturas seletivas do Redux com muito menos cerimônia, e é comum em projetos novos. O Nível 3 volta a ele ao tratar de estratégias avançadas de estado.
+
+## Quando usar cada um
+
+| Tipo de estado | Exemplo na Quitanda | Ferramenta |
+|---|---|---|
+| Local de um componente | Menu aberto, texto digitado | `useState` |
+| Local com regras | Etapas do checkout | `useReducer` |
+| Na URL | Busca, categoria, página | Query string (React Router) |
+| Dados do servidor | Produtos, pedidos | TanStack Query (ou RTK Query, Apollo) |
+| Global, muda pouco | Tema, usuário, idioma | Context |
+| Global, muda muito, lido em muitos lugares | Carrinho | Redux Toolkit ou Zustand |
+| Formulário | Checkout | `<form action>` ou React Hook Form |
+
+Duas regras de bolso. Primeiro, a maior parte do que parecia "estado global" em projetos antigos era cache de servidor; tire-o para o TanStack Query e o que sobra costuma ser pequeno. Segundo, escolha Redux Toolkit quando o estado global for grande, compartilhado por muitas telas e precisar de rastreabilidade (DevTools com histórico de ações, middleware, times grandes com convenções fortes). Para um carrinho isolado, um `useReducer` com Context dividido ou Zustand também dão conta, e a Quitanda usa Redux aqui para você conhecer a ferramenta que domina o código existente nas empresas.
+
+<Callout type="tip" title="Os DevTools contam a história">
+Instale a extensão Redux DevTools e adicione itens ao carrinho. Cada ação aparece com o payload e o diff do estado, e o recurso de "viajar no tempo" volta a interface a qualquer ponto. Quando um bug só acontece "às vezes", a sequência de ações costuma revelá-lo em minutos.
+</Callout>
+
+## Na entrevista
+
+**O que é prop drilling e como resolver?** É passar props por vários componentes intermediários que não as usam, só para chegar a um descendente. Resolve-se com composição (passar componentes como `children`), Context para valores globais estáveis ou uma store como Redux ou Zustand.
+
+**Por que um Context pode deixar a aplicação lenta?** Porque toda mudança do `value` faz renderizar todos os consumidores, mesmo os que usam só uma parte, e um objeto literal no `value` muda a cada renderização do provider. Mitiga-se estabilizando o valor, separando estado e ações e dividindo contextos por domínio.
+
+**Como o Redux Toolkit permite escrever push dentro do reducer?** Usando Immer: o reducer recebe um rascunho, as alterações são registradas e um novo estado imutável é produzido no fim. Fora de `createSlice` ou `createReducer`, mutar o estado continua sendo um erro.
+
+**Quando um componente com useSelector renderiza de novo?** Quando o valor devolvido pelo seletor muda de referência após uma ação. Por isso seletores que criam arrays ou objetos novos devem ser memorizados com `createSelector`.
+
+**Redux ou TanStack Query para dados da API?** TanStack Query, ou RTK Query se o projeto já usa Redux. Dados de API são estado de servidor, com cache, revalidação e invalidação, que essas bibliotecas resolvem. Redux fica para estado de cliente realmente global.
+
+## Pratique
+
+1. Crie `TemaProvider` e `useTema`, ligue-os à variante `dark` do Tailwind do capítulo de estilos e persista a escolha.
+2. Crie `UsuarioProvider` com `entrar` e `sair` simulados e mostre o nome do usuário no cabeçalho. Use o React DevTools para ver quais componentes renderizam ao trocar de tema.
+3. Migre o carrinho para Redux Toolkit com o `carrinhoSlice`, remova `onAdicionar` das props de `ListaDeProdutos` e `CartaoProduto` e confirme no Profiler que adicionar um item renderiza só o cartão afetado e o mini carrinho.
+4. Escreva um seletor de itens com preço acima de R$ 20 sem `createSelector`, observe o aviso no console e corrija.
+5. Implemente o mesmo carrinho com Zustand num branch separado e compare tamanho do código e comportamento no Profiler.
+6. Faça um inventário do estado da Quitanda e classifique cada item segundo a tabela deste capítulo.
+
+<Quiz question="Um provider faz value igual a um objeto literal com tema e alternar. O provider renderiza por outro motivo e o tema não muda. O que acontece com os consumidores?" options={["Nada, o React compara o conteúdo do objeto","Todos renderizam, porque o objeto é uma referência nova","Só os consumidores que leem alternar renderizam","O React lança um aviso e ignora a mudança"]} answer={1} explanation="O React compara o value por referência. Um objeto literal novo em cada renderização faz todos os consumidores renderizarem, a menos que o valor seja estabilizado." />
+
+<Quiz question="Dentro de um reducer de createSlice, estado.itens.push(novo) funciona porque:" options={["O Redux clona o estado antes de cada ação","Arrays do Redux são imutáveis por padrão","O React detecta a mutação e copia o array","O Immer transforma alterações num rascunho em um novo estado imutável"]} answer={3} explanation="createSlice usa Immer. O reducer manipula um rascunho, e o Immer produz o novo estado sem mutar o anterior." />
+
+<Quiz question="Qual escolha é mais adequada para guardar a lista de produtos vinda da API?" options={["TanStack Query ou RTK Query, que tratam cache, revalidação e invalidação","Um slice do Redux preenchido num useEffect","Um Context com useState preenchido na montagem","localStorage lido em cada componente"]} answer={0} explanation="Dados da API são estado de servidor. Bibliotecas específicas resolvem cache, deduplicação e sincronização que soluções manuais reimplementam com bugs." />
+
+## Base no CodeForge
+
+- [React: utilizando hooks para gerenciar estados](/learn/carreira-react/react-hooks-gerenciar-estados): `useReducer` e levantamento de estado, a base do Redux.
+- [React: consumindo APIs HTTP no seu projeto](/learn/carreira-react/react-consumindo-apis-http): por que dados de API ficam fora do Redux.
+- [Observer](/learn/lld/observer): o padrão por trás de `subscribe` e dos seletores.
+- [React: implementando estratégias avançadas de gerenciamento de estado](/learn/carreira-react/react-estrategias-avancadas-gerenciamento-estado): a continuação no Nível 3.
+
+## Referências
+
+- [React: Passing Data Deeply with Context](https://react.dev/learn/passing-data-deeply-with-context)
+- [React: createContext](https://react.dev/reference/react/createContext)
+- [Redux Toolkit: Quick Start](https://redux-toolkit.js.org/tutorials/quick-start)
+- [Redux: Deriving Data with Selectors](https://redux.js.org/usage/deriving-data-selectors)
+- [Zustand: Introduction](https://zustand.docs.pmnd.rs/getting-started/introduction)

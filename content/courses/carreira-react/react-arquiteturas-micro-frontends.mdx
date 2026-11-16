@@ -1,0 +1,302 @@
+---
+title: "React: aplicando arquiteturas de Micro frontends"
+kind: lesson
+---
+
+A Quitanda tem agora quatro times de produto: Catálogo e Busca, Checkout, Conta e Pedidos (com o acompanhamento em tempo real) e Painel do Lojista. Os três primeiros mexem na mesma aplicação Next.js, `apps/loja`. Toda terça há um "trem de release": as mudanças dos três times sobem juntas, um teste quebrado do Catálogo segura a correção urgente do Checkout, e um conflito de dependência vira reunião. A liderança ouviu falar de micro frontends e pergunta se é a solução.
+
+Pode ser. Micro frontends dividem o front-end em partes que times diferentes desenvolvem, testam e implantam de forma independente, como microsserviços fizeram no back-end. Também podem ser a decisão mais cara do ano, se o problema real era outro. Este capítulo mostra quando a arquitetura vale, as formas de compor as partes (em build, no servidor ou no navegador), as duas implementações mais usadas com React (Next.js multi-zones e Module Federation) e os problemas que aparecem depois: comunicação, design system e dependências compartilhadas.
+
+**Você vai aprender:**
+
+- Decidir quando micro frontends resolvem o problema e quando só o mudam de lugar
+- Comparar composição em build time, no servidor e em runtime no navegador
+- Dividir a loja em zonas com Next.js multi-zones
+- Carregar módulos remotos com Module Federation e compartilhar dependências como singleton
+- Desenhar a comunicação entre micro frontends e manter um design system comum sem acoplamento
+
+## Quando vale e quando não vale
+
+Micro frontends resolvem um problema **organizacional**: vários times autônomos que precisam entregar sem esperar uns pelos outros. Eles não resolvem código bagunçado, build lento ou falta de testes; esses problemas viajam junto para cada pedaço e ainda ganham a complexidade de um sistema distribuído.
+
+| Sinal | Aponta para micro frontends | Aponta para manter o monólito modular |
+|---|---|---|
+| Times | Três ou mais times com domínios claros | Um ou dois times |
+| Gargalo | Coordenação de release, filas de merge | Qualidade do código, testes lentos |
+| Domínio | Áreas com ciclos de vida diferentes (checkout muda toda semana, conta quase nunca) | Funcionalidades muito entrelaçadas |
+| Tecnologia | Migração gradual de stack, legado a conviver | Stack única e atual |
+| Maturidade | CI/CD, observabilidade e design system sólidos | Ainda faltando o básico |
+
+Antes de dividir, vale tentar o caminho mais barato: no monorepo do Turborepo, cada time dono de pacotes e pastas (CODEOWNERS), testes rodando só no que mudou (`--affected`) e deploy contínuo em vez de trem semanal. Muitas vezes isso basta. Na Quitanda, o problema persiste porque Checkout precisa implantar várias vezes por dia e o ciclo de testes da loja inteira leva 25 minutos.
+
+<Callout type="warning" title="O custo que não aparece no diagrama">
+Cada micro frontend é mais um pipeline, mais um deploy, mais uma configuração de monitoramento e mais uma cópia potencial de React no navegador. A experiência do usuário pode ficar inconsistente (dois tons de verde, dois cabeçalhos) e mais lenta. Se ninguém for dono da plataforma que une as partes, ela apodrece em meses.
+</Callout>
+
+## Como dividir
+
+A divisão mais segura é **vertical, por domínio e por rota**: cada time é dono de um conjunto de páginas, do componente ao endpoint no BFF. Uma página inteira pertence a um time só.
+
+```text
+quitanda.com.br/                 -> zona Catálogo (time Catálogo e Busca)
+quitanda.com.br/busca            -> zona Catálogo
+quitanda.com.br/checkout/...     -> zona Checkout (time Checkout)
+quitanda.com.br/conta/...        -> zona Conta (time Conta e Pedidos)
+quitanda.com.br/pedidos/...      -> zona Conta
+painel.quitanda.com.br           -> painel (time Painel), com widgets remotos
+```
+
+A divisão **horizontal**, com vários times compondo a mesma página (a vitrine de um time, o mini-carrinho de outro, as recomendações de um terceiro), é possível, mas cobra mais: contratos entre partes da mesma tela, carregamento coordenado e falhas parciais visíveis ao usuário. Use-a para widgets bem delimitados, não como regra.
+
+## Formas de compor
+
+| Composição | Como funciona | Deploy independente | Exemplo |
+|---|---|---|---|
+| Build time | Cada parte é um pacote npm instalado na aplicação hospedeira | Não: o host precisa reinstalar e reimplantar | `@quitanda/ui` |
+| Servidor ou borda | Um proxy roteia por caminho ou monta o HTML a partir de vários servidores | Sim | Next.js multi-zones, rewrites na CDN |
+| Runtime no cliente | O navegador baixa código de outros deploys e o executa | Sim | Module Federation, import maps, web components |
+| Iframe | Cada parte é uma página isolada embutida | Sim | Widgets de terceiros, legado muito diferente |
+
+Composição em build time não é micro frontend no sentido estrito, porque o host precisa de novo deploy a cada versão. Mas é a forma certa de compartilhar o que é estável e comum, como o design system. Iframes dão isolamento total e por isso mesmo custam caro: acessibilidade, rolagem, tamanho e comunicação ficam difíceis. Ficam para casos de isolamento obrigatório.
+
+## Next.js multi-zones: dividir por rota
+
+Multi-zones é a abordagem oficial do Next.js: várias aplicações Next.js independentes servidas sob o mesmo domínio, cada uma responsável por um conjunto de caminhos. Uma delas, a zona principal, recebe todo o tráfego e encaminha os caminhos das outras por rewrites.
+
+```ts
+// apps/zona-catalogo/next.config.ts (zona principal)
+import type { NextConfig } from "next";
+
+const checkout = process.env.ZONA_CHECKOUT_URL;
+const conta = process.env.ZONA_CONTA_URL;
+
+const config: NextConfig = {
+  async rewrites() {
+    return [
+      { source: "/checkout", destination: `${checkout}/checkout` },
+      { source: "/checkout/:caminho+", destination: `${checkout}/checkout/:caminho+` },
+      { source: "/checkout-static/:caminho+", destination: `${checkout}/checkout-static/:caminho+` },
+      { source: "/conta/:caminho*", destination: `${conta}/conta/:caminho*` },
+      { source: "/pedidos/:caminho*", destination: `${conta}/pedidos/:caminho*` },
+      { source: "/conta-static/:caminho+", destination: `${conta}/conta-static/:caminho+` },
+    ];
+  },
+};
+
+export default config;
+```
+
+```ts
+// apps/zona-checkout/next.config.ts
+import type { NextConfig } from "next";
+
+const config: NextConfig = {
+  assetPrefix: "/checkout-static",
+};
+
+export default config;
+```
+
+O `assetPrefix` faz os arquivos da zona de checkout (JavaScript, CSS) serem servidos sob `/checkout-static/_next/...`, sem colidir com os `/_next/...` da zona principal. As rotas da zona de checkout continuam em `src/app/checkout/...`, com o mesmo caminho público.
+
+Pontos de atenção:
+
+- **Navegação entre zonas é navegação completa.** O `Link` do Next.js faz navegação suave dentro de uma zona; para ir do catálogo ao checkout, o navegador carrega um documento novo. Use `a` comum para links entre zonas. Por isso, a fronteira entre zonas deve coincidir com uma fronteira natural de jornada: ir ao checkout é um momento em que um carregamento completo é aceitável.
+- **Sessão compartilhada.** Mesmo domínio significa mesmo cookie de sessão; todas as zonas validam a sessão pelo BFF.
+- **Server Actions.** Como a zona de checkout recebe requisições encaminhadas, a checagem de origem das Server Actions precisa conhecer o domínio público (`experimental.serverActions.allowedOrigins`).
+- **Cabeçalho e rodapé.** Cada zona renderiza o próprio layout. Eles vêm de um pacote compartilhado (`@quitanda/layout`), versionado como a Quitanda UI, para não divergirem.
+
+Plataformas de hospedagem também oferecem roteamento de micro frontends gerenciado (a Vercel, por exemplo, com um arquivo de configuração que descreve as zonas e um proxy local para desenvolvimento), mas o modelo continua o mesmo: rotas mapeadas para deploys diferentes.
+
+## Module Federation: compor no navegador
+
+O painel do lojista é uma SPA com Vite, e o time de Dados quer entregar o gráfico de vendas e o relatório de estoque como peças que evoluem no ritmo deles, sem depender do deploy do painel. Aqui a divisão é horizontal e em runtime, o caso do Module Federation.
+
+Com Module Federation, uma aplicação (o **remote**) expõe módulos, e outra (o **host**) os importa em tempo de execução de uma URL. Os dois negociam dependências compartilhadas para que o React, por exemplo, seja carregado uma vez só. A versão atual (Module Federation 2.0) tem plugins para webpack, Rspack e Vite, além de um runtime que pode ser usado diretamente.
+
+```ts
+// apps/relatorios/vite.config.ts (remote do time de Dados)
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { federation } from "@module-federation/vite";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    federation({
+      name: "relatorios",
+      filename: "remoteEntry.js",
+      exposes: {
+        "./GraficoDeVendas": "./src/GraficoDeVendas.tsx",
+        "./RelatorioDeEstoque": "./src/RelatorioDeEstoque.tsx",
+      },
+      shared: {
+        react: { singleton: true, requiredVersion: "^19.0.0" },
+        "react-dom": { singleton: true, requiredVersion: "^19.0.0" },
+        "@quitanda/ui": { singleton: true, requiredVersion: "^1.0.0" },
+      },
+    }),
+  ],
+});
+```
+
+```ts
+// apps/painel-spa/vite.config.ts (host)
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { federation } from "@module-federation/vite";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    federation({
+      name: "painel",
+      remotes: {
+        relatorios: {
+          type: "module",
+          name: "relatorios",
+          entry: "https://relatorios.quitanda.com.br/remoteEntry.js",
+        },
+      },
+      shared: {
+        react: { singleton: true, requiredVersion: "^19.0.0" },
+        "react-dom": { singleton: true, requiredVersion: "^19.0.0" },
+        "@quitanda/ui": { singleton: true, requiredVersion: "^1.0.0" },
+      },
+    }),
+  ],
+});
+```
+
+No host, o módulo remoto é importado como qualquer import dinâmico. Como ele vem da rede, de outro deploy, pode demorar ou falhar; trate as duas coisas:
+
+```tsx
+// apps/painel-spa/src/paginas/Visao.tsx
+import { lazy, Suspense } from "react";
+import { ErrorBoundary } from "react-error-boundary";
+import { Selo } from "@quitanda/ui";
+
+const GraficoDeVendas = lazy(() => import("relatorios/GraficoDeVendas"));
+
+export function Visao() {
+  return (
+    <section aria-labelledby="titulo-vendas">
+      <h2 id="titulo-vendas">Vendas da semana</h2>
+      <ErrorBoundary fallback={<Selo tom="aviso">Relatório indisponível no momento</Selo>}>
+        <Suspense fallback={<p>Carregando gráfico...</p>}>
+          <GraficoDeVendas periodo="7d" />
+        </Suspense>
+      </ErrorBoundary>
+    </section>
+  );
+}
+```
+
+O que o `shared` garante:
+
+- **`singleton: true`** carrega uma única instância daquela biblioteca para todos. Para React, React DOM, styled-components e bibliotecas com contexto, é obrigatório: duas cópias do React quebram os hooks, duas do styled-components geram estilos e temas separados.
+- **`requiredVersion`** declara a faixa aceita. Se o remote exige React `^19` e o host fornece 18, o Module Federation avisa (ou falha, com `strictVersion`). Por isso atualizações de React viram projetos coordenados entre todos os times, o preço da independência.
+
+Para tipos, o remote pode gerar e publicar as declarações dos módulos expostos, que o host baixa no desenvolvimento; sem isso, declare-os à mão num `.d.ts`. E o endereço do remote não precisa ser fixo no build: o runtime do Module Federation permite registrar remotes dinamicamente (por ambiente, por feature flag), o que habilita canário de um remote só.
+
+<Callout type="tip" title="Module Federation e o App Router">
+O Module Federation funciona melhor em SPAs com webpack, Rspack ou Vite. Com Next.js e App Router (Server Components, streaming, cache), o suporte é limitado e não é o caminho que o Next.js recomenda. Para dividir uma aplicação Next.js, prefira multi-zones; para widgets dentro de páginas Next.js, considere componentes de cliente carregados de um pacote ou um iframe bem delimitado.
+</Callout>
+
+### Outras formas de compor no navegador
+
+Module Federation não é a única opção de runtime. Duas outras aparecem com frequência:
+
+- **Import maps.** Um recurso nativo do navegador que mapeia nomes de módulo (`"relatorios"`) para URLs. O host faz `import("relatorios")` e o navegador resolve pelo mapa, que pode ser trocado sem rebuild. Frameworks como o single-spa usam essa base para montar e desmontar aplicações por rota. Não há negociação de versões compartilhadas: isso fica por sua conta.
+- **Web components.** O remote empacota a parte como um elemento customizado (`quitanda-grafico-vendas`), com Shadow DOM isolando estilos. O host usa a tag sem saber se dentro há React, Vue ou nada. É a opção mais agnóstica de framework, ao custo de passar dados por atributos e eventos, e de cada parte trazer o próprio runtime.
+
+## Comunicação entre micro frontends
+
+Quanto menos os micro frontends conversam, melhor. Cada canal de comunicação é um contrato que precisa ser versionado e testado. Em ordem de preferência:
+
+1. **A URL.** Filtros, produto selecionado, etapa do checkout: tudo que pode estar na URL deve estar. É o contrato mais simples, compartilhável e resistente.
+2. **O servidor.** O carrinho não mora em nenhum micro frontend: mora no BFF. O catálogo adiciona um item com uma chamada; o checkout lê o carrinho com outra. Nenhum precisa saber que o outro existe.
+3. **Eventos do navegador.** Para avisos em tempo real dentro da mesma página (o mini-carrinho do cabeçalho atualizar quando o catálogo adiciona um item), eventos customizados no `window`, com contrato tipado num pacote pequeno e versionado:
+
+```ts
+// packages/eventos/src/index.ts (@quitanda/eventos)
+export type EventosQuitanda = {
+  "quitanda:carrinho-atualizado": { quantidadeDeItens: number };
+  "quitanda:sessao-encerrada": Record<string, never>;
+};
+
+export function emitir<N extends keyof EventosQuitanda>(nome: N, detalhe: EventosQuitanda[N]) {
+  window.dispatchEvent(new CustomEvent(nome, { detail: detalhe }));
+}
+
+export function ouvir<N extends keyof EventosQuitanda>(nome: N, aoReceber: (detalhe: EventosQuitanda[N]) => void) {
+  const handler = (e: Event) => aoReceber((e as CustomEvent<EventosQuitanda[N]>).detail);
+  window.addEventListener(nome, handler);
+  return () => window.removeEventListener(nome, handler);
+}
+```
+
+4. **Entre abas**, o `BroadcastChannel` avisa que a sessão foi encerrada em outra aba.
+
+O que evitar: uma store Redux global compartilhada entre micro frontends. Ela recria o acoplamento que a arquitetura queria eliminar: mudar o formato de um slice exige coordenar o deploy de todos os times. Estado compartilhado de verdade é estado de servidor.
+
+## Design system e dependências compartilhadas
+
+A Quitanda UI e os tokens são o que faz quatro deploys parecerem uma loja só. Há uma tensão real aqui:
+
+| Estratégia | Vantagem | Risco |
+|---|---|---|
+| Cada zona instala `@quitanda/ui` do npm (build time) | Independência total; cada time atualiza quando quiser | Versões diferentes convivendo na mesma jornada (botão muda de altura entre catálogo e checkout) |
+| UI compartilhada em runtime como singleton | Uma versão só, atualização para todos de uma vez | Uma versão quebrada da UI derruba todos os micro frontends |
+
+A combinação mais comum: pacote npm com versionamento semântico rigoroso, Renovate abrindo PRs de atualização em todas as zonas no mesmo dia e uma política explícita ("ninguém fica mais de uma minor atrás"). Os tokens, que são só CSS, podem ser servidos de um endereço compartilhado e versionado, porque variáveis CSS mudam a aparência de todos sem recompilar ninguém.
+
+Para as demais dependências, a regra prática: compartilhe como singleton o que tem estado global ou contexto (React, roteador do host, biblioteca de estilos); deixe cada micro frontend com a própria cópia do resto (utilitários de data, bibliotecas de gráfico). E monitore o tamanho: três micro frontends com três versões de uma biblioteca de datas são três downloads para o mesmo usuário.
+
+## Operando micro frontends
+
+- **Observabilidade por micro frontend.** Cada parte etiqueta erros, traces e métricas com o próprio nome e versão (`mfe: checkout`, `release: checkout@3.8.1`). Sem isso, o alerta da taxa de erro da loja não diz qual time acordar.
+- **Testes de contrato e de integração.** Os eventos de `@quitanda/eventos`, os módulos expostos pelo remote e as rotas das zonas são contratos. Um teste end-to-end com Playwright que percorre a jornada completa (catálogo, carrinho, checkout, pedido) roda contra as versões em produção de cada parte a cada deploy de qualquer uma delas.
+- **Plataforma com dono.** A zona principal, o pacote de layout, os eventos e a configuração de Module Federation são de um time de plataforma (ou de um grupo com mandato claro). Sem dono, ninguém atualiza o React.
+
+## Na entrevista
+
+**Quando você recomendaria micro frontends?** Quando vários times autônomos, com domínios claros, estão travados por coordenação de release numa aplicação única, e a organização já tem CI/CD, observabilidade e design system maduros. Não recomendaria para um ou dois times, nem como solução para código ruim ou build lento, que têm correções mais baratas.
+
+**Qual a diferença entre composição em build time e em runtime?** Em build time, as partes são pacotes instalados no host, e cada atualização exige novo deploy do host. Em runtime, o host carrega código de outros deploys durante a execução (Module Federation) ou um proxy roteia por caminho (multi-zones), permitindo deploys independentes.
+
+**Como funcionam as multi-zones do Next.js?** Várias aplicações Next.js sob o mesmo domínio, cada uma dona de um conjunto de caminhos. A zona principal encaminha os caminhos das outras por rewrites, e cada zona usa um `assetPrefix` próprio. Navegar entre zonas é uma navegação completa.
+
+**Por que React precisa ser singleton no Module Federation?** Porque hooks e contexto dependem de uma única instância do React. Duas cópias na mesma página causam o erro de hooks inválidos e contextos que não se enxergam, além de baixar a biblioteca duas vezes.
+
+**Como micro frontends devem se comunicar?** O mínimo possível: pela URL, por estado no servidor e, para avisos na mesma página, por eventos do navegador com contrato tipado e versionado. Evito store global compartilhada, que recria o acoplamento entre deploys.
+
+## Pratique
+
+1. Escreva um documento de decisão (ADR) para a Quitanda com os sinais a favor e contra micro frontends e as alternativas mais baratas que foram tentadas antes.
+2. Separe o checkout numa zona Next.js própria com `assetPrefix`, configure os rewrites na zona principal e confira no DevTools que os arquivos do checkout vêm de `/checkout-static`.
+3. Crie o remote `relatorios` com Module Federation e Vite expondo `GraficoDeVendas`, consuma-o no painel com `lazy`, `Suspense` e um error boundary, e derrube o servidor do remote para ver o fallback.
+4. Remova o `singleton` do React no host e no remote e observe o erro resultante. Depois declare versões incompatíveis em `requiredVersion` e leia o aviso.
+5. Implemente o pacote `@quitanda/eventos` e faça o mini-carrinho do cabeçalho reagir ao evento `quitanda:carrinho-atualizado` emitido pela zona do catálogo.
+
+<Quiz question="A Quitanda tem um único time de quatro pessoas e builds lentos. Qual a melhor recomendação?" options={["Dividir a loja em micro frontends com Module Federation","Criar uma zona Next.js por página","Migrar para iframes","Manter o monólito modular e atacar o build lento com cache e execução só do que mudou"]} answer={3} explanation="Micro frontends resolvem coordenação entre vários times autônomos. Para um time só, eles adicionam custo sem resolver o problema, que tem correções mais baratas." />
+
+<Quiz question="Em Next.js multi-zones, como deve ser feito o link do catálogo para o checkout, que está em outra zona?" options={["Com o componente Link, que faz navegação suave entre zonas","Com uma âncora comum, porque a navegação entre zonas carrega um documento novo","Com router.push dentro de um useEffect","Com um iframe apontando para o checkout"]} answer={1} explanation="O Link faz navegação no cliente dentro da mesma aplicação. Entre zonas, a outra aplicação precisa ser carregada, então o correto é uma navegação completa." />
+
+<Quiz question="O host e o remote do Module Federation carregaram cada um sua cópia do React. Qual configuração resolve?" options={["Declarar react e react-dom em shared com singleton true nos dois lados","Mover o React para devDependencies","Usar React.lazy no remote","Aumentar o requiredVersion do host"]} answer={0} explanation="Com singleton, o runtime do Module Federation negocia uma única instância compartilhada, que host e remotes passam a usar." />
+
+## Base no CodeForge
+
+- [Microsserviços](/learn/system-design/microsservicos): a mesma troca entre autonomia e complexidade, do lado do back-end.
+- [Monolito](/learn/system-design/monolito): por que o monólito modular costuma ser o ponto de partida certo.
+- [React: desenvolvendo design systems modulares com Turborepo](/learn/carreira-react/react-design-systems-modulares-turborepo): o monorepo e a UI compartilhada entre as partes.
+- [React: publicando pacotes no npm com versionamento semântico](/learn/carreira-react/react-publicando-pacotes-npm-versionamento-semantico): a composição em build time da Quitanda UI.
+- [React: tomando decisões estratégicas em projetos](/learn/carreira-react/react-decisoes-estrategicas-projetos): como registrar e defender uma decisão desse tamanho.
+
+## Referências
+
+- [Next.js: Multi-zones](https://nextjs.org/docs/app/guides/multi-zones)
+- [Module Federation: documentação](https://module-federation.io/)
+- [Micro Frontends, por Cam Jackson (martinfowler.com)](https://martinfowler.com/articles/micro-frontends.html)
+- [MDN: CustomEvent](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent)
+- [MDN: BroadcastChannel](https://developer.mozilla.org/en-US/docs/Web/API/BroadcastChannel)

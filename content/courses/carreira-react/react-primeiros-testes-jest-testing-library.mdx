@@ -1,0 +1,428 @@
+---
+title: "React: escrevendo seus primeiros testes com Jest e Testing Library"
+kind: lesson
+---
+
+A Quitanda em React já tem catálogo, carrinho com Redux, rotas, API e um checkout com validação. Cada capítulo mexeu em código que outro capítulo tinha escrito: o carrinho saiu do `useState` para o `useReducer`, depois para o Redux; o checkout saiu de um `Form` do roteador para o React Hook Form. Em cada mudança, a única garantia de que nada quebrou foi clicar na tela e torcer. Num projeto real, com várias pessoas e deploys diários, isso não escala: a regra "não passar do estoque" quebra numa refatoração e ninguém percebe até o primeiro cliente reclamar.
+
+Testes automatizados transformam essas regras em verificações que rodam em segundos. Este capítulo configura Jest num projeto Vite, escreve testes de unidade para funções puras e para o reducer do carrinho, testa componentes do jeito que o usuário os usa com React Testing Library e user-event, cobre o checkout e mostra mocks simples para isolar a API. No Nível 2, os testes avançados acrescentam MSW, testes de hooks e cobertura no CI.
+
+**Você vai aprender:**
+
+- Configurar Jest 30 com Babel num projeto Vite e contornar as diferenças de ambiente
+- Escrever testes de unidade com `describe`, `test` e `expect`
+- Renderizar componentes e encontrá-los por papel e rótulo, como um usuário
+- Simular interações com `user-event` e esperar resultados assíncronos
+- Testar o carrinho e o formulário de checkout da Quitanda
+- Substituir módulos e funções por mocks com `jest.mock` e `jest.fn`
+
+## Por que Jest num projeto Vite
+
+O Vite não roda testes. Duas ferramentas dominam o mercado para isso: **Jest**, o executor mais usado na história do ecossistema React e presente na maior parte dos projetos existentes, e **Vitest**, que reaproveita a configuração e os plugins do Vite e tem API quase idêntica à do Jest. Em projeto Vite novo, Vitest exige menos configuração. Este capítulo usa Jest porque é o que você vai encontrar na maioria das vagas e dos códigos legados; tudo o que você aprender de Testing Library vale igual nos dois, e migrar de um para o outro costuma ser trocar `jest.fn` por `vi.fn`.
+
+A diferença de configuração vem do fato de que o Jest não usa o pipeline do Vite. Ele precisa de outra forma de entender JSX e `import`, não sabe o que fazer com arquivos CSS e não conhece `import.meta.env`. Cada um desses pontos tem uma solução simples.
+
+## Configuração
+
+```bash
+npm install -D jest jest-environment-jsdom babel-jest @babel/core @babel/preset-env @babel/preset-react \
+  @testing-library/react @testing-library/dom @testing-library/user-event @testing-library/jest-dom identity-obj-proxy
+```
+
+O Babel traduz JSX e módulos ES para o que o Jest executa. Como o `package.json` do Vite tem `"type": "module"`, o arquivo de configuração do Babel usa a extensão `.cjs`:
+
+```js
+// babel.config.cjs
+module.exports = {
+  presets: [
+    ["@babel/preset-env", { targets: { node: "current" } }],
+    ["@babel/preset-react", { runtime: "automatic" }],
+  ],
+};
+```
+
+```js
+// jest.config.js
+export default {
+  testEnvironment: "jsdom",
+  setupFilesAfterEnv: ["<rootDir>/jest.setup.js"],
+  moduleNameMapper: {
+    "\\.module\\.css$": "identity-obj-proxy",
+    "\\.css$": "<rootDir>/testes/arquivoVazio.js",
+    "\\.(png|jpe?g|svg|webp)$": "<rootDir>/testes/arquivoVazio.js",
+    "^(\\.{1,2}/)+ambiente\\.js$": "<rootDir>/testes/ambiente.js",
+    "^@/(.*)$": "<rootDir>/src/$1",
+  },
+};
+```
+
+```js
+// jest.setup.js
+import "@testing-library/jest-dom";
+import { TextDecoder, TextEncoder } from "node:util";
+
+// o jsdom não expõe essas APIs, e o React Router 7 depende delas
+Object.assign(globalThis, { TextEncoder, TextDecoder });
+```
+
+```json
+// package.json (trecho)
+"scripts": {
+  "test": "jest",
+  "test:watch": "jest --watch"
+}
+```
+
+O que cada peça resolve:
+
+- **`testEnvironment: "jsdom"`** simula `document` e `window` no Node. O pacote `jest-environment-jsdom` é instalado à parte desde o Jest 28.
+- **`moduleNameMapper`** troca importações que o Jest não entende. `identity-obj-proxy` faz `estilos.cartao` devolver a string `"cartao"`, o que mantém CSS Modules funcionando. Outros CSS e imagens viram um módulo vazio (`export default {}` em `testes/arquivoVazio.js`).
+- **`jest-dom`** acrescenta matchers como `toBeInTheDocument`, `toBeDisabled` e `toHaveAccessibleDescription`.
+- **`import.meta.env`** é sintaxe do Vite que o Jest, rodando em CommonJS, não aceita. A solução mais limpa é isolar a leitura num módulo e trocá-lo nos testes:
+
+```js
+// src/ambiente.js
+export const API_URL = import.meta.env.VITE_API_URL ?? "/api";
+```
+
+```js
+// testes/ambiente.js
+export const API_URL = "http://teste.local/api";
+```
+
+E `src/servicos/api.js` passa a importar `API_URL` de `../ambiente.js` em vez de ler `import.meta.env` diretamente. Uma alternativa é o plugin de Babel `babel-plugin-transform-vite-meta-env`, que reescreve `import.meta.env` durante os testes.
+
+No Nível 2, com TypeScript, a configuração troca o Babel por `ts-jest` ou acrescenta `@babel/preset-typescript`. O resto deste capítulo não muda.
+
+## Primeiros testes: funções puras
+
+O Jest procura arquivos `*.test.js`, `*.test.jsx` ou dentro de pastas `__tests__`. A convenção da Quitanda é deixar o teste ao lado do arquivo testado.
+
+```js
+// src/utilidades/formatarPreco.test.js
+import { formatarPreco } from "./formatarPreco.js";
+
+describe("formatarPreco", () => {
+  test("converte centavos em reais no formato brasileiro", () => {
+    expect(formatarPreco(699)).toBe("R$ 6,99");
+  });
+
+  test("formata milhar com ponto", () => {
+    expect(formatarPreco(123456)).toBe("R$ 1.234,56");
+  });
+
+  test("formata zero", () => {
+    expect(formatarPreco(0)).toBe("R$ 0,00");
+  });
+});
+```
+
+O ` ` é o espaço não separável que o `Intl.NumberFormat` coloca entre "R$" e o número. Comparar com um espaço comum falha, e é um tropeço clássico. O teste segue o padrão **preparar, agir, verificar** (arrange, act, assert), aqui tudo numa linha.
+
+O reducer do carrinho é a parte mais valiosa de testar: é puro, cheio de regras e usado em toda a loja.
+
+```js
+// src/estado/carrinhoSlice.test.js
+import reducer, { adicionou, alterouQuantidade, esvaziou, selecionarTotal } from "./carrinhoSlice.js";
+
+const banana = { id: "1", nome: "Banana prata", precoEmCentavos: 699, unidade: "kg", estoque: 2 };
+const tomate = { id: "3", nome: "Tomate italiano", precoEmCentavos: 899, unidade: "kg", estoque: 0 };
+
+describe("carrinhoSlice", () => {
+  test("adiciona um produto novo com quantidade 1", () => {
+    const estado = reducer(undefined, adicionou(banana));
+    expect(estado.itens).toEqual([{ produto: banana, quantidade: 1 }]);
+  });
+
+  test("não passa do estoque", () => {
+    let estado = reducer(undefined, adicionou(banana));
+    estado = reducer(estado, adicionou(banana));
+    estado = reducer(estado, adicionou(banana));
+    expect(estado.itens[0].quantidade).toBe(2);
+  });
+
+  test("ignora produto esgotado", () => {
+    expect(reducer(undefined, adicionou(tomate)).itens).toHaveLength(0);
+  });
+
+  test("remove o item quando a quantidade chega a zero", () => {
+    const comBanana = reducer(undefined, adicionou(banana));
+    const estado = reducer(comBanana, alterouQuantidade({ id: "1", quantidade: 0 }));
+    expect(estado.itens).toEqual([]);
+  });
+
+  test("calcula o total em centavos", () => {
+    const estado = { carrinho: reducer(reducer(undefined, adicionou(banana)), adicionou(banana)) };
+    expect(selecionarTotal(estado)).toBe(1398);
+  });
+
+  test("esvazia", () => {
+    const estado = reducer(reducer(undefined, adicionou(banana)), esvaziou());
+    expect(estado.itens).toEqual([]);
+  });
+});
+```
+
+`toBe` compara por identidade (`Object.is`), adequado a números e strings. `toEqual` compara estrutura, adequado a objetos e arrays.
+
+## Testando componentes como o usuário usa
+
+A React Testing Library parte de um princípio: **quanto mais o teste se parece com o uso real, mais confiança ele dá**. Em vez de inspecionar estado interno ou nomes de classes, o teste encontra elementos como uma pessoa encontraria (pelo papel, pelo rótulo, pelo texto) e interage com eles. Um teste assim sobrevive a refatorações: trocar `useReducer` por Redux não quebra nada se o comportamento na tela for o mesmo.
+
+### Queries: a ordem de preferência
+
+| Query | Encontra | Quando usar |
+|---|---|---|
+| `getByRole("button", { name: "Adicionar" })` | Elemento pelo papel de acessibilidade e nome acessível | Primeira escolha para quase tudo |
+| `getByLabelText("E-mail")` | Campo pelo rótulo associado | Campos de formulário |
+| `getByPlaceholderText` | Campo pelo placeholder | Só se não houver rótulo (e aí corrija o rótulo) |
+| `getByText("Esgotado")` | Elemento pelo texto | Conteúdo não interativo |
+| `getByAltText` | Imagem pelo texto alternativo | Imagens |
+| `getByTestId` | Atributo `data-testid` | Último recurso |
+
+Cada uma tem três variantes: `getBy` lança erro se não encontrar (para o que deve estar na tela), `queryBy` devolve `null` (para afirmar que algo **não** está na tela) e `findBy` devolve uma promise que espera o elemento aparecer (para resultados assíncronos). As versões `getAllBy`, `queryAllBy` e `findAllBy` devolvem listas.
+
+Usar `getByRole` tem um efeito colateral bom: se o teste não consegue achar o botão pelo papel e pelo nome, um leitor de tela também não consegue. Testes viram uma auditoria de acessibilidade.
+
+### Um utilitário de renderização
+
+Os componentes da Quitanda dependem de Redux, do roteador e do TanStack Query. Um utilitário monta esses provedores com instâncias novas a cada teste, para que um teste não contamine o outro:
+
+```jsx
+// src/testes/renderizar.jsx
+import { render } from "@testing-library/react";
+import { configureStore } from "@reduxjs/toolkit";
+import { Provider } from "react-redux";
+import { MemoryRouter } from "react-router";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import carrinhoReducer from "../estado/carrinhoSlice.js";
+
+export function renderizar(ui, { estadoInicial, rota = "/" } = {}) {
+  const store = configureStore({ reducer: { carrinho: carrinhoReducer }, preloadedState: estadoInicial });
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+  function Provedores({ children }) {
+    return (
+      <Provider store={store}>
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[rota]}>{children}</MemoryRouter>
+        </QueryClientProvider>
+      </Provider>
+    );
+  }
+
+  return { store, ...render(ui, { wrapper: Provedores }) };
+}
+```
+
+O `retry: false` evita que um teste de erro espere as novas tentativas do Query.
+
+### O cartão de produto e o carrinho
+
+```jsx
+// src/componentes/CartaoProduto.test.jsx
+import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { renderizar } from "../testes/renderizar.jsx";
+import CartaoProduto from "./CartaoProduto.jsx";
+
+const banana = { id: "1", nome: "Banana prata", precoEmCentavos: 699, unidade: "kg", estoque: 2, foto: "/fotos/banana.jpg" };
+
+test("mostra nome e preço do produto", () => {
+  renderizar(<CartaoProduto produto={banana} />);
+  expect(screen.getByRole("heading", { name: "Banana prata" })).toBeInTheDocument();
+  expect(screen.getByText(/6,99/)).toBeInTheDocument();
+});
+
+test("adiciona ao carrinho e respeita o estoque", async () => {
+  const user = userEvent.setup();
+  const { store } = renderizar(<CartaoProduto produto={banana} />);
+  const botao = screen.getByRole("button", { name: "Adicionar" });
+
+  await user.click(botao);
+  await user.click(botao);
+  await user.click(botao);
+
+  expect(screen.getByText("2 no carrinho")).toBeInTheDocument();
+  expect(store.getState().carrinho.itens[0].quantidade).toBe(2);
+});
+
+test("desabilita o botão de produto esgotado", () => {
+  renderizar(<CartaoProduto produto={{ ...banana, estoque: 0 }} />);
+  expect(screen.getByRole("button", { name: "Esgotado" })).toBeDisabled();
+  expect(screen.queryByText(/no carrinho/)).not.toBeInTheDocument();
+});
+```
+
+Pontos importantes:
+
+- **`userEvent.setup()`** antes de renderizar e **`await`** em cada interação. O `user-event` simula a sequência real de eventos (foco, `pointerdown`, `mouseup`, `click`, digitação tecla a tecla), mais fiel que o `fireEvent`, que dispara um evento isolado.
+- **Afirme pelo que aparece na tela.** Conferir a store diretamente é aceitável em testes de integração como este, mas o principal é o texto "2 no carrinho".
+- **`queryBy` para ausência.** `getByText` lançaria erro antes de chegar ao `expect`.
+
+<Callout type="tip" title="Quando a query não encontra nada">
+`screen.debug()` imprime o HTML renderizado no terminal, e a mensagem de erro do `getByRole` já lista todos os papéis e nomes disponíveis. Na maioria das vezes, o elemento está lá com outro nome acessível, por exemplo um botão de ícone sem `aria-label`, e a correção é no componente, não no teste.
+</Callout>
+
+## Testando o formulário de checkout
+
+O checkout chama a API. Num teste de componente, a rede real é lenta, instável e cria pedidos de verdade. A saída é substituir o módulo de serviço por um **mock**:
+
+```jsx
+// src/paginas/Checkout.test.jsx
+import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { Route, Routes } from "react-router";
+import { renderizar } from "../testes/renderizar.jsx";
+import Checkout from "./Checkout.jsx";
+import { criarPedido } from "../servicos/pedidos.js";
+
+jest.mock("../servicos/pedidos.js", () => ({
+  criarPedido: jest.fn(),
+}));
+
+const banana = { id: "1", nome: "Banana prata", precoEmCentavos: 699, unidade: "kg", estoque: 10 };
+const carrinhoComBanana = { carrinho: { itens: [{ produto: banana, quantidade: 2 }] } };
+
+function renderizarCheckout() {
+  return renderizar(
+    <Routes>
+      <Route path="/checkout" element={<Checkout />} />
+      <Route path="/pedidos/:id" element={<h1>Pedido recebido</h1>} />
+    </Routes>,
+    { rota: "/checkout", estadoInicial: carrinhoComBanana },
+  );
+}
+
+async function preencherDadosValidos(user) {
+  await user.type(screen.getByLabelText("Nome completo"), "Ana Souza");
+  await user.type(screen.getByLabelText("E-mail"), "ana@exemplo.com");
+  await user.type(screen.getByLabelText("Telefone"), "(11) 91234-5678");
+  await user.type(screen.getByLabelText("CEP"), "01001-000");
+  await user.type(screen.getByLabelText("Número"), "42");
+  await user.click(screen.getByRole("radio", { name: "Pix" }));
+}
+
+beforeEach(() => {
+  criarPedido.mockReset();
+});
+
+test("mostra os erros ao enviar vazio e não chama a API", async () => {
+  const user = userEvent.setup();
+  renderizarCheckout();
+
+  await user.click(screen.getByRole("button", { name: "Finalizar pedido" }));
+
+  expect(await screen.findByText("Informe seu nome completo.")).toBeInTheDocument();
+  expect(screen.getByLabelText("Nome completo")).toHaveAccessibleDescription("Informe seu nome completo.");
+  expect(screen.getByLabelText("Nome completo")).toHaveFocus();
+  expect(criarPedido).not.toHaveBeenCalled();
+});
+
+test("envia o pedido e navega para a página do pedido", async () => {
+  criarPedido.mockResolvedValue({ id: "71" });
+  const user = userEvent.setup();
+  const { store } = renderizarCheckout();
+
+  await preencherDadosValidos(user);
+  await user.click(screen.getByRole("button", { name: "Finalizar pedido" }));
+
+  expect(await screen.findByRole("heading", { name: "Pedido recebido" })).toBeInTheDocument();
+  expect(criarPedido).toHaveBeenCalledWith(
+    expect.objectContaining({ nome: "Ana Souza", pagamento: "pix", itens: [{ produto: banana, quantidade: 2 }] }),
+  );
+  expect(store.getState().carrinho.itens).toEqual([]);
+});
+
+test("mostra mensagem quando a API falha", async () => {
+  criarPedido.mockRejectedValue(new Error("500"));
+  const user = userEvent.setup();
+  renderizarCheckout();
+
+  await preencherDadosValidos(user);
+  await user.click(screen.getByRole("button", { name: "Finalizar pedido" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Não foi possível finalizar");
+});
+```
+
+O que vale observar:
+
+- **`jest.mock` com fábrica** substitui o módulo inteiro antes de qualquer importação (o Babel move a chamada para o topo do arquivo). O componente importa `criarPedido` normalmente e recebe o `jest.fn`.
+- **`mockResolvedValue` e `mockRejectedValue`** definem o resultado da promise em cada cenário, e **`mockReset`** no `beforeEach` limpa chamadas e respostas entre os testes.
+- **`findBy`** espera o resultado assíncrono (validação, mutação, navegação) aparecer, com tempo limite padrão de um segundo. Para afirmações que não são sobre a presença de um elemento, use `await waitFor(() => expect(...))`.
+- **`toHaveAccessibleDescription`** verifica que a mensagem de erro está ligada ao campo por `aria-describedby`. O teste garante a acessibilidade, não só o texto.
+
+### Mocks simples, sem exagero
+
+| Ferramenta | Uso |
+|---|---|
+| `jest.fn()` | Função falsa que registra chamadas; ideal para props como `onAdicionar` |
+| `jest.mock("caminho", fábrica)` | Substitui um módulo inteiro, como um serviço de API |
+| `jest.spyOn(objeto, "metodo")` | Observa ou substitui um método existente, como `window.fetch` ou `Storage.prototype.setItem` |
+| `jest.useFakeTimers()` | Controla `setTimeout` e `setInterval`, como na faixa de promoção |
+
+```jsx
+// teste de componente que recebe função por prop
+const onRemover = jest.fn();
+render(<Carrinho itens={[{ produto: banana, quantidade: 1 }]} onRemover={onRemover} />);
+await user.click(screen.getByRole("button", { name: "Remover" }));
+expect(onRemover).toHaveBeenCalledWith("1");
+```
+
+Mockar demais é um risco: um teste que substitui tudo verifica só os próprios mocks. A regra prática é mockar a **fronteira** (rede, tempo, armazenamento) e deixar o código da aplicação rodar de verdade. No Nível 2, o MSW (Mock Service Worker) leva essa ideia adiante, interceptando as requisições HTTP em vez de substituir o módulo de serviço, de modo que a camada de serviço também é testada.
+
+<Callout type="warning" title="Não teste detalhes de implementação">
+Testes que verificam o nome de uma classe CSS, a quantidade de vezes que um componente renderizou ou o valor de um estado interno quebram em toda refatoração sem que o comportamento tenha mudado. Pergunte o que o usuário veria de diferente se o código estivesse errado, e afirme isso.
+</Callout>
+
+## O que testar primeiro na Quitanda
+
+1. **Regras de negócio puras**: `formatarPreco`, `carrinhoSlice`, `criarEsquemaCheckout`. Rápidos, estáveis e de alto valor.
+2. **Componentes com interação**: cartão de produto, carrinho, seletor de quantidade.
+3. **Fluxos críticos**: checkout com sucesso, validação e falha da API.
+4. **O resto, conforme os bugs aparecem**: cada bug corrigido ganha um teste que o reproduz antes da correção.
+
+Testes de ponta a ponta, com navegador real e a aplicação inteira rodando, ficam com o Playwright, no Nível 2.
+
+## Na entrevista
+
+**Qual a diferença entre getBy, queryBy e findBy?** `getBy` encontra de forma síncrona e lança erro se não achar. `queryBy` devolve `null` quando não acha, útil para afirmar ausência. `findBy` devolve uma promise que espera o elemento aparecer, para resultados assíncronos.
+
+**Por que preferir getByRole?** Porque encontra os elementos como tecnologias assistivas os encontram, pelo papel e nome acessível. O teste fica resistente a mudanças de marcação e ainda denuncia problemas de acessibilidade.
+
+**Por que user-event em vez de fireEvent?** O `user-event` simula a interação completa de um usuário, com a sequência de eventos de foco, ponteiro e teclado que o navegador dispararia. O `fireEvent` dispara um único evento sintético, o que pode passar em situações em que o uso real falharia.
+
+**Como você testaria um componente que chama uma API?** Isolando a fronteira de rede: com `jest.mock` no módulo de serviço, definindo respostas de sucesso e erro com `mockResolvedValue` e `mockRejectedValue`, ou com MSW interceptando as requisições. E afirmando o que aparece na tela em cada cenário.
+
+**Jest ou Vitest num projeto Vite?** Vitest reaproveita a configuração do Vite e exige menos ajustes, com API compatível com a do Jest. Jest é mais comum em projetos existentes. Os testes com Testing Library são praticamente os mesmos nos dois.
+
+## Pratique
+
+1. Configure Jest na Quitanda com Babel, `jsdom`, `jest-dom` e o mapeamento de CSS, e faça os testes de `formatarPreco` passarem.
+2. Escreva os testes do `carrinhoSlice` cobrindo todas as ações e quebre de propósito a regra do estoque para ver o teste falhar com uma mensagem clara.
+3. Crie o utilitário `renderizar` e teste o `CartaoProduto`: nome, preço, adição, limite de estoque e produto esgotado.
+4. Teste o checkout nos três cenários deste capítulo e acrescente um quarto: troco menor que o total quando o pagamento é em dinheiro.
+5. Use `jest.useFakeTimers()` para testar que a `FaixaPromocao` troca de mensagem a cada cinco segundos.
+6. Instale o Vitest num branch, rode os mesmos testes trocando `jest` por `vi` onde necessário e compare a configuração e o tempo de execução.
+
+<Quiz question="Qual query afirma corretamente que o texto 2 no carrinho NÃO aparece na tela?" options={["expect(screen.getByText('2 no carrinho')).toBeNull()","expect(await screen.findByText('2 no carrinho')).not.toBeInTheDocument()","expect(screen.queryByText('2 no carrinho')).not.toBeInTheDocument()","expect(screen.getByTestId('carrinho')).toBeEmpty()"]} answer={2} explanation="queryBy devolve null quando não encontra o elemento. getBy e findBy falhariam antes de chegar à afirmação." />
+
+<Quiz question="Por que o teste de formatarPreco compara com R$ seguido de   e não de um espaço comum?" options={["Porque o Jest normaliza espaços","Porque o Intl.NumberFormat usa um espaço não separável entre o símbolo e o valor","Porque o jsdom troca espaços por entidades HTML","Porque o Babel converte espaços em strings"]} answer={1} explanation="A formatação de moeda em pt-BR insere o caractere U+00A0. Um espaço comum faz a comparação estrita falhar." />
+
+<Quiz question="Num teste de componente que finaliza um pedido, o que é mais adequado substituir por mock?" options={["O módulo de serviço que faz a requisição HTTP","O reducer do carrinho","O componente Campo do formulário","O React Hook Form"]} answer={0} explanation="Mocke a fronteira (rede, tempo, armazenamento) e deixe o código da aplicação rodar de verdade, para que o teste verifique o comportamento real." />
+
+## Base no CodeForge
+
+- [React: utilizando hooks para gerenciar estados](/learn/carreira-react/react-hooks-gerenciar-estados): reducers puros, o código mais fácil de testar.
+- [React: explorando frameworks e bibliotecas para criação de interfaces e validação de formulários](/learn/carreira-react/react-frameworks-bibliotecas-interfaces-validacao-formularios): o checkout testado aqui.
+- [Node.js: implementando testes em uma API](/learn/carreira-nodejs/nodejs-implementando-testes-api): Jest do lado do servidor.
+- [React: realizando testes avançados com Jest e Testing Library](/learn/carreira-react/react-testes-avancados-jest-testing-library): MSW, hooks e cobertura no Nível 2.
+
+## Referências
+
+- [Jest: Getting Started](https://jestjs.io/docs/getting-started)
+- [Testing Library: About Queries](https://testing-library.com/docs/queries/about)
+- [Testing Library: user-event](https://testing-library.com/docs/user-event/intro)
+- [jest-dom: custom matchers](https://github.com/testing-library/jest-dom)
+- [Vitest: Getting Started](https://vitest.dev/guide/)

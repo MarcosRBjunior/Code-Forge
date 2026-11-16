@@ -1,0 +1,397 @@
+---
+title: "React: técnicas avançadas de otimização e desempenho"
+kind: lesson
+---
+
+O lojista da Quitanda reclamou: no painel, digitar no filtro da tabela de pedidos trava, e a página de métricas demora para abrir no celular. No catálogo, com 2.000 produtos depois que entraram os orgânicos e os congelados, a rolagem engasga. A tentação é sair espalhando `useMemo` e `React.memo` por todo lado. Quase sempre isso não resolve, porque ninguém mediu o que estava lento.
+
+Otimização em React segue uma ordem: medir, achar a causa, aplicar a técnica certa para aquela causa e medir de novo. As causas se dividem em quatro famílias: renderizações desnecessárias, trabalho caro dentro da renderização, JavaScript demais no carregamento e DOM demais na tela. Cada família tem sua ferramenta.
+
+**Você vai aprender:**
+
+- Medir com o Profiler do React DevTools e com o componente `Profiler`
+- Entender quando `memo`, `useMemo` e `useCallback` ajudam e o que o React Compiler automatiza
+- Dividir o bundle com `lazy`, `Suspense` e rotas preguiçosas do React Router
+- Virtualizar listas longas com TanStack Virtual
+- Manter a interface responsiva com `useTransition` e `useDeferredValue`
+
+## Primeiro, medir
+
+### React DevTools Profiler
+
+Instale a extensão React DevTools e abra a aba **Profiler**. O fluxo:
+
+1. Nas configurações (engrenagem), marque **Record why each component rendered while profiling**.
+2. Clique em gravar, faça a interação lenta (digitar no filtro de pedidos) e pare.
+3. Leia o **flamegraph**: cada barra é um componente; a largura é o tempo de renderização, a cor indica o custo relativo naquele commit, e cinza significa que o componente não renderizou.
+4. Clique num componente para ver **por que** renderizou: props mudaram (quais), estado mudou, hook mudou, ou o pai renderizou.
+
+O **ranked chart** ordena os componentes pelo tempo, o que aponta direto o culpado. Ative também **Highlight updates when components render** na aba Components: cada renderização pisca uma borda na tela, e você vê se digitar uma letra acende a página inteira.
+
+Meça sempre num build de produção (`npm run build && npm run preview`): o modo de desenvolvimento é mais lento de propósito, e o `StrictMode` renderiza duas vezes. Para profiling em produção, o React oferece um build específico de profiling; no Vite, isso exige um alias para `react-dom/profiling`.
+
+### O componente Profiler
+
+Para medir em código, inclusive em produção:
+
+```tsx
+// src/paginas/painel/Pedidos.tsx (trecho)
+import { Profiler, type ProfilerOnRenderCallback } from "react";
+
+const registrar: ProfilerOnRenderCallback = (id, fase, duracaoReal, duracaoBase) => {
+  if (duracaoReal > 16) console.warn(`${id} (${fase}) levou ${duracaoReal.toFixed(1)}ms`, { duracaoBase });
+};
+
+<Profiler id="TabelaDePedidos" onRender={registrar}>
+  <TabelaDePedidos pedidos={pedidos} />
+</Profiler>;
+```
+
+`duracaoReal` é o tempo do commit; `duracaoBase` estima quanto custaria renderizar a subárvore inteira sem memoização. Se as duas são próximas, a memoização não está ajudando. Use com moderação: o `Profiler` tem custo próprio.
+
+<Callout type="tip" title="16 milissegundos">
+A 60 quadros por segundo, cada quadro tem cerca de 16ms para JavaScript, estilo, layout e pintura. Uma renderização que passa disso em resposta a uma tecla é percebida como travamento. O Chrome DevTools, aba Performance, mostra essas tarefas longas (acima de 50ms) com uma marca vermelha.
+</Callout>
+
+## Renderizações desnecessárias
+
+Um componente renderiza quando seu estado muda, quando um contexto que ele lê muda ou quando o pai renderiza. Esse último caso é o mais comum e o mais barato de resolver sem memoização.
+
+### Mova o estado para baixo
+
+```tsx
+// Antes: digitar no filtro renderiza o painel inteiro
+function PainelDePedidos() {
+  const [filtro, setFiltro] = useState("");
+  return (
+    <>
+      <input value={filtro} onChange={(e) => setFiltro(e.target.value)} />
+      <GraficoDeVendas />          {/* caro, não depende do filtro */}
+      <TabelaDePedidos filtro={filtro} />
+    </>
+  );
+}
+```
+
+```tsx
+// Depois: o estado mora só onde é usado
+function PainelDePedidos() {
+  return (
+    <>
+      <GraficoDeVendas />
+      <PedidosFiltrados />  {/* contém o input e a tabela */}
+    </>
+  );
+}
+```
+
+### Passe componentes como children
+
+Quando o estado precisa ficar no alto (um layout que abre e fecha o menu lateral), receba o conteúdo pesado como `children`. Elementos JSX criados pelo pai do layout não mudam quando o layout renderiza, e o React pula a reconciliação deles.
+
+```tsx
+// src/componentes/LayoutDoPainel.tsx
+function LayoutDoPainel({ children }: { children: ReactNode }) {
+  const [menuAberto, setMenuAberto] = useState(true);
+  return (
+    <div className="flex">
+      <MenuLateral aberto={menuAberto} onAlternar={() => setMenuAberto((a) => !a)} />
+      <main>{children}</main> {/* não re-renderiza ao alternar o menu */}
+    </div>
+  );
+}
+```
+
+### Keys estáveis
+
+Use o `id` do produto como `key`, nunca o índice quando a lista é reordenada, filtrada ou recebe itens no início. Com índice, o React reaproveita o componente errado: o estado de quantidade de "Tomate" aparece em "Banana", e componentes inteiros são recriados sem necessidade.
+
+## memo, useMemo e useCallback
+
+- `memo(Componente)` pula a renderização se todas as props forem iguais por `Object.is` às da renderização anterior.
+- `useMemo(() => calculo, deps)` guarda o resultado de um cálculo entre renderizações.
+- `useCallback(fn, deps)` guarda a referência de uma função (é um `useMemo` que devolve a função).
+
+Os três só servem juntos. `memo` em `LinhaDePedido` é inútil se o pai passa `onSelecionar={() => ...}` criado a cada render: a prop sempre muda.
+
+```tsx
+// src/paginas/painel/TabelaDePedidos.tsx
+import { memo, useCallback, useMemo } from "react";
+
+const LinhaDePedido = memo(function LinhaDePedido({ pedido, onSelecionar }: {
+  pedido: Pedido;
+  onSelecionar: (id: string) => void;
+}) {
+  return (
+    <tr onClick={() => onSelecionar(pedido.id)}>
+      <td>{pedido.id}</td>
+      <td>{rotulosDeStatus[pedido.status]}</td>
+      <td>{formatarPreco(pedido.total)}</td>
+    </tr>
+  );
+});
+
+export function TabelaDePedidos({ pedidos, filtro }: { pedidos: Pedido[]; filtro: string }) {
+  const [selecionado, setSelecionado] = useState<string | null>(null);
+
+  const visiveis = useMemo(
+    () => pedidos.filter((p) => p.id.includes(filtro)).sort((a, b) => +b.criadoEm - +a.criadoEm),
+    [pedidos, filtro],
+  );
+
+  const selecionar = useCallback((id: string) => setSelecionado(id), []);
+
+  return (
+    <table>
+      <tbody>
+        {visiveis.map((p) => (
+          <LinhaDePedido key={p.id} pedido={p} onSelecionar={selecionar} />
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+| Ferramenta | Use quando | Não use quando |
+|---|---|---|
+| `memo` | Componente caro renderiza com as mesmas props por causa do pai | Props mudam quase sempre, ou o componente é barato |
+| `useMemo` | Cálculo caro (filtrar e ordenar milhares de itens) ou objeto passado a um filho memoizado | Cálculo trivial; o custo da comparação supera o ganho |
+| `useCallback` | Função passada a um filho memoizado ou usada como dependência de efeito | Função usada só em elementos nativos (`button`, `input`) |
+
+Quebras comuns: passar `style={{ ... }}` ou um objeto literal novo como prop, ler um contexto cujo `value` é um objeto recriado a cada render, e dependências instáveis que invalidam o `useMemo` toda vez.
+
+### React Compiler
+
+O React Compiler (estável desde a versão 1.0, em 2025) é um plugin de build que analisa os componentes e insere a memoização automaticamente, num nível mais fino que o manual: ele memoiza trechos de JSX e valores individuais, não só componentes inteiros. Com ele, a maior parte dos `memo`, `useMemo` e `useCallback` deixa de ser necessária.
+
+```bash
+npm i -D babel-plugin-react-compiler
+```
+
+```ts
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [
+    react({
+      babel: { plugins: ["babel-plugin-react-compiler"] },
+    }),
+  ],
+});
+```
+
+O formato exato da integração com o plugin do Vite muda entre versões; confira a documentação de instalação do compilador para a sua. No Next.js 16, basta `reactCompiler: true` no `next.config.ts`.
+
+O compilador assume que o código segue as Regras do React: componentes puros, props e estado tratados como imutáveis, hooks no topo. Componentes que violam as regras são simplesmente pulados. As regras do compilador estão no preset recomendado do `eslint-plugin-react-hooks` nas versões recentes; ligue o lint antes de ligar o compilador, porque ele aponta o que impediria a otimização. A diretiva `"use no memo"` no topo de um componente desliga o compilador nele, útil para isolar um problema.
+
+<Callout type="warning" title="O compilador não conserta tudo">
+Ele elimina renderizações por referências instáveis. Não resolve uma lista com 2.000 nós de DOM, um bundle de 1 MB, um cálculo que é caro mesmo uma única vez, nem um contexto global que muda a cada segundo. Para isso continuam valendo virtualização, code splitting, mover estado e dividir contextos.
+</Callout>
+
+## Code splitting com lazy e Suspense
+
+O painel do lojista, com gráficos e tabelas, não deveria pesar no carregamento do catálogo que o cliente abre no celular. Code splitting divide o bundle em pedaços carregados sob demanda, usando `import()` dinâmico.
+
+```tsx
+// src/paginas/painel/Metricas.tsx (componente pesado, com biblioteca de gráficos)
+// precisa de export default para o lazy
+export default function Metricas() { /* ... */ }
+```
+
+```tsx
+// src/paginas/painel/Painel.tsx
+import { lazy, Suspense } from "react";
+
+const Metricas = lazy(() => import("./Metricas"));
+
+export function Painel() {
+  return (
+    <Suspense fallback={<EsqueletoDeGrafico />}>
+      <Metricas />
+    </Suspense>
+  );
+}
+```
+
+Na primeira renderização, `Metricas` suspende enquanto o arquivo é baixado, e o `Suspense` mais próximo mostra o fallback. O Vite gera um chunk separado automaticamente.
+
+### Rotas preguiçosas no React Router 7
+
+O melhor ponto de corte é a rota. No modo de dados do React Router, a propriedade `lazy` carrega o módulo da rota (componente, loader, error boundary) só quando ela é visitada:
+
+```tsx
+// src/rotas.tsx
+import { createBrowserRouter } from "react-router";
+
+export const router = createBrowserRouter([
+  {
+    path: "/",
+    Component: LayoutDaLoja,
+    children: [
+      { index: true, Component: Catalogo },
+      { path: "produtos/:id", lazy: () => import("./paginas/Produto").then((m) => ({ Component: m.Produto })) },
+      { path: "carrinho", lazy: () => import("./paginas/Carrinho").then((m) => ({ Component: m.Carrinho })) },
+    ],
+  },
+  {
+    path: "/painel",
+    lazy: () => import("./paginas/painel/rota"), // o módulo exporta Component, loader etc.
+  },
+]);
+```
+
+Combine com pré-carregamento: chamar `import("./paginas/Carrinho")` quando o cursor passa sobre o ícone do carrinho faz o chunk chegar antes do clique. O `Link` do React Router aceita `prefetch` no modo framework, assunto do capítulo sobre Remix.
+
+### Enxergando o bundle
+
+`npx vite-bundle-visualizer` (ou o plugin `rollup-plugin-visualizer`) gera um mapa do bundle. Os suspeitos de sempre: bibliotecas de data inteiras para formatar uma data (prefira `Intl.DateTimeFormat`), ícones importados como pacote completo, lodash sem tree shaking e bibliotecas de gráfico no chunk principal.
+
+## Virtualização de listas
+
+Renderizar 2.000 cartões cria dezenas de milhares de nós de DOM. Mesmo memoizados, o custo está no navegador: layout, pintura e memória. Virtualizar significa renderizar só o que cabe na tela (mais uma margem) e simular a altura total com um espaçador.
+
+```tsx
+// src/componentes/ListaVirtualDeProdutos.tsx
+import { useRef } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+
+export function ListaVirtualDeProdutos({ produtos }: { produtos: Produto[] }) {
+  const pai = useRef<HTMLDivElement>(null);
+
+  const virtualizador = useVirtualizer({
+    count: produtos.length,
+    getScrollElement: () => pai.current,
+    estimateSize: () => 96,
+    overscan: 5,
+  });
+
+  return (
+    <div ref={pai} className="h-[70vh] overflow-auto">
+      <div style={{ height: virtualizador.getTotalSize(), position: "relative" }}>
+        {virtualizador.getVirtualItems().map((linha) => {
+          const produto = produtos[linha.index]!;
+          return (
+            <div
+              key={produto.id}
+              data-index={linha.index}
+              ref={virtualizador.measureElement}
+              style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${linha.start}px)` }}
+            >
+              <LinhaDeProduto produto={produto} />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+```
+
+`measureElement` mede a altura real de cada item, para linhas de tamanho variável. Para grades, o TanStack Virtual virtualiza linhas e colunas. Alternativas: `react-window` e `react-virtuoso`.
+
+Custos da virtualização: o `Ctrl+F` do navegador não acha itens fora da tela, leitores de tela não sabem o total (informe com `aria-rowcount` ou texto) e o scroll para uma âncora exige a API do virtualizador. Para listas médias, a propriedade CSS `content-visibility: auto` com `contain-intrinsic-size` faz o navegador pular a renderização de itens fora da tela sem tirar nada do DOM. E, antes de tudo, pergunte se a lista deveria ser paginada.
+
+## Prioridades: useTransition e useDeferredValue
+
+Algumas atualizações são urgentes (o caractere aparecer no input) e outras podem esperar (a tabela filtrada). O React concorrente permite marcar as que podem esperar; ele as renderiza em segundo plano e as interrompe se chegar algo urgente.
+
+### useDeferredValue
+
+Quando você recebe um valor e não controla quem o atualiza:
+
+```tsx
+// src/paginas/painel/PedidosFiltrados.tsx
+import { useDeferredValue, useState } from "react";
+
+export function PedidosFiltrados({ pedidos }: { pedidos: Pedido[] }) {
+  const [filtro, setFiltro] = useState("");
+  const filtroAdiado = useDeferredValue(filtro);
+  const desatualizado = filtro !== filtroAdiado;
+
+  return (
+    <>
+      <input value={filtro} onChange={(e) => setFiltro(e.target.value)} aria-label="Filtrar pedidos" />
+      <div style={{ opacity: desatualizado ? 0.6 : 1 }}>
+        <TabelaDePedidos pedidos={pedidos} filtro={filtroAdiado} />
+      </div>
+    </>
+  );
+}
+```
+
+O input atualiza na hora. A tabela renderiza com o valor antigo e, em segundo plano, com o novo. Para o ganho existir, `TabelaDePedidos` precisa ser memoizada (pelo `memo` ou pelo compilador); senão ela renderiza de novo junto com o input de qualquer forma.
+
+### useTransition
+
+Quando você controla a atualização, marque-a como transição:
+
+```tsx
+// src/paginas/painel/Painel.tsx (trecho)
+const [aba, setAba] = useState("pedidos");
+const [pendente, iniciarTransicao] = useTransition();
+
+function trocarAba(nova: string) {
+  iniciarTransicao(() => setAba(nova));
+}
+
+<span aria-live="polite">{pendente && "Carregando…"}</span>
+```
+
+Trocar para "Métricas" não congela os botões enquanto o gráfico renderiza, e se o lojista clicar em outra aba no meio, o React descarta o trabalho anterior. Transições também evitam que um `Suspense` já visível volte para o fallback: o React mantém a tela antiga enquanto prepara a nova. No React 19, a função passada a `startTransition` pode ser assíncrona, e o `pendente` cobre toda a espera; esse é o mecanismo por trás das Actions.
+
+Nenhum dos dois é debounce: não há atraso fixo, e em máquinas rápidas a renderização adiada acontece quase imediatamente. Para economizar requisições, continue usando `useDebounce`; para manter a interface responsiva durante renderizações caras, use transições.
+
+## Um roteiro de diagnóstico
+
+| Sintoma | Causa provável | Técnica |
+|---|---|---|
+| Digitar trava, Profiler mostra a página inteira renderizando | Estado alto demais | Mover estado para baixo, `children`, `memo` ou compilador |
+| Um componente leva muito tempo mesmo sozinho | Cálculo caro no render | `useMemo`, mover cálculo para o servidor ou para um worker |
+| Primeira carga lenta, muito JavaScript | Bundle grande | Rotas com `lazy`, `import()` dinâmico, trocar dependências |
+| Rolagem engasga em listas longas | DOM demais | Virtualização, paginação, `content-visibility` |
+| Interface congela durante uma atualização grande | Renderização urgente demais | `useTransition`, `useDeferredValue` |
+
+## Na entrevista
+
+**Quando um componente React renderiza de novo?** Quando seu estado muda, quando um contexto que ele consome muda ou quando o pai renderiza. Props mudarem não é a causa por si: sem `memo`, o filho renderiza junto com o pai mesmo com props iguais.
+
+**`useMemo` e `useCallback` deixam tudo mais rápido?** Não. Eles têm custo de memória e de comparação, e só ajudam quando evitam um cálculo caro ou mantêm estável uma prop de um filho memoizado. Eu meço com o Profiler antes de aplicar.
+
+**O que o React Compiler faz?** É um plugin de build que insere memoização automática em componentes e hooks que seguem as Regras do React. Reduz a necessidade de `memo`, `useMemo` e `useCallback` manuais, mas não resolve bundle grande, DOM excessivo nem cálculos caros por natureza.
+
+**Qual a diferença entre `useTransition` e `useDeferredValue`?** `useTransition` marca uma atualização de estado que você dispara como não urgente e dá um `isPending`. `useDeferredValue` adia um valor que você recebe, útil quando não controla o setter. Os dois usam renderização interrompível, não um atraso fixo.
+
+**Como você reduziria o tempo de carregamento inicial de uma SPA?** Medindo o bundle com um visualizador, dividindo por rotas com `lazy`, removendo dependências pesadas, carregando componentes secundários sob demanda e pré-carregando o próximo passo provável. Depois confirmo pelo LCP e pelo tamanho dos chunks.
+
+## Pratique
+
+1. Grave no Profiler a digitação no filtro de pedidos do painel, identifique o componente mais caro e anote o motivo de cada renderização.
+2. Refatore o painel movendo o estado do filtro para baixo e compare a gravação antes e depois.
+3. Ative o React Compiler na Quitanda, rode o lint das regras do compilador e remova os `useCallback` que ficaram redundantes; confirme no Profiler que nada piorou.
+4. Transforme as rotas do painel em rotas `lazy` e compare o tamanho do chunk principal no `vite build` antes e depois.
+5. Gere 5.000 produtos no `db.json` e virtualize o catálogo com TanStack Virtual; meça a rolagem na aba Performance.
+6. Aplique `useDeferredValue` ao filtro de pedidos e simule CPU lenta (4x) no DevTools para perceber a diferença.
+
+<Quiz question="O componente LinhaDePedido foi envolvido em memo, mas continua renderizando a cada tecla no filtro. Qual a causa mais provável?" options={["memo só funciona com componentes de classe","O pai passa uma função ou objeto novo a cada renderização como prop","O React ignora memo em modo de produção","A key de cada linha é o id do pedido"]} answer={1} explanation="memo compara as props por referência. Uma arrow function criada no render do pai é uma prop nova a cada vez, então a comparação falha." />
+
+<Quiz question="Qual técnica resolve uma rolagem lenta num catálogo com milhares de cartões?" options={["useCallback em todos os handlers","useTransition na rolagem","Virtualizar a lista, renderizando apenas os itens visíveis","Trocar a key para o índice"]} answer={2} explanation="O gargalo é a quantidade de nós de DOM. Virtualização mantém no DOM só os itens visíveis e uma pequena margem." />
+
+<Quiz question="O que acontece com os arquivos importados via lazy e import dinâmico no build do Vite?" options={["Viram chunks separados, baixados apenas quando o componente é renderizado pela primeira vez","São incluídos no bundle principal, mas executados depois","São carregados pelo servidor a cada requisição","São descartados no build de produção"]} answer={0} explanation="O import dinâmico é um ponto de divisão: o bundler gera um chunk à parte, e o Suspense mostra o fallback enquanto ele é baixado." />
+
+## Base no CodeForge
+
+- [React: explorando padrões de composição com custom hooks](/learn/carreira-react/react-padroes-composicao-custom-hooks): composição com `children`, que evita renderizações sem memoização.
+- [React: otimização avançada de performance](/learn/carreira-react/react-otimizacao-avancada-performance): a continuação no Nível 3, com métricas de produção.
+- [Latência e throughput](/learn/system-design/latencia-throughput): as duas medidas por trás de "está lento".
+- [CDN](/learn/system-design/cdn): onde os chunks gerados pelo code splitting são servidos.
+
+## Referências
+
+- [React: memo](https://react.dev/reference/react/memo) e [useMemo](https://react.dev/reference/react/useMemo)
+- [React Compiler: Introduction](https://react.dev/learn/react-compiler)
+- [React: useTransition](https://react.dev/reference/react/useTransition) e [useDeferredValue](https://react.dev/reference/react/useDeferredValue)
+- [React: lazy](https://react.dev/reference/react/lazy)
+- [TanStack Virtual](https://tanstack.com/virtual/latest)

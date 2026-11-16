@@ -1,0 +1,407 @@
+---
+title: "React: garantindo qualidade de código e automações de deploy"
+kind: lesson
+---
+
+A Quitanda tem TypeScript, testes de unidade, integração e ponta a ponta, uma arquitetura por funcionalidade e um processo de release com previews e rollback. Só que tudo isso depende de alguém lembrar de rodar os comandos. Na semana passada um PR entrou com erro de tipo porque o autor não rodou `tsc`, outro reformatou 40 arquivos e escondeu a mudança real no diff, e o deploy de sexta foi feito da máquina de alguém, com um `.env` diferente.
+
+Qualidade sustentável é a que não depende de memória nem de boa vontade. Este capítulo automatiza a Quitanda em três momentos: no editor e no commit (ESLint, Prettier, Husky, lint-staged, commits convencionais), no pull request (GitHub Actions com lint, tipos, testes, build, e2e e Lighthouse) e no deploy (Vercel com previews por PR e produção a partir da branch principal).
+
+**Você vai aprender:**
+
+- Configurar ESLint 9 no formato flat com as regras do Next.js, TypeScript e React Hooks
+- Separar formatação (Prettier) de qualidade (ESLint) sem conflito entre as duas
+- Barrar problemas antes do commit com Husky, lint-staged e commitlint
+- Montar um pipeline no GitHub Actions com lint, typecheck, testes, build e e2e
+- Publicar na Vercel com preview por pull request e variáveis por ambiente
+- Medir desempenho e acessibilidade a cada PR com Lighthouse CI
+
+## Onde cada verificação acontece
+
+| Momento | Verificação | Tempo aceitável | Ferramenta |
+|---|---|---|---|
+| No editor | Erros de lint e tipo enquanto digita, formatação ao salvar | Instantâneo | Extensões do ESLint e Prettier, TypeScript |
+| No commit | Lint e formatação só dos arquivos alterados, mensagem do commit | Poucos segundos | Husky, lint-staged, commitlint |
+| No PR | Tudo, no projeto inteiro e numa máquina limpa | Alguns minutos | GitHub Actions |
+| No deploy | Build de produção, migrações, verificação pós-deploy | Minutos | Vercel, Actions |
+
+A regra: quanto mais cedo, mais rápido e mais restrito ao que mudou. O CI é a fonte de verdade, porque hooks locais podem ser pulados com `--no-verify`.
+
+## ESLint 9 com flat config
+
+O ESLint 9 usa um único arquivo `eslint.config.mjs` que exporta um array de objetos de configuração, aplicados em ordem. O antigo `.eslintrc` com `extends` em string não existe mais. No Next.js 16, o comando `next lint` foi removido e o `next build` não roda mais o lint: você chama o ESLint diretamente.
+
+```bash
+npm install -D eslint eslint-config-next eslint-config-prettier
+```
+
+```js
+// eslint.config.mjs
+import { defineConfig, globalIgnores } from "eslint/config";
+import nextVitals from "eslint-config-next/core-web-vitals";
+import nextTs from "eslint-config-next/typescript";
+import prettier from "eslint-config-prettier/flat";
+
+export default defineConfig([
+  ...nextVitals,
+  ...nextTs,
+  {
+    rules: {
+      "no-console": ["warn", { allow: ["warn", "error"] }],
+      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
+      "no-restricted-imports": [
+        "error",
+        { patterns: [{ group: ["@/features/*/*"], message: "Use a API pública da feature." }] },
+      ],
+    },
+  },
+  {
+    files: ["**/*.test.{ts,tsx}", "e2e/**"],
+    rules: { "no-console": "off" },
+  },
+  prettier,
+  globalIgnores([".next/**", "out/**", "coverage/**", "playwright-report/**", "next-env.d.ts"]),
+]);
+```
+
+O que cada parte traz:
+
+- `core-web-vitals`: regras do Next.js (uso de `next/image`, `next/link`, scripts), de React e as de React Hooks, que apontam dependências faltando em `useEffect` e hooks chamados condicionalmente.
+- `typescript`: regras do `typescript-eslint`.
+- O bloco de regras do time, incluindo a fronteira entre features do capítulo de arquitetura.
+- `prettier` por último: desliga as regras de estilo que brigariam com o formatador.
+
+```json
+// package.json (trecho)
+{
+  "scripts": {
+    "lint": "eslint . --max-warnings=0",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "jest",
+    "test:e2e": "playwright test"
+  }
+}
+```
+
+`--max-warnings=0` faz avisos falharem no CI. Sem isso, avisos se acumulam até ninguém mais lê-los. Se uma regra não vale a pena, desligue-a explicitamente; não a deixe como aviso eterno.
+
+O `typecheck` é separado porque o ESLint não faz verificação completa de tipos, e o `next build` sim, mas só no fim de um processo lento. `tsc --noEmit` dá a resposta em segundos.
+
+## Prettier: formatação sem discussão
+
+ESLint cuida de qualidade (bugs prováveis, padrões perigosos). Prettier cuida de formatação (aspas, quebras de linha, vírgulas). Misturar os dois gera conflito e lentidão.
+
+```bash
+npm install -D prettier prettier-plugin-tailwindcss
+```
+
+```json
+// .prettierrc.json
+{
+  "printWidth": 100,
+  "semi": true,
+  "singleQuote": false,
+  "trailingComma": "all",
+  "plugins": ["prettier-plugin-tailwindcss"]
+}
+```
+
+```bash
+# .prettierignore
+.next
+coverage
+playwright-report
+package-lock.json
+```
+
+O plugin do Tailwind ordena as classes no padrão recomendado, o que acaba com diffs do tipo "mudei a ordem de `flex` e `gap-2`". Ative "formatar ao salvar" no editor e versione um `.vscode/settings.json` com o Prettier como formatador padrão, para que todo o time tenha o mesmo comportamento.
+
+<Callout type="tip" title="Um PR só para formatar">
+Ao introduzir o Prettier num projeto existente, rode `npm run format` num PR separado, sem outra mudança. Depois, adicione o hash desse commit a um arquivo `.git-blame-ignore-revs` para que o `git blame` continue mostrando o autor real de cada linha.
+</Callout>
+
+## Husky, lint-staged e commits convencionais
+
+Husky instala hooks do Git versionados no repositório. lint-staged roda comandos apenas nos arquivos que estão no commit, o que mantém o hook rápido.
+
+```bash
+npm install -D husky lint-staged @commitlint/cli @commitlint/config-conventional
+npx husky init
+```
+
+O `husky init` cria a pasta `.husky/` e adiciona o script `prepare` ao `package.json`, que reinstala os hooks a cada `npm install`. Troque o conteúdo do hook de pré-commit:
+
+```bash
+# .husky/pre-commit
+npx lint-staged
+```
+
+```json
+// package.json (trecho)
+{
+  "lint-staged": {
+    "*.{ts,tsx,js,mjs}": ["eslint --fix --max-warnings=0", "prettier --write"],
+    "*.{json,md,css,yml}": "prettier --write"
+  }
+}
+```
+
+Testes completos e `tsc` ficam fora do pré-commit: são lentos e analisam o projeto todo. Eles pertencem ao CI (ou, no máximo, a um hook de `pre-push`).
+
+### Mensagens de commit
+
+Commits convencionais dão estrutura ao histórico e alimentam o changelog e a versão semântica, como visto no capítulo de release.
+
+| Tipo | Uso | Efeito na versão |
+|---|---|---|
+| `feat` | Funcionalidade nova | minor |
+| `fix` | Correção de bug | patch |
+| `perf`, `refactor` | Desempenho, refatoração sem mudança de comportamento | nenhum (ou patch, conforme a ferramenta) |
+| `test`, `docs`, `chore`, `ci`, `build` | Testes, documentação, manutenção, pipeline | nenhum |
+| `feat!` ou rodapé `BREAKING CHANGE:` | Quebra de compatibilidade | major |
+
+Exemplos: `feat(carrinho): aplica cupom de frete grátis`, `fix(checkout): recalcula total com preço do banco`, `ci: adiciona lighthouse ao pipeline`.
+
+```js
+// commitlint.config.mjs
+export default {
+  extends: ["@commitlint/config-conventional"],
+  rules: {
+    "scope-enum": [2, "always", ["catalogo", "carrinho", "checkout", "pedidos", "painel", "auth", "deps"]],
+  },
+};
+```
+
+```bash
+# .husky/commit-msg
+npx --no -- commitlint --edit "$1"
+```
+
+Os escopos espelham as features da arquitetura: o histórico passa a responder "o que mudou no checkout este mês?". Se o time faz squash merge, o título do PR vira o commit; nesse caso, valide o título do PR no CI também.
+
+## O pipeline no GitHub Actions
+
+O CI roda tudo, do zero, em cada pull request e em cada push na branch principal.
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualidade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test -- --coverage --ci
+      - uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('src/**') }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+      - run: npm run build
+
+  e2e:
+    needs: qualidade
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: quitanda
+          POSTGRES_PASSWORD: quitanda
+          POSTGRES_DB: quitanda_teste
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U quitanda"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://quitanda:quitanda@localhost:5432/quitanda_teste
+      BETTER_AUTH_SECRET: segredo-apenas-para-o-ci
+      BETTER_AUTH_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx prisma migrate deploy && npm run seed
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e -- --project=chromium
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+```
+
+Pontos de atenção:
+
+- `npm ci` instala exatamente o que está no `package-lock.json` e falha se ele estiver dessincronizado. Nunca use `npm install` no CI.
+- `concurrency` cancela a execução anterior do mesmo PR quando chega um push novo.
+- O cache de `.next/cache` acelera builds seguintes; o de `npm` vem do `setup-node`.
+- O e2e roda contra um Postgres descartável, criado pelo próprio runner, com migrações e seed. Nada de banco compartilhado.
+- O relatório do Playwright é anexado quando o teste falha, com os traces para investigar.
+
+Depois, nas configurações do repositório, ative a proteção da branch `main`: PR obrigatório, aprovação de revisão e os jobs `qualidade` e `e2e` como verificações obrigatórias. É isso que transforma o pipeline de sugestão em regra.
+
+<Callout type="warning" title="Segredos no CI">
+Tokens e senhas vão em `Settings > Secrets` e são lidos como `secrets.NOME`. Nunca os escreva no YAML nem os imprima no log. Workflows disparados por PRs de forks não recebem segredos, de propósito: não troque `pull_request` por `pull_request_target` para contornar isso sem entender o risco de executar código de terceiros com acesso aos segredos.
+</Callout>
+
+## Deploy na Vercel
+
+O caminho mais simples é a integração com o Git: importe o repositório na Vercel e ela passa a fazer build de cada push.
+
+- **Push num branch com PR aberto**: preview deployment com URL própria, comentada no PR.
+- **Merge na `main`**: deploy de produção no domínio da loja.
+- **Variáveis de ambiente por ambiente**: Development, Preview e Production têm valores separados. `DATABASE_URL` de produção existe só em Production; previews apontam para o banco de homologação.
+
+Para baixar as variáveis de desenvolvimento para a máquina local:
+
+```bash
+vercel link
+vercel env pull .env.local
+```
+
+### Deploy controlado pelo Actions
+
+Se você quer que a Vercel só publique depois do CI passar (ou precisa rodar migrações antes), desligue o deploy automático e faça o deploy pelo próprio workflow com a CLI:
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy de produção
+
+on:
+  push:
+    branches: [main]
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --global vercel@latest
+      - run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+      - run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PRODUCAO }}
+      - run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+      - run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+```
+
+`vercel build` gera o resultado localmente no runner e `vercel deploy --prebuilt` só envia os arquivos prontos. O `environment: production` do GitHub permite exigir aprovação manual antes do job rodar. As migrações seguem o padrão expandir e contrair, para que a versão anterior continue funcionando caso seja preciso um rollback.
+
+Depois do deploy, um teste de fumaça (um script que abre a home e o catálogo e confere o status 200) confirma que o ar está respirável. Se falhar, `vercel rollback` devolve a versão anterior.
+
+## Lighthouse CI
+
+Desempenho e acessibilidade regridem aos poucos: uma imagem sem `next/image` aqui, um script de terceiros ali. Lighthouse CI roda o Lighthouse em cada PR e falha quando as métricas pioram além do limite.
+
+```json
+// lighthouserc.json
+{
+  "ci": {
+    "collect": {
+      "startServerCommand": "npm run start",
+      "url": ["http://localhost:3000/", "http://localhost:3000/produtos?categoria=frutas"],
+      "numberOfRuns": 3
+    },
+    "assert": {
+      "assertions": {
+        "categories:performance": ["warn", { "minScore": 0.9 }],
+        "categories:accessibility": ["error", { "minScore": 0.95 }],
+        "categories:seo": ["error", { "minScore": 0.9 }],
+        "largest-contentful-paint": ["error", { "maxNumericValue": 2500 }],
+        "cumulative-layout-shift": ["error", { "maxNumericValue": 0.1 }]
+      }
+    },
+    "upload": { "target": "temporary-public-storage" }
+  }
+}
+```
+
+```yaml
+# trecho de .github/workflows/ci.yml, no job qualidade, depois do build
+      - run: npx @lhci/cli autorun
+```
+
+Três execuções por URL reduzem o ruído, porque a nota varia entre rodadas. Use `error` para o que é objetivo (acessibilidade, CLS) e `warn` para a nota de performance, que depende da máquina do runner. O `temporary-public-storage` gera um link com o relatório completo; para guardar histórico, o time pode subir um servidor LHCI próprio.
+
+Lighthouse mede um laboratório. O desempenho real dos usuários vem de dados de campo (Core Web Vitals coletados no navegador), tema do Nível 3 com New Relic.
+
+## Dependências em dia
+
+Fechando a automação, deixe um robô abrir PRs de atualização: Dependabot (nativo do GitHub) ou Renovate. Agrupe atualizações menores, revise as maiores com calma, e deixe o pipeline decidir se o PR pode entrar. Sem testes e CI, atualizar dependência é aposta; com eles, vira rotina.
+
+## Na entrevista
+
+**Qual a diferença entre ESLint e Prettier e como você os combina?** ESLint aponta problemas de qualidade e bugs prováveis; Prettier só formata. Combino desligando no ESLint as regras de estilo com `eslint-config-prettier` e rodando o Prettier separado, no editor, no lint-staged e com `--check` no CI.
+
+**O que muda no ESLint 9 com flat config?** A configuração vira um array de objetos em `eslint.config.mjs`, aplicados em ordem, com plugins importados como módulos em vez de nomes em string. Blocos com `files` aplicam regras a partes do projeto, e `globalIgnores` substitui o `.eslintignore`.
+
+**Por que não rodar todos os testes no pre-commit?** Porque o hook precisa ser rápido, senão o time o pula com `--no-verify`. No commit rodo lint e formatação só dos arquivos alterados; testes, typecheck e build ficam no CI, que é a fonte de verdade.
+
+**Como seria o pipeline de CI de um projeto React?** Instalação com `npm ci` e cache, checagem de formatação, lint, `tsc --noEmit`, testes com cobertura, build, e um job de e2e com banco descartável. Tudo como verificação obrigatória na proteção da branch principal, e deploy de produção só após a aprovação.
+
+**Para que servem os preview deployments?** Cada PR ganha um ambiente real com URL própria, com variáveis e banco de homologação. Revisores, designers e QA testam a mudança antes do merge, e testes e Lighthouse podem rodar contra ela.
+
+## Pratique
+
+1. Migre a Quitanda para `eslint.config.mjs` com as configs do Next.js, TypeScript e Prettier, rode `npm run lint` e zere os avisos, desligando conscientemente as regras que o time não quer.
+2. Configure Prettier com o plugin do Tailwind, formate o projeto num PR separado e registre o commit em `.git-blame-ignore-revs`.
+3. Instale Husky, lint-staged e commitlint com os escopos das features. Tente commitar `arrumei coisas` e veja o hook recusar.
+4. Escreva o `ci.yml` com os jobs `qualidade` e `e2e` e torne-os obrigatórios na proteção da `main`. Abra um PR com um erro de tipo proposital e confirme que o merge fica bloqueado.
+5. Conecte o repositório à Vercel, configure variáveis separadas para Preview e Production e abra um PR para conferir a URL de preview.
+6. Adicione Lighthouse CI com limite de acessibilidade 0,95 e quebre-o de propósito removendo o `alt` de uma imagem do catálogo.
+
+<Quiz question="No Next.js 16, como o lint é executado no projeto?" options={["Com next lint, que continua sendo o comando recomendado","Automaticamente pelo next build, que falha com qualquer aviso","Chamando o ESLint diretamente, por exemplo com um script eslint ponto no package.json","Somente pela extensão do editor"]} answer={2} explanation="O Next.js 16 removeu o comando next lint e deixou de rodar o lint no build. O projeto usa o ESLint CLI com o eslint.config.mjs." />
+
+<Quiz question="Por que o pipeline usa npm ci em vez de npm install?" options={["Porque npm ci instala exatamente as versões do package-lock e falha se ele estiver dessincronizado","Porque npm install não funciona no Linux","Porque npm ci atualiza as dependências para a última versão","Porque npm ci dispensa o package.json"]} answer={0} explanation="npm ci garante instalações reprodutíveis a partir do lockfile, que é o que se quer numa máquina limpa de CI." />
+
+<Quiz question="Qual commit convencional deve gerar uma nova versão major?" options={["fix(checkout): corrige arredondamento","feat(carrinho): adiciona cupom","chore(deps): atualiza dependências","feat(api)! com rodapé BREAKING CHANGE descrevendo a remoção de um campo"]} answer={3} explanation="O ponto de exclamação após o tipo ou o rodapé BREAKING CHANGE sinalizam quebra de compatibilidade, que incrementa a versão major." />
+
+## Base no CodeForge
+
+- [CI/CD](/learn/system-design/ci-cd): os conceitos de integração e entrega contínuas.
+- [ESLint: padronizando código com regras personalizadas](/learn/carreira-nodejs/eslint-padronizando-codigo-regras-personalizadas): escrever as próprias regras de lint.
+- [Integração contínua: pipelines com testes automatizados no GitHub Actions](/learn/carreira-nodejs/integracao-continua-pipelines-testes-automatizados-github-actions): o mesmo pipeline do lado de uma API.
+- [Git e GitHub: compartilhando e colaborando em projetos](/learn/carreira-nodejs/git-github-compartilhando-colaborando-projetos): branches, PRs e revisão.
+- [Projetos para portfólio](/learn/projetos-portfolio): como apresentar a Quitanda com pipeline e deploy públicos.
+
+## Referências
+
+- [Next.js: ESLint](https://nextjs.org/docs/app/api-reference/config/eslint)
+- [ESLint: Configuration files](https://eslint.org/docs/latest/use/configure/configuration-files)
+- [Husky](https://typicode.github.io/husky/) e [lint-staged](https://github.com/lint-staged/lint-staged)
+- [Vercel: Deploying with GitHub Actions](https://vercel.com/guides/how-can-i-use-github-actions-with-vercel)
+- [Lighthouse CI: Getting started](https://github.com/GoogleChrome/lighthouse-ci/blob/main/docs/getting-started.md)

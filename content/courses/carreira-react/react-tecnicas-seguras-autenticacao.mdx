@@ -1,0 +1,451 @@
+---
+title: "React: implementando técnicas seguras de autenticação"
+kind: lesson
+---
+
+A Quitanda já roda em Next.js com TypeScript, mas qualquer pessoa que digite `/painel` na barra de endereços vê os pedidos de todos os clientes, e a página "Meus pedidos" ainda depende de um `clienteId` guardado no `localStorage`. Antes de abrir a loja ao público, ela precisa saber quem está do outro lado: o cliente que acompanha o próprio pedido e o lojista que altera preços e estoque. E precisa saber isso no servidor, porque é lá que estão os dados.
+
+Autenticação é a área em que um atalho "que funciona" no navegador vira incidente em produção. Este capítulo põe a Quitanda num desenho seguro: sessão em cookie `HttpOnly`, uma biblioteca madura em vez de criptografia caseira, login social com OAuth/OIDC, proteção de rotas em camadas e verificação no servidor em cada leitura e em cada Server Action.
+
+**Você vai aprender:**
+
+- Comparar sessão em cookie `HttpOnly` com token em `localStorage` e justificar a escolha
+- Configurar Better Auth (e reconhecer o equivalente em Auth.js) num projeto Next.js 16
+- Entender o fluxo OAuth 2.0 com OIDC e PKCE no login com provedor externo
+- Usar o `proxy.ts` do Next.js como filtro otimista e verificar a sessão de verdade numa camada de acesso a dados
+- Proteger Server Actions contra CSRF e contra usuários sem permissão
+- Tratar expiração, renovação de sessão e logout que realmente encerra o acesso
+
+## Onde guardar a credencial
+
+Depois do login, o navegador precisa apresentar alguma prova de identidade em cada requisição. As duas opções mais vistas em tutoriais são um token (geralmente JWT) no `localStorage` ou um identificador de sessão num cookie.
+
+| Critério | Token no `localStorage` | Cookie `HttpOnly; Secure; SameSite=Lax` |
+|---|---|---|
+| Leitura por JavaScript | Qualquer script da página lê | Nenhum script lê |
+| Impacto de um XSS | O atacante copia o token e usa de outra máquina | O atacante age só enquanto a vítima está na página |
+| Envio | Manual, no cabeçalho `Authorization` | Automático pelo navegador |
+| CSRF | Não se aplica (não é automático) | Mitigado por `SameSite` e verificação de origem |
+| Server Components e SSR | O servidor não enxerga o token na primeira requisição | O servidor recebe o cookie em toda requisição |
+| Revogação | Difícil com JWT sem estado (vale até expirar) | Apagar a sessão no banco encerra o acesso |
+
+Para uma aplicação Next.js com servidor próprio, o cookie `HttpOnly` vence em quase tudo. O servidor renderiza "Olá, Ana" já no HTML, sem flash de tela deslogada, e um script injetado não consegue exfiltrar a credencial. Token em cabeçalho continua fazendo sentido para clientes que não são navegador (app mobile, integração entre serviços).
+
+<Callout type="warning" title="Sessão no cliente não é segurança">
+Esconder o botão "Painel" quando o usuário não é lojista é experiência, não proteção. Todo dado sensível tem de ser filtrado no servidor, com a sessão lida do cookie. Se a única barreira está num componente React, ela some com um `fetch` feito no console.
+</Callout>
+
+Os atributos do cookie importam tanto quanto o lugar:
+
+- `HttpOnly`: invisível para `document.cookie`.
+- `Secure`: só trafega em HTTPS (em `localhost` os navegadores abrem exceção).
+- `SameSite=Lax`: não vai em requisições `POST` disparadas por outros sites, o que corta a maior parte do CSRF.
+- Prefixo `__Secure-` ou `__Host-` no nome: o navegador recusa o cookie se ele não vier com `Secure` (e, no `__Host-`, sem `Domain` e com `Path=/`).
+
+## Escolhendo a biblioteca
+
+Escrever hash de senha, rotação de sessão, fluxo OAuth e verificação de e-mail à mão é a receita para errar um detalhe. No ecossistema Next.js as opções mais usadas são:
+
+| Opção | Onde ficam usuários e sessões | Quando faz sentido |
+|---|---|---|
+| Better Auth | No seu banco (Postgres, SQLite, MySQL) | Controle total dos dados, plugins (2FA, organizações, passkeys) |
+| Auth.js (NextAuth v5) | Banco via adapter ou JWT criptografado no cookie | Projetos existentes; muito material publicado |
+| Clerk, Auth0, Supabase Auth | No provedor | Quer terceirizar telas, MFA e conformidade |
+
+Em 2025 o Auth.js passou a ser mantido pela equipe do Better Auth, que recomenda Better Auth para projetos novos. A Quitanda usa Better Auth com o Postgres que já guarda produtos e pedidos. Os conceitos (sessão, provedor, callback, verificação no servidor) são os mesmos em todas.
+
+## Configurando Better Auth na Quitanda
+
+```bash
+npm install better-auth
+```
+
+As variáveis de ambiente ficam no `.env.local`, fora do repositório:
+
+```bash
+# .env.local
+BETTER_AUTH_SECRET=gere-com-openssl-rand-base64-32
+BETTER_AUTH_URL=http://localhost:3000
+DATABASE_URL=postgres://quitanda:senha@localhost:5432/quitanda
+GITHUB_CLIENT_ID=...
+GITHUB_CLIENT_SECRET=...
+```
+
+A instância do servidor concentra a configuração:
+
+```ts
+// src/lib/auth.ts
+import { betterAuth } from "better-auth";
+import { nextCookies } from "better-auth/next-js";
+import { prismaAdapter } from "better-auth/adapters/prisma";
+import { db } from "@/lib/db";
+
+export const auth = betterAuth({
+  database: prismaAdapter(db, { provider: "postgresql" }),
+  emailAndPassword: {
+    enabled: true,
+    minPasswordLength: 10,
+    requireEmailVerification: true,
+  },
+  socialProviders: {
+    github: {
+      clientId: process.env.GITHUB_CLIENT_ID!,
+      clientSecret: process.env.GITHUB_CLIENT_SECRET!,
+    },
+  },
+  user: {
+    additionalFields: {
+      papel: { type: "string", defaultValue: "cliente", input: false },
+    },
+  },
+  session: {
+    expiresIn: 60 * 60 * 24 * 7, // 7 dias
+    updateAge: 60 * 60 * 24, // renova a validade uma vez por dia de uso
+  },
+  plugins: [nextCookies()],
+});
+```
+
+O campo `papel` tem `input: false`: o cliente não consegue mandar `papel: "lojista"` no cadastro. Quem promove alguém a lojista é um script ou o próprio painel, no servidor. O plugin `nextCookies` permite que chamadas feitas dentro de Server Actions gravem o cookie de sessão na resposta.
+
+O `db` é o cliente Prisma que a Quitanda já usa para produtos e pedidos. A CLI do Better Auth acrescenta ao `schema.prisma` os models de que a biblioteca precisa (`User`, `Session`, `Account`, `Verification`), e a migração do Prisma cria as tabelas:
+
+```bash
+npx @better-auth/cli generate
+npx prisma migrate dev --name autenticacao
+```
+
+As rotas HTTP da biblioteca (login, callback do OAuth, logout) são montadas num único route handler:
+
+```ts
+// src/app/api/auth/[...all]/route.ts
+import { auth } from "@/lib/auth";
+import { toNextJsHandler } from "better-auth/next-js";
+
+export const { GET, POST } = toNextJsHandler(auth);
+```
+
+E o cliente React ganha um objeto com métodos tipados:
+
+```ts
+// src/lib/auth-cliente.ts
+import { createAuthClient } from "better-auth/react";
+
+export const authCliente = createAuthClient();
+```
+
+### A tela de login
+
+```tsx
+// src/app/entrar/FormularioDeLogin.tsx
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { authCliente } from "@/lib/auth-cliente";
+
+export function FormularioDeLogin() {
+  const router = useRouter();
+  const [erro, setErro] = useState<string | null>(null);
+
+  async function entrar(formData: FormData) {
+    const { error } = await authCliente.signIn.email({
+      email: String(formData.get("email")),
+      password: String(formData.get("senha")),
+    });
+    if (error) {
+      setErro("E-mail ou senha inválidos.");
+      return;
+    }
+    router.push("/pedidos");
+    router.refresh();
+  }
+
+  return (
+    <form action={entrar} className="flex flex-col gap-3">
+      <label>
+        E-mail
+        <input name="email" type="email" autoComplete="email" required />
+      </label>
+      <label>
+        Senha
+        <input name="senha" type="password" autoComplete="current-password" required />
+      </label>
+      {erro && <p role="alert">{erro}</p>}
+      <button type="submit">Entrar</button>
+      <button
+        type="button"
+        onClick={() => authCliente.signIn.social({ provider: "github", callbackURL: "/pedidos" })}
+      >
+        Entrar com GitHub
+      </button>
+    </form>
+  );
+}
+```
+
+Repare na mensagem de erro genérica: "E-mail ou senha inválidos" não revela se o e-mail existe. O `router.refresh()` faz os Server Components lerem o cookie novo.
+
+### O equivalente em Auth.js
+
+Se você encontrar um projeto com Auth.js v5, a forma é parecida: um `auth.ts` que exporta `handlers`, `auth`, `signIn` e `signOut`.
+
+```ts
+// src/auth.ts (projeto com Auth.js)
+import NextAuth from "next-auth";
+import GitHub from "next-auth/providers/github";
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  providers: [GitHub],
+});
+```
+
+```ts
+// src/app/api/auth/[...nextauth]/route.ts
+import { handlers } from "@/auth";
+
+export const { GET, POST } = handlers;
+```
+
+Por padrão, sem adapter de banco, o Auth.js guarda a sessão num JWT criptografado dentro do próprio cookie. Funciona sem tabela de sessões, mas a revogação só acontece quando o token expira.
+
+## OAuth 2.0 e OIDC em uma página
+
+O botão "Entrar com GitHub" dispara um fluxo de autorização. Os nomes ajudam na entrevista:
+
+1. A Quitanda redireciona o navegador para o provedor com `client_id`, `redirect_uri`, `scope`, um `state` aleatório e um `code_challenge` (PKCE).
+2. O usuário se autentica no provedor e consente.
+3. O provedor redireciona de volta para `/api/auth/callback/github` com um `code` e o mesmo `state`.
+4. O servidor da Quitanda confere o `state` (contra CSRF no login), troca o `code` por tokens enviando o `client_secret` e o `code_verifier` do PKCE.
+5. Com os dados do usuário, a biblioteca cria ou vincula o usuário local e abre uma sessão própria, gravada no cookie.
+
+OAuth 2.0 trata de **autorização** (um token para acessar uma API em nome do usuário). OIDC (OpenID Connect) é a camada de **identidade** por cima: acrescenta o `id_token`, um JWT assinado com quem é o usuário (`sub`, `email`, `name`). Google e Microsoft falam OIDC; o GitHub usa OAuth puro e a biblioteca consulta a API de perfil.
+
+O ponto central: o token do provedor fica no servidor. O navegador da Quitanda só recebe o cookie de sessão da própria Quitanda.
+
+<Callout type="tip" title="redirect_uri exata em cada ambiente">
+Cadastre no provedor a URL de callback exata de cada ambiente (`http://localhost:3000/api/auth/callback/github` e a de produção). Previews com domínio dinâmico exigem um app OAuth separado ou um proxy de callback; não libere curingas amplos na configuração do provedor.
+</Callout>
+
+## Proteção em camadas
+
+No App Router a proteção acontece em três lugares, cada um com um papel.
+
+### Camada 1: o proxy como filtro otimista
+
+No Next.js 16 o antigo `middleware.ts` passou a se chamar `proxy.ts` (a função exportada também se chama `proxy`) e roda no runtime Node.js. Ele intercepta a requisição antes da rota e serve bem para redirecionar quem claramente não tem sessão, sem consultar o banco:
+
+```ts
+// src/proxy.ts
+import { NextResponse, type NextRequest } from "next/server";
+import { getSessionCookie } from "better-auth/cookies";
+
+export function proxy(request: NextRequest) {
+  const cookie = getSessionCookie(request);
+  if (!cookie) {
+    const url = new URL("/entrar", request.url);
+    url.searchParams.set("voltarPara", request.nextUrl.pathname);
+    return NextResponse.redirect(url);
+  }
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/pedidos/:path*", "/painel/:path*", "/checkout"],
+};
+```
+
+`getSessionCookie` só confere se o cookie existe. Um cookie forjado ou expirado passa por aqui. Por isso o proxy é otimista: melhora a experiência e evita renderizar a página à toa, mas não é a barreira.
+
+<Callout type="warning" title="Nunca confie só no proxy">
+Em 2025 uma falha no Next.js (CVE-2025-29927) permitia pular o middleware com um cabeçalho interno forjado. Aplicações que verificavam a sessão apenas ali ficaram expostas. A lição vale para qualquer versão: a verificação definitiva fica perto do dado.
+</Callout>
+
+### Camada 2: uma camada de acesso a dados
+
+Concentre a leitura da sessão numa função só para servidor. O pacote `server-only` faz o build falhar se um Client Component importar o arquivo.
+
+```ts
+// src/lib/sessao.ts
+import "server-only";
+import { cache } from "react";
+import { headers } from "next/headers";
+import { redirect } from "next/navigation";
+import { auth } from "@/lib/auth";
+
+export const obterSessao = cache(async () => {
+  return auth.api.getSession({ headers: await headers() });
+});
+
+export async function exigirUsuario() {
+  const sessao = await obterSessao();
+  if (!sessao) redirect("/entrar");
+  return sessao.user;
+}
+
+export async function exigirLojista() {
+  const usuario = await exigirUsuario();
+  if (usuario.papel !== "lojista") redirect("/");
+  return usuario;
+}
+```
+
+O `cache` do React deduplica a chamada dentro da mesma requisição: o layout, a página e três componentes podem chamar `obterSessao()` e o banco é consultado uma vez.
+
+### Camada 3: a consulta filtra pelo dono
+
+```tsx
+// src/app/pedidos/page.tsx
+import { exigirUsuario } from "@/lib/sessao";
+import { listarPedidosDoCliente } from "@/servicos/pedidos";
+import { ListaDePedidos } from "@/componentes/ListaDePedidos";
+
+export default async function PaginaMeusPedidos() {
+  const usuario = await exigirUsuario();
+  const pedidos = await listarPedidosDoCliente(usuario.id);
+  return <ListaDePedidos pedidos={pedidos} />;
+}
+```
+
+```ts
+// src/servicos/pedidos.ts
+import "server-only";
+import { db } from "@/lib/db";
+
+export async function listarPedidosDoCliente(clienteId: string) {
+  return db.pedido.findMany({
+    where: { clienteId },
+    orderBy: { criadoEm: "desc" },
+  });
+}
+
+export async function buscarPedidoDoCliente(pedidoId: string, clienteId: string) {
+  return db.pedido.findFirst({ where: { id: pedidoId, clienteId } });
+}
+```
+
+`buscarPedidoDoCliente` recebe o dono junto com o id. Trocar `/pedidos/41` por `/pedidos/42` na URL devolve "não encontrado" em vez do pedido de outra pessoa. Esse erro (IDOR, referência direta insegura a objeto) é um dos mais comuns em APIs.
+
+## Server Actions: autenticação e CSRF
+
+Server Actions são endpoints `POST` públicos. O fato de o botão só aparecer para o lojista não impede ninguém de chamar a action diretamente. Cada uma confere a sessão:
+
+```ts
+// src/app/painel/produtos/acoes.ts
+"use server";
+
+import { z } from "zod";
+import { revalidatePath } from "next/cache";
+import { exigirLojista } from "@/lib/sessao";
+import { db } from "@/lib/db";
+
+const esquemaPreco = z.object({
+  produtoId: z.string().min(1),
+  precoEmCentavos: z.coerce.number().int().positive(),
+});
+
+export async function atualizarPreco(_estado: unknown, formData: FormData) {
+  await exigirLojista();
+
+  const dados = esquemaPreco.safeParse(Object.fromEntries(formData));
+  if (!dados.success) return { erro: "Preço inválido." };
+
+  await db.produto.update({
+    where: { id: dados.data.produtoId },
+    data: { precoEmCentavos: dados.data.precoEmCentavos },
+  });
+  revalidatePath("/painel/produtos");
+  return { erro: null };
+}
+```
+
+Sobre CSRF, o Next.js compara o cabeçalho `Origin` da requisição com o `Host` e recusa Server Actions vindas de outro site. Somado ao `SameSite=Lax` do cookie, isso cobre o caso comum. Atrás de um proxy reverso que reescreve o host, configure `serverActions.allowedOrigins` no `next.config.ts` em vez de desligar a verificação. O Better Auth faz checagem parecida nos próprios endpoints com a opção `trustedOrigins`.
+
+Route handlers que você escreve à mão (`app/api/.../route.ts`) não têm essa proteção automática. Se eles mudam estado com base no cookie, confira a origem ou exija um cabeçalho customizado que formulários de outros sites não conseguem enviar.
+
+## Expiração, renovação e logout
+
+Sessão boa tem prazo. Na configuração acima, a sessão vale 7 dias e, se o usuário usar a loja, a validade é estendida no máximo uma vez por dia (`updateAge`). Quem some por uma semana precisa entrar de novo.
+
+Em arquiteturas com tokens de acesso curtos (comum quando o front chama uma API separada), aparece o par **access token** de poucos minutos e **refresh token** de longa duração. Boas práticas:
+
+- O refresh token fica em cookie `HttpOnly` com `Path` restrito à rota de renovação.
+- A cada uso, o servidor emite um refresh token novo e invalida o antigo (rotação). Se um token antigo reaparecer, alguém o roubou: revogue a família inteira.
+- O front nunca decodifica um JWT para decidir permissões; quem decide é o servidor.
+
+Na Quitanda, com sessão no banco, não há refresh token no navegador: o cookie aponta para uma linha da tabela `session`, e o servidor decide se ela vale.
+
+O logout precisa apagar a sessão no servidor, não só o cookie:
+
+```tsx
+// src/componentes/BotaoSair.tsx
+"use client";
+
+import { useRouter } from "next/navigation";
+import { authCliente } from "@/lib/auth-cliente";
+
+export function BotaoSair() {
+  const router = useRouter();
+
+  async function sair() {
+    await authCliente.signOut();
+    router.push("/");
+    router.refresh();
+  }
+
+  return <button onClick={sair}>Sair</button>;
+}
+```
+
+`signOut` remove a linha da sessão e manda o navegador expirar o cookie. Ao trocar a senha, revogue as outras sessões do usuário (o Better Auth oferece `revokeOtherSessions` na troca de senha) para derrubar quem estiver usando uma sessão roubada.
+
+## Checklist de senha e conta
+
+- Hash lento e com sal (scrypt, Argon2 ou bcrypt), limite de tentativas por IP e por conta, e mensagens genéricas no login e na recuperação de senha.
+- Links de confirmação e de redefinição com validade curta e uso único, e um identificador de sessão novo depois do login (evita fixação de sessão).
+- Segredos (`BETTER_AUTH_SECRET`, `client_secret`) só em variáveis de ambiente do servidor, nunca com prefixo `NEXT_PUBLIC_`.
+
+## Na entrevista
+
+**Onde você guarda o token de autenticação numa aplicação React?** Num cookie `HttpOnly`, `Secure` e `SameSite=Lax`, emitido pelo servidor. Assim nenhum script lê a credencial, o que limita o estrago de um XSS, e o servidor recebe a sessão em toda requisição, inclusive no SSR. `localStorage` deixa o token ao alcance de qualquer script injetado.
+
+**Se o cookie vai automaticamente, como você evita CSRF?** Com `SameSite=Lax` ou `Strict`, que impede o envio em `POST` vindo de outro site, e com verificação de `Origin` no servidor. O Next.js já faz essa checagem em Server Actions; em endpoints próprios que mudam estado, eu confiro a origem ou exijo um cabeçalho customizado.
+
+**O middleware (proxy) do Next.js basta para proteger as rotas?** Não. Ele é um filtro otimista para redirecionar cedo. A verificação definitiva fica numa camada de acesso a dados chamada pelas páginas, route handlers e Server Actions, e as consultas filtram pelo dono do recurso.
+
+**Qual a diferença entre OAuth 2.0 e OIDC?** OAuth 2.0 delega autorização: o app recebe um token para acessar recursos em nome do usuário. OIDC acrescenta identidade com o `id_token`, que diz quem o usuário é. Para "Entrar com Google" o correto é OIDC, com Authorization Code e PKCE.
+
+**Sessão no banco ou JWT sem estado?** Sessão no banco permite revogar na hora (logout em todos os dispositivos, troca de senha) ao custo de uma consulta, que dá para cachear. JWT dispensa a consulta, mas só deixa de valer quando expira. Para uma loja com painel administrativo, prefiro sessão no banco.
+
+**O que é IDOR e como evitar?** É acessar um recurso de outro usuário trocando o id na URL ou no corpo. Evita-se buscando sempre com o filtro do dono (`where: { id, clienteId }`) ou conferindo a permissão depois de carregar, no servidor.
+
+## Pratique
+
+1. Instale Better Auth na Quitanda, gere os models e rode a migração e crie as páginas `/entrar` e `/cadastro` com e-mail e senha. Confira no DevTools, em Application, que o cookie de sessão tem `HttpOnly`, `SameSite=Lax` e `Secure` em produção.
+2. Adicione login com GitHub e verifique que o usuário criado ganha `papel: "cliente"` mesmo se você editar a requisição de cadastro para mandar `"lojista"`.
+3. Escreva `src/proxy.ts` protegendo `/pedidos`, `/checkout` e `/painel`, com o parâmetro `voltarPara`. Depois apague o cookie, crie um cookie falso com o mesmo nome e confirme que a página ainda bloqueia, graças a `exigirUsuario`.
+4. Implemente `/pedidos/[id]` usando `buscarPedidoDoCliente` e prove, com dois usuários, que trocar o id na URL resulta em `notFound()`.
+5. Proteja a action `atualizarPreco` com `exigirLojista` e tente chamá-la logado como cliente. Registre no log quem tentou.
+6. Adicione um botão "Sair de todos os dispositivos" no perfil que revoga todas as sessões do usuário.
+
+<Quiz question="Por que guardar a sessão em cookie HttpOnly reduz o impacto de um XSS em comparação com localStorage?" options={["Porque cookies são criptografados pelo navegador","Porque scripts da página não conseguem ler o cookie, então o atacante não copia a credencial para usar de fora","Porque cookies HttpOnly impedem que scripts sejam executados","Porque o XSS não funciona em páginas com cookies"]} answer={1} explanation="HttpOnly impede a leitura por document.cookie. O XSS ainda pode agir na página da vítima, mas não exfiltra a credencial para reutilizar depois." />
+
+<Quiz question="Na Quitanda, o proxy.ts verifica apenas se o cookie de sessão existe. Onde deve ficar a verificação definitiva?" options={["No componente cliente, antes de renderizar o botão","No next.config.ts","Numa camada de acesso a dados no servidor, chamada pelas páginas e Server Actions","No localStorage, com a data de expiração"]} answer={2} explanation="O proxy é otimista e pode ser contornado. A sessão é validada perto do dado, em funções server-only usadas por páginas, route handlers e actions." />
+
+<Quiz question="Qual parâmetro do fluxo OAuth protege o próprio login contra CSRF?" options={["state","scope","client_id","response_type"]} answer={0} explanation="O state é gerado aleatoriamente, guardado pelo app e conferido no callback. Se não bater, a resposta não pertence a um login iniciado por aquele navegador." />
+
+## Base no CodeForge
+
+- [Sessão vs token](/learn/system-design/sessao-vs-token): os trade-offs de estado no servidor e credencial autocontida.
+- [OAuth 2.0](/learn/system-design/oauth2) e [JWT](/learn/system-design/jwt): os protocolos por trás do login social.
+- [Armazenamento de senhas](/learn/system-design/armazenamento-de-senhas): hash, sal e funções lentas.
+- [Node.js: autenticação com Passport e OAuth 2.0](/learn/carreira-nodejs/nodejs-autenticacao-passport-oauth-20): o mesmo fluxo visto do lado de uma API Express.
+- [React: implementando segurança web com padrões OWASP](/learn/carreira-react/react-seguranca-web-owasp): XSS, CSP e o restante do OWASP no front-end.
+
+## Referências
+
+- [Next.js: Authentication](https://nextjs.org/docs/app/guides/authentication)
+- [Better Auth: Next.js integration](https://www.better-auth.com/docs/integrations/next)
+- [Auth.js: Getting started](https://authjs.dev/getting-started)
+- [MDN: Using HTTP cookies](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Cookies)
+- [OWASP: Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)

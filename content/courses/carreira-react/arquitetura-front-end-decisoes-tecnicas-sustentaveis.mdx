@@ -1,0 +1,346 @@
+---
+title: "Arquitetura no front-end: estruturando aplicações com decisões técnicas sustentáveis"
+kind: lesson
+---
+
+A Quitanda cresceu. Em `src/componentes/` há 70 arquivos, de `Botao.tsx` a `TabelaDePedidosDoPainel.tsx`; `src/servicos/` mistura chamadas ao banco com formatação de preço; e o cálculo do frete aparece em três lugares, cada um com uma regra ligeiramente diferente. Uma pessoa nova no time leva dois dias para descobrir onde mexer para mudar o checkout, e toda mudança no carrinho quebra algo no painel.
+
+Nada disso é falta de talento: é falta de decisões explícitas sobre onde cada coisa mora e quem pode depender de quem. Arquitetura no front-end não é desenhar diagramas bonitos, é tornar barato o tipo de mudança que o time faz toda semana. Este capítulo reorganiza a Quitanda por funcionalidade, separa UI, estado e dados, coloca as fronteiras sob verificação automática e registra as decisões para que elas sobrevivam à troca de pessoas.
+
+**Você vai aprender:**
+
+- Comparar organização por tipo de arquivo e por funcionalidade (feature), e migrar de uma para a outra
+- Separar as camadas de UI, estado, dados e regras de domínio num projeto Next.js
+- Impor fronteiras com API pública por feature, `server-only` e regras de lint
+- Escolher onde cada tipo de estado vive (servidor, URL, cache de dados, estado local, store global)
+- Registrar decisões com ADRs e escolher bibliotecas com critérios objetivos
+- Definir convenções de time que reduzem discussão em code review
+
+## O que torna uma arquitetura sustentável
+
+Uma estrutura é boa quando responde rápido a três perguntas: onde está o código desta funcionalidade, o que quebra se eu mudar isto, e onde coloco o código novo. Os sinais de que ela não responde:
+
+- Mudanças simples tocam muitas pastas distantes.
+- Importações circulares e componentes que dependem de detalhes internos de outros.
+- Regras de negócio dentro de componentes visuais, duplicadas.
+- Medo de apagar código, porque ninguém sabe quem usa.
+
+O objetivo é **alta coesão** (o que muda junto fica junto) e **baixo acoplamento** (as partes se conhecem pelo mínimo necessário).
+
+## Por tipo ou por funcionalidade
+
+A estrutura que a Quitanda herdou do Nível 1 é organizada por tipo técnico:
+
+```bash
+# estrutura por tipo (antes)
+src/
+  componentes/   # 70 arquivos de todas as telas
+  hooks/         # useCarrinho, usePedidos, useProdutos...
+  servicos/      # api.ts, pedidos.ts, produtos.ts
+  utils/         # formatarPreco, calcularFrete, validarCep...
+  app/           # rotas do Next.js
+```
+
+Funciona com dez arquivos. Com cem, mudar o carrinho exige abrir quatro pastas, e `utils/` vira a gaveta de tudo. A alternativa é agrupar por funcionalidade do negócio:
+
+```bash
+# estrutura por funcionalidade (depois)
+src/
+  app/                       # só rotas: páginas finas que compõem features
+    (loja)/produtos/page.tsx
+    (loja)/carrinho/page.tsx
+    pedidos/page.tsx
+    painel/produtos/page.tsx
+  features/
+    catalogo/
+      componentes/           # ListaDeProdutos, CartaoDeProduto, FiltroDeCategoria
+      dados.ts               # consultas no servidor
+      tipos.ts
+      index.ts               # API pública da feature
+    carrinho/
+      componentes/           # Carrinho, ItemDoCarrinho, ResumoDoCarrinho
+      dominio.ts             # regras puras: total, frete, cupom
+      useCarrinho.ts
+      index.ts
+    pedidos/
+    checkout/
+    painel/
+  compartilhado/
+    ui/                      # Botao, Campo, Modal: sem regra de negócio
+    lib/                     # formatarPreco, datas
+  lib/                       # infraestrutura: db, auth, log, flags
+```
+
+| Critério | Por tipo | Por funcionalidade |
+|---|---|---|
+| Achar o código de uma tela | Espalhado | Uma pasta |
+| Apagar uma funcionalidade | Caçar arquivos | Apagar a pasta |
+| Dono no time | Difuso | `CODEOWNERS` por pasta |
+| Projetos pequenos | Simples | Pode ser exagero |
+| Risco | Gaveta `utils` | Features que importam o interior umas das outras |
+
+Na prática, o padrão maduro é híbrido: features para o negócio, `compartilhado/` para o que é genuinamente genérico, e `app/` só com o roteamento. Projetos como Feature-Sliced Design e bulletproof-react formalizam variações dessa ideia.
+
+<Callout type="tip" title="Migre aos poucos">
+Não pare o time para reorganizar tudo. Crie `features/carrinho`, mova os arquivos do carrinho, ajuste importações (o TypeScript aponta cada uma) e abra um PR só com isso. Repita por feature. Um PR de mudança estrutural sem mudança de comportamento é fácil de revisar.
+</Callout>
+
+## Camadas dentro de uma feature
+
+Dentro de cada feature, separe responsabilidades que mudam por motivos diferentes.
+
+| Camada | Responsabilidade | Na Quitanda |
+|---|---|---|
+| Domínio | Regras puras, sem React nem I/O | `calcularTotal`, `calcularFrete`, `podeCancelar(pedido)` |
+| Dados | Buscar e gravar (banco, API, cache) | `listarProdutos`, `criarPedido`, Server Actions |
+| Estado | Coordenar o que a tela mostra e como muda | `useCarrinho`, `useActionState`, TanStack Query |
+| UI | Renderizar e capturar eventos | `ListaDeProdutos`, `ItemDoCarrinho` |
+
+O domínio é a camada mais valiosa e a mais fácil de testar, porque é só função:
+
+```ts
+// src/features/carrinho/dominio.ts
+export type ItemDoCarrinho = {
+  produtoId: string;
+  precoEmCentavos: number;
+  quantidade: number;
+};
+
+export const FRETE_GRATIS_A_PARTIR_DE = 10000;
+export const FRETE_PADRAO = 990;
+
+export function calcularSubtotal(itens: ItemDoCarrinho[]): number {
+  return itens.reduce((soma, item) => soma + item.precoEmCentavos * item.quantidade, 0);
+}
+
+export function calcularFrete(subtotal: number): number {
+  return subtotal >= FRETE_GRATIS_A_PARTIR_DE ? 0 : FRETE_PADRAO;
+}
+
+export function calcularTotal(itens: ItemDoCarrinho[]): number {
+  const subtotal = calcularSubtotal(itens);
+  return subtotal + calcularFrete(subtotal);
+}
+```
+
+A mesma função é usada pelo `ResumoDoCarrinho` no navegador e pela Server Action de checkout no servidor. A regra do frete existe em um lugar só, e o servidor recalcula o total em vez de confiar no valor enviado pelo cliente.
+
+A camada de dados fica do lado do servidor e não vaza para o cliente:
+
+```ts
+// src/features/catalogo/dados.ts
+import "server-only";
+import { db } from "@/lib/db";
+import type { Produto } from "./tipos";
+
+export async function listarProdutosPorCategoria(categoria: string): Promise<Produto[]> {
+  return db.produto.findMany({
+    where: { categoria, ativo: true },
+    orderBy: { nome: "asc" },
+  });
+}
+```
+
+E a UI recebe dados prontos por props, sem saber de onde vieram:
+
+```tsx
+// src/app/(loja)/produtos/page.tsx
+import { listarProdutosPorCategoria, ListaDeProdutos } from "@/features/catalogo";
+
+export default async function PaginaProdutos({
+  searchParams,
+}: {
+  searchParams: Promise<{ categoria?: string }>;
+}) {
+  const { categoria = "frutas" } = await searchParams;
+  const produtos = await listarProdutosPorCategoria(categoria);
+  return <ListaDeProdutos produtos={produtos} />;
+}
+```
+
+A página é fina: lê parâmetros, chama dados, compõe componentes. Se amanhã o catálogo vier de um BFF em NestJS (tema do Nível 3), muda `dados.ts` e nada mais.
+
+## Fronteiras que o código respeita
+
+Uma convenção que depende da memória das pessoas dura até o primeiro prazo apertado. Transforme as fronteiras em verificações.
+
+### API pública por feature
+
+Cada feature expõe o que os outros podem usar num `index.ts`. O resto é detalhe interno.
+
+```ts
+// src/features/catalogo/index.ts
+export { ListaDeProdutos } from "./componentes/ListaDeProdutos";
+export { CartaoDeProduto } from "./componentes/CartaoDeProduto";
+export { listarProdutosPorCategoria } from "./dados";
+export type { Produto } from "./tipos";
+```
+
+Mantenha esses arquivos curtos e explícitos (nada de `export *` em cascata). Barris enormes dificultam a análise do bundler e misturam código de servidor com código de cliente. Se a feature tem muito código só de servidor, separe em `index.ts` e `servidor.ts`.
+
+### Regras de lint para as importações
+
+```js
+// eslint.config.mjs (trecho)
+export default [
+  // ...configurações do Next.js
+  {
+    files: ["src/**/*.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["@/features/*/*"],
+              message: "Importe pela API pública da feature: @/features/nome",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    files: ["src/compartilhado/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        { patterns: [{ group: ["@/features/*"], message: "compartilhado não depende de features" }] },
+      ],
+    },
+  },
+];
+```
+
+Para regras mais ricas (quais features podem importar quais, camadas por pasta), plugins como `eslint-plugin-boundaries` declaram os elementos e as dependências permitidas. Dependências circulares entre features são um alerta: em geral indicam que um conceito comum merece sua própria feature ou foi para o lugar errado.
+
+### Servidor e cliente
+
+No App Router a fronteira mais perigosa é a que separa servidor de navegador. Duas ferramentas:
+
+- `import "server-only"` no topo de arquivos com acesso a banco, segredos ou sessão: se um Client Component importar, o build falha.
+- `import "client-only"` em código que depende de `window`, para o erro aparecer cedo se um Server Component o usar.
+
+Tipos e funções de domínio puras podem ser usados dos dois lados.
+
+## Onde o estado mora
+
+Grande parte da complexidade de front-end vem de guardar estado no lugar errado. Uma regra de decisão:
+
+| Tipo de estado | Exemplo na Quitanda | Lugar |
+|---|---|---|
+| Dado do servidor, lido na renderização | Catálogo, pedidos do cliente | Server Component + cache do Next.js |
+| Dado do servidor que muda no cliente | Status do pedido atualizando, busca com digitação | TanStack Query (ou atualização em tempo real) |
+| Estado que deve estar no link | Categoria, página, ordenação | URL (`searchParams`) |
+| Estado de formulário | Checkout | `useActionState`, React Hook Form |
+| Estado de UI local | Modal aberto, aba ativa | `useState` no componente |
+| Estado de cliente compartilhado entre telas | Carrinho antes do login | Store pequena (Zustand ou Context) |
+
+O erro clássico é copiar dados do servidor para uma store global e passar a sincronizá-los à mão. Se o dado tem uma fonte de verdade no servidor, trate-o como cache dessa fonte.
+
+## Decisões registradas: ADRs
+
+Daqui a um ano alguém vai perguntar "por que Better Auth e não Clerk?" ou "por que Zustand só no carrinho?". Sem registro, a resposta é arqueologia em PRs antigos. Um ADR (Architecture Decision Record) é um texto curto, versionado no repositório, que registra uma decisão significativa.
+
+```md
+<!-- docs/adr/0007-autenticacao-com-better-auth.md -->
+# 7. Autenticação com Better Auth e sessão no banco
+
+Data: 2026-09-14
+Status: aceita
+
+## Contexto
+Precisamos de login por e-mail e GitHub, papéis (cliente e lojista) e
+logout que revogue a sessão. Os dados de usuário devem ficar no nosso Postgres.
+
+## Decisão
+Usar Better Auth com o adapter do Prisma, sessão em cookie HttpOnly e
+tabela de sessões. Verificação no servidor via src/lib/sessao.ts.
+
+## Alternativas consideradas
+- Clerk: menos código, mas dados fora da nossa base e custo por usuário ativo.
+- Auth.js com JWT: sem revogação imediata.
+
+## Consequências
+- Mantemos as telas de login e o fluxo de recuperação de senha.
+- Atualizações de segurança da biblioteca entram no processo de dependências.
+```
+
+Regras práticas: numere em sequência, nunca edite um ADR aceito para mudar a decisão (escreva outro que o substitui e marque o antigo como "substituída por 0012"), e escreva ADR só para decisões caras de reverter: framework, autenticação, gerenciamento de estado, estratégia de estilos, estrutura de pastas.
+
+## Critérios para escolher uma biblioteca
+
+Toda dependência é código de outra pessoa que você passa a manter. Antes de `npm install`, avalie:
+
+| Critério | Pergunta |
+|---|---|
+| Problema real | Resolve algo que temos hoje ou um problema imaginado? |
+| Manutenção | Releases recentes, issues respondidas, mais de um mantenedor? |
+| Compatibilidade | Funciona com React 19, Server Components e o runtime em que vamos usar? |
+| Tamanho e custo | Quanto pesa no bundle do cliente? Dá para usar só no servidor? |
+| Tipagem | Tipos de primeira classe ou `@types` desatualizado? |
+| Saída | Se a biblioteca morrer, quanto custa trocar? Ela fica isolada atrás de uma interface nossa? |
+| Licença e segurança | Licença compatível, histórico de vulnerabilidades tratado? |
+
+O último critério é o que mais se esquece. Envolver a biblioteca numa função ou componente da própria aplicação (`src/lib/flags.ts`, `compartilhado/ui/Modal.tsx`) limita o estrago de uma troca a um arquivo.
+
+<Callout type="warning" title="Arquitetura de currículo">
+Microfrontends, monorepo, Clean Architecture completa e cinco camadas de abstração numa loja com dois desenvolvedores criam mais custo do que resolvem. Comece simples, observe onde dói e evolua. A decisão sustentável é a proporcional ao tamanho do time e do problema.
+</Callout>
+
+## Convenções do time
+
+Convenções diminuem as decisões pequenas que consomem energia no code review. Escreva-as num `CONTRIBUTING.md` curto e automatize o que der:
+
+- **Nomes**: componentes em PascalCase (`ListaDeProdutos.tsx`), hooks com `use` (`useCarrinho.ts`), termos do domínio em português, APIs da linguagem como são.
+- **Um componente exportado por arquivo**, com o nome do arquivo igual ao do componente.
+- **Testes ao lado do código** (`dominio.test.ts` junto de `dominio.ts`).
+- **Valores monetários em centavos** e formatação só na borda da UI.
+- **Importações por alias** (`@/features/...`), nunca `../../../`.
+- **Dono por pasta** num arquivo `CODEOWNERS`, para que o revisor certo seja chamado.
+- **PRs pequenos** e com descrição do porquê; mudança estrutural separada de mudança de comportamento.
+
+Formatação e ordenação de imports não são convenção para discutir: o Prettier e o ESLint decidem, como mostra o capítulo de qualidade de código.
+
+## Na entrevista
+
+**Como você organiza as pastas de um projeto React grande?** Por funcionalidade: cada feature agrupa componentes, hooks, dados e regras, com uma API pública num `index.ts`. Código genérico fica em `compartilhado/` e, no Next.js, `app/` contém só rotas finas que compõem features. Isso deixa juntas as coisas que mudam juntas.
+
+**Onde fica a regra de negócio num front-end?** Em funções puras de domínio, fora dos componentes. Elas são testadas sem renderizar nada e reaproveitadas no servidor; o servidor sempre revalida o que importa, como preço e total.
+
+**Como você impede que as fronteiras se degradem com o tempo?** Tornando-as verificáveis: `no-restricted-imports` ou um plugin de fronteiras no ESLint, `server-only` para código de servidor, TypeScript estrito e revisão por dono de pasta. Convenção que só existe na cabeça das pessoas não sobrevive.
+
+**O que é um ADR e quando você escreve um?** Um registro curto de contexto, decisão, alternativas e consequências, versionado com o código. Escrevo para decisões caras de reverter, como framework, autenticação ou gerenciamento de estado. Se a decisão muda, escrevo um novo ADR que substitui o anterior.
+
+**Que critérios você usa para adotar uma biblioteca?** Se resolve um problema real, saúde da manutenção, compatibilidade com o React e o framework atuais, custo no bundle, qualidade dos tipos, licença e o custo de sair dela. E isolo a biblioteca atrás de uma interface da aplicação.
+
+## Pratique
+
+1. Mapeie os arquivos atuais da Quitanda em features (catálogo, carrinho, checkout, pedidos, painel) numa tabela e identifique o que é realmente compartilhado.
+2. Migre o carrinho para `src/features/carrinho`, com `dominio.ts` contendo `calcularSubtotal`, `calcularFrete` e `calcularTotal`, e faça a Server Action de checkout recalcular o total usando essas funções.
+3. Adicione a regra `no-restricted-imports` que proíbe importar o interior de outra feature e corrija as violações.
+4. Coloque `import "server-only"` em todos os arquivos de dados e confirme que importar um deles num Client Component quebra o build.
+5. Escreva dois ADRs: um sobre a organização por feature e outro sobre onde fica o estado do carrinho antes e depois do login.
+6. Avalie duas bibliotecas de data (por exemplo, date-fns e Day.js) com a tabela de critérios e registre a escolha.
+
+<Quiz question="Na estrutura por funcionalidade, por que cada feature expõe um index.ts?" options={["Porque o Next.js exige esse arquivo em cada pasta","Para definir uma API pública e manter os detalhes internos livres para mudar sem quebrar outras features","Para melhorar automaticamente o desempenho do bundle","Para que o TypeScript consiga compilar a pasta"]} answer={1} explanation="O index.ts é o contrato da feature. Quem está fora depende só dele, então o interior pode ser reorganizado sem efeitos colaterais." />
+
+<Quiz question="A Quitanda calcula o frete no cliente para mostrar o total. Qual é o desenho mais sustentável?" options={["Copiar a regra para a Server Action de checkout","Confiar no total enviado pelo formulário","Calcular o frete só no servidor e não mostrar o total antes do checkout","Uma função pura de domínio usada pelo componente e pela Server Action, que recalcula o total no servidor"]} answer={3} explanation="Uma única função de domínio evita regras divergentes, e o servidor recalcula porque nunca deve confiar em valores vindos do cliente." />
+
+<Quiz question="Uma decisão registrada num ADR aceito foi revista. O que fazer?" options={["Escrever um novo ADR com a nova decisão e marcar o antigo como substituído","Editar o ADR antigo com a decisão nova","Apagar o ADR antigo","Registrar a mudança apenas na descrição do PR"]} answer={0} explanation="ADRs são um histórico. Preservar o antigo mostra o contexto em que ele fazia sentido e por que a decisão mudou." />
+
+## Base no CodeForge
+
+- [Acoplamento e coesão](/learn/lld/acoplamento-coesao) e [Separação de responsabilidades](/learn/lld/separacao-de-responsabilidades): os princípios por trás das camadas.
+- [Injeção de dependência](/learn/lld/injecao-de-dependencia): como isolar bibliotecas atrás de interfaces próprias.
+- [YAGNI](/learn/lld/yagni) e [KISS](/learn/lld/kiss): o antídoto para arquitetura de currículo.
+- [SOLID aplicado ao React](/learn/carreira-react/solid-react-modularidade-flexibilidade): o aprofundamento do Nível 3.
+- [React: integração com Supabase e conceitos de arquitetura limpa na prática](/learn/carreira-react/react-supabase-arquitetura-limpa): camadas levadas ao limite.
+
+## Referências
+
+- [Next.js: Project structure and organization](https://nextjs.org/docs/app/getting-started/project-structure)
+- [React: Choosing the State Structure](https://react.dev/learn/choosing-the-state-structure)
+- [ESLint: no-restricted-imports](https://eslint.org/docs/latest/rules/no-restricted-imports)
+- [Architecture Decision Records (adr.github.io)](https://adr.github.io/)
+- [Feature-Sliced Design](https://feature-sliced.design/)

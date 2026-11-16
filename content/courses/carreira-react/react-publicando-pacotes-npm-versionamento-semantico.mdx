@@ -1,0 +1,347 @@
+---
+title: "React: publicando pacotes no npm com versionamento semântico"
+kind: lesson
+---
+
+Dentro do monorepo, a loja e o painel consomem a Quitanda UI pelo `workspace:*`: toda mudança chega na hora. Agora a Quitanda fechou parceria com feiras de bairro que vão ter as próprias lojas online, desenvolvidas por outras equipes, em outros repositórios. Elas querem o mesmo botão, o mesmo campo de CEP e os mesmos tokens. E querem algo que o monorepo não oferece: decidir **quando** atualizar. Uma feira que está no meio da Black Friday não pode receber, sem aviso, um botão que mudou de altura.
+
+Isso pede um pacote publicado, com versões que comunicam o tamanho de cada mudança. Este capítulo empacota `@quitanda/ui` e `@quitanda/tokens` para o npm, configura `exports` e `peerDependencies` do jeito que bundlers e o Node.js esperam, adota versionamento semântico com Changesets e publica pelo GitHub Actions, com proveniência e sem token guardado em segredo.
+
+**Você vai aprender:**
+
+- Empacotar uma biblioteca React em ESM com declarações de tipos usando tsup ou o modo biblioteca do Vite
+- Configurar `exports`, `files`, `sideEffects` e `peerDependencies` corretamente
+- Aplicar versionamento semântico a uma biblioteca de componentes, incluindo a faixa 0.x e pré-lançamentos
+- Registrar mudanças e gerar versões e changelogs com Changesets
+- Publicar no escopo `@quitanda` pelo GitHub Actions com trusted publishing e provenance
+
+## O que vai dentro do pacote
+
+Quem instala a Quitanda UI não quer o seu `src/` em TypeScript, as stories nem os testes. Quer JavaScript pronto, declarações de tipos e nada mais. Três decisões definem o pacote:
+
+- **Formato do módulo.** ESM (`import`/`export`) é o padrão da plataforma. Bundlers como Vite, Turbopack e webpack o preferem porque permite tree shaking, e versões atuais do Node.js conseguem até fazer `require` de ESM. Para uma biblioteca de componentes React em 2026, publicar só ESM é uma escolha razoável e simplifica muito o empacotamento.
+- **Dependências externas.** React, React DOM e styled-components não entram no bundle; o app fornece.
+- **A diretiva `"use client"`.** Os componentes usam hooks e styled-components, então o arquivo final precisa começar com a diretiva, ou o Next.js tentará usá-los como Server Components e falhará.
+
+### Empacotando com tsup
+
+O tsup, baseado no esbuild, compila TypeScript e JSX e gera declarações com poucas linhas de configuração. Ele trata `dependencies` e `peerDependencies` como externas automaticamente. Vale saber que o próprio projeto passou a indicar o tsdown como sucessor, com configuração muito parecida; o raciocínio abaixo vale para os dois.
+
+```ts
+// packages/ui/tsup.config.ts
+import { defineConfig } from "tsup";
+
+export default defineConfig({
+  entry: ["src/index.ts"],
+  format: ["esm"],
+  dts: true,
+  sourcemap: true,
+  clean: true,
+  treeshake: true,
+  target: "es2022",
+  banner: { js: '"use client";' },
+});
+```
+
+O `banner` coloca `"use client"` no topo do arquivo gerado. Sem ele, a diretiva que estava em cada componente se perde quando o bundler junta tudo num arquivo só.
+
+### Alternativa: modo biblioteca do Vite
+
+Se a UI já usa Vite (o Storybook da Quitanda UI usa), o modo biblioteca aproveita a mesma configuração e os mesmos plugins:
+
+```ts
+// packages/ui/vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import dts from "vite-plugin-dts";
+
+export default defineConfig({
+  plugins: [react(), dts({ tsconfigPath: "./tsconfig.build.json", rollupTypes: true })],
+  build: {
+    lib: { entry: "src/index.ts", formats: ["es"], fileName: "index" },
+    rollupOptions: {
+      external: ["react", "react-dom", "react/jsx-runtime", "styled-components"],
+      output: { banner: '"use client";' },
+    },
+    sourcemap: true,
+  },
+});
+```
+
+No Vite, as dependências externas são declaradas à mão. Esquecer `react/jsx-runtime` é um erro clássico: o JSX compilado importa esse módulo, e ele acaba copiado para dentro do pacote, criando uma segunda cópia de React.
+
+| Critério | tsup (ou tsdown) | Vite, modo biblioteca |
+|---|---|---|
+| Configuração | Mínima | Média, reaproveita a do app |
+| Declarações de tipos | `dts: true` | Plugin (`vite-plugin-dts`) |
+| Externos | Automáticos a partir do `package.json` | Manuais |
+| CSS e assets | Suporte básico | Pipeline completo do Vite |
+| Bom para | Bibliotecas TS e React sem CSS próprio | Bibliotecas com CSS, assets ou já em Vite |
+
+## O `package.json` de uma biblioteca
+
+```json
+// packages/ui/package.json
+{
+  "name": "@quitanda/ui",
+  "version": "0.4.0",
+  "description": "Componentes da Quitanda UI",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/quitanda/quitanda.git", "directory": "packages/ui" },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "engines": { "node": ">=20.19" },
+  "scripts": {
+    "build": "tsup",
+    "lint:pacote": "publint && attw --pack . --profile esm-only"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "styled-components": "^6.1.0"
+  },
+  "dependencies": {
+    "@quitanda/tokens": "workspace:^"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.0",
+    "publint": "^0.3.0",
+    "tsup": "^8.0.0"
+  },
+  "publishConfig": { "access": "public" }
+}
+```
+
+Campo a campo, o que importa:
+
+- **`name` com escopo.** `@quitanda/ui` só pode ser publicado por membros da organização `quitanda` no npm. Pacotes com escopo são privados por padrão; `publishConfig.access: "public"` torna a publicação pública.
+- **`exports`.** Define as únicas portas de entrada do pacote. Com ele, `import { Botao } from "@quitanda/ui"` funciona e `import "@quitanda/ui/dist/Botao/Botao.js"` é bloqueado, o que dá liberdade para reorganizar arquivos internos sem quebrar ninguém. A condição `types` vem primeiro, porque o TypeScript usa a primeira condição que reconhece.
+- **`files`.** Lista branca do que vai para o tarball. Sem ele, o `.npmignore` (ou o `.gitignore`) decide, e é comum publicar sem querer testes, fontes ou até um `.env`.
+- **`sideEffects: false`.** Diz ao bundler que importar um módulo não faz nada além de exportar valores, o que libera o tree shaking: a loja que usa só o `Botao` não carrega o `Dialogo`.
+- **`peerDependencies`.** O pacote funciona com o React e o styled-components do app, dentro dessas faixas. O npm instala peers automaticamente desde a versão 7 e avisa sobre conflitos.
+- **`dependencies`.** O que o pacote precisa e o app não precisa saber: aqui, os tokens. O `workspace:^` é trocado pela faixa real (por exemplo, `^0.3.0`) no momento da publicação.
+- **`repository`.** Obrigatório para a proveniência, que confere se o pacote veio daquele repositório.
+
+<Callout type="tip" title="Confira o tarball antes de publicar">
+`npm pack --dry-run` lista exatamente os arquivos que iriam para o registro, com tamanhos. O `publint` aponta erros de `exports` e campos inconsistentes, e o `attw` (Are the Types Wrong) confere se os tipos resolvem corretamente em cada modo de resolução do TypeScript. Os três rodam em segundos e evitam a maioria das publicações quebradas.
+</Callout>
+
+O pacote de tokens publica também o CSS, por um subcaminho explícito:
+
+```json
+// packages/tokens/package.json (trecho)
+{
+  "name": "@quitanda/tokens",
+  "exports": {
+    ".": { "types": "./dist/tokens.d.ts", "import": "./dist/tokens.js" },
+    "./tokens.css": "./dist/tokens.css"
+  },
+  "files": ["dist"],
+  "sideEffects": ["*.css"]
+}
+```
+
+Aqui `sideEffects` lista os arquivos CSS: importar `@quitanda/tokens/tokens.css` não exporta nada, só aplica estilos, e o bundler não pode descartar esse import.
+
+## Versionamento semântico
+
+O semver dá a cada número da versão `MAJOR.MINOR.PATCH` um significado combinado:
+
+- **PATCH** (`0.4.0` para `0.4.1`): correção compatível. Nada que funcionava deixa de funcionar.
+- **MINOR** (`0.4.1` para `0.5.0`): funcionalidade nova compatível. Um componente novo, uma prop opcional nova.
+- **MAJOR** (`1.4.2` para `2.0.0`): mudança incompatível. Quem atualizar pode precisar mudar código.
+
+O difícil é decidir o que é incompatível numa biblioteca de componentes. A pergunta certa é: algum consumidor que segue a API documentada pode quebrar?
+
+| Mudança na Quitanda UI | Tipo |
+|---|---|
+| Corrigir o foco visível do `Botao` que não aparecia | PATCH |
+| Adicionar o componente `Tabela` | MINOR |
+| Adicionar a prop opcional `icone` ao `Botao` | MINOR |
+| Renomear a prop `aoFechar` para `onClose` | MAJOR |
+| Trocar a variante padrão do `Botao` de primário para secundário | MAJOR |
+| Remover ou renomear um token semântico | MAJOR |
+| Deixar de aceitar React 18 no peer | MAJOR |
+| Deixar de publicar CommonJS | MAJOR |
+| Mudar a altura padrão do `Botao` de 40px para 44px | Depende do acordo; muitos times tratam como MINOR com aviso no changelog |
+
+A última linha mostra que semver é um contrato social. Escreva no README o que a biblioteca considera API pública (props, exports, nomes de tokens, comportamento de teclado) e o que não considera (nomes de classes geradas, estrutura interna do DOM).
+
+### As faixas que os consumidores escrevem
+
+| Faixa | Aceita | Uso típico |
+|---|---|---|
+| `^1.4.2` | maior ou igual a 1.4.2 e menor que 2.0.0 | O padrão do `npm install` |
+| `~1.4.2` | maior ou igual a 1.4.2 e menor que 1.5.0 | Só correções |
+| `1.4.2` | exatamente essa | Controle total, atualização manual |
+| `^0.4.1` | maior ou igual a 0.4.1 e menor que 0.5.0 | Na faixa 0.x, o circunflexo trava a minor |
+
+Na faixa `0.x`, a convenção é que qualquer minor pode quebrar, e por isso o circunflexo se comporta como um til. A Quitanda UI começa em `0.x` enquanto a API se estabiliza e vai para `1.0.0` quando o time estiver pronto para levar o contrato a sério.
+
+Pré-lançamentos (`2.0.0-beta.1`) permitem testar uma major com voluntários. Publique-os com uma dist-tag diferente de `latest`, como `npm publish --tag next`, para que um `npm install @quitanda/ui` comum nunca os traga.
+
+## Changesets: versões e changelog sem planilha
+
+Num monorepo com vários pacotes publicáveis, decidir a versão de cada um na hora do release é propenso a erro. O Changesets inverte o fluxo: quem faz a mudança declara, no próprio PR, o tipo dela.
+
+```bash
+pnpm add -Dw @changesets/cli
+pnpm changeset init
+```
+
+```json
+// .changeset/config.json
+{
+  "$schema": "https://unpkg.com/@changesets/config/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": []
+}
+```
+
+Apps como `loja` e `painel` têm `"private": true` e são ignorados na publicação automaticamente. Os pacotes publicáveis perdem o `"private": true` que tinham no capítulo do monorepo.
+
+Ao terminar uma mudança, quem desenvolve roda `pnpm changeset`, escolhe os pacotes afetados e o tipo de cada um, e escreve uma frase para o changelog. O resultado é um arquivo Markdown em `.changeset/` (aqui, `.changeset/botao-com-icone.md`) que entra no PR. Ele começa direto pelo frontmatter:
+
+```md
+---
+"@quitanda/ui": minor
+---
+
+`Botao` aceita a prop opcional `icone`, exibida antes do texto.
+```
+
+Na hora do release, dois comandos fazem o resto:
+
+- **`changeset version`** consome os arquivos pendentes, calcula a maior mudança por pacote, atualiza as versões nos `package.json`, atualiza dependências internas (se `@quitanda/tokens` sobe, a UI ganha um patch apontando para a versão nova) e escreve os `CHANGELOG.md`.
+- **`changeset publish`** publica todo pacote cuja versão local ainda não existe no registro e cria as tags Git.
+
+```json
+// package.json (raiz, trecho)
+{
+  "scripts": {
+    "version-packages": "changeset version",
+    "release": "turbo run build --filter=./packages/* && changeset publish"
+  }
+}
+```
+
+## Publicando pelo GitHub Actions
+
+Publicar da máquina de alguém é frágil: depende de quem tem o token, de que branch está ativa e de o build local estar limpo. O fluxo recomendado é publicar só pelo CI, a partir da `main`.
+
+```yaml
+# .github/workflows/release.yml
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run lint test --filter=./packages/*
+      - uses: changesets/action@v1
+        with:
+          version: pnpm version-packages
+          publish: pnpm release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+A ação do Changesets tem dois comportamentos. Se há changesets pendentes na `main`, ela abre (ou atualiza) um PR chamado "Version Packages" com as versões e changelogs calculados. Quando esse PR é aprovado e mesclado, não há mais changesets pendentes, e ela roda o `publish`. O release vira uma revisão de PR, com histórico e aprovação.
+
+### Trusted publishing e provenance
+
+A permissão `id-token: write` é o que dispensa o `NPM_TOKEN`. Com **trusted publishing**, você cadastra no npmjs.com, nas configurações do pacote, qual repositório e qual arquivo de workflow podem publicá-lo. Na execução, o GitHub emite um token OIDC de curta duração, o npm confere se ele veio daquele workflow e autoriza a publicação. Não há segredo de longa duração para vazar, e um token roubado de um desenvolvedor não publica nada. O suporte exige uma versão recente do npm CLI (11.5.1 ou mais nova; o Node.js 24 já traz o npm 11).
+
+Publicações por trusted publishing geram **provenance** automaticamente: uma atestação assinada (pelo Sigstore) que liga a versão publicada ao repositório, ao commit e ao workflow que a construíram. A página do pacote no npmjs.com mostra essa origem, e qualquer consumidor pode verificar as assinaturas do que instalou com `npm audit signatures`. Fora do trusted publishing, a provenance pode ser pedida com `npm publish --provenance` ou `"provenance": true` no `publishConfig`, desde que o publish rode num CI suportado com `id-token: write`.
+
+<Callout type="warning" title="Publicado é para sempre (quase)">
+O npm só permite despublicar uma versão em até 72 horas, com restrições, e o número de versão nunca pode ser reutilizado. Se uma versão saiu quebrada, publique uma correção e marque a versão ruim com `npm deprecate @quitanda/ui@0.5.0 "Use 0.5.1: o Dialogo não fechava com Esc"`. O aviso aparece para quem instalar.
+</Callout>
+
+## Do outro lado: consumindo o pacote
+
+Na loja da feira parceira, num repositório separado:
+
+```bash
+npm install @quitanda/ui @quitanda/tokens styled-components
+```
+
+```tsx
+// src/app/layout.tsx (app da feira parceira)
+import "@quitanda/tokens/tokens.css";
+import { ProvedorDeTema } from "@quitanda/ui";
+```
+
+O npm resolve as faixas, instala os peers e grava as versões exatas no `package-lock.json`. Quando sair a `0.5.0`, a feira decide quando atualizar, lendo o changelog. Ferramentas como Renovate e Dependabot abrem esse PR de atualização automaticamente, tema do capítulo sobre dependências.
+
+## Na entrevista
+
+**Para que serve o campo exports no package.json?** Define as entradas públicas do pacote e, por condições como `types` e `import`, qual arquivo cada ambiente recebe. Tudo que não está listado fica inacessível para o consumidor, o que permite mudar a estrutura interna sem quebrar ninguém.
+
+**Quando usar peerDependencies em vez de dependencies?** Quando o pacote precisa compartilhar a mesma instância que o app usa, como React ou styled-components. Duplicar React quebra hooks e contexto. `dependencies` é para o que o pacote usa internamente e pode ter cópia própria.
+
+**O que muda no circunflexo para versões 0.x?** Em `^0.4.1`, a faixa vai até antes de `0.5.0`, não até `1.0.0`. Na faixa 0.x, minor é tratada como potencialmente incompatível.
+
+**Como o Changesets decide a próxima versão?** Cada PR traz um arquivo declarando o tipo de mudança por pacote. No release, ele aplica a maior mudança pendente de cada pacote, propaga para dependentes internos, atualiza changelogs e publica o que não está no registro.
+
+**O que é provenance no npm e por que importa?** É uma atestação assinada que liga a versão publicada ao código-fonte e ao build que a gerou. Ajuda contra ataques de cadeia de suprimentos, porque mostra se o pacote foi construído no CI do repositório declarado, e não na máquina de alguém com um token roubado.
+
+## Pratique
+
+1. Configure o tsup na Quitanda UI com saída ESM, declarações e o banner `"use client"`. Rode `npm pack --dry-run` e confirme que só `dist/` e o `package.json` entram.
+2. Rode `publint` e `attw` no pacote e corrija os avisos. Inverta a ordem de `types` e `import` no `exports` e observe o que muda.
+3. Faça o mesmo empacotamento com o modo biblioteca do Vite, esqueça `react/jsx-runtime` nos externos de propósito e encontre o problema no arquivo gerado.
+4. Instale o Changesets, crie changesets para três mudanças (um patch na UI, uma minor nos tokens e uma major na UI) e rode `changeset version` para ver as versões e os changelogs resultantes.
+5. Monte o workflow de release com trusted publishing num repositório de teste, publique `@seu-escopo/ui` e confira a proveniência na página do pacote e com `npm audit signatures` num projeto que o instale.
+
+<Quiz question="Uma feira parceira declarou @quitanda/ui com a faixa ^0.4.1. Qual versão o npm pode instalar?" options={["0.5.0","1.0.0","0.4.9","0.3.9"]} answer={2} explanation="Na faixa 0.x, o circunflexo aceita até antes da próxima minor: maior ou igual a 0.4.1 e menor que 0.5.0." />
+
+<Quiz question="A Quitanda UI empacotada com Vite trouxe uma segunda cópia do runtime do React no bundle. Qual a causa mais provável?" options={["Faltou sideEffects false","react/jsx-runtime não foi declarado como externo","O pacote foi publicado como ESM","O React está em peerDependencies"]} answer={1} explanation="O JSX compilado importa react/jsx-runtime. Se ele não for externo, o bundler copia o módulo para dentro do pacote." />
+
+<Quiz question="Qual mudança exige uma nova versão MAJOR na Quitanda UI já em 1.x?" options={["Adicionar o componente Tabela","Corrigir o contraste do Selo de aviso","Adicionar uma prop opcional ao Botao","Renomear o token semântico cor.acao.primaria"]} answer={3} explanation="Remover ou renomear um token público quebra quem o usa. As outras mudanças são compatíveis: minor ou patch." />
+
+## Base no CodeForge
+
+- [React: desenvolvendo design systems modulares com Turborepo](/learn/carreira-react/react-design-systems-modulares-turborepo): o monorepo de onde o pacote sai.
+- [React: garantindo qualidade de código e automações de deploy](/learn/carreira-react/react-qualidade-codigo-automacoes-deploy): o CI que agora também publica.
+- [React: gerenciando dependências e evoluindo projetos com segurança](/learn/carreira-react/react-gerenciando-dependencias-evoluindo-projetos): o lado de quem consome e atualiza pacotes.
+- [Node.js e terminal: dominando o ambiente de desenvolvimento front-end](/learn/carreira-react/nodejs-terminal-ambiente-front-end): npm, `package.json` e scripts desde a base.
+
+## Referências
+
+- [npm Docs: package.json](https://docs.npmjs.com/cli/configuring-npm/package-json)
+- [npm Docs: Trusted publishing](https://docs.npmjs.com/trusted-publishers)
+- [npm Docs: Generating provenance statements](https://docs.npmjs.com/generating-provenance-statements)
+- [Semantic Versioning 2.0.0](https://semver.org/lang/pt-BR/)
+- [Changesets](https://github.com/changesets/changesets)

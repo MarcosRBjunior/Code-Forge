@@ -1,0 +1,373 @@
+---
+title: "React: implementando arquitetura event-driven com Socket.io"
+kind: lesson
+---
+
+Hoje o cliente da Quitanda descobre que o pedido saiu para entrega recarregando a página. Uma versão anterior fazia polling a cada 5 segundos: com mil clientes acompanhando pedidos, eram 12 mil requisições por minuto ao BFF, quase todas respondendo "nada mudou". O lojista também quer ver pedidos novos chegando no painel sem apertar F5, e o entregador quer avisar "estou a 2 minutos".
+
+A solução é inverter a direção: em vez de o front perguntar, o servidor avisa quando algo acontece. Isso é arquitetura orientada a eventos (event-driven) aplicada à interface. Este capítulo monta o servidor Socket.io dentro do BFF NestJS, organiza os clientes em rooms por pedido, cria o hook `useStatusDoPedido` no front, trata reconexão e eventos fora de ordem, tipa os eventos dos dois lados e escala para várias instâncias com o adapter Redis.
+
+**Você vai aprender:**
+
+- O que muda quando a interface reage a eventos em vez de buscar dados
+- Escolher entre polling, Server-Sent Events, WebSocket puro e Socket.io
+- Criar um gateway Socket.io no NestJS com autenticação e rooms por pedido
+- Escrever o hook `useStatusDoPedido` integrado ao TanStack Query
+- Lidar com reconexão, eventos perdidos e eventos fora de ordem
+- Escalar o Socket.io horizontalmente com o adapter Redis
+
+## Eventos, não perguntas
+
+Num sistema orientado a eventos, quem produz um fato o publica ("o pedido 42 mudou para separando") e quem se interessa reage, sem que o produtor saiba quem são os consumidores. No back-end, isso costuma passar por um broker (Kafka, RabbitMQ, SQS). No front, o último trecho do caminho é uma conexão persistente entre o navegador e o servidor.
+
+Duas distinções ajudam a desenhar os eventos:
+
+- **Evento** descreve algo que já aconteceu, no passado: `pedido:status-alterado`. **Comando** pede que algo aconteça: `pedido:cancelar`. Do servidor para o cliente, quase tudo é evento; do cliente para o servidor, são comandos ou pedidos de assinatura.
+- **Evento com estado completo** ("o pedido agora está assim") versus **evento de notificação** ("o pedido mudou, busque de novo"). O primeiro economiza uma requisição; o segundo é mais simples de manter consistente. Para o status do pedido, o estado é pequeno, então vale mandar o status junto.
+
+## Como levar o evento até o navegador
+
+| Técnica | Direção | Prós | Contras |
+|---|---|---|---|
+| Polling | Cliente pergunta | Trivial, funciona com qualquer back-end | Atraso igual ao intervalo, carga desperdiçada |
+| Server-Sent Events | Servidor para cliente | HTTP comum, reconexão nativa no `EventSource` | Só uma direção, texto apenas |
+| WebSocket puro | Bidirecional | Padrão do navegador, baixo overhead | Reconexão, rooms, acks e fallback ficam por sua conta |
+| Socket.io | Bidirecional | Reconexão, rooms, acks, namespaces, adapters para escalar | Protocolo próprio: cliente e servidor precisam ser Socket.io |
+
+Para o status de um pedido, SSE resolveria. A Quitanda escolhe Socket.io porque o painel do lojista e o entregador também enviam eventos e porque rooms e o adapter Redis economizam muito código. Registre essa escolha num ADR, como no primeiro capítulo do nível.
+
+## Contrato de eventos tipado
+
+O Socket.io 4 aceita genéricos para tipar eventos nos dois lados. O contrato fica no pacote compartilhado:
+
+```ts
+// packages/contratos/src/eventos.ts
+import type { z } from "zod";
+import type { StatusDoPedido } from "./pedidos";
+
+type Status = z.infer<typeof StatusDoPedido>;
+
+export type StatusAlterado = { pedidoId: string; status: Status; versao: number; em: string };
+
+export interface EventosServidorParaCliente {
+  "pedido:status-alterado": (evento: StatusAlterado) => void;
+  "painel:pedido-novo": (evento: { pedidoId: string; totalEmCentavos: number }) => void;
+}
+
+export interface EventosClienteParaServidor {
+  "pedido:acompanhar": (pedidoId: string, ack: (r: { ok: boolean; status?: Status; versao?: number }) => void) => void;
+  "pedido:parar": (pedidoId: string) => void;
+}
+```
+
+A `versao` cresce a cada mudança do pedido (vem do banco). Ela é o que permite descartar eventos atrasados, como você verá adiante.
+
+## O gateway no NestJS
+
+```bash
+npm install @nestjs/websockets @nestjs/platform-socket.io socket.io cookie
+```
+
+```ts
+// apps/bff/src/pedidos/pedidos.gateway.ts
+import {
+  ConnectedSocket, MessageBody, OnGatewayConnection, SubscribeMessage,
+  WebSocketGateway, WebSocketServer,
+} from "@nestjs/websockets";
+import type { Server, Socket } from "socket.io";
+import { parse } from "cookie";
+import type { EventosClienteParaServidor, EventosServidorParaCliente, StatusAlterado } from "@quitanda/contratos";
+import { AuthService } from "../auth/auth.service";
+import { PedidosService } from "./pedidos.service";
+
+type Dados = { usuarioId: string; token: string };
+type SocketQuitanda = Socket<EventosClienteParaServidor, EventosServidorParaCliente, {}, Dados>;
+
+@WebSocketGateway({ cors: { origin: process.env.FRONT_URL, credentials: true } })
+export class PedidosGateway implements OnGatewayConnection {
+  @WebSocketServer()
+  server!: Server<EventosClienteParaServidor, EventosServidorParaCliente, {}, Dados>;
+
+  constructor(private readonly auth: AuthService, private readonly pedidos: PedidosService) {}
+
+  async handleConnection(socket: SocketQuitanda) {
+    const cookies = parse(socket.handshake.headers.cookie ?? "");
+    const sessao = await this.auth.sessao(cookies.quitanda_sessao);
+    if (!sessao) return socket.disconnect(true);
+    socket.data = { usuarioId: sessao.usuarioId, token: sessao.token };
+    if (sessao.papel === "lojista") socket.join("painel");
+  }
+
+  @SubscribeMessage("pedido:acompanhar")
+  async acompanhar(@ConnectedSocket() socket: SocketQuitanda, @MessageBody() pedidoId: string) {
+    const pedido = await this.pedidos.resumoSeAutorizado(pedidoId, socket.data.usuarioId, socket.data.token);
+    if (!pedido) return { ok: false };
+    await socket.join(`pedido:${pedidoId}`);
+    return { ok: true, status: pedido.status, versao: pedido.versao };
+  }
+
+  @SubscribeMessage("pedido:parar")
+  parar(@ConnectedSocket() socket: SocketQuitanda, @MessageBody() pedidoId: string) {
+    socket.leave(`pedido:${pedidoId}`);
+  }
+
+  emitirStatus(evento: StatusAlterado) {
+    this.server.to(`pedido:${evento.pedidoId}`).emit("pedido:status-alterado", evento);
+  }
+
+  emitirPedidoNovo(pedidoId: string, totalEmCentavos: number) {
+    this.server.to("painel").emit("painel:pedido-novo", { pedidoId, totalEmCentavos });
+  }
+}
+```
+
+Pontos importantes:
+
+- **Autenticação no handshake.** O navegador envia o cookie da sessão na conexão (mesmo site, `withCredentials`). Sem sessão válida, o socket é desconectado antes de entrar em qualquer room.
+- **Autorização ao entrar na room.** Estar logado não basta: `resumoSeAutorizado` confere que o pedido é do cliente (ou que o usuário é lojista). Sem isso, qualquer um assinaria `pedido:42` e veria pedidos alheios.
+- **O retorno do handler vira o ack.** No Nest, o valor devolvido por um `@SubscribeMessage` é enviado como resposta ao callback do cliente. Aqui ele já traz o status atual, o que resolve a corrida entre "carreguei a página" e "entrei na room".
+- **Rooms são baratas.** Uma room por pedido é normal; o Socket.io só mantém um conjunto de ids por room.
+
+### De onde vem o evento
+
+O gateway não decide quando o status muda. O serviço de pedidos publica o fato, e o BFF repassa. Com um broker, um consumidor no BFF chama `gateway.emitirStatus(evento)`. Numa versão mais simples, o serviço de pedidos chama um webhook interno do BFF:
+
+```ts
+// apps/bff/src/pedidos/eventos-internos.controller.ts
+import { Body, Controller, HttpCode, Post, UseGuards } from "@nestjs/common";
+import type { StatusAlterado } from "@quitanda/contratos";
+import { ChaveInternaGuard } from "../auth/chave-interna.guard";
+import { PedidosGateway } from "./pedidos.gateway";
+
+@Controller("interno/eventos")
+@UseGuards(ChaveInternaGuard)
+export class EventosInternosController {
+  constructor(private readonly gateway: PedidosGateway) {}
+
+  @Post("status-alterado")
+  @HttpCode(202)
+  statusAlterado(@Body() evento: StatusAlterado) {
+    this.gateway.emitirStatus(evento);
+  }
+}
+```
+
+## O cliente no React
+
+Uma única conexão por aba, criada sob demanda:
+
+```ts
+// src/servicos/socket.ts
+import { io, type Socket } from "socket.io-client";
+import type { EventosClienteParaServidor, EventosServidorParaCliente } from "@quitanda/contratos";
+
+export type SocketQuitanda = Socket<EventosServidorParaCliente, EventosClienteParaServidor>;
+
+let socket: SocketQuitanda | null = null;
+
+export function obterSocket(): SocketQuitanda {
+  if (!socket) {
+    socket = io(process.env.NEXT_PUBLIC_SOCKET_URL ?? "", {
+      withCredentials: true,
+      autoConnect: false,
+      transports: ["websocket"],
+    });
+  }
+  return socket;
+}
+```
+
+`transports: ["websocket"]` pula o long-polling inicial, o que simplifica o balanceamento (veja a seção de escala). Se parte dos clientes estiver atrás de proxies que bloqueiam WebSocket, mantenha o padrão e configure sticky sessions.
+
+### O hook `useStatusDoPedido`
+
+O status inicial vem do TanStack Query (renderizado no servidor ou buscado no BFF). O socket só atualiza o cache:
+
+```tsx
+// src/hooks/useStatusDoPedido.ts
+"use client";
+import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import type { DetalheDoPedido, StatusAlterado } from "@quitanda/contratos";
+import { obterSocket } from "@/servicos/socket";
+
+type Conexao = "conectando" | "conectado" | "reconectando";
+
+export function useStatusDoPedido(pedidoId: string) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    const socket = obterSocket();
+    const chave = ["pedidos", pedidoId] as const;
+
+    const aplicar = (evento: Pick<StatusAlterado, "status" | "versao">) => {
+      queryClient.setQueryData<DetalheDoPedido & { versao?: number }>(chave, (atual) => {
+        if (!atual) return atual;
+        if (atual.versao !== undefined && evento.versao <= atual.versao) return atual; // evento velho
+        return { ...atual, status: evento.status, versao: evento.versao };
+      });
+    };
+
+    const assinar = () => {
+      socket.emit("pedido:acompanhar", pedidoId, (r) => {
+        if (r.ok && r.status && r.versao !== undefined) aplicar({ status: r.status, versao: r.versao });
+      });
+    };
+
+    const aoMudar = (evento: StatusAlterado) => {
+      if (evento.pedidoId === pedidoId) aplicar(evento);
+    };
+
+    socket.on("connect", assinar); // primeira conexão e cada reconexão
+    socket.on("pedido:status-alterado", aoMudar);
+    if (socket.connected) assinar();
+    else socket.connect();
+
+    return () => {
+      socket.emit("pedido:parar", pedidoId);
+      socket.off("connect", assinar);
+      socket.off("pedido:status-alterado", aoMudar);
+    };
+  }, [pedidoId, queryClient]);
+}
+```
+
+```tsx
+// src/componentes/AcompanhamentoDoPedido.tsx
+"use client";
+import { useQuery } from "@tanstack/react-query";
+import { useStatusDoPedido } from "@/hooks/useStatusDoPedido";
+import { buscarDetalheDoPedido } from "@/adaptadores/http/bff";
+
+const rotulos = { recebido: "Recebido", separando: "Separando", saiu_para_entrega: "Saiu para entrega", entregue: "Entregue" };
+
+export function AcompanhamentoDoPedido({ pedidoId }: { pedidoId: string }) {
+  const { data: pedido } = useQuery({ queryKey: ["pedidos", pedidoId], queryFn: () => buscarDetalheDoPedido(pedidoId) });
+  useStatusDoPedido(pedidoId);
+
+  if (!pedido) return null;
+  return (
+    <p role="status" aria-live="polite">
+      Status: <strong>{rotulos[pedido.status]}</strong>
+    </p>
+  );
+}
+```
+
+`role="status"` com `aria-live="polite"` faz o leitor de tela anunciar a mudança sem interromper o usuário. A interface em tempo real também precisa ser acessível.
+
+<Callout type="tip" title="Socket atualiza o cache, não um estado paralelo">
+Guardar o status num `useState` separado cria duas fontes de verdade: a query e o socket. Escrevendo no cache do TanStack Query com `setQueryData`, toda tela que lê `["pedidos", id]` se atualiza junto, e uma revalidação normal corrige qualquer desvio.
+</Callout>
+
+## Reconexão, perdas e ordem
+
+Conexões caem: o celular troca de 4G para Wi-Fi, o usuário fecha a tampa do notebook, o BFF é reimplantado. O cliente Socket.io reconecta sozinho com backoff exponencial, mas três problemas continuam sendo seus:
+
+1. **Rooms não sobrevivem à reconexão.** A conexão nova é outro socket, sem rooms. Por isso o hook assina de novo no evento `connect`, e não só uma vez.
+2. **Eventos emitidos durante a queda se perdem.** O ack de `pedido:acompanhar` devolve o status atual, então a reassinatura já recupera o estado. Alternativamente, invalide a query no `connect` para buscar tudo de novo.
+3. **Eventos podem chegar fora de ordem** entre o ack e o broadcast, ou entre instâncias. A `versao` resolve: evento com versão menor ou igual à atual é descartado.
+
+O Socket.io 4.6 trouxe a **connection state recovery**, que reenvia eventos perdidos durante quedas curtas, configurada no servidor com `connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000 }`. É útil, mas não substitui a reassinatura com estado atual: quedas longas, reinício do servidor e alguns adapters não preservam o histórico.
+
+Mostre ao usuário quando a conexão estiver instável. O socket expõe `socket.io.on("reconnect_attempt", ...)` e `socket.on("disconnect", ...)`: um aviso discreto "reconectando..." evita que o cliente ache que o status travou.
+
+## Escalar com o adapter Redis
+
+Com uma instância do BFF, `server.to("pedido:42").emit(...)` alcança todos os sockets da room. Com três instâncias atrás de um balanceador, o cliente do pedido 42 pode estar conectado na instância B enquanto o evento chega na A. O adapter Redis faz cada emissão ser publicada no Redis e repassada por todas as instâncias.
+
+```bash
+npm install @socket.io/redis-adapter redis
+```
+
+```ts
+// apps/bff/src/adapters/redis-io.adapter.ts
+import { IoAdapter } from "@nestjs/platform-socket.io";
+import type { ServerOptions } from "socket.io";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { createClient } from "redis";
+
+export class RedisIoAdapter extends IoAdapter {
+  private adaptador?: ReturnType<typeof createAdapter>;
+
+  async conectar() {
+    const pub = createClient({ url: process.env.REDIS_URL });
+    const sub = pub.duplicate();
+    await Promise.all([pub.connect(), sub.connect()]);
+    this.adaptador = createAdapter(pub, sub);
+  }
+
+  createIOServer(porta: number, opcoes?: ServerOptions) {
+    const servidor = super.createIOServer(porta, opcoes);
+    servidor.adapter(this.adaptador!);
+    return servidor;
+  }
+}
+```
+
+```ts
+// apps/bff/src/main.ts (trecho)
+const redisIo = new RedisIoAdapter(app);
+await redisIo.conectar();
+app.useWebSocketAdapter(redisIo);
+```
+
+Outras peças da escala:
+
+| Questão | O que fazer |
+|---|---|
+| Long-polling com várias instâncias | Sticky sessions no balanceador, ou `transports: ["websocket"]` no cliente |
+| Limite de conexões por instância | Medir; cada conexão ocupa memória e um descritor de arquivo. Escale por número de conexões, não só CPU |
+| Deploy derruba todas as conexões | Rolling deploy e reconexão com jitter (padrão do cliente) evitam a manada de reconexões |
+| Recovery com Redis | O adapter Redis clássico não preserva eventos para a connection state recovery; o adapter baseado em Redis Streams oferece esse suporte |
+
+<Callout type="warning" title="Não confie no cliente para entrar em rooms">
+Qualquer pessoa pode abrir o console e emitir `pedido:acompanhar` com o id de outro pedido. A verificação de que o usuário pode ver aquele pedido precisa acontecer no servidor, antes do `join`. O mesmo vale para a room `painel`: ela é atribuída pelo papel da sessão, nunca por um evento do cliente.
+</Callout>
+
+## Testando
+
+No front, mocke o módulo `src/servicos/socket.ts` com um objeto que registra handlers e permite disparar eventos no teste, e verifique que `setQueryData` atualizou o texto da tela. No BFF, o Nest permite subir a aplicação num teste e conectar um `socket.io-client` real numa porta aleatória, verificando o fluxo completo: conectar com cookie, acompanhar, receber o evento após chamar o webhook interno.
+
+## Na entrevista
+
+**Por que Socket.io e não WebSocket puro?** O Socket.io acrescenta reconexão automática, rooms, acks, namespaces, fallback para long-polling e adapters para várias instâncias. Com WebSocket puro eu teria de construir isso. O custo é um protocolo próprio nos dois lados. Para fluxo só do servidor para o cliente, considero SSE.
+
+**Como você garante que um cliente só receba eventos dos próprios pedidos?** Autentico no handshake (cookie de sessão), e a entrada na room do pedido passa por uma verificação de autorização no servidor. O cliente pede para acompanhar; o servidor decide se ele entra.
+
+**O que acontece com as rooms quando o cliente reconecta?** São perdidas, porque a conexão nova é outro socket. O cliente precisa reassinar no evento `connect`, e o servidor deve devolver o estado atual no ack para cobrir os eventos perdidos.
+
+**Como lidar com eventos fora de ordem?** Cada evento carrega uma versão monotônica do recurso. O cliente aplica só eventos com versão maior que a atual e descarta os outros.
+
+**Como escalar Socket.io para várias instâncias?** Com um adapter (Redis é o mais comum) que propaga emissões entre instâncias, sticky sessions se houver long-polling e monitoramento do número de conexões por instância.
+
+## Pratique
+
+1. Crie o pacote de contratos com `EventosServidorParaCliente` e `EventosClienteParaServidor` e use os genéricos no servidor e no cliente.
+2. Implemente o `PedidosGateway` com autenticação por cookie e autorização ao entrar na room, e teste tentando acompanhar o pedido de outro usuário.
+3. Escreva `useStatusDoPedido` e o componente `AcompanhamentoDoPedido`, e veja o status mudar ao chamar o webhook interno com `curl`.
+4. Desligue a rede no DevTools por 30 segundos, altere o status nesse intervalo e confirme que a tela mostra o status correto ao voltar.
+5. Envie dois eventos com versões 3 e 2, nessa ordem, e prove com um teste que a tela fica na versão 3.
+6. Suba duas instâncias do BFF com o adapter Redis e um balanceador local, e confirme que o evento chega independentemente da instância conectada.
+
+<Quiz question="O cliente perdeu a conexão por 20 segundos e reconectou. Por que ele pode não receber mais eventos do pedido?" options={["O servidor bane clientes que reconectam","As rooms pertencem ao socket antigo; o cliente precisa assinar de novo ao reconectar","O Socket.io não reconecta automaticamente","O cookie de sessão expira em toda reconexão"]} answer={1} explanation="A conexão nova é um socket novo, sem rooms. O hook reassina no evento connect e usa o ack para obter o estado atual." />
+
+<Quiz question="Onde deve acontecer a verificação de que o usuário pode acompanhar o pedido 42?" options={["No componente React, escondendo o botão","No cliente Socket.io, antes de emitir o evento","No servidor, antes de colocar o socket na room do pedido","No adapter Redis"]} answer={2} explanation="Qualquer um pode emitir eventos pelo console. Só o servidor pode decidir quem entra numa room." />
+
+<Quiz question="Com três instâncias do BFF, um evento emitido na instância A não chega a clientes conectados na B. O que resolve?" options={["Usar um adapter, como o Redis, que propaga as emissões entre instâncias","Aumentar o timeout de reconexão","Trocar rooms por namespaces","Emitir o evento três vezes"]} answer={0} explanation="Cada instância só conhece os próprios sockets. O adapter publica a emissão num canal compartilhado que todas as instâncias consomem." />
+
+## Base no CodeForge
+
+- [Arquitetura event-driven](/learn/system-design/event-driven) e [Pub/Sub](/learn/system-design/pub-sub): os conceitos por trás dos eventos.
+- [WebSockets](/learn/system-design/websockets) e [Server-Sent Events](/learn/system-design/server-sent-events): as alternativas de transporte.
+- [Atualizações em tempo real](/learn/system-design-interviews/atualizacoes-em-tempo-real): o padrão em entrevistas de system design.
+- [WebSockets: implemente comunicações em tempo real com Socket.io e MongoDB](/learn/carreira-nodejs/websockets-implemente-comunicacoes-tempo-real-socketio-mongodb): Socket.io do lado do servidor.
+- [React e Nest: implementando um Backend for Front-end](/learn/carreira-react/react-nest-backend-for-frontend): o BFF onde o gateway vive.
+
+## Referências
+
+- [Socket.IO: Rooms](https://socket.io/docs/v4/rooms/)
+- [Socket.IO: TypeScript](https://socket.io/docs/v4/typescript/)
+- [Socket.IO: Connection state recovery](https://socket.io/docs/v4/connection-state-recovery)
+- [Socket.IO: Redis adapter](https://socket.io/docs/v4/redis-adapter/)
+- [NestJS: Gateways](https://docs.nestjs.com/websockets/gateways) e [Adapters](https://docs.nestjs.com/websockets/adapter)
