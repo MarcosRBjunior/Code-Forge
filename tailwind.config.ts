@@ -39,6 +39,8 @@ const config = {
       maxWidth: { reader: v("reader-measure") },
       width: { sidebar: v("layout-sidebar-w"), aside: v("layout-aside-w"), toc: v("layout-toc-w") },
       height: { header: v("layout-header-h") },
+      // top-header: elementos sticky/fixed logo abaixo do cabeçalho (sidebar, sumário, painel de notas)
+      inset: { header: v("layout-header-h") },
       borderRadius: { xs: v("radius-xs"), sm: v("radius-sm"), md: v("radius-md"), lg: v("radius-lg"), xl: v("radius-xl") },
       boxShadow: { sm: v("shadow-sm"), md: v("shadow-md"), lg: v("shadow-lg") },
       transitionDuration: { fast: v("duration-fast"), base: v("duration-base"), slow: v("duration-slow") },
