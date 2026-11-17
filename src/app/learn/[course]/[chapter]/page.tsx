@@ -49,7 +49,9 @@ export default async function ChapterPage({ params }: { params: Params }) {
 
   return (
     <div className="cf-chapter-grid xl:grid xl:grid-cols-[1fr_var(--cf-layout-toc-w)]">
-      <main className="min-w-0 px-4 pb-24 pt-8 lg:px-10">
+      <main className="min-w-0 px-3 pb-16 pt-6 lg:px-8 lg:pt-8">
+        {/* Card sólido (igual aos da home) para o fundo animado não atrapalhar a leitura */}
+        <div className="cf-reading-card mx-auto max-w-[1100px] px-4 pb-10 pt-8 lg:px-10">
         <div className="mx-auto cf-measure">
           <p className="text-sm text-fg-subtle">
             <Link href={`/learn/${course}`} className="hover:text-accent-text">
@@ -140,6 +142,7 @@ export default async function ChapterPage({ params }: { params: Params }) {
           prev={ch.prev ? `/learn/${course}/${ch.prev.slug}` : undefined}
           next={ch.next ? `/learn/${course}/${ch.next.slug}` : undefined}
         />
+        </div>
       </main>
 
       {ch.available && (

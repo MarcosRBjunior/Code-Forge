@@ -24,7 +24,8 @@ export default async function CoursePage({ params }: { params: Promise<{ course:
   if (!course) notFound();
 
   return (
-    <main className="mx-auto max-w-3xl px-4 py-10 lg:px-8">
+    <main className="mx-auto max-w-3xl px-3 py-6 lg:px-6">
+      <div className="cf-reading-card px-4 py-8 lg:px-8">
       <p className="text-xs font-medium uppercase tracking-wide text-fg-subtle">{course.level}</p>
       <h1 className="mt-1 text-3xl font-semibold tracking-tight">{course.title}</h1>
       <p className="mt-2 text-fg-muted">{course.description}</p>
@@ -66,6 +67,7 @@ export default async function CoursePage({ params }: { params: Promise<{ course:
           </li>
         ))}
       </ol>
+      </div>
     </main>
   );
 }
