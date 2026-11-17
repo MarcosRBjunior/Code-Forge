@@ -25,11 +25,11 @@ export default async function AnimationPage({ params }: { params: Promise<{ slug
       <h1 className="mt-2 text-3xl font-semibold tracking-tight">{a.title}</h1>
       <p className="mt-1 text-fg-muted">{a.description}</p>
       {a.chapter && (
-        <Link href={`/learn/${a.chapter}`} className="mt-3 inline-block text-sm text-accent-text underline">
-          Ler o capítulo relacionado →
+        <Link href={`/learn/${a.chapter}`} className="mt-3 inline-flex min-h-10 items-center gap-1 text-sm text-accent-text underline">
+          Ler o capítulo relacionado <span aria-hidden className="cf-nudge">→</span>
         </Link>
       )}
-      <AnimationPlayer slug={a.slug} />
+      <AnimationPlayer slug={a.slug} globalKeys />
     </main>
   );
 }

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { previewLabels, RATING_LABELS, schedule, type Rating } from "@/lib/srs";
 import type { ReviewCounts, ReviewItem } from "@/server/study/reviews";
+import { useBounceOnChange, useDelayedFlag } from "@/lib/motion";
 
 const RATINGS: Rating[] = [1, 2, 3, 4];
 const RATING_STYLE: Record<Rating, string> = {
@@ -26,6 +27,10 @@ export function ReviewSession() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
   const [reviewed, setReviewed] = useState<Record<Rating, number>>({ 1: 0, 2: 0, 3: 0, 4: 0 });
+  // Doherty: skeleton só se o carregamento demorar (evita piscar em respostas rápidas)
+  const showSkeleton = useDelayedFlag(!queue && !error);
+  // Exagero: o contador de restantes dá um "pulo" a cada cartão respondido
+  const remainingRef = useBounceOnChange<HTMLSpanElement>(queue?.length);
 
   useEffect(() => {
     fetch("/api/reviews")
@@ -102,14 +107,31 @@ export function ReviewSession() {
   }, [revealed, current, answer]);
 
   if (error) return <p className="mt-8 text-danger">Não foi possível carregar a revisão. Recarregue a página.</p>;
-  if (!queue || !counts) return <p className="mt-8 text-fg-muted">Carregando…</p>;
+  if (!queue || !counts) {
+    if (!showSkeleton) return <div className="mt-8 min-h-72" aria-busy="true" />;
+    return (
+      <div className="mt-8 cf-fade-in" aria-busy="true" aria-label="Carregando revisão">
+        <div className="mb-3 flex justify-between">
+          <span className="cf-skeleton h-4 w-24" />
+          <span className="cf-skeleton h-4 w-16" />
+        </div>
+        <div className="space-y-3 rounded-lg border border-line bg-surface-1 p-6">
+          <div className="cf-skeleton h-3 w-32" />
+          <div className="cf-skeleton h-6 w-2/3" />
+          <div className="cf-skeleton h-4 w-full" />
+        </div>
+        <div className="cf-skeleton mt-4 h-12 w-full" />
+      </div>
+    );
+  }
 
   const total = Object.values(reviewed).reduce((a, b) => a + b, 0);
 
   if (!current) {
     return (
-      <section className="mt-8 rounded-lg border border-line bg-surface-1 p-6">
-        <h2 className="text-xl font-semibold">{total > 0 ? "Revisão de hoje concluída" : "Nada para revisar agora"}</h2>
+      <section className="cf-rise-in mt-8 rounded-lg border border-line bg-surface-1 p-6">
+        {/* Exagero: concluir a sessão ganha um "jelly" de comemoração */}
+        <h2 className={`inline-block text-xl font-semibold ${total > 0 ? "cf-jelly text-success" : ""}`}>{total > 0 ? "Revisão de hoje concluída" : "Nada para revisar agora"}</h2>
         {total > 0 && (
           <p className="mt-2 text-fg-muted">
             {total} {total === 1 ? "cartão revisado" : "cartões revisados"}: {reviewed[1]} errei, {reviewed[2]} difícil, {reviewed[3]} bom, {reviewed[4]} fácil.
@@ -137,13 +159,17 @@ export function ReviewSession() {
     <section className="mt-8">
       <div className="mb-3 flex items-center justify-between text-sm text-fg-muted">
         <span>
-          {queue.length} {queue.length === 1 ? "restante" : "restantes"}
+          <span ref={remainingRef} className="inline-block font-medium tabular-nums text-fg">
+            {queue.length}
+          </span>{" "}
+          {queue.length === 1 ? "restante" : "restantes"}
           {current.isNew && <span className="ml-2 rounded bg-surface-3 px-1.5 py-0.5 text-xs">novo</span>}
         </span>
         <span>{current.kind === "problem" ? "Problema" : "Destaque"}</span>
       </div>
 
-      <article className="rounded-lg border border-line bg-surface-1 p-6">
+      {/* Pose to pose: cada cartão novo entra em cena (key = id), sem herdar o estado do anterior */}
+      <article key={`${current.id}-${total}`} className="cf-rise-in rounded-lg border border-line bg-surface-1 p-6">
         <p className="text-xs uppercase tracking-wide text-fg-subtle">{current.chapter.moduleTitle}</p>
         <h2 className="mt-1 text-xl font-semibold">{current.chapter.title}</h2>
 
@@ -160,7 +186,7 @@ export function ReviewSession() {
             <p className="mt-4 text-fg-muted">Você destacou um trecho deste capítulo. Consegue lembrar o que ele dizia?</p>
             {quoteCue && <blockquote className="mt-3 border-l-4 border-line pl-3 italic">{quoteCue}</blockquote>}
             {revealed && (
-              <>
+              <div className="cf-rise-in">
                 <blockquote className="mt-4 rounded-md border-l-4 border-line p-3" style={{ background: `var(--cf-hl-${current.color})` }}>
                   {current.quote}
                 </blockquote>
@@ -173,36 +199,44 @@ export function ReviewSession() {
                 <Link href={`/learn/${current.chapter.course}/${current.chapter.slug}`} target="_blank" className="mt-3 inline-block text-sm text-accent underline">
                   Abrir o capítulo
                 </Link>
-              </>
+              </div>
             )}
           </>
         )}
       </article>
 
       {!revealed ? (
-        <button type="button" onClick={() => setRevealed(true)} className="mt-4 w-full rounded-md bg-accent px-4 py-3 font-medium text-fg-on-accent">
+        <button
+          type="button"
+          onClick={() => setRevealed(true)}
+          aria-keyshortcuts="Space Enter"
+          className="mt-4 min-h-12 w-full rounded-md bg-accent px-4 py-3 font-medium text-fg-on-accent hover:bg-accent-hover"
+        >
           {current.kind === "problem" ? "Já tentei" : "Mostrar o trecho"} <span className="opacity-70">(espaço)</span>
         </button>
       ) : (
-        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        // Follow through: as notas chegam em cascata depois da revelação
+        <div className="cf-stagger mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
           {RATINGS.map((r) => (
             <button
               key={r}
               type="button"
               disabled={busy}
               onClick={() => void answer(r)}
-              className={`rounded-md border bg-surface-1 px-3 py-3 text-center transition hover:bg-surface-2 disabled:opacity-50 ${RATING_STYLE[r]}`}
+              aria-keyshortcuts={String(r)}
+              // Squash exagerado: a nota "afunda" mais que um botão comum ao ser escolhida
+              className={`min-h-16 rounded-md border bg-surface-1 px-3 py-3 text-center hover:bg-surface-2 active:[transform:scale(0.9)] disabled:opacity-50 ${RATING_STYLE[r]} ${busy ? "cf-busy" : ""}`}
             >
               <span className="block font-medium">{RATING_LABELS[r]}</span>
               <span className="block text-xs text-fg-muted">
-                {previews?.[r]} · tecla {r}
+                {previews?.[r]} · <kbd className="rounded border border-line px-1 font-mono text-[10px]">{r}</kbd>
               </span>
             </button>
           ))}
         </div>
       )}
 
-      <button type="button" onClick={() => void suspend()} disabled={busy} className="mt-4 text-sm text-fg-subtle underline hover:text-fg">
+      <button type="button" onClick={() => void suspend()} disabled={busy} className="mt-4 min-h-10 text-sm text-fg-subtle underline hover:text-fg">
         Parar de revisar este cartão
       </button>
     </section>

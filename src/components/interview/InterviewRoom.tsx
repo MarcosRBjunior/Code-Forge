@@ -16,6 +16,7 @@ import {
   type Difficulty,
   type RubricKey,
 } from "@/lib/interview";
+import { useBounceOnChange } from "@/lib/motion";
 
 interface PoolItem {
   course: string;
@@ -49,7 +50,10 @@ function Room({ pool }: { pool: PoolItem[] }) {
     () => Object.fromEntries(RUBRIC.map((r) => [r.key, 3])) as Record<RubricKey, number>,
   );
   const [notes, setNotes] = useState("");
+  const [saving, setSaving] = useState(false);
   const id = useRef(crypto.randomUUID());
+  // Exagero: a nota final dá um "pulo" a cada ajuste na rubrica
+  const scoreRef = useBounceOnChange<HTMLSpanElement>(totalScore(scores));
 
   // Sorteia os problemas uma vez
   useEffect(() => {
@@ -97,7 +101,8 @@ function Room({ pool }: { pool: PoolItem[] }) {
       </main>
     );
   }
-  if (!problems) return <main className="px-4 py-16 text-center text-fg-muted">Sorteando problemas…</main>;
+  // Doherty: feedback imediato enquanto os enunciados chegam
+  if (!problems) return <main className="cf-busy px-4 py-16 text-center text-fg-muted" aria-busy="true">Sorteando problemas…</main>;
 
   const budget = problems.reduce((s, p) => s + MINUTES[p.difficulty] * 60, 0);
   const remaining = budget - elapsed;
@@ -107,7 +112,20 @@ function Room({ pool }: { pool: PoolItem[] }) {
   const bar = LEVELS[config.level].bar;
 
   async function save() {
-    await fetch("/api/interviews", {
+    if (saving) return;
+    setSaving(true);
+    try {
+      await saveRequest();
+      setPhase("saved");
+    } catch {
+      /* falha de rede: mantém o formulário para tentar de novo */
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveRequest() {
+    const res = await fetch("/api/interviews", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -120,12 +138,12 @@ function Room({ pool }: { pool: PoolItem[] }) {
         durationS: elapsed,
       }),
     });
-    setPhase("saved");
+    if (!res.ok) throw new Error();
   }
 
   if (phase !== "running") {
     return (
-      <main className="mx-auto max-w-3xl px-4 py-10">
+      <main className="cf-rise-in mx-auto max-w-3xl px-4 py-10">
         <h1 className="text-2xl font-semibold">Avaliação</h1>
         <p className="mt-1 text-sm text-fg-muted">
           Tempo usado: {fmt(elapsed)} de {fmt(budget)} · {solved.size}/{problems.length} problema(s) com todos os testes passando.
@@ -155,7 +173,7 @@ function Room({ pool }: { pool: PoolItem[] }) {
                       aria-pressed={scores[r.key] === v}
                       title={SCORE_LABELS[v]}
                       onClick={() => setScores((s) => ({ ...s, [r.key]: v }))}
-                      className="size-8 rounded-md border border-line text-sm aria-pressed:border-accent aria-pressed:bg-accent aria-pressed:text-fg-on-accent"
+                      className="size-10 rounded-md border border-line text-sm hover:bg-surface-2 aria-pressed:border-accent aria-pressed:bg-accent aria-pressed:text-fg-on-accent"
                     >
                       {v}
                     </button>
@@ -174,16 +192,24 @@ function Room({ pool }: { pool: PoolItem[] }) {
         <div className="mt-6 flex flex-wrap items-center gap-4 rounded-xl border border-line bg-surface-2 p-5">
           <div>
             <p className="text-xs uppercase tracking-wide text-fg-subtle">Nota</p>
-            <p className={`text-4xl font-semibold tabular-nums ${total >= bar ? "text-success" : "text-danger"}`}>{total}<span className="text-lg text-fg-subtle">/100</span></p>
+            <p className={`text-4xl font-semibold tabular-nums ${total >= bar ? "text-success" : "text-danger"}`}><span ref={scoreRef} className="inline-block">{total}</span><span className="text-lg text-fg-subtle">/100</span></p>
           </div>
           <p className="flex-1 text-sm text-fg-muted">
             {total >= bar ? "Acima" : "Abaixo"} da linha de aprovação para {LEVELS[config.level].label} ({bar}/100).
           </p>
           {phase === "saved" ? (
-            <Link href="/interview" className="rounded-md border border-line px-4 py-2 text-sm hover:bg-surface-1">Salvo ✓ · Nova entrevista</Link>
+            <Link href="/interview" className="cf-press cf-jelly inline-flex min-h-10 items-center gap-1 rounded-md border border-line px-4 py-2 text-sm hover:bg-surface-1">
+              Salvo ✓ · Nova entrevista <span aria-hidden className="cf-nudge">→</span>
+            </Link>
           ) : (
-            <button type="button" onClick={save} className="rounded-md bg-accent px-4 py-2 font-medium text-fg-on-accent hover:bg-accent-hover">
-              Salvar no histórico
+            <button
+              type="button"
+              onClick={save}
+              disabled={saving}
+              aria-busy={saving}
+              className={`min-h-10 rounded-md bg-accent px-4 py-2 font-medium text-fg-on-accent hover:bg-accent-hover disabled:opacity-70 ${saving ? "cf-busy" : ""}`}
+            >
+              {saving ? "Salvando…" : "Salvar no histórico"}
             </button>
           )}
         </div>
@@ -201,19 +227,22 @@ function Room({ pool }: { pool: PoolItem[] }) {
         <nav className="ml-auto flex gap-1" aria-label="Problemas da entrevista">
           {problems.map((p, i) => (
             <button key={key(p)} type="button" aria-current={i === index ? "step" : undefined} onClick={() => setIndex(i)}
-              className="rounded-md border border-line px-3 py-1 text-sm aria-[current=step]:border-accent aria-[current=step]:bg-accent-soft">
-              {solved.has(key(p)) ? "✓ " : ""}{i + 1}. {DIFF_LABEL[p.difficulty]}
+              className="min-h-9 rounded-md border border-line px-3 py-1 text-sm hover:bg-surface-2 aria-[current=step]:border-accent aria-[current=step]:bg-accent-soft">
+              {/* Exagero: o ✓ entra com "pulo" no momento em que o problema é resolvido */}
+              {solved.has(key(p)) && <span className="cf-bounce mr-1 inline-block text-success">✓</span>}
+              {i + 1}. {DIFF_LABEL[p.difficulty]}
             </button>
           ))}
         </nav>
         <button type="button" onClick={() => { if (confirm("Encerrar a entrevista e ir para a avaliação?")) setPhase("review"); }}
-          className="rounded-md bg-danger px-3 py-1.5 text-sm font-medium text-fg-on-accent">
+          className="min-h-9 rounded-md bg-danger px-3 py-1.5 text-sm font-medium text-fg-on-accent">
           Encerrar
         </button>
       </div>
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
-        <section aria-label="Enunciado" className="rounded-xl border border-line bg-surface-1 p-5">
+        {/* Staging: trocar de problema faz o enunciado e o editor entrarem de novo em cena */}
+        <section key={key(current)} aria-label="Enunciado" className="cf-fade-in rounded-xl border border-line bg-surface-1 p-5">
           <h1 className="text-xl font-semibold">{current.title}</h1>
           <p className="mt-1 text-xs text-fg-subtle">{DIFF_LABEL[current.difficulty]} · {MINUTES[current.difficulty]} min sugeridos</p>
           {/* HTML gerado no servidor a partir do Markdown do próprio repositório */}
@@ -223,7 +252,7 @@ function Room({ pool }: { pool: PoolItem[] }) {
           />
           {config.style !== "coaching" && <p className="mt-4 text-xs text-fg-subtle">Dicas ocultas neste modo de entrevistador.</p>}
         </section>
-        <div key={key(current)}>
+        <div key={key(current)} className="cf-fade-in">
           <ProblemWorkspace chapterKey={key(current)} problem={current.problem} allowRun={!config.noRun} />
         </div>
       </div>

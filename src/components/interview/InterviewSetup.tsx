@@ -14,6 +14,7 @@ import {
   type InterviewLevel,
   type InterviewStyle,
 } from "@/lib/interview";
+import { useBounceOnChange, useDelayedFlag } from "@/lib/motion";
 
 interface PastInterview {
   id: string;
@@ -37,6 +38,16 @@ function Step({ n, title, children }: { n: string; title: string; children: Reac
   );
 }
 
+/** Número que dá um "pulo" ao mudar (exagero no feedback do contador). */
+function Bump({ value, className = "" }: { value: React.ReactNode; className?: string }) {
+  const ref = useBounceOnChange<HTMLSpanElement>(value);
+  return (
+    <span ref={ref} className={`inline-block tabular-nums ${className}`}>
+      {value}
+    </span>
+  );
+}
+
 export function InterviewSetup({ counts }: { counts: Record<Difficulty, number> }) {
   const router = useRouter();
   const [style, setStyle] = useState<InterviewStyle>("standard");
@@ -56,9 +67,17 @@ export function InterviewSetup({ counts }: { counts: Record<Difficulty, number> 
   const total = mix.easy + mix.medium + mix.hard;
   const tooLong = minutes > MAX_MINUTES;
   const notEnough = (Object.keys(mix) as Difficulty[]).some((d) => mix[d] > counts[d]);
+  const showHistorySkeleton = useDelayedFlag(history === null);
 
+  // Solid drawing + estado selecionado inequívoco (borda, fundo, anel e marca de seleção)
   const choice = (active: boolean) =>
-    `rounded-lg border p-3 text-left transition-colors duration-fast ${active ? "border-accent bg-accent-soft" : "border-line hover:bg-surface-2"}`;
+    `cf-lift relative rounded-lg border p-3 pr-8 text-left ${active ? "border-accent bg-accent-soft ring-1 ring-accent" : "border-line hover:bg-surface-2"}`;
+  const check = (active: boolean) =>
+    active ? (
+      <span aria-hidden className="cf-pop absolute right-2.5 top-2.5 grid size-5 place-items-center rounded-full bg-accent text-[11px] text-fg-on-accent">
+        ✓
+      </span>
+    ) : null;
 
   return (
     <div className="mt-8 grid gap-4 lg:grid-cols-[1fr_300px]">
@@ -67,6 +86,7 @@ export function InterviewSetup({ counts }: { counts: Record<Difficulty, number> 
           <div className="grid gap-2 sm:grid-cols-3">
             {(Object.keys(STYLES) as InterviewStyle[]).map((s) => (
               <button key={s} type="button" aria-pressed={style === s} className={choice(style === s)} onClick={() => setStyle(s)}>
+                {check(style === s)}
                 <p className="font-medium">{STYLES[s].label}</p>
                 <p className="text-xs text-fg-muted">{STYLES[s].hint}</p>
               </button>
@@ -78,12 +98,13 @@ export function InterviewSetup({ counts }: { counts: Record<Difficulty, number> 
           <div className="grid gap-2 sm:grid-cols-3">
             {(Object.keys(LEVELS) as InterviewLevel[]).map((l) => (
               <button key={l} type="button" aria-pressed={level === l} className={choice(level === l)} onClick={() => setLevel(l)}>
+                {check(level === l)}
                 <p className="font-medium">{LEVELS[l].label}</p>
                 <p className="text-xs text-fg-muted">Aprovação a partir de {LEVELS[l].bar}/100</p>
               </button>
             ))}
           </div>
-          <label className="mt-4 flex items-start gap-3 rounded-lg border border-line p-3">
+          <label className={`mt-4 flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors duration-fast ${noRun ? "border-accent bg-accent-soft" : "border-line hover:bg-surface-2"}`}>
             <input type="checkbox" checked={noRun} onChange={(e) => setNoRun(e.target.checked)} className="mt-1" />
             <span>
               <span className="font-medium">Modo sem executar</span>
@@ -108,17 +129,17 @@ export function InterviewSetup({ counts }: { counts: Record<Difficulty, number> 
                 <div className="flex items-center gap-2">
                   <button type="button" aria-label={`Menos ${DIFF_LABEL[d]}`} disabled={mix[d] === 0}
                     onClick={() => setMix((m) => ({ ...m, [d]: m[d] - 1 }))}
-                    className="size-8 rounded-md border border-line text-lg hover:bg-surface-2 disabled:opacity-40">−</button>
-                  <span className="w-5 text-center tabular-nums">{mix[d]}</span>
+                    className="size-10 rounded-md border border-line text-lg hover:bg-surface-2 disabled:opacity-40">−</button>
+                  <Bump value={mix[d]} className="w-5 text-center font-medium" />
                   <button type="button" aria-label={`Mais ${DIFF_LABEL[d]}`} disabled={mix[d] === 3 || mix[d] >= counts[d]}
                     onClick={() => setMix((m) => ({ ...m, [d]: m[d] + 1 }))}
-                    className="size-8 rounded-md border border-line text-lg hover:bg-surface-2 disabled:opacity-40">+</button>
+                    className="size-10 rounded-md border border-line text-lg hover:bg-surface-2 disabled:opacity-40">+</button>
                 </div>
               </div>
             ))}
             <button
               type="button"
-              className="text-sm text-accent-text underline"
+              className="min-h-10 text-sm text-accent-text underline"
               onClick={() => {
                 const opts: Array<Record<Difficulty, number>> = [
                   { easy: 1, medium: 1, hard: 0 },
@@ -138,7 +159,7 @@ export function InterviewSetup({ counts }: { counts: Record<Difficulty, number> 
       <aside className="h-fit rounded-xl border border-line bg-surface-1 p-5 lg:sticky lg:top-[calc(var(--cf-layout-header-h)+1rem)]">
         <h2 className="font-semibold">Resumo</h2>
         <dl className="mt-3 space-y-2 text-sm">
-          <div className="flex justify-between"><dt className="text-fg-muted">Duração</dt><dd className={tooLong ? "text-danger" : ""}>{minutes} min / {MAX_MINUTES} máx.</dd></div>
+          <div className="flex justify-between"><dt className="text-fg-muted">Duração</dt><dd className={tooLong ? "text-danger" : ""}><Bump value={minutes} /> min / {MAX_MINUTES} máx.</dd></div>
           <div className="flex justify-between"><dt className="text-fg-muted">Problemas</dt><dd>{(Object.keys(mix) as Difficulty[]).filter((d) => mix[d]).map((d) => `${mix[d]} ${DIFF_LABEL[d]}`).join(", ") || "—"}</dd></div>
           <div className="flex justify-between"><dt className="text-fg-muted">Entrevistador</dt><dd>{STYLES[style].label}</dd></div>
           <div className="flex justify-between"><dt className="text-fg-muted">Nível</dt><dd>{LEVELS[level].label}</dd></div>
@@ -148,21 +169,28 @@ export function InterviewSetup({ counts }: { counts: Record<Difficulty, number> 
           type="button"
           disabled={total === 0 || tooLong || notEnough}
           onClick={() => router.push(`/interview/session?c=${encodeConfig({ style, level, noRun, mix })}`)}
-          className="mt-5 w-full rounded-md bg-accent px-4 py-2 font-medium text-fg-on-accent hover:bg-accent-hover disabled:opacity-45"
+          className="mt-5 min-h-11 w-full rounded-md bg-accent px-4 py-2.5 font-medium text-fg-on-accent shadow-sm hover:bg-accent-hover disabled:opacity-45"
         >
-          Começar entrevista
+          Começar entrevista <span aria-hidden className="cf-nudge">→</span>
         </button>
-        {tooLong && <p className="mt-2 text-xs text-danger">Reduza para no máximo {MAX_MINUTES} minutos.</p>}
+        {total === 0 && <p className="cf-fade-in mt-2 text-xs text-fg-muted">Escolha ao menos um problema.</p>}
+        {tooLong && <p className="cf-fade-in mt-2 text-xs text-danger">Reduza para no máximo {MAX_MINUTES} minutos.</p>}
+        {notEnough && <p className="cf-fade-in mt-2 text-xs text-danger">Não há problemas suficientes nessa dificuldade.</p>}
       </aside>
 
       <section className="lg:col-span-2">
         <h2 className="mt-4 font-semibold">Entrevistas anteriores</h2>
         {history === null ? (
-          <p className="mt-2 text-sm text-fg-muted">Carregando…</p>
+          showHistorySkeleton ? (
+            <div className="mt-3 space-y-2" aria-busy="true" aria-label="Carregando entrevistas anteriores">
+              <div className="cf-skeleton h-11 w-full" />
+              <div className="cf-skeleton h-11 w-full" />
+            </div>
+          ) : null
         ) : history.length === 0 ? (
-          <p className="mt-2 text-sm text-fg-muted">Nenhuma ainda.</p>
+          <p className="cf-fade-in mt-2 text-sm text-fg-muted">Nenhuma ainda.</p>
         ) : (
-          <ul className="mt-3 divide-y divide-line rounded-lg border border-line bg-surface-1">
+          <ul className="cf-stagger mt-3 divide-y divide-line rounded-lg border border-line bg-surface-1">
             {history.map((h) => {
               const bar = LEVELS[h.config.level]?.bar ?? 70;
               return (

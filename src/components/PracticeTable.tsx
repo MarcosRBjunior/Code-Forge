@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { PracticeList } from "@/lib/practice-lists";
 import { Fragment, useEffect, useMemo, useState } from "react";
+import { replayAnimation } from "@/lib/motion";
 
 export interface PracticeProblem {
   key: string;
@@ -31,7 +32,12 @@ const PILL = {
   hard: "border-danger/20 bg-danger-soft text-danger",
 } as const;
 
-const input = "rounded-md border border-line-input bg-surface-1 px-2.5 py-1.5 text-sm";
+const input = "min-h-10 rounded-md border border-line-input bg-surface-1 px-2.5 py-1.5 text-sm";
+
+/** Postel: busca tolerante a maiúsculas, acentos e espaços extras ("arvore  binaria" acha "Árvore Binária"). */
+function fold(text: string) {
+  return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+}
 
 export function PracticeTable({ problems: allProblems, lists }: { problems: PracticeProblem[]; lists: PracticeList[] }) {
   const router = useRouter();
@@ -52,6 +58,12 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
   const [status, setStatus] = useState<Status>("all");
   const [showPlanned, setShowPlanned] = useState(false);
   const [grouped, setGrouped] = useState(true);
+  // Follow through só na primeira renderização: depois, filtrar não deve fazer a tabela "dançar"
+  const [entering, setEntering] = useState(true);
+  useEffect(() => {
+    const t = setTimeout(() => setEntering(false), 700);
+    return () => clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     fetch("/api/state")
@@ -68,11 +80,11 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
   const available = problems.filter((p) => p.available);
 
   const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase();
+    const needle = fold(q);
     return problems.filter(
       (p) =>
         (showPlanned || p.available) &&
-        (!needle || p.title.toLowerCase().includes(needle)) &&
+        (!needle || fold(p.title).includes(needle) || fold(p.pattern).includes(needle)) &&
         (!pattern || p.pattern === pattern) &&
         (!difficulty || p.difficulty === difficulty) &&
         (status === "all" ||
@@ -81,6 +93,42 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
           (status === "starred" && starred.has(p.key))),
     );
   }, [problems, q, pattern, difficulty, status, solved, starred, showPlanned]);
+
+  const hasFilters = q.trim() !== "" || pattern !== "" || difficulty !== "" || status !== "all" || showPlanned;
+  function clearFilters() {
+    setQ("");
+    setPattern("");
+    setDifficulty("");
+    setStatus("all");
+    setShowPlanned(false);
+  }
+
+  /** Doherty: favoritar é otimista; se o servidor recusar, desfaz. */
+  function toggleStar(key: string, el: HTMLElement) {
+    const next = !starred.has(key);
+    const apply = (on: boolean) =>
+      setStarred((s) => {
+        const copy = new Set(s);
+        if (on) copy.add(key);
+        else copy.delete(key);
+        return copy;
+      });
+    apply(next);
+    // Exagero: a estrela dá um "pulo" ao mudar de estado
+    replayAnimation(el, "cf-bounce");
+    fetch("/api/stars", {
+      method: next ? "PUT" : "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key }),
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error();
+      })
+      .catch(() => {
+        apply(!next);
+        replayAnimation(el, "cf-wiggle");
+      });
+  }
 
   function pickRandom() {
     const pool = filtered.filter((p) => p.available && !solved.has(p.key));
@@ -104,7 +152,7 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
               role="radio"
               aria-checked={selected}
               onClick={() => chooseList(l.id)}
-              className={`rounded-lg border p-3 text-left transition hover:bg-surface-2 ${selected ? "border-accent bg-accent-soft" : "border-line bg-surface-1"}`}
+              className={`cf-lift rounded-lg border p-3 text-left hover:bg-surface-2 ${selected ? "border-accent bg-accent-soft ring-1 ring-accent" : "border-line bg-surface-1"}`}
             >
               <span className="flex items-baseline justify-between gap-2">
                 <span className="font-medium">{l.title}</span>
@@ -133,7 +181,7 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
                 </span>
               </div>
               <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-surface-3">
-                <div className={`h-full rounded-full ${DIFF[d].bar}`} style={{ width: total ? `${(done / total) * 100}%` : 0 }} />
+                <div className={`cf-progress-fill h-full rounded-full ${DIFF[d].bar}`} style={{ width: total ? `${(done / total) * 100}%` : 0 }} />
               </div>
             </div>
           );
@@ -168,22 +216,27 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
           <option value="solved">Resolvidos</option>
           <option value="starred">Favoritos</option>
         </select>
-        <label className="flex items-center gap-1.5 text-sm text-fg-muted">
+        <label className="flex min-h-10 cursor-pointer items-center gap-1.5 text-sm text-fg-muted">
           <input type="checkbox" checked={showPlanned} onChange={(e) => setShowPlanned(e.target.checked)} />
           Mostrar “em breve”
         </label>
+        {hasFilters && (
+          <button type="button" onClick={clearFilters} className="cf-fade-in min-h-10 rounded-md px-2.5 py-1.5 text-sm text-fg-muted underline hover:text-fg">
+            Limpar filtros
+          </button>
+        )}
         <button
           type="button"
           aria-pressed={!grouped}
           onClick={() => setGrouped((g) => !g)}
-          className="ml-auto rounded-md border border-line px-3 py-1.5 text-sm hover:bg-surface-2"
+          className="ml-auto min-h-10 rounded-md border border-line px-3 py-1.5 text-sm hover:bg-surface-2"
         >
           {grouped ? "Ocultar grupos" : "Mostrar grupos"}
         </button>
         <button
           type="button"
           onClick={pickRandom}
-          className="rounded-md bg-accent px-3.5 py-1.5 text-sm font-medium text-fg-on-accent hover:bg-accent-hover"
+          className="min-h-10 rounded-md bg-accent px-3.5 py-1.5 text-sm font-medium text-fg-on-accent hover:bg-accent-hover"
         >
           🎲 Problema aleatório
         </button>
@@ -195,13 +248,13 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
           <thead className="bg-surface-2 text-left text-xs uppercase tracking-wide text-fg-muted">
             <tr>
               <th scope="col" className="w-10 px-3 py-2 text-right">#</th>
-              <th scope="col" className="w-14 px-3 py-2">Status</th>
+              <th scope="col" className="w-20 px-3 py-2 text-center">Status</th>
               <th scope="col" className="px-3 py-2">Problema</th>
               <th scope="col" className="hidden px-3 py-2 sm:table-cell">Padrão</th>
               <th scope="col" className="px-3 py-2">Dificuldade</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-line">
+          <tbody className={`divide-y divide-line ${entering ? "cf-stagger" : ""}`}>
             {filtered.map((p, i) => (
               <Fragment key={p.key}>
               {grouped && (i === 0 || filtered[i - 1].pattern !== p.pattern) && (
@@ -217,14 +270,26 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
               )}
               <tr className={p.available ? "hover:bg-surface-2" : "opacity-60"}>
                 <td className="px-3 py-2.5 text-right tabular-nums text-fg-subtle">{i + 1}</td>
-                <td className="px-3 py-2.5 text-center">
-                  {solved.has(p.key) ? (
-                    <span className="text-success" title="Resolvido">✓</span>
-                  ) : starred.has(p.key) ? (
-                    <span className="text-warning" title="Favorito">★</span>
-                  ) : (
-                    <span className="text-fg-subtle" aria-hidden>·</span>
-                  )}
+                <td className="px-3 py-2.5">
+                  <span className="flex items-center justify-center gap-1.5">
+                    {solved.has(p.key) ? (
+                      <span className="w-3 text-success" title="Resolvido">✓</span>
+                    ) : (
+                      <span className="w-3 text-center text-fg-subtle" aria-hidden>·</span>
+                    )}
+                    <button
+                      type="button"
+                      aria-pressed={starred.has(p.key)}
+                      aria-label={starred.has(p.key) ? `Remover ${p.title} dos favoritos` : `Favoritar ${p.title}`}
+                      title={starred.has(p.key) ? "Favorito" : "Favoritar"}
+                      onClick={(e) => toggleStar(p.key, e.currentTarget)}
+                      className={`cf-hit inline-grid size-6 place-items-center rounded-md leading-none ${
+                        starred.has(p.key) ? "text-warning" : "text-fg-subtle opacity-60 hover:text-warning hover:opacity-100"
+                      }`}
+                    >
+                      {starred.has(p.key) ? "★" : "☆"}
+                    </button>
+                  </span>
                 </td>
                 <td className="px-3 py-2.5">
                   <Link href={`/learn/${p.course}/${p.slug}`} className="font-medium hover:text-accent-text">
@@ -239,7 +304,16 @@ export function PracticeTable({ problems: allProblems, lists }: { problems: Prac
             ))}
           </tbody>
         </table>
-        {filtered.length === 0 && <p className="px-3 py-6 text-center text-fg-muted">Nenhum problema com esses filtros.</p>}
+        {filtered.length === 0 && (
+          <p className="cf-fade-in px-3 py-6 text-center text-fg-muted">
+            Nenhum problema com esses filtros.{" "}
+            {hasFilters && (
+              <button type="button" onClick={clearFilters} className="text-accent-text underline">
+                Limpar filtros
+              </button>
+            )}
+          </p>
+        )}
       </div>
       <p className="mt-2 text-xs text-fg-subtle">
         {filtered.length} problema(s) · {available.length} disponíveis de {problems.length} planejados

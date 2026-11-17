@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getAnimation, type CellRole, type Frame } from "@/lib/animations";
 
 const ROLE_STYLE: Record<CellRole, string> = {
@@ -131,8 +131,13 @@ function Ring({ frame }: { frame: Frame }) {
   );
 }
 
-export function AnimationPlayer({ slug }: { slug: string }) {
+/**
+ * `globalKeys`: na página própria da animação os atalhos valem na página inteira; embutida num capítulo,
+ * só com a animação em foco (clique nela), para não roubar o espaço/setas da leitura.
+ */
+export function AnimationPlayer({ slug, globalKeys = false }: { slug: string; globalKeys?: boolean }) {
   const def = getAnimation(slug)!;
+  const rootRef = useRef<HTMLDivElement>(null);
   const [raw, setRaw] = useState<Record<string, string>>(() => Object.fromEntries(def.inputs.map((i) => [i.key, i.default])));
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState(0);
@@ -165,23 +170,38 @@ export function AnimationPlayer({ slug }: { slug: string }) {
   }, [playing, step, current.length, speed]);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).closest("input, select, textarea")) return;
+    const target: HTMLElement | Window | null = globalKeys ? window : rootRef.current;
+    if (!target) return;
+    const onKey = (ev: Event) => {
+      const e = ev as KeyboardEvent;
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+      const el = e.target as HTMLElement;
+      if (el.closest?.("input, select, textarea, [contenteditable]")) return;
       if (e.key === "ArrowRight") setStep((s) => Math.min(s + 1, current.length - 1));
-      if (e.key === "ArrowLeft") setStep((s) => Math.max(s - 1, 0));
-      if (e.key === " ") {
-        e.preventDefault();
-        setPlaying((p) => !p);
-      }
+      else if (e.key === "ArrowLeft") setStep((s) => Math.max(s - 1, 0));
+      else if (e.key === "Home") setStep(0);
+      else if (e.key === "End") setStep(current.length - 1);
+      else if (e.key === " " && !el.closest?.("button, a")) setPlaying((p) => !p); // em botão, o espaço já aciona o próprio botão
+      else return;
+      // marca a tecla como usada: a navegação ← → entre capítulos não reage a ela
+      e.preventDefault();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [current.length]);
+    target.addEventListener("keydown", onKey);
+    return () => target.removeEventListener("keydown", onKey);
+  }, [current.length, globalKeys]);
 
-  const btn = "rounded-md border border-line px-3 py-1.5 text-sm hover:bg-surface-2 disabled:opacity-40";
+  // Fitts: controles com pelo menos 40px de altura
+  const btn = "min-h-10 rounded-md border border-line px-3 py-1.5 text-sm hover:bg-surface-2 disabled:opacity-40";
+  const atEnd = step >= current.length - 1;
 
   return (
-    <div className="mt-6 space-y-4">
+    <div
+      ref={rootRef}
+      data-keys
+      tabIndex={-1}
+      aria-keyshortcuts="Space ArrowLeft ArrowRight Home End"
+      className="mt-6 space-y-4 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-[var(--cf-focus-ring)]"
+    >
       <form
         className="flex flex-wrap items-end gap-3 rounded-lg border border-line bg-surface-1 p-3"
         onSubmit={(e) => {
@@ -203,10 +223,10 @@ export function AnimationPlayer({ slug }: { slug: string }) {
             />
           </label>
         ))}
-        <button type="submit" disabled={!frames} className="rounded-md bg-accent px-3.5 py-1.5 text-sm font-medium text-fg-on-accent disabled:opacity-45">
+        <button type="submit" disabled={!frames} className="min-h-10 rounded-md bg-accent px-3.5 py-1.5 text-sm font-medium text-fg-on-accent disabled:opacity-45">
           Aplicar
         </button>
-        {error && <p className="w-full text-sm text-danger">{error}</p>}
+        {error && <p className="cf-fade-in w-full text-sm text-danger">{error}</p>}
       </form>
 
       <div className="rounded-xl border border-line bg-surface-2 p-6">
@@ -228,34 +248,53 @@ export function AnimationPlayer({ slug }: { slug: string }) {
           </dl>
         )}
         <p className="mt-5 text-center text-sm" aria-live="polite">
-          {frame.note}
+          {/* cada passo troca a legenda com um fade curto (a região aria-live continua a mesma) */}
+          <span key={step} className="cf-fade-in inline-block">
+            {frame.note}
+          </span>
         </p>
       </div>
 
       <div className="flex flex-wrap items-center justify-center gap-2">
-        <button type="button" className={btn} onClick={() => { setStep(0); setPlaying(false); }}>⏮</button>
-        <button type="button" className={btn} disabled={step === 0} onClick={() => setStep((s) => s - 1)}>◀ Voltar</button>
         <button
           type="button"
-          className="rounded-md bg-accent px-4 py-1.5 text-sm font-medium text-fg-on-accent"
+          className={`${btn} min-w-10`}
+          aria-label="Voltar ao início"
+          title="Voltar ao início (Home)"
+          disabled={step === 0 && !playing}
           onClick={() => {
-            if (step >= current.length - 1) setStep(0);
+            setStep(0);
+            setPlaying(false);
+          }}
+        >
+          ⏮
+        </button>
+        <button type="button" className={btn} title="Passo anterior (←)" disabled={step === 0} onClick={() => setStep((s) => s - 1)}>◀ Voltar</button>
+        {/* Frequência de uso: a ação principal é o maior alvo e fica no centro */}
+        <button
+          type="button"
+          className="min-h-10 min-w-36 rounded-md bg-accent px-5 py-1.5 text-sm font-medium text-fg-on-accent hover:bg-accent-hover"
+          title="Reproduzir / pausar (espaço)"
+          onClick={() => {
+            if (atEnd) setStep(0);
             setPlaying((p) => !p);
           }}
         >
-          {playing ? "⏸ Pausar" : "▶ Reproduzir"}
+          {playing ? "⏸ Pausar" : atEnd && current.length > 1 ? "↺ Repetir" : "▶ Reproduzir"}
         </button>
-        <button type="button" className={btn} disabled={step >= current.length - 1} onClick={() => setStep((s) => s + 1)}>Avançar ▶</button>
+        <button type="button" className={btn} title="Próximo passo (→)" disabled={atEnd} onClick={() => setStep((s) => s + 1)}>Avançar ▶</button>
         <span className="px-2 text-sm tabular-nums text-fg-muted">
           {step + 1} / {current.length}
         </span>
-        <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} aria-label="Velocidade" className="rounded-md border border-line-input bg-surface-1 px-2 py-1.5 text-sm">
+        <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} aria-label="Velocidade" className="min-h-10 rounded-md border border-line-input bg-surface-1 px-2 py-1.5 text-sm">
           {[0.5, 1, 1.5, 2].map((s) => (
             <option key={s} value={s}>{s}×</option>
           ))}
         </select>
       </div>
-      <p className="text-center text-xs text-fg-subtle">Atalhos: espaço reproduz/pausa · ← → navegam pelos passos</p>
+      <p className="text-center text-xs text-fg-subtle">
+        {globalKeys ? "Atalhos" : "Com a animação em foco (clique nela)"}: espaço reproduz/pausa · ← → navegam pelos passos
+      </p>
     </div>
   );
 }

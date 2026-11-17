@@ -8,6 +8,7 @@ import { SolutionPanel } from "@/components/practice/SolutionPanel";
 import { getSolution } from "@/lib/solutions";
 import { LANGS, type Lang } from "@/lib/langs";
 import { TableOfContents } from "@/components/reader/TableOfContents";
+import { ChapterKeyNav } from "./ChapterKeyNav";
 
 type Params = Promise<{ course: string; chapter: string }>;
 
@@ -101,22 +102,44 @@ export default async function ChapterPage({ params }: { params: Params }) {
           </div>
         )}
 
+        {/* Fitts: cada lado é um alvo grande (card inteiro clicável); a seta antecipa a direção no hover */}
         <nav aria-label="Navegação entre capítulos" className="mx-auto mt-16 flex cf-measure justify-between gap-4 border-t border-line pt-6">
           {ch.prev ? (
-            <Link href={`/learn/${course}/${ch.prev.slug}`} className="group max-w-[45%] text-sm">
-              <span className="block text-xs text-fg-subtle">← Anterior</span>
-              <span className="font-medium group-hover:text-accent-text">{ch.prev.title}</span>
+            <Link
+              href={`/learn/${course}/${ch.prev.slug}`}
+              aria-keyshortcuts="ArrowLeft"
+              title="Capítulo anterior (←)"
+              className="cf-press group -ml-3 flex min-h-14 max-w-[48%] items-center gap-2.5 rounded-lg px-3 py-2 text-sm hover:bg-surface-2"
+            >
+              {/* seta como filho direto do link: a .cf-nudge reage ao hover do card inteiro; espelhada aponta para trás */}
+              <span aria-hidden className="cf-nudge -scale-x-100 text-fg-subtle group-hover:text-accent-text">→</span>
+              <span className="min-w-0">
+                <span className="block text-xs text-fg-subtle">Anterior</span>
+                <span className="font-medium group-hover:text-accent-text">{ch.prev.title}</span>
+              </span>
             </Link>
           ) : (
             <span />
           )}
           {ch.next && (
-            <Link href={`/learn/${course}/${ch.next.slug}`} className="group max-w-[45%] text-right text-sm">
-              <span className="block text-xs text-fg-subtle">Próximo →</span>
-              <span className="font-medium group-hover:text-accent-text">{ch.next.title}</span>
+            <Link
+              href={`/learn/${course}/${ch.next.slug}`}
+              aria-keyshortcuts="ArrowRight"
+              title="Próximo capítulo (→)"
+              className="cf-press group -mr-3 flex min-h-14 max-w-[48%] items-center gap-2.5 rounded-lg px-3 py-2 text-right text-sm hover:bg-surface-2"
+            >
+              <span className="min-w-0">
+                <span className="block text-xs text-fg-subtle">Próximo</span>
+                <span className="font-medium group-hover:text-accent-text">{ch.next.title}</span>
+              </span>
+              <span aria-hidden className="cf-nudge text-fg-subtle group-hover:text-accent-text">→</span>
             </Link>
           )}
         </nav>
+        <ChapterKeyNav
+          prev={ch.prev ? `/learn/${course}/${ch.prev.slug}` : undefined}
+          next={ch.next ? `/learn/${course}/${ch.next.slug}` : undefined}
+        />
       </main>
 
       {ch.available && (

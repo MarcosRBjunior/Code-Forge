@@ -79,9 +79,10 @@ export function TutorPanel({
         {messages.map((m, i) => (
           <div
             key={i}
-            className={`whitespace-pre-wrap rounded-lg px-3 py-2 ${m.role === "user" ? "ml-8 bg-accent-soft" : "mr-4 bg-surface-2"}`}
+            // Mensagem nova sobe para o lugar; enquanto a resposta não chega, "…" pulsa (Doherty)
+            className={`cf-rise-in whitespace-pre-wrap rounded-lg px-3 py-2 ${m.role === "user" ? "ml-8 bg-accent-soft" : "mr-4 bg-surface-2"}`}
           >
-            {m.content || (streaming && i === messages.length - 1 ? "…" : "")}
+            {m.content || (streaming && i === messages.length - 1 ? <span className="cf-busy">…</span> : "")}
           </div>
         ))}
         <div ref={endRef} />
@@ -90,7 +91,7 @@ export function TutorPanel({
         {pendingSelection && (
           <p className="mb-2 line-clamp-2 rounded-md bg-surface-2 px-2 py-1 text-xs text-fg-muted">
             Trecho: “{pendingSelection}”
-            <button type="button" className="ml-2 underline" onClick={() => setPendingSelection(undefined)}>remover</button>
+            <button type="button" className="cf-hit ml-2 rounded-xs underline" onClick={() => setPendingSelection(undefined)}>remover</button>
           </p>
         )}
         <div className="flex gap-2">
@@ -99,14 +100,15 @@ export function TutorPanel({
             onChange={(e) => setInput(e.target.value)}
             placeholder="Sua pergunta…"
             aria-label="Pergunta para o tutor"
+            autoFocus
             className="min-w-0 flex-1 rounded-md border border-line-input bg-surface-1 px-2.5 py-2"
           />
           {streaming ? (
-            <button type="button" onClick={() => abortRef.current?.abort()} className="rounded-md border border-line px-3">
+            <button type="button" onClick={() => abortRef.current?.abort()} className="min-h-10 rounded-md border border-line px-3">
               Parar
             </button>
           ) : (
-            <button type="submit" className="rounded-md bg-accent px-3 font-medium text-fg-on-accent">
+            <button type="submit" className="min-h-10 rounded-md bg-accent px-3 font-medium text-fg-on-accent">
               Enviar
             </button>
           )}

@@ -18,12 +18,13 @@ export default function AnimationsPage() {
               <span className="text-sm text-fg-subtle">{list.length} animações</span>
             </div>
             <p className="mt-1 text-sm text-fg-muted">{cat.description}</p>
-            <ul className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {/* Follow through: os cards de cada categoria chegam em cascata */}
+            <ul className="cf-stagger mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {list.map((a) => (
                 <li key={a.slug}>
                   <Link
                     href={`/animations/${a.slug}`}
-                    className="block h-full rounded-lg border border-line bg-surface-1 p-4 shadow-sm transition-colors duration-fast hover:border-accent"
+                    className="cf-lift block h-full rounded-lg border border-line bg-surface-1 p-4 shadow-sm hover:border-accent"
                   >
                     <p className="font-medium">{a.title}</p>
                     <p className="mt-1 text-sm text-fg-muted">{a.description}</p>

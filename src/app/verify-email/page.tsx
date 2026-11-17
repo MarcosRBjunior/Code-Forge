@@ -53,33 +53,34 @@ export default function VerifyEmailPage() {
 
   return (
     <main className="grid min-h-dvh place-items-center px-4">
-      <div className="w-full max-w-sm rounded-xl border border-line bg-surface-1 p-6 shadow-md">
+      <div className="cf-rise-in w-full max-w-sm rounded-xl border border-line bg-surface-1 p-6 shadow-md">
         <h1 className="text-xl font-semibold">Confirmação de e-mail</h1>
 
         {phase === "loading" && (
-          <p className="mt-3 text-sm" role="status">
+          // Doherty: pulsa enquanto confirma, em vez de um texto parado.
+          <p className="cf-busy mt-3 text-sm" role="status" aria-busy="true">
             Confirmando…
           </p>
         )}
 
         {phase === "invalid" && (
-          <>
+          <div className="cf-fade-in">
             <p className="mt-3 text-sm">
               Este link é inválido, expirou (vale por 24 horas) ou já foi usado. Se você já confirmou, é só entrar.
             </p>
             <div className="mt-5 flex justify-between text-sm">
-              <Link href="/login" className="text-accent hover:underline">
-                Entrar
+              <Link href="/login" className="cf-hit text-accent hover:underline">
+                Entrar <span aria-hidden="true" className="cf-nudge">→</span>
               </Link>
-              <Link href="/register" className="text-fg-muted hover:underline">
+              <Link href="/register" className="cf-hit text-fg-muted hover:underline">
                 Cadastrar de novo
               </Link>
             </div>
-          </>
+          </div>
         )}
 
         {phase === "error" && (
-          <p className="mt-3 text-sm text-danger" role="alert">
+          <p className="cf-shake mt-3 text-sm text-danger" role="alert">
             {message}
           </p>
         )}

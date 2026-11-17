@@ -8,6 +8,7 @@ import { COLORS, COLOR_LABEL, type Color } from "./colors";
 import { NotesPanel, type HighlightRow, type NoteRow } from "./NotesPanel";
 import { TutorPanel } from "./TutorPanel";
 import { BookModeButton } from "./BookModeButton";
+import { replayAnimation, useBounceOnChange, useDelayedFlag } from "@/lib/motion";
 
 interface ChapterState {
   progress: { percentRead: number; lastBlockId: string | null; completed: boolean } | null;
@@ -47,6 +48,14 @@ export function ChapterReader({
   const [tutorSelection, setTutorSelection] = useState<string | undefined>();
   const [error, setError] = useState<string | null>(null);
   const speech = useSpeech(proseRef);
+  const completeRef = useRef<HTMLButtonElement>(null);
+  const starRef = useRef<HTMLButtonElement>(null);
+  const asideRef = useRef<HTMLElement>(null);
+  const noteCount = state ? state.highlights.length + state.notes.length : 0;
+  // Feedback exagerado: o contador de notas "pula" quando muda
+  const noteCountRef = useBounceOnChange<HTMLSpanElement>(noteCount);
+  // Doherty: só pulsa os botões que dependem do estado se a carga passar de 150ms
+  const loadingSlow = useDelayedFlag(!state && !error);
 
   // ---- carregar estado e pintar destaques ----
   useEffect(() => {
@@ -182,17 +191,35 @@ export function ChapterReader({
     await send("/api/highlights", "PATCH", { id, color }).catch(() => setError("Não foi possível mudar a cor."));
   }, []);
 
+  // Doherty / UI otimista: a nota entra (ou muda) na hora e o servidor confirma depois; se falhar, desfaz e avisa
   const saveNote = useCallback(
     async (body: string, highlightId: string | null, noteId?: string) => {
+      const now = new Date().toISOString();
       if (noteId) {
-        const row: NoteRow = await send("/api/notes", "PATCH", { id: noteId, body });
-        setState((s) => (s ? { ...s, notes: s.notes.map((n) => (n.id === noteId ? row : n)) } : s));
+        const before = state?.notes.find((n) => n.id === noteId);
+        setState((s) => (s ? { ...s, notes: s.notes.map((n) => (n.id === noteId ? { ...n, body, updatedAt: now } : n)) } : s));
+        try {
+          const row: NoteRow = await send("/api/notes", "PATCH", { id: noteId, body });
+          setState((s) => (s ? { ...s, notes: s.notes.map((n) => (n.id === noteId ? row : n)) } : s));
+        } catch (e) {
+          if (before) setState((s) => (s ? { ...s, notes: s.notes.map((n) => (n.id === noteId ? before : n)) } : s));
+          setError("Não foi possível salvar a nota.");
+          throw e;
+        }
       } else {
-        const row: NoteRow = await send("/api/notes", "POST", { id: crypto.randomUUID(), key: chapterKey, highlightId, body });
-        setState((s) => (s ? { ...s, notes: [...s.notes, row] } : s));
+        const id = crypto.randomUUID();
+        setState((s) => (s ? { ...s, notes: [...s.notes, { id, highlightId, body, createdAt: now, updatedAt: now }] } : s));
+        try {
+          const row: NoteRow = await send("/api/notes", "POST", { id, key: chapterKey, highlightId, body });
+          setState((s) => (s ? { ...s, notes: s.notes.map((n) => (n.id === id ? row : n)) } : s));
+        } catch (e) {
+          setState((s) => (s ? { ...s, notes: s.notes.filter((n) => n.id !== id) } : s));
+          setError("Não foi possível salvar a nota.");
+          throw e;
+        }
       }
     },
-    [chapterKey],
+    [state, chapterKey],
   );
 
   const deleteNote = useCallback(async (id: string) => {
@@ -202,6 +229,8 @@ export function ChapterReader({
 
   const toggleComplete = useCallback(async () => {
     const completed = !state?.progress?.completed;
+    // Feedback exagerado: concluir dá um "pulo" de gelatina no botão
+    if (completed) replayAnimation(completeRef.current, "cf-jelly");
     setState((s) =>
       s ? { ...s, progress: { percentRead: completed ? 100 : (s.progress?.percentRead ?? 0), lastBlockId: s.progress?.lastBlockId ?? null, completed } } : s,
     );
@@ -222,9 +251,33 @@ export function ChapterReader({
 
   const toggleStar = useCallback(async () => {
     const starred = !state?.starred;
+    if (starred) replayAnimation(starRef.current, "cf-bounce");
     setState((s) => (s ? { ...s, starred } : s));
     await send("/api/stars", starred ? "PUT" : "DELETE", { key: chapterKey }).catch(() => {});
   }, [state, chapterKey]);
+
+  // Jakob: Esc fecha a barra de destaque e o painel lateral; o foco volta para quem abriu o painel
+  useEffect(() => {
+    if (!aside && !toolbar) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (toolbar) setToolbar(null);
+      else setAside(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [aside, toolbar]);
+
+  const hasAside = aside !== null;
+  useEffect(() => {
+    if (!hasAside) return;
+    const opener = document.activeElement as HTMLElement | null;
+    // não rouba o foco de um campo com autoFocus dentro do painel
+    if (!asideRef.current?.contains(document.activeElement)) asideRef.current?.focus({ preventScroll: true });
+    return () => {
+      if (opener && document.contains(opener) && !opener.closest("aside[data-reader-aside]")) opener.focus({ preventScroll: true });
+    };
+  }, [hasAside]);
 
   const resumeBlock = state?.progress && !state.progress.completed && state.progress.lastBlockId;
   const completed = state?.progress?.completed ?? false;
@@ -266,11 +319,21 @@ export function ChapterReader({
         )}
         <span className="mx-1 h-5 w-px bg-line" aria-hidden />
         <BookModeButton className={btn} />
-        <button type="button" className={btn} aria-pressed={state?.starred ?? false} onClick={toggleStar} disabled={!state}>
+        <button
+          ref={starRef}
+          type="button"
+          className={`${btn} ${loadingSlow ? "cf-busy" : ""}`}
+          aria-pressed={state?.starred ?? false}
+          onClick={toggleStar}
+          disabled={!state}
+        >
           {state?.starred ? "★ Favorito" : "☆ Favoritar"}
         </button>
         <button type="button" className={btn} aria-pressed={aside === "notes"} onClick={() => setAside(aside === "notes" ? null : "notes")}>
-          ✎ Notas {state && state.highlights.length + state.notes.length > 0 ? `(${state.highlights.length + state.notes.length})` : ""}
+          ✎ Notas{" "}
+          <span ref={noteCountRef} className="inline-block tabular-nums">
+            {noteCount > 0 ? `(${noteCount})` : ""}
+          </span>
         </button>
         {tutorEnabled && (
           <button type="button" className={btn} aria-pressed={aside === "tutor"} onClick={() => setAside(aside === "tutor" ? null : "tutor")}>
@@ -278,10 +341,12 @@ export function ChapterReader({
           </button>
         )}
         <button
+          ref={completeRef}
           type="button"
           onClick={toggleComplete}
           disabled={!state}
-          className={`ml-auto rounded-md px-3 py-1.5 text-sm font-medium disabled:opacity-45 ${
+          aria-pressed={completed}
+          className={`ml-auto min-h-10 rounded-md px-3 py-1.5 text-sm font-medium disabled:opacity-45 ${loadingSlow ? "cf-busy " : ""}${
             completed ? "bg-success-soft text-success" : "bg-accent text-fg-on-accent hover:bg-accent-hover"
           }`}
         >
@@ -301,7 +366,7 @@ export function ChapterReader({
         </div>
       )}
       {error && (
-        <p role="alert" className="mx-auto mt-3 cf-measure rounded-md bg-danger-soft px-3 py-2 text-sm text-danger">
+        <p role="alert" className="cf-rise-in mx-auto mt-3 cf-measure rounded-md bg-danger-soft px-3 py-2 text-sm text-danger">
           {error}
         </p>
       )}
@@ -323,9 +388,11 @@ export function ChapterReader({
           data-selection-toolbar
           role="toolbar"
           aria-label="Destacar seleção"
-          className="absolute z-50 flex -translate-x-1/2 -translate-y-full items-center gap-1 rounded-lg border border-line bg-surface-1 p-1.5 shadow-lg"
+          className="absolute z-50 -translate-x-1/2 -translate-y-full"
           style={{ left: toolbar.x, top: toolbar.y - 8 }}
         >
+          {/* Staging: a barra "brota" da seleção (origem embaixo); fica num filho para não brigar com o translate */}
+          <div className="cf-pop flex items-center gap-1.5 rounded-lg border border-line bg-surface-1 p-1.5 shadow-lg" style={{ "--cf-origin": "bottom center" } as React.CSSProperties}>
           {COLORS.map((c) => (
             <button
               key={c}
@@ -333,18 +400,18 @@ export function ChapterReader({
               aria-label={`Destacar em ${COLOR_LABEL[c]}`}
               title={COLOR_LABEL[c]}
               onClick={() => createHighlight(c)}
-              className="size-6 rounded-full border border-line-input hover:scale-110"
+              className="cf-hit size-7 rounded-full border border-line-input hover:scale-110"
               style={{ background: `var(--cf-hl-${c})` }}
             />
           ))}
           <span className="mx-0.5 h-5 w-px bg-line" aria-hidden />
-          <button type="button" className="rounded-md px-2 py-1 text-xs hover:bg-surface-2" onClick={() => createHighlight("yellow", true)}>
+          <button type="button" className="min-h-8 rounded-md px-2 py-1 text-xs hover:bg-surface-2" onClick={() => createHighlight("yellow", true)}>
             + Nota
           </button>
           {tutorEnabled && (
             <button
               type="button"
-              className="rounded-md px-2 py-1 text-xs hover:bg-surface-2"
+              className="min-h-8 rounded-md px-2 py-1 text-xs hover:bg-surface-2"
               onClick={() => {
                 setTutorSelection(toolbar.anchor.quote);
                 setAside("tutor");
@@ -354,17 +421,23 @@ export function ChapterReader({
               ✦ Perguntar
             </button>
           )}
+          </div>
         </div>
       )}
 
       {aside && (
         <aside
+          ref={asideRef}
+          data-reader-aside
+          tabIndex={-1}
           aria-label={aside === "notes" ? "Notas e destaques" : "Tutor de IA"}
-          className="fixed inset-y-0 right-0 z-50 flex w-full flex-col border-l border-line bg-surface-1 shadow-lg sm:top-header sm:w-[var(--cf-layout-aside-w)]"
+          // Staging: o painel entra a partir do canto onde fica (direita), sem atravessar o texto
+          className="cf-pop fixed inset-y-0 right-0 z-50 flex w-full flex-col border-l border-line bg-surface-1 shadow-lg outline-none sm:top-header sm:w-[var(--cf-layout-aside-w)]"
+          style={{ "--cf-origin": "top right" } as React.CSSProperties}
         >
           <div className="flex items-center justify-between border-b border-line px-4 py-3">
             <h2 className="text-sm font-semibold">{aside === "notes" ? "Notas e destaques" : "Tutor de IA"}</h2>
-            <button type="button" aria-label="Fechar painel" className="rounded-md px-2 py-1 hover:bg-surface-2" onClick={() => setAside(null)}>
+            <button type="button" aria-label="Fechar painel" title="Fechar (Esc)" className="cf-hit grid size-8 place-items-center rounded-md hover:bg-surface-2" onClick={() => setAside(null)}>
               ✕
             </button>
           </div>
