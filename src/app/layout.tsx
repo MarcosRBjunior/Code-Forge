@@ -8,6 +8,7 @@ import { COURSE_GROUPS } from "@/lib/course-groups";
 import { getCourses } from "@/lib/content";
 import { SearchDialog } from "@/components/SearchDialog";
 import { HeaderGuard } from "@/components/HeaderGuard";
+import { AppBackground } from "@/components/AppBackground";
 import "./globals.css";
 
 const inter = Inter({ subsets: ["latin", "latin-ext"], variable: "--font-inter", display: "swap" });
@@ -54,6 +55,7 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
         <script dangerouslySetInnerHTML={{ __html: prefsScript }} />
       </head>
       <body className="font-ui antialiased">
+        <AppBackground />
         <header className="sticky top-0 z-40 flex h-header items-center gap-2 border-b sm:gap-4 border-line bg-bg/80 px-4 backdrop-blur-md">
           <HeaderGuard>
             <Link href="/" className="cf-press flex min-h-10 items-center gap-2 rounded-md font-semibold tracking-tight">
