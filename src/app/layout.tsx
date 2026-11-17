@@ -56,22 +56,24 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
       <body className="font-ui antialiased">
         <header className="sticky top-0 z-40 flex h-header items-center gap-2 border-b sm:gap-4 border-line bg-bg/80 px-4 backdrop-blur-md">
           <HeaderGuard>
-            <Link href="/" className="flex items-center gap-2 font-semibold tracking-tight">
+            <Link href="/" className="cf-press flex min-h-10 items-center gap-2 rounded-md font-semibold tracking-tight">
               <span aria-hidden className="grid size-7 place-items-center rounded-md bg-accent text-sm text-fg-on-accent">
                 CF
               </span>
               <span className="hidden sm:inline">CodeForge</span>
             </Link>
+            {/* Fitts: todos os alvos da barra têm ao menos 36px de altura; cf-press dá o squash no clique */}
             <nav className="ml-2 flex items-center gap-1 text-sm text-fg-muted">
               <NavMenu label="Cursos" sections={courseSections} columns={2} />
               <NavMenu label="Prática" sections={practiceSections} badge={<ReviewCount />} />
-              <Link href="/roadmaps" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg md:inline">
-                Roadmaps
-              </Link>
-              <Link href="/dashboard" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg sm:inline">
+              {/* Frequência de uso: o Painel (retomar/revisar) vem antes de Roadmaps e aparece em telas menores */}
+              <Link href="/dashboard" className="cf-press hidden min-h-9 items-center rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg sm:inline-flex">
                 Painel
               </Link>
-              <Link href="/notebook/dsa" className="hidden rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg lg:inline">
+              <Link href="/roadmaps" className="cf-press hidden min-h-9 items-center rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg md:inline-flex">
+                Roadmaps
+              </Link>
+              <Link href="/notebook/dsa" className="cf-press hidden min-h-9 items-center rounded-md px-2.5 py-1.5 hover:bg-surface-2 hover:text-fg lg:inline-flex">
                 Caderno
               </Link>
             </nav>

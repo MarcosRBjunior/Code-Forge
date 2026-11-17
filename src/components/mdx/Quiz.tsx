@@ -1,6 +1,7 @@
 "use client";
 
-import { useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { replayAnimation } from "@/lib/motion";
 
 /** Opções que só fazem sentido no fim ("Nenhuma das anteriores", "Todas as anteriores"). */
 const PINNED_LAST = /^(nenhuma|todas)\s+(d?as?\s+)?(anteriores|acima|alternativas|op[cç][õo]es)/i;
@@ -47,6 +48,16 @@ export function Quiz({
   const order = useMemo(() => displayOrder(question, options), [question, options]);
   const answered = chosen !== null;
   const correct = chosen === answer;
+  const retryRef = useRef<HTMLButtonElement>(null);
+  const firstRef = useRef<HTMLButtonElement>(null);
+  const touched = useRef(false);
+
+  // Foco (Jakob): a opção clicada fica desabilitada; o foco vai para "Tentar de novo" e, ao tentar de novo, volta à 1ª opção
+  useEffect(() => {
+    if (!touched.current) return;
+    if (answered) retryRef.current?.focus({ preventScroll: true });
+    else firstRef.current?.focus({ preventScroll: true });
+  }, [answered]);
 
   return (
     <fieldset className="rounded-lg border border-line bg-surface-1 p-4 font-ui text-[0.95em]" data-quiz>
@@ -60,12 +71,18 @@ export function Quiz({
           return (
             <button
               key={i}
+              ref={pos === 0 ? firstRef : undefined}
               type="button"
               role="radio"
               aria-checked={chosen === i}
               disabled={answered}
-              onClick={() => setChosen(i)}
-              className={`rounded-md border px-3 py-2 text-left text-sm transition-colors duration-fast ${
+              onClick={(e) => {
+                touched.current = true;
+                // Ação secundária: acerto "pula" (gelatina), erro balança
+                replayAnimation(e.currentTarget, i === answer ? "cf-jelly" : "cf-shake");
+                setChosen(i);
+              }}
+              className={`min-h-10 rounded-md border px-3 py-2 text-left text-sm ${
                 state === "right"
                   ? "border-success bg-success-soft text-fg"
                   : state === "wrong"
@@ -83,10 +100,10 @@ export function Quiz({
         })}
       </div>
       {answered && (
-        <div role="status" className="mt-3 text-sm">
+        <div role="status" className="cf-rise-in mt-3 text-sm">
           <p className={`font-semibold ${correct ? "text-success" : "text-danger"}`}>{correct ? "✓ Correto!" : "✗ Não foi dessa vez."}</p>
           {explanation && <p className="mt-1 text-fg-muted">{explanation}</p>}
-          <button type="button" onClick={() => setChosen(null)} className="mt-2 text-xs text-accent-text underline">
+          <button ref={retryRef} type="button" onClick={() => setChosen(null)} className="cf-hit mt-2 rounded-xs text-xs text-accent-text underline">
             Tentar de novo
           </button>
         </div>

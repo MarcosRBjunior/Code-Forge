@@ -1,9 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useDelayedFlag } from "@/lib/motion";
 
 export function CourseProgressBar({ course, total }: { course: string; total: number }) {
   const [done, setDone] = useState<number | null>(null);
+  // Doherty: o placeholder só aparece se a resposta demorar (evita piscar em respostas rápidas).
+  const loading = useDelayedFlag(done === null);
 
   useEffect(() => {
     fetch(`/api/state?course=${course}`)
@@ -24,10 +27,22 @@ export function CourseProgressBar({ course, total }: { course: string; total: nu
         aria-valuemin={0}
         aria-valuemax={100}
         aria-label="Progresso do curso"
+        aria-busy={done === null}
       >
-        <div className="h-full rounded-full bg-success transition-[width] duration-slow" style={{ width: `${pct}%` }} />
+        {/* Pose to pose: nasce em 0 e desliza até o valor real com desaceleração */}
+        <div className="cf-progress-fill h-full rounded-full bg-success" style={{ width: `${pct}%` }} />
       </div>
-      <p className="mt-1 text-xs tabular-nums text-fg-subtle">{done === null ? "…" : `${done}/${total} concluídos`}</p>
+      <p className="mt-1 text-xs tabular-nums text-fg-subtle">
+        {done !== null ? (
+          `${done}/${total} concluídos`
+        ) : loading ? (
+          <span className="cf-skeleton inline-block w-20" aria-hidden>
+            &nbsp;
+          </span>
+        ) : (
+          " "
+        )}
+      </p>
     </div>
   );
 }

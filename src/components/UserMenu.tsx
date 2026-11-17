@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import type { UserResponse } from "@/contracts/api";
+import { moveMenuFocus } from "@/components/NavMenus";
 
 type User = UserResponse["user"];
 
@@ -22,7 +23,11 @@ export function UserMenu() {
   const pathname = usePathname();
   const [user, setUser] = useState<User | null>(null);
   const [open, setOpen] = useState(false);
+  const [leaving, setLeaving] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const focusFirst = useRef(false);
   const isPublic = PUBLIC_PAGES.has(pathname);
 
   // Busca a conta ao montar e ao navegar enquanto ainda não há usuário (ex.: confirmação de e-mail que já loga).
@@ -41,7 +46,12 @@ export function UserMenu() {
   useEffect(() => {
     if (!open) return;
     const close = (e: MouseEvent | KeyboardEvent) => {
-      if (e instanceof KeyboardEvent ? e.key === "Escape" : !ref.current?.contains(e.target as Node)) setOpen(false);
+      if (e instanceof KeyboardEvent) {
+        if (e.key !== "Escape") return;
+        setOpen(false);
+        // Jakob: Esc devolve o foco ao botão que abriu o menu
+        if (ref.current?.contains(document.activeElement)) triggerRef.current?.focus();
+      } else if (!ref.current?.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener("mousedown", close);
     document.addEventListener("keydown", close);
@@ -53,23 +63,53 @@ export function UserMenu() {
 
   useEffect(() => setOpen(false), [pathname]);
 
+  useEffect(() => {
+    if (open && focusFirst.current) menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    focusFirst.current = false;
+  }, [open]);
+
   if (isPublic || !user) return null;
 
   return (
-    <div ref={ref} className="relative">
+    <div
+      ref={ref}
+      className="relative"
+      onBlur={(e) => {
+        if (open && e.relatedTarget && !ref.current?.contains(e.relatedTarget as Node)) setOpen(false);
+      }}
+    >
       <button
+        ref={triggerRef}
         type="button"
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label={`Conta de ${user.name || user.email}`}
         title={user.email}
-        onClick={() => setOpen((o) => !o)}
-        className="flex h-8 w-8 items-center justify-center rounded-full border border-line bg-surface-2 text-xs font-semibold hover:bg-surface-1"
+        onClick={(e) => {
+          // detail === 0: aberto pelo teclado, então o foco entra no menu
+          if (!open && e.detail === 0) focusFirst.current = true;
+          setOpen((o) => !o);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown" && !open) {
+            e.preventDefault();
+            focusFirst.current = true;
+            setOpen(true);
+          }
+        }}
+        // Fitts: 36px de alvo (antes 32px)
+        className="flex size-9 items-center justify-center rounded-full border border-line bg-surface-2 text-xs font-semibold hover:bg-surface-1 aria-expanded:border-line-strong"
       >
         {initials(user)}
       </button>
       {open && (
-        <div role="menu" className="absolute right-0 top-full z-50 mt-2 w-64 rounded-lg border border-line bg-surface-1 p-2 shadow-lg">
+        <div
+          ref={menuRef}
+          role="menu"
+          onKeyDown={(e) => moveMenuFocus(menuRef.current, e)}
+          className="cf-pop absolute right-0 top-full z-50 mt-2 w-64 rounded-lg border border-line bg-surface-1 p-2 shadow-lg"
+          style={{ ["--cf-origin" as string]: "top right" }}
+        >
           <div className="border-b border-line px-2 pb-2 pt-1">
             {user.name && <p className="truncate text-sm font-medium">{user.name}</p>}
             <p className="truncate text-xs text-fg-muted">{user.email}</p>
@@ -78,20 +118,28 @@ export function UserMenu() {
             href="/account"
             role="menuitem"
             onClick={() => setOpen(false)}
-            className="mt-1 block rounded-md px-2 py-1.5 text-sm hover:bg-surface-2"
+            className="mt-1 flex min-h-9 items-center rounded-md px-2 py-1.5 text-sm hover:bg-surface-2 focus-visible:bg-surface-2"
           >
             Minha conta
           </Link>
           <button
             type="button"
             role="menuitem"
+            disabled={leaving}
+            aria-busy={leaving}
             onClick={async () => {
-              await fetch("/api/auth/logout", { method: "POST" });
-              window.location.href = "/login";
+              // Doherty: feedback imediato enquanto a sessão é encerrada
+              setLeaving(true);
+              try {
+                await fetch("/api/auth/logout", { method: "POST" });
+                window.location.href = "/login";
+              } catch {
+                setLeaving(false);
+              }
             }}
-            className="block w-full rounded-md px-2 py-1.5 text-left text-sm hover:bg-surface-2"
+            className={`flex min-h-9 w-full items-center rounded-md px-2 py-1.5 text-left text-sm hover:bg-surface-2 focus-visible:bg-surface-2 ${leaving ? "cf-busy" : ""}`}
           >
-            Sair
+            {leaving ? "Saindo…" : "Sair"}
           </button>
         </div>
       )}

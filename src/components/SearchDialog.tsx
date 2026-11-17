@@ -4,9 +4,19 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { SearchDoc } from "@/app/api/search-index/route";
+import { useDelayedFlag } from "@/lib/motion";
 
-/** Remove acentos e caixa: "Programação" e "programacao" casam. */
-const fold = (s: string) => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+/**
+ * Postel: remove acentos e caixa ("Programação" casa com "programacao") e trata hífen, sublinhado,
+ * ponto e barra como espaço ("two-pointers" casa com "two pointers"). Troca 1 caractere por 1 para
+ * os índices continuarem valendo no texto original (usado no trecho de contexto).
+ */
+const fold = (s: string) =>
+  s
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/[-_./]/g, " ");
 
 interface Hit {
   doc: SearchDoc;
@@ -54,8 +64,13 @@ export function SearchDialog() {
   const [q, setQ] = useState("");
   const [active, setActive] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  // Jakob: ao fechar, o foco volta para onde estava (o botão de busca ou o que estava focado no Ctrl+K)
+  const returnFocus = useRef<HTMLElement | null>(null);
+  const loadingShown = useDelayedFlag(open && !docs);
 
   const show = useCallback(() => {
+    returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setOpen(true);
     if (!docs) fetch("/api/search-index").then((r) => r.json()).then(setDocs).catch(() => setDocs([]));
   }, [docs]);
@@ -76,8 +91,28 @@ export function SearchDialog() {
     else setQ("");
   }, [open]);
 
+  const close = useCallback(() => {
+    setOpen(false);
+    returnFocus.current?.focus();
+  }, []);
+
+  // Esc fecha mesmo com o foco fora do campo (ex.: depois de clicar num resultado com o meio do mouse)
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, close]);
+
   const hits = useMemo(() => (docs ? search(docs, q) : []), [docs, q]);
   useEffect(() => setActive(0), [q]);
+
+  // O item ativo pelo teclado fica sempre visível na lista
+  useEffect(() => {
+    listRef.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
+  }, [active]);
 
   const go = (h: Hit) => {
     setOpen(false);
@@ -89,7 +124,9 @@ export function SearchDialog() {
       <button
         type="button"
         onClick={show}
-        className="flex items-center gap-2 rounded-md border border-line px-2.5 py-1.5 text-sm text-fg-muted hover:bg-surface-2"
+        aria-haspopup="dialog"
+        aria-keyshortcuts="Control+K Meta+K"
+        className="flex min-h-9 items-center gap-2 rounded-md border border-line px-2.5 py-1.5 text-sm text-fg-muted hover:bg-surface-2"
       >
         <span aria-hidden>⌕</span>
         <span className="hidden sm:inline">Buscar</span>
@@ -97,14 +134,20 @@ export function SearchDialog() {
       </button>
       {open && createPortal(
         <div className="fixed inset-0 z-[60] flex items-start justify-center px-4 pt-[12vh]" role="dialog" aria-modal="true" aria-label="Buscar">
-          <button type="button" aria-label="Fechar busca" className="absolute inset-0 bg-[var(--cf-surface-overlay)]" onClick={() => setOpen(false)} />
-          <div className="relative w-full max-w-xl overflow-hidden rounded-xl border border-line bg-surface-1 shadow-lg">
+          <button
+            type="button"
+            aria-label="Fechar busca"
+            data-no-press
+            className="cf-fade-in absolute inset-0 bg-[var(--cf-surface-overlay)]"
+            onClick={close}
+          />
+          {/* Staging: o painel "salta" no centro de atenção enquanto o fundo escurece */}
+          <div className="cf-pop relative w-full max-w-xl overflow-hidden rounded-xl border border-line bg-surface-1 shadow-lg">
             <input
               ref={inputRef}
               value={q}
               onChange={(e) => setQ(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Escape") setOpen(false);
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
                   setActive((a) => Math.min(a + 1, hits.length - 1));
@@ -120,8 +163,18 @@ export function SearchDialog() {
               aria-controls="search-results"
               className="w-full border-b border-line bg-transparent px-4 py-3 outline-none"
             />
-            <ul id="search-results" role="listbox" className="max-h-[50vh] overflow-y-auto py-1">
-              {!docs && <li className="px-4 py-3 text-sm text-fg-muted">Carregando índice…</li>}
+            <ul ref={listRef} id="search-results" role="listbox" className="max-h-[50vh] overflow-y-auto py-1">
+              {/* Doherty: esqueleto só se o índice demorar; antes disso, nada pisca */}
+              {!docs &&
+                (loadingShown ? (
+                  <li aria-label="Carregando índice" className="space-y-3 px-4 py-3">
+                    <span className="cf-skeleton block h-4 w-2/3" />
+                    <span className="cf-skeleton block h-3 w-1/2" />
+                    <span className="cf-skeleton block h-4 w-3/5" />
+                  </li>
+                ) : (
+                  <li className="h-[76px]" aria-hidden />
+                ))}
               {docs && q && hits.length === 0 && <li className="px-4 py-3 text-sm text-fg-muted">Nada encontrado para “{q}”.</li>}
               {docs && !q && <li className="px-4 py-3 text-sm text-fg-muted">Digite um tema, padrão ou nome de problema.</li>}
               {hits.map((h, i) => (

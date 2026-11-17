@@ -22,7 +22,7 @@ export default async function NotebookPage({ params }: { params: Promise<{ cours
             key={c.slug}
             href={`/notebook/${c.slug}`}
             aria-current={c.slug === slug ? "page" : undefined}
-            className="rounded-full border border-line px-3 py-1 text-fg-muted hover:bg-surface-2 current:border-accent current:bg-accent-soft current:text-fg"
+            className="cf-press inline-flex min-h-9 items-center rounded-full border border-line px-3 py-1 text-fg-muted hover:bg-surface-2 current:border-accent current:bg-accent-soft current:text-fg"
           >
             {c.title}
           </Link>

@@ -40,19 +40,22 @@ export function TableOfContents({ items }: { items: TocItem[] }) {
           <span className="tabular-nums">{progress}%</span>
         </div>
         <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-surface-3">
-          <div className="h-full rounded-full bg-accent transition-[width] duration-fast" style={{ width: `${progress}%` }} />
+          <div className="h-full rounded-full bg-accent transition-[width] duration-fast ease-[var(--cf-ease-standard)]" style={{ width: `${progress}%` }} />
         </div>
       </div>
       {items.length > 0 && (
         <>
           <p className="text-xs font-semibold uppercase tracking-wide text-fg-subtle">Nesta página</p>
-          <ul className="mt-3 space-y-1.5 border-l border-line text-sm">
+          <ul className="mt-3 space-y-0.5 border-l border-line text-sm">
             {items.map((t) => (
-              <li key={t.id} className={t.depth === 3 ? "pl-6" : "pl-3"}>
+              <li key={t.id}>
+                {/* Pose to pose: a marca da seção ativa (borda à esquerda) e a cor passam de um item ao outro com transição */}
                 <a
                   href={`#${t.id}`}
                   aria-current={active === t.id ? "location" : undefined}
-                  className={`block ${active === t.id ? "font-medium text-accent-text" : "text-fg-muted hover:text-fg"}`}
+                  className={`-ml-px block border-l-2 py-1 transition-colors duration-base ease-[var(--cf-ease-standard)] ${t.depth === 3 ? "pl-6" : "pl-3"} ${
+                    active === t.id ? "border-accent font-medium text-accent-text" : "border-transparent text-fg-muted hover:border-line-strong hover:text-fg"
+                  }`}
                 >
                   {t.text}
                 </a>

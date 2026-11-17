@@ -14,7 +14,8 @@ export default async function AccountPage() {
   if (!user) redirect("/login?next=/account");
 
   return (
-    <main className="mx-auto w-full max-w-xl px-4 py-10">
+    // Follow through: título e cartões chegam em cascata, do mais usado (dados) ao mais raro (excluir).
+    <main className="cf-stagger mx-auto w-full max-w-xl px-4 py-10">
       <h1 className="text-2xl font-semibold">Conta</h1>
 
       <section className="mt-6 rounded-xl border border-line bg-surface-1 p-6 shadow-sm" aria-labelledby="dados">
@@ -29,7 +30,7 @@ export default async function AccountPage() {
         </dl>
         <p className="mt-3 text-xs text-fg-muted">
           Veja quais dados guardamos e por quê na{" "}
-          <Link href="/privacidade" className="text-accent hover:underline">
+          <Link href="/privacidade" className="cf-hit text-accent hover:underline">
             política de privacidade
           </Link>
           .

@@ -33,12 +33,13 @@ export default async function CoursePage({ params }: { params: Promise<{ course:
         {course.availableCount} de {course.chapterCount} capítulos escritos · os demais aparecem como “em breve”
       </p>
       <div className="mt-6 flex gap-2">
-        <Link href={`/notebook/${course.slug}`} className="rounded-md border border-line px-3.5 py-2 text-sm hover:bg-surface-2">
+        <Link href={`/notebook/${course.slug}`} className="cf-press inline-flex min-h-10 items-center rounded-md border border-line px-3.5 py-2 text-sm hover:bg-surface-2">
           Abrir caderno
         </Link>
       </div>
 
-      <ol className="mt-10 space-y-8">
+      {/* Miller: capítulos já agrupados por módulo; os módulos chegam em cascata (follow through) */}
+      <ol className="cf-stagger mt-10 space-y-8">
         {course.modules.map((m, i) => (
           <li key={m.slug}>
             <h2 className="text-lg font-semibold">
@@ -50,12 +51,14 @@ export default async function CoursePage({ params }: { params: Promise<{ course:
                 <li key={c.slug}>
                   <Link
                     href={`/learn/${course.slug}/${c.slug}`}
-                    className="flex items-center gap-3 px-4 py-3 text-sm hover:bg-surface-2"
+                    className="group flex min-h-11 items-center gap-3 px-4 py-3 text-sm transition-colors duration-fast hover:bg-surface-2"
                   >
                     <span className="w-16 shrink-0 text-xs text-fg-subtle">{KIND_LABEL[c.kind]}</span>
                     <span className={`flex-1 ${c.available ? "" : "text-fg-subtle"}`}>{c.title}</span>
                     {!c.available && <span className="text-[10px] uppercase tracking-wide text-fg-subtle">em breve</span>}
                     {c.difficulty && <span className={`text-xs font-medium ${DIFF[c.difficulty][1]}`}>{DIFF[c.difficulty][0]}</span>}
+                    {/* Antecipação discreta: a seta aparece e "puxa" para o capítulo no hover */}
+                    <span aria-hidden className="cf-nudge text-fg-subtle opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100">→</span>
                   </Link>
                 </li>
               ))}

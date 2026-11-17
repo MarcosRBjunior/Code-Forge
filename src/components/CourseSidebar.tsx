@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useBounceOnChange } from "@/lib/motion";
 import { PROGRESS_EVENT, type ProgressEventDetail } from "@/lib/events";
 
 type Kind = "lesson" | "problem" | "quiz";
@@ -24,6 +25,12 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
   const [railOnly, setRailOnly] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [mobileOpen, setMobileOpen] = useState(false);
+  // Capítulo recém-concluído: o ícone dele "pula" uma vez (feedback exagerado)
+  const [justDone, setJustDone] = useState<string | null>(null);
+  const asideRef = useRef<HTMLElement>(null);
+  const drawerRef = useRef<HTMLDivElement>(null);
+  const openerRef = useRef<HTMLButtonElement>(null);
+  const counterRef = useBounceOnChange<HTMLParagraphElement>(completed.size);
 
   const load = useCallback(() => {
     fetch(`/api/state?course=${course.slug}`)
@@ -43,6 +50,7 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
       const { key, completed: done } = (e as CustomEvent<ProgressEventDetail>).detail;
       const [c, ch] = key.split("/");
       if (c !== course.slug) return;
+      setJustDone(done ? ch : null);
       setCompleted((prev) => {
         const next = new Set(prev);
         if (done) next.add(ch);
@@ -55,6 +63,33 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
   }, [course.slug]);
 
   useEffect(() => setMobileOpen(false), [pathname]);
+
+  // Staging: o capítulo atual fica sempre à vista na lista (rola só a barra, não a página)
+  useEffect(() => {
+    for (const root of [asideRef.current, drawerRef.current]) {
+      const item = root?.querySelector<HTMLElement>('[aria-current="page"]');
+      const box = item?.closest<HTMLElement>("[data-scroll]");
+      if (!item || !box) continue;
+      const top = item.getBoundingClientRect().top - box.getBoundingClientRect().top;
+      if (top < 0 || top > box.clientHeight - item.offsetHeight) box.scrollTop += top - box.clientHeight / 3;
+    }
+  }, [pathname, mobileOpen, railOnly]);
+
+  // Gaveta no celular (Jakob): Esc fecha, o foco entra na gaveta e volta ao botão que a abriu
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const opener = openerRef.current;
+    const drawer = drawerRef.current;
+    (drawer?.querySelector<HTMLElement>('[aria-current="page"]') ?? drawer?.querySelector<HTMLElement>("a, button"))?.focus({ preventScroll: true });
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMobileOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      opener?.focus({ preventScroll: true });
+    };
+  }, [mobileOpen]);
 
   // Barra recolhida no desktop (fica só um trilho); a preferência vale para todos os cursos.
   useEffect(() => setRailOnly(document.documentElement.dataset.sidebar === "collapsed"), []);
@@ -79,18 +114,18 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
           <Link href={`/learn/${course.slug}`} className="text-sm font-semibold hover:text-accent-text">
             {course.title}
           </Link>
-          <p className="mt-0.5 text-xs tabular-nums text-fg-subtle">
+          <p ref={counterRef} className="mt-0.5 w-fit origin-left text-xs tabular-nums text-fg-subtle">
             {completed.size} de {total} concluídos
           </p>
           <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-surface-3" aria-hidden>
-            <div className="h-full rounded-full bg-success" style={{ width: `${total ? (completed.size / total) * 100 : 0}%` }} />
+            <div className="cf-progress-fill h-full rounded-full bg-success" style={{ width: `${total ? (completed.size / total) * 100 : 0}%` }} />
           </div>
         </div>
-        <button type="button" onClick={toggleRail} aria-label="Recolher a barra de capítulos" title="Recolher" className="hidden rounded-md px-1.5 py-0.5 text-fg-subtle hover:bg-surface-2 hover:text-fg lg:block">
+        <button type="button" onClick={toggleRail} aria-label="Recolher a barra de capítulos" title="Recolher" className="cf-hit hidden rounded-md px-2 py-1 text-fg-subtle hover:bg-surface-2 hover:text-fg lg:block">
           «
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto px-2 py-3 [scrollbar-width:thin]">
+      <div data-scroll className="flex-1 overflow-y-auto px-2 py-3 [scrollbar-width:thin]">
         {modules.map((m) => {
           const done = m.chapters.filter((c) => completed.has(c.slug)).length;
           const isCollapsed = collapsed.has(m.slug);
@@ -111,11 +146,15 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
               >
                 <span>{m.title}</span>
                 <span className="tabular-nums font-normal normal-case text-fg-subtle">
-                  {done}/{m.chapters.filter((c) => c.available).length} {isCollapsed ? "▸" : "▾"}
+                  {done}/{m.chapters.filter((c) => c.available).length}{" "}
+                  {/* Pose to pose: a mesma seta gira entre aberto e fechado */}
+                  <span aria-hidden className={`inline-block transition-transform duration-base ${isCollapsed ? "-rotate-90" : ""}`}>
+                    ▾
+                  </span>
                 </span>
               </button>
               {!isCollapsed && (
-                <ul className="mt-0.5">
+                <ul className="cf-fade-in mt-0.5">
                   {m.chapters.map((c) => {
                     const isDone = completed.has(c.slug);
                     const isStarted = !isDone && started.has(c.slug);
@@ -125,11 +164,13 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
                           href={`/learn/${course.slug}/${c.slug}`}
                           aria-current={c.slug === current ? "page" : undefined}
                           data-state={isDone ? "completed" : isStarted ? "in-progress" : undefined}
-                          className="relative flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 text-sm text-fg-muted hover:bg-surface-2 hover:text-fg current:bg-accent-soft current:font-medium current:text-accent-text current:before:absolute current:before:inset-y-1.5 current:before:left-0 current:before:w-[3px] current:before:rounded-full current:before:bg-accent-hover"
+                          className="relative flex min-h-9 items-center gap-2 rounded-md px-2 py-1.5 text-sm text-fg-muted transition-colors duration-fast hover:bg-surface-2 hover:text-fg current:bg-accent-soft current:font-medium current:text-accent-text current:before:absolute current:before:inset-y-1.5 current:before:left-0 current:before:w-[3px] current:before:rounded-full current:before:bg-accent-hover"
                         >
                           <span
                             aria-hidden
-                            className={`grid size-5 shrink-0 place-items-center rounded-full text-[10px] ${
+                            className={`grid size-5 shrink-0 place-items-center rounded-full text-[10px] transition-colors duration-base ${
+                              isDone && c.slug === justDone ? "cf-bounce " : ""
+                            }${
                               isDone
                                 ? "bg-success text-fg-on-accent"
                                 : isStarted
@@ -161,22 +202,30 @@ export function CourseSidebar({ course, modules }: { course: { slug: string; tit
   return (
     <>
       <button
+        ref={openerRef}
         type="button"
         onClick={() => setMobileOpen(true)}
-        className="m-3 rounded-md border border-line px-3 py-1.5 text-sm lg:hidden"
+        aria-expanded={mobileOpen}
+        className="m-3 min-h-10 rounded-md border border-line px-3 py-1.5 text-sm lg:hidden"
       >
         ☰ Capítulos
       </button>
       {mobileOpen && (
         <div className="fixed inset-0 z-50 lg:hidden" role="dialog" aria-modal="true" aria-label="Capítulos">
-          <button type="button" aria-label="Fechar" className="absolute inset-0 bg-[var(--cf-surface-overlay)]" onClick={() => setMobileOpen(false)} />
-          <div className="absolute inset-y-0 left-0 w-[min(85vw,320px)] bg-surface-1 shadow-lg">{nav}</div>
+          <button type="button" aria-label="Fechar" data-no-press className="cf-fade-in absolute inset-0 bg-[var(--cf-surface-overlay)]" onClick={() => setMobileOpen(false)} />
+          <div
+            ref={drawerRef}
+            className="cf-pop absolute inset-y-0 left-0 w-[min(85vw,320px)] bg-surface-1 shadow-lg"
+            style={{ "--cf-origin": "left center" } as React.CSSProperties}
+          >
+            {nav}
+          </div>
         </div>
       )}
-      <aside className="cf-course-sidebar sticky top-header hidden h-[calc(100dvh-var(--cf-layout-header-h))] border-r border-line bg-surface-1 lg:block">
+      <aside ref={asideRef} className="cf-course-sidebar sticky top-header hidden h-[calc(100dvh-var(--cf-layout-header-h))] border-r border-line bg-surface-1 lg:block">
         {railOnly ? (
           <div className="flex flex-col items-center gap-3 py-3">
-            <button type="button" onClick={toggleRail} aria-label="Mostrar a barra de capítulos" title="Mostrar capítulos" className="rounded-md px-1.5 py-0.5 text-fg-subtle hover:bg-surface-2 hover:text-fg">
+            <button type="button" onClick={toggleRail} aria-label="Mostrar a barra de capítulos" title="Mostrar capítulos" className="cf-hit rounded-md px-2 py-1 text-fg-subtle hover:bg-surface-2 hover:text-fg">
               »
             </button>
             <span className="text-xs tabular-nums text-fg-subtle [writing-mode:vertical-rl]">

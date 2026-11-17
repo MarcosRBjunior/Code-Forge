@@ -65,9 +65,10 @@ export default async function RoadmapsPage() {
     <main className="mx-auto max-w-4xl px-4 py-10">
       <h1 className="text-3xl font-semibold tracking-tight">Roadmaps</h1>
       <p className="mt-1 text-fg-muted">Sequências de estudo prontas, montadas a partir dos cursos. Cada etapa é aproximadamente uma a duas semanas.</p>
-      <div className="mt-8 space-y-10">
+      {/* Follow through: os planos chegam em cascata */}
+      <div className="cf-stagger mt-8 space-y-10">
         {PLANS.map((plan) => (
-          <section key={plan.slug} id={plan.slug} className="rounded-xl border border-line bg-surface-1 p-5">
+          <section key={plan.slug} id={plan.slug} className="rounded-xl border border-line bg-surface-1 p-5 shadow-sm">
             <h2 className="text-xl font-semibold">{plan.title}</h2>
             <p className="mt-1 text-sm text-fg-muted">{plan.description}</p>
             <ol className="mt-5 space-y-4 border-l-2 border-line pl-6">
@@ -89,7 +90,8 @@ export default async function RoadmapsPage() {
                           <li key={m.slug}>
                             <Link
                               href={`/learn/${course.slug}/${first.slug}`}
-                              className="inline-block rounded-full border border-line px-3 py-1 text-sm hover:border-accent hover:bg-accent-soft"
+                              // Fitts: chip com 36px de alto; cf-press dá o squash no clique
+                              className="cf-press inline-flex min-h-9 items-center rounded-full border border-line px-3 py-1.5 text-sm hover:border-accent hover:bg-accent-soft"
                             >
                               {m.title}
                               <span className="ml-1.5 text-xs tabular-nums text-fg-subtle">{written}/{m.chapters.length}</span>

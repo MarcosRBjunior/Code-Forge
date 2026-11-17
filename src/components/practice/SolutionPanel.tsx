@@ -27,9 +27,26 @@ export function SolutionPanel({
   }, [codes]);
 
   return (
-    <details className="group rounded-xl border border-line bg-surface-1">
-      <summary className="cursor-pointer select-none px-4 py-3 font-medium">Ver solução de referência</summary>
-      <div className="border-t border-line px-4 pb-4 pt-3">
+    <details
+      className="group rounded-xl border border-line bg-surface-1"
+      // Jakob: Esc fecha o painel aberto e devolve o foco ao resumo
+      onKeyDown={(e) => {
+        const el = e.currentTarget;
+        if (e.key === "Escape" && el.open) {
+          el.open = false;
+          el.querySelector("summary")?.focus();
+        }
+      }}
+    >
+      <summary className="flex min-h-11 cursor-pointer select-none list-none items-center gap-2 px-4 py-3 font-medium [&::-webkit-details-marker]:hidden">
+        {/* Pose to pose: a seta gira de "fechado" para "aberto" com desaceleração */}
+        <span aria-hidden className="inline-block text-fg-subtle transition-transform duration-base ease-[var(--cf-ease-standard)] group-open:rotate-90">
+          ▸
+        </span>
+        Ver solução de referência
+      </summary>
+      {/* Staging: o conteúdo sobe ao abrir (a animação reinicia a cada abertura do <details>) */}
+      <div className="cf-rise-in border-t border-line px-4 pb-4 pt-3">
         <p className="rounded-md bg-warning-soft px-3 py-2 text-sm">Tente resolver sozinho antes de olhar. Ler a solução cedo demais tira o ganho do exercício.</p>
         <div className="cf-prose mt-4">
           <h3 className="text-lg font-semibold">Ideia</h3>
@@ -45,7 +62,7 @@ export function SolutionPanel({
               type="button"
               aria-selected={lang === l}
               onClick={() => setLang(l)}
-              className="rounded-md px-2.5 py-1 text-sm text-fg-muted hover:bg-surface-2 aria-selected:bg-accent-soft aria-selected:font-medium aria-selected:text-fg"
+              className="min-h-9 rounded-md px-2.5 py-1 text-sm text-fg-muted hover:bg-surface-2 aria-selected:bg-accent-soft aria-selected:font-medium aria-selected:text-fg"
             >
               {LANG_LABEL[l]}
             </button>

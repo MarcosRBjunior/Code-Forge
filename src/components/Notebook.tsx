@@ -2,6 +2,10 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { useDelayedFlag } from "@/lib/motion";
+
+/** Postel: a busca ignora acentos e maiúsculas ("funcao" encontra "Função"). */
+const fold = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 
 interface Hl {
   id: string;
@@ -38,8 +42,8 @@ export function Notebook({
 
   const groups = useMemo(() => {
     if (!data) return [];
-    const needle = q.trim().toLowerCase();
-    const match = (s: string) => !needle || s.toLowerCase().includes(needle);
+    const needle = fold(q.trim());
+    const match = (s: string) => !needle || fold(s).includes(needle);
     return chapters
       .map((ch) => {
         const key = `${course}/${ch.slug}`;
@@ -73,8 +77,8 @@ export function Notebook({
     URL.revokeObjectURL(a.href);
   }
 
-  if (error) return <p className="mt-8 text-danger">Não foi possível carregar o caderno.</p>;
-  if (!data) return <p className="mt-8 text-fg-muted">Carregando…</p>;
+  if (error) return <p role="alert" className="cf-rise-in mt-8 text-danger">Não foi possível carregar o caderno.</p>;
+  if (!data) return <NotebookSkeleton />;
 
   return (
     <>
@@ -91,19 +95,20 @@ export function Notebook({
           type="button"
           onClick={exportMarkdown}
           disabled={groups.length === 0}
-          className="rounded-md border border-line px-3.5 py-2 text-sm hover:bg-surface-2 disabled:opacity-45"
+          className="min-h-10 rounded-md border border-line px-3.5 py-2 text-sm hover:bg-surface-2 disabled:opacity-45"
         >
           Exportar .md
         </button>
       </div>
 
       {groups.length === 0 && (
-        <p className="mt-10 text-fg-muted">
+        <p className="cf-fade-in mt-10 text-fg-muted">
           {q ? "Nada encontrado." : "Ainda não há destaques. Selecione um trecho em qualquer capítulo para começar."}
         </p>
       )}
 
-      <div className="mt-8 space-y-10">
+      {/* Follow through: os capítulos chegam em cascata */}
+      <div className="cf-stagger mt-8 space-y-10">
         {groups.map(({ ch, items, free }) => (
           <section key={ch.slug}>
             <p className="text-xs uppercase tracking-wide text-fg-subtle">{ch.module}</p>
@@ -133,5 +138,23 @@ export function Notebook({
         ))}
       </div>
     </>
+  );
+}
+
+/** Doherty: o esqueleto só aparece se a carga passar de 150ms, sem "piscar" nas respostas rápidas. */
+function NotebookSkeleton() {
+  const show = useDelayedFlag(true);
+  if (!show) return <p className="sr-only">Carregando…</p>;
+  return (
+    <div className="mt-6 space-y-4" aria-busy="true" aria-label="Carregando o caderno">
+      <div className="cf-skeleton h-10 w-full" />
+      {[0, 1, 2].map((i) => (
+        <div key={i} className="space-y-2 pt-4">
+          <div className="cf-skeleton h-3 w-24" />
+          <div className="cf-skeleton h-5 w-2/3" />
+          <div className="cf-skeleton h-16 w-full" />
+        </div>
+      ))}
+    </div>
   );
 }

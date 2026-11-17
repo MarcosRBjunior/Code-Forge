@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getSandbox, isRemote, type Compare, type Language, type RunOutcome, type TestCase, type ValueType } from "./runner";
 import { allStarters, isLang, LANG_LABEL, type ProblemShape } from "@/lib/langs";
 import { PROGRESS_EVENT, type ProgressEventDetail } from "@/lib/events";
+import { replayAnimation } from "@/lib/motion";
 
 const Editor = dynamic(() => import("@monaco-editor/react").then((m) => m.default), {
   ssr: false,
@@ -59,6 +60,11 @@ export function ProblemWorkspace({
   const [activeCase, setActiveCase] = useState(0);
   const theme = useDataTheme();
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Guarda síncrona: evita duas execuções simultâneas (atalho no Monaco + atalho global)
+  const runningRef = useRef(false);
+  // Cada execução ganha um id novo: o painel de resultado remonta e entra em cena de novo (staging)
+  const [runId, setRunId] = useState(0);
+  const verdictRef = useRef<HTMLParagraphElement>(null);
 
   // Rascunhos salvos + linguagem preferida
   useEffect(() => {
@@ -94,6 +100,9 @@ export function ProblemWorkspace({
   };
 
   const run = useCallback(async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    // Doherty: o estado "executando" aparece no mesmo frame do clique
     setRunning(true);
     setOutcome(null);
     const result = await getSandbox(language).run({
@@ -107,8 +116,10 @@ export function ProblemWorkspace({
       design: problem.design ?? false,
       tests: problem.tests,
     });
+    runningRef.current = false;
     setRunning(false);
     setOutcome(result);
+    setRunId((n) => n + 1);
     setInterpreter("ready");
     if (result.kind === "done") {
       const firstFail = result.cases.findIndex((c) => !c.ok);
@@ -124,6 +135,16 @@ export function ProblemWorkspace({
     }
   }, [code, language, problem, chapterKey]);
 
+  // Atalho Ctrl/Cmd+Enter também de dentro do editor (o Monaco consome a tecla antes da janela)
+  const runRef = useRef(run);
+  useEffect(() => {
+    runRef.current = run;
+  }, [run]);
+  const allowRunRef = useRef(allowRun);
+  useEffect(() => {
+    allowRunRef.current = allowRun;
+  }, [allowRun]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -137,6 +158,12 @@ export function ProblemWorkspace({
 
   const passed = outcome?.kind === "done" ? outcome.cases.filter((c) => c.ok).length : 0;
   const allPassed = outcome?.kind === "done" && passed === outcome.cases.length;
+
+  // Feedback exagerado no veredito: tudo passou → "jelly" de comemoração; falhou → balança (ação secundária)
+  useEffect(() => {
+    if (!outcome) return;
+    replayAnimation(verdictRef.current, allPassed ? "cf-jelly" : "cf-shake");
+  }, [runId, outcome, allPassed]);
 
   return (
     <section aria-label="Editor de código" className="overflow-hidden rounded-xl border border-line bg-surface-1 shadow-sm">
@@ -165,7 +192,7 @@ export function ProblemWorkspace({
           onClick={() => {
             if (confirm("Restaurar o código inicial? O rascunho atual será substituído.")) onChange(starters[language] ?? "");
           }}
-          className="ml-auto rounded-md px-2.5 py-1 text-sm text-fg-muted hover:bg-surface-2"
+          className="ml-auto min-h-9 rounded-md px-2.5 py-1 text-sm text-fg-muted hover:bg-surface-2"
         >
           Restaurar
         </button>
@@ -174,10 +201,14 @@ export function ProblemWorkspace({
           onClick={run}
           disabled={running || !allowRun}
           aria-busy={running}
-          title="Ctrl+Enter"
-          className="rounded-md bg-accent px-3.5 py-1.5 text-sm font-medium text-fg-on-accent hover:bg-accent-hover disabled:opacity-60"
+          title="Ctrl+Enter (⌘+Enter no Mac)"
+          aria-keyshortcuts="Control+Enter Meta+Enter"
+          className={`inline-flex min-h-10 items-center gap-2 rounded-md bg-accent px-4 py-2 text-sm font-medium text-fg-on-accent shadow-sm hover:bg-accent-hover disabled:opacity-60 ${running ? "cf-busy" : ""}`}
         >
           {running ? "Executando…" : "▶ Executar testes"}
+          {!running && allowRun && (
+            <kbd className="hidden rounded border border-white/30 px-1 font-mono text-[10px] leading-4 opacity-80 sm:inline">Ctrl ↵</kbd>
+          )}
         </button>
       </div>
 
@@ -186,6 +217,11 @@ export function ProblemWorkspace({
           language={language}
           value={code[language] ?? ""}
           onChange={onChange}
+          onMount={(editor, monaco) => {
+            editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
+              if (allowRunRef.current) void runRef.current();
+            });
+          }}
           theme={theme === "dark" ? "vs-dark" : "light"}
           options={{
             fontSize: 14,
@@ -208,18 +244,23 @@ export function ProblemWorkspace({
               : "Modo sem executar: percorra os exemplos manualmente. Os testes rodam ao final da entrevista."}
           </p>
         )}
-        {running && <p className="text-fg-muted">Rodando os testes…</p>}
-        {outcome?.kind === "timeout" && <p className="font-medium text-danger">Tempo limite excedido. Verifique se há um laço infinito.</p>}
-        {outcome?.kind === "error" && <p className="font-medium text-danger">{outcome.message}</p>}
-        {outcome?.kind === "compile_error" && (
-          <>
-            <p className="font-medium text-danger">Erro no código</p>
-            <pre className="mt-2 overflow-x-auto rounded-md bg-danger-soft p-3 font-mono text-xs">{outcome.message}</pre>
-          </>
+        {running && <p className="cf-busy text-fg-muted">Rodando os testes…</p>}
+        {outcome && outcome.kind !== "done" && (
+          <div key={runId} className="cf-rise-in">
+            <p ref={verdictRef} className="font-medium text-danger">
+              {outcome.kind === "timeout" ? "Tempo limite excedido. Verifique se há um laço infinito." : outcome.kind === "error" ? outcome.message : "Erro no código"}
+            </p>
+            {outcome.kind === "compile_error" && (
+              <pre className="mt-2 overflow-x-auto rounded-md bg-danger-soft p-3 font-mono text-xs">{outcome.message}</pre>
+            )}
+          </div>
         )}
         {outcome?.kind === "done" && (
-          <>
-            <p className={`font-semibold ${allPassed ? "text-success" : "text-danger"}`}>
+          <div key={runId} className="cf-rise-in">
+            <p
+              ref={verdictRef}
+              className={`inline-block origin-left font-semibold ${allPassed ? "rounded-md bg-success-soft px-2.5 py-1 text-success" : "text-danger"}`}
+            >
               {allPassed ? `✓ Aceito — ${passed}/${outcome.cases.length} testes passaram` : `✗ ${passed}/${outcome.cases.length} testes passaram`}
             </p>
             <div role="tablist" aria-label="Casos de teste" className="mt-3 flex flex-wrap gap-1.5">
@@ -230,7 +271,7 @@ export function ProblemWorkspace({
                   type="button"
                   aria-selected={activeCase === i}
                   onClick={() => setActiveCase(i)}
-                  className={`rounded-md px-2.5 py-1 text-xs font-medium aria-selected:ring-2 aria-selected:ring-[var(--cf-focus-ring)] ${
+                  className={`min-h-8 rounded-md px-2.5 py-1 text-xs font-medium aria-selected:ring-2 aria-selected:ring-[var(--cf-focus-ring)] ${
                     c.ok ? "bg-success-soft text-success" : "bg-danger-soft text-danger"
                   }`}
                 >
@@ -256,7 +297,7 @@ export function ProblemWorkspace({
                 <dd>{outcome.cases[activeCase].ms} ms</dd>
               </dl>
             )}
-          </>
+          </div>
         )}
       </div>
     </section>
