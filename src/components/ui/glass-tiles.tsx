@@ -13,7 +13,7 @@ import "./glass-tiles-utils/glass-tiles.css";
 const VERT = `attribute vec2 a; void main(){ gl_Position = vec4(a, 0.0, 1.0); }`;
 const FRAG = `precision highp float;
 uniform vec2 uRes; uniform float uTime; uniform float uCols; uniform vec2 uMouse; uniform float uLamp;
-uniform vec3 uGlow; uniform vec3 uDeep; uniform vec3 uGround;
+uniform vec3 uGlow; uniform vec3 uDeep; uniform vec3 uGround; uniform float uLight;
 
 // The light behind the glass: a few slow beams and soft pools, in screen units (y 0..1).
 float light(vec2 p){
@@ -44,7 +44,7 @@ void main(){
   vec2 aq = abs(q);
   float sq = pow(pow(aq.x, 9.0) + pow(aq.y, 9.0), 1.0 / 9.0);
   float d = sq - 0.955;                                // leaves a thin grout
-  if (d > 0.0) { gl_FragColor = vec4(uGround * 0.6, 1.0); return; }
+  if (d > 0.0) { gl_FragColor = vec4(uGround * mix(0.6, 0.93, uLight), 1.0); return; }
   // Bevel: the outer part of the tile bends light inwards.
   float edge = clamp(1.0 + d / 0.55, 0.0, 1.0);
   vec2 g = normalize(sign(q) * pow(aq + 1e-4, vec2(8.0)));
@@ -60,6 +60,12 @@ void main(){
   vec3 col = uGround + uDeep * (face + 0.04) + uGlow * (rim + face * 0.6) + vec3(1.0) * pow(max(rim - 1.2, 0.0), 2.0) * 0.35 + fres;
   // a faint inner gradient so each tile reads as a thick block
   col *= 0.85 + 0.15 * (0.5 + 0.5 * q.y);
+  if (uLight > 0.5) {
+    // CodeForge (tema claro): papel claro; a luz vira tinta — o que absorve o complemento da cor aparece tingido.
+    float ink = min(rim * 0.30 + face * 0.55, 0.85);
+    col = uGround - (1.0 - uGlow) * ink - (1.0 - uDeep) * 0.025 + vec3(1.0) * fres * 0.4;
+    col *= 0.975 + 0.025 * (0.5 + 0.5 * q.y);
+  }
   gl_FragColor = vec4(col, 1.0);
 }`;
 
@@ -84,6 +90,8 @@ type Props = {
   columns?: number;
   speed?: number;
   motion?: "full" | "reduced";
+  /** "light": versão para fundo claro (a luz tinge o papel em vez de brilhar no escuro). */
+  variant?: "dark" | "light";
   className?: string;
   style?: CSSProperties;
   children?: ReactNode;
@@ -94,6 +102,7 @@ export function GlassTiles({
   columns = 8,
   speed = 1,
   motion = "full",
+  variant = "dark",
   className = "",
   style,
   children,
@@ -143,6 +152,7 @@ export function GlassTiles({
     gl.uniform3f(U("uGlow"), ...rgb(palette.glow));
     gl.uniform3f(U("uDeep"), ...rgb(palette.deep));
     gl.uniform3f(U("uGround"), ...rgb(palette.ground));
+    gl.uniform1f(U("uLight"), variant === "light" ? 1 : 0);
 
     let scale = 1,
       raf = 0,
@@ -232,7 +242,7 @@ export function GlassTiles({
       window.removeEventListener("pointermove", onMove);
       document.documentElement.removeEventListener("pointerleave", onLeave);
     };
-  }, [palette, columns, speed, motion]);
+  }, [palette, columns, speed, motion, variant]);
 
   return (
     <div
